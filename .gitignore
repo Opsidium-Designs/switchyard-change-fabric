@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Wrangler / Cloudflare local dev
+.wrangler/
+worker-configuration.d.ts
+
+# Secrets and local env (never commit — see .env.example)
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+
+# Test / coverage output
+coverage/
+reports/
+*.log
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

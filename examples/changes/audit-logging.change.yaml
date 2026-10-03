@@ -1,0 +1,32 @@
+# Example Change for the Switchyard Change Fabric spike.
+#
+# Three WorkUnits, one dependency (api -> model), and one intentional
+# path-collision (`api` and `tests` both declare src/audit/events.ts) to drive
+# the deterministic conflict/lease demo.
+#
+# The Change target is examples/demo-project/ in this repo.
+id: change-audit-logging
+objective: Add organization-level audit logging
+baseline: HEAD
+budget_usd: 5.00
+assurance: standard
+
+work:
+  - id: model
+    objective: Implement audit event persistence
+    paths:
+      - src/audit/**
+
+  - id: api
+    objective: Add API read endpoints
+    depends_on:
+      - model
+    paths:
+      - src/api/audit/**
+      - src/audit/events.ts        # collides with `tests` below
+
+  - id: tests
+    objective: Add audit logging tests
+    paths:
+      - tests/audit/**
+      - src/audit/events.ts        # collision: both touch events.ts

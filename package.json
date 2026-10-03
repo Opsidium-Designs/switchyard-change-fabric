@@ -1,0 +1,26 @@
+{
+  "name": "switchyard-change-fabric",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Agent-native change coordination on Cloudflare (local-first spike).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm -w apps/worker run dev",
+    "dev:worker": "npm -w apps/worker run dev",
+    "build": "npm run build --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "wrangler": "^4.40.0"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@switchyard-change/worker",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Cloudflare Worker control surface: Change API + Workflow + Durable Object + Artifacts binding.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "cf-typegen": "wrangler types",
+    "typecheck": "wrangler types && tsc --noEmit",
+    "build": "wrangler types && tsc --noEmit"
+  },
+  "dependencies": {
+    "@switchyard-change/artifact-workspace": "*",
+    "@switchyard-change/change-core": "*"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "wrangler": "^4.40.0"
+  }
+}

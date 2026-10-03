@@ -1,0 +1,52 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "switchyard-change-fabric",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-23",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  },
+
+  // Durable Object: single-owner serialized Change state + path/write leases.
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CHANGE_STATE",
+        "class_name": "ChangeState"
+      }
+    ]
+  },
+
+  // SQLite-backed Durable Objects are the current default class type.
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ChangeState"]
+    }
+  ],
+
+  // Workflow: durable, restartable Change work-graph lifecycle.
+  "workflows": [
+    {
+      "name": "change-workflow",
+      "binding": "CHANGE_WORKFLOW",
+      "class_name": "ChangeWorkflow"
+    }
+  ],
+
+  // Cloudflare Artifacts binding — the M0 exit capability.
+  //
+  // `remote: true` proxies just this binding to the real Cloudflare Artifacts
+  // service while the Worker/Workflow/DO run locally under `wrangler dev`,
+  // giving a clone-and-run experience that still
+  // exercises real Artifacts. The namespace is a placeholder a contributor sets
+  // after `wrangler login`; no secrets are committed.
+  "artifacts": [
+    {
+      "binding": "ARTIFACTS",
+      "namespace": "switchyard-change-fabric",
+      "remote": true
+    }
+  ]
+}
