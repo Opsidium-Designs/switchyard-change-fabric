@@ -2,7 +2,7 @@
   "name": "@switchyard-change/change-core",
   "version": "0.0.0",
   "private": true,
-  "description": "Portable Change / WorkUnit / WorkGraph coordination contracts (public subset).",
+  "description": "Portable Change / WorkUnit / WorkGraph coordination contracts and scheduling (public subset).",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./src/index.ts",
@@ -11,9 +11,15 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "yaml": "^2.6.1"
   },
   "devDependencies": {
-    "typescript": "5.9.3"
+    "typescript": "5.9.3",
+    "vitest": "^2.1.8"
   }
 }

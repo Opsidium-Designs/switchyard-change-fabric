@@ -2,7 +2,7 @@
   "name": "@switchyard-change/artifact-workspace",
   "version": "0.0.0",
   "private": true,
-  "description": "WorkspaceProvider contract over Cloudflare Artifacts (create/delete/token) — public subset.",
+  "description": "WorkspaceProvider contract over Cloudflare Artifacts (create/delete/token); public subset.",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./src/index.ts",

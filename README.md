@@ -83,20 +83,23 @@ try the project.
 ```bash
 git clone <this-repo>
 cd switchyard-change-fabric
-npm install
+make install
 npx wrangler login
 cp .env.example .env
-npm run dev            # starts wrangler dev, the console, and the local runner pool
+make dev-all           # runs the Worker (wrangler dev) and the console together
 ```
+
+Common tasks are in the `Makefile`: `make dev` (Worker only), `make console`
+(console only), `make cli ARGS="doctor"` (the CLI), `make check` (typecheck +
+build + test), `make example` (lint/build/test the example project).
 
 Then run an example Change:
 
 ```bash
-npx switchyard-change init ../example-project
-npx switchyard-change run examples/audit-logging.change.yaml
-# open the local console (e.g. http://localhost:8787) to watch WorkUnits,
-# conflicts, verification, cost, and promotion
-npx switchyard-change promote <change-id>
+make cli ARGS="init ../example-project"
+make cli ARGS="run examples/changes/audit-logging.change.yaml"
+# open the local console to watch WorkUnits, conflicts, verification, and promotion
+make cli ARGS="promote <change-id>"
 ```
 
 ## License

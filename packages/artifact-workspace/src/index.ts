@@ -1,12 +1,12 @@
 /**
- * artifact-workspace — the WorkspaceProvider contract.
+ * artifact-workspace: the WorkspaceProvider contract.
  *
  * A Workspace is an isolated, disposable per-WorkUnit Git workspace. The first
  * (and only, in this spike) implementation is Cloudflare Artifacts: one isolated
  * Artifact repo per WorkUnit with short-lived repo-scoped Git tokens.
  *
  * M0 scope: the contract plus a thin adapter over the Cloudflare Artifacts
- * binding, exposing just the M0 exit capability — create and delete an Artifact
+ * binding, exposing just the M0 exit capability: create and delete an Artifact
  * repo. `seed`/`fork`/`issue_*_token`/`inspect` are declared on the interface but
  * land in M2. The adapter must *wire* the binding; when the binding is absent or
  * the environment is unauthenticated, calls are stubbed cleanly rather than

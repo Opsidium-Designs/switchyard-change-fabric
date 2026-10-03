@@ -9,10 +9,12 @@ export interface ChangeWorkflowParams {
 }
 
 /**
- * ChangeWorkflow — durable, restartable work-graph lifecycle for a Change.
- * M0 is a stub with a single recorded step so the Workflow binding is
- * wired and schedulable; the real WorkGraph scheduling (runnable/waiting
- * transitions, verification, integration) lands in M1–M3.
+ * ChangeWorkflow: durable, restartable work-graph lifecycle for a Change.
+ *
+ * The live runnable/waiting scheduling state now lives in the ChangeState
+ * Durable Object. This Workflow stays a wired, schedulable stub with a single
+ * recorded step; it takes over the durable run loop (leasing runnable WorkUnits
+ * to a runner, recording verification, and integration) in a later milestone.
  */
 export class ChangeWorkflow extends WorkflowEntrypoint<Env, ChangeWorkflowParams> {
   override async run(

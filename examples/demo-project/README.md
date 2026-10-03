@@ -13,10 +13,10 @@ path-scope checks) runs quickly and reproducibly.
 
 | Module | Path | Example WorkUnit |
 |--------|------|------------------|
-| Audit event types + validation | `src/audit/events.ts` | shared by `api` **and** `tests` — the deterministic path collision |
+| Audit event types + validation | `src/audit/events.ts` | shared by `api` **and** `tests` (the deterministic path collision) |
 | Audit event persistence | `src/audit/store.ts` | `model` |
 | Audit read API (framework-free) | `src/api/audit/handler.ts` | `api` (depends on `model`) |
-| Service wiring + entry point | `src/index.ts` | — |
+| Service wiring + entry point | `src/index.ts` | (n/a) |
 | Tests | `tests/audit/*.test.ts` | `tests` |
 
 The `api -> model` dependency and the `src/audit/events.ts` collision between the

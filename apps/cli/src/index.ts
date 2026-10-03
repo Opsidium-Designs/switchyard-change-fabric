@@ -19,7 +19,7 @@ interface Command {
 
 function placeholder(message: string): void {
   console.log(message);
-  console.log("(stub — not yet implemented in this milestone)");
+  console.log("(stub, not yet implemented in this milestone)");
 }
 
 const commands: Command[] = [
@@ -80,7 +80,7 @@ const commands: Command[] = [
 const commandMap = new Map(commands.map((c) => [c.name, c]));
 
 function printHelp(): void {
-  console.log(`${CLI_NAME} v${VERSION} — agent-native change coordination (spike)\n`);
+  console.log(`${CLI_NAME} v${VERSION}: agent-native change coordination (spike)\n`);
   console.log(`Usage: ${CLI_NAME} <command> [options]\n`);
   console.log("Commands:");
   const width = Math.max(...commands.map((c) => c.name.length));

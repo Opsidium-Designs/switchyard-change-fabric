@@ -1,8 +1,12 @@
-# Switchyard Change Fabric — developer tasks
+# Switchyard Change Fabric: developer tasks
 #
 # Run tasks manually; there is no CI pipeline. Requires Node.js and npm.
 #
 #   make install   install all workspace dependencies
+#   make dev       run the Worker locally (wrangler dev)
+#   make console   run the local console (Vite)
+#   make dev-all   run the Worker and the console together
+#   make cli ARGS="doctor"   run the switchyard-change CLI
 #   make build     build every workspace
 #   make typecheck typecheck every workspace
 #   make test      run every workspace's tests
@@ -10,10 +14,31 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: install dev console dev-all cli build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
+
+# --- local dev loop ---
+
+# Run the Cloudflare Worker locally under wrangler dev. The Artifacts binding is
+# configured with remote=true, so `wrangler login` first to reach real Artifacts.
+dev:
+	npm -w apps/worker run dev
+
+# Run the local console (Vite dev server).
+console:
+	npm -w apps/console run dev
+
+# Run the Worker and the console together (Ctrl-C stops both).
+dev-all:
+	npm -w apps/worker run dev & \
+	npm -w apps/console run dev & \
+	wait
+
+# Run the switchyard-change CLI, e.g. `make cli ARGS="doctor"`.
+cli:
+	npm -w apps/cli run dev -- $(ARGS)
 
 build:
 	npm run build

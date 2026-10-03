@@ -23,8 +23,8 @@ export interface ApiResponse {
 
 /**
  * Minimal router for the two read endpoints:
- *   GET /audit/events        — list events (optional orgId/actor/action filters)
- *   GET /audit/events/:id    — fetch a single event
+ *   GET /audit/events        list events (optional orgId/actor/action filters)
+ *   GET /audit/events/:id    fetch a single event
  */
 export function createAuditApi(store: AuditStore) {
   function handle(req: ApiRequest): ApiResponse {

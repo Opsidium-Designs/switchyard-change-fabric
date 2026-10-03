@@ -1,5 +1,7 @@
 import type { ArtifactsBinding } from "@switchyard-change/artifact-workspace";
 
+import type { ChangeState } from "./change-state.ts";
+
 /**
  * Typed Worker bindings (wrangler.jsonc). In a configured build these can be
  * generated via `wrangler types`; this hand-written version keeps the Worker
@@ -7,7 +9,7 @@ import type { ArtifactsBinding } from "@switchyard-change/artifact-workspace";
  */
 export interface Env {
   /** Durable Object namespace for live Change state + path leases. */
-  readonly CHANGE_STATE: DurableObjectNamespace;
+  readonly CHANGE_STATE: DurableObjectNamespace<ChangeState>;
   /** Workflow binding for the durable Change work-graph lifecycle. */
   readonly CHANGE_WORKFLOW: Workflow;
   /**

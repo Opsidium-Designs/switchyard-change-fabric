@@ -35,7 +35,7 @@
     }
   ],
 
-  // Cloudflare Artifacts binding — the M0 exit capability.
+  // Cloudflare Artifacts binding: the M0 exit capability.
   //
   // `remote: true` proxies just this binding to the real Cloudflare Artifacts
   // service while the Worker/Workflow/DO run locally under `wrangler dev`,
