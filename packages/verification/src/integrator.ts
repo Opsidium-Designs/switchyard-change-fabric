@@ -43,6 +43,13 @@ export interface VerifiedWorkspace {
   readonly gitUrl: string;
   /** The Git ref that workspace was seeded from, for deriving changed files. */
   readonly baselineRef: string;
+  /**
+   * Contested paths this WorkUnit must yield to another lease owner. The
+   * integrator skips these files when applying this unit, so the single lease
+   * owner is the only contributor of each contested path. This is what turns a
+   * would-be silent merge collision into a coordinated, single-writer result.
+   */
+  readonly yieldedPaths?: readonly string[];
 }
 
 /** Inputs to integrate verified WorkUnits into one combined workspace. */
@@ -136,18 +143,25 @@ export class Integrator {
    * Clone one verified WorkUnit's workspace, derive the files it changed since
    * the baseline, and copy those files into the integration checkout. Because
    * verified WorkUnits touch non-overlapping declared paths, copies do not
-   * clobber one another.
+   * clobber one another. Any path this unit yielded to a lease owner is skipped
+   * so the owner is the only contributor of a contested path.
    */
   private async applyUnit(
     unit: VerifiedWorkspace,
     integrationDir: string,
     workRoot: string,
   ): Promise<void> {
+    const yielded = new Set(unit.yieldedPaths ?? []);
     const unitDir = await mkdtemp(join(workRoot, `scf-unit-${sanitize(unit.unitId)}-`));
     try {
       await clone(unit.gitUrl, unitDir);
       const changed = await changedPathsSinceBaseline(unitDir, unit.baselineRef);
       for (const rel of changed) {
+        if (yielded.has(rel)) {
+          // This contested path belongs to another lease owner; skip it so the
+          // single owner's version is the one that lands in the integration.
+          continue;
+        }
         const from = join(unitDir, rel);
         const to = join(integrationDir, rel);
         await mkdir(dirname(to), { recursive: true });

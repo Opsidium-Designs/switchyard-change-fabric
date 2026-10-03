@@ -21,6 +21,8 @@
 export type {
   CheckKind,
   CheckResult,
+  CoordinationDecision,
+  CoordinationSummary,
   EvidenceSummary,
   IntegrationResult,
   OutputRef,

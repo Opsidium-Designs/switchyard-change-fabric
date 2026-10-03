@@ -12,7 +12,13 @@
  * governance concepts: it only verifies work and reports evidence.
  */
 
-import { findWorkUnit, type Change } from "@switchyard-change/change-core";
+import {
+  detectPathCollisions,
+  findWorkUnit,
+  planWriteLeases,
+  unitLeaseViews,
+  type Change,
+} from "@switchyard-change/change-core";
 import type { WorkspaceProvider, WorkspaceRef } from "@switchyard-change/artifact-workspace";
 
 import { Integrator, type VerifiedWorkspace } from "./integrator.ts";
@@ -23,6 +29,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
+  CoordinationSummary,
   EvidenceSummary,
   IntegrationResult,
   VerificationContract,
@@ -76,13 +83,41 @@ export class ChangeVerification {
   }
 
   /**
-   * Verify every completed WorkUnit, integrate the verified ones, and produce
-   * the evidence summary. Each WorkUnit's declared paths come from the Change
-   * (via change-core), so scope is driven by the coordination model.
+   * Verify every completed WorkUnit, coordinate any declared path collisions
+   * with a write-lease plan, integrate the verified ones, and produce the
+   * evidence summary. Each WorkUnit's declared paths come from the Change (via
+   * change-core), so scope is driven by the coordination model.
+   *
+   * Coordination happens before integration: declared path collisions are
+   * detected, a deterministic write-lease plan grants each contested path to a
+   * single owner (or flags it), and the decision is recorded in the evidence.
+   * A waiter's contested files are then kept out of integration so the owner is
+   * the only contributor, which turns a would-be silent merge collision into a
+   * coordinated single-writer result.
    */
   async verifyAndIntegrate(options: VerifyAndIntegrateOptions): Promise<EvidenceSummary> {
     const { change, completed } = options;
     const workRoot = options.workRoot ?? tmpdir();
+
+    // Coordinate declared path collisions before integration. The plan is a
+    // pure function of the Change, so it is reproducible every run.
+    const collisions = detectPathCollisions(change);
+    const leasePlan = planWriteLeases(change, collisions);
+    const leaseViews = unitLeaseViews(leasePlan);
+    const coordination: CoordinationSummary | undefined =
+      collisions.length === 0
+        ? undefined
+        : {
+            needsAttention: leasePlan.needsAttention,
+            decisions: leasePlan.decisions.map((d) => ({
+              path: d.path,
+              contenders: d.contenders,
+              resolution: d.resolution,
+              owner: d.owner,
+              waiters: d.waiters,
+              reason: d.reason,
+            })),
+          };
 
     const units: WorkUnitVerification[] = [];
     const verifiedWorkspaces: VerifiedWorkspace[] = [];
@@ -103,6 +138,9 @@ export class ChangeVerification {
           unitId: done.unitId,
           gitUrl: done.gitUrl,
           baselineRef: done.baselineRef,
+          // Keep this unit's yielded contested paths out of integration so the
+          // single lease owner is the only contributor of that path.
+          yieldedPaths: leaseViews.get(done.unitId)?.yields ?? [],
         });
       } else {
         excludedUnits.push(done.unitId);
@@ -119,7 +157,7 @@ export class ChangeVerification {
       identity: options.identity,
     });
 
-    return { changeId: change.id, units, integration };
+    return { changeId: change.id, units, integration, coordination };
   }
 
   /** Build a verification contract for one completed WorkUnit from the Change. */

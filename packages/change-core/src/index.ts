@@ -33,3 +33,11 @@ export {
   waitingUnits,
   workUnitStatuses,
 } from "./graph.ts";
+
+export type {
+  LeaseDecision,
+  LeasePlan,
+  LeaseResolution,
+  UnitLeaseView,
+} from "./lease.ts";
+export { planWriteLeases, unitLeaseViews } from "./lease.ts";

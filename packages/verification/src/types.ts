@@ -108,4 +108,37 @@ export interface EvidenceSummary {
   readonly changeId: string;
   readonly units: readonly WorkUnitVerification[];
   readonly integration: IntegrationResult;
+  /**
+   * The write-lease coordination applied before integration, when the Change
+   * had declared path collisions. Omitted when there were no collisions.
+   */
+  readonly coordination?: CoordinationSummary;
+}
+
+/**
+ * The recorded coordination decision for a Change's contested paths. It mirrors
+ * change-core's LeasePlan so a caller can see, without re-running anything,
+ * which paths collided, who was granted each write lease, who waited, and
+ * whether anything was flagged for attention.
+ */
+export interface CoordinationSummary {
+  /** One recorded decision per contested path. */
+  readonly decisions: readonly CoordinationDecision[];
+  /** True when at least one contested path was flagged rather than serialized. */
+  readonly needsAttention: boolean;
+}
+
+/** The recorded decision for one contested path. */
+export interface CoordinationDecision {
+  readonly path: string;
+  /** The colliding WorkUnit ids, sorted. */
+  readonly contenders: readonly string[];
+  /** "serialized" when a single owner was granted the lease, else "flagged". */
+  readonly resolution: "serialized" | "flagged";
+  /** The WorkUnit granted the lease, when serialized. */
+  readonly owner?: string;
+  /** The WorkUnit ids told to wait for the owner, when serialized. */
+  readonly waiters: readonly string[];
+  /** A short, human-readable reason for the decision. */
+  readonly reason: string;
 }
