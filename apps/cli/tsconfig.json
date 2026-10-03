@@ -3,10 +3,8 @@
   "compilerOptions": {
     "lib": ["ES2022"],
     "types": ["node"],
-    "outDir": "dist",
-    "rootDir": "src",
-    "noEmit": false,
-    "sourceMap": false
+    "noEmit": true,
+    "allowImportingTsExtensions": true
   },
   "include": ["src"]
 }

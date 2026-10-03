@@ -1,0 +1,31 @@
+{
+  "name": "@switchyard-change/orchestration",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Drive a Change end to end (orchestration, runners, verification, integration, conflict coordination, local Git promotion) deterministically offline.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@switchyard-change/artifact-workspace": "*",
+    "@switchyard-change/change-core": "*",
+    "@switchyard-change/git-promotion": "*",
+    "@switchyard-change/local-runner": "*",
+    "@switchyard-change/model-adapters": "*",
+    "@switchyard-change/verification": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "typescript": "5.9.3",
+    "vitest": "^2.1.8"
+  }
+}

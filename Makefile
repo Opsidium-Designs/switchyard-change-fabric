@@ -7,6 +7,8 @@
 #   make console   run the local console (Vite)
 #   make dev-all   run the Worker and the console together
 #   make cli ARGS="doctor"   run the switchyard-change CLI
+#   make doctor    run the readiness check (switchyard-change doctor)
+#   make demo      run the example audit-logging Change end to end (offline)
 #   make build     build every workspace
 #   make typecheck typecheck every workspace
 #   make test      run every workspace's tests
@@ -14,7 +16,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install dev console dev-all cli build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: install dev console dev-all cli doctor demo build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -39,6 +41,17 @@ dev-all:
 # Run the switchyard-change CLI, e.g. `make cli ARGS="doctor"`.
 cli:
 	npm -w apps/cli run dev -- $(ARGS)
+
+# Check local prerequisites and print a readiness report.
+doctor:
+	npm -w apps/cli run dev -- doctor
+
+# Run the example audit-logging Change end to end, deterministically and
+# offline (noop executor + honest local fallback, no Cloudflare account, no
+# real inference). Prints a readable summary ending in a promoted local Git
+# commit.
+demo:
+	npm -w apps/cli run dev -- run $(CURDIR)/examples/changes/audit-logging.change.yaml
 
 build:
 	npm run build

@@ -20,6 +20,9 @@ export type {
 export type { NoopExecutorOptions } from "./noop.ts";
 export { NoopExecutor } from "./noop.ts";
 
+export type { ScopedNoopExecutorOptions } from "./scoped-noop.ts";
+export { ScopedNoopExecutor } from "./scoped-noop.ts";
+
 export type {
   ChatFn,
   ChatRequest,

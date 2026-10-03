@@ -4,16 +4,16 @@
   "private": true,
   "type": "module",
   "bin": {
-    "switchyard-change": "./dist/index.js"
+    "switchyard-change": "./src/index.ts"
   },
-  "files": [
-    "dist"
-  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "dev": "node --experimental-strip-types src/index.ts",
-    "start": "node dist/index.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "dev": "node --disable-warning=ExperimentalWarning --experimental-transform-types src/index.ts",
+    "demo": "node --disable-warning=ExperimentalWarning --experimental-transform-types src/index.ts run ../../examples/changes/audit-logging.change.yaml",
+    "start": "node --disable-warning=ExperimentalWarning --experimental-transform-types src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@switchyard-change/orchestration": "*"
   },
   "devDependencies": {
     "@types/node": "^22.10.5",

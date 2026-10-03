@@ -74,41 +74,99 @@ identically regardless of executor.
 
 ## Requirements
 
-- Node.js and Git
+For the offline demo (`make demo`) you need only:
+
+- Node.js (version 20 or newer) and Git
+
+To reach the real Cloudflare services you additionally need:
+
 - A Cloudflare account with Workers + Artifacts access (Artifacts is in open beta)
 - One inference path: an authenticated Codex CLI, **or** a provider key in AI
   Gateway, **or** sufficient Cloudflare credits for Workers AI / Unified Billing
 - Docker (only if the optional containerized verifier is used)
 
-You do **not** need a production Cloudflare deploy or a local GPU/model server to
-try the project.
+You do **not** need a production Cloudflare deploy, a Cloudflare account, or a
+local GPU/model server to run the example end to end.
 
-## Getting started
+## Getting started (clone and run)
 
-> Commands below are the intended developer experience; some land as the spike is
-> built out.
+A fresh clone runs the full example Change end to end offline, with no Cloudflare
+account and no model inference:
 
 ```bash
 git clone <this-repo>
 cd switchyard-change-fabric
 make install
-npx wrangler login
-cp .env.example .env
-make dev-all           # runs the Worker (wrangler dev) and the console together
+make doctor            # readiness report: Node, Git, wrangler, auth, executors
+make demo              # run the example Change end to end (offline, deterministic)
 ```
 
-Common tasks are in the `Makefile`: `make dev` (Worker only), `make console`
-(console only), `make cli ARGS="doctor"` (the CLI), `make check` (typecheck +
-build + test), `make example` (lint/build/test the example project).
+`make demo` runs the example audit-logging Change through orchestration, local
+runners, deterministic verification, integration, write-lease conflict
+coordination, and local Git promotion, then prints a readable summary that ends
+in a promoted local Git commit. It uses the deterministic `noop` executor and the
+honest local-filesystem fallback, so the same run always produces the same result.
 
-Then run an example Change:
+Other common tasks are in the `Makefile`: `make check` (typecheck + build +
+test), `make example` (lint/build/test the example project), `make cli
+ARGS="status examples/changes/audit-logging.change.yaml"` (print a Change's
+planned WorkGraph and schedule), `make dev-all` (run the Worker under
+`wrangler dev` plus the console, for exploring the real Cloudflare path after
+`npx wrangler login`).
+
+The CLI mirrors these:
 
 ```bash
-make cli ARGS="init ../example-project"
-make cli ARGS="run examples/changes/audit-logging.change.yaml"
-# open the local console to watch WorkUnits, conflicts, verification, and promotion
-make cli ARGS="promote <change-id>"
+make cli ARGS="doctor"                                                 # readiness report
+make cli ARGS="status examples/changes/audit-logging.change.yaml"      # plan + schedule
+make cli ARGS="run examples/changes/audit-logging.change.yaml"         # run end to end
+make cli ARGS="promote examples/changes/audit-logging.change.yaml"     # run and promote
 ```
+
+## The example Change
+
+The seeded example lives in two files:
+
+- [`examples/changes/audit-logging.change.yaml`](examples/changes/audit-logging.change.yaml):
+  a Change that adds organization-level audit logging. It declares three
+  WorkUnits with one dependency (`api` depends on `model`) and one deliberate
+  path collision (`api` and `tests` both declare `src/audit/events.ts`), which is
+  what drives the coordination demo.
+- [`examples/demo-project/`](examples/demo-project/README.md): the small
+  standalone TypeScript service the Change targets.
+
+## Demo script (a 5 to 10 minute walkthrough)
+
+Everything below runs offline and deterministically.
+
+1. **Show readiness.** `make doctor`. It reports Node and Git as present
+   (required), wrangler and Cloudflare auth best-effort (optional), and that the
+   deterministic `noop` executor is always available. Point out that the offline
+   demo needs no Cloudflare account.
+2. **Show the plan.** `make cli ARGS="status examples/changes/audit-logging.change.yaml"`.
+   Walk through the three WorkUnits, the `api -> model` dependency, and the
+   declared `src/audit/events.ts` collision between `api` and `tests`. Highlight
+   the schedule: `model` and `tests` are runnable at once; `api` waits for
+   `model`.
+3. **Run it end to end.** `make demo`. As it runs, call out the stages in the
+   summary:
+   - **WorkUnits** scheduled in waves (`model` and `tests` concurrently, then
+     `api`), each in its own isolated local-fallback workspace;
+   - **Conflict coordination**: the `src/audit/events.ts` collision is resolved
+     by granting a single write lease to `api`, with `tests` recorded as a
+     waiter, so there is one writer and no silent merge;
+   - **Verification + integration**: every WorkUnit verifies and the combined
+     result verifies;
+   - **Cost**: zero spent against the Change budget (the `noop` executor spends
+     no inference);
+   - **Promotion**: a real branch and commit (`switchyard/change-audit-logging`)
+     in a local Git repository, ending in a promoted commit hash;
+   - **Cleanup**: the per-WorkUnit and integration workspaces are expired.
+4. **Show it is reproducible.** Run `make demo` again and note the same WorkUnit
+   ordering, the same coordinated owner, and the same promoted tree.
+5. **(Optional) Show the real Cloudflare path.** After `npx wrangler login`, run
+   `make dev-all` to bring up the Worker under `wrangler dev` and the console,
+   where the same flow uses real Cloudflare Artifacts.
 
 ## License
 

@@ -4,7 +4,7 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { NoopExecutor, OpenAiCompatibleExecutor } from "../src/index.ts";
+import { NoopExecutor, OpenAiCompatibleExecutor, ScopedNoopExecutor } from "../src/index.ts";
 
 let worktree: string;
 
@@ -51,6 +51,69 @@ describe("NoopExecutor", () => {
       return body;
     };
     expect(await makeResult()).toBe(await makeResult());
+  });
+});
+
+describe("ScopedNoopExecutor", () => {
+  it("writes a marker inside a directory glob and reports zero cost", async () => {
+    const executor = new ScopedNoopExecutor();
+    expect(executor.name).toBe("noop");
+    const result = await executor.execute({
+      worktreeDir: worktree,
+      workUnitId: "model",
+      objective: "persist audit events",
+      paths: ["src/audit/**"],
+      baselineRef: "HEAD",
+    });
+    expect(result.status).toBe("changed");
+    expect(result.changedPaths).toEqual(["src/audit/model.done"]);
+    expect(result.cost.usd).toBe(0);
+
+    const body = await readFile(join(worktree, "src/audit/model.done"), "utf8");
+    expect(body).toContain("owner: model");
+  });
+
+  it("writes an exact declared file verbatim (reproduces a collision path)", async () => {
+    const result = await new ScopedNoopExecutor().execute({
+      worktreeDir: worktree,
+      workUnitId: "api",
+      objective: "add read endpoints",
+      paths: ["src/api/audit/**", "src/audit/events.ts"],
+      baselineRef: "HEAD",
+    });
+    // Sorted: the exact file plus the in-scope marker.
+    expect([...result.changedPaths].sort()).toEqual([
+      "src/api/audit/api.done",
+      "src/audit/events.ts",
+    ]);
+    const events = await readFile(join(worktree, "src/audit/events.ts"), "utf8");
+    expect(events).toContain("owner: api");
+  });
+
+  it("stays within declared scope: no file is written outside the globs", async () => {
+    const result = await new ScopedNoopExecutor().execute({
+      worktreeDir: worktree,
+      workUnitId: "tests",
+      objective: "add tests",
+      paths: ["tests/audit/**", "src/audit/events.ts"],
+      baselineRef: "HEAD",
+    });
+    for (const rel of result.changedPaths) {
+      const underTests = rel.startsWith("tests/audit/");
+      const exact = rel === "src/audit/events.ts";
+      expect(underTests || exact).toBe(true);
+    }
+  });
+
+  it("falls back to a labelled marker when no paths are declared", async () => {
+    const result = await new ScopedNoopExecutor().execute({
+      worktreeDir: worktree,
+      workUnitId: "free",
+      objective: "no scope",
+      paths: [],
+      baselineRef: "HEAD",
+    });
+    expect(result.changedPaths).toEqual([".switchyard/free.done"]);
   });
 });
 
