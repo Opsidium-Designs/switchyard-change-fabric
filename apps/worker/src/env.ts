@@ -8,15 +8,15 @@ import type { ChangeState } from "./change-state.ts";
  * type-checkable without a generated file in the repo.
  */
 export interface Env {
-  /** Durable Object namespace for live Change state + path leases. */
+  /** Durable Object namespace for live Change state, leases, and cost. */
   readonly CHANGE_STATE: DurableObjectNamespace<ChangeState>;
   /** Workflow binding for the durable Change work-graph lifecycle. */
   readonly CHANGE_WORKFLOW: Workflow;
   /**
    * Cloudflare Artifacts binding (open beta), configured `remote = true` in
    * local dev. Optional at the type level because it is unavailable until the
-   * contributor authenticates with `wrangler login`; the Artifacts provider
-   * stubs cleanly when it is absent.
+   * contributor authenticates with `wrangler login`; the provisioner degrades to
+   * an honest, clearly-labelled fallback when it is absent.
    */
   readonly ARTIFACTS?: ArtifactsBinding;
 }

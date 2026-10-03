@@ -49,7 +49,15 @@ Developer workstation
 ```
 
 The Cloudflare Worker/Workflow/Agent state runs locally under Wrangler while the
-**Artifacts binding uses the real remote service** (`remote = true`).
+**Artifacts binding uses the real remote service** (`remote = true`) once you have
+run `wrangler login`.
+
+Without Cloudflare credentials the flow still runs end to end: the workspace
+provider degrades to an honest, clearly-labelled local fallback (a bare Git repo
+reachable over a `file://` URL, marked `backend: "local-filesystem"` and
+`fallback: true`), and a deterministic `noop` executor makes a trivial, zero
+inference edit. This keeps the clone, execute, commit, and push loop testable and
+demoable offline, and it never pretends to be the real Artifacts service.
 
 ## Executor modes
 
