@@ -16,13 +16,12 @@
  * imports these types and this function; the tests assert the mapping and the
  * no-unbacked-node rule against real snapshots.
  *
- * Typed-but-not-yet-populated hooks (so the shape is stable before the behavior
- * lands) are marked explicitly: the `tool` node kind and the `consumed-tool`
- * edge kind are reserved for the agent-for-agent tooling milestone and are
- * never emitted yet; the `escalated` node flag is reserved for the human
- * escalation milestone and is always false until the engine surfaces an
- * escalation. They are part of the type now so the view and its tests do not
- * change shape when that behavior arrives.
+ * Typed hooks and their status: the `tool` node kind and the `consumed-tool`
+ * edge kind are populated from real state (an agent-built tool published to its
+ * own repo, and the downstream units that actually ran it); the `lease` edge
+ * kind surfaces the write-lease coordination (owner vs waiter) on a contested
+ * path. The `escalated` node flag remains reserved for the human escalation
+ * milestone and is always false until the engine surfaces an escalation.
  */
 
 /** The WorkUnit lifecycle status, mirrored from change-core without importing it. */
@@ -83,6 +82,57 @@ export interface CostEventSnapshot {
   readonly at: string;
 }
 
+/**
+ * A recorded agent-built tool, as reported by the state. This is the real
+ * backing for the `tool` node: it names the tool-builder WorkUnit, the real
+ * workspace (Artifact repo) the tool was published into, the capability it
+ * provides, and the file the tool script lives at inside that repo. A tool node
+ * is only emitted when this record is present, so a tool node always maps to a
+ * real tool-builder repo (the no-unbacked-node rule for the new kind).
+ */
+export interface ToolSnapshot {
+  /** The WorkUnit id of the tool-builder agent. */
+  readonly builderUnitId: string;
+  /** The capability the tool provides (e.g. "codemod:validate"). */
+  readonly capability: string;
+  /** The repo-relative path of the published tool script inside its workspace. */
+  readonly toolPath: string;
+  /** The real workspace (Artifact repo) the tool was published into. */
+  readonly workspace: WorkspaceIdentitySnapshot;
+  /** A short, human-readable label for the tool node. */
+  readonly label: string;
+}
+
+/**
+ * A recorded tool-consumption, as reported by the state. This is the real
+ * backing for a `consumed-tool` edge: a downstream WorkUnit actually ran the
+ * tool (not a decorative link). The edge is only emitted when this record is
+ * present, so a consumed-tool edge always maps to a real consumption.
+ */
+export interface ToolConsumptionSnapshot {
+  /** The capability consumed (matches ToolSnapshot.capability). */
+  readonly capability: string;
+  /** The downstream WorkUnit id that ran the tool. */
+  readonly consumerUnitId: string;
+  readonly at: string;
+}
+
+/**
+ * A recorded write-lease coordination on a contested path, as reported by the
+ * state. This is the real backing for a `lease` edge: the owner holds the write
+ * lease on the path and each waiter is ordered to wait for it, so there is one
+ * writer and no silent terminal merge. The edge is only emitted when this record
+ * is present, so a lease edge always maps to a real coordination decision.
+ */
+export interface LeaseEdgeSnapshot {
+  /** The contested path the lease coordinates. */
+  readonly path: string;
+  /** The WorkUnit granted the write lease (the single writer). */
+  readonly owner: string;
+  /** The WorkUnit ids ordered to wait for the owner. */
+  readonly waiters: readonly string[];
+}
+
 /** The min/max concurrency dial currently in force. */
 export interface DialSnapshot {
   readonly minConcurrency: number;
@@ -104,6 +154,22 @@ export interface ChangeStateSnapshot {
   readonly dial?: DialSnapshot;
   readonly recruitments?: readonly RecruitmentEventSnapshot[];
   readonly costEvents?: readonly CostEventSnapshot[];
+  /**
+   * The agent-built tool for this Change, when the work needed a capability the
+   * repo lacked and one was built. Present only when a real tool-builder repo
+   * exists; it is what the `tool` node is backed by.
+   */
+  readonly tool?: ToolSnapshot;
+  /**
+   * The real tool-consumption records: each is a downstream unit that actually
+   * ran the tool. Each becomes one `consumed-tool` edge.
+   */
+  readonly toolConsumptions?: readonly ToolConsumptionSnapshot[];
+  /**
+   * The real write-lease coordination on contested paths: owner vs waiters.
+   * Each becomes `lease` edges surfacing the single-writer coordination.
+   */
+  readonly leaseEdges?: readonly LeaseEdgeSnapshot[];
 }
 
 /** The kind of a node in the rendered graph. */
@@ -111,14 +177,15 @@ export type GraphNodeKind =
   | "goal" // the Change itself: the root the graph self-organizes toward
   | "work" // a declared WorkUnit before an agent is recruited for it
   | "agent" // a WorkUnit an agent has been recruited for (a real repo exists)
-  | "tool"; // RESERVED (agent-for-agent tooling milestone); never emitted yet
+  | "tool"; // an agent-built tool published to its own repo, consumed downstream
 
 /** The kind of an edge in the rendered graph. */
 export type GraphEdgeKind =
   | "dependency" // a declared WorkGraph dependency between two units
   | "data-flow" // a dependency an agent push has made live (data has flowed)
   | "spawn" // an event-driven recruitment: a push recruited the target
-  | "consumed-tool"; // RESERVED (tooling milestone); never emitted yet
+  | "consumed-tool" // a downstream agent actually ran an agent-built tool
+  | "lease"; // a write-lease coordination: owner <- waiter on a contested path
 
 /**
  * The real state element a node is backed by. Every node carries one. There is
@@ -136,6 +203,14 @@ export type NodeBacking =
       readonly kind: "workspace";
       readonly unitId: string;
       readonly workspace: WorkspaceIdentitySnapshot;
+    }
+  | {
+      // A tool node is backed by the real tool-builder repo the tool was
+      // published into, so it can never be a decorative node.
+      readonly kind: "tool";
+      readonly builderUnitId: string;
+      readonly capability: string;
+      readonly workspace: WorkspaceIdentitySnapshot;
     };
 
 /** The real state element an edge is backed by. */
@@ -146,6 +221,21 @@ export type EdgeBacking =
       readonly at: string;
       readonly pushedWorkspace?: string;
       readonly completedUnit?: string;
+    }
+  | {
+      // A consumed-tool edge is backed by a real consumption record (a
+      // downstream unit that actually ran the tool).
+      readonly kind: "tool-consumption";
+      readonly capability: string;
+      readonly consumerUnitId: string;
+      readonly at: string;
+    }
+  | {
+      // A lease edge is backed by a real write-lease coordination decision.
+      readonly kind: "lease";
+      readonly path: string;
+      readonly owner: string;
+      readonly waiter: string;
     };
 
 /** A node in the rendered graph. */
@@ -195,6 +285,11 @@ export function unitNodeId(unitId: string): string {
   return `unit:${unitId}`;
 }
 
+/** The id used for the agent-built tool node (one tool per Change). */
+export function toolNodeId(capability: string): string {
+  return `tool:${capability}`;
+}
+
 /**
  * The honesty guard every node passes through. It verifies the node carries a
  * backing that actually resolves against the snapshot, and throws otherwise. A
@@ -226,6 +321,35 @@ export function assertBacked(node: GraphNode, snapshot: ChangeStateSnapshot): Gr
       if (!unit || !unit.workspace) {
         throw new Error(
           `unbacked node ${node.id}: WorkUnit ${backing.unitId} has no recorded workspace in the state`,
+        );
+      }
+      return node;
+    }
+    case "tool": {
+      // A tool node must map to the real tool record the state reports: its
+      // builder unit must exist, and the tool must have a recorded workspace
+      // (its own Artifact repo) matching the node's backing. A tool node with
+      // no backing tool record, or naming a builder the state does not list, is
+      // exactly the decorative node this rule forbids.
+      if (!snapshot.tool) {
+        throw new Error(
+          `unbacked node ${node.id}: no agent-built tool recorded in the state`,
+        );
+      }
+      if (snapshot.tool.capability !== backing.capability) {
+        throw new Error(
+          `unbacked node ${node.id}: tool capability ${backing.capability} does not match the recorded tool ${snapshot.tool.capability}`,
+        );
+      }
+      const builder = snapshot.work.find((u) => u.id === backing.builderUnitId);
+      if (!builder) {
+        throw new Error(
+          `unbacked node ${node.id}: tool builder ${backing.builderUnitId} is not a WorkUnit in the state`,
+        );
+      }
+      if (!snapshot.tool.workspace || snapshot.tool.workspace.workspaceName !== backing.workspace.workspaceName) {
+        throw new Error(
+          `unbacked node ${node.id}: tool has no recorded builder workspace in the state`,
         );
       }
       return node;
@@ -381,6 +505,91 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
           pushedWorkspace: event.pushedWorkspace,
           completedUnit: event.completedUnit,
         },
+      });
+    }
+  }
+
+  // The agent-built tool node, when the state records one. It is backed by the
+  // real tool-builder repo (its own Artifact repo), so it is never a decorative
+  // node. The builder WorkUnit remains its own agent/work node; the tool node is
+  // the published tool itself, linked to its builder and its consumers.
+  const tool = snapshot.tool;
+  if (tool) {
+    const toolNode: GraphNode = {
+      id: toolNodeId(tool.capability),
+      kind: "tool",
+      label: tool.label,
+      // The tool greens once it is published (its builder repo exists). The
+      // state only reports a tool once it has been built and published, so a
+      // present tool record is a built tool.
+      status: "integrated",
+      verified: true,
+      escalated: false,
+      workspace: tool.workspace,
+      backing: {
+        kind: "tool",
+        builderUnitId: tool.builderUnitId,
+        capability: tool.capability,
+        workspace: tool.workspace,
+      },
+    };
+    nodes.push(assertBacked(toolNode, snapshot));
+
+    // The builder-to-tool edge: the tool was published by its builder. Drawn as
+    // a data-flow edge from the builder unit to the tool, backed by the tool
+    // record (the builder unit is in the work set, which the record guarantees).
+    if (unitIds.has(tool.builderUnitId)) {
+      edges.push({
+        id: `built:${tool.builderUnitId}->${tool.capability}`,
+        kind: "data-flow",
+        from: unitNodeId(tool.builderUnitId),
+        to: toolNodeId(tool.capability),
+        backing: { kind: "dependency", from: tool.builderUnitId, to: tool.capability },
+      });
+    }
+
+    // One consumed-tool edge per real consumption record: a downstream unit that
+    // actually ran the tool. The edge runs from the tool to the consumer, backed
+    // by the real consumption record, so it maps to a genuine use, not a link.
+    for (const consumption of snapshot.toolConsumptions ?? []) {
+      if (consumption.capability !== tool.capability) {
+        continue;
+      }
+      if (!unitIds.has(consumption.consumerUnitId)) {
+        continue;
+      }
+      edges.push({
+        id: `consumed:${tool.capability}->${consumption.consumerUnitId}`,
+        kind: "consumed-tool",
+        from: toolNodeId(tool.capability),
+        to: unitNodeId(consumption.consumerUnitId),
+        backing: {
+          kind: "tool-consumption",
+          capability: consumption.capability,
+          consumerUnitId: consumption.consumerUnitId,
+          at: consumption.at,
+        },
+      });
+    }
+  }
+
+  // Write-lease coordination edges: for each contested path, one edge from each
+  // waiter to the owner, surfacing the single-writer coordination (the waiter
+  // waits for the owner before integrating). Backed by the real lease decision.
+  for (const lease of snapshot.leaseEdges ?? []) {
+    if (!unitIds.has(lease.owner)) {
+      continue;
+    }
+    for (const waiter of lease.waiters) {
+      if (!unitIds.has(waiter)) {
+        continue;
+      }
+      edges.push({
+        id: `lease:${lease.path}:${waiter}->${lease.owner}`,
+        kind: "lease",
+        from: unitNodeId(waiter),
+        to: unitNodeId(lease.owner),
+        backing: { kind: "lease", path: lease.path, owner: lease.owner, waiter },
       });
     }
   }

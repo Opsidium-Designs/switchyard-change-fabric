@@ -5,12 +5,15 @@ import {
   detectPathCollisions,
   normalizeDial,
   parseChangeSpec,
+  planWriteLeases,
   recruit,
   runnableUnits,
   workUnitStatuses,
   type Change,
   type ConcurrencyDial,
   type Dependency,
+  type LeaseDecision,
+  type LeasePlan,
   type PathCollision,
   type RecruitDecision,
   type WorkUnitStatus,
@@ -79,6 +82,39 @@ export interface CostEvent {
   readonly at: string;
 }
 
+/**
+ * The agent-built tool recorded on the Change, when the work needed a capability
+ * the repo lacked and a tool-builder agent published one. It names the builder
+ * WorkUnit, the capability, the published script path, and the real workspace
+ * (Artifact repo) the tool lives in. The console's tool node is backed by this,
+ * so a tool node always maps to a real tool-builder repo.
+ */
+export interface ToolRecord {
+  readonly builderUnitId: string;
+  readonly capability: string;
+  readonly toolPath: string;
+  readonly workspace: WorkspaceIdentity;
+  readonly label: string;
+}
+
+/** A recorded tool-consumption: a downstream unit that actually ran the tool. */
+export interface ToolConsumption {
+  readonly capability: string;
+  readonly consumerUnitId: string;
+  readonly at: string;
+}
+
+/**
+ * A write-lease coordination record for a contested path: the single owner and
+ * the waiters ordered behind it. Projected from the lease plan so the console
+ * surfaces the single-writer coordination as a graph edge.
+ */
+export interface LeaseEdge {
+  readonly path: string;
+  readonly owner: string;
+  readonly waiters: readonly string[];
+}
+
 /** The live, serializable projection of a Change's orchestration state. */
 export interface ChangeStateView {
   readonly id: string;
@@ -99,6 +135,18 @@ export interface ChangeStateView {
   readonly dial: ConcurrencyDial;
   /** The inspectable recruitment-event log (why/what triggered each wave). */
   readonly recruitments: readonly RecruitmentEvent[];
+  /**
+   * The agent-built tool for this Change, when one was built; otherwise absent.
+   * Backs the console's tool node.
+   */
+  readonly tool?: ToolRecord;
+  /** Real tool-consumption records; each backs one consumed-tool edge. */
+  readonly toolConsumptions: readonly ToolConsumption[];
+  /**
+   * The write-lease coordination on contested paths (owner vs waiters). Backs
+   * the console's lease edges and makes the single-writer coordination legible.
+   */
+  readonly leaseEdges: readonly LeaseEdge[];
 }
 
 /** The payload returned when a runner leases a WorkUnit. */
@@ -204,6 +252,16 @@ export class ChangeState extends DurableObject<Env> {
     await this.ctx.storage.put("transitions", [] as Transition[]);
     await this.ctx.storage.put("dial", normalizeDial(undefined));
     await this.ctx.storage.put("recruitments", [] as RecruitmentEvent[]);
+    // Compute and persist the write-lease plan from the Change's declared path
+    // collisions at creation: one owner per contested path, the rest waiters.
+    // This is the first-class lease coordination the DO serves, so a shared path
+    // is resolved to a single writer rather than a silent terminal merge.
+    const leasePlan = planWriteLeases(change, detectPathCollisions(change));
+    await this.ctx.storage.put("leasePlan", leasePlan);
+    // The agent-built tool for this Change (recorded when a tool-builder agent
+    // publishes one), and the downstream consumption records.
+    await this.ctx.storage.put("tool", null);
+    await this.ctx.storage.put("toolConsumptions", [] as ToolConsumption[]);
     // Map from the backend workspace name a runner pushes to back to its unit
     // id, so a repo-pushed event (which carries the workspace, not the unit) can
     // recognize which WorkUnit finished.
@@ -233,6 +291,49 @@ export class ChangeState extends DurableObject<Env> {
   /** The inspectable recruitment-event log (why each wave was recruited). */
   async getRecruitments(): Promise<readonly RecruitmentEvent[]> {
     return this.loadRecruitments();
+  }
+
+  /** The write-lease coordination plan (one owner per contested path). */
+  async getLeasePlan(): Promise<LeasePlan> {
+    return this.loadLeasePlan();
+  }
+
+  /**
+   * Record the agent-built tool published for this Change. The builder unit must
+   * exist in the Change (a tool node is backed by a real builder/workspace), so
+   * recording a tool for an unknown builder is rejected rather than producing a
+   * decorative node.
+   */
+  async recordTool(tool: ToolRecord): Promise<ToolRecord> {
+    const change = await this.loadChange();
+    if (!change.work.some((u) => u.id === tool.builderUnitId)) {
+      throw new Error(`unknown tool builder WorkUnit: ${tool.builderUnitId}`);
+    }
+    await this.ctx.storage.put("tool", tool);
+    return tool;
+  }
+
+  /**
+   * Record that a downstream WorkUnit actually consumed (ran) the agent-built
+   * tool. Rejected if no tool is recorded or the consumer is not a WorkUnit, so
+   * a consumed-tool edge always maps to a real consumption by a real unit.
+   */
+  async recordToolConsumption(
+    consumption: Omit<ToolConsumption, "at">,
+  ): Promise<ToolConsumption> {
+    const change = await this.loadChange();
+    const tool = await this.loadTool();
+    if (!tool) {
+      throw new Error("no agent-built tool recorded for this Change");
+    }
+    if (!change.work.some((u) => u.id === consumption.consumerUnitId)) {
+      throw new Error(`unknown consumer WorkUnit: ${consumption.consumerUnitId}`);
+    }
+    const stored: ToolConsumption = { ...consumption, at: new Date().toISOString() };
+    const list = await this.loadToolConsumptions();
+    list.push(stored);
+    await this.ctx.storage.put("toolConsumptions", list);
+    return stored;
   }
 
   /**
@@ -493,9 +594,14 @@ export class ChangeState extends DurableObject<Env> {
     const dial = await this.loadDial();
     const recruitments = await this.loadRecruitments();
     const workspaces = await this.loadWorkspaces();
+    const leasePlan = await this.loadLeasePlan();
+    const tool = await this.loadTool();
+    const toolConsumptions = await this.loadToolConsumptions();
     const statuses = workUnitStatuses(change, completed);
     const graph = buildWorkGraph(change);
     const collisions = detectPathCollisions(change);
+
+    const leaseEdges = leaseEdgesFromPlan(leasePlan);
 
     const work: WorkUnitView[] = change.work.map((unit) => {
       const base = statuses.get(unit.id) ?? "waiting";
@@ -534,6 +640,9 @@ export class ChangeState extends DurableObject<Env> {
       transitions,
       dial,
       recruitments,
+      ...(tool ? { tool } : {}),
+      toolConsumptions,
+      leaseEdges,
     };
   }
 
@@ -576,4 +685,38 @@ export class ChangeState extends DurableObject<Env> {
   private async loadWorkspaces(): Promise<Record<string, WorkspaceIdentity>> {
     return (await this.ctx.storage.get<Record<string, WorkspaceIdentity>>("workspaces")) ?? {};
   }
+
+  private async loadLeasePlan(): Promise<LeasePlan> {
+    const stored = await this.ctx.storage.get<LeasePlan>("leasePlan");
+    if (stored) {
+      return stored;
+    }
+    // Backfill for a Change created before lease planning existed in state.
+    const change = await this.loadChange();
+    return planWriteLeases(change, detectPathCollisions(change));
+  }
+
+  private async loadTool(): Promise<ToolRecord | null> {
+    return (await this.ctx.storage.get<ToolRecord | null>("tool")) ?? null;
+  }
+
+  private async loadToolConsumptions(): Promise<ToolConsumption[]> {
+    return (await this.ctx.storage.get<ToolConsumption[]>("toolConsumptions")) ?? [];
+  }
+}
+
+/**
+ * Project a LeasePlan into the console's lease-edge shape: one entry per
+ * serialized contested path, naming the single owner and the waiters ordered
+ * behind it. Flagged (unserializable) collisions are omitted because they have
+ * no owner to point a lease edge at; they still appear in the collision list.
+ */
+function leaseEdgesFromPlan(plan: LeasePlan): LeaseEdge[] {
+  const edges: LeaseEdge[] = [];
+  for (const decision of plan.decisions as readonly LeaseDecision[]) {
+    if (decision.resolution === "serialized" && decision.owner !== undefined) {
+      edges.push({ path: decision.path, owner: decision.owner, waiters: decision.waiters });
+    }
+  }
+  return edges;
 }

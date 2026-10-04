@@ -66,3 +66,11 @@ export type {
   RecruitInput,
 } from "./recruit.ts";
 export { DEFAULT_DIAL, normalizeDial, recruit } from "./recruit.ts";
+
+export type { EditKind, ToolNeedOptions, ToolRequirement } from "./toolneed.ts";
+export {
+  capabilityId,
+  defaultEditKindOf,
+  detectToolRequirement,
+  toolUnitId,
+} from "./toolneed.ts";

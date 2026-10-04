@@ -20,12 +20,14 @@ import {
   detectPathCollisions,
   normalizeDial,
   parseChangeSpec,
+  planWriteLeases,
   recruit,
   runnableUnits,
   workUnitStatuses,
   type Change,
   type ConcurrencyDial,
   type Dependency,
+  type LeaseDecision,
   type PathCollision,
   type RecruitDecision,
   type WorkUnitStatus,
@@ -98,6 +100,35 @@ export interface ChangeStateView {
   readonly costEvents: readonly CostEvent[];
   readonly dial: ConcurrencyDial;
   readonly recruitments: readonly RecruitmentEvent[];
+  /** The agent-built tool for this Change, when one was recorded. */
+  readonly tool?: ToolRecord;
+  /** Real tool-consumption records; each backs one consumed-tool edge. */
+  readonly toolConsumptions: readonly ToolConsumption[];
+  /** Write-lease coordination on contested paths (owner vs waiters). */
+  readonly leaseEdges: readonly LeaseEdge[];
+}
+
+/** The agent-built tool recorded on the Change (mirrors the Worker). */
+export interface ToolRecord {
+  readonly builderUnitId: string;
+  readonly capability: string;
+  readonly toolPath: string;
+  readonly workspace: WorkspaceIdentity;
+  readonly label: string;
+}
+
+/** A recorded tool-consumption by a downstream unit (mirrors the Worker). */
+export interface ToolConsumption {
+  readonly capability: string;
+  readonly consumerUnitId: string;
+  readonly at: string;
+}
+
+/** A write-lease coordination record for a contested path (mirrors the Worker). */
+export interface LeaseEdge {
+  readonly path: string;
+  readonly owner: string;
+  readonly waiters: readonly string[];
 }
 
 /** A recruitment plan for one wave in the offline substrate (mirrors the DO). */
@@ -138,6 +169,10 @@ class ChangeRecord {
   readonly recruitments: RecruitmentEvent[] = [];
   /** Backend workspace name -> unit id, so a repo-pushed event resolves a unit. */
   readonly workspaceUnits = new Map<string, string>();
+  /** The agent-built tool recorded for this Change, when one was built. */
+  tool: ToolRecord | null = null;
+  /** Real tool-consumption records (downstream units that ran the tool). */
+  readonly toolConsumptions: ToolConsumption[] = [];
   constructor(change: Change) {
     this.change = change;
   }
@@ -176,6 +211,40 @@ export class LocalChangeControl {
   /** The inspectable recruitment-event log for a Change. */
   recruitments(changeId: string): readonly RecruitmentEvent[] {
     return this.require(changeId).recruitments;
+  }
+
+  /**
+   * Record the agent-built tool published for this Change (mirrors the DO). The
+   * builder unit must exist, so a tool node is backed by a real builder.
+   */
+  recordTool(changeId: string, tool: ToolRecord): ToolRecord {
+    const record = this.require(changeId);
+    if (!record.change.work.some((u) => u.id === tool.builderUnitId)) {
+      throw new Error(`unknown tool builder WorkUnit: ${tool.builderUnitId}`);
+    }
+    record.tool = tool;
+    return tool;
+  }
+
+  /**
+   * Record that a downstream unit actually ran the tool (mirrors the DO). A tool
+   * must be recorded and the consumer must be a WorkUnit, so a consumed-tool
+   * edge always maps to a real consumption.
+   */
+  recordToolConsumption(
+    changeId: string,
+    consumption: Omit<ToolConsumption, "at">,
+  ): ToolConsumption {
+    const record = this.require(changeId);
+    if (!record.tool) {
+      throw new Error("no agent-built tool recorded for this Change");
+    }
+    if (!record.change.work.some((u) => u.id === consumption.consumerUnitId)) {
+      throw new Error(`unknown consumer WorkUnit: ${consumption.consumerUnitId}`);
+    }
+    const stored: ToolConsumption = { ...consumption, at: new Date().toISOString() };
+    record.toolConsumptions.push(stored);
+    return stored;
   }
 
   /**
@@ -272,6 +341,13 @@ export class LocalChangeControl {
     const statuses = workUnitStatuses(change, record.completed);
     const collisions = detectPathCollisions(change);
     const graph = buildWorkGraph(change);
+    const leasePlan = planWriteLeases(change, collisions);
+    const leaseEdges: LeaseEdge[] = [];
+    for (const decision of leasePlan.decisions as readonly LeaseDecision[]) {
+      if (decision.resolution === "serialized" && decision.owner !== undefined) {
+        leaseEdges.push({ path: decision.path, owner: decision.owner, waiters: decision.waiters });
+      }
+    }
     const work: WorkUnitView[] = change.work.map((unit) => {
       const base = statuses.get(unit.id) ?? "waiting";
       const leased = record.leases.has(unit.id);
@@ -312,6 +388,9 @@ export class LocalChangeControl {
       costEvents: record.costEvents,
       dial: record.dial,
       recruitments: record.recruitments,
+      ...(record.tool ? { tool: record.tool } : {}),
+      toolConsumptions: record.toolConsumptions,
+      leaseEdges,
     };
   }
 

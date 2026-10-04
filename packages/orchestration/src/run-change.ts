@@ -31,9 +31,12 @@ import { promisify } from "node:util";
 
 import {
   buildWorkGraph,
+  detectPathCollisions,
   findDependencyCycle,
+  planWriteLeases,
   runnableUnits,
   type Change,
+  type LeasePlan,
 } from "@switchyard-change/change-core";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 import type { WorkspaceRef } from "@switchyard-change/artifact-workspace";
@@ -61,6 +64,7 @@ import {
 } from "@switchyard-change/git-promotion";
 
 import { LocalChangeControl, workspaceNameFor } from "./local-control.ts";
+import { maybeBuildTool, type ToolBuildResult } from "./tool-build.ts";
 
 const run = promisify(execFile);
 
@@ -94,6 +98,17 @@ export interface RunChangeResult {
   readonly cleanup: CleanupResult;
   /** Absolute path to the local source repository the result was promoted into. */
   readonly sourceRepoDir: string;
+  /**
+   * The agent-built tool for this Change, when the work needed a capability the
+   * repo lacked and one was built; otherwise undefined. The tool is built in its
+   * own workspace and genuinely run by downstream consumers.
+   */
+  readonly tool?: ToolBuildResult;
+  /**
+   * The write-lease coordination plan: how each contested path was resolved to a
+   * single owner with the others as waiters (no silent terminal merge).
+   */
+  readonly leasePlan: LeasePlan;
 }
 
 /** Options for runChange. */
@@ -125,6 +140,7 @@ export interface RunChangeOptions {
 /** A progress event emitted during a run, for live console output. */
 export type RunEvent =
   | { readonly kind: "change-created"; readonly change: Change }
+  | { readonly kind: "tool-built"; readonly tool: ToolBuildResult }
   | { readonly kind: "wave-start"; readonly units: readonly string[] }
   | { readonly kind: "unit-done"; readonly report: UnitRunReport }
   | { readonly kind: "verifying" }
@@ -155,6 +171,23 @@ export async function runChange(options: RunChangeOptions): Promise<RunChangeRes
   const cycle = findDependencyCycle(change);
   if (cycle) {
     throw new Error(`Change ${change.id} has a dependency cycle: ${cycle.join(" -> ")}`);
+  }
+
+  // The write-lease coordination plan for this Change's declared path collisions:
+  // one owner per contested path, the others recorded as waiters. This is the
+  // first-class lease decision the Durable Object serves at runtime; here it is
+  // computed once so the result and the summary surface the coordination.
+  const leasePlan = planWriteLeases(change, detectPathCollisions(change));
+
+  // The agent-for-agent tooling moment: if the WORK (not the goal string) needs
+  // a capability the repo lacks, one agent builds a tool in its own workspace
+  // and the downstream agents run it. The trigger is structural, so a layered
+  // Change with distinct units builds no tool and this is undefined.
+  const toolRoot = join(workRoot, "tools");
+  await mkdir(toolRoot, { recursive: true });
+  const tool = await maybeBuildTool({ change, workRoot: toolRoot, workspaces });
+  if (tool) {
+    emit({ kind: "tool-built", tool });
   }
 
   const client = new WorkerClient("http://local-control", control.fetch);
@@ -255,13 +288,29 @@ export async function runChange(options: RunChangeOptions): Promise<RunChangeRes
 
   // 6. Expire the per-WorkUnit and integration workspaces.
   const changeWorkspaces: ChangeWorkspaces = {
-    unitWorkspaces: change.work.map((unit) => {
-      const lease = control.leases(change.id).get(unit.id);
-      if (!lease) {
-        throw new Error(`missing lease for ${unit.id}`);
-      }
-      return lease.ref;
-    }),
+    unitWorkspaces: [
+      ...change.work.map((unit) => {
+        const lease = control.leases(change.id).get(unit.id);
+        if (!lease) {
+          throw new Error(`missing lease for ${unit.id}`);
+        }
+        return lease.ref;
+      }),
+      // The agent-built tool's own workspace is disposable too: expire it with
+      // the rest so no tool repo lingers after delivery.
+      ...(tool
+        ? [
+            {
+              id: tool.workspace.workspaceId,
+              name: tool.workspace.workspaceName,
+              gitUrl: tool.workspace.gitUrl,
+              defaultBranch: tool.workspace.defaultBranch,
+              backend: tool.workspace.backend as WorkspaceRef["backend"],
+              fallback: tool.workspace.fallback,
+            } satisfies WorkspaceRef,
+          ]
+        : []),
+    ],
     integrationWorkspace: integrationRef,
   };
   const cleanup = await cleanupWorkspaces(workspaces, changeWorkspaces);
@@ -282,6 +331,8 @@ export async function runChange(options: RunChangeOptions): Promise<RunChangeRes
     promotion,
     cleanup,
     sourceRepoDir,
+    ...(tool ? { tool } : {}),
+    leasePlan,
   };
 }
 

@@ -121,7 +121,9 @@ function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
     case "spawn":
       return { stroke: "#d2a8ff", dash: "2 5" }; // event-driven recruitment
     case "consumed-tool":
-      return { stroke: "#f0883e", dash: "6 4" }; // RESERVED (tooling milestone)
+      return { stroke: "#f0883e", dash: "6 4" }; // a downstream agent ran the tool
+    case "lease":
+      return { stroke: "#db6d28", dash: "1 4" }; // waiter waits for the lease owner
     case "dependency":
     default:
       return { stroke: "#5a6472" };
@@ -133,6 +135,9 @@ function nodeFill(node: GraphNode): string {
   if (node.escalated) {
     return "#f85149"; // RESERVED escalation highlight (human escalation milestone)
   }
+  if (node.kind === "tool") {
+    return "#9e6a03"; // agent-built tool, published to its own repo
+  }
   if (node.verified) {
     return "#238636"; // greened: evidence landed (verified/integrated)
   }
@@ -141,8 +146,6 @@ function nodeFill(node: GraphNode): string {
       return "#1f6feb";
     case "agent":
       return node.status === "running" ? "#388bfd" : "#30497a";
-    case "tool":
-      return "#9e6a03"; // RESERVED tool node (tooling milestone)
     case "work":
     default:
       return node.status === "running" ? "#388bfd" : "#21262d";

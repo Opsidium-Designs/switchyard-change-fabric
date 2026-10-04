@@ -1,6 +1,6 @@
 import { parseChangeSpec } from "@switchyard-change/change-core";
 
-import type { LeaseWorkspace } from "./change-state.ts";
+import type { LeaseWorkspace, WorkspaceIdentity } from "./change-state.ts";
 import type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 import { selectProvisioner } from "./workspace-provisioner.ts";
 
@@ -262,6 +262,47 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     return json({ dial: plan.dial, ceiling: plan.ceiling, recruited }, 201);
   }
 
+  // Record the agent-built tool published for a Change. A Node tool-builder
+  // (which can run Git) publishes a real codemod repo, then records the tool and
+  // which downstream units consumed it here, so the live console graph can show
+  // the tool node and consumed-tool edges backed by that real state. The Worker
+  // runtime cannot run Git, so building the tool is a Node-side step; recording
+  // it is this control-plane endpoint.
+  const toolMatch = url.pathname.match(/^\/changes\/([^/]+)\/tool$/);
+  if (request.method === "POST" && toolMatch) {
+    const changeId = decodeURIComponent(toolMatch[1] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: ToolBody;
+    try {
+      body = (await request.json()) as ToolBody;
+    } catch {
+      return json({ error: "invalid tool body" }, 400);
+    }
+    if (!body.builderUnitId || !body.capability || !body.workspace) {
+      return json({ error: "tool requires builderUnitId, capability, and workspace" }, 400);
+    }
+    try {
+      const tool = await stub.recordTool({
+        builderUnitId: body.builderUnitId,
+        capability: body.capability,
+        toolPath: body.toolPath ?? "",
+        workspace: body.workspace,
+        label: body.label ?? body.capability,
+      });
+      for (const consumerUnitId of body.consumers ?? []) {
+        await stub
+          .recordToolConsumption({ capability: body.capability, consumerUnitId })
+          .catch(() => {});
+      }
+      return json({ tool }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
   // Ingest a repo-pushed event (the real Artifacts event, or a faked one in a
   // deterministic test). The push a runner makes when it finishes a WorkUnit is
   // the trigger for the next recruitment wave. This path drives recruitment from
@@ -420,6 +461,16 @@ interface DialBody {
   readonly maxConcurrency?: number;
   readonly min?: number;
   readonly max?: number;
+}
+
+/** Body of POST /changes/:id/tool: an agent-built tool and its consumers. */
+interface ToolBody {
+  readonly builderUnitId?: string;
+  readonly capability?: string;
+  readonly toolPath?: string;
+  readonly label?: string;
+  readonly workspace?: WorkspaceIdentity;
+  readonly consumers?: readonly string[];
 }
 
 /** Body of POST /events/repo-pushed. */

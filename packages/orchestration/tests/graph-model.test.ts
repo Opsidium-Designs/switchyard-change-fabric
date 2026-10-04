@@ -205,11 +205,15 @@ describe("M3: the graph is a projection of real ChangeState, not a script", () =
     expect(model.dial).toEqual({ minConcurrency: 1, maxConcurrency: 3 });
   });
 
-  it("reserves the tool node kind and consumed-tool edge kind for later (never emitted yet)", () => {
+  it("emits no tool node or consumed-tool edge when the state records none", () => {
     const model = buildWorkGraphModel(layeredSnapshot());
+    // The layered snapshot records no tool, so no tool node / consumed-tool edge
+    // is emitted (a tool node requires a real tool record; see tool-build.e2e).
     expect(model.nodes.some((n) => n.kind === "tool")).toBe(false);
     expect(model.edges.some((e) => e.kind === "consumed-tool")).toBe(false);
-    // The escalation highlight is reserved too: no node is escalated yet.
+    // No lease coordination recorded, so no lease edge either.
+    expect(model.edges.some((e) => e.kind === "lease")).toBe(false);
+    // The escalation highlight is still reserved: no node is escalated yet.
     expect(model.nodes.some((n) => n.escalated)).toBe(false);
   });
 });

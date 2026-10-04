@@ -21,10 +21,13 @@
 export type {
   ChangeStateView,
   CostEvent,
+  LeaseEdge,
   LeaseRecord,
   RecruitmentEvent,
   RecruitmentPlan,
   RepoPushedResult,
+  ToolConsumption,
+  ToolRecord,
   WorkspaceIdentity,
   WorkUnitView,
 } from "./local-control.ts";
@@ -56,6 +59,17 @@ export type {
 } from "./run-change.ts";
 export { describeChange, runChange } from "./run-change.ts";
 
+export type {
+  BuildToolOptions,
+  ToolBuildResult,
+  ToolConsumptionRecord,
+  ToolWorkspaceIdentity,
+} from "./tool-build.ts";
+export { maybeBuildTool } from "./tool-build.ts";
+
+export type { ToolRequirement } from "@switchyard-change/change-core";
+export { detectToolRequirement } from "@switchyard-change/change-core";
+
 export type { RepoFile, RepoSnapshot } from "@switchyard-change/change-core";
 export { scanRepoFiles, scanRepoSnapshot } from "./scan-repo.ts";
 
@@ -83,14 +97,17 @@ export type {
   GraphEdgeKind,
   GraphNode,
   GraphNodeKind,
+  LeaseEdgeSnapshot,
   NodeBacking,
   RecruitmentEventSnapshot,
+  ToolConsumptionSnapshot,
+  ToolSnapshot,
   WorkGraphModel,
   WorkspaceIdentitySnapshot,
   WorkUnitSnapshot,
   WorkUnitStatus,
 } from "./graph-model.ts";
-export { assertBacked, buildWorkGraphModel, goalNodeId, unitNodeId } from "./graph-model.ts";
+export { assertBacked, buildWorkGraphModel, goalNodeId, toolNodeId, unitNodeId } from "./graph-model.ts";
 
 export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor.ts";
 export { formatDoctorReport, runDoctor } from "./doctor.ts";

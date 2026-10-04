@@ -281,11 +281,13 @@ function Legend() {
       <li><span className="swatch sw-work" /> work unit</li>
       <li><span className="swatch sw-agent" /> recruited agent (real repo)</li>
       <li><span className="swatch sw-verified" /> verified / integrated</li>
-      <li><span className="swatch sw-tool" /> tool (reserved)</li>
+      <li><span className="swatch sw-tool" /> agent-built tool (real repo)</li>
       <li><span className="swatch sw-escalated" /> escalation (reserved)</li>
       <li><span className="line ln-dependency" /> dependency</li>
       <li><span className="line ln-dataflow" /> data flow</li>
       <li><span className="line ln-spawn" /> event-driven spawn</li>
+      <li><span className="line ln-tool" /> consumed tool</li>
+      <li><span className="line ln-lease" /> write-lease (waiter to owner)</li>
     </ul>
   );
 }

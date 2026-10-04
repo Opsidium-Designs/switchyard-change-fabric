@@ -52,10 +52,19 @@ doctor:
 
 # Run the example audit-logging Change end to end, deterministically and
 # offline (noop executor + honest local fallback, no Cloudflare account, no
-# real inference). Prints a readable summary ending in a promoted local Git
-# commit.
+# real inference). It prints a readable summary with the shared-path collision
+# coordinated by a write lease (one owner, no silent merge). Then it runs a
+# second goal whose work needs a repeated edit across many files, so an agent
+# builds a codemod the downstream units run: the agent-for-agent tool-build
+# moment, visible in that run's summary.
 demo:
 	npm -w apps/cli run dev -- run $(CURDIR)/examples/changes/audit-logging.change.yaml
+	@echo ""
+	@echo "=== Agent-for-agent tooling: a goal whose work needs a shared codemod ==="
+	@echo ""
+	npm -w apps/cli run dev -- run-goal \
+	  --goal-file $(CURDIR)/examples/goals/add-input-validation.goal.txt \
+	  --project $(CURDIR)/examples/calc-project
 
 # Decompose a goal against a target project into a WorkGraph and print the plan
 # plus schedule, deterministically and offline (the heuristic analyzer, no live

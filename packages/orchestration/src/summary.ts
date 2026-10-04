@@ -47,6 +47,26 @@ export function formatRunSummary(result: RunChangeResult): string {
   }
   lines.push("");
 
+  // Agent-for-agent tooling: when the work needed a capability the repo lacked,
+  // one agent built a tool the downstream agents ran. Shown here so the
+  // tool-build moment is visible in the run summary.
+  if (result.tool) {
+    const tool = result.tool;
+    const consumers = tool.consumptions.filter((c) => c.changed).map((c) => c.consumerUnitId);
+    lines.push("Agent-for-agent tooling:");
+    lines.push(`  Tool built: ${tool.label} (${tool.capability})`);
+    lines.push(`  Builder:    ${tool.builderUnitId}`);
+    lines.push(`  Published:  ${tool.workspace.workspaceName} [${tool.workspace.backend}]`);
+    lines.push(`  Script:     ${tool.toolPath}`);
+    lines.push(
+      `  Consumed by ${consumers.length} downstream unit(s): ${consumers.join(", ") || "(none)"}`,
+    );
+    lines.push("");
+  } else {
+    lines.push("Agent-for-agent tooling: no missing capability detected (no tool built).");
+    lines.push("");
+  }
+
   // Conflict coordination.
   const coord = result.evidence.coordination;
   if (coord && coord.decisions.length > 0) {

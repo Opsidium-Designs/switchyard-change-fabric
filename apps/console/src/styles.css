@@ -345,6 +345,8 @@ body {
 .ln-dependency { border-top-color: #5a6472; }
 .ln-dataflow { border-top-color: #3fb950; }
 .ln-spawn { border-top-color: #d2a8ff; border-top-style: dashed; }
+.ln-tool { border-top-color: #f0883e; border-top-style: dashed; }
+.ln-lease { border-top-color: #db6d28; border-top-style: dotted; }
 
 /* --- Dial control --- */
 

@@ -110,6 +110,13 @@ const commands: Command[] = [
             case "change-created":
               console.log(`Created Change ${event.change.id}: ${event.change.objective}`);
               break;
+            case "tool-built":
+              console.log(
+                `Agent built a tool: ${event.tool.label} (${event.tool.capability}) in ` +
+                  `${event.tool.workspace.workspaceName}, consumed by ` +
+                  `${event.tool.consumptions.filter((c) => c.changed).length} downstream unit(s)`,
+              );
+              break;
             case "wave-start":
               console.log(`Running WorkUnits: ${event.units.join(", ")}`);
               break;
