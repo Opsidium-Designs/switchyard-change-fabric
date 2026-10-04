@@ -273,8 +273,11 @@ export interface GraphNode {
   /** True once this unit's work is verified/integrated (the node greens). */
   readonly verified: boolean;
   /**
-   * RESERVED for the human escalation milestone. Always false until the engine
-   * surfaces an evidence-unsettled fork; the console highlights it when true.
+   * True while a pending human escalation is attached to this node (an
+   * evidence-unsettled fork the engine surfaced and is waiting on). It is lit
+   * from real escalation state: a unit-scoped pending escalation lights its
+   * unit's node, a change-scoped one lights the goal node, and it clears when a
+   * human decision resolves the escalation. The console highlights it when true.
    */
   readonly escalated: boolean;
   /** The real Artifact repo backing an agent node, when one exists. */
@@ -401,7 +404,9 @@ function isVerified(status: WorkUnitStatus): boolean {
  *   - each WorkUnit is one node: it is an `agent` node (backed by its real
  *     workspace) once a lease has recorded a workspace for it, otherwise a
  *     plain `work` node (backed by the WorkUnit). A node greens when its status
- *     is verified/integrated. The `escalated` flag is reserved (always false).
+ *     is verified/integrated. The `escalated` flag lights from real escalation
+ *     state: a pending human escalation lights its unit's node (or the goal node
+ *     for a change-scoped escalation) and clears when a human decision resolves it.
  *   - every WorkUnit node gets a `dependency` edge from the goal, so the graph
  *     is rooted and nothing floats unattached to the Change it serves;
  *   - each declared dependency edge is a `dependency` edge, promoted to a

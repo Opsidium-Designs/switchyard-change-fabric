@@ -37,15 +37,72 @@ import { GraphView } from "./graph-view";
 
 // The Worker control API runs separately under `wrangler dev`. Override with
 // VITE_WORKER_URL when it is not on the default local port.
+/**
+ * The seeded demo Change spec. The console cannot read repository files, so the
+ * "Start the demo Change" affordance embeds the same seeded audit-logging spec
+ * that `examples/changes/audit-logging.change.yaml` holds (three units, one
+ * dependency, and the deliberate `src/audit/events.ts` collision that drives the
+ * lease and escalation beats). Starting a Change from the UI POSTs this spec to
+ * the Worker, so a fresh clone shows a live graph without hand-POSTing YAML.
+ * A goal-driven start remains the CLI/`make seed-change` path, since
+ * decomposition is a Node-side step that does not run in the browser.
+ */
+const DEMO_CHANGE_SPEC = `id: change-audit-logging
+objective: Add organization-level audit logging
+baseline: HEAD
+budget_usd: 5.00
+assurance: standard
+
+work:
+  - id: model
+    objective: Implement audit event persistence
+    paths:
+      - src/audit/**
+
+  - id: api
+    objective: Add API read endpoints
+    depends_on:
+      - model
+    paths:
+      - src/api/audit/**
+      - src/audit/events.ts
+
+  - id: tests
+    objective: Add audit logging tests
+    paths:
+      - tests/audit/**
+      - src/audit/events.ts
+`;
+
 const WORKER_BASE: string =
   (import.meta.env.VITE_WORKER_URL as string | undefined) ?? "http://127.0.0.1:8787";
 const POLL_MS = 1200;
 
+// The demo Change id. The watch-mode live run uses this STABLE id (not a
+// per-run Date.now id), so the console can auto-load it with no hand-typing.
+const DEFAULT_CHANGE_ID = "change-audit-logging";
+
+/**
+ * The Change id to load on first paint: a `?change=<id>` query param when
+ * present (so a watch-mode run can hand the user a direct link), otherwise the
+ * stable demo id. This is what lets the console auto-load the demo Change
+ * instead of making the user hand-type it.
+ */
+function initialChangeId(): string {
+  if (typeof window !== "undefined") {
+    const fromQuery = new URLSearchParams(window.location.search).get("change");
+    if (fromQuery && fromQuery.trim() !== "") {
+      return fromQuery.trim();
+    }
+  }
+  return DEFAULT_CHANGE_ID;
+}
+
 export function App() {
-  const [changeId, setChangeId] = useState("change-audit-logging");
+  const [changeId, setChangeId] = useState(initialChangeId);
   const [snapshot, setSnapshot] = useState<ChangeStateSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [polling, setPolling] = useState(false);
+  const [polling, setPolling] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [min, setMin] = useState(1);
   const [max, setMax] = useState(3);
@@ -166,6 +223,34 @@ export function App() {
     setBusy(false);
   }, [post, changeId, load]);
 
+  // Start the seeded demo Change: POST the embedded spec to the Worker (the same
+  // spec examples/changes/audit-logging.change.yaml holds), then load it. This
+  // is the create-a-Change affordance: a fresh clone shows a live graph without
+  // hand-POSTing YAML. It is idempotent on the Worker side (re-creating an
+  // existing Change id just returns its state), so pressing it twice is safe.
+  const startDemoChange = useCallback(async () => {
+    setBusy(true);
+    try {
+      const res = await fetch(`${WORKER_BASE}/changes`, {
+        method: "POST",
+        headers: { "content-type": "text/plain" },
+        body: DEMO_CHANGE_SPEC,
+      });
+      if (res.ok) {
+        setChangeId(DEFAULT_CHANGE_ID);
+        setNotice(`started Change ${DEFAULT_CHANGE_ID}; recruit a wave to populate it`);
+        setPolling(true);
+        await load(DEFAULT_CHANGE_ID);
+      } else {
+        const parsed = (await res.json().catch(() => ({}))) as { error?: string };
+        setNotice(parsed.error ?? `could not start the Change (${res.status})`);
+      }
+    } catch {
+      setNotice(`cannot reach the Worker at ${WORKER_BASE}`);
+    }
+    setBusy(false);
+  }, [load]);
+
   return (
     <main className="app-shell">
       <header className="app-header">
@@ -197,7 +282,22 @@ export function App() {
           >
             {polling ? "Pause polling" : "Resume polling"}
           </button>
+          <button
+            type="button"
+            className="secondary"
+            onClick={() => void startDemoChange()}
+            disabled={busy}
+            title="POST the seeded audit-logging Change to the Worker and load it"
+          >
+            Start the demo Change
+          </button>
         </form>
+        <p className="muted">
+          No Change yet? Press <strong>Start the demo Change</strong> to seed the
+          example audit-logging Change into the Worker, then <strong>Recruit
+          wave</strong> below to watch the graph populate. (A goal-driven start is
+          the CLI / <code>make seed-change</code> path.)
+        </p>
         {error ? <p className="error">{error}</p> : null}
         {notice ? <p className="notice">{notice}</p> : null}
       </section>

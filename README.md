@@ -134,18 +134,25 @@ a living work graph. Bring up the Worker and the console together:
 make dev-all     # Worker under wrangler dev + the console (Vite)
 ```
 
-Then open the console, enter a Change id, and press Load. It polls the Worker's
+Then open the console. It auto-loads a Change on first paint: the demo Change id
+(`change-audit-logging`) by default, or whatever `?change=<id>` the URL carries,
+so you do not hand-type an id. If no Change exists yet, press **Start the demo
+Change** to seed the example audit-logging Change into the Worker (the
+create-a-Change affordance; a goal-driven start is the CLI / `make seed-change`
+path), then **Recruit wave** to watch the graph populate. It polls the Worker's
 live state endpoint and renders the graph:
 
-- Nodes are the goal, the work-graph units, and recruited agents. A unit becomes
-  an agent node once the engine recruits it (a workspace is recorded for it), and
-  a node greens as its work is verified or integrated. Tool nodes and the
-  escalation highlight are typed hooks reserved for later milestones and are not
-  drawn yet.
+- Nodes are the goal, the work-graph units, recruited agents, and agent-built
+  tools. A unit becomes an agent node once the engine recruits it (a workspace is
+  recorded for it), a node greens as its work is verified or integrated, a tool
+  node appears when an agent builds and publishes a tool, and a node lights up
+  when a pending human escalation is attached to it. Node labels sit beside/below
+  each node so they stay legible rather than being crammed inside the circle.
 - Edges are dependency edges, data-flow edges (a dependency whose prerequisite is
-  complete, so data has flowed), and event-driven spawn edges (a real repo-pushed
-  event recruited the target). A consumed-tool edge kind is typed and reserved for
-  later.
+  complete, so data has flowed), event-driven spawn edges (a real repo-pushed
+  event recruited the target), consumed-tool edges (a downstream agent ran an
+  agent-built tool), and write-lease edges (a waiter ordered behind the single
+  write-lease owner on a contested path).
 - Every node and edge is a projection of real durable state read from the Worker.
   The graph is built by one pure function (`buildWorkGraphModel`) that routes
   every node through a backing guard, so a node with no backing state cannot be
@@ -210,6 +217,27 @@ decomposition is deterministic and offline by default (a heuristic goal analyzer
 no live inference), so it runs in `make check`. An inference-backed analyzer can
 be injected without changing the decomposer; it must return the same intent
 shape, so determinism is preserved wherever the heuristic default is used.
+
+### The anti-puppet demonstration
+
+The point of a goal-agnostic engine is that two structurally different goals run
+through the SAME code path and produce two different graphs, with no per-goal
+scripting. Prove it in one command:
+
+```bash
+make anti-puppet
+```
+
+It decomposes goal A (audit logging) against the layered `demo-project` and goal
+B (input validation on every exported function) against the flat `calc-project`,
+and prints both WorkGraphs. Goal A comes out LAYERED (module units plus a
+dependent tests unit, with dependency edges); goal B comes out a FLAT fan-out
+(one unit per source file, no edges). Same `decompose` call, two shapes, derived
+from how each goal's features interact with each repo's structure. The engine
+never branches on the goal string and holds no table keyed on known goals; the
+`decompose` tests pin exactly that (same features yield the same shape, swapping
+the repo while holding the goal changes the result, and a wholly novel goal
+string still decomposes sensibly).
 
 ## The durable run loop
 
@@ -421,15 +449,63 @@ repository metadata field `last_push_at` is eventually consistent and may still
 read `null` for a short window right after a push, so treat a fresh clone (not
 that field) as the proof that content landed.
 
-### 6. (Optional) Deploy the Worker
+### 6. Watch the live run morph the graph
 
-Running locally with `wrangler dev` is enough to use real Artifacts. If you want
-the Worker itself hosted on Cloudflare:
+The full live headline run (`run-live`) decomposes a goal, recruits real agents
+into real Artifact repos, drives event-driven waves, runs the human escalation
+beat, verifies, integrates, promotes to local Git, and cleans up. A plain
+`run-live` is fast and tears its repos down on the way out, which is right for a
+scripted run but too quick to watch. For a watchable demo, use watch mode:
 
 ```bash
-npx wrangler deploy        # from apps/worker, or: npm -w apps/worker run deploy
+make dev-all        # Worker + console (another terminal)
+make run-live-watch # seeded audit Change, STABLE id, LEAVES repos up at the end
 ```
 
-A production deploy is **not** required to try the project.
+`make run-live-watch` differs from `run-live` in three ways that make it
+watchable:
+
+- it uses the **seeded audit-logging Change** (which has the hardcoded
+  `src/audit/events.ts` collision between `api` and `tests`), so the **human
+  escalation beat fires every time** rather than depending on whether a free-text
+  goal happens to collide;
+- it uses a **stable, predictable Change id** (`change-audit-logging`, not a
+  per-run id), and the console **auto-loads that id**, so you just open the
+  console and watch;
+- it **pauses before cleanup** (`--watch` / `--no-cleanup`): the real Artifact
+  repos and the Change state are left in place at the end so you can study the
+  finished graph. Nothing is torn down mid-run in either mode.
+
+When you are done watching, tear the real repos down:
+
+```bash
+make clean-live     # archives the real Artifact repos the watch run left up
+```
+
+To seed a Change into a running Worker without the full run (so the console shows
+a live graph you can then recruit into), use `make seed-change` or the console's
+**Start the demo Change** button.
+
+### 7. (Optional) Deploy the Worker and prove the queued event hop
+
+Running locally with `wrangler dev` is enough to use real Artifacts, and a
+production deploy is **not** required to try the project. Deploy only if you want
+the Worker itself hosted on Cloudflare, which is also what lets the real
+`repo.pushed` -> Queue -> consumer hop be proven end to end (under `wrangler dev`
+the Worker consumes a local queue simulation, so a remote subscription cannot
+reach it).
+
+```bash
+npx wrangler queues create switchyard-change-fabric-repo-pushed   # once, if absent
+make deploy             # wrangler deploy (prints the deployed Worker URL)
+make artifacts-subscribe # provision the Artifacts repo.pushed -> Queue subscription
+```
+
+With the Worker deployed and the subscription provisioned, a real push to a live
+Artifact repo emits a real `repo.pushed` event that the deployed Queue consumer
+receives and turns into the next recruitment wave, with no use of the HTTP
+ingress. [`docs/EVENT-SUBSCRIPTION.md`](docs/EVENT-SUBSCRIPTION.md) documents the
+two delivery paths, the exact proof, and the teardown commands
+(`cd apps/worker && npx wrangler delete`).
 
 Apache-2.0. See [LICENSE](./LICENSE).

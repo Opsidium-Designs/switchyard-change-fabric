@@ -172,6 +172,17 @@ export interface RunFullLiveOptions {
    * the full chain (but then `waited` reports the auto path honestly).
    */
   readonly resolveEscalation?: EscalationResolver;
+  /**
+   * When true, leave the real Artifact repos and the Change state in place
+   * after the run instead of archiving them, so a human can watch the finished
+   * graph morph in the console before tearing it down. The result still lists
+   * the workspaces it created (as `workspaces`), and `cleanedUp` is empty; a
+   * separate cleanup command (`switchyard-change cleanup-live`) removes them
+   * when the watcher is done. The per-unit repos are also never torn down
+   * mid-run (cleanup only ever runs at the very end), so watch mode simply
+   * skips that final step.
+   */
+  readonly skipCleanup?: boolean;
   /** An injectable fetch for tests; defaults to the global fetch. */
   readonly fetchFn?: typeof fetch;
   /** Optional progress sink for human-readable console output. */
@@ -376,10 +387,18 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   );
 
   // 7. Clean up the real Artifact repos the run created (and the local
-  // integration repo). Only now, after the whole chain ran against them.
+  // integration repo). Only now, after the whole chain ran against them. In
+  // watch mode (skipCleanup) this final step is skipped so a human can watch the
+  // finished graph in the console; the repos are torn down later by the separate
+  // cleanup-live command. Note cleanup ONLY ever runs here, at the very end, so
+  // the per-unit repos are never torn down mid-run in either mode.
   const completedState = await getJson(`/changes/${encodeURIComponent(changeId)}`);
-  const cleanedUp = await cleanup(base, fetchFn, [...allWorkspaces]);
-  await integrationProvider.archive(integrationRef).catch(() => {});
+  const cleanedUp = options.skipCleanup
+    ? []
+    : await cleanup(base, fetchFn, [...allWorkspaces]);
+  if (!options.skipCleanup) {
+    await integrationProvider.archive(integrationRef).catch(() => {});
+  }
   emit({ kind: "cleaned-up", archived: cleanedUp });
 
   return {
@@ -604,6 +623,47 @@ async function cleanup(
     }
   }
   return archived.sort();
+}
+
+/** The outcome of a watch-mode cleanup pass. */
+export interface CleanupLiveResult {
+  readonly changeId: string;
+  readonly workerUrl: string;
+  /** The workspace (Artifact repo) names the Change recorded. */
+  readonly workspaces: readonly string[];
+  /** The workspace names actually archived (deleted). */
+  readonly archived: readonly string[];
+}
+
+/**
+ * Tear down the real Artifact repos a watch-mode run left in place. It reads the
+ * Change's live state from the Worker, collects every recorded workspace, and
+ * archives each through the Worker's archive path. This is the human-triggered
+ * cleanup the `--watch` / `--no-cleanup` run defers to, so a watcher can study
+ * the finished graph in the console first and then remove the repos on demand.
+ */
+export async function cleanupLive(options: {
+  readonly changeId: string;
+  readonly workerUrl: string;
+  readonly fetchFn?: typeof fetch;
+}): Promise<CleanupLiveResult> {
+  const fetchFn = options.fetchFn ?? fetch;
+  const base = options.workerUrl.replace(/\/$/, "");
+  const res = await fetchFn(`${base}/changes/${encodeURIComponent(options.changeId)}`);
+  if (res.status >= 400) {
+    const text = await res.text();
+    const detail = (safeJson(text) as { error?: string }).error ?? `HTTP ${res.status}`;
+    throw new Error(`cannot read Change ${options.changeId}: ${detail}`);
+  }
+  const state = (safeJson(await res.text()) as {
+    work?: ReadonlyArray<{ workspace?: { workspaceName?: string } }>;
+  });
+  const workspaces = (state.work ?? [])
+    .map((u) => u.workspace?.workspaceName)
+    .filter((n): n is string => typeof n === "string" && n !== "")
+    .sort();
+  const archived = await cleanup(base, fetchFn, workspaces);
+  return { changeId: options.changeId, workerUrl: base, workspaces, archived };
 }
 
 function safeJson(text: string): unknown {

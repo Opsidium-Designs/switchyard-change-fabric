@@ -56,6 +56,7 @@ export type {
 export { runRecruitmentLive } from "./recruit-live.ts";
 
 export type {
+  CleanupLiveResult,
   EscalationReport,
   EscalationResolution,
   EscalationResolver,
@@ -63,7 +64,7 @@ export type {
   RunFullLiveOptions,
   RunFullLiveResult,
 } from "./run-live.ts";
-export { runFullLive } from "./run-live.ts";
+export { cleanupLive, runFullLive } from "./run-live.ts";
 
 export type {
   RunChangeOptions,

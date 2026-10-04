@@ -21,6 +21,7 @@ import { dirname, resolve } from "node:path";
 
 import {
   changeToSpecYaml,
+  cleanupLive,
   decomposeGoal,
   describeChange,
   formatChangePlan,
@@ -294,7 +295,7 @@ const commands: Command[] = [
     name: "run-live",
     summary:
       "Full live run: decompose -> recruit real agents (Workers AI) -> escalate -> verify -> integrate -> promote -> cleanup.",
-    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>]`,
+    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--watch]`,
     async run(args) {
       const change = await resolveChange(args);
       if (!change) {
@@ -312,6 +313,13 @@ const commands: Command[] = [
       const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
       const dial = dialFromArgs(args);
 
+      // Watch mode: leave the real Artifact repos and the Change state in place
+      // after the run so a human can watch the finished graph morph in the
+      // console, and use a STABLE, predictable Change id (not a per-run Date.now
+      // id) so the console can auto-load it without the human hand-typing it.
+      // A normal (non-watch) run keeps the unique per-run id and cleans up.
+      const watch = hasFlag(args, "--watch") || hasFlag(args, "--no-cleanup");
+
       // Select the executor from the environment (.env). workers-ai is the live
       // inference path; anything else is the deterministic noop. The credential
       // is read inside selectExecutor and never printed here.
@@ -323,12 +331,13 @@ const commands: Command[] = [
         return 1;
       }
 
-      // Give each live run a unique Change id so real Artifact repo names never
-      // collide with a prior run's just-deleted repos (deletion is eventually
-      // consistent). A fresh id per run side-steps that without weakening
-      // per-unit isolation.
+      // Normal runs give each live run a unique Change id so real Artifact repo
+      // names never collide with a prior run's just-deleted repos (deletion is
+      // eventually consistent). Watch mode uses the STABLE id so the console
+      // auto-loads it; it is the caller's job to run cleanup-live between watch
+      // runs (the command tears the repos down and frees the stable name).
       const runId = Date.now().toString(36);
-      const liveChange: Change = { ...change, id: `${change.id}-${runId}` };
+      const liveChange: Change = watch ? change : { ...change, id: `${change.id}-${runId}` };
 
       // The human escalation resolver. A real human chooses the lease owner for
       // a contested path; --owner / --decision supplies that non-interactively
@@ -356,6 +365,7 @@ const commands: Command[] = [
         projectDir,
         executor: selected.executor,
         resolveEscalation,
+        skipCleanup: watch,
         onEvent: (event) => {
           switch (event.kind) {
             case "change-created":
@@ -412,7 +422,34 @@ const commands: Command[] = [
         console.log("  promoted: nothing to promote (no changes)");
       }
       console.log(`  cleaned up repos: ${result.cleanedUp.join(", ") || "(none)"}`);
+      if (watch) {
+        console.log("");
+        console.log("Watch mode: the real Artifact repos and Change state are LEFT in place.");
+        console.log(`  open the console and it auto-loads this Change:`);
+        console.log(`    ?change=${encodeURIComponent(result.changeId)}  (the console also defaults to it)`);
+        console.log(`  when done watching, tear the real repos down with:`);
+        console.log(`    make clean-live   (or: ${CLI_NAME} cleanup-live --change-id ${result.changeId} --worker ${result.workerUrl})`);
+      }
       return result.promotion.committed && result.completed.length === change.work.length ? 0 : 1;
+    },
+  },
+  {
+    name: "cleanup-live",
+    summary: "Tear down the real Artifact repos a watch-mode run left in place.",
+    usage: `${CLI_NAME} cleanup-live --change-id <id> [--worker <url>]`,
+    async run(args) {
+      const changeId = optionValue(args, "--change-id") ?? optionValue(args, "--change");
+      if (!changeId) {
+        console.error(`Usage: ${CLI_NAME} cleanup-live --change-id <id> [--worker <url>]`);
+        return 1;
+      }
+      const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
+      const result = await cleanupLive({ changeId, workerUrl });
+      console.log(`Cleaning up Change ${result.changeId} on ${result.workerUrl}`);
+      console.log(`  recorded repos: ${result.workspaces.join(", ") || "(none)"}`);
+      console.log(`  archived repos: ${result.archived.join(", ") || "(none)"}`);
+      // A clean teardown archived every recorded repo.
+      return result.archived.length === result.workspaces.length ? 0 : 1;
     },
   },
   {
@@ -465,6 +502,11 @@ function optionValue(args: readonly string[], flag: string): string | undefined 
     return undefined;
   }
   return args[index + 1];
+}
+
+/** True when a boolean flag like --watch is present in the args. */
+function hasFlag(args: readonly string[], flag: string): boolean {
+  return args.includes(flag);
 }
 
 /**

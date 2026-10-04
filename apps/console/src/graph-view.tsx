@@ -25,11 +25,13 @@ import { goalNodeId } from "@switchyard-change/orchestration/graph-model";
  * fades in where its layer puts it.
  */
 
-const WIDTH = 900;
-const LAYER_HEIGHT = 150;
-const TOP_MARGIN = 70;
-const NODE_RADIUS = 26;
-const GOAL_RADIUS = 34;
+const WIDTH = 960;
+const LAYER_HEIGHT = 170;
+const TOP_MARGIN = 80;
+const NODE_RADIUS = 24;
+const GOAL_RADIUS = 32;
+/** Vertical gap between a node's circle edge and its label row (outside it). */
+const LABEL_GAP = 10;
 
 interface Placed {
   readonly node: GraphNode;
@@ -247,10 +249,22 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                 stroke={selected ? "#e6edf3" : "#0d1117"}
                 strokeWidth={selected ? 3 : 1.5}
               />
-              <text className="node-label" textAnchor="middle" dy="0.35em">
-                {node.label.length > 10 ? `${node.label.slice(0, 9)}...` : node.label}
+              {/* Labels sit OUTSIDE the circle, below it, so they are legible
+                  and never crammed inside the small node. The full label is
+                  shown (not truncated into the circle); the kind is a smaller
+                  caption line beneath it. */}
+              <text
+                className="node-label"
+                textAnchor="middle"
+                y={r + LABEL_GAP + 11}
+              >
+                {node.label}
               </text>
-              <text className="node-kind" textAnchor="middle" dy={r + 14}>
+              <text
+                className="node-kind"
+                textAnchor="middle"
+                y={r + LABEL_GAP + 24}
+              >
                 {node.kind}
               </text>
               <title>{`${node.label} [${node.kind}] status=${node.status}`}</title>

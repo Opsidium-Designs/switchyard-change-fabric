@@ -86,30 +86,65 @@ consumer reads it from there (falling back to flat `workspace`/`repo` fields for
 hand-posted or test event), maps it back to its Change by the `<changeId>--<unitId>`
 naming, and drives the next recruitment wave.
 
-## Honest status (open beta): what is proven and what is not
+## Honest status (open beta): what is proven
 
 Proven live against the account:
 
 - The Queue is created, the `artifacts` namespace-level `repo.pushed` event
   subscription is created against it, and real pushes to Artifact repos DO
-  deliver real `cf.artifacts.repo.pushed` messages to that Queue (verified by
-  attaching a temporary HTTP pull consumer and reading the delivered messages,
-  each carrying the real commit SHA an agent pushed and the subscription id).
+  deliver real `cf.artifacts.repo.pushed` messages to that Queue.
+- End to end through the DEPLOYED consumer: with the Worker deployed to
+  Cloudflare (`make deploy` / `wrangler deploy`) so its real Queue consumer runs
+  in Cloudflare, a real push to a live Artifact repo drives the next recruitment
+  wave through the queued event, with NO use of the `POST /events/repo-pushed`
+  ingress. A reproducible proof: create a two-unit Change where unit `b` depends
+  on unit `a` on the deployed Worker, kick off recruitment (recruits only `a`),
+  then clone `a`'s real Artifact repo and push to it. The push emits a real
+  `repo.pushed` event; the deployed Queue consumer receives it and recruits `b`,
+  recorded in the Change state as a `repo-pushed` recruitment event. Because the
+  ingress was never called, the deployed consumer reacting to the real queued
+  event is the only path that could have recruited `b`.
 
-Not yet proven, and why:
+  Observed on the deployed Worker
+  `https://switchyard-change-fabric.ckinney.workers.dev`: the next wave appeared
+  within about ten seconds of the push, with the state recording
+  `recruitments = [ (kickoff, [a]), (repo-pushed, [b]) ]`.
 
-- A full push-to-wave through the queue requires the Worker's `queue()` consumer
-  to actually receive the message. Under `wrangler dev` the Worker runs locally
-  and consumes a LOCAL queue simulation, so a remote event subscription delivering
-  to the remote Queue does not reach the local-dev consumer. Driving the next wave
-  from the real queued message therefore needs the Worker DEPLOYED (`wrangler
-  deploy`) so its real Queue consumer runs in Cloudflare. The code path is wired
-  and the delivery is proven; the deployed consume-and-recruit leg is the piece a
-  deploy would close.
-- Earlier the source type `artifacts.repository` was rejected; the valid
-  discriminators the API returned are `artifacts` and `artifacts.repo`. The script
-  uses `artifacts`.
+### Earlier rough edges (resolved)
 
-In the meantime the HTTP ingress path (`POST /events/repo-pushed`) drives the
-identical downstream handler, so the engine runs end to end during a live run
-regardless of the deploy state.
+- Under `wrangler dev` the Worker runs locally and consumes a LOCAL queue
+  simulation, so a remote event subscription delivering to the remote Queue does
+  not reach the local-dev consumer. Driving the next wave from the real queued
+  message therefore needs the Worker DEPLOYED, which is now done and proven above.
+- The source type `artifacts.repository` was rejected; the valid discriminators
+  the API returns are `artifacts` and `artifacts.repo`. The script uses
+  `artifacts`.
+
+The HTTP ingress path (`POST /events/repo-pushed`) still drives the identical
+downstream handler, so the offline test substrate and a run on an account without
+a provisioned subscription both exercise the same recruitment logic.
+
+## Deploying and tearing down the Worker
+
+```bash
+# Deploy the single Worker (Artifacts + AI bindings + the repo-pushed Queue
+# consumer). The queue must exist first; create it once if needed.
+npx wrangler queues create switchyard-change-fabric-repo-pushed   # once, if absent
+make deploy                                                        # wrangler deploy
+
+# Provision the Artifacts repo.pushed -> Queue subscription (once).
+make artifacts-subscribe
+
+# Tear the deployed Worker down when you are finished.
+cd apps/worker && npx wrangler delete
+
+# (Optional) remove the subscription and the queue too.
+#   list:   curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+#             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/event_subscriptions/subscriptions"
+#   delete: DELETE the same path with the subscription id appended.
+#   queue:  npx wrangler queues delete switchyard-change-fabric-repo-pushed
+```
+
+A production deploy is not required to try the project: the offline `make demo`
+and the local `wrangler dev` path both run without it. The deploy exists so the
+real `repo.pushed` -> Queue -> consumer hop can be proven end to end.

@@ -285,17 +285,27 @@ body {
 
 .node-label {
   fill: #e6edf3;
-  font-size: 0.72rem;
+  font-size: 0.8rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   pointer-events: none;
+  /* A dark halo keeps the label legible where it sits over an edge or another
+     node's neighbourhood, since labels now render outside the circles. */
+  paint-order: stroke;
+  stroke: #0a0e14;
+  stroke-width: 3px;
+  stroke-linejoin: round;
 }
 
 .node-kind {
   fill: var(--muted);
-  font-size: 0.6rem;
+  font-size: 0.62rem;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   pointer-events: none;
+  paint-order: stroke;
+  stroke: #0a0e14;
+  stroke-width: 3px;
+  stroke-linejoin: round;
 }
 
 .edge {

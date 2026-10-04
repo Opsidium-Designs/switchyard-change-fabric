@@ -9,6 +9,11 @@
 #   make cli ARGS="doctor"   run the switchyard-change CLI
 #   make doctor    run the readiness check (switchyard-change doctor)
 #   make demo      run the example audit-logging Change end to end (offline)
+#   make anti-puppet   run two different goals through one engine (offline)
+#   make run-live-watch  watchable live run: stable id, escalation fires, repos left up
+#   make clean-live  tear down the real repos a watch run left up
+#   make seed-change seed the demo Change into a running Worker (for the console)
+#   make deploy    deploy the Worker to Cloudflare (wrangler deploy)
 #   make build     build every workspace
 #   make typecheck typecheck every workspace
 #   make test      run every workspace's tests
@@ -16,7 +21,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live artifacts-subscribe build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch clean-live seed-change anti-puppet deploy artifacts-subscribe build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -129,6 +134,69 @@ run-live:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- run-live "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" \
 	  --min $(MIN) --max $(MAX) $(if $(OWNER),--owner $(OWNER),)
+
+# The watchable live headline run. It uses the seeded audit-logging Change (which
+# has the hardcoded src/audit/events.ts collision), so the human escalation beat
+# fires EVERY time, and it runs in watch mode: a STABLE Change id
+# (change-audit-logging, not a per-run id), and it LEAVES the real Artifact repos
+# and the Change state in place at the end so you can watch the finished graph in
+# the console (which auto-loads that id). Start the Worker and console first with
+# `make dev-all`, run this, then open the console. Tear the real repos down with
+# `make clean-live` when you are done watching.
+AUDIT_CHANGE = $(CURDIR)/examples/changes/audit-logging.change.yaml
+DEMO_PROJECT = $(CURDIR)/examples/demo-project
+CHANGE_ID ?= change-audit-logging
+
+run-live-watch:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	npm -w apps/cli run dev -- run-live --change "$(AUDIT_CHANGE)" --project "$(DEMO_PROJECT)" \
+	  --worker "$(WORKER)" --min $(MIN) --max $(MAX) --watch $(if $(OWNER),--owner $(OWNER),)
+
+# Tear down the real Artifact repos a watch-mode run (make run-live-watch) left
+# in place, through the running Worker. Override CHANGE_ID if you watched a
+# different Change id.
+clean-live:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	npm -w apps/cli run dev -- cleanup-live --change-id "$(CHANGE_ID)" --worker "$(WORKER)"
+
+# Seed the example audit-logging Change into a running Worker so the console
+# shows a live graph without hand-POSTing YAML (the create-a-Change path for the
+# clone-and-run story). Start the Worker first with `make dev` or `make dev-all`.
+# The console's "Start the demo Change" button does the same from the UI.
+seed-change:
+	curl -s -X POST -H "content-type: text/plain" \
+	  --data-binary @"$(AUDIT_CHANGE)" "$(WORKER)/changes" >/dev/null \
+	  && echo "Seeded Change change-audit-logging into $(WORKER). Open the console (it auto-loads it)."
+
+# The anti-puppet demonstration: run TWO structurally different goals through the
+# SAME decomposer engine, with NO per-goal scripting, and show the two different
+# WorkGraphs side by side. Goal A (audit logging) decomposes against the layered
+# demo-project into a LAYERED graph with dependency edges; goal B (input
+# validation on every exported function) decomposes against the flat calc-project
+# into a FLAT fan-out with no edges. Same `decompose` code path, two shapes,
+# derived from (goal features x repo structure). Offline and deterministic.
+anti-puppet:
+	@echo "=== Goal A: audit logging (layered: dependency edges) ==="
+	@echo ""
+	npm -w apps/cli run dev -- decompose \
+	  --goal-file $(CURDIR)/examples/goals/audit-logging.goal.txt \
+	  --project $(CURDIR)/examples/demo-project
+	@echo ""
+	@echo "=== Goal B: input validation on every exported function (flat fan-out: no edges) ==="
+	@echo ""
+	npm -w apps/cli run dev -- decompose \
+	  --goal-file $(CURDIR)/examples/goals/add-input-validation.goal.txt \
+	  --project $(CURDIR)/examples/calc-project
+
+# Deploy the Worker to Cloudflare (wrangler deploy). This is the single hosted
+# Worker with the Artifacts + AI bindings and the repo-pushed Queue consumer, so
+# a real Artifacts event subscription can deliver repo.pushed events to the
+# deployed consumer. Authenticate first (wrangler login, or a scoped
+# CLOUDFLARE_API_TOKEN in .env). Tear it down with `npx wrangler delete` from
+# apps/worker. See docs/EVENT-SUBSCRIPTION.md.
+deploy:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	npm -w apps/worker run deploy
 
 # Provision the Artifacts event subscription that delivers repo-pushed events to
 # the Worker's Queue consumer, against the live account. This is the real
