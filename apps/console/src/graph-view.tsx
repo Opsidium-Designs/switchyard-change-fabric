@@ -250,6 +250,12 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
   // the SVG-space point under the pointer fixed as the scale changes.
   const onWheel = useCallback(
     (event: React.WheelEvent<SVGSVGElement>) => {
+      // Zoom is gated behind the ctrl (or cmd) key: a plain wheel scrolls the
+      // page as normal, and ctrl/cmd + wheel zooms the graph. Without the
+      // modifier we do not preventDefault, so page scrolling is never hijacked.
+      if (!event.ctrlKey && !event.metaKey) {
+        return;
+      }
       event.preventDefault();
       const { x, y } = clientToSvg(event.clientX, event.clientY);
       setView((prev) => {
@@ -346,6 +352,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
         >
           Reset view
         </button>
+        <span className="graph-hint muted">ctrl + scroll to zoom, drag to pan</span>
       </div>
       <svg
         ref={svgRef}
