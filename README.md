@@ -135,39 +135,114 @@ The seeded example lives in two files:
 - [`examples/demo-project/`](examples/demo-project/README.md): the small
   standalone TypeScript service the Change targets.
 
-## Demo script (a 5 to 10 minute walkthrough)
+## Running against real Cloudflare Artifacts
 
-Everything below runs offline and deterministically.
+The offline demo above never touches the network. To run the same flow against
+**real Cloudflare Artifacts** (isolated remote Git repos per WorkUnit, with
+short-lived scoped credentials), set up Cloudflare once and then start the Worker
+locally with the Artifacts binding pointed at the real service.
 
-1. **Show readiness.** `make doctor`. It reports Node and Git as present
-   (required), wrangler and Cloudflare auth best-effort (optional), and that the
-   deterministic `noop` executor is always available. Point out that the offline
-   demo needs no Cloudflare account.
-2. **Show the plan.** `make cli ARGS="status examples/changes/audit-logging.change.yaml"`.
-   Walk through the three WorkUnits, the `api -> model` dependency, and the
-   declared `src/audit/events.ts` collision between `api` and `tests`. Highlight
-   the schedule: `model` and `tests` are runnable at once; `api` waits for
-   `model`.
-3. **Run it end to end.** `make demo`. As it runs, call out the stages in the
-   summary:
-   - **WorkUnits** scheduled in waves (`model` and `tests` concurrently, then
-     `api`), each in its own isolated local-fallback workspace;
-   - **Conflict coordination**: the `src/audit/events.ts` collision is resolved
-     by granting a single write lease to `api`, with `tests` recorded as a
-     waiter, so there is one writer and no silent merge;
-   - **Verification + integration**: every WorkUnit verifies and the combined
-     result verifies;
-   - **Cost**: zero spent against the Change budget (the `noop` executor spends
-     no inference);
-   - **Promotion**: a real branch and commit (`switchyard/change-audit-logging`)
-     in a local Git repository, ending in a promoted commit hash;
-   - **Cleanup**: the per-WorkUnit and integration workspaces are expired.
-4. **Show it is reproducible.** Run `make demo` again and note the same WorkUnit
-   ordering, the same coordinated owner, and the same promoted tree.
-5. **(Optional) Show the real Cloudflare path.** After `npx wrangler login`, run
-   `make dev-all` to bring up the Worker under `wrangler dev` and the console,
-   where the same flow uses real Cloudflare Artifacts.
+### 1. Prerequisites
 
-## License
+- A **Cloudflare account**. Workers and **Artifacts** must be enabled for it.
+  Artifacts is in **open beta**, so your account/plan has to have access; if the
+  binding calls fail with an access error, this is the first thing to check.
+- **Node.js 20+**, **Git**, and this repo installed (`make install`).
+- Wrangler is already a dev dependency of this repo, so you do not need a global
+  install; the commands below use `npx wrangler`.
+
+### 2. Authenticate Wrangler
+
+```bash
+npx wrangler login
+```
+
+This opens a browser OAuth flow and stores a token identifying your Cloudflare
+account. It is required because the Artifacts binding is configured with
+`remote = true`: even though the Worker runs locally, the create-repo /
+issue-token / delete calls go to the real Cloudflare service and must be made on
+behalf of your account.
+
+Verify it worked:
+
+```bash
+npx wrangler whoami      # should print your account/email
+make cli ARGS="doctor"   # "Cloudflare auth" should now read ok
+```
+
+### 3. Point the Artifacts binding at your account
+
+The Artifacts binding lives in [`apps/worker/wrangler.jsonc`](apps/worker/wrangler.jsonc):
+
+```jsonc
+"artifacts": [
+  {
+    "binding": "ARTIFACTS",
+    "namespace": "switchyard-change-fabric",
+    "remote": true
+  }
+]
+```
+
+- Set `namespace` to an Artifacts namespace your account can use (create one in
+  the Cloudflare dashboard or with Wrangler if your account exposes that command;
+  check `npx wrangler artifacts --help`). The default value is a placeholder.
+- Leave `remote: true` so local `wrangler dev` uses the real remote Artifacts
+  service rather than a local stand-in.
+
+No secrets go in this file. The scoped Git tokens the fabric uses are issued at
+runtime by Artifacts and are short-lived; nothing is committed to the repo.
+
+### 4. (Optional) Configure an inference path
+
+The default executor is `noop` (a deterministic, zero-inference edit), which is
+all the example needs. To have a WorkUnit call a real model, pick one executor
+and provide its credential yourself (copy `.env.example` to `.env` first):
+
+| Executor | How to enable |
+|----------|---------------|
+| `codex` | Have the Codex CLI already authenticated; select `--executor codex`. No API key stored here. |
+| `switchyard-gateway` (AI Gateway BYOK) | Store a provider key in your Cloudflare **AI Gateway**, set `AI_GATEWAY_MODEL` (e.g. `openai/<model>`) in `.env`, and select `--executor switchyard-gateway`. The raw provider key stays in AI Gateway, not in this repo. |
+| `workers-ai` | Set `WORKERS_AI_MODEL` to a supported Workers AI model and select `--executor workers-ai`. Needs only your Cloudflare account. |
+
+Never put a raw provider key in the repo or in `wrangler.jsonc`. `.env` is
+git-ignored; `.env.example` shows the shape with empty placeholders.
+
+### 5. Run against Cloudflare
+
+Start the Worker (and console) locally with the real Artifacts binding:
+
+```bash
+make dev-all        # Worker under `wrangler dev` + the local console
+```
+
+Then, in another terminal, run a Change against it:
+
+```bash
+make cli ARGS="run examples/changes/audit-logging.change.yaml"
+# or, to run and promote the integrated result:
+make cli ARGS="promote examples/changes/audit-logging.change.yaml"
+```
+
+Each WorkUnit now gets a **real isolated Artifact repository** with a short-lived
+scoped Git credential; runners clone over standard Git HTTPS, execute, and push
+back; verification, integration, conflict coordination, and local-Git promotion
+work exactly as in the offline demo. `make doctor` reports which pieces
+(Cloudflare auth, Artifacts reachability, executor) are ready.
+
+> Note: the Artifacts binding is written to the documented API. If a call fails,
+> re-check that your account has Artifacts beta access and that the `namespace`
+> matches one your account can use.
+
+### 6. (Optional) Deploy the Worker
+
+Running locally with `wrangler dev` is enough to use real Artifacts. If you want
+the Worker itself hosted on Cloudflare:
+
+```bash
+npx wrangler deploy        # from apps/worker, or: npm -w apps/worker run deploy
+```
+
+A production deploy is **not** required to try the project.
 
 Apache-2.0. See [LICENSE](./LICENSE).
