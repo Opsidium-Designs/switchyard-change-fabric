@@ -295,7 +295,7 @@ const commands: Command[] = [
     name: "run-live",
     summary:
       "Full live run: decompose -> recruit real agents (Workers AI) -> escalate -> verify -> integrate -> promote -> cleanup.",
-    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--watch]`,
+    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--id <changeId>] [--watch] [--await-escalation]`,
     async run(args) {
       const change = await resolveChange(args);
       if (!change) {
@@ -336,12 +336,33 @@ const commands: Command[] = [
       // eventually consistent). Watch mode uses the STABLE id so the console
       // auto-loads it; it is the caller's job to run cleanup-live between watch
       // runs (the command tears the repos down and frees the stable name).
+      //
+      // An explicit --id overrides both strategies: the browser console
+      // launcher generates a FRESH UNIQUE id per launch and passes it here so it
+      // can follow exactly that run (no stable id, no collisions). An explicit
+      // id is used verbatim.
+      const explicitId = optionValue(args, "--id");
       const runId = Date.now().toString(36);
-      const liveChange: Change = watch ? change : { ...change, id: `${change.id}-${runId}` };
+      const liveChange: Change = explicitId
+        ? { ...change, id: explicitId }
+        : watch
+          ? change
+          : { ...change, id: `${change.id}-${runId}` };
 
-      // The human escalation resolver. A real human chooses the lease owner for
-      // a contested path; --owner / --decision supplies that non-interactively
-      // so the run is reproducible, defaulting to the deterministic lease owner.
+      // Whether to BLOCK on a human answering the escalation in the browser
+      // rather than auto-answering it. The console launcher sets this so the
+      // escalating template genuinely pauses on the real pending fork until the
+      // human clicks an answer in the UI (which resolves the durable record on
+      // the Worker); the beat then proceeds with that human decision. Without
+      // this flag the run is non-interactive and auto-answers (reproducible CLI
+      // and offline behavior is unchanged).
+      const awaitEscalation = hasFlag(args, "--await-escalation");
+
+      // The human escalation resolver for the non-interactive (CLI) path. A real
+      // human chooses the lease owner for a contested path; --owner / --decision
+      // supplies that non-interactively so the run is reproducible, defaulting to
+      // the deterministic lease owner. When --await-escalation is set the browser
+      // supplies the decision instead, so no CLI resolver is passed.
       const explicitDecision = optionValue(args, "--owner") ?? optionValue(args, "--decision");
       const resolveEscalation = async (escalation: Escalation): Promise<string> => {
         const decision =
@@ -364,7 +385,11 @@ const commands: Command[] = [
         specYaml: changeToSpecYaml(liveChange),
         projectDir,
         executor: selected.executor,
-        resolveEscalation,
+        // Block on the browser answer when --await-escalation is set; otherwise
+        // auto-answer non-interactively through the CLI resolver.
+        ...(awaitEscalation
+          ? { awaitExternalResolution: true }
+          : { resolveEscalation }),
         skipCleanup: watch,
         onEvent: (event) => {
           switch (event.kind) {
@@ -425,8 +450,9 @@ const commands: Command[] = [
       if (watch) {
         console.log("");
         console.log("Watch mode: the real Artifact repos and Change state are LEFT in place.");
-        console.log(`  open the console and it auto-loads this Change:`);
-        console.log(`    ?change=${encodeURIComponent(result.changeId)}  (the console also defaults to it)`);
+        console.log(`  this run's Change id: ${result.changeId}`);
+        console.log(`  (the console is normally driven by its own template gallery; this`);
+        console.log(`   command is the manual CLI path to a watchable run.)`);
         console.log(`  when done watching, tear the real repos down with:`);
         console.log(`    make clean-live   (or: ${CLI_NAME} cleanup-live --change-id ${result.changeId} --worker ${result.workerUrl})`);
       }

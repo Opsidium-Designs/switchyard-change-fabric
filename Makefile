@@ -146,10 +146,12 @@ run-live:
 # has the hardcoded src/audit/events.ts collision), so the human escalation beat
 # fires EVERY time, and it runs in watch mode: a STABLE Change id
 # (change-audit-logging, not a per-run id), and it LEAVES the real Artifact repos
-# and the Change state in place at the end so you can watch the finished graph in
-# the console (which auto-loads that id). Start the Worker and console first with
-# `make dev-all`, run this, then open the console. Tear the real repos down with
-# `make clean-live` when you are done watching.
+# and the Change state in place at the end so you can inspect the finished graph.
+# The console's normal path is its own template gallery (which launches and
+# follows its own unique run); this CLI run's state can be read directly from the
+# Worker at /changes/<id>. Start the Worker and console first with `make dev-all`,
+# run this, then inspect it. Tear the real repos down with `make clean-live` when
+# you are done watching.
 AUDIT_CHANGE = $(CURDIR)/examples/changes/audit-logging.change.yaml
 DEMO_PROJECT = $(CURDIR)/examples/demo-project
 CHANGE_ID ?= change-audit-logging
@@ -181,11 +183,11 @@ clean-live:
 # Seed the example audit-logging Change into a running Worker so the console
 # shows a live graph without hand-POSTing YAML (the create-a-Change path for the
 # clone-and-run story). Start the Worker first with `make dev` or `make dev-all`.
-# The console's "Start the demo Change" button does the same from the UI.
+# The console's own template gallery is the normal browser path to launch a run.
 seed-change:
 	curl -s -X POST -H "content-type: text/plain" \
 	  --data-binary @"$(AUDIT_CHANGE)" "$(WORKER)/changes" >/dev/null \
-	  && echo "Seeded Change change-audit-logging into $(WORKER). Open the console (it auto-loads it)."
+	  && echo "Seeded Change change-audit-logging into $(WORKER). Read it at $(WORKER)/changes/change-audit-logging."
 
 # Deploy the Worker to Cloudflare (wrangler deploy). This is the single hosted
 # Worker with the Artifacts + AI bindings and the repo-pushed Queue consumer, so

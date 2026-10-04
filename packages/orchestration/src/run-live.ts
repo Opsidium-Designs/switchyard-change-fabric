@@ -173,6 +173,30 @@ export interface RunFullLiveOptions {
    */
   readonly resolveEscalation?: EscalationResolver;
   /**
+   * When true, the escalation beat does NOT resolve the fork itself. It raises
+   * the durable escalation on the Worker and then BLOCKS, polling the Worker's
+   * state until an external actor (the console, where a human clicks an answer)
+   * resolves it, then proceeds using that human-supplied decision. This is what
+   * makes the browser the control plane for the escalating template: the run
+   * genuinely pauses on a real pending record and only advances once the human
+   * answers in the UI. When false (the default), the beat uses `resolveEscalation`
+   * (or the deterministic default owner) and resolves the record itself, which
+   * keeps the offline/CLI/test path non-interactive and unattended.
+   */
+  readonly awaitExternalResolution?: boolean;
+  /**
+   * How long to wait for an external resolution before giving up, in
+   * milliseconds (only used with `awaitExternalResolution`). Defaults to ten
+   * minutes, which is comfortably long for a human to answer a single question
+   * in the browser without hanging an abandoned run forever.
+   */
+  readonly externalResolutionTimeoutMs?: number;
+  /**
+   * How often to poll the Worker for the external resolution, in milliseconds
+   * (only used with `awaitExternalResolution`). Defaults to one second.
+   */
+  readonly externalResolutionPollMs?: number;
+  /**
    * When true, leave the real Artifact repos and the Change state in place
    * after the run instead of archiving them, so a human can watch the finished
    * graph morph in the console before tearing it down. The result still lists
@@ -336,6 +360,11 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     getJson,
     options.resolveEscalation,
     emit,
+    {
+      awaitExternal: options.awaitExternalResolution ?? false,
+      timeoutMs: options.externalResolutionTimeoutMs ?? 10 * 60 * 1000,
+      pollMs: options.externalResolutionPollMs ?? 1000,
+    },
   );
 
   // 5. Verify + integrate. Clone each completed unit's real repo and verify it
@@ -422,9 +451,21 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
 /**
  * Run the escalation beat against the live Worker. If the Change has a contested
  * shared path, raise a lease-owner escalation, confirm the Worker reports it
- * pending (the durable wait), ask the resolver for the human decision, and
- * resolve it. When there is no contested path, there is nothing to escalate and
- * the beat reports it did not raise one.
+ * pending (the durable wait), obtain the human decision, and proceed. When there
+ * is no contested path, there is nothing to escalate and the beat reports it did
+ * not raise one.
+ *
+ * Two resolution modes:
+ *   - external (awaitExternal: true): the beat raises the escalation and then
+ *     BLOCKS, polling the Worker until some external actor (the console, where a
+ *     human clicks an answer) resolves the durable record. The beat never
+ *     resolves the fork itself, so the run genuinely pauses on a real pending
+ *     escalation until the human answers in the browser. This is the escalating
+ *     template's path.
+ *   - self (the default): the beat asks the `resolver` (or falls back to the
+ *     deterministic default owner) for the decision and resolves the record
+ *     itself, so an unattended offline/CLI/test run still proves the full chain
+ *     without a human in the loop.
  */
 async function runEscalationBeat(
   change: Change,
@@ -433,6 +474,7 @@ async function runEscalationBeat(
   getJson: (path: string) => Promise<Record<string, unknown>>,
   resolver: EscalationResolver | undefined,
   emit: (event: FullLiveEvent) => void,
+  external: { readonly awaitExternal: boolean; readonly timeoutMs: number; readonly pollMs: number },
 ): Promise<EscalationReport> {
   const collisions = detectPathCollisions(change);
   const plan = planWriteLeases(change, collisions);
@@ -463,10 +505,26 @@ async function runEscalationBeat(
   const escalations = (state.escalations as Escalation[] | undefined) ?? [];
   const waited = escalations.some((e) => e.id === raised.id && e.status === "pending");
 
-  // The human decision: in a live run a human supplies the owner; offline/in a
-  // test an auto-resolver returns the deterministic default owner so the chain
-  // still proves end to end. Either way the engine proceeds only AFTER a
-  // decision resolves the durable record.
+  if (external.awaitExternal) {
+    // Block on the browser. Poll the durable escalation record until a human has
+    // resolved it in the console (which POSTs the resolve to the Worker). The
+    // engine proceeds only AFTER that external decision lands, so the run truly
+    // pauses on the real pending fork. The beat never resolves the record here.
+    const resolved = await awaitExternalResolution(
+      changeId,
+      raised.id,
+      getJson,
+      external.timeoutMs,
+      external.pollMs,
+    );
+    emit({ kind: "escalation-resolved", escalation: resolved });
+    return { raised, resolved, waited };
+  }
+
+  // The self-resolve path: in an unattended run a resolver supplies the owner
+  // (offline/in a test an auto-resolver returns the deterministic default owner
+  // so the chain still proves end to end). Either way the engine proceeds only
+  // AFTER a decision resolves the durable record.
   const defaultOwner = contested.owner ?? contested.contenders[0] ?? "";
   const decision = resolver ? await resolver(raised) : defaultOwner;
   const resolvedResp = await post(
@@ -477,6 +535,42 @@ async function runEscalationBeat(
   emit({ kind: "escalation-resolved", escalation: resolved });
 
   return { raised, resolved, waited };
+}
+
+/**
+ * Poll the Worker until the given escalation is resolved by an external actor
+ * (the human clicking an answer in the console, which POSTs the resolve to the
+ * Worker). Returns the resolved escalation record. Throws if the escalation is
+ * not resolved within the timeout, so an abandoned run does not hang forever.
+ */
+async function awaitExternalResolution(
+  changeId: string,
+  escalationId: string,
+  getJson: (path: string) => Promise<Record<string, unknown>>,
+  timeoutMs: number,
+  pollMs: number,
+): Promise<Escalation> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const state = await getJson(`/changes/${encodeURIComponent(changeId)}`);
+    const escalations = (state.escalations as Escalation[] | undefined) ?? [];
+    const found = escalations.find((e) => e.id === escalationId);
+    if (found && found.status === "resolved") {
+      return found;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `escalation ${escalationId} on Change ${changeId} was not resolved within ` +
+          `${Math.round(timeoutMs / 1000)}s; the run was waiting on a human answer in the console`,
+      );
+    }
+    await delay(pollMs);
+  }
+}
+
+/** A small awaitable delay used by the external-resolution poll loop. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**

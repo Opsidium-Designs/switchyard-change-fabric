@@ -52,23 +52,35 @@ then verifies, integrates, and promotes. Follow these steps in order.
    make dev-all
    ```
 
-6. **Run the watchable live demo.** Seeds the demo audit-logging Change and runs
-   the watchable live run on Workers AI, leaving the real Artifact repos up so
-   you can watch.
-   ```bash
-   make demo-live
-   ```
-
-7. **Open the console and watch the graph morph.**
+6. **Open the console and drive everything from the browser.**
    ```text
-   http://127.0.0.1:5173/?change=change-audit-logging
+   http://127.0.0.1:5173/
    ```
+   The console is the control plane. Pick a template from the gallery to launch
+   a live run: it starts with a fresh unique Change id the console follows
+   automatically, and the graph morphs in real time against the run's durable
+   state. There is no CLI step for the demo.
 
-8. **Tear down when done.** `make clean-live` removes the run's Artifact repos;
+   - **Audit logging** (about 3 agents) hits a shared contested path, so the run
+     pauses and the console asks you which agent owns it. Answer in the browser
+     and the run continues.
+   - **Validation fan-out** (about 5 agents) and **Large (scale)** (13 agents)
+     run to completion on their own, with no human step.
+
+7. **Tear down the run from the console.** Each template leaves its real Artifact
+   repos up so you can study the finished graph; click **Tear down this run's
+   repos** to delete them (scoped to that run's unique id). Launching another
+   template uses a fresh unique id, so repeated runs never collide.
+
+   A CLI-driven alternative to steps 6 and 7 is `make demo-live` (it drives one
+   watchable run from the terminal); the console template gallery is the primary
+   browser path.
+
+8. **Tear down the hosted infrastructure when done.** Per-run Artifact repos are
+   removed from the console (step 7) or with `make clean-live` for a CLI run;
    `make infra-down` removes the hosted Worker, Queue, and subscription so
    nothing keeps billing.
    ```bash
-   make clean-live
    make infra-down
    ```
 
@@ -82,10 +94,13 @@ then verifies, integrates, and promotes. Follow these steps in order.
   behind the single owner of a contested path).
 - **Click a node** to see its real backing: an agent's actual Artifact repo,
   clone URL, backend, status, and evidence.
-- **The min/max dial** is a real control: raise it and recruit, and visibly more
-  agents run at once through the same engine.
+- **The min/max dial** is a real control: raise it and the next wave recruits
+  more agents at once through the same engine.
 - **The human escalation beat** pauses the run for a decision rather than
-  guessing on a contested path.
+  guessing on a contested path; you answer the question in the console and the
+  run continues.
+- **Per-run cleanup** is a console control: tear down a run's real Artifact repos
+  when you are done watching, scoped to that run's unique id.
 
 ### Other ways to run
 

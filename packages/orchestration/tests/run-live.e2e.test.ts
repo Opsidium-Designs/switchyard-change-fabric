@@ -293,6 +293,62 @@ describe("M5: the full end-to-end run with the human escalation beat", () => {
     expect(resolvedModel.nodes.some((n) => n.escalated)).toBe(false);
   });
 
+  it("blocks on an EXTERNAL (browser) decision and only advances once it lands", async () => {
+    const artifactsRoot = join(workRoot, "ext-artifacts");
+    const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: artifactsRoot });
+    const control = new LocalChangeControl(workspaces);
+    const { fetchFn } = fakeWorker(control, workspaces);
+    const change = parseChangeSpec(SPEC);
+
+    const projectDir = join(workRoot, "ext-project");
+    await mkdir(join(projectDir, "src"), { recursive: true });
+    await writeFile(join(projectDir, "src", "index.ts"), "export const seeded = true;\n", "utf8");
+
+    // Simulate the browser: once the run has recorded a pending escalation, an
+    // external actor (not the run driver) resolves it, exactly as the console's
+    // POST to the Worker's resolve route does. The run must block until then.
+    let resolvedExternally = false;
+    const browser = setInterval(() => {
+      const pending = control
+        .escalations("change-m5")
+        .find((e) => e.status === "pending");
+      if (pending) {
+        control.resolveEscalation("change-m5", pending.id, "tests");
+        resolvedExternally = true;
+        clearInterval(browser);
+      }
+    }, 10);
+
+    const result = await runFullLive({
+      change,
+      dial: { minConcurrency: 1, maxConcurrency: 3 },
+      workerUrl: "http://w",
+      specYaml: SPEC,
+      projectDir,
+      workRoot: join(workRoot, "ext-run"),
+      fetchFn,
+      // No resolver: the beat must NOT resolve it itself. It waits for the
+      // external (browser) decision and proceeds with that.
+      awaitExternalResolution: true,
+      externalResolutionPollMs: 10,
+      externalResolutionTimeoutMs: 10_000,
+    });
+    clearInterval(browser);
+
+    // The run blocked on the real pending record and advanced only after the
+    // external decision resolved it; it used that human decision, not an auto
+    // default (the self-resolve default owner here would be "api").
+    expect(resolvedExternally).toBe(true);
+    expect(result.escalation.raised).not.toBeNull();
+    expect(result.escalation.waited).toBe(true);
+    expect(result.escalation.resolved?.status).toBe("resolved");
+    expect(result.escalation.resolved?.decision).toBe("tests");
+
+    // The full chain still completed after the human answered.
+    expect([...result.completed].sort()).toEqual(["api", "model", "tests"]);
+    expect(result.promotion.committed).toBe(true);
+  });
+
   it("raising the same fork twice is idempotent (a re-driven engine does not pile up)", () => {
     const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, "a3") });
     const control = new LocalChangeControl(workspaces);
