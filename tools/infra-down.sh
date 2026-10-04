@@ -6,9 +6,11 @@
 #      'switchyard-change-fabric-repo-pushed';
 #   2. the Queue 'switchyard-change-fabric-repo-pushed';
 #   3. the deployed Worker 'switchyard-change-fabric';
-#   4. any leftover Artifact repos in the 'switchyard-change-fabric' namespace
-#      (so nothing keeps billing), restricted to names that begin with
-#      'switchyard-change-fabric' as a safety belt.
+#   4. ALL leftover Artifact repos in the 'switchyard-change-fabric' namespace
+#      (so nothing keeps billing). The namespace is itself the project boundary,
+#      so every repo in it (control-plane runs, 'console-*' template runs,
+#      'change-*' CLI runs, tool repos) is swept by default. Set REPO_PREFIX to
+#      narrow to only names with a given prefix if you ever need that.
 #
 # It is idempotent: anything already gone is reported as "already absent" with
 # NO error. It prints EXACTLY what it is about to delete before deleting it, and
@@ -28,7 +30,9 @@ NAMESPACE="${NAMESPACE:-switchyard-change-fabric}"
 # Only repos whose name starts with this prefix are eligible for deletion. The
 # namespace is already project-scoped, but this is an explicit second guard so a
 # stray repo from unrelated work is never touched.
-REPO_PREFIX="${REPO_PREFIX:-switchyard-change-fabric}"
+# REPO_PREFIX is UNSET by default so the whole project namespace is swept.
+# Set it (e.g. REPO_PREFIX=console-) to narrow deletion to a name prefix.
+REPO_PREFIX="${REPO_PREFIX:-}"
 API_BASE="${API_BASE:-https://api.cloudflare.com/client/v4}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,7 +56,7 @@ echo "This deletes ONLY these named resources on account ${CLOUDFLARE_ACCOUNT_ID
 echo "  - subscription '${SUBSCRIPTION_NAME}'"
 echo "  - queue '${QUEUE_NAME}'"
 echo "  - worker '${WORKER_NAME}'"
-echo "  - Artifact repos in namespace '${NAMESPACE}' named '${REPO_PREFIX}*'"
+echo "  - ALL Artifact repos in namespace '${NAMESPACE}'${REPO_PREFIX:+ named '${REPO_PREFIX}*'}"
 echo ""
 
 # ---------------------------------------------------------------------------
@@ -71,7 +75,7 @@ else
     RESP=$(curl -s -w "\nHTTP:%{http_code}" -X DELETE -H "${AUTH}" \
       "${ACCT}/event_subscriptions/subscriptions/${sid}")
     STATUS=$(echo "${RESP}" | sed -n 's/.*HTTP:\([0-9]*\).*/\1/p')
-    if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
+    if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "202" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
       echo "  deleted (or already gone)."
     else
       echo "${RESP}" | sed 's/"token":"[^"]*"/"token":"REDACTED"/g'
@@ -95,7 +99,7 @@ else
   RESP=$(curl -s -w "\nHTTP:%{http_code}" -X DELETE -H "${AUTH}" \
     "${ACCT}/queues/${QUEUE_ID}")
   STATUS=$(echo "${RESP}" | sed -n 's/.*HTTP:\([0-9]*\).*/\1/p')
-  if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
+  if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "202" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
     echo "  deleted (or already gone)."
   else
     echo "${RESP}" | sed 's/"token":"[^"]*"/"token":"REDACTED"/g'
@@ -121,7 +125,7 @@ else
   RESP=$(curl -s -w "\nHTTP:%{http_code}" -X DELETE -H "${AUTH}" \
     "${ACCT}/workers/scripts/${WORKER_NAME}?force=true")
   STATUS=$(echo "${RESP}" | sed -n 's/.*HTTP:\([0-9]*\).*/\1/p')
-  if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
+  if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "202" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
     echo "  deleted."
   else
     echo "${RESP}" | sed 's/"token":"[^"]*"/"token":"REDACTED"/g'
@@ -144,7 +148,7 @@ if [ -n "${QUEUE_ID}" ] && [ "${QUEUE_ID}" != "null" ]; then
   RESP=$(curl -s -w "\nHTTP:%{http_code}" -X DELETE -H "${AUTH}" \
     "${ACCT}/queues/${QUEUE_ID}")
   STATUS=$(echo "${RESP}" | sed -n 's/.*HTTP:\([0-9]*\).*/\1/p')
-  if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
+  if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "202" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
     echo "  deleted (or already gone)."
   else
     echo "${RESP}" | sed 's/"token":"[^"]*"/"token":"REDACTED"/g'
@@ -154,26 +158,35 @@ if [ -n "${QUEUE_ID}" ] && [ "${QUEUE_ID}" != "null" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 4: delete any leftover Artifact repos in the namespace so nothing bills.
-# Only names starting with REPO_PREFIX are eligible (the namespace is already
-# project-scoped; this is a second guard).
+# Step 4: delete leftover Artifact repos in the namespace so nothing bills.
+# The namespace '${NAMESPACE}' IS the project boundary (every repo in it belongs
+# to this project: control-plane runs, console template runs named
+# 'console-*', CLI runs named 'change-*', tool repos, etc.), so by default we
+# sweep ALL repos in it. Set REPO_PREFIX to narrow to only names with a given
+# prefix if you ever need the conservative behavior.
 # ---------------------------------------------------------------------------
 echo "== Step 4: leftover Artifact repos in namespace '${NAMESPACE}' =="
-REPOS=$(curl -s -H "${AUTH}" "${ACCT}/artifacts/namespaces/${NAMESPACE}/repos?per_page=50")
+REPOS=$(curl -s -H "${AUTH}" "${ACCT}/artifacts/namespaces/${NAMESPACE}/repos?per_page=100")
 if ! echo "${REPOS}" | jq -e '.success == true' >/dev/null 2>&1; then
   echo "could not list repos (the namespace may not exist yet); treating as empty."
   echo "${REPOS}" | jq -c '.errors' 2>/dev/null || true
 else
-  NAMES=$(echo "${REPOS}" | jq -r --arg p "${REPO_PREFIX}" \
-    '(.result // [])[] | (.name // .id) | select(startswith($p))')
-  SKIPPED=$(echo "${REPOS}" | jq -r --arg p "${REPO_PREFIX}" \
-    '(.result // [])[] | (.name // .id) | select(startswith($p) | not)')
-  if [ -n "${SKIPPED}" ]; then
-    echo "NOT touching these repos (name does not start with '${REPO_PREFIX}'):"
-    echo "${SKIPPED}" | sed 's/^/  - /'
+  if [ -n "${REPO_PREFIX:-}" ]; then
+    # Optional narrowing: only delete names starting with REPO_PREFIX.
+    NAMES=$(echo "${REPOS}" | jq -r --arg p "${REPO_PREFIX}" \
+      '(.result // [])[] | (.name // .id) | select(startswith($p))')
+    SKIPPED=$(echo "${REPOS}" | jq -r --arg p "${REPO_PREFIX}" \
+      '(.result // [])[] | (.name // .id) | select(startswith($p) | not)')
+    if [ -n "${SKIPPED}" ]; then
+      echo "NOT touching these repos (REPO_PREFIX='${REPO_PREFIX}' set; name does not match):"
+      echo "${SKIPPED}" | sed 's/^/  - /'
+    fi
+  else
+    # Default: the namespace is project-scoped, so clean every repo in it.
+    NAMES=$(echo "${REPOS}" | jq -r '(.result // [])[] | (.name // .id)')
   fi
   if [ -z "${NAMES}" ]; then
-    echo "no leftover '${REPO_PREFIX}*' repos; nothing to delete."
+    echo "no leftover repos in the namespace; nothing to delete."
   else
     while IFS= read -r name; do
       [ -n "${name}" ] || continue
@@ -181,7 +194,7 @@ else
       RESP=$(curl -s -w "\nHTTP:%{http_code}" -X DELETE -H "${AUTH}" \
         "${ACCT}/artifacts/namespaces/${NAMESPACE}/repos/${name}")
       STATUS=$(echo "${RESP}" | sed -n 's/.*HTTP:\([0-9]*\).*/\1/p')
-      if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
+      if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "202" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
         echo "  deleted (or already gone)."
       else
         echo "${RESP}" | sed 's/"token":"[^"]*"/"token":"REDACTED"/g'
