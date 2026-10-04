@@ -94,6 +94,15 @@ export interface BuildToolOptions {
   readonly identity?: GitIdentity;
   /** A fixed stamp for determinism. */
   readonly stamp?: string;
+  /**
+   * The WorkUnit id to record as the tool's builder. Defaults to the structural
+   * tool unit id the requirement names (e.g. "tool-validate"). The live path
+   * passes a REAL recruited unit here (the first fanned-out agent), so the tool
+   * node hangs off a real agent that already has a workspace and the Worker's
+   * no-unbacked-builder guard is satisfied; that builder is then excluded from
+   * the consumers so it does not consume its own tool.
+   */
+  readonly builderUnitId?: string;
 }
 
 const DEFAULT_STAMP = "1970-01-01T00:00:00.000Z";
@@ -121,7 +130,13 @@ async function buildAndConsumeTool(
 ): Promise<ToolBuildResult> {
   const identity = options.identity ?? RUNNER_IDENTITY;
   const stamp = options.stamp ?? DEFAULT_STAMP;
-  const builderUnitId = requirement.toolUnitId;
+  // The builder is a real agent that produces the tool repo. By default it is
+  // the structural tool unit the requirement names; the live path overrides it
+  // with a REAL recruited unit so the tool node hangs off a backed agent and the
+  // Worker accepts the record. A builder that is also a consumer is excluded
+  // from the consumption list so it does not consume its own tool.
+  const builderUnitId = options.builderUnitId ?? requirement.toolUnitId;
+  const consumerIds = requirement.consumers.filter((id) => id !== builderUnitId);
 
   // 1. The tool-builder agent provisions its OWN workspace (its own repo).
   const toolWorkspaceName = `${options.change.id}--${builderUnitId}`.replace(
@@ -159,7 +174,7 @@ async function buildAndConsumeTool(
     await run("git", ["clone", ref.gitUrl, toolRunScratch]);
     const codemodAbs = join(toolRunScratch, toolRelPath);
     // Map each consumer to the concrete file it declares (the fan-out surface).
-    for (const consumerId of requirement.consumers) {
+    for (const consumerId of consumerIds) {
       const unit = options.change.work.find((u) => u.id === consumerId);
       const targetFile = unit?.paths.find((p) => !/[*?]/.test(p));
       if (!targetFile) {

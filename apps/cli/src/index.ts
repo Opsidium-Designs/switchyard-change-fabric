@@ -396,6 +396,14 @@ const commands: Command[] = [
             case "change-created":
               console.log(`Created Change ${event.changeId} on the live Worker`);
               break;
+            case "tool-built":
+              console.log(
+                `Agent built a tool in its own repo: ${event.tool.label} ` +
+                  `(${event.tool.capability}) in ${event.tool.workspace.workspaceName} ` +
+                  `[${event.tool.workspace.backend}], cloned and run by ` +
+                  `${event.tool.consumptions.filter((c) => c.changed).length} downstream unit(s)`,
+              );
+              break;
             case "wave":
               console.log(
                 `Wave [${event.wave.trigger}]: ${event.wave.agents
@@ -437,6 +445,13 @@ const commands: Command[] = [
         );
       } else {
         console.log("  escalation: none raised (no contested shared path)");
+      }
+      if (result.tool) {
+        console.log(
+          `  tool: ${result.tool.label} (${result.tool.capability}) in its own repo ` +
+            `${result.tool.workspace.workspaceName}, run by ` +
+            `${result.tool.consumptions.filter((c) => c.changed).length} downstream unit(s)`,
+        );
       }
       console.log(`  verification: ${result.evidence.integration.verdict}`);
       if (result.promotion.committed) {

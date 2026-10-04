@@ -27,11 +27,16 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { parseChangeSpec } from "@switchyard-change/change-core";
+import { decompose, parseChangeSpec, type RepoFile } from "@switchyard-change/change-core";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 
 import { LocalChangeControl, workspaceNameFor } from "../src/local-control.ts";
-import { buildWorkGraphModel, type ChangeStateSnapshot } from "../src/graph-model.ts";
+import {
+  assertBacked,
+  buildWorkGraphModel,
+  toolNodeId,
+  type ChangeStateSnapshot,
+} from "../src/graph-model.ts";
 import { runFullLive } from "../src/run-live.ts";
 
 /**
@@ -163,6 +168,39 @@ function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWork
       const b = body() as { decision?: string };
       const escalation = control.resolveEscalation(dec(resolve[1]), dec(resolve[2]), String(b.decision));
       return json({ escalation });
+    }
+    // Record an agent-built tool and its real downstream consumptions, exactly
+    // as the Worker's POST /changes/:id/tool route does: the builder/consumers
+    // must be real WorkUnits, so the recorded tool node is backed by real state.
+    const toolRoute = url.pathname.match(/^\/changes\/([^/]+)\/tool$/);
+    if (method === "POST" && toolRoute) {
+      const changeId = dec(toolRoute[1]);
+      const b = body() as {
+        builderUnitId?: string;
+        capability?: string;
+        toolPath?: string;
+        label?: string;
+        workspace?: Record<string, unknown>;
+        consumers?: string[];
+      };
+      const tool = control.recordTool(changeId, {
+        builderUnitId: String(b.builderUnitId),
+        capability: String(b.capability),
+        toolPath: String(b.toolPath ?? ""),
+        label: String(b.label ?? b.capability),
+        workspace: b.workspace as unknown as Parameters<typeof control.recordTool>[1]["workspace"],
+      });
+      for (const consumerUnitId of b.consumers ?? []) {
+        try {
+          control.recordToolConsumption(changeId, {
+            capability: String(b.capability),
+            consumerUnitId,
+          });
+        } catch {
+          /* a consumer the state does not list is skipped, as the Worker does */
+        }
+      }
+      return json({ tool }, 201);
     }
     const state = url.pathname.match(/^\/changes\/([^/]+)$/);
     if (method === "GET" && state) {
@@ -367,5 +405,138 @@ describe("M5: the full end-to-end run with the human escalation beat", () => {
     });
     expect(second.id).toBe(first.id);
     expect(control.escalations("change-m5").length).toBe(1);
+  });
+});
+
+/**
+ * A flat repo whose universal goal fans OUT into one unit per file applying the
+ * same mechanical transform, so the tool-build trigger fires: one agent builds a
+ * codemod in its OWN repo and the others clone and run it. This is the live
+ * counterpart of the offline tool-build.e2e assertions.
+ */
+const TOOL_REPO: RepoFile[] = [
+  { path: "src/statistics.ts", content: "export function mean(v: number[]): number { return 0; }\n" },
+  { path: "src/geometry.ts", content: "export function area(w: number, h: number): number { return w * h; }\n" },
+  { path: "src/finance.ts", content: "export function pct(a: number, p: number): number { return 0; }\n" },
+  { path: "src/index.ts", content: "export { mean } from './statistics.js';\n" },
+];
+
+describe("M8.1: the live run builds the tool its OWN real repo and records it as a tool node", () => {
+  it("builds a tool in its own workspace, a downstream unit clones+runs it, and the tool node is backed", async () => {
+    const artifactsRoot = join(workRoot, "tool-artifacts");
+    const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: artifactsRoot });
+    const control = new LocalChangeControl(workspaces);
+    const { fetchFn } = fakeWorker(control, workspaces);
+
+    const change = decompose({
+      goal: "Add input validation to every exported function",
+      repo: TOOL_REPO,
+    }).change;
+    const specYaml = await import("../src/decompose-goal.ts").then((m) =>
+      m.changeToSpecYaml(change),
+    );
+
+    const projectDir = join(workRoot, "tool-project");
+    await mkdir(join(projectDir, "src"), { recursive: true });
+    for (const file of TOOL_REPO) {
+      await mkdir(join(projectDir, file.path.slice(0, file.path.lastIndexOf("/"))), {
+        recursive: true,
+      });
+      await writeFile(join(projectDir, file.path), file.content, "utf8");
+    }
+
+    const result = await runFullLive({
+      change,
+      dial: { minConcurrency: 1, maxConcurrency: 4 },
+      workerUrl: "http://w",
+      specYaml,
+      projectDir,
+      workRoot: join(workRoot, "tool-run"),
+      fetchFn,
+      // The flat goal has no contested path, so no escalation is raised.
+    });
+
+    // (1) a tool was built in its OWN real repo (the honest local fallback),
+    // distinct from the agent repos, and recorded with its real workspace.
+    expect(result.tool).toBeDefined();
+    const tool = result.tool!;
+    expect(tool.capability).toBe("codemod:validate");
+    expect(tool.workspace.backend).toBe("local-filesystem");
+    expect(tool.workspace.fallback).toBe(true);
+    // The builder is a REAL recruited unit (a fanned-out agent), so the tool node
+    // hangs off a backed agent in the Change, not a synthetic id.
+    expect(change.work.some((u) => u.id === tool.builderUnitId)).toBe(true);
+
+    // (2) a downstream unit GENUINELY cloned and ran the tool (changed=true), a
+    // real effect, not a decorative link. The builder is excluded from consumers.
+    const changed = tool.consumptions.filter((c) => c.changed);
+    expect(changed.length).toBeGreaterThanOrEqual(1);
+    for (const consumption of changed) {
+      expect(consumption.consumerUnitId).not.toBe(tool.builderUnitId);
+      expect(change.work.some((u) => u.id === consumption.consumerUnitId)).toBe(true);
+    }
+
+    // (3) the Worker state records the tool and its consumptions, so the console
+    // graph projects a tool node backed by the real tool repo and consumed-tool
+    // edges, and the no-unbacked-node rule holds for every emitted node.
+    const snapshot = control.state(change.id) as ChangeStateSnapshot;
+    expect(snapshot.tool?.capability).toBe("codemod:validate");
+    const model = buildWorkGraphModel(snapshot);
+    const toolNodes = model.nodes.filter((n) => n.kind === "tool");
+    expect(toolNodes).toHaveLength(1);
+    expect(toolNodes[0]?.id).toBe(toolNodeId("codemod:validate"));
+    // The tool node reveals its real repo (what the console's click shows).
+    expect(toolNodes[0]?.workspace?.workspaceName).toBe(tool.workspace.workspaceName);
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
+    // The builder->tool edge hangs the tool off its builder agent, and at least
+    // one consumed-tool edge connects the tool to a downstream consumer.
+    const built = model.edges.filter((e) => e.id.startsWith("built:"));
+    expect(built).toHaveLength(1);
+    expect(built[0]?.to).toBe(toolNodeId("codemod:validate"));
+    const consumed = model.edges.filter((e) => e.kind === "consumed-tool");
+    expect(consumed.length).toBeGreaterThanOrEqual(1);
+    for (const edge of consumed) {
+      expect(edge.from).toBe(toolNodeId("codemod:validate"));
+    }
+
+    // (4) the tool's OWN repo is torn down with the run (a real repo, not an
+    // edge, so it must not leak): its workspace name is in the cleaned-up set.
+    expect(result.cleanedUp).toContain(tool.workspace.workspaceName);
+    // Every unit repo was cleaned up too.
+    for (const name of result.workspaces) {
+      expect(result.cleanedUp).toContain(name);
+    }
+  });
+
+  it("builds NO tool for the layered Change, so no tool node is recorded (trigger is the work)", async () => {
+    const artifactsRoot = join(workRoot, "layered-artifacts");
+    const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: artifactsRoot });
+    const control = new LocalChangeControl(workspaces);
+    const { fetchFn } = fakeWorker(control, workspaces);
+    const change = parseChangeSpec(SPEC);
+
+    const projectDir = join(workRoot, "layered-project");
+    await mkdir(join(projectDir, "src"), { recursive: true });
+    await writeFile(join(projectDir, "src", "index.ts"), "export const seeded = true;\n", "utf8");
+
+    const result = await runFullLive({
+      change,
+      dial: { minConcurrency: 1, maxConcurrency: 3 },
+      workerUrl: "http://w",
+      specYaml: SPEC,
+      projectDir,
+      workRoot: join(workRoot, "layered-run"),
+      fetchFn,
+      resolveEscalation: async (escalation) => escalation.options[0] ?? "api",
+    });
+
+    expect(result.tool).toBeUndefined();
+    const snapshot = control.state(change.id) as ChangeStateSnapshot;
+    expect(snapshot.tool).toBeUndefined();
+    const model = buildWorkGraphModel(snapshot);
+    expect(model.nodes.some((n) => n.kind === "tool")).toBe(false);
+    expect(model.edges.some((e) => e.kind === "consumed-tool")).toBe(false);
   });
 });

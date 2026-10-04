@@ -132,6 +132,16 @@ function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
   }
 }
 
+/**
+ * The four points of a diamond (a square rotated 45deg) whose half-diagonal is
+ * `r`, centered at the node origin. Used for the tool node so it reads as a
+ * distinct tool/output artifact rather than another agent circle, while keeping
+ * the same visual footprint as a circle of radius `r`.
+ */
+function diamondPoints(r: number): string {
+  return `0,${-r} ${r},0 0,${r} ${-r},0`;
+}
+
 /** The fill color for a node from its kind and verified/escalated/failed state. */
 function nodeFill(node: GraphNode): string {
   if (node.escalated) {
@@ -250,16 +260,31 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                 }
               }}
             >
-              <circle
-                r={r}
-                fill={nodeFill(node)}
-                stroke={selected ? "#e6edf3" : "#0d1117"}
-                strokeWidth={selected ? 3 : 1.5}
-              />
-              {/* Labels sit OUTSIDE the circle, below it, so they are legible
-                  and never crammed inside the small node. The full label is
-                  shown (not truncated into the circle); the kind is a smaller
-                  caption line beneath it. */}
+              {/* The tool node is a DISTINCT shape (a diamond), so an
+                  agent-built tool published to its own repo reads as a tool/
+                  output artifact at a glance, not another agent circle. Every
+                  other node stays a circle. The diamond's half-diagonal matches
+                  the circle radius so it occupies the same visual footprint and
+                  the deterministic layout is unchanged. */}
+              {node.kind === "tool" ? (
+                <polygon
+                  points={diamondPoints(r)}
+                  fill={nodeFill(node)}
+                  stroke={selected ? "#e6edf3" : "#0d1117"}
+                  strokeWidth={selected ? 3 : 1.5}
+                />
+              ) : (
+                <circle
+                  r={r}
+                  fill={nodeFill(node)}
+                  stroke={selected ? "#e6edf3" : "#0d1117"}
+                  strokeWidth={selected ? 3 : 1.5}
+                />
+              )}
+              {/* Labels sit OUTSIDE the node, below it, so they are legible and
+                  never crammed inside the small node. The full label is shown
+                  (not truncated into the node); the kind is a smaller caption
+                  line beneath it. */}
               <text
                 className="node-label"
                 textAnchor="middle"
