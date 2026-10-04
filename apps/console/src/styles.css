@@ -249,6 +249,36 @@ body {
   overflow-x: auto;
 }
 
+/* The graph stage wraps the SVG and its view controls. It is positioned so the
+   reset-view control can sit over the top-right corner of the graph. */
+.graph-stage {
+  position: relative;
+}
+
+.graph-controls {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  z-index: 1;
+  display: flex;
+  gap: 0.4rem;
+}
+
+.graph-reset {
+  padding: 0.3rem 0.65rem;
+  background: rgba(22, 27, 34, 0.9);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.graph-reset:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 .graph-svg {
   width: 100%;
   height: auto;
@@ -256,6 +286,15 @@ body {
   background: #0a0e14;
   border: 1px solid var(--border);
   border-radius: 8px;
+  /* Mouse-first navigation: wheel to zoom, drag to pan. The grab cursor hints
+     that the graph can be dragged; it switches to grabbing while a pan is in
+     progress. The pan/zoom is a pure view transform over the fixed layout. */
+  cursor: grab;
+  touch-action: none;
+}
+
+.graph-svg.is-panning {
+  cursor: grabbing;
 }
 
 /* Nodes fade in when they first appear and animate color as they green or
@@ -353,6 +392,22 @@ body {
 .sw-tool { background: #9e6a03; }
 .sw-escalated { background: #f85149; }
 
+/* The tool legend glyph is a DIAMOND (a CSS-rotated square), matching the
+   diamond tool node drawn in the graph, so the legend and the graph agree that
+   the agent-built tool is a distinct shape, not a circle. It keeps the same
+   footprint as the circular swatches. */
+.swatch-diamond {
+  width: 0.8rem;
+  height: 0.8rem;
+  display: inline-block;
+  transform: rotate(45deg);
+  border: 1px solid #0d1117;
+}
+
+.swatch-diamond.sw-tool {
+  background: #9e6a03;
+}
+
 .line {
   width: 1.4rem;
   height: 0;
@@ -364,8 +419,11 @@ body {
 .ln-dependency { border-top-color: #5a6472; }
 .ln-dataflow { border-top-color: #3fb950; }
 .ln-spawn { border-top-color: #d2a8ff; border-top-style: dashed; }
-.ln-tool { border-top-color: #f0883e; border-top-style: dashed; }
-.ln-lease { border-top-color: #db6d28; border-top-style: dotted; }
+/* A consumed-tool edge is a SOLID amber line; a write-lease is a DOTTED teal
+   line. They mirror the graph-view edge styling exactly, so the legend reads
+   the same as the graph and the two are never confusable. */
+.ln-tool { border-top-color: #f0883e; border-top-style: solid; }
+.ln-lease { border-top-color: #2dd4bf; border-top-style: dotted; }
 
 /* --- Dial control --- */
 
@@ -390,6 +448,24 @@ body {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   min-width: 1.2rem;
   text-align: center;
+}
+
+/* The "locked for this run" indicator shown beside the disabled sliders while a
+   run is active, so it is obvious the dial is read-only for the run's lifetime. */
+.dial-locked {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 0.12rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(139, 148, 158, 0.15);
+  color: var(--muted);
+}
+
+.dial-row input[type="range"]:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .dial-row button {

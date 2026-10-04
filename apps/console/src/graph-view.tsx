@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 
 import type {
   GraphEdge,
@@ -123,9 +123,15 @@ function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
     case "spawn":
       return { stroke: "#d2a8ff", dash: "2 5" }; // event-driven recruitment
     case "consumed-tool":
-      return { stroke: "#f0883e", dash: "6 4" }; // a downstream agent ran the tool
+      // A real tool run: a bright AMBER edge, drawn solid (no dash), so it reads
+      // as a distinct tool-consumption and is never confused with the lease
+      // edge. A consumed-tool edge only ever appears next to a diamond tool node.
+      return { stroke: "#f0883e" };
     case "lease":
-      return { stroke: "#db6d28", dash: "1 4" }; // waiter waits for the lease owner
+      // Owner-coordination (a waiter waiting for the single write lease): a TEAL
+      // dotted edge, a clearly different hue and pattern from the amber tool
+      // edge, so the two are visually unmistakable even at render scale.
+      return { stroke: "#2dd4bf", dash: "1 5" };
     case "dependency":
     default:
       return { stroke: "#5a6472" };
@@ -177,6 +183,24 @@ interface GraphViewProps {
   readonly onSelect: (nodeId: string) => void;
 }
 
+/** The pan/zoom view transform: a scale `k` and a translation in SVG units. */
+interface ViewTransform {
+  readonly k: number;
+  readonly tx: number;
+  readonly ty: number;
+}
+
+const IDENTITY_VIEW: ViewTransform = { k: 1, tx: 0, ty: 0 };
+const MIN_SCALE = 0.3;
+const MAX_SCALE = 4;
+/** Pixels of mouse movement before a press is treated as a drag, not a click. */
+const DRAG_THRESHOLD = 4;
+
+/** Clamp a zoom scale into the allowed range. */
+function clampScale(k: number): number {
+  return Math.max(MIN_SCALE, Math.min(MAX_SCALE, k));
+}
+
 export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
   const { placed, height } = useMemo(() => placeNodes(model), [model]);
   const byId = useMemo(() => {
@@ -187,123 +211,272 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
     return map;
   }, [placed]);
 
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  // The view transform (pan/zoom) is a pure VIEW concern layered over the
+  // deterministic layout: the node coordinates are unchanged, only the wrapping
+  // <g> is translated and scaled. Resetting restores the identity view.
+  const [view, setView] = useState<ViewTransform>(IDENTITY_VIEW);
+  // Pan drag bookkeeping. `moved` lets a press be told apart from a drag so a
+  // click still selects a node but a drag only pans and does not select.
+  const drag = useRef<{
+    startX: number;
+    startY: number;
+    originTx: number;
+    originTy: number;
+    moved: boolean;
+  } | null>(null);
+
+  /**
+   * Convert a mouse event's client position to a coordinate in the SVG's own
+   * viewBox space, so wheel-zoom can keep the point under the cursor fixed. It
+   * maps through the element rect to the fixed viewBox (WIDTH x height), which
+   * is the untransformed space the view <g> sits in.
+   */
+  const clientToSvg = useCallback(
+    (clientX: number, clientY: number): { x: number; y: number } => {
+      const svg = svgRef.current;
+      if (!svg) {
+        return { x: 0, y: 0 };
+      }
+      const rect = svg.getBoundingClientRect();
+      const x = ((clientX - rect.left) / rect.width) * WIDTH;
+      const y = ((clientY - rect.top) / rect.height) * height;
+      return { x, y };
+    },
+    [height],
+  );
+
+  // Wheel to zoom, centered on the cursor: solve for the translation that keeps
+  // the SVG-space point under the pointer fixed as the scale changes.
+  const onWheel = useCallback(
+    (event: React.WheelEvent<SVGSVGElement>) => {
+      event.preventDefault();
+      const { x, y } = clientToSvg(event.clientX, event.clientY);
+      setView((prev) => {
+        const factor = Math.exp(-event.deltaY * 0.0015);
+        const k = clampScale(prev.k * factor);
+        if (k === prev.k) {
+          return prev;
+        }
+        // Keep (x,y) fixed: x = tx + k * sx  =>  sx = (x - tx)/k ; after zoom,
+        // tx' = x - k' * sx.
+        const sx = (x - prev.tx) / prev.k;
+        const sy = (y - prev.ty) / prev.k;
+        return { k, tx: x - k * sx, ty: y - k * sy };
+      });
+    },
+    [clientToSvg],
+  );
+
+  // Begin a potential pan on left-button press anywhere in the SVG background.
+  const onMouseDown = useCallback(
+    (event: React.MouseEvent<SVGSVGElement>) => {
+      if (event.button !== 0) {
+        return;
+      }
+      drag.current = {
+        startX: event.clientX,
+        startY: event.clientY,
+        originTx: view.tx,
+        originTy: view.ty,
+        moved: false,
+      };
+    },
+    [view.tx, view.ty],
+  );
+
+  const onMouseMove = useCallback(
+    (event: React.MouseEvent<SVGSVGElement>) => {
+      const d = drag.current;
+      if (!d) {
+        return;
+      }
+      const dxClient = event.clientX - d.startX;
+      const dyClient = event.clientY - d.startY;
+      if (!d.moved && Math.hypot(dxClient, dyClient) < DRAG_THRESHOLD) {
+        return; // below the threshold: still a click candidate, not a pan yet
+      }
+      d.moved = true;
+      const svg = svgRef.current;
+      const rect = svg?.getBoundingClientRect();
+      // Scale the client-pixel delta into SVG-space so panning tracks the cursor
+      // one-to-one regardless of how the SVG is sized in the layout.
+      const scaleX = rect ? WIDTH / rect.width : 1;
+      const scaleY = rect ? height / rect.height : 1;
+      setView((prev) => ({
+        ...prev,
+        tx: d.originTx + dxClient * scaleX,
+        ty: d.originTy + dyClient * scaleY,
+      }));
+    },
+    [height],
+  );
+
+  const endDrag = useCallback(() => {
+    drag.current = null;
+  }, []);
+
+  // A node click selects it only when the press did not become a drag, so
+  // dragging to pan over a node never accidentally selects it.
+  const handleNodeClick = useCallback(
+    (nodeId: string) => {
+      if (drag.current?.moved) {
+        return;
+      }
+      onSelect(nodeId);
+    },
+    [onSelect],
+  );
+
+  const resetView = useCallback(() => setView(IDENTITY_VIEW), []);
+  const transformed = view.k !== 1 || view.tx !== 0 || view.ty !== 0;
+
   return (
-    <svg
-      className="graph-svg"
-      viewBox={`0 0 ${WIDTH} ${height}`}
-      role="img"
-      aria-label="Living work graph"
-    >
-      <defs>
-        <marker
-          id="arrow"
-          viewBox="0 0 10 10"
-          refX="9"
-          refY="5"
-          markerWidth="7"
-          markerHeight="7"
-          orient="auto-start-reverse"
+    <div className="graph-stage">
+      {/* A small, always-present view control: reset returns to the identity
+          view (the deterministic layout at 1:1). It only enables once the view
+          has been panned or zoomed. */}
+      <div className="graph-controls">
+        <button
+          type="button"
+          className="graph-reset"
+          onClick={resetView}
+          disabled={!transformed}
+          title="Reset the pan/zoom view to fit"
         >
-          <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6472" />
-        </marker>
-      </defs>
+          Reset view
+        </button>
+      </div>
+      <svg
+        ref={svgRef}
+        className={`graph-svg${drag.current ? " is-panning" : ""}`}
+        viewBox={`0 0 ${WIDTH} ${height}`}
+        role="img"
+        aria-label="Living work graph"
+        onWheel={onWheel}
+        onMouseDown={onMouseDown}
+        onMouseMove={onMouseMove}
+        onMouseUp={endDrag}
+        onMouseLeave={endDrag}
+      >
+        <defs>
+          <marker
+            id="arrow"
+            viewBox="0 0 10 10"
+            refX="9"
+            refY="5"
+            markerWidth="7"
+            markerHeight="7"
+            orient="auto-start-reverse"
+          >
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#5a6472" />
+          </marker>
+        </defs>
 
-      {/* Edges first, so nodes draw on top. */}
-      <g className="edges">
-        {model.edges.map((edge) => {
-          const from = byId.get(edge.from);
-          const to = byId.get(edge.to);
-          if (!from || !to) {
-            return null;
-          }
-          const style = edgeStyle(edge.kind);
-          return (
-            <line
-              key={edge.id}
-              x1={from.x}
-              y1={from.y}
-              x2={to.x}
-              y2={to.y}
-              stroke={style.stroke}
-              strokeWidth={edge.kind === "data-flow" ? 2.5 : 1.5}
-              strokeDasharray={style.dash}
-              markerEnd="url(#arrow)"
-              className={`edge edge-${edge.kind}`}
-            >
-              <title>{`${edge.kind}: ${edge.from} to ${edge.to}`}</title>
-            </line>
-          );
-        })}
-      </g>
+        {/* The view transform wraps BOTH edges and nodes, so pan/zoom moves the
+            whole graph as one. The layout coordinates inside are untouched: this
+            is purely a view transform (translate + scale), so determinism and
+            every node's placement are unchanged. */}
+        <g transform={`translate(${view.tx}, ${view.ty}) scale(${view.k})`}>
+          {/* Edges first, so nodes draw on top. */}
+          <g className="edges">
+            {model.edges.map((edge) => {
+              const from = byId.get(edge.from);
+              const to = byId.get(edge.to);
+              if (!from || !to) {
+                return null;
+              }
+              const style = edgeStyle(edge.kind);
+              return (
+                <line
+                  key={edge.id}
+                  x1={from.x}
+                  y1={from.y}
+                  x2={to.x}
+                  y2={to.y}
+                  stroke={style.stroke}
+                  strokeWidth={edge.kind === "data-flow" ? 2.5 : 1.5}
+                  strokeDasharray={style.dash}
+                  markerEnd="url(#arrow)"
+                  className={`edge edge-${edge.kind}`}
+                >
+                  <title>{`${edge.kind}: ${edge.from} to ${edge.to}`}</title>
+                </line>
+              );
+            })}
+          </g>
 
-      {/* Nodes. Each is keyed by its stable id so React fades it in/out as the
-          state gains or loses it, rather than redrawing the whole set. */}
-      <g className="nodes">
-        {placed.map(({ node, x, y }) => {
-          const r = node.kind === "goal" ? GOAL_RADIUS : NODE_RADIUS;
-          const selected = node.id === selectedId;
-          return (
-            <g
-              key={node.id}
-              className={`node node-${node.kind} ${node.verified ? "is-verified" : ""} ${
-                node.escalated ? "is-escalated" : ""
-              } ${node.status === "failed" ? "is-failed" : ""} ${selected ? "is-selected" : ""}`}
-              transform={`translate(${x}, ${y})`}
-              tabIndex={0}
-              role="button"
-              aria-label={`${node.kind} ${node.label} (${node.status})`}
-              onClick={() => onSelect(node.id)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  onSelect(node.id);
-                }
-              }}
-            >
-              {/* The tool node is a DISTINCT shape (a diamond), so an
-                  agent-built tool published to its own repo reads as a tool/
-                  output artifact at a glance, not another agent circle. Every
-                  other node stays a circle. The diamond's half-diagonal matches
-                  the circle radius so it occupies the same visual footprint and
-                  the deterministic layout is unchanged. */}
-              {node.kind === "tool" ? (
-                <polygon
-                  points={diamondPoints(r)}
-                  fill={nodeFill(node)}
-                  stroke={selected ? "#e6edf3" : "#0d1117"}
-                  strokeWidth={selected ? 3 : 1.5}
-                />
-              ) : (
-                <circle
-                  r={r}
-                  fill={nodeFill(node)}
-                  stroke={selected ? "#e6edf3" : "#0d1117"}
-                  strokeWidth={selected ? 3 : 1.5}
-                />
-              )}
-              {/* Labels sit OUTSIDE the node, below it, so they are legible and
-                  never crammed inside the small node. The full label is shown
-                  (not truncated into the node); the kind is a smaller caption
-                  line beneath it. */}
-              <text
-                className="node-label"
-                textAnchor="middle"
-                y={r + LABEL_GAP + 11}
-              >
-                {node.label}
-              </text>
-              <text
-                className="node-kind"
-                textAnchor="middle"
-                y={r + LABEL_GAP + 24}
-              >
-                {node.kind}
-              </text>
-              <title>{`${node.label} [${node.kind}] status=${node.status}`}</title>
-            </g>
-          );
-        })}
-      </g>
-    </svg>
+          {/* Nodes. Each is keyed by its stable id so React fades it in/out as
+              the state gains or loses it, rather than redrawing the whole set. */}
+          <g className="nodes">
+            {placed.map(({ node, x, y }) => {
+              const r = node.kind === "goal" ? GOAL_RADIUS : NODE_RADIUS;
+              const selected = node.id === selectedId;
+              return (
+                <g
+                  key={node.id}
+                  className={`node node-${node.kind} ${node.verified ? "is-verified" : ""} ${
+                    node.escalated ? "is-escalated" : ""
+                  } ${node.status === "failed" ? "is-failed" : ""} ${selected ? "is-selected" : ""}`}
+                  transform={`translate(${x}, ${y})`}
+                  tabIndex={0}
+                  role="button"
+                  aria-label={`${node.kind} ${node.label} (${node.status})`}
+                  onClick={() => handleNodeClick(node.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      onSelect(node.id);
+                    }
+                  }}
+                >
+                  {/* The tool node is a DISTINCT shape (a diamond), so an
+                      agent-built tool published to its own repo reads as a tool/
+                      output artifact at a glance, not another agent circle.
+                      Every other node stays a circle. The diamond's
+                      half-diagonal matches the circle radius so it occupies the
+                      same visual footprint and the deterministic layout is
+                      unchanged. */}
+                  {node.kind === "tool" ? (
+                    <polygon
+                      points={diamondPoints(r)}
+                      fill={nodeFill(node)}
+                      stroke={selected ? "#e6edf3" : "#0d1117"}
+                      strokeWidth={selected ? 3 : 1.5}
+                    />
+                  ) : (
+                    <circle
+                      r={r}
+                      fill={nodeFill(node)}
+                      stroke={selected ? "#e6edf3" : "#0d1117"}
+                      strokeWidth={selected ? 3 : 1.5}
+                    />
+                  )}
+                  {/* Labels sit OUTSIDE the node, below it, so they are legible
+                      and never crammed inside the small node. The full label is
+                      shown (not truncated into the node); the kind is a smaller
+                      caption line beneath it. */}
+                  <text
+                    className="node-label"
+                    textAnchor="middle"
+                    y={r + LABEL_GAP + 11}
+                  >
+                    {node.label}
+                  </text>
+                  <text
+                    className="node-kind"
+                    textAnchor="middle"
+                    y={r + LABEL_GAP + 24}
+                  >
+                    {node.kind}
+                  </text>
+                  <title>{`${node.label} [${node.kind}] status=${node.status}`}</title>
+                </g>
+              );
+            })}
+          </g>
+        </g>
+      </svg>
+    </div>
   );
 }

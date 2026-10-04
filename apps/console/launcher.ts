@@ -50,6 +50,8 @@ interface LaunchedRun {
   readonly child: ChildProcess;
   status: "running" | "exited";
   exitCode: number | null;
+  /** The concurrency dial this run was launched with (its locked launch config). */
+  readonly dial: LaunchDial;
   /** The last lines of CLI output, kept small for an honest status read. */
   readonly log: string[];
 }
@@ -76,8 +78,47 @@ function freshChangeId(template: Template): string {
   return `console-${template.id}-${stamp}${rand}`.replace(/[^A-Za-z0-9._-]+/g, "-");
 }
 
-/** Build the run-live CLI args for a template and a generated unique id. */
-function runLiveArgs(template: Template, changeId: string): string[] {
+/**
+ * The concurrency dial captured for a launch. The human sets min/max in the
+ * console BEFORE launching, and that choice becomes this run's launch config:
+ * it is passed straight through to the run-live CLI as --min/--max, so the
+ * launched run uses it from the first wave. It is NOT changed mid-run (the
+ * console locks the dial once a run is active), so a run keeps the dial it was
+ * launched with.
+ */
+interface LaunchDial {
+  readonly min: number;
+  readonly max: number;
+}
+
+/** The dial defaults, matching the CLI's own dialFromArgs defaults. */
+const DEFAULT_DIAL: LaunchDial = { min: 1, max: 3 };
+
+/**
+ * Read and clamp a numeric dial bound from the launch body. A missing or
+ * non-finite value falls back to the default; the value is clamped to the same
+ * 0..8 range the console sliders expose, so a browser-supplied body can never
+ * drive the dial out of range.
+ */
+function dialBound(value: unknown, fallback: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+  return Math.max(0, Math.min(8, Math.round(n)));
+}
+
+/** Resolve the launch dial from the request body, clamped and defaulted. */
+function dialFromBody(body: Record<string, unknown>): LaunchDial {
+  const min = dialBound(body.min, DEFAULT_DIAL.min);
+  const max = dialBound(body.max, DEFAULT_DIAL.max);
+  // Keep the dial coherent: max is never below min, min is never below one.
+  const safeMin = Math.max(1, min);
+  return { min: safeMin, max: Math.max(safeMin, max) };
+}
+
+/** Build the run-live CLI args for a template, a generated unique id, and a dial. */
+function runLiveArgs(template: Template, changeId: string, dial: LaunchDial): string[] {
   const args = ["-w", "apps/cli", "run", "dev", "--", "run-live"];
   if (template.source.kind === "change") {
     args.push("--change", resolve(REPO_ROOT, template.source.changeFile));
@@ -86,6 +127,11 @@ function runLiveArgs(template: Template, changeId: string): string[] {
   }
   args.push("--project", resolve(REPO_ROOT, template.projectDir));
   args.push("--worker", WORKER_URL);
+  // The dial the human set BEFORE launching is this run's launch config. The
+  // run-live CLI already reads --min/--max (dialFromArgs), so passing them here
+  // means the launched run recruits under exactly the dial that was chosen; the
+  // console then locks the dial read-only for the life of the run.
+  args.push("--min", String(dial.min), "--max", String(dial.max));
   // A dynamic-branching template carries a discovery marker: pass it so a
   // completing unit discovers follow-up work carrying that marker in the target
   // repo, growing the live WorkGraph. The marker is a generic repo fact, not a
@@ -137,10 +183,10 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
-/** Spawn a run-live child for a template and track it. */
-function launch(template: Template): LaunchedRun {
+/** Spawn a run-live child for a template under a chosen dial and track it. */
+function launch(template: Template, dial: LaunchDial): LaunchedRun {
   const changeId = freshChangeId(template);
-  const args = runLiveArgs(template, changeId);
+  const args = runLiveArgs(template, changeId, dial);
   // Inherit the dev process environment (already sourced from .env by the make
   // target), so the Workers AI executor and the Artifacts token are present
   // without the launcher ever reading or forwarding the secret itself.
@@ -155,6 +201,7 @@ function launch(template: Template): LaunchedRun {
     child,
     status: "running",
     exitCode: null,
+    dial,
     log: [],
   };
   child.stdout?.on("data", (data: Buffer) => pushLog(run, data.toString("utf8")));
@@ -197,11 +244,15 @@ export function launcherPlugin(): Plugin {
             sendJson(res, 400, { error: `unknown template: ${templateId || "(none)"}` });
             return;
           }
-          const run = launch(template);
+          // The dial the human set before launching is captured as this run's
+          // launch config and passed through to the run-live CLI as --min/--max.
+          const dial = dialFromBody(body);
+          const run = launch(template, dial);
           sendJson(res, 201, {
             changeId: run.changeId,
             templateId: run.templateId,
             escalates: template.escalates,
+            dial: run.dial,
           });
         });
       });
@@ -222,6 +273,7 @@ export function launcherPlugin(): Plugin {
           templateId: run.templateId,
           status: run.status,
           exitCode: run.exitCode,
+          dial: run.dial,
           log: run.log,
         });
       });

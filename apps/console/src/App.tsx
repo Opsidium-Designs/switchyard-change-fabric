@@ -213,22 +213,10 @@ export function App() {
     }
   }, []);
 
-  // Push the dial to the real recruitment config (the engine lever), then refresh.
-  const applyDial = useCallback(async () => {
-    if (!changeId) {
-      return;
-    }
-    setBusy(true);
-    const ok = await post(`/changes/${encodeURIComponent(changeId)}/dial`, {
-      minConcurrency: min,
-      maxConcurrency: max,
-    });
-    if (ok) {
-      setNotice(`dial set to min ${min}, max ${max}`);
-      await load(changeId);
-    }
-    setBusy(false);
-  }, [post, changeId, min, max, load]);
+  // The dial is set BEFORE a run and locked during it: there is no mid-run
+  // re-POST that changes concurrency live. The chosen min/max is captured as the
+  // launched run's config (passed through POST /api/launch), and while a run is
+  // active the control is read-only, showing the in-force dial reported by state.
 
   // Launch a template: ask the launcher to start a real live run with a FRESH
   // UNIQUE Change id, then follow exactly that id. The browser is the launcher,
@@ -240,7 +228,7 @@ export function App() {
       const res = await fetch("/api/launch", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ templateId: template.id }),
+        body: JSON.stringify({ templateId: template.id, min, max }),
       });
       if (!res.ok) {
         const parsed = (await res.json().catch(() => ({}))) as { error?: string };
@@ -265,7 +253,7 @@ export function App() {
       setNotice("cannot reach the launcher. Is `make dev-all` running?");
     }
     setBusy(false);
-  }, []);
+  }, [min, max]);
 
   // Per-run cleanup: tear down THIS run's real Artifact repos (scoped to its
   // unique id), so clicking through templates repeatedly never leaves billable
@@ -369,18 +357,23 @@ export function App() {
       </section>
 
       {/*
-        The concurrency dial is ALWAYS part of the run surface, not gated behind
-        a launched run. Before a run it shows the min/max you can set and reads
-        as the pre-run default; "Apply dial" is only active once a run exists,
-        since the dial applies to a live Change. During a run its values sync
-        from the real reported dial and "Apply dial" POSTs the live config.
+        The concurrency dial is SET BEFORE a run and LOCKED DURING one. Before a
+        run (no changeId yet) the sliders are live: the min/max you choose here
+        becomes the launched run's config, passed through POST /api/launch so the
+        run recruits under exactly this dial from its first wave. Once a run is
+        active the control is READ-ONLY: it shows the in-force dial the run was
+        launched with (synced from the real reported dial), and there is no
+        mid-run re-POST that changes concurrency live. To run with a different
+        dial, set it here before launching the next run.
       */}
       <section className="app-panel dial-panel" aria-label="Concurrency dial">
         <h2>Concurrency dial</h2>
         <p className="muted">
-          The min/max dial is the real recruitment config. Raise max to widen
-          how many agent nodes run at once, by the same engine mechanism.
-          {changeId ? "" : " Pick a template to launch a run, then apply it live."}
+          The min/max dial is the real recruitment config: it bounds how many
+          agent nodes run at once, by the same engine mechanism.{" "}
+          {changeId
+            ? "A run is active, so the dial is locked to the config it launched with."
+            : "Set the concurrency for the next run, then launch a template above to apply it."}
         </p>
         <div className="dial-row">
           <label htmlFor="dial-min">min</label>
@@ -390,6 +383,7 @@ export function App() {
             min={0}
             max={8}
             value={min}
+            disabled={Boolean(changeId)}
             onChange={(event) => setMin(Number(event.target.value))}
           />
           <span className="dial-value">{min}</span>
@@ -400,25 +394,32 @@ export function App() {
             min={1}
             max={8}
             value={max}
+            disabled={Boolean(changeId)}
             onChange={(event) => setMax(Number(event.target.value))}
           />
           <span className="dial-value">{max}</span>
-          <button
-            type="button"
-            onClick={() => void applyDial()}
-            disabled={busy || !changeId}
-            title={changeId ? "Apply this dial to the live run" : "Launch a run to apply the dial live"}
-          >
-            Apply dial
-          </button>
+          {changeId ? (
+            <span className="dial-locked" title="The dial is fixed for the life of a run">
+              locked for this run
+            </span>
+          ) : null}
         </div>
-        {reportedDial ? (
-          <p className="muted">
-            in force now: min {reportedDial.minConcurrency}, max{" "}
-            {reportedDial.maxConcurrency}
-          </p>
+        {changeId ? (
+          reportedDial ? (
+            <p className="muted">
+              in force for this run: min {reportedDial.minConcurrency}, max{" "}
+              {reportedDial.maxConcurrency} (read-only until the run ends)
+            </p>
+          ) : (
+            <p className="muted">
+              launched with min {min}, max {max}: this run keeps that dial for its
+              lifetime
+            </p>
+          )
         ) : (
-          <p className="muted">no run yet: this is the dial you will apply once one is launched</p>
+          <p className="muted">
+            no run yet: this is the concurrency the next launched run will use
+          </p>
         )}
       </section>
 
@@ -536,13 +537,22 @@ function Legend() {
       <li><span className="swatch sw-agent" /> recruited agent (real repo)</li>
       <li><span className="swatch sw-verified" /> verified / integrated</li>
       <li><span className="swatch sw-failed" /> failed unit</li>
-      <li><span className="swatch sw-tool" /> agent-built tool (real repo)</li>
+      {/* The tool entry uses a DIAMOND glyph so it matches the diamond tool node
+          drawn in the graph, not a circular swatch like the other node kinds. */}
+      <li>
+        <span className="swatch-diamond sw-tool" aria-hidden="true" /> agent-built tool (real repo)
+      </li>
       <li><span className="swatch sw-escalated" /> pending human escalation</li>
       <li><span className="line ln-dependency" /> dependency</li>
       <li><span className="line ln-dataflow" /> data flow</li>
       <li><span className="line ln-spawn" /> event-driven spawn</li>
-      <li><span className="line ln-tool" /> consumed tool</li>
-      <li><span className="line ln-lease" /> write-lease (waiter to owner)</li>
+      {/* The two edges that used to both read as "orange dashed" are now plainly
+          distinct (see graph-view edgeStyle and styles.css): a consumed-tool
+          edge is a solid amber tool run, a write-lease is a dotted teal
+          owner-coordination edge, so they are never confusable. A consumed-tool
+          edge only ever appears alongside a diamond tool node by construction. */}
+      <li><span className="line ln-tool" /> consumed tool (agent ran a built tool)</li>
+      <li><span className="line ln-lease" /> write-lease (waiter waits for owner)</li>
     </ul>
   );
 }
