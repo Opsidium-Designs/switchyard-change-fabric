@@ -9,7 +9,6 @@
 #   make cli ARGS="doctor"   run the switchyard-change CLI
 #   make doctor    run the readiness check (switchyard-change doctor)
 #   make demo      run the example audit-logging Change end to end (offline)
-#   make anti-puppet   run two different goals through one engine (offline)
 #   make run-live-watch  watchable live run: stable id, escalation fires, repos left up
 #   make demo-live   one-command watchable live demo (needs `make dev-all` running)
 #   make clean-live  tear down the real repos a watch run left up
@@ -25,7 +24,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch demo-live clean-live seed-change anti-puppet deploy artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch demo-live clean-live seed-change deploy artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -92,7 +91,7 @@ decompose:
 
 # Decompose the audit-logging goal against the demo-project, whose natural
 # decomposition is a layered graph with dependency edges (contrast with the flat
-# `make decompose`). This is the anti-puppet contrast on the command line.
+# `make decompose`): two different goals, two shapes, one decomposer.
 decompose-audit:
 	npm -w apps/cli run dev -- decompose \
 	  --goal-file $(CURDIR)/examples/goals/audit-logging.goal.txt \
@@ -187,26 +186,6 @@ seed-change:
 	curl -s -X POST -H "content-type: text/plain" \
 	  --data-binary @"$(AUDIT_CHANGE)" "$(WORKER)/changes" >/dev/null \
 	  && echo "Seeded Change change-audit-logging into $(WORKER). Open the console (it auto-loads it)."
-
-# The anti-puppet demonstration: run TWO structurally different goals through the
-# SAME decomposer engine, with NO per-goal scripting, and show the two different
-# WorkGraphs side by side. Goal A (audit logging) decomposes against the layered
-# demo-project into a LAYERED graph with dependency edges; goal B (input
-# validation on every exported function) decomposes against the flat calc-project
-# into a FLAT fan-out with no edges. Same `decompose` code path, two shapes,
-# derived from (goal features x repo structure). Offline and deterministic.
-anti-puppet:
-	@echo "=== Goal A: audit logging (layered: dependency edges) ==="
-	@echo ""
-	npm -w apps/cli run dev -- decompose \
-	  --goal-file $(CURDIR)/examples/goals/audit-logging.goal.txt \
-	  --project $(CURDIR)/examples/demo-project
-	@echo ""
-	@echo "=== Goal B: input validation on every exported function (flat fan-out: no edges) ==="
-	@echo ""
-	npm -w apps/cli run dev -- decompose \
-	  --goal-file $(CURDIR)/examples/goals/add-input-validation.goal.txt \
-	  --project $(CURDIR)/examples/calc-project
 
 # Deploy the Worker to Cloudflare (wrangler deploy). This is the single hosted
 # Worker with the Artifacts + AI bindings and the repo-pushed Queue consumer, so
