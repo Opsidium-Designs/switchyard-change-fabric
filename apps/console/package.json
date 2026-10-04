@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@switchyard-change/orchestration": "*",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },

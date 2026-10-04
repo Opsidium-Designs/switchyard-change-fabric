@@ -16,6 +16,7 @@
  */
 
 import {
+  buildWorkGraph,
   detectPathCollisions,
   normalizeDial,
   parseChangeSpec,
@@ -24,6 +25,7 @@ import {
   workUnitStatuses,
   type Change,
   type ConcurrencyDial,
+  type Dependency,
   type PathCollision,
   type RecruitDecision,
   type WorkUnitStatus,
@@ -49,6 +51,7 @@ export interface LeaseRecord {
   readonly unitId: string;
   readonly ref: WorkspaceRef;
   readonly token: ScopedToken;
+  readonly leasedAt: string;
 }
 
 /** A read-only view of one WorkUnit's live state. */
@@ -59,6 +62,25 @@ export interface WorkUnitView {
   readonly paths: readonly string[];
   readonly status: WorkUnitStatus;
   readonly leased: boolean;
+  /**
+   * The real workspace (Artifact repo) identity backing this unit, present once
+   * a lease has provisioned one. Mirrors the Worker's WorkUnitView.workspace so
+   * the console projects the offline substrate and the live Worker identically.
+   * The plaintext token is never included (only the token id).
+   */
+  readonly workspace?: WorkspaceIdentity;
+}
+
+/** The real backing identity of a WorkUnit's workspace, mirroring the Worker. */
+export interface WorkspaceIdentity {
+  readonly workspaceId: string;
+  readonly workspaceName: string;
+  readonly gitUrl: string;
+  readonly defaultBranch: string;
+  readonly backend: string;
+  readonly fallback: boolean;
+  readonly tokenId: string;
+  readonly leasedAt: string;
 }
 
 /** The live, serializable projection of a Change's orchestration state. */
@@ -69,10 +91,13 @@ export interface ChangeStateView {
   readonly budgetUsd: number;
   readonly assurance: Change["assurance"];
   readonly work: readonly WorkUnitView[];
+  readonly edges: readonly Dependency[];
   readonly collisions: readonly PathCollision[];
   readonly completed: readonly string[];
   readonly spentUsd: number;
   readonly costEvents: readonly CostEvent[];
+  readonly dial: ConcurrencyDial;
+  readonly recruitments: readonly RecruitmentEvent[];
 }
 
 /** A recruitment plan for one wave in the offline substrate (mirrors the DO). */
@@ -246,9 +271,23 @@ export class LocalChangeControl {
     const change = record.change;
     const statuses = workUnitStatuses(change, record.completed);
     const collisions = detectPathCollisions(change);
+    const graph = buildWorkGraph(change);
     const work: WorkUnitView[] = change.work.map((unit) => {
       const base = statuses.get(unit.id) ?? "waiting";
       const leased = record.leases.has(unit.id);
+      const lease = record.leases.get(unit.id);
+      const workspace: WorkspaceIdentity | undefined = lease
+        ? {
+            workspaceId: lease.ref.id,
+            workspaceName: lease.ref.name,
+            gitUrl: lease.ref.gitUrl,
+            defaultBranch: lease.ref.defaultBranch,
+            backend: lease.ref.backend,
+            fallback: lease.ref.fallback,
+            tokenId: lease.token.id,
+            leasedAt: lease.leasedAt,
+          }
+        : undefined;
       return {
         id: unit.id,
         objective: unit.objective,
@@ -256,6 +295,7 @@ export class LocalChangeControl {
         paths: unit.paths,
         status: base === "runnable" && leased ? "running" : base,
         leased,
+        ...(workspace ? { workspace } : {}),
       };
     });
     return {
@@ -265,10 +305,13 @@ export class LocalChangeControl {
       budgetUsd: change.budgetUsd,
       assurance: change.assurance,
       work,
+      edges: graph.edges,
       collisions,
       completed: [...record.completed],
       spentUsd: this.spentUsd(changeId),
       costEvents: record.costEvents,
+      dial: record.dial,
+      recruitments: record.recruitments,
     };
   }
 
@@ -310,7 +353,7 @@ export class LocalChangeControl {
     const workspaceName = workspaceNameFor(changeId, unitId);
     const ref = await this.workspaces.create(workspaceName, { defaultBranch: "main" });
     const token = await this.workspaces.issueWriteToken(ref);
-    record.leases.set(unitId, { unitId, ref, token });
+    record.leases.set(unitId, { unitId, ref, token, leasedAt: new Date().toISOString() });
     record.workspaceUnits.set(ref.name, unitId);
     return json(
       {

@@ -25,6 +25,7 @@ export type {
   RecruitmentEvent,
   RecruitmentPlan,
   RepoPushedResult,
+  WorkspaceIdentity,
   WorkUnitView,
 } from "./local-control.ts";
 export { LocalChangeControl, workspaceNameFor } from "./local-control.ts";
@@ -71,6 +72,25 @@ export {
 } from "./decompose-goal.ts";
 
 export { formatChangePlan, formatRecruitmentSummary, formatRunSummary, formatStateView } from "./summary.ts";
+
+export type {
+  ChangeStateSnapshot,
+  CostEventSnapshot,
+  DependencySnapshot,
+  DialSnapshot,
+  EdgeBacking,
+  GraphEdge,
+  GraphEdgeKind,
+  GraphNode,
+  GraphNodeKind,
+  NodeBacking,
+  RecruitmentEventSnapshot,
+  WorkGraphModel,
+  WorkspaceIdentitySnapshot,
+  WorkUnitSnapshot,
+  WorkUnitStatus,
+} from "./graph-model.ts";
+export { assertBacked, buildWorkGraphModel, goalNodeId, unitNodeId } from "./graph-model.ts";
 
 export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor.ts";
 export { formatDoctorReport, runDoctor } from "./doctor.ts";

@@ -125,6 +125,42 @@ make cli ARGS='decompose "Add a health check endpoint" --project examples/demo-p
 make cli ARGS='run-goal --goal-file examples/goals/add-input-validation.goal.txt --project examples/calc-project'
 ```
 
+## The living work graph (the console)
+
+The console is the primary visual surface: a real-state-backed morphing graph of
+a living work graph. Bring up the Worker and the console together:
+
+```bash
+make dev-all     # Worker under wrangler dev + the console (Vite)
+```
+
+Then open the console, enter a Change id, and press Load. It polls the Worker's
+live state endpoint and renders the graph:
+
+- Nodes are the goal, the work-graph units, and recruited agents. A unit becomes
+  an agent node once the engine recruits it (a workspace is recorded for it), and
+  a node greens as its work is verified or integrated. Tool nodes and the
+  escalation highlight are typed hooks reserved for later milestones and are not
+  drawn yet.
+- Edges are dependency edges, data-flow edges (a dependency whose prerequisite is
+  complete, so data has flowed), and event-driven spawn edges (a real repo-pushed
+  event recruited the target). A consumed-tool edge kind is typed and reserved for
+  later.
+- Every node and edge is a projection of real durable state read from the Worker.
+  The graph is built by one pure function (`buildWorkGraphModel`) that routes
+  every node through a backing guard, so a node with no backing state cannot be
+  drawn. Clicking a node reveals its real backing: for an agent node, its real
+  Artifact repo name, clone URL, backend (live or the honest fallback), and real
+  status; for a work node, the real WorkUnit it stands for.
+- The min/max concurrency dial is a real control, not a cosmetic slider. It posts
+  the dial to the Worker's recruitment config and kicks a recruitment wave through
+  the same engine mechanism, so raising max and recruiting visibly widens how many
+  agent nodes run at once.
+
+The console renders the real state whether the workspaces are live Cloudflare
+Artifacts or the honest local fallback (when no account is configured), so the
+deterministic offline path is fully watchable.
+
 ## The example Change
 
 The seeded example lives in two files:

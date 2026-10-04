@@ -232,3 +232,214 @@ body {
 .arrow {
   color: var(--accent);
 }
+
+/* --- Living work graph --- */
+
+.app-shell {
+  max-width: 1100px;
+}
+
+.notice {
+  margin-top: 0.75rem;
+  color: var(--accent);
+  font-size: 0.9rem;
+}
+
+.graph-panel {
+  overflow-x: auto;
+}
+
+.graph-svg {
+  width: 100%;
+  height: auto;
+  display: block;
+  background: #0a0e14;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+/* Nodes fade in when they first appear and animate color as they green or
+   escalate. Because each node is keyed by its stable state id, a node mounting
+   is the state gaining it, and unmounting is the state losing it: the morph is
+   driven by state, the transition only smooths it. */
+.node circle {
+  transition: fill 0.6s ease, stroke 0.2s ease, r 0.4s ease;
+  cursor: pointer;
+}
+
+.node {
+  animation: node-appear 0.5s ease both;
+}
+
+@keyframes node-appear {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.6);
+  }
+}
+
+.node.is-escalated circle {
+  stroke: #ffdf5d;
+  stroke-width: 3;
+}
+
+.node-label {
+  fill: #e6edf3;
+  font-size: 0.72rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  pointer-events: none;
+}
+
+.node-kind {
+  fill: var(--muted);
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  pointer-events: none;
+}
+
+.edge {
+  transition: stroke 0.6s ease, stroke-width 0.4s ease;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1.25rem;
+  list-style: none;
+  margin: 1rem 0 0;
+  padding: 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.legend li {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.swatch {
+  width: 0.9rem;
+  height: 0.9rem;
+  border-radius: 50%;
+  display: inline-block;
+  border: 1px solid #0d1117;
+}
+
+.sw-goal { background: #1f6feb; }
+.sw-work { background: #21262d; border-color: var(--border); }
+.sw-agent { background: #30497a; }
+.sw-verified { background: #238636; }
+.sw-tool { background: #9e6a03; }
+.sw-escalated { background: #f85149; }
+
+.line {
+  width: 1.4rem;
+  height: 0;
+  display: inline-block;
+  border-top-width: 2px;
+  border-top-style: solid;
+}
+
+.ln-dependency { border-top-color: #5a6472; }
+.ln-dataflow { border-top-color: #3fb950; }
+.ln-spawn { border-top-color: #d2a8ff; border-top-style: dashed; }
+
+/* --- Dial control --- */
+
+.dial-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+}
+
+.dial-row label {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.dial-row input[type="range"] {
+  width: 9rem;
+}
+
+.dial-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  min-width: 1.2rem;
+  text-align: center;
+}
+
+.dial-row button {
+  padding: 0.4rem 0.85rem;
+  background: var(--accent);
+  color: #0d1117;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.dial-row button.secondary {
+  background: transparent;
+  color: var(--text);
+  border-color: var(--border);
+  font-weight: 500;
+}
+
+.dial-row button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* --- Node detail --- */
+
+.detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.detail-head button {
+  padding: 0.35rem 0.8rem;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.detail-panel h3 {
+  margin: 1.2rem 0 0.5rem;
+  font-size: 0.95rem;
+  color: var(--accent);
+}
+
+.detail-panel dd code {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.05rem 0.35rem;
+  word-break: break-all;
+}
+
+.raw-backing {
+  margin-top: 1rem;
+}
+
+.raw-backing summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.raw-backing pre {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+  overflow-x: auto;
+  font-size: 0.8rem;
+}

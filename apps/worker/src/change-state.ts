@@ -31,6 +31,27 @@ export interface LeaseWorkspace {
   readonly tokenExpiresAt: string;
 }
 
+/**
+ * The real backing identity of a WorkUnit's workspace (its Artifact repo),
+ * projected from the recorded lease. This is what the console reveals when a
+ * node is clicked: the actual repo name, clone URL, backend, and whether it is
+ * the honest local/memory fallback. The plaintext scoped token is deliberately
+ * never included here (only the token id), so the state projection carries the
+ * repo identity without leaking a credential.
+ */
+export interface WorkspaceIdentity {
+  readonly workspaceId: string;
+  readonly workspaceName: string;
+  readonly gitUrl: string;
+  readonly defaultBranch: string;
+  readonly backend: string;
+  /** True when this is the honest local/memory fallback, not a live repo. */
+  readonly fallback: boolean;
+  readonly tokenId: string;
+  readonly tokenExpiresAt: string;
+  readonly leasedAt: string;
+}
+
 /** The live view of a single WorkUnit, as served to the console and CLI. */
 export interface WorkUnitView {
   readonly id: string;
@@ -40,6 +61,12 @@ export interface WorkUnitView {
   readonly status: WorkUnitStatus;
   /** Whether a runner currently holds a lease on this unit. */
   readonly leased: boolean;
+  /**
+   * The real Artifact repo backing this unit, present once an agent has been
+   * recruited (a lease recorded) for it. Absent before recruitment. This is the
+   * honest backing the console reveals on click; it is never fabricated.
+   */
+  readonly workspace?: WorkspaceIdentity;
 }
 
 /** A recorded cost event emitted by a runner for a WorkUnit. */
@@ -181,6 +208,10 @@ export class ChangeState extends DurableObject<Env> {
     // id, so a repo-pushed event (which carries the workspace, not the unit) can
     // recognize which WorkUnit finished.
     await this.ctx.storage.put("workspaceUnits", {} as Record<string, string>);
+    // Map from unit id to its real workspace (Artifact repo) identity, recorded
+    // when the unit is leased and kept past completion so a completed node still
+    // reveals the real repo it ran in. The plaintext token is never stored here.
+    await this.ctx.storage.put("workspaces", {} as Record<string, WorkspaceIdentity>);
     return this.view();
   }
 
@@ -264,6 +295,22 @@ export class ChangeState extends DurableObject<Env> {
     const workspaceUnits = await this.loadWorkspaceUnits();
     workspaceUnits[workspace.workspaceName] = unitId;
     await this.ctx.storage.put("workspaceUnits", workspaceUnits);
+    // Record this unit's real workspace (Artifact repo) identity so the state
+    // projection can reveal it when the node is clicked, and keep it past
+    // completion. Only the token id is kept, never the plaintext token.
+    const workspaces = await this.loadWorkspaces();
+    workspaces[unitId] = {
+      workspaceId: record.workspaceId,
+      workspaceName: record.workspaceName,
+      gitUrl: record.gitUrl,
+      defaultBranch: record.defaultBranch,
+      backend: record.backend,
+      fallback: record.fallback,
+      tokenId: record.tokenId,
+      tokenExpiresAt: record.tokenExpiresAt,
+      leasedAt: record.leasedAt,
+    };
+    await this.ctx.storage.put("workspaces", workspaces);
     return record;
   }
 
@@ -445,6 +492,7 @@ export class ChangeState extends DurableObject<Env> {
     const transitions = await this.loadTransitions();
     const dial = await this.loadDial();
     const recruitments = await this.loadRecruitments();
+    const workspaces = await this.loadWorkspaces();
     const statuses = workUnitStatuses(change, completed);
     const graph = buildWorkGraph(change);
     const collisions = detectPathCollisions(change);
@@ -452,6 +500,7 @@ export class ChangeState extends DurableObject<Env> {
     const work: WorkUnitView[] = change.work.map((unit) => {
       const base = statuses.get(unit.id) ?? "waiting";
       const leased = leases[unit.id] !== undefined;
+      const workspace = workspaces[unit.id];
       return {
         id: unit.id,
         objective: unit.objective,
@@ -460,6 +509,9 @@ export class ChangeState extends DurableObject<Env> {
         // A leased, not-yet-complete unit reads as "running".
         status: base === "runnable" && leased ? "running" : base,
         leased,
+        // Present once an agent has been recruited for this unit; kept past
+        // completion so the node always reveals the real repo it ran in.
+        ...(workspace ? { workspace } : {}),
       };
     });
 
@@ -519,5 +571,9 @@ export class ChangeState extends DurableObject<Env> {
 
   private async loadWorkspaceUnits(): Promise<Record<string, string>> {
     return (await this.ctx.storage.get<Record<string, string>>("workspaceUnits")) ?? {};
+  }
+
+  private async loadWorkspaces(): Promise<Record<string, WorkspaceIdentity>> {
+    return (await this.ctx.storage.get<Record<string, WorkspaceIdentity>>("workspaces")) ?? {};
   }
 }

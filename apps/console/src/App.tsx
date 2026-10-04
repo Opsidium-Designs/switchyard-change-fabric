@@ -1,73 +1,55 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import {
+  buildWorkGraphModel,
+  type ChangeStateSnapshot,
+  type GraphNode,
+  type WorkGraphModel,
+} from "@switchyard-change/orchestration/graph-model";
+
+import { GraphView } from "./graph-view";
 
 /**
  * Console for the Switchyard Change Fabric.
  *
- * It reads a Change's live orchestration state from the Worker control API and
- * renders the WorkUnit list with runnable/waiting/done status plus the
- * dependency edges between units. State is polled on an interval so transitions
- * (a dependent moving from waiting to runnable as its prerequisite completes)
- * appear without a reload.
+ * This is the primary deliverable: a real-state-backed morphing graph of a
+ * living work graph. It polls a Change's live orchestration state from the
+ * Worker control API, projects that snapshot into the typed node/edge graph with
+ * the shared `buildWorkGraphModel` (the exact same projection the tests pin),
+ * and renders it. The morphing a watcher sees (nodes appearing as units become
+ * runnable and agents are recruited, greening as evidence lands, fading on
+ * cleanup) is a projection of real state transitions between successive
+ * snapshots, never a timed animation.
+ *
+ * Honesty: because the view is `buildWorkGraphModel(state)` and every node in
+ * that model carries a backing that resolves against the state (the builder
+ * routes every node through `assertBacked`), it is impossible to show a node
+ * with no backing state. Clicking a node reveals its real backing: for an agent
+ * node, its real Artifact repo identity and its real status/evidence; for a
+ * plain work node, the real WorkUnit it stands for.
+ *
+ * The dial is a real control, not a cosmetic slider: it POSTs the min/max to the
+ * Worker's `/dial` endpoint (the single lever M2 built), and the Recruit button
+ * POSTs `/recruit`, so raising max and recruiting visibly widens how many agent
+ * nodes become concurrently active, by the same engine mechanism.
  */
 
-type WorkUnitStatus =
-  | "waiting"
-  | "runnable"
-  | "running"
-  | "verified"
-  | "failed"
-  | "integrated";
-
-interface WorkUnitView {
-  id: string;
-  objective: string;
-  dependsOn: string[];
-  paths: string[];
-  status: WorkUnitStatus;
-}
-
-interface Dependency {
-  from: string;
-  to: string;
-}
-
-interface PathCollision {
-  path: string;
-  unitIds: string[];
-}
-
-interface ChangeStateView {
-  id: string;
-  objective: string;
-  baseline: string;
-  budgetUsd: number;
-  assurance: string;
-  work: WorkUnitView[];
-  edges: Dependency[];
-  collisions: PathCollision[];
-  completed: string[];
-}
-
-// The Worker control API runs separately under `wrangler dev`. Override the base
-// URL with VITE_WORKER_URL when it is not on the default local port.
+// The Worker control API runs separately under `wrangler dev`. Override with
+// VITE_WORKER_URL when it is not on the default local port.
 const WORKER_BASE: string =
   (import.meta.env.VITE_WORKER_URL as string | undefined) ?? "http://127.0.0.1:8787";
-const POLL_MS = 1500;
-
-const STATUS_LABEL: Record<WorkUnitStatus, string> = {
-  waiting: "waiting",
-  runnable: "runnable",
-  running: "running",
-  verified: "verified",
-  failed: "failed",
-  integrated: "done",
-};
+const POLL_MS = 1200;
 
 export function App() {
   const [changeId, setChangeId] = useState("change-audit-logging");
-  const [state, setState] = useState<ChangeStateView | null>(null);
+  const [snapshot, setSnapshot] = useState<ChangeStateSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [polling, setPolling] = useState(false);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [min, setMin] = useState(1);
+  const [max, setMax] = useState(3);
+  const [busy, setBusy] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const load = useCallback(async (id: string) => {
     try {
@@ -75,14 +57,14 @@ export function App() {
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as { error?: string };
         setError(body.error ?? `request failed (${res.status})`);
-        setState(null);
+        setSnapshot(null);
         return;
       }
-      setState((await res.json()) as ChangeStateView);
+      setSnapshot((await res.json()) as ChangeStateSnapshot);
       setError(null);
     } catch {
       setError(`cannot reach the Worker at ${WORKER_BASE}`);
-      setState(null);
+      setSnapshot(null);
     }
   }, []);
 
@@ -95,15 +77,102 @@ export function App() {
     return () => clearInterval(timer);
   }, [polling, changeId, load]);
 
+  // Build the graph model from the live snapshot. If the snapshot ever fails the
+  // backing guard (an unbacked node), surface it loudly rather than drawing a
+  // dishonest graph: the no-unbacked-node rule is enforced here too, at render.
+  const { model, backingError } = useMemo((): {
+    model: WorkGraphModel | null;
+    backingError: string | null;
+  } => {
+    if (!snapshot) {
+      return { model: null, backingError: null };
+    }
+    try {
+      return { model: buildWorkGraphModel(snapshot), backingError: null };
+    } catch (err) {
+      return {
+        model: null,
+        backingError: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }, [snapshot]);
+
+  // Keep the dial inputs in sync with the real dial the state reports, so the
+  // control shows the config actually in force (not a local guess).
+  const reportedDial = snapshot?.dial;
+  const lastDialKey = useRef<string>("");
+  useEffect(() => {
+    if (!reportedDial) {
+      return;
+    }
+    const key = `${reportedDial.minConcurrency}/${reportedDial.maxConcurrency}`;
+    if (key !== lastDialKey.current) {
+      lastDialKey.current = key;
+      setMin(reportedDial.minConcurrency);
+      setMax(reportedDial.maxConcurrency);
+    }
+  }, [reportedDial]);
+
+  const selectedNode: GraphNode | null = useMemo(() => {
+    if (!model || !selectedId) {
+      return null;
+    }
+    return model.nodes.find((n) => n.id === selectedId) ?? null;
+  }, [model, selectedId]);
+
+  const post = useCallback(async (path: string, body?: unknown): Promise<boolean> => {
+    try {
+      const res = await fetch(`${WORKER_BASE}${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const parsed = (await res.json().catch(() => ({}))) as { error?: string };
+        setNotice(parsed.error ?? `request failed (${res.status})`);
+        return false;
+      }
+      return true;
+    } catch {
+      setNotice(`cannot reach the Worker at ${WORKER_BASE}`);
+      return false;
+    }
+  }, []);
+
+  // Push the dial to the real recruitment config (the M2 lever), then refresh.
+  const applyDial = useCallback(async () => {
+    setBusy(true);
+    const ok = await post(`/changes/${encodeURIComponent(changeId)}/dial`, {
+      minConcurrency: min,
+      maxConcurrency: max,
+    });
+    if (ok) {
+      setNotice(`dial set to min ${min}, max ${max}`);
+      await load(changeId);
+    }
+    setBusy(false);
+  }, [post, changeId, min, max, load]);
+
+  // Kick off a recruitment wave under the current dial through the real engine.
+  const recruit = useCallback(async () => {
+    setBusy(true);
+    const ok = await post(`/changes/${encodeURIComponent(changeId)}/recruit`);
+    if (ok) {
+      setNotice("recruitment wave kicked off");
+      setPolling(true);
+      await load(changeId);
+    }
+    setBusy(false);
+  }, [post, changeId, load]);
+
   return (
     <main className="app-shell">
       <header className="app-header">
         <h1>Switchyard Change Fabric</h1>
-        <p className="tagline">Agent-native change coordination on Cloudflare</p>
+        <p className="tagline">A living work graph, every node backed by real state</p>
       </header>
 
       <section className="app-panel" aria-label="Load a Change">
-        <h2>Change state</h2>
         <form
           className="load-row"
           onSubmit={(event) => {
@@ -129,103 +198,175 @@ export function App() {
           </button>
         </form>
         {error ? <p className="error">{error}</p> : null}
+        {notice ? <p className="notice">{notice}</p> : null}
       </section>
 
-      {state ? <ChangeView state={state} /> : null}
+      {snapshot ? (
+        <section className="app-panel dial-panel" aria-label="Concurrency dial">
+          <h2>Concurrency dial</h2>
+          <p className="muted">
+            The min/max dial is the real recruitment config. Raise max and recruit
+            to widen how many agent nodes run at once, by the same engine mechanism.
+          </p>
+          <div className="dial-row">
+            <label htmlFor="dial-min">min</label>
+            <input
+              id="dial-min"
+              type="range"
+              min={0}
+              max={8}
+              value={min}
+              onChange={(event) => setMin(Number(event.target.value))}
+            />
+            <span className="dial-value">{min}</span>
+            <label htmlFor="dial-max">max</label>
+            <input
+              id="dial-max"
+              type="range"
+              min={1}
+              max={8}
+              value={max}
+              onChange={(event) => setMax(Number(event.target.value))}
+            />
+            <span className="dial-value">{max}</span>
+            <button type="button" onClick={() => void applyDial()} disabled={busy}>
+              Apply dial
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => void recruit()}
+              disabled={busy}
+            >
+              Recruit wave
+            </button>
+          </div>
+          {reportedDial ? (
+            <p className="muted">
+              in force now: min {reportedDial.minConcurrency}, max{" "}
+              {reportedDial.maxConcurrency}
+            </p>
+          ) : null}
+        </section>
+      ) : null}
+
+      {backingError ? (
+        <section className="app-panel" aria-label="Honesty guard">
+          <p className="error">
+            Refusing to render: a node had no backing state ({backingError}). The graph
+            only draws nodes that map to real ChangeState.
+          </p>
+        </section>
+      ) : null}
+
+      {model ? (
+        <section className="app-panel graph-panel" aria-label="Living work graph">
+          <GraphView model={model} selectedId={selectedId} onSelect={setSelectedId} />
+          <Legend />
+        </section>
+      ) : null}
+
+      {selectedNode ? (
+        <NodeDetail node={selectedNode} onClose={() => setSelectedId(null)} />
+      ) : null}
     </main>
   );
 }
 
-function ChangeView({ state }: { state: ChangeStateView }) {
-  const done = state.work.filter((unit) => unit.status === "integrated").length;
+/** The legend explaining node and edge kinds, including the reserved ones. */
+function Legend() {
   return (
-    <>
-      <section className="app-panel" aria-label="Change overview">
-        <h2>{state.id}</h2>
-        <p className="objective">{state.objective}</p>
-        <dl className="meta">
-          <div>
-            <dt>Baseline</dt>
-            <dd>{state.baseline}</dd>
-          </div>
-          <div>
-            <dt>Assurance</dt>
-            <dd>{state.assurance}</dd>
-          </div>
-          <div>
-            <dt>Budget</dt>
-            <dd>${state.budgetUsd.toFixed(2)}</dd>
-          </div>
-          <div>
-            <dt>Progress</dt>
-            <dd>
-              {done}/{state.work.length} done
-            </dd>
-          </div>
-        </dl>
-      </section>
+    <ul className="legend" aria-label="Legend">
+      <li><span className="swatch sw-goal" /> goal</li>
+      <li><span className="swatch sw-work" /> work unit</li>
+      <li><span className="swatch sw-agent" /> recruited agent (real repo)</li>
+      <li><span className="swatch sw-verified" /> verified / integrated</li>
+      <li><span className="swatch sw-tool" /> tool (reserved)</li>
+      <li><span className="swatch sw-escalated" /> escalation (reserved)</li>
+      <li><span className="line ln-dependency" /> dependency</li>
+      <li><span className="line ln-dataflow" /> data flow</li>
+      <li><span className="line ln-spawn" /> event-driven spawn</li>
+    </ul>
+  );
+}
 
-      <section className="app-panel" aria-label="Work units">
-        <h2>Work units</h2>
-        <ul className="work-list">
-          {state.work.map((unit) => (
-            <li key={unit.id} className="work-item">
-              <div className="work-head">
-                <span className="work-id">{unit.id}</span>
-                <span className={`badge badge-${unit.status}`}>
-                  {STATUS_LABEL[unit.status]}
-                </span>
+/**
+ * The node detail panel: the real backing of the clicked node. For an agent
+ * node this is its real Artifact repo identity (name, clone URL, backend, and
+ * whether it is the honest fallback) and its real status; for a work node it is
+ * the real WorkUnit it stands for. Nothing here is synthesized: every field is
+ * read straight from the node's backing, which was validated against the state.
+ */
+function NodeDetail({ node, onClose }: { node: GraphNode; onClose: () => void }) {
+  const backing = node.backing;
+  return (
+    <section className="app-panel detail-panel" aria-label="Node detail">
+      <div className="detail-head">
+        <h2>
+          {node.label} <span className="muted">[{node.kind}]</span>
+        </h2>
+        <button type="button" className="secondary" onClick={onClose}>
+          Close
+        </button>
+      </div>
+
+      <dl className="meta">
+        <div>
+          <dt>Status</dt>
+          <dd>{node.status}</dd>
+        </div>
+        <div>
+          <dt>Verified</dt>
+          <dd>{node.verified ? "yes" : "no"}</dd>
+        </div>
+        <div>
+          <dt>Backing kind</dt>
+          <dd>{backing.kind}</dd>
+        </div>
+      </dl>
+
+      {node.workspace ? (
+        <>
+          <h3>Real Artifact repo backing</h3>
+          <dl className="meta">
+            <div>
+              <dt>Repo name</dt>
+              <dd><code>{node.workspace.workspaceName}</code></dd>
+            </div>
+            <div>
+              <dt>Clone URL</dt>
+              <dd><code>{node.workspace.gitUrl}</code></dd>
+            </div>
+            <div>
+              <dt>Branch</dt>
+              <dd><code>{node.workspace.defaultBranch}</code></dd>
+            </div>
+            <div>
+              <dt>Backend</dt>
+              <dd>
+                {node.workspace.backend}
+                {node.workspace.fallback ? " (honest local/offline fallback)" : " (live)"}
+              </dd>
+            </div>
+            {node.workspace.leasedAt ? (
+              <div>
+                <dt>Leased at</dt>
+                <dd>{node.workspace.leasedAt}</dd>
               </div>
-              <p className="work-objective">{unit.objective}</p>
-              {unit.dependsOn.length > 0 ? (
-                <p className="work-deps">
-                  depends on: {unit.dependsOn.join(", ")}
-                </p>
-              ) : (
-                <p className="work-deps muted">no dependencies</p>
-              )}
-              <ul className="paths">
-                {unit.paths.map((path) => (
-                  <li key={path}>
-                    <code>{path}</code>
-                  </li>
-                ))}
-              </ul>
-            </li>
-          ))}
-        </ul>
-      </section>
+            ) : null}
+          </dl>
+        </>
+      ) : (
+        <p className="muted">
+          No agent has been recruited for this unit yet, so it has no Artifact repo.
+          It becomes an agent node (with a real repo) once the engine recruits it.
+        </p>
+      )}
 
-      <section className="app-panel" aria-label="Dependency edges">
-        <h2>Dependencies</h2>
-        {state.edges.length > 0 ? (
-          <ul className="edge-list">
-            {state.edges.map((edge) => (
-              <li key={`${edge.from}->${edge.to}`}>
-                <code>{edge.from}</code>
-                <span className="arrow"> {"->"} </span>
-                <code>{edge.to}</code>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="muted">No dependency edges.</p>
-        )}
-      </section>
-
-      {state.collisions.length > 0 ? (
-        <section className="app-panel" aria-label="Path collisions">
-          <h2>Declared path collisions</h2>
-          <ul className="collision-list">
-            {state.collisions.map((collision) => (
-              <li key={collision.path}>
-                <code>{collision.path}</code>
-                <span className="muted"> claimed by {collision.unitIds.join(", ")}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-    </>
+      <details className="raw-backing">
+        <summary>Raw backing state</summary>
+        <pre>{JSON.stringify(node.backing, null, 2)}</pre>
+      </details>
+    </section>
   );
 }
