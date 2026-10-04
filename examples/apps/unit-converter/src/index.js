@@ -16,8 +16,55 @@ const PAGE = `<!doctype html>
   <head><meta charset="utf-8" /><title>unit-converter</title></head>
   <body style="font-family: system-ui, sans-serif; max-width: 40rem; margin: 3rem auto;">
     <h1>unit-converter</h1>
-    <p>Convert Celsius to Fahrenheit at <code>/convert?c=100</code>.</p>
-    <p>100&deg;C should be <strong>212&deg;F</strong>.</p>
+    <p>This page calls the app's own <code>/convert</code> API and shows the live result.</p>
+    <p>
+      <label>Celsius: <input id="c" type="number" value="100" step="any" /></label>
+      <button id="go" type="button">Convert</button>
+    </p>
+    <p id="result" aria-live="polite">Loading...</p>
+    <p id="note"></p>
+    <script>
+      const cInput = document.getElementById("c");
+      const result = document.getElementById("result");
+      const note = document.getElementById("note");
+      const go = document.getElementById("go");
+
+      async function convert() {
+        const c = cInput.value;
+        result.textContent = "Converting...";
+        note.textContent = "";
+        try {
+          const res = await fetch("/convert?c=" + encodeURIComponent(c));
+          const data = await res.json();
+          if (!res.ok || typeof data.fahrenheit !== "number") {
+            result.textContent = "Error: " + (data.error || res.status);
+            return;
+          }
+          const actual = data.fahrenheit;
+          const expected = Number(c) * 9 / 5 + 32;
+          result.textContent = data.celsius + "C = " + actual + "F";
+          if (actual !== expected) {
+            note.innerHTML =
+              "<strong>Bug visible:</strong> the API returned " + actual +
+              "F, but " + data.celsius + "C should be " + expected + "F.";
+            note.style.color = "#b00020";
+          } else {
+            note.innerHTML =
+              "<strong>Correct:</strong> " + data.celsius + "C = " +
+              expected + "F.";
+            note.style.color = "#1b5e20";
+          }
+        } catch (err) {
+          result.textContent = "Request failed: " + err;
+        }
+      }
+
+      go.addEventListener("click", convert);
+      cInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") convert();
+      });
+      convert();
+    </script>
   </body>
 </html>
 `;

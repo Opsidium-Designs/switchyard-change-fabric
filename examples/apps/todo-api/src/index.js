@@ -21,6 +21,7 @@
 import { handleCreate } from "./routes/create.js";
 import { handleList } from "./routes/list.js";
 import { handleGet } from "./routes/get.js";
+import { handleHome } from "./routes/home.js";
 
 /** The in-memory store (reset per isolate; this is a demo app). */
 const TODOS = [];
@@ -30,6 +31,9 @@ export default {
     const url = new URL(request.url);
     const parts = url.pathname.split("/").filter((p) => p !== "");
 
+    if (request.method === "GET" && parts.length === 0) {
+      return handleHome();
+    }
     if (parts[0] !== "todos") {
       return json({ error: "not found" }, 404);
     }
