@@ -47,6 +47,9 @@ export {
   createWorkersAiRestInvoke,
   DEFAULT_WORKERS_AI_FALLBACK_MODEL,
   DEFAULT_WORKERS_AI_MODEL,
+  DEFAULT_WORKERS_AI_TIMEOUT_MS,
+  isTransientWorkersAiError,
   UnusableModelOutputError,
   WorkersAiExecutor,
+  WorkersAiTimeoutError,
 } from "./workers-ai.ts";

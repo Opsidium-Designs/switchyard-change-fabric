@@ -215,6 +215,55 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
   }
 
+  // Mark a WorkUnit FAILED (runner-driven): an agent ultimately could not
+  // complete it after the executor's bounded retries, or it timed out. This
+  // mirrors the /complete route but records a terminal failure instead of a
+  // completion: it revokes the lease's token (exactly as /complete does) and
+  // advances the work graph by freeing the dial slot, so one flaky model call
+  // fails just that unit rather than freezing the whole wave.
+  const failMatch = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/fail$/);
+  if (request.method === "POST" && failMatch) {
+    const changeId = decodeURIComponent(failMatch[1] ?? "");
+    const unitId = decodeURIComponent(failMatch[2] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: FailBody = {};
+    const raw = await request.text();
+    if (raw.trim() !== "") {
+      try {
+        body = JSON.parse(raw) as FailBody;
+      } catch {
+        return json({ error: "invalid failure body" }, 400);
+      }
+    }
+    const lease = await stub.getLease(unitId);
+    try {
+      await stub.failUnit(unitId, body.reason);
+      if (lease) {
+        const provisioner = selectProvisioner(env);
+        await provisioner.revoke(lease.workspaceName, lease.tokenId).catch(() => {});
+      }
+      // A failed unit freed a dial slot. Recruit the next wave the freed slot
+      // now allows (if any), exactly as a repo-pushed event does, so the wave
+      // advances instead of freezing. The runner drives these recruited agents.
+      const plan = await stub.planRecruitment();
+      const recruited = await provisionAndRecordWave(env, changeId, plan.recruit);
+      await stub.recordRecruitment({
+        trigger: "repo-pushed",
+        completedUnit: undefined,
+        recruited: recruited.map((r) => r.unitId),
+        ceiling: plan.ceiling,
+        inFlightAfter: plan.inFlight + recruited.length,
+      });
+      const state = await stub.getState();
+      return json({ ...state, recruited });
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
   // Configure the min/max concurrency dial for a Change. The dial is the single
   // lever that governs how many agents recruitment runs at once.
   const dialMatch = url.pathname.match(/^\/changes\/([^/]+)\/dial$/);
@@ -528,6 +577,11 @@ interface CostBody {
 
 interface CompleteBody {
   readonly cost?: CostBody;
+}
+
+/** Body of POST /changes/:id/work/:unit/fail: an optional short failure reason. */
+interface FailBody {
+  readonly reason?: string;
 }
 
 /** Body of POST /changes/:id/dial. Accepts min/max under either spelling. */

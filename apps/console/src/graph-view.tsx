@@ -132,10 +132,17 @@ function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
   }
 }
 
-/** The fill color for a node from its kind and verified/escalated state. */
+/** The fill color for a node from its kind and verified/escalated/failed state. */
 function nodeFill(node: GraphNode): string {
   if (node.escalated) {
-    return "#f85149"; // a pending human escalation lights this node (M5 beat)
+    return "#f85149"; // a pending human escalation lights this node (the human beat)
+  }
+  if (node.status === "failed") {
+    // A failed unit is a distinct terminal state: a dark, muted red, clearly not
+    // the healthy green of a verified node and not the blue of a running one, so
+    // a watcher sees a dead unit at a glance rather than a stuck-green or
+    // perpetually-running node.
+    return "#8b2c22";
   }
   if (node.kind === "tool") {
     return "#9e6a03"; // agent-built tool, published to its own repo
@@ -230,7 +237,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
               key={node.id}
               className={`node node-${node.kind} ${node.verified ? "is-verified" : ""} ${
                 node.escalated ? "is-escalated" : ""
-              } ${selected ? "is-selected" : ""}`}
+              } ${node.status === "failed" ? "is-failed" : ""} ${selected ? "is-selected" : ""}`}
               transform={`translate(${x}, ${y})`}
               tabIndex={0}
               role="button"

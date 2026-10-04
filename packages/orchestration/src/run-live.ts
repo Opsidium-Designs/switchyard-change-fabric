@@ -91,6 +91,14 @@ export interface LiveAgentReport {
   readonly changedPaths: readonly string[];
   /** The model id used, when an inference executor reported one. */
   readonly model?: string;
+  /**
+   * True when this agent ultimately failed (its executor errored past the
+   * bounded retries, or timed out) and the unit was reported FAILED to the
+   * Worker. A failed agent did not push a result; the wave advanced without it.
+   */
+  readonly failed?: boolean;
+  /** A short failure reason when `failed` is true (never a secret or a token). */
+  readonly failureReason?: string;
 }
 
 /** One live recruitment wave. */
@@ -138,6 +146,14 @@ export interface RunFullLiveResult {
   /** True when at least one agent held a real (non-fallback) Artifact repo. */
   readonly anyLive: boolean;
   readonly completed: readonly string[];
+  /**
+   * The WorkUnits an agent ultimately failed on (after the executor's bounded
+   * retries, or a timeout). Each is terminal-for-that-unit: the scheduler
+   * advanced the rest of the wave rather than freezing, so the run completes
+   * with these units failed instead of hanging. Backed by the Change state's
+   * failed set.
+   */
+  readonly failedUnits: readonly { readonly unitId: string; readonly reason: string }[];
   /** The escalation beat: what was raised, how it was resolved, and that it waited. */
   readonly escalation: EscalationReport;
   /** The deterministic verification + integration evidence. */
@@ -217,6 +233,7 @@ export interface RunFullLiveOptions {
 export type FullLiveEvent =
   | { readonly kind: "change-created"; readonly changeId: string }
   | { readonly kind: "wave"; readonly wave: LiveWave }
+  | { readonly kind: "agent-failed"; readonly unitId: string; readonly reason: string }
   | { readonly kind: "escalation-raised"; readonly escalation: Escalation }
   | { readonly kind: "escalation-resolved"; readonly escalation: Escalation }
   | { readonly kind: "verifying" }
@@ -277,6 +294,10 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   // clone the real repo for verification. For a file:// fallback the token is
   // ignored, so this is also correct offline.
   const unitAuthRemotes = new Map<string, string>();
+  // Next-wave agents the fail route returned for a failed unit, keyed by unit id,
+  // so runWave can advance from a failed unit the same way it advances from a
+  // repo-pushed event for a successful one.
+  const failRecruited = new Map<string, RecruitedAgent[]>();
   let anyLive = false;
   let peakConcurrency = 0;
 
@@ -313,6 +334,40 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
         changedPaths: result.changedPaths,
         ...(result.cost.model ? { model: result.cost.model } : {}),
       };
+    } catch (error) {
+      // The agent ultimately failed: its executor errored past the bounded
+      // retries, or timed out, or the clone/push failed. Rather than letting the
+      // throw propagate (which would reject the whole wave and freeze every other
+      // unit), report the unit FAILED to the Worker. That releases the lease and
+      // frees the dial slot, so the scheduler advances the remaining runnable
+      // units instead of blocking forever. We return a report marked failed so
+      // the wave aggregation records it; we do NOT rethrow.
+      const reason = failureReason(error);
+      allWorkspaces.add(agent.workspaceName);
+      let recruitedAfterFail: RecruitedAgent[] = [];
+      try {
+        const outcome = await post(
+          `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(agent.unitId)}/fail`,
+          { reason },
+        );
+        recruitedAfterFail = (outcome.recruited as RecruitedAgent[] | undefined) ?? [];
+      } catch {
+        // Best-effort: even if the fail signal itself fails to send, we still
+        // record the agent as failed locally so the run does not hang on it.
+      }
+      failRecruited.set(agent.unitId, recruitedAfterFail);
+      emit({ kind: "agent-failed", unitId: agent.unitId, reason });
+      return {
+        unitId: agent.unitId,
+        workspaceName: agent.workspaceName,
+        backend: agent.backend,
+        fallback: agent.fallback,
+        gitUrl: agent.gitUrl,
+        commit: "",
+        changedPaths: [],
+        failed: true,
+        failureReason: reason,
+      };
     } finally {
       await rm(worktreeDir, { recursive: true, force: true });
     }
@@ -326,13 +381,63 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       return;
     }
     peakConcurrency = Math.max(peakConcurrency, agents.length);
-    const reports = await Promise.all(agents.map((a) => runAgent(a)));
+    // Use allSettled, not all: one agent's failure must NOT cancel its siblings.
+    // runAgent itself converts an executor failure into a FAILED report (it
+    // reports the unit failed to the Worker and returns a failed report rather
+    // than throwing), so a rejection here would be an unexpected internal error;
+    // we still guard with allSettled so a single bad unit can never wedge the
+    // wave or stop the surviving agents from driving the next wave.
+    const settled = await Promise.allSettled(agents.map((a) => runAgent(a)));
+    const reports: LiveAgentReport[] = [];
+    for (let i = 0; i < settled.length; i += 1) {
+      const outcome = settled[i]!;
+      if (outcome.status === "fulfilled") {
+        reports.push(outcome.value);
+      } else {
+        // Defensive: runAgent is written not to throw, but if it ever does, fail
+        // the unit to the Worker so the wave still advances rather than freezing.
+        const agent = agents[i]!;
+        const reason = failureReason(outcome.reason);
+        allWorkspaces.add(agent.workspaceName);
+        try {
+          const failOut = await post(
+            `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(agent.unitId)}/fail`,
+            { reason },
+          );
+          failRecruited.set(agent.unitId, (failOut.recruited as RecruitedAgent[] | undefined) ?? []);
+        } catch {
+          failRecruited.set(agent.unitId, []);
+        }
+        emit({ kind: "agent-failed", unitId: agent.unitId, reason });
+        reports.push({
+          unitId: agent.unitId,
+          workspaceName: agent.workspaceName,
+          backend: agent.backend,
+          fallback: agent.fallback,
+          gitUrl: agent.gitUrl,
+          commit: "",
+          changedPaths: [],
+          failed: true,
+          failureReason: reason,
+        });
+      }
+    }
     const wave: LiveWave = { trigger: waveTrigger, concurrency: agents.length, agents: reports };
     waves.push(wave);
     emit({ kind: "wave", wave });
 
     const next: RecruitedAgent[] = [];
     for (const report of reports) {
+      // A failed agent already signalled its failure through the fail route,
+      // which released its lease, freed the dial slot, and returned the next
+      // wave the freed slot allows (if any). Use that recruited set to drive the
+      // wave forward instead of a repo-pushed event, since a failed unit
+      // produced no push. A successful agent drives the next wave from its
+      // repo-pushed event as before.
+      if (report.failed) {
+        next.push(...(failRecruited.get(report.unitId) ?? []));
+        continue;
+      }
       const outcome = await post("/events/repo-pushed", {
         changeId,
         workspace: report.workspaceName,
@@ -440,6 +545,9 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     workspaces: [...allWorkspaces].sort(),
     anyLive,
     completed: (completedState.completed as string[] | undefined) ?? [],
+    failedUnits: (
+      (completedState.failed as { unitId?: string; reason?: string }[] | undefined) ?? []
+    ).map((f) => ({ unitId: String(f.unitId ?? ""), reason: String(f.reason ?? "agent failed") })),
     escalation,
     evidence,
     promotion,
@@ -758,6 +866,22 @@ export async function cleanupLive(options: {
     .sort();
   const archived = await cleanup(base, fetchFn, workspaces);
   return { changeId: options.changeId, workerUrl: base, workspaces, archived };
+}
+
+/**
+ * A short, readable failure reason from a thrown executor error, bounded in
+ * length. The executor never puts a credential in its error, but bound the
+ * length defensively so a huge stack trace does not bloat the state. The DO
+ * sanitizes it again before storing it.
+ */
+function failureReason(error: unknown): string {
+  const text = (error instanceof Error ? error.message : String(error ?? "agent failed"))
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text === "") {
+    return "agent failed";
+  }
+  return text.length > 300 ? `${text.slice(0, 297)}...` : text;
 }
 
 function safeJson(text: string): unknown {

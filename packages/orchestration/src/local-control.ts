@@ -108,6 +108,19 @@ export interface ChangeStateView {
   readonly leaseEdges: readonly LeaseEdge[];
   /** Human escalations recorded for this Change (pending and resolved). */
   readonly escalations: readonly Escalation[];
+  /**
+   * The WorkUnits an agent ultimately failed on, with the reason. A failed unit
+   * is terminal-for-that-unit and does not block the rest of the wave. Mirrors
+   * the Worker's ChangeStateView so the console projects both identically.
+   */
+  readonly failed: readonly FailureRecord[];
+}
+
+/** A recorded WorkUnit failure (mirrors the Worker's FailureRecord). */
+export interface FailureRecord {
+  readonly unitId: string;
+  readonly reason: string;
+  readonly at: string;
 }
 
 /** The agent-built tool recorded on the Change (mirrors the Worker). */
@@ -206,6 +219,8 @@ class ChangeRecord {
   readonly toolConsumptions: ToolConsumption[] = [];
   /** Human escalations recorded for this Change (pending and resolved). */
   readonly escalations: Escalation[] = [];
+  /** WorkUnits an agent ultimately failed on (mirrors the DO's failed set). */
+  readonly failed = new Map<string, FailureRecord>();
   constructor(change: Change) {
     this.change = change;
   }
@@ -317,6 +332,42 @@ export class LocalChangeControl {
     );
   }
 
+  /** The WorkUnits an agent ultimately failed on for a Change. */
+  failures(changeId: string): readonly FailureRecord[] {
+    return [...this.require(changeId).failed.values()];
+  }
+
+  /**
+   * Mark a WorkUnit FAILED (mirrors the DO's failUnit). An agent ultimately
+   * could not complete it after the executor's bounded retries, or it timed out.
+   * It releases the lease so the dial frees the slot and the wave advances, and
+   * records a durable failure so the unit projects status "failed". A failed
+   * unit is terminal-for-that-unit and NOT added to completed, so its dependents
+   * stay blocked while the rest of the open runnable set advances. Idempotent:
+   * failing an already-completed unit is a safe no-op (a late failure signal
+   * does not undo a real success).
+   */
+  failUnit(changeId: string, unitId: string, reason?: string): FailureRecord | null {
+    const record = this.require(changeId);
+    if (!record.change.work.some((u) => u.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    if (record.completed.has(unitId)) {
+      return record.failed.get(unitId) ?? null;
+    }
+    let failure = record.failed.get(unitId);
+    if (!failure) {
+      failure = {
+        unitId,
+        reason: ((reason ?? "agent failed").toString().replace(/\s+/g, " ").trim() || "agent failed").slice(0, 300),
+        at: new Date().toISOString(),
+      };
+      record.failed.set(unitId, failure);
+    }
+    record.leases.delete(unitId);
+    return failure;
+  }
+
   /**
    * Record the agent-built tool published for this Change (mirrors the DO). The
    * builder unit must exist, so a tool node is backed by a real builder.
@@ -359,7 +410,7 @@ export class LocalChangeControl {
   planRecruitment(changeId: string): RecruitmentPlan {
     const record = this.require(changeId);
     const runnable = runnableUnits(record.change, record.completed);
-    const openRunnable = runnable.filter((id) => !record.leases.has(id));
+    const openRunnable = runnable.filter((id) => !record.leases.has(id) && !record.failed.has(id));
     // In flight = agents still running: leased but not yet completed. Completed
     // leases are retained for later verification, so they must not count toward
     // the concurrency ceiling or recruitment would stall after the first wave.
@@ -399,7 +450,12 @@ export class LocalChangeControl {
     }
 
     const plan = this.planRecruitment(changeId);
-    const done = record.completed.size >= record.change.work.length && plan.recruit.length === 0;
+    // The wave is done when nothing is left to recruit and every unit has reached
+    // a terminal state (completed or failed). A failed unit is terminal, so a run
+    // with some failures still finishes rather than waiting forever for a count
+    // of completed units it can never reach.
+    const terminal = record.completed.size + record.failed.size;
+    const done = terminal >= record.change.work.length && plan.recruit.length === 0;
     const event: RecruitmentEvent = {
       trigger: "repo-pushed",
       pushedWorkspace: workspaceName,
@@ -468,12 +524,19 @@ export class LocalChangeControl {
             leasedAt: lease.leasedAt,
           }
         : undefined;
+      // A failed unit projects "failed" over any derived status, mirroring the
+      // Worker: it is terminal-for-that-unit even though it released its lease.
+      const status: WorkUnitStatus = record.failed.has(unit.id)
+        ? "failed"
+        : base === "runnable" && leased
+          ? "running"
+          : base;
       return {
         id: unit.id,
         objective: unit.objective,
         dependsOn: unit.dependsOn,
         paths: unit.paths,
-        status: base === "runnable" && leased ? "running" : base,
+        status,
         leased,
         ...(workspace ? { workspace } : {}),
       };
@@ -496,6 +559,9 @@ export class LocalChangeControl {
       toolConsumptions: record.toolConsumptions,
       leaseEdges,
       escalations: record.escalations,
+      failed: [...record.failed.values()].sort((a, b) =>
+        a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0,
+      ),
     };
   }
 
@@ -515,6 +581,10 @@ export class LocalChangeControl {
     const complete = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/complete$/);
     if (method === "POST" && complete) {
       return this.handleComplete(dec(complete[1]), dec(complete[2]), parseBody(init));
+    }
+    const fail = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/fail$/);
+    if (method === "POST" && fail) {
+      return this.handleFail(dec(fail[1]), dec(fail[2]), parseBody(init));
     }
     return json({ error: "not found" }, 404);
   };
@@ -611,6 +681,28 @@ export class LocalChangeControl {
       { completed: [...record.completed], statuses: Object.fromEntries(statuses) },
       200,
     );
+  }
+
+  private async handleFail(
+    changeId: string,
+    unitId: string,
+    body: Record<string, unknown>,
+  ): Promise<Response> {
+    const record = this.records.get(changeId);
+    if (!record) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    if (!record.change.work.some((u) => u.id === unitId)) {
+      return json({ error: `unknown WorkUnit: ${unitId}` }, 404);
+    }
+    const lease = record.leases.get(unitId);
+    const failure = this.failUnit(changeId, unitId, body.reason as string | undefined);
+    if (lease) {
+      // Revoke the token exactly as completion does; the workspace ref is kept
+      // for any later inspection, but the unit is terminal and not integrated.
+      await this.workspaces.revokeToken(lease.ref, lease.token.id).catch(() => {});
+    }
+    return json({ failed: failure, completed: [...record.completed] }, 200);
   }
 
   private require(changeId: string): ChangeRecord {

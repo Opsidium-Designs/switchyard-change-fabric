@@ -283,6 +283,14 @@ body {
   stroke-width: 3;
 }
 
+/* A failed unit is terminal: a muted-red fill (set in graph-view) with a bright
+   red outline, so it reads clearly as a dead node, never a stuck-green or
+   perpetually-running one. */
+.node.is-failed circle {
+  stroke: #f85149;
+  stroke-width: 3;
+}
+
 .node-label {
   fill: #e6edf3;
   font-size: 0.8rem;
@@ -341,6 +349,7 @@ body {
 .sw-work { background: #21262d; border-color: var(--border); }
 .sw-agent { background: #30497a; }
 .sw-verified { background: #238636; }
+.sw-failed { background: #8b2c22; border-color: #f85149; }
 .sw-tool { background: #9e6a03; }
 .sw-escalated { background: #f85149; }
 

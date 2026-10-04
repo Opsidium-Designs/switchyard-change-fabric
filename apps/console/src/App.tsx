@@ -492,6 +492,7 @@ function Legend() {
       <li><span className="swatch sw-work" /> work unit</li>
       <li><span className="swatch sw-agent" /> recruited agent (real repo)</li>
       <li><span className="swatch sw-verified" /> verified / integrated</li>
+      <li><span className="swatch sw-failed" /> failed unit</li>
       <li><span className="swatch sw-tool" /> agent-built tool (real repo)</li>
       <li><span className="swatch sw-escalated" /> pending human escalation</li>
       <li><span className="line ln-dependency" /> dependency</li>

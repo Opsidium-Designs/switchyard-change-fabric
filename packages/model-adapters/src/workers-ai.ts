@@ -100,6 +100,31 @@ export interface WorkersAiExecutorOptions {
   readonly maxContextFiles?: number;
   /** The maximum bytes of any one file sent to the model. Defaults to 8 KiB. */
   readonly maxFileBytes?: number;
+  /**
+   * How many times to retry a TRANSIENT model-call failure (a provider internal
+   * error, a 5xx, or a timeout) before giving up. This is a small bounded cap so
+   * a single flaky call on a hosted model does not fail the whole unit, while a
+   * hard cap keeps it from looping forever. Each attempt still tries the headline
+   * model then the fallback once, so the retry sits on top of the existing
+   * two-model path. Defaults to 2. A non-transient failure (for example a bad
+   * model reply) is not retried: that is an honest failure, not a flaky call.
+   */
+  readonly maxRetries?: number;
+  /**
+   * Backoff before each retry, in milliseconds. Injectable so tests retry with
+   * zero delay and stay fast and offline. Defaults to a short 500 ms base; a real
+   * run can leave the default.
+   */
+  readonly retryBackoffMs?: number;
+  /**
+   * Classify whether a thrown error is a transient provider failure worth
+   * retrying (a 5xx, an internal error, or a timeout) versus a hard failure that
+   * should fail immediately. Injectable for tests; defaults to a conservative
+   * matcher over the error message.
+   */
+  readonly isTransientError?: (error: unknown) => boolean;
+  /** Injectable sleep, for tests (so a retry does not actually wait). */
+  readonly sleep?: (ms: number) => Promise<void>;
   /** Injectable reader, for tests. Defaults to reading the real worktree. */
   readonly readScopedFiles?: (
     worktreeDir: string,
@@ -112,6 +137,8 @@ export interface WorkersAiExecutorOptions {
 
 const DEFAULT_MAX_CONTEXT_FILES = 6;
 const DEFAULT_MAX_FILE_BYTES = 8 * 1024;
+const DEFAULT_MAX_RETRIES = 2;
+const DEFAULT_RETRY_BACKOFF_MS = 500;
 
 /** Thrown when the model returns something the executor cannot use as an edit. */
 export class UnusableModelOutputError extends Error {
@@ -119,6 +146,53 @@ export class UnusableModelOutputError extends Error {
     super(message);
     this.name = "UnusableModelOutputError";
   }
+}
+
+/**
+ * Thrown when a Workers AI call does not settle within the configured timeout.
+ * It is a distinct type so the retry classifier (and a caller) can tell a hung
+ * call apart from a provider error, and so a timeout is clearly surfaced rather
+ * than hanging the agent forever.
+ */
+export class WorkersAiTimeoutError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkersAiTimeoutError";
+  }
+}
+
+/**
+ * The default transient-error classifier: a provider internal error, a 5xx, an
+ * aborted/timed-out call, or a network-level fetch failure is transient and
+ * worth a bounded retry. A UnusableModelOutputError (a bad model reply) is NOT
+ * transient: retrying it would not help and would hide an honest failure.
+ */
+export function isTransientWorkersAiError(error: unknown): boolean {
+  if (error instanceof UnusableModelOutputError) {
+    return false;
+  }
+  if (error instanceof WorkersAiTimeoutError) {
+    return true;
+  }
+  const message = (error instanceof Error ? error.message : String(error ?? "")).toLowerCase();
+  if (message === "") {
+    return false;
+  }
+  return (
+    message.includes("http 5") ||
+    message.includes("internal error") ||
+    message.includes("internalerror") ||
+    message.includes("timeout") ||
+    message.includes("timed out") ||
+    message.includes("aborted") ||
+    message.includes("abort") ||
+    message.includes("econnreset") ||
+    message.includes("network") ||
+    message.includes("fetch failed") ||
+    message.includes("socket hang up") ||
+    message.includes("service unavailable") ||
+    message.includes("temporarily")
+  );
 }
 
 export class WorkersAiExecutor implements ExecutorProvider {
@@ -150,21 +224,62 @@ export class WorkersAiExecutor implements ExecutorProvider {
 
     const messages = buildMessages(context, contextFiles);
 
-    // Try the headline model, then the cheaper fallback model once if the
-    // headline call throws (a provider error, not a bad reply). A bad reply from
-    // either model is an honest failure, not grounds for a silent noop.
-    let result: WorkersAiInvokeResult;
-    let usedModel = this.model;
-    try {
-      result = await this.options.invoke({ model: this.model, messages });
-    } catch (headlineError) {
-      if (this.fallbackModel && this.fallbackModel !== this.model) {
-        usedModel = this.fallbackModel;
-        result = await this.options.invoke({ model: this.fallbackModel, messages });
-      } else {
+    const maxRetries = Math.max(0, this.options.maxRetries ?? DEFAULT_MAX_RETRIES);
+    const backoffMs = this.options.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS;
+    const isTransient = this.options.isTransientError ?? isTransientWorkersAiError;
+    const sleep = this.options.sleep ?? defaultSleep;
+
+    // One attempt tries the headline model, then the cheaper fallback model once
+    // if the headline call throws (a provider error, not a bad reply). A bad
+    // reply from either model is an honest failure, not grounds for a silent
+    // noop. The whole attempt is wrapped in a bounded retry: a transient
+    // provider failure or a timeout (a flaky hosted-model call) is retried up to
+    // `maxRetries` times with a short backoff, so one wedged or internal-error
+    // call does not fail the unit. The retry cap is hard, so it can never loop
+    // forever, and a non-transient failure is thrown immediately.
+    const attempt = async (): Promise<{ result: WorkersAiInvokeResult; usedModel: string }> => {
+      try {
+        return { result: await this.options.invoke({ model: this.model, messages }), usedModel: this.model };
+      } catch (headlineError) {
+        if (this.fallbackModel && this.fallbackModel !== this.model) {
+          return {
+            result: await this.options.invoke({ model: this.fallbackModel, messages }),
+            usedModel: this.fallbackModel,
+          };
+        }
         throw headlineError;
       }
+    };
+
+    let result: WorkersAiInvokeResult;
+    let usedModel = this.model;
+    let lastError: unknown;
+    for (let tryNo = 0; tryNo <= maxRetries; tryNo += 1) {
+      try {
+        const outcome = await attempt();
+        result = outcome.result;
+        usedModel = outcome.usedModel;
+        lastError = undefined;
+        break;
+      } catch (error) {
+        lastError = error;
+        // Stop immediately on a hard (non-transient) failure, or once the bounded
+        // retries are exhausted. Otherwise back off and try the whole two-model
+        // attempt again.
+        if (tryNo >= maxRetries || !isTransient(error)) {
+          throw error;
+        }
+        if (backoffMs > 0) {
+          await sleep(backoffMs * (tryNo + 1));
+        }
+      }
     }
+    if (lastError !== undefined) {
+      throw lastError;
+    }
+    // After a successful break, result is assigned; the non-null assertion is
+    // safe because the loop either assigns result and breaks or throws.
+    result = result!;
 
     const parsed = parseEdits(result.text);
     if (parsed.edits.length === 0) {
@@ -445,8 +560,25 @@ export interface WorkersAiRestOptions {
   readonly apiToken: string;
   /** Override the API base, for a proxy or a test. Defaults to the public API. */
   readonly baseUrl?: string;
+  /**
+   * How long a single model call may run before it is aborted and surfaced as a
+   * WorkersAiTimeoutError, in milliseconds. This is the safety net for a slow or
+   * hung hosted-model call: without it a wedged request would hang the agent
+   * forever and freeze the wave. Defaults to 75 seconds, comfortably long for a
+   * real coding model while still bounding a hang. Set to 0 to disable (not
+   * recommended for a live run).
+   */
+  readonly timeoutMs?: number;
   /** Injectable fetch, for tests. Defaults to the global fetch. */
   readonly fetchFn?: typeof fetch;
+}
+
+/** The default per-call timeout for the live REST transport (75 seconds). */
+export const DEFAULT_WORKERS_AI_TIMEOUT_MS = 75_000;
+
+/** A real (non-injected) sleep used between bounded retries. */
+function defaultSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**
@@ -456,22 +588,53 @@ export interface WorkersAiRestOptions {
  * a Worker `env.AI` binding. The token is held in this closure only and is never
  * returned, logged, or written anywhere.
  *
+ * The call is bounded by a timeout via an AbortController: if the model does not
+ * respond within `timeoutMs` the request is aborted and surfaced as a distinct
+ * WorkersAiTimeoutError, so a hung call cannot wedge the agent forever. The
+ * executor's bounded retry treats that timeout as a transient failure.
+ *
  * The REST response shape is `{ result: { response: "..." }, ... }` for the chat
  * text-generation models; usage, when present, is read from `result.usage`.
  */
 export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): WorkersAiInvoke {
   const fetchFn = options.fetchFn ?? fetch;
   const base = (options.baseUrl ?? "https://api.cloudflare.com/client/v4").replace(/\/$/, "");
+  const timeoutMs = options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS;
   return async (request: WorkersAiInvokeRequest): Promise<WorkersAiInvokeResult> => {
     const url = `${base}/accounts/${encodeURIComponent(options.accountId)}/ai/run/${request.model}`;
-    const res = await fetchFn(url, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${options.apiToken}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify({ messages: request.messages }),
-    });
+    // Bound the call with an AbortController so a slow or hung model cannot hang
+    // the agent forever. The timer is always cleared on settle, and an abort is
+    // surfaced as a distinct timeout error rather than an opaque fetch failure.
+    const controller = timeoutMs > 0 ? new AbortController() : undefined;
+    const timer =
+      controller !== undefined
+        ? setTimeout(() => controller.abort(), timeoutMs)
+        : undefined;
+    let res: Response;
+    try {
+      res = await fetchFn(url, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${options.apiToken}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ messages: request.messages }),
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+    } catch (error) {
+      // An abort (the timeout fired) is reported as a distinct timeout error; any
+      // other fetch-level failure is passed through. Neither path leaks the token.
+      if (controller?.signal.aborted) {
+        throw new WorkersAiTimeoutError(
+          `Workers AI call for ${request.model} timed out after ${timeoutMs}ms`,
+        );
+      }
+      throw error instanceof Error ? error : new Error(String(error));
+    } finally {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+    }
     const text = await res.text();
     if (res.status >= 400) {
       // Do not include the request body or headers in the error (no token leak).

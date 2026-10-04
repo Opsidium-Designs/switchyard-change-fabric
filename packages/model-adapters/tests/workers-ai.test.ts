@@ -7,8 +7,10 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createWorkersAiRestInvoke,
   DEFAULT_WORKERS_AI_MODEL,
+  isTransientWorkersAiError,
   UnusableModelOutputError,
   WorkersAiExecutor,
+  WorkersAiTimeoutError,
   type WorkersAiInvoke,
 } from "../src/index.ts";
 
@@ -213,5 +215,128 @@ describe("createWorkersAiRestInvoke", () => {
     await expect(
       invoke({ model: "m", messages: [{ role: "user", content: "x" }] }),
     ).rejects.not.toThrow(/secret-token-value/);
+  });
+
+  it("aborts and throws a distinct timeout error when a call hangs past the timeout", async () => {
+    // A fetch that never resolves on its own, but honors the AbortSignal the
+    // transport attaches, so the configured timeout is what ends it. This is the
+    // hung-call failure mode: without the timeout the agent would wait forever.
+    const hangingFetch = ((_url: string, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal) {
+          signal.addEventListener("abort", () => {
+            const err = new Error("aborted");
+            (err as { name: string }).name = "AbortError";
+            reject(err);
+          });
+        }
+      })) as unknown as typeof fetch;
+
+    const invoke = createWorkersAiRestInvoke({
+      accountId: "acct",
+      apiToken: "secret-token-value",
+      fetchFn: hangingFetch,
+      timeoutMs: 20,
+    });
+    const started = Date.now();
+    await expect(
+      invoke({ model: "m", messages: [{ role: "user", content: "x" }] }),
+    ).rejects.toBeInstanceOf(WorkersAiTimeoutError);
+    // It did not hang: it returned promptly once the timeout aborted the call.
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+});
+
+describe("WorkersAiExecutor bounded retry (tolerating transient model errors)", () => {
+  const okReply = JSON.stringify({
+    edits: [{ path: "src/x.ts", contents: "export const x = 1;\n" }],
+  });
+
+  it("retries a transient provider error a bounded number of times, then succeeds", async () => {
+    let calls = 0;
+    const sleeps: number[] = [];
+    const invoke: WorkersAiInvoke = async () => {
+      calls += 1;
+      // Fail transiently on the first attempt (both headline and fallback within
+      // that attempt), then succeed on the retry.
+      if (calls <= 2) {
+        throw new Error("internal error: 5xx from the provider");
+      }
+      return { text: okReply };
+    };
+    const result = await new WorkersAiExecutor({
+      invoke,
+      maxRetries: 2,
+      retryBackoffMs: 1,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    }).execute({
+      worktreeDir: worktree,
+      workUnitId: "x",
+      objective: "add x",
+      paths: ["src/x.ts"],
+      baselineRef: "HEAD",
+    });
+    expect(result.changedPaths).toEqual(["src/x.ts"]);
+    // One backoff happened (one retry), with no real delay (injected sleep).
+    expect(sleeps.length).toBe(1);
+  });
+
+  it("fails the unit after exhausting the bounded retries on a persistently erroring executor", async () => {
+    let attempts = 0;
+    const invoke: WorkersAiInvoke = async () => {
+      attempts += 1;
+      throw new Error("internal error");
+    };
+    await expect(
+      new WorkersAiExecutor({
+        invoke,
+        // Disable the second model so each attempt is exactly one invoke call,
+        // making the attempt count easy to assert.
+        model: "m",
+        fallbackModel: "m",
+        maxRetries: 2,
+        retryBackoffMs: 0,
+      }).execute({
+        worktreeDir: worktree,
+        workUnitId: "x",
+        objective: "add x",
+        paths: ["src/x.ts"],
+        baselineRef: "HEAD",
+      }),
+    ).rejects.toThrow(/internal error/);
+    // 1 initial attempt + 2 bounded retries = 3 invoke calls, then it gives up.
+    expect(attempts).toBe(3);
+  });
+
+  it("does not retry a non-transient failure (a bad model reply is an honest failure)", async () => {
+    let attempts = 0;
+    const invoke: WorkersAiInvoke = async () => {
+      attempts += 1;
+      return { text: "I cannot help with that." }; // not JSON: UnusableModelOutputError
+    };
+    await expect(
+      new WorkersAiExecutor({ invoke, maxRetries: 3, retryBackoffMs: 0 }).execute({
+        worktreeDir: worktree,
+        workUnitId: "x",
+        objective: "add x",
+        paths: ["src/x.ts"],
+        baselineRef: "HEAD",
+      }),
+    ).rejects.toThrow(UnusableModelOutputError);
+    // A bad reply is not transient, so it is not retried: exactly one attempt
+    // (headline model only, since the default fallback differs but a bad reply
+    // is not a thrown provider error, so the fallback path is not taken).
+    expect(attempts).toBe(1);
+  });
+
+  it("classifies transient vs hard errors", () => {
+    expect(isTransientWorkersAiError(new WorkersAiTimeoutError("timed out"))).toBe(true);
+    expect(isTransientWorkersAiError(new Error("Workers AI call failed (HTTP 500)"))).toBe(true);
+    expect(isTransientWorkersAiError(new Error("internal error"))).toBe(true);
+    expect(isTransientWorkersAiError(new UnusableModelOutputError("no edits"))).toBe(false);
+    expect(isTransientWorkersAiError(new Error("HTTP 400 bad request"))).toBe(false);
   });
 });

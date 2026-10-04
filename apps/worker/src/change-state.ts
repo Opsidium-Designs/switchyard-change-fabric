@@ -153,6 +153,26 @@ export interface ChangeStateView {
    * the graph and the engine waits on it; a resolved one carries the decision.
    */
   readonly escalations: readonly Escalation[];
+  /**
+   * The WorkUnits an agent ultimately failed on, with the reason. A failed unit
+   * is terminal-for-that-unit and does not block the rest of the wave: the
+   * scheduler advances the remaining runnable units. The console renders a
+   * failed node distinctly, and the run summary reports which units failed.
+   */
+  readonly failed: readonly FailureRecord[];
+}
+
+/**
+ * A recorded WorkUnit failure: an agent ultimately could not complete the unit
+ * (its executor errored past the bounded retries, or timed out). It releases the
+ * lease and is terminal-for-that-unit, so the scheduler advances the rest of the
+ * wave rather than freezing on it.
+ */
+export interface FailureRecord {
+  readonly unitId: string;
+  /** A short, human-readable reason (never a secret or a token). */
+  readonly reason: string;
+  readonly at: string;
 }
 
 /** The payload returned when a runner leases a WorkUnit. */
@@ -325,6 +345,12 @@ export class ChangeState extends DurableObject<Env> {
     // Human escalations: forks mechanical evidence could not settle. Empty until
     // the engine raises one; a pending one is a durable wait the graph blocks on.
     await this.ctx.storage.put("escalations", [] as Escalation[]);
+    // WorkUnits an agent ultimately failed on (after bounded retries or a
+    // timeout). A failed unit is terminal-for-that-unit: it releases its lease so
+    // the dial frees that slot and the wave advances, and it is NOT counted as
+    // completed, so its dependents stay blocked rather than running on a missing
+    // prerequisite. The failure reason is kept so the state can report why.
+    await this.ctx.storage.put("failed", {} as Record<string, FailureRecord>);
     return this.view();
   }
 
@@ -488,6 +514,7 @@ export class ChangeState extends DurableObject<Env> {
     const completed = await this.loadCompleted();
     const leases = await this.loadLeases();
     const dial = await this.loadDial();
+    const failed = await this.loadFailed();
     // In flight = runnable units an agent currently holds a lease on.
     const runnable = runnableUnits(change, completed);
     // Agents still running: leased but not yet completed. The DO releases a
@@ -495,8 +522,12 @@ export class ChangeState extends DurableObject<Env> {
     // completed keeps the ceiling correct even if a completed lease is retained.
     const completedSet = new Set(completed);
     const inFlight = Object.keys(leases).filter((id) => !completedSet.has(id)).length;
-    // Only recruit for units that are runnable AND not already leased.
-    const openRunnable = runnable.filter((id) => !leases[id]);
+    // Only recruit for units that are runnable AND not already leased AND not
+    // already failed. A failed unit is terminal-for-that-unit: it has released
+    // its lease, so without this filter it would read as open-runnable again and
+    // the wave would re-recruit a unit that already failed. Excluding it lets the
+    // rest of the open runnable set advance while the failed unit stays failed.
+    const openRunnable = runnable.filter((id) => !leases[id] && !failed[id]);
     const decision = recruit({ runnable: openRunnable, inFlight, dial });
     return { ...decision, inFlight, dial, runnable: openRunnable };
   }
@@ -599,7 +630,13 @@ export class ChangeState extends DurableObject<Env> {
 
     const plan = await this.planRecruitment();
     const completed = await this.loadCompleted();
-    const done = completed.length >= change.work.length && plan.recruit.length === 0;
+    const failed = await this.loadFailed();
+    // Done when nothing is left to recruit and every unit has reached a terminal
+    // state (completed or failed). A failed unit is terminal, so a run with some
+    // failures still finishes instead of waiting for a completed count it can
+    // never reach.
+    const terminal = completed.length + Object.keys(failed).length;
+    const done = terminal >= change.work.length && plan.recruit.length === 0;
     const event: RecruitmentEvent = {
       trigger: "repo-pushed",
       pushedWorkspace: workspaceName,
@@ -636,6 +673,52 @@ export class ChangeState extends DurableObject<Env> {
    */
   async completeUnit(unitId: string, cost?: Omit<CostEvent, "at" | "unitId">): Promise<ChangeStateView> {
     return this.markComplete(unitId, cost, "runner");
+  }
+
+  /**
+   * Mark a WorkUnit FAILED (runner-driven): an agent ultimately could not
+   * complete it after the executor's bounded retries, or it timed out. This is
+   * the fail path that keeps a flaky model call from freezing the whole wave:
+   *
+   *   - it releases the unit's lease, so the dial no longer counts it as an
+   *     in-flight agent and the next runnable units can be recruited;
+   *   - it records a durable failure (reason kept, never a secret), so the unit
+   *     projects status "failed" and the console lights a distinct node;
+   *   - it records a transition for observability.
+   *
+   * A failed unit is terminal-for-that-unit and NOT added to completed, so its
+   * dependents stay blocked (they will never run on a missing prerequisite)
+   * while the rest of the open runnable set advances. Idempotent: failing an
+   * already-failed or already-completed unit is a safe no-op. A unit that
+   * already completed is not overwritten as failed.
+   */
+  async failUnit(unitId: string, reason?: string): Promise<ChangeStateView> {
+    const change = await this.loadChange();
+    if (!change.work.some((unit) => unit.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    const completed = await this.loadCompleted();
+    if (completed.includes(unitId)) {
+      // Already integrated: a late failure signal does not undo a real success.
+      return this.view();
+    }
+    const failed = await this.loadFailed();
+    if (!failed[unitId]) {
+      failed[unitId] = {
+        unitId,
+        reason: sanitizeReason(reason),
+        at: new Date().toISOString(),
+      };
+      await this.ctx.storage.put("failed", failed);
+      await this.recordTransition(unitId, "running", "failed", "runner");
+    }
+    // Release the lease so the dial frees the slot and recruitment advances.
+    const leases = await this.loadLeases();
+    if (leases[unitId]) {
+      delete leases[unitId];
+      await this.ctx.storage.put("leases", leases);
+    }
+    return this.view();
   }
 
   /**
@@ -737,6 +820,7 @@ export class ChangeState extends DurableObject<Env> {
     const tool = await this.loadTool();
     const toolConsumptions = await this.loadToolConsumptions();
     const escalations = await this.loadEscalations();
+    const failed = await this.loadFailed();
     const statuses = workUnitStatuses(change, completed);
     const graph = buildWorkGraph(change);
     const collisions = detectPathCollisions(change);
@@ -747,13 +831,21 @@ export class ChangeState extends DurableObject<Env> {
       const base = statuses.get(unit.id) ?? "waiting";
       const leased = leases[unit.id] !== undefined;
       const workspace = workspaces[unit.id];
+      // A failed unit projects "failed" over any derived status: it is terminal
+      // for that unit, so it must not read as runnable/running again even though
+      // it has released its lease. A leased, not-yet-complete unit reads as
+      // "running"; everything else keeps its scheduling-derived status.
+      const status: WorkUnitStatus = failed[unit.id]
+        ? "failed"
+        : base === "runnable" && leased
+          ? "running"
+          : base;
       return {
         id: unit.id,
         objective: unit.objective,
         dependsOn: unit.dependsOn,
         paths: unit.paths,
-        // A leased, not-yet-complete unit reads as "running".
-        status: base === "runnable" && leased ? "running" : base,
+        status,
         leased,
         // Present once an agent has been recruited for this unit; kept past
         // completion so the node always reveals the real repo it ran in.
@@ -784,6 +876,7 @@ export class ChangeState extends DurableObject<Env> {
       toolConsumptions,
       leaseEdges,
       escalations,
+      failed: Object.values(failed).sort((a, b) => (a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0)),
     };
   }
 
@@ -848,6 +941,10 @@ export class ChangeState extends DurableObject<Env> {
   private async loadEscalations(): Promise<Escalation[]> {
     return (await this.ctx.storage.get<Escalation[]>("escalations")) ?? [];
   }
+
+  private async loadFailed(): Promise<Record<string, FailureRecord>> {
+    return (await this.ctx.storage.get<Record<string, FailureRecord>>("failed")) ?? {};
+  }
 }
 
 /**
@@ -864,4 +961,19 @@ function leaseEdgesFromPlan(plan: LeasePlan): LeaseEdge[] {
     }
   }
   return edges;
+}
+
+/**
+ * Keep a failure reason short and free of anything that could be a secret. A
+ * token or key would never normally be in an executor error (the executor is
+ * built to not leak one), but the reason is stored and shown, so bound its
+ * length and strip obvious credential-looking fragments defensively.
+ */
+function sanitizeReason(reason: string | undefined): string {
+  const text = (reason ?? "agent failed").toString().replace(/\s+/g, " ").trim();
+  const redacted = text
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
+    .replace(/\b[A-Za-z0-9_-]{40,}\b/g, "[redacted]");
+  const bounded = redacted.length > 300 ? `${redacted.slice(0, 297)}...` : redacted;
+  return bounded === "" ? "agent failed" : bounded;
 }

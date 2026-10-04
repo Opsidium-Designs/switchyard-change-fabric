@@ -24,6 +24,7 @@ export type {
   Escalation,
   EscalationKind,
   EscalationStatus,
+  FailureRecord,
   LeaseEdge,
   LeaseRecord,
   RaiseEscalationInput,
