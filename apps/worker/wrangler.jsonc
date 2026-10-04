@@ -39,9 +39,12 @@
   //
   // `remote: true` proxies just this binding to the real Cloudflare Artifacts
   // service while the Worker/Workflow/DO run locally under `wrangler dev`,
-  // giving a clone-and-run experience that still
-  // exercises real Artifacts. The namespace is a placeholder a contributor sets
-  // after `wrangler login`; no secrets are committed.
+  // giving a clone-and-run experience that still exercises real Artifacts.
+  //
+  // The `switchyard-change-fabric` namespace is created implicitly the first
+  // time a repo is created under it (there is no separate `namespaces create`
+  // command; see the README live-Artifacts notes). Authenticate first with
+  // `wrangler login` or a CLOUDFLARE_API_TOKEN; no secrets are committed.
   "artifacts": [
     {
       "binding": "ARTIFACTS",

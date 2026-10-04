@@ -34,6 +34,7 @@ export type {
   ArtifactsCreateOptions,
   ArtifactsCreateRepoResult,
   ArtifactsCreateTokenResult,
+  ArtifactsForkOptions,
   ArtifactsImportParams,
   ArtifactsRepoHandle,
   ArtifactsRepoInfo,

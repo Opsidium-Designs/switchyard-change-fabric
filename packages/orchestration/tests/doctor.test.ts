@@ -70,6 +70,34 @@ describe("doctor", () => {
     expect(auth?.status).toBe("ok");
   });
 
+  it("reports Artifacts reachable when authenticated and namespaces list succeeds", async () => {
+    const report = await runDoctor({
+      env: {},
+      runCommand: fakeRunner({
+        "git --version": "git version 2.40.0",
+        "npx wrangler --version": "4.0.0",
+        "npx wrangler whoami": "You are logged in with an Account API Token",
+        "npx wrangler artifacts namespaces list": "No Artifacts namespaces found.",
+      }),
+    });
+    const artifacts = report.checks.find((c) => c.name === "Artifacts namespace");
+    expect(artifacts?.status).toBe("ok");
+    expect(artifacts?.detail).toContain("reachable");
+  });
+
+  it("reports Artifacts unknown (not ok) when not authenticated", async () => {
+    const report = await runDoctor({
+      env: {},
+      runCommand: fakeRunner({
+        "git --version": "git version 2.40.0",
+        "npx wrangler --version": "4.0.0",
+        // whoami absent (throws) => not authenticated.
+      }),
+    });
+    const artifacts = report.checks.find((c) => c.name === "Artifacts namespace");
+    expect(artifacts?.status).toBe("unknown");
+  });
+
   it("reports the openai-compatible mode as available when a model is configured", async () => {
     const report = await runDoctor({
       env: { AI_GATEWAY_MODEL: "someprovider/some-model" },

@@ -163,11 +163,17 @@ account. It is required because the Artifacts binding is configured with
 issue-token / delete calls go to the real Cloudflare service and must be made on
 behalf of your account.
 
+As a non-interactive alternative to `wrangler login`, you can export a scoped
+`CLOUDFLARE_API_TOKEN` (with Workers + Artifacts permissions) and
+`CLOUDFLARE_ACCOUNT_ID`. Put them in a git-ignored `.env` (see `.env.example`);
+`make dev` and `make doctor` source `.env` automatically, and any `npx wrangler`
+call picks the token up from the environment.
+
 Verify it worked:
 
 ```bash
-npx wrangler whoami      # should print your account/email
-make cli ARGS="doctor"   # "Cloudflare auth" should now read ok
+npx wrangler whoami      # should print your account/email or API-token account
+make doctor              # "Cloudflare auth" and "Artifacts namespace" should read ok
 ```
 
 ### 3. Point the Artifacts binding at your account
@@ -184,9 +190,13 @@ The Artifacts binding lives in [`apps/worker/wrangler.jsonc`](apps/worker/wrangl
 ]
 ```
 
-- Set `namespace` to an Artifacts namespace your account can use (create one in
-  the Cloudflare dashboard or with Wrangler if your account exposes that command;
-  check `npx wrangler artifacts --help`). The default value is a placeholder.
+- The `namespace` is `switchyard-change-fabric`. An Artifacts namespace is
+  created **implicitly** the first time a repository is created under it: there is
+  no separate `namespaces create` command (confirm with
+  `npx wrangler artifacts namespaces --help`, which exposes only `list` and
+  `get`). So you do not pre-create it; the first repo the fabric (or the smoke
+  loop below) creates brings the namespace into existence. Change the value only
+  if you want your repos grouped under a different namespace name.
 - Leave `remote: true` so local `wrangler dev` uses the real remote Artifacts
   service rather than a local stand-in.
 
@@ -230,9 +240,51 @@ back; verification, integration, conflict coordination, and local-Git promotion
 work exactly as in the offline demo. `make doctor` reports which pieces
 (Cloudflare auth, Artifacts reachability, executor) are ready.
 
-> Note: the Artifacts binding is written to the documented API. If a call fails,
-> re-check that your account has Artifacts beta access and that the `namespace`
-> matches one your account can use.
+> Note: the Artifacts binding method names were reconciled against a live
+> account. If a call fails, re-check that your account has Artifacts beta access
+> and that the `namespace` matches one your account can use.
+
+### 5a. Prove the live Artifacts loop directly (smoke)
+
+You can exercise the whole create / token / push / inspect / delete loop against
+the live service with Wrangler alone, without starting the Worker. This is the
+reproducible proof that the real binding works for your account:
+
+```bash
+# Source your gitignored .env so CLOUDFLARE_API_TOKEN/ACCOUNT_ID are set, or run
+# `npx wrangler login` first.
+set -a; . ./.env; set +a
+
+NS=switchyard-change-fabric
+REPO="smoke-$(date +%s)"
+ACCOUNT="$CLOUDFLARE_ACCOUNT_ID"
+REMOTE="https://$ACCOUNT.artifacts.cloudflare.net/git/$NS/$REPO.git"
+
+# 1. Create a repo (this also creates the namespace the first time).
+npx wrangler artifacts repos create "$REPO" --namespace "$NS" --json
+
+# 2. Issue a short-lived write token (capture its "plaintext" value).
+npx wrangler artifacts repos issue-token "$REPO" --namespace "$NS" \
+  --scope write --ttl 600 --json
+
+# 3. Clone, commit, and push over Git HTTPS. The scoped token authenticates as
+#    the password (any username) or as a Bearer header. Keep the token out of
+#    your shell history and logs.
+git -c http.extraHeader="Authorization: Bearer <token>" clone "$REMOTE" repo
+cd repo && echo "hello" > PROOF.txt && git add PROOF.txt \
+  && git commit -m "smoke" \
+  && git -c http.extraHeader="Authorization: Bearer <token>" push "$REMOTE" HEAD:main
+cd ..
+
+# 4. Inspect, then clean up.
+npx wrangler artifacts repos get "$REPO" --namespace "$NS" --json
+npx wrangler artifacts repos delete "$REPO" --namespace "$NS" --force --json
+```
+
+A fresh clone of the repo after the push shows the committed file. Note that the
+repository metadata field `last_push_at` is eventually consistent and may still
+read `null` for a short window right after a push, so treat a fresh clone (not
+that field) as the proof that content landed.
 
 ### 6. (Optional) Deploy the Worker
 

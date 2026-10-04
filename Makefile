@@ -24,8 +24,10 @@ install:
 # --- local dev loop ---
 
 # Run the Cloudflare Worker locally under wrangler dev. The Artifacts binding is
-# configured with remote=true, so `wrangler login` first to reach real Artifacts.
+# configured with remote=true, so authenticate first: either `wrangler login`,
+# or put a scoped CLOUDFLARE_API_TOKEN in a gitignored .env (sourced below).
 dev:
+	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/worker run dev
 
 # Run the local console (Vite dev server).
@@ -42,8 +44,10 @@ dev-all:
 cli:
 	npm -w apps/cli run dev -- $(ARGS)
 
-# Check local prerequisites and print a readiness report.
+# Check local prerequisites and print a readiness report. Sources .env when
+# present so the live-Artifacts reachability probe sees CLOUDFLARE_API_TOKEN.
 doctor:
+	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- doctor
 
 # Run the example audit-logging Change end to end, deterministically and

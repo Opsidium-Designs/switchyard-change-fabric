@@ -43,6 +43,15 @@ function fakeBinding(): ArtifactsBinding & { revoked: string[] } {
         async info() {
           return { id: `repo-${name}`, name, defaultBranch: "main", lastPushAt: null };
         },
+        async fork(target: string) {
+          return {
+            id: `repo-${target}`,
+            name: target,
+            defaultBranch: "main",
+            remote: `https://artifacts.example/${target}.git`,
+            token: `fork-token-${target}`,
+          };
+        },
       };
     },
     async import() {
@@ -87,6 +96,16 @@ describe("CloudflareArtifactWorkspaceProvider", () => {
     const ok = await provider.revokeToken(ref, token.id);
     expect(ok).toBe(true);
     expect(binding.revoked).toContain(token.id);
+  });
+
+  it("forks a workspace into a new ref with its one-time token", async () => {
+    const provider = new CloudflareArtifactWorkspaceProvider(fakeBinding());
+    const ref = await provider.create("unit-src");
+    const forked = await provider.fork(ref, "unit-fork");
+    expect(forked.ref.name).toBe("unit-fork");
+    expect(forked.ref.gitUrl).toBe("https://artifacts.example/unit-fork.git");
+    expect(forked.ref.backend).toBe("cloudflare-artifacts");
+    expect(forked.token).toBe("fork-token-unit-fork");
   });
 
   it("translates an unauthenticated binding failure into BindingUnavailableError", async () => {

@@ -26,11 +26,24 @@ import {
 
 /**
  * Minimal structural view of the Cloudflare Artifacts binding this provider
- * depends on. The field and method names mirror the generated `wrangler types`
- * surface (ArtifactsCreateRepoResult, ArtifactsRepo, ArtifactsCreateTokenResult),
- * declared here so this package type-checks on its own without the Worker's
- * generated types. The real binding injected by the Worker runtime is structurally
- * compatible and can be passed directly.
+ * depends on. The field and method names are reconciled against the real
+ * generated `wrangler types` surface (the `Artifacts`, `ArtifactsRepo`,
+ * `ArtifactsCreateRepoResult`, and `ArtifactsCreateTokenResult` shapes), so this
+ * package type-checks on its own without the Worker's generated types. The real
+ * binding injected by the Worker runtime is structurally compatible and can be
+ * passed directly.
+ *
+ * Reconciliation notes (verified against a live account):
+ *   - namespace methods are `create` / `get` / `import` / `delete` (plus `list`,
+ *     unused here);
+ *   - `create` returns `remote` (the HTTPS git URL) and a one-time `token`;
+ *   - the repo handle (`get(name)`) exposes `createToken` (default scope
+ *     "write"), `revokeToken`, `info`, and `fork`;
+ *   - a scoped token authenticates ordinary Git over HTTPS as the password with
+ *     any username (equivalently an `Authorization: Bearer <token>` header);
+ *   - `info().lastPushAt` is eventually consistent and can read `null` for a
+ *     short window right after a push, so it is not a reliable proof-of-push on
+ *     its own.
  */
 export interface ArtifactsBinding {
   create(name: string, opts?: ArtifactsCreateOptions): Promise<ArtifactsCreateRepoResult>;
@@ -61,11 +74,24 @@ export interface ArtifactsCreateTokenResult {
   readonly expiresAt: string;
 }
 
+/**
+ * Repository metadata as returned by the real `ArtifactsRepo.info()`. This
+ * provider reads only `id` / `name` / `defaultBranch` / `lastPushAt`; the other
+ * fields are declared to match the real surface and may be read by callers.
+ */
 export interface ArtifactsRepoInfo {
   readonly id: string;
   readonly name: string;
   readonly defaultBranch: string;
+  /** ISO 8601 timestamp of the last push, or null if never pushed (lags briefly). */
   readonly lastPushAt: string | null;
+  readonly description?: string | null;
+  readonly createdAt?: string;
+  readonly updatedAt?: string;
+  /** Fork source, or null if this repo is not a fork. */
+  readonly source?: string | null;
+  readonly readOnly?: boolean;
+  readonly remote?: string;
 }
 
 export interface ArtifactsImportParams {
@@ -76,16 +102,26 @@ export interface ArtifactsImportParams {
   };
 }
 
+/** Options for forking an existing repo to a new one (`ArtifactsRepo.fork`). */
+export interface ArtifactsForkOptions {
+  readonly description?: string;
+  readonly readOnly?: boolean;
+  readonly defaultBranchOnly?: boolean;
+}
+
 /**
  * A repository handle (`env.ARTIFACTS.get(name)`). The real handle is an RPC stub
- * that is also disposable; this view keeps only the token lifecycle methods used
- * here. The real stub is released when the request ends, so this provider does
- * not dispose it explicitly.
+ * that extends `Disposable`; this structural view keeps the methods this provider
+ * uses. A real `Disposable` stub stays assignable to it. The real stub is also
+ * released when the request ends, so disposal here is best-effort: the provider
+ * calls `[Symbol.dispose]` when the runtime provides it (see `disposeHandle`).
  */
 export interface ArtifactsRepoHandle {
   createToken(scope?: TokenScope, ttl?: number): Promise<ArtifactsCreateTokenResult>;
   revokeToken(tokenOrId: string): Promise<boolean>;
   info(): Promise<ArtifactsRepoInfo>;
+  /** Fork this repo to a new repo; returns the new repo with its one-time token. */
+  fork?(name: string, opts?: ArtifactsForkOptions): Promise<ArtifactsCreateRepoResult>;
 }
 
 /** Thrown when the Artifacts binding is wired but cannot reach the service. */
@@ -125,6 +161,27 @@ export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
     );
   }
 
+  /**
+   * Fork an existing workspace into a new one, returning the new ref and its
+   * one-time creation token. Fork lives on the repo handle in the real binding
+   * (`get(name).fork(target)`); a fake without `fork` reports it as unsupported.
+   * This is an additive capability over the portable WorkspaceProvider contract,
+   * used by the live Artifacts path; non-forking backends simply do not expose it.
+   */
+  async fork(
+    ref: WorkspaceRef,
+    targetName: string,
+    opts?: ArtifactsForkOptions,
+  ): Promise<{ ref: WorkspaceRef; token: string }> {
+    return this.withRepo(ref.name, async (repo) => {
+      if (typeof repo.fork !== "function") {
+        throw new Error("the Artifacts binding handle does not support fork");
+      }
+      const result = await repo.fork(targetName, opts);
+      return { ref: this.toRef(result), token: result.token };
+    });
+  }
+
   async issueReadToken(ref: WorkspaceRef, ttlSeconds = DEFAULT_TOKEN_TTL_SECONDS): Promise<ScopedToken> {
     return this.issueToken(ref, "read", ttlSeconds);
   }
@@ -134,16 +191,15 @@ export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
   }
 
   async revokeToken(ref: WorkspaceRef, tokenOrId: string): Promise<boolean> {
-    return this.call(async () => {
-      const repo = await this.binding.get(ref.name);
-      return repo.revokeToken(tokenOrId);
-    });
+    return this.withRepo(ref.name, (repo) => repo.revokeToken(tokenOrId));
   }
 
   async inspect(ref: WorkspaceRef): Promise<WorkspaceInspection> {
-    return this.call(async () => {
-      const repo = await this.binding.get(ref.name);
+    return this.withRepo(ref.name, async (repo) => {
       const info = await repo.info();
+      // Note: info().lastPushAt is eventually consistent and can read null for a
+      // short window right after a push, so callers must not treat a null here
+      // as proof the repo was never pushed to.
       return {
         id: info.id,
         name: info.name,
@@ -164,8 +220,7 @@ export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
     scope: TokenScope,
     ttlSeconds: number,
   ): Promise<ScopedToken> {
-    return this.call(async () => {
-      const repo = await this.binding.get(ref.name);
+    return this.withRepo(ref.name, async (repo) => {
       const token = await repo.createToken(scope, ttlSeconds);
       return {
         id: token.id,
@@ -173,6 +228,25 @@ export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
         scope: token.scope,
         expiresAt: token.expiresAt,
       };
+    });
+  }
+
+  /**
+   * Acquire a repo handle, run a function against it, and dispose it when the
+   * runtime provides `[Symbol.dispose]` (the real RPC stub does). Binding-
+   * unavailable failures are translated into BindingUnavailableError.
+   */
+  private async withRepo<T>(
+    name: string,
+    fn: (repo: ArtifactsRepoHandle) => Promise<T>,
+  ): Promise<T> {
+    return this.call(async () => {
+      const repo = await this.binding.get(name);
+      try {
+        return await fn(repo);
+      } finally {
+        disposeHandle(repo);
+      }
     });
   }
 
@@ -199,6 +273,27 @@ export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
         );
       }
       throw error;
+    }
+  }
+}
+
+/**
+ * Release an Artifacts repo handle when the runtime provides the well-known
+ * disposer. The real binding handle is a disposable RPC stub; a plain fake is
+ * not, so this is best-effort and never throws. Accessing the symbol via a
+ * runtime lookup keeps this compatible without widening the TS lib target.
+ */
+function disposeHandle(repo: ArtifactsRepoHandle): void {
+  const disposer = (Symbol as { dispose?: symbol }).dispose;
+  if (!disposer) {
+    return;
+  }
+  const fn = (repo as unknown as Record<symbol, unknown>)[disposer];
+  if (typeof fn === "function") {
+    try {
+      (fn as () => void).call(repo);
+    } catch {
+      // Disposal is best-effort; the stub is also released at request end.
     }
   }
 }

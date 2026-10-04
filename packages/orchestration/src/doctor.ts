@@ -69,11 +69,13 @@ export async function runDoctor(options: DoctorEnv = {}): Promise<DoctorReport> 
   checks.push(wrangler);
 
   // Cloudflare auth (optional, best-effort). Only probed when wrangler is here.
-  checks.push(await probeCloudflareAuth(runCommand, wrangler.status === "ok"));
+  const auth = await probeCloudflareAuth(runCommand, wrangler.status === "ok");
+  checks.push(auth);
 
-  // Artifacts reachability (optional, best-effort). Honestly reported as
-  // unknown offline: the demo uses the local fallback and never needs it.
-  checks.push(probeArtifacts(wrangler.status === "ok"));
+  // Artifacts reachability (optional, best-effort). When authenticated, this
+  // actually probes the live Artifacts service; offline it is honestly reported
+  // as using the local fallback.
+  checks.push(await probeArtifacts(runCommand, wrangler.status === "ok", auth.status === "ok"));
 
   // Executor modes.
   checks.push(...executorChecks(env));
@@ -166,16 +168,63 @@ async function probeCloudflareAuth(
   }
 }
 
-/** Artifacts reachability is only meaningful with Cloudflare auth; honest unknown otherwise. */
-function probeArtifacts(wranglerPresent: boolean): DoctorCheck {
-  return {
-    name: "Artifacts namespace",
-    status: "unknown",
-    required: false,
-    detail: wranglerPresent
-      ? "reachability unknown without a logged-in account; offline demo uses the local fallback"
-      : "wrangler not available; offline demo uses the honest local-filesystem fallback",
-  };
+/**
+ * Artifacts reachability. When wrangler is present and the account is
+ * authenticated, this actually asks the live service to list namespaces: a
+ * success means real Artifacts is reachable (`ok`), a failure is reported
+ * honestly (`unknown`) rather than claimed as working. Without auth it reports
+ * that the offline local fallback is used instead. It never throws.
+ */
+async function probeArtifacts(
+  runCommand: (program: string, args: readonly string[]) => Promise<string>,
+  wranglerPresent: boolean,
+  authenticated: boolean,
+): Promise<DoctorCheck> {
+  if (!wranglerPresent) {
+    return {
+      name: "Artifacts namespace",
+      status: "unknown",
+      required: false,
+      detail: "wrangler not available; offline demo uses the honest local-filesystem fallback",
+    };
+  }
+  if (!authenticated) {
+    return {
+      name: "Artifacts namespace",
+      status: "unknown",
+      required: false,
+      detail:
+        "not authenticated; run `npx wrangler login` or set CLOUDFLARE_API_TOKEN for real Artifacts (offline demo uses the local fallback)",
+    };
+  }
+  try {
+    const out = await runCommand("npx", ["wrangler", "artifacts", "namespaces", "list"]);
+    // The open-beta command prints a warning but still lists namespaces; any
+    // non-error completion means the live Artifacts service answered us.
+    const reachable = !/not authenticated|unauthorized|forbidden|error/i.test(out);
+    if (reachable) {
+      return {
+        name: "Artifacts namespace",
+        status: "ok",
+        required: false,
+        detail: "live Artifacts reachable (namespaces listed against the account)",
+      };
+    }
+    return {
+      name: "Artifacts namespace",
+      status: "unknown",
+      required: false,
+      detail: "authenticated but Artifacts did not list cleanly; offline demo uses the local fallback",
+    };
+  } catch {
+    return {
+      name: "Artifacts namespace",
+      status: "unknown",
+      required: false,
+      detail:
+        "authenticated but could not reach Artifacts (open beta access or network); offline demo uses the local fallback",
+    };
+  }
 }
 
 /** Report which executor modes are available from configuration. */
