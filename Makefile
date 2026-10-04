@@ -11,9 +11,13 @@
 #   make demo      run the example audit-logging Change end to end (offline)
 #   make anti-puppet   run two different goals through one engine (offline)
 #   make run-live-watch  watchable live run: stable id, escalation fires, repos left up
+#   make demo-live   one-command watchable live demo (needs `make dev-all` running)
 #   make clean-live  tear down the real repos a watch run left up
 #   make seed-change seed the demo Change into a running Worker (for the console)
 #   make deploy    deploy the Worker to Cloudflare (wrangler deploy)
+#   make infra-up      spin the hosted Cloudflare infra up (deploy + queue + subscription), idempotent
+#   make infra-status  read-only: what is live right now (am I paying for anything?)
+#   make infra-down    spin the hosted Cloudflare infra down (delete worker + queue + subscription + repos), idempotent
 #   make build     build every workspace
 #   make typecheck typecheck every workspace
 #   make test      run every workspace's tests
@@ -21,7 +25,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch clean-live seed-change anti-puppet deploy artifacts-subscribe build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch demo-live clean-live seed-change anti-puppet deploy artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -39,8 +43,12 @@ dev:
 console:
 	npm -w apps/console run dev
 
-# Run the Worker and the console together (Ctrl-C stops both).
+# Run the Worker and the console together (Ctrl-C stops both). Sources .env so
+# the Worker's remote Artifacts binding authenticates with CLOUDFLARE_API_TOKEN
+# (the same as the `dev` target); without it `wrangler dev` cannot establish the
+# remote proxy session in a non-interactive shell.
 dev-all:
+	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/worker run dev & \
 	npm -w apps/console run dev & \
 	wait
@@ -152,6 +160,18 @@ run-live-watch:
 	npm -w apps/cli run dev -- run-live --change "$(AUDIT_CHANGE)" --project "$(DEMO_PROJECT)" \
 	  --worker "$(WORKER)" --min $(MIN) --max $(MAX) --watch $(if $(OWNER),--owner $(OWNER),)
 
+# The one-command watchable live demo. It checks the local Worker and console
+# are reachable (start them with `make dev-all` in another terminal first; if
+# they are not up it prints that instruction and exits non-zero rather than
+# backgrounding long-lived dev servers), seeds the demo audit Change, runs the
+# watchable live run (stable id change-audit-logging, escalation beat fires,
+# real Artifact repos left up), and prints the console URL to open to watch the
+# morph. The executor comes from .env (set EXECUTOR=workers-ai for real
+# inference). Tear the real repos down afterwards with `make clean-live`.
+demo-live:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	bash tools/demo-live.sh
+
 # Tear down the real Artifact repos a watch-mode run (make run-live-watch) left
 # in place, through the running Worker. Override CHANGE_ID if you watched a
 # different Change id.
@@ -207,6 +227,34 @@ deploy:
 artifacts-subscribe:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	bash tools/artifacts-subscribe.sh
+
+# Spin the hosted Cloudflare infrastructure UP as one idempotent command:
+# deploy the Worker, ensure the repo-pushed Queue, and ensure the Artifacts
+# repo.pushed event subscription pointed at that Queue. Anything already present
+# is left in place. Prints the deployed Worker URL and a summary of what now
+# exists. This deploys a REAL hosted Worker + Queue + subscription on the
+# account in your .env; tear it down with `make infra-down`. See the README.
+infra-up:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	bash tools/infra-up.sh
+
+# Read-only report of what Change Fabric infrastructure is live on the account
+# right now (deployed Worker reachable? queue? subscription? how many Artifact
+# repos in the namespace?), so anyone can answer "am I paying for anything?".
+# Creates and deletes nothing.
+infra-status:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	bash tools/infra-status.sh
+
+# Spin the hosted Cloudflare infrastructure DOWN as one idempotent command:
+# delete ONLY this project's named resources (the Artifacts subscription, the
+# Queue switchyard-change-fabric-repo-pushed, the deployed Worker) plus any
+# leftover switchyard-change-fabric Artifact repos so nothing keeps billing. It
+# prints exactly what it deletes, errors on nothing already gone, and confirms
+# the namespace is empty at the end. See the README.
+infra-down:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	bash tools/infra-down.sh
 
 build:
 	npm run build

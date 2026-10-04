@@ -125,6 +125,112 @@ make cli ARGS='decompose "Add a health check endpoint" --project examples/demo-p
 make cli ARGS='run-goal --goal-file examples/goals/add-input-validation.goal.txt --project examples/calc-project'
 ```
 
+## One-command infrastructure lifecycle and watchable demo
+
+There are two ways to see the fabric run, and a safe one-command lifecycle for
+the real Cloudflare infrastructure in between. If you only want to read one
+section before trying it, read this one.
+
+### Offline, no account: `make demo`
+
+```bash
+make demo
+```
+
+Runs the example audit-logging Change end to end with the deterministic `noop`
+executor and the honest local-filesystem fallback. No Cloudflare account, no
+network, no inference, same result every time. This is the fastest way to see the
+whole orchestration, verification, integration, conflict coordination, and local
+Git promotion flow.
+
+### The hosted infrastructure lifecycle: `infra-up` / `infra-status` / `infra-down`
+
+These three commands make spinning the real Cloudflare infrastructure up and down
+a one-command, idempotent, safe operation. They source your gitignored `.env`
+(so `CLOUDFLARE_ACCOUNT_ID` and a scoped `CLOUDFLARE_API_TOKEN` are set) and never
+print the token.
+
+```bash
+make infra-up       # deploy the Worker + ensure the Queue + ensure the subscription
+make infra-status   # read-only: what is live right now?
+make infra-down     # delete the Worker + Queue + subscription + any leftover repos
+```
+
+Be honest about what each one does:
+
+- **`make infra-up` deploys REAL hosted resources on the account in your `.env`.**
+  It (a) ensures the Queue `switchyard-change-fabric-repo-pushed` exists, (b) runs
+  `wrangler deploy` to publish the hosted Worker (with its Durable Object,
+  Workflow, Artifacts binding, and Queue consumer), and (c) ensures the Artifacts
+  `repo.pushed` event subscription exists, pointed at that Queue. It is
+  idempotent: anything already present is left in place, so re-running it is safe.
+  It finishes by printing the deployed Worker URL and a summary of what now
+  exists. A deployed Worker and a Queue are billable resources on your account.
+- **`make infra-status` is strictly read-only.** It creates and deletes nothing,
+  and reports whether the deployed Worker is reachable (and its URL), whether the
+  Queue exists, whether the subscription exists, and how many Artifact repos sit
+  in the `switchyard-change-fabric` namespace. Run it any time to answer "am I
+  paying for anything right now?".
+- **`make infra-down` removes exactly what `infra-up` created, and nothing else.**
+  It deletes only this project's named resources (the Artifacts subscription, the
+  Queue `switchyard-change-fabric-repo-pushed`, and the Worker
+  `switchyard-change-fabric`) plus any leftover `switchyard-change-fabric` Artifact
+  repos so nothing keeps billing. It prints exactly what it is about to delete
+  before deleting it, treats anything already gone as a no-op (no error), never
+  touches resources outside those names, and confirms the namespace is empty at
+  the end. It is idempotent, so running it twice is harmless.
+
+A typical lifecycle, with the account left clean at the end:
+
+```bash
+make infra-up       # stand the hosted event path up
+make infra-status   # confirm the Worker, Queue, and subscription are live
+# ... exercise the deployed Worker ...
+make infra-down     # tear it all down
+make infra-status   # confirm nothing is left (namespace empty)
+```
+
+### The one-command watchable demo: `make demo-live`
+
+`make demo-live` is the headline watchable run against your **local** Worker (it
+does not require `make infra-up`; it talks to the Worker you run under
+`wrangler dev`). It:
+
+1. checks the local Worker and console are reachable. If either is not up it
+   prints a clear instruction to run `make dev-all` in another terminal and exits
+   non-zero. It does **not** try to background and babysit those long-lived dev
+   servers, so it never leaves orphaned processes behind. This is the deliberate,
+   robust choice: you keep `make dev-all` in its own terminal, and `demo-live`
+   stays a clean, repeatable command;
+2. seeds the demo audit-logging Change (`change-audit-logging`) into the Worker;
+3. runs the watchable live run (`run-live --watch` against the seeded
+   audit-logging Change), so the human escalation beat fires every time, using the
+   stable Change id and leaving the real Artifact repos up so you can watch;
+4. prints the console URL to open to watch the graph morph.
+
+The executor comes from your `.env` (`EXECUTOR`); set `EXECUTOR=workers-ai` for
+real inference, otherwise the deterministic `noop` executor runs.
+
+```bash
+make dev-all        # terminal 1: Worker under wrangler dev + the console (leave running)
+make demo-live      # terminal 2: seed + watchable live run (real Artifact repos left up)
+```
+
+Then open the console and watch it morph:
+
+```text
+http://127.0.0.1:5173/?change=change-audit-logging
+```
+
+The console also defaults to `change-audit-logging`, so plain
+`http://127.0.0.1:5173/` works too. When you are done watching, tear the real
+Artifact repos down (this is the separate cleanup step):
+
+```bash
+make clean-live
+```
+
+
 ## The living work graph (the console)
 
 The console is the primary visual surface: a real-state-backed morphing graph of
