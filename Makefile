@@ -16,7 +16,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install dev console dev-all cli doctor demo build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -56,6 +56,30 @@ doctor:
 # commit.
 demo:
 	npm -w apps/cli run dev -- run $(CURDIR)/examples/changes/audit-logging.change.yaml
+
+# Decompose a goal against a target project into a WorkGraph and print the plan
+# plus schedule, deterministically and offline (the heuristic analyzer, no live
+# inference). Defaults to the second seeded goal (add input validation to every
+# exported function) against the calc-project, whose natural decomposition is a
+# wide, flat graph. Override GOAL and PROJECT to decompose anything else.
+GOAL ?= $(shell cat $(CURDIR)/examples/goals/add-input-validation.goal.txt)
+PROJECT ?= $(CURDIR)/examples/calc-project
+
+decompose:
+	npm -w apps/cli run dev -- decompose "$(GOAL)" --project "$(PROJECT)"
+
+# Decompose the audit-logging goal against the demo-project, whose natural
+# decomposition is a layered graph with dependency edges (contrast with the flat
+# `make decompose`). This is the anti-puppet contrast on the command line.
+decompose-audit:
+	npm -w apps/cli run dev -- decompose \
+	  --goal-file $(CURDIR)/examples/goals/audit-logging.goal.txt \
+	  --project $(CURDIR)/examples/demo-project
+
+# Decompose a goal and run the resulting WorkGraph to completion offline, ending
+# in a promoted local Git commit. Same GOAL/PROJECT overrides as `make decompose`.
+run-goal:
+	npm -w apps/cli run dev -- run-goal "$(GOAL)" --project "$(PROJECT)"
 
 build:
 	npm run build

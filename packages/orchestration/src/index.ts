@@ -34,6 +34,16 @@ export type {
 } from "./run-change.ts";
 export { describeChange, runChange } from "./run-change.ts";
 
+export type { RepoFile, RepoSnapshot } from "@switchyard-change/change-core";
+export { scanRepoFiles, scanRepoSnapshot } from "./scan-repo.ts";
+
+export type { DecomposeGoalOptions, DecomposeGoalResult } from "./decompose-goal.ts";
+export {
+  decomposeGoal,
+  formatDecomposition,
+  changeToSpecYaml,
+} from "./decompose-goal.ts";
+
 export { formatChangePlan, formatRunSummary, formatStateView } from "./summary.ts";
 
 export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor.ts";

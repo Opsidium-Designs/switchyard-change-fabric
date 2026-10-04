@@ -121,6 +121,8 @@ make cli ARGS="doctor"                                                 # readine
 make cli ARGS="status examples/changes/audit-logging.change.yaml"      # plan + schedule
 make cli ARGS="run examples/changes/audit-logging.change.yaml"         # run end to end
 make cli ARGS="promote examples/changes/audit-logging.change.yaml"     # run and promote
+make cli ARGS='decompose "Add a health check endpoint" --project examples/demo-project'
+make cli ARGS='run-goal --goal-file examples/goals/add-input-validation.goal.txt --project examples/calc-project'
 ```
 
 ## The example Change
@@ -134,6 +136,58 @@ The seeded example lives in two files:
   what drives the coordination demo.
 - [`examples/demo-project/`](examples/demo-project/README.md): the small
   standalone TypeScript service the Change targets.
+
+## From a goal to a work graph (the decomposer)
+
+Authoring a Change by hand (the YAML above) is still a valid input, but the
+headline input is a plain-text **goal** plus the target repository. A
+goal-agnostic **decomposer** reads the goal and the repository's structure and
+produces the WorkGraph; no part of it is scripted per goal.
+
+```bash
+# Decompose a goal into a WorkGraph (plan + schedule), offline and deterministic.
+make decompose          # the "input validation to every exported function" goal
+make decompose-audit    # the "audit logging with a read API and tests" goal
+make run-goal           # decompose a goal and run its graph to a promoted commit
+```
+
+How it stays goal-agnostic: the decomposer never branches on the goal string and
+holds no table keyed on known goals. It reduces the goal to generic features
+(action families such as add / validate / wire / test, salient target terms, and
+whether the goal quantifies over "every" / "all"), scans the repository into
+generic structural facts (source versus test files, directory modules, exported
+symbols, entry-point and router-like files), and then applies one fixed set of
+rules that match the goal's features against the repo's structure. Because the
+shape is a function of how the goal's features interact with the repository, two
+structurally different goals produce two differently-shaped graphs through the
+same code path:
+
+| Goal | Target | Shape |
+|------|--------|-------|
+| Add input validation to every exported function | `examples/calc-project` | wide, flat: one WorkUnit per source file, no dependency edges (a universal fan-out) |
+| Add organization-level audit logging with a read API and tests | `examples/demo-project` | layered: module WorkUnits plus a dependent tests WorkUnit, with dependency edges |
+
+The two seeded goals live in
+[`examples/goals/`](examples/goals/) and are inputs only; the second target
+project is [`examples/calc-project/`](examples/calc-project/README.md). The
+decomposition is deterministic and offline by default (a heuristic goal analyzer,
+no live inference), so it runs in `make check`. An inference-backed analyzer can
+be injected without changing the decomposer; it must return the same intent
+shape, so determinism is preserved wherever the heuristic default is used.
+
+## The durable run loop
+
+Driving a WorkGraph to completion is a real durable loop, not a one-shot. The
+Cloudflare Workflow (`apps/worker/src/workflow.ts`) advances the graph one
+scheduling wave per durable step: each step asks the `ChangeState` Durable Object
+to lease every currently-runnable WorkUnit, record it running, then record it
+complete so its dependents become runnable on the next wave, until the graph is
+complete. Every mutation is inside a `step.do` boundary, and the Durable Object
+advance is idempotent, so the loop is restartable and cannot double-advance on
+resume. The offline substrate drives the same graph through the same scheduling
+kernel (`driveWorkGraph` in `change-core`), so the live and offline paths cannot
+drift. Live agent recruitment and the morphing graph visualization build on this
+loop in later work.
 
 ## Running against real Cloudflare Artifacts
 

@@ -41,3 +41,21 @@ export type {
   UnitLeaseView,
 } from "./lease.ts";
 export { planWriteLeases, unitLeaseViews } from "./lease.ts";
+
+export type {
+  ExportedSymbol,
+  ModuleGroup,
+  RepoFile,
+  RepoSnapshot,
+  SourceFileFacts,
+} from "./repo-snapshot.ts";
+export { buildRepoSnapshot, isTestPath } from "./repo-snapshot.ts";
+
+export type { ActionFamily, GoalAnalyzer, GoalIntent } from "./goal.ts";
+export { HeuristicGoalAnalyzer } from "./goal.ts";
+
+export type { DecomposeOptions, DecomposeResult } from "./decompose.ts";
+export { decompose, decomposeToChange } from "./decompose.ts";
+
+export type { DriveOptions, DriveTrace, DriveWave } from "./scheduler.ts";
+export { driveWorkGraph } from "./scheduler.ts";

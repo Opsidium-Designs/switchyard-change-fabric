@@ -62,6 +62,8 @@ export interface ChangeStateView {
   /** Total recorded cost across all WorkUnits so far. */
   readonly spentUsd: number;
   readonly costEvents: readonly CostEvent[];
+  /** The ordered log of WorkUnit state transitions this run has recorded. */
+  readonly transitions: readonly Transition[];
 }
 
 /** The payload returned when a runner leases a WorkUnit. */
@@ -71,6 +73,28 @@ export interface LeaseRecord extends LeaseWorkspace {
   readonly paths: readonly string[];
   readonly baselineRef: string;
   readonly leasedAt: string;
+}
+
+/** A recorded WorkUnit state transition, for observability and the viz later. */
+export interface Transition {
+  readonly unitId: string;
+  readonly from: WorkUnitStatus;
+  readonly to: WorkUnitStatus;
+  readonly at: string;
+  /** What drove the transition: the durable workflow loop or a runner. */
+  readonly by: "workflow" | "runner";
+}
+
+/** The outcome of advancing one scheduling wave from the durable workflow. */
+export interface AdvanceResult {
+  /** How many WorkUnits were advanced to complete in this wave. */
+  readonly advanced: number;
+  /** The WorkUnit ids advanced in this wave, in schedule order. */
+  readonly units: readonly string[];
+  /** True when the graph is complete (no runnable and no waiting units remain). */
+  readonly done: boolean;
+  /** The completed WorkUnit ids after this wave. */
+  readonly completed: readonly string[];
 }
 
 /**
@@ -92,6 +116,7 @@ export class ChangeState extends DurableObject<Env> {
     await this.ctx.storage.put("completed", [] as string[]);
     await this.ctx.storage.put("leases", {} as Record<string, LeaseRecord>);
     await this.ctx.storage.put("costEvents", [] as CostEvent[]);
+    await this.ctx.storage.put("transitions", [] as Transition[]);
     return this.view();
   }
 
@@ -150,6 +175,50 @@ export class ChangeState extends DurableObject<Env> {
    * event, releasing its lease, and advancing dependents to runnable.
    */
   async completeUnit(unitId: string, cost?: Omit<CostEvent, "at" | "unitId">): Promise<ChangeStateView> {
+    return this.markComplete(unitId, cost, "runner");
+  }
+
+  /**
+   * Advance exactly one scheduling wave from the durable workflow loop: take
+   * every currently-runnable WorkUnit, record it running then complete, so its
+   * dependents become runnable on the next wave. Idempotent: a unit already
+   * complete is skipped, and when the graph is already complete this returns
+   * `done` with nothing advanced, so a resumed or re-executed Workflow step can
+   * never double-advance or corrupt the graph.
+   *
+   * This is the deterministic in-process driver for the milestone. It does not
+   * provision a workspace or recruit a live agent (that is a later milestone);
+   * it advances the WorkGraph state transitions the Workflow is responsible for.
+   */
+  async advanceWave(): Promise<AdvanceResult> {
+    const change = await this.loadChange();
+    const completed = await this.loadCompleted();
+    const runnable = runnableUnits(change, completed);
+
+    if (runnable.length === 0) {
+      // Nothing runnable: either the graph is complete or it is stuck.
+      const done = completed.length >= change.work.length;
+      return { advanced: 0, units: [], done, completed: [...completed] };
+    }
+
+    const advanced: string[] = [];
+    for (const unitId of runnable) {
+      await this.recordTransition(unitId, "runnable", "running", "workflow");
+      await this.markComplete(unitId, undefined, "workflow");
+      advanced.push(unitId);
+    }
+
+    const nowCompleted = await this.loadCompleted();
+    const done = nowCompleted.length >= change.work.length;
+    return { advanced: advanced.length, units: advanced, done, completed: nowCompleted };
+  }
+
+  /** Shared completion path for both runner and workflow drivers. */
+  private async markComplete(
+    unitId: string,
+    cost: Omit<CostEvent, "at" | "unitId"> | undefined,
+    by: Transition["by"],
+  ): Promise<ChangeStateView> {
     const change = await this.loadChange();
     if (!change.work.some((unit) => unit.id === unitId)) {
       throw new Error(`unknown WorkUnit: ${unitId}`);
@@ -163,6 +232,7 @@ export class ChangeState extends DurableObject<Env> {
     if (!completed.includes(unitId)) {
       completed.push(unitId);
       await this.ctx.storage.put("completed", completed);
+      await this.recordTransition(unitId, "running", "integrated", by);
     }
     const leases = await this.loadLeases();
     if (leases[unitId]) {
@@ -170,6 +240,18 @@ export class ChangeState extends DurableObject<Env> {
       await this.ctx.storage.put("leases", leases);
     }
     return this.view();
+  }
+
+  /** Append a transition to the durable log. */
+  private async recordTransition(
+    unitId: string,
+    from: WorkUnitStatus,
+    to: WorkUnitStatus,
+    by: Transition["by"],
+  ): Promise<void> {
+    const transitions = await this.loadTransitions();
+    transitions.push({ unitId, from, to, at: new Date().toISOString(), by });
+    await this.ctx.storage.put("transitions", transitions);
   }
 
   /** Read the live state projection. */
@@ -187,6 +269,7 @@ export class ChangeState extends DurableObject<Env> {
     const completed = await this.loadCompleted();
     const leases = await this.loadLeases();
     const costEvents = await this.loadCostEvents();
+    const transitions = await this.loadTransitions();
     const statuses = workUnitStatuses(change, completed);
     const graph = buildWorkGraph(change);
     const collisions = detectPathCollisions(change);
@@ -221,6 +304,7 @@ export class ChangeState extends DurableObject<Env> {
       completed,
       spentUsd,
       costEvents,
+      transitions,
     };
   }
 
@@ -242,5 +326,9 @@ export class ChangeState extends DurableObject<Env> {
 
   private async loadCostEvents(): Promise<CostEvent[]> {
     return (await this.ctx.storage.get<CostEvent[]>("costEvents")) ?? [];
+  }
+
+  private async loadTransitions(): Promise<Transition[]> {
+    return (await this.ctx.storage.get<Transition[]>("transitions")) ?? [];
   }
 }

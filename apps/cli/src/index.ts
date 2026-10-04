@@ -20,8 +20,11 @@ import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 import {
+  changeToSpecYaml,
+  decomposeGoal,
   describeChange,
   formatChangePlan,
+  formatDecomposition,
   formatDoctorReport,
   formatRunSummary,
   runChange,
@@ -145,6 +148,60 @@ const commands: Command[] = [
     },
   },
   {
+    name: "decompose",
+    summary: "Decompose a goal against a project into a WorkGraph (plan + schedule).",
+    usage: `${CLI_NAME} decompose "<goal>" --project <dir>  |  ${CLI_NAME} decompose --goal-file <file> --project <dir>`,
+    async run(args) {
+      const goal = await resolveGoal(args);
+      if (goal === undefined) {
+        console.error(
+          `Usage: ${CLI_NAME} decompose "<goal text>" --project <dir>\n` +
+            `   or: ${CLI_NAME} decompose --goal-file <goal.txt> --project <dir>`,
+        );
+        return 1;
+      }
+      const projectDir = requireProjectDir(args);
+      if (!projectDir) {
+        console.error("A target project is required: pass --project <dir>.");
+        return 1;
+      }
+      const result = await decomposeGoal({ goal, projectDir });
+      console.log(formatDecomposition(result));
+      return 0;
+    },
+  },
+  {
+    name: "run-goal",
+    summary: "Decompose a goal and run the resulting Change end to end offline.",
+    usage: `${CLI_NAME} run-goal "<goal>" --project <dir>  |  ${CLI_NAME} run-goal --goal-file <file> --project <dir>`,
+    async run(args) {
+      const goal = await resolveGoal(args);
+      if (goal === undefined) {
+        console.error(
+          `Usage: ${CLI_NAME} run-goal "<goal text>" --project <dir>\n` +
+            `   or: ${CLI_NAME} run-goal --goal-file <goal.txt> --project <dir>`,
+        );
+        return 1;
+      }
+      const projectDir = requireProjectDir(args);
+      if (!projectDir) {
+        console.error("A target project is required: pass --project <dir>.");
+        return 1;
+      }
+      const decomposition = await decomposeGoal({ goal, projectDir });
+      console.log(formatDecomposition(decomposition));
+      console.log("");
+      console.log("Running the decomposed WorkGraph to completion offline...");
+      console.log("");
+      const result = await runChange({
+        specYaml: changeToSpecYaml(decomposition.change),
+        projectDir,
+      });
+      console.log(formatRunSummary(result));
+      return result.promotion.committed ? 0 : 1;
+    },
+  },
+  {
     name: "promote",
     summary: "Run a Change and promote the verified result into local Git.",
     usage: `${CLI_NAME} promote <change.yaml> [--project <dir>]`,
@@ -194,6 +251,39 @@ function optionValue(args: readonly string[], flag: string): string | undefined 
     return undefined;
   }
   return args[index + 1];
+}
+
+/**
+ * Resolve the goal text for a goal-driven command. Accepts either an inline goal
+ * as the first positional argument, or a --goal-file pointing at a text file.
+ * Returns undefined when no goal was provided.
+ */
+async function resolveGoal(args: readonly string[]): Promise<string | undefined> {
+  const file = optionValue(args, "--goal-file");
+  if (file) {
+    return (await readFile(resolve(file), "utf8")).trim();
+  }
+  const positional = args.find((arg) => !arg.startsWith("--") && !isOptionValue(args, arg));
+  if (positional && positional.trim() !== "") {
+    return positional.trim();
+  }
+  return undefined;
+}
+
+/** Resolve the required --project directory, or undefined when absent. */
+function requireProjectDir(args: readonly string[]): string | undefined {
+  const explicit = optionValue(args, "--project");
+  return explicit ? resolve(explicit) : undefined;
+}
+
+/** True when `value` is the argument consumed by a preceding --flag. */
+function isOptionValue(args: readonly string[], value: string): boolean {
+  const index = args.indexOf(value);
+  if (index <= 0) {
+    return false;
+  }
+  const prev = args[index - 1] ?? "";
+  return prev.startsWith("--");
 }
 
 async function main(argv: string[]): Promise<number> {
