@@ -133,7 +133,7 @@ function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
 /** The fill color for a node from its kind and verified/escalated state. */
 function nodeFill(node: GraphNode): string {
   if (node.escalated) {
-    return "#f85149"; // RESERVED escalation highlight (human escalation milestone)
+    return "#f85149"; // a pending human escalation lights this node (M5 beat)
   }
   if (node.kind === "tool") {
     return "#9e6a03"; // agent-built tool, published to its own repo

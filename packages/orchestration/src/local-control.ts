@@ -106,6 +106,8 @@ export interface ChangeStateView {
   readonly toolConsumptions: readonly ToolConsumption[];
   /** Write-lease coordination on contested paths (owner vs waiters). */
   readonly leaseEdges: readonly LeaseEdge[];
+  /** Human escalations recorded for this Change (pending and resolved). */
+  readonly escalations: readonly Escalation[];
 }
 
 /** The agent-built tool recorded on the Change (mirrors the Worker). */
@@ -129,6 +131,35 @@ export interface LeaseEdge {
   readonly path: string;
   readonly owner: string;
   readonly waiters: readonly string[];
+}
+
+/** The kind of a fork that must be escalated to a human (mirrors the Worker). */
+export type EscalationKind = "lease-owner" | "verification-ambiguous" | "decision";
+
+/** Whether an escalation is still pending or resolved (mirrors the Worker). */
+export type EscalationStatus = "pending" | "resolved";
+
+/** A human escalation record (mirrors the Worker's durable escalation). */
+export interface Escalation {
+  readonly id: string;
+  readonly kind: EscalationKind;
+  readonly unitId?: string;
+  readonly path?: string;
+  readonly question: string;
+  readonly options: readonly string[];
+  readonly status: EscalationStatus;
+  readonly decision?: string;
+  readonly raisedAt: string;
+  readonly resolvedAt?: string;
+}
+
+/** The input to raise an escalation offline (mirrors the Worker). */
+export interface RaiseEscalationInput {
+  readonly kind: EscalationKind;
+  readonly unitId?: string;
+  readonly path?: string;
+  readonly question: string;
+  readonly options?: readonly string[];
 }
 
 /** A recruitment plan for one wave in the offline substrate (mirrors the DO). */
@@ -173,6 +204,8 @@ class ChangeRecord {
   tool: ToolRecord | null = null;
   /** Real tool-consumption records (downstream units that ran the tool). */
   readonly toolConsumptions: ToolConsumption[] = [];
+  /** Human escalations recorded for this Change (pending and resolved). */
+  readonly escalations: Escalation[] = [];
   constructor(change: Change) {
     this.change = change;
   }
@@ -211,6 +244,77 @@ export class LocalChangeControl {
   /** The inspectable recruitment-event log for a Change. */
   recruitments(changeId: string): readonly RecruitmentEvent[] {
     return this.require(changeId).recruitments;
+  }
+
+  /** All escalations recorded for a Change (pending and resolved). */
+  escalations(changeId: string): readonly Escalation[] {
+    return this.require(changeId).escalations;
+  }
+
+  /**
+   * Raise a human escalation for a fork mechanical evidence cannot settle
+   * (mirrors the DO). Idempotent for the same pending (kind, unitId, path), so a
+   * re-driven engine does not pile up duplicates. The engine then waits on it.
+   */
+  raiseEscalation(changeId: string, input: RaiseEscalationInput): Escalation {
+    const record = this.require(changeId);
+    if (input.unitId && !record.change.work.some((u) => u.id === input.unitId)) {
+      throw new Error(`unknown WorkUnit for escalation: ${input.unitId}`);
+    }
+    const existing = record.escalations.find(
+      (e) =>
+        e.status === "pending" &&
+        e.kind === input.kind &&
+        e.unitId === input.unitId &&
+        e.path === input.path,
+    );
+    if (existing) {
+      return existing;
+    }
+    const escalation: Escalation = {
+      id: `esc-${record.escalations.length + 1}-${Date.now().toString(36)}`,
+      kind: input.kind,
+      ...(input.unitId !== undefined ? { unitId: input.unitId } : {}),
+      ...(input.path !== undefined ? { path: input.path } : {}),
+      question: input.question,
+      options: input.options ?? [],
+      status: "pending",
+      raisedAt: new Date().toISOString(),
+    };
+    record.escalations.push(escalation);
+    return escalation;
+  }
+
+  /**
+   * Resolve a pending escalation with the human's decision (mirrors the DO).
+   * This is the input that ends the durable wait and lets the graph advance.
+   */
+  resolveEscalation(changeId: string, id: string, decision: string): Escalation {
+    const record = this.require(changeId);
+    const index = record.escalations.findIndex((e) => e.id === id);
+    if (index === -1) {
+      throw new Error(`unknown escalation: ${id}`);
+    }
+    const current = record.escalations[index] as Escalation;
+    if (current.status === "resolved") {
+      throw new Error(`escalation already resolved: ${id}`);
+    }
+    const resolved: Escalation = {
+      ...current,
+      status: "resolved",
+      decision,
+      resolvedAt: new Date().toISOString(),
+    };
+    record.escalations[index] = resolved;
+    return resolved;
+  }
+
+  /** Whether a pending escalation exists (optionally for a specific unit). */
+  hasPendingEscalation(changeId: string, unitId?: string): boolean {
+    const record = this.require(changeId);
+    return record.escalations.some(
+      (e) => e.status === "pending" && (unitId === undefined || e.unitId === unitId),
+    );
   }
 
   /**
@@ -391,6 +495,7 @@ export class LocalChangeControl {
       ...(record.tool ? { tool: record.tool } : {}),
       toolConsumptions: record.toolConsumptions,
       leaseEdges,
+      escalations: record.escalations,
     };
   }
 

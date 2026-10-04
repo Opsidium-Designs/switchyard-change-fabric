@@ -2,7 +2,7 @@
   "name": "@switchyard-change/model-adapters",
   "version": "0.0.0",
   "private": true,
-  "description": "ExecutorProvider contract and pluggable executors (deterministic noop, thin OpenAI-compatible / AI Gateway shape).",
+  "description": "ExecutorProvider contract and pluggable executors (deterministic noop, thin OpenAI-compatible / AI Gateway shape, Workers AI).",
   "license": "Apache-2.0",
   "type": "module",
   "main": "./src/index.ts",

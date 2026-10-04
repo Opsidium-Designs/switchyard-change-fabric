@@ -147,6 +147,12 @@ export interface ChangeStateView {
    * the console's lease edges and makes the single-writer coordination legible.
    */
   readonly leaseEdges: readonly LeaseEdge[];
+  /**
+   * The human escalations recorded for this Change: forks mechanical evidence
+   * could not settle. A pending escalation lights the `escalated` node flag in
+   * the graph and the engine waits on it; a resolved one carries the decision.
+   */
+  readonly escalations: readonly Escalation[];
 }
 
 /** The payload returned when a runner leases a WorkUnit. */
@@ -231,6 +237,52 @@ export interface RepoPushedResult {
 }
 
 /**
+ * The kind of a fork the engine cannot settle on mechanical evidence and must
+ * escalate to a human. "lease-owner" is a contested shared path with no
+ * evidence-based way to pick the single writer; "verification-ambiguous" is a
+ * WorkUnit whose verification evidence does not clearly pass or fail;
+ * "decision" is any other required decision with no evidence-based answer.
+ */
+export type EscalationKind = "lease-owner" | "verification-ambiguous" | "decision";
+
+/** Whether an escalation is still waiting on a human, or has been resolved. */
+export type EscalationStatus = "pending" | "resolved";
+
+/**
+ * A human escalation: a fork mechanical evidence cannot settle. The engine
+ * records it and WAITS (a durable record in ChangeState, not a sleep) until a
+ * human posts a decision, which resolves it and lets the graph advance. A
+ * pending escalation lights the `escalated` flag on its node in the graph.
+ */
+export interface Escalation {
+  /** Stable id for this escalation (used to resolve it). */
+  readonly id: string;
+  readonly kind: EscalationKind;
+  /** The WorkUnit this escalation concerns, when it is unit-scoped. */
+  readonly unitId?: string;
+  /** The contested path, for a lease-owner escalation. */
+  readonly path?: string;
+  /** The human-readable question the engine needs answered. */
+  readonly question: string;
+  /** The candidate answers the human may choose among (advisory, not enforced). */
+  readonly options: readonly string[];
+  readonly status: EscalationStatus;
+  /** The human's decision text, once resolved. */
+  readonly decision?: string;
+  readonly raisedAt: string;
+  readonly resolvedAt?: string;
+}
+
+/** The input to raise an escalation (ids and timestamps are assigned by the DO). */
+export interface RaiseEscalationInput {
+  readonly kind: EscalationKind;
+  readonly unitId?: string;
+  readonly path?: string;
+  readonly question: string;
+  readonly options?: readonly string[];
+}
+
+/**
  * ChangeState: single-owner, serialized Durable Object holding the live Change
  * projection and the lease/cost bookkeeping that drives the work graph.
  *
@@ -270,6 +322,9 @@ export class ChangeState extends DurableObject<Env> {
     // when the unit is leased and kept past completion so a completed node still
     // reveals the real repo it ran in. The plaintext token is never stored here.
     await this.ctx.storage.put("workspaces", {} as Record<string, WorkspaceIdentity>);
+    // Human escalations: forks mechanical evidence could not settle. Empty until
+    // the engine raises one; a pending one is a durable wait the graph blocks on.
+    await this.ctx.storage.put("escalations", [] as Escalation[]);
     return this.view();
   }
 
@@ -296,6 +351,90 @@ export class ChangeState extends DurableObject<Env> {
   /** The write-lease coordination plan (one owner per contested path). */
   async getLeasePlan(): Promise<LeasePlan> {
     return this.loadLeasePlan();
+  }
+
+  /** All escalations recorded for this Change (pending and resolved). */
+  async getEscalations(): Promise<readonly Escalation[]> {
+    return this.loadEscalations();
+  }
+
+  /**
+   * Raise a human escalation for a fork mechanical evidence cannot settle. The
+   * engine records it and waits (a durable record, not a sleep) for a human
+   * decision. Raising the same fork twice is idempotent: an existing pending
+   * escalation for the same (kind, unitId, path) is returned rather than
+   * duplicated, so a resumed or re-driven engine does not pile up escalations.
+   * A unit-scoped escalation must name a WorkUnit that exists in the Change.
+   */
+  async raiseEscalation(input: RaiseEscalationInput): Promise<Escalation> {
+    const change = await this.loadChange();
+    if (input.unitId && !change.work.some((u) => u.id === input.unitId)) {
+      throw new Error(`unknown WorkUnit for escalation: ${input.unitId}`);
+    }
+    const escalations = await this.loadEscalations();
+    const existing = escalations.find(
+      (e) =>
+        e.status === "pending" &&
+        e.kind === input.kind &&
+        e.unitId === input.unitId &&
+        e.path === input.path,
+    );
+    if (existing) {
+      return existing;
+    }
+    const escalation: Escalation = {
+      id: `esc-${escalations.length + 1}-${Date.now().toString(36)}`,
+      kind: input.kind,
+      ...(input.unitId !== undefined ? { unitId: input.unitId } : {}),
+      ...(input.path !== undefined ? { path: input.path } : {}),
+      question: input.question,
+      options: input.options ?? [],
+      status: "pending",
+      raisedAt: new Date().toISOString(),
+    };
+    escalations.push(escalation);
+    await this.ctx.storage.put("escalations", escalations);
+    return escalation;
+  }
+
+  /**
+   * Resolve a pending escalation with the human's decision. This is the input
+   * that ends the durable wait and lets the graph advance past the fork.
+   * Resolving an unknown or already-resolved escalation is rejected so a
+   * decision is never silently lost.
+   */
+  async resolveEscalation(id: string, decision: string): Promise<Escalation> {
+    const escalations = await this.loadEscalations();
+    const index = escalations.findIndex((e) => e.id === id);
+    if (index === -1) {
+      throw new Error(`unknown escalation: ${id}`);
+    }
+    const current = escalations[index] as Escalation;
+    if (current.status === "resolved") {
+      throw new Error(`escalation already resolved: ${id}`);
+    }
+    const resolved: Escalation = {
+      ...current,
+      status: "resolved",
+      decision,
+      resolvedAt: new Date().toISOString(),
+    };
+    escalations[index] = resolved;
+    await this.ctx.storage.put("escalations", escalations);
+    return resolved;
+  }
+
+  /**
+   * Whether this Change has a pending escalation (optionally for a specific
+   * WorkUnit). The engine checks this before advancing a fork: a pending
+   * escalation is a hard, durable wait, so the engine does not self-certify past
+   * it. This is the "wait" half of the escalation beat, read from durable state.
+   */
+  async hasPendingEscalation(unitId?: string): Promise<boolean> {
+    const escalations = await this.loadEscalations();
+    return escalations.some(
+      (e) => e.status === "pending" && (unitId === undefined || e.unitId === unitId),
+    );
   }
 
   /**
@@ -597,6 +736,7 @@ export class ChangeState extends DurableObject<Env> {
     const leasePlan = await this.loadLeasePlan();
     const tool = await this.loadTool();
     const toolConsumptions = await this.loadToolConsumptions();
+    const escalations = await this.loadEscalations();
     const statuses = workUnitStatuses(change, completed);
     const graph = buildWorkGraph(change);
     const collisions = detectPathCollisions(change);
@@ -643,6 +783,7 @@ export class ChangeState extends DurableObject<Env> {
       ...(tool ? { tool } : {}),
       toolConsumptions,
       leaseEdges,
+      escalations,
     };
   }
 
@@ -702,6 +843,10 @@ export class ChangeState extends DurableObject<Env> {
 
   private async loadToolConsumptions(): Promise<ToolConsumption[]> {
     return (await this.ctx.storage.get<ToolConsumption[]>("toolConsumptions")) ?? [];
+  }
+
+  private async loadEscalations(): Promise<Escalation[]> {
+    return (await this.ctx.storage.get<Escalation[]>("escalations")) ?? [];
   }
 }
 

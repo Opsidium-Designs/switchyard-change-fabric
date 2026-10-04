@@ -1,6 +1,6 @@
 import { parseChangeSpec } from "@switchyard-change/change-core";
 
-import type { LeaseWorkspace, WorkspaceIdentity } from "./change-state.ts";
+import type { EscalationKind, LeaseWorkspace, WorkspaceIdentity } from "./change-state.ts";
 import type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 import { selectProvisioner } from "./workspace-provisioner.ts";
 
@@ -303,6 +303,81 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
   }
 
+  // Raise a human escalation for a fork mechanical evidence cannot settle. The
+  // engine records it and WAITS (a durable record in the DO, not a sleep) until
+  // a human posts a decision. A pending escalation lights the graph's escalated
+  // node flag so the console/CLI can show the pending decision.
+  const escalateMatch = url.pathname.match(/^\/changes\/([^/]+)\/escalations$/);
+  if (request.method === "POST" && escalateMatch) {
+    const changeId = decodeURIComponent(escalateMatch[1] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: EscalationBody;
+    try {
+      body = (await request.json()) as EscalationBody;
+    } catch {
+      return json({ error: "invalid escalation body" }, 400);
+    }
+    if (!body.question || !body.kind) {
+      return json({ error: "escalation requires a kind and a question" }, 400);
+    }
+    try {
+      const escalation = await stub.raiseEscalation({
+        kind: body.kind,
+        unitId: body.unitId,
+        path: body.path,
+        question: body.question,
+        options: body.options,
+      });
+      return json({ escalation }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Read the escalations recorded for a Change (pending and resolved).
+  const listEscalationsMatch = url.pathname.match(/^\/changes\/([^/]+)\/escalations$/);
+  if (request.method === "GET" && listEscalationsMatch) {
+    const changeId = decodeURIComponent(listEscalationsMatch[1] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    return json({ escalations: await stub.getEscalations() });
+  }
+
+  // Resolve a pending escalation with a human decision. This is the input that
+  // ends the durable wait and lets the graph advance past the fork.
+  const resolveMatch = url.pathname.match(/^\/changes\/([^/]+)\/escalations\/([^/]+)\/resolve$/);
+  if (request.method === "POST" && resolveMatch) {
+    const changeId = decodeURIComponent(resolveMatch[1] ?? "");
+    const escalationId = decodeURIComponent(resolveMatch[2] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: ResolveBody = {};
+    const raw = await request.text();
+    if (raw.trim() !== "") {
+      try {
+        body = JSON.parse(raw) as ResolveBody;
+      } catch {
+        return json({ error: "invalid resolve body" }, 400);
+      }
+    }
+    if (!body.decision || body.decision.trim() === "") {
+      return json({ error: "a resolution requires a decision" }, 400);
+    }
+    try {
+      const escalation = await stub.resolveEscalation(escalationId, body.decision);
+      return json({ escalation });
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
   // Ingest a repo-pushed event (the real Artifacts event, or a faked one in a
   // deterministic test). The push a runner makes when it finishes a WorkUnit is
   // the trigger for the next recruitment wave. This path drives recruitment from
@@ -481,6 +556,20 @@ interface RepoPushedBody {
   readonly workspace?: string;
 }
 
+/** Body of POST /changes/:id/escalations: a fork for a human to settle. */
+interface EscalationBody {
+  readonly kind?: EscalationKind;
+  readonly unitId?: string;
+  readonly path?: string;
+  readonly question?: string;
+  readonly options?: readonly string[];
+}
+
+/** Body of POST /changes/:id/escalations/:escId/resolve: the human decision. */
+interface ResolveBody {
+  readonly decision?: string;
+}
+
 /** A recruited agent: its WorkUnit, its own workspace, and its one-time token. */
 export interface RecruitedAgent {
   readonly unitId: string;
@@ -506,11 +595,27 @@ interface RepoPushedHandled {
   readonly done: boolean;
 }
 
-/** The shape of a repo-pushed message delivered to the Queue consumer. */
+/**
+ * The shape of a repo-pushed message delivered to the Queue consumer.
+ *
+ * The real Cloudflare Artifacts event (verified live) is delivered as:
+ *   { "type": "cf.artifacts.repo.pushed",
+ *     "source": { "namespace": "...", "repoName": "<workspace>", "type": "artifacts" },
+ *     "payload": { "ref": "...", "commits": [...] }, ... }
+ * so the pushed workspace (Artifact repo) name is `source.repoName`. The older
+ * flat fields are kept as fallbacks for a hand-posted or test event, and the
+ * HTTP ingress path still uses the flat `{ changeId, workspace }` body.
+ */
 interface RepoPushedMessageBody {
   readonly type?: string;
   readonly changeId?: string;
-  /** The pushed Artifact repo (workspace) name, under either field name. */
+  /** The pushed Artifact repo (workspace) name, under the real nested field. */
+  readonly source?: {
+    readonly namespace?: string;
+    readonly repoName?: string;
+    readonly type?: string;
+  };
+  /** Flat fallbacks for a hand-posted or test event. */
   readonly workspace?: string;
   readonly repo?: string;
   readonly repository?: string;
@@ -550,7 +655,10 @@ export default {
     for (const message of batch.messages) {
       try {
         const body = message.body;
-        const workspace = body.workspace ?? body.repo ?? body.repository ?? "";
+        // The real Artifacts event carries the pushed repo as source.repoName;
+        // a hand-posted or test event may use a flat workspace/repo field.
+        const workspace =
+          body.source?.repoName ?? body.workspace ?? body.repo ?? body.repository ?? "";
         if (workspace === "") {
           message.ack();
           continue;

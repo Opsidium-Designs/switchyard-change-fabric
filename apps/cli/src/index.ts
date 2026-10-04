@@ -30,10 +30,13 @@ import {
   formatRunSummary,
   runChange,
   runDoctor,
+  runFullLive,
   runRecruitment,
   runRecruitmentLive,
+  selectExecutor,
   type Change,
   type ConcurrencyDial,
+  type Escalation,
 } from "@switchyard-change/orchestration";
 
 const CLI_NAME = "switchyard-change";
@@ -288,6 +291,131 @@ const commands: Command[] = [
     },
   },
   {
+    name: "run-live",
+    summary:
+      "Full live run: decompose -> recruit real agents (Workers AI) -> escalate -> verify -> integrate -> promote -> cleanup.",
+    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>]`,
+    async run(args) {
+      const change = await resolveChange(args);
+      if (!change) {
+        console.error(
+          `Usage: ${CLI_NAME} run-live "<goal text>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>]\n` +
+            `   or: ${CLI_NAME} run-live --change <change.yaml> --project <dir> --worker <url> [--min N] [--max N]`,
+        );
+        return 1;
+      }
+      const projectDir = requireProjectDir(args);
+      if (!projectDir) {
+        console.error("A target project is required: pass --project <dir>.");
+        return 1;
+      }
+      const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
+      const dial = dialFromArgs(args);
+
+      // Select the executor from the environment (.env). workers-ai is the live
+      // inference path; anything else is the deterministic noop. The credential
+      // is read inside selectExecutor and never printed here.
+      let selected;
+      try {
+        selected = selectExecutor();
+      } catch (error) {
+        console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      }
+
+      // Give each live run a unique Change id so real Artifact repo names never
+      // collide with a prior run's just-deleted repos (deletion is eventually
+      // consistent). A fresh id per run side-steps that without weakening
+      // per-unit isolation.
+      const runId = Date.now().toString(36);
+      const liveChange: Change = { ...change, id: `${change.id}-${runId}` };
+
+      // The human escalation resolver. A real human chooses the lease owner for
+      // a contested path; --owner / --decision supplies that non-interactively
+      // so the run is reproducible, defaulting to the deterministic lease owner.
+      const explicitDecision = optionValue(args, "--owner") ?? optionValue(args, "--decision");
+      const resolveEscalation = async (escalation: Escalation): Promise<string> => {
+        const decision =
+          explicitDecision ?? escalation.options[0] ?? "proceed";
+        console.log(`  human decision for ${escalation.id}: ${decision}`);
+        return decision;
+      };
+
+      console.log(
+        `Full live run for ${liveChange.id} under dial min ${dial.minConcurrency}, max ${dial.maxConcurrency} ` +
+          `against Worker ${workerUrl}`,
+      );
+      console.log(`  executor: ${selected.description}`);
+      console.log("");
+
+      const result = await runFullLive({
+        change: liveChange,
+        dial,
+        workerUrl,
+        specYaml: changeToSpecYaml(liveChange),
+        projectDir,
+        executor: selected.executor,
+        resolveEscalation,
+        onEvent: (event) => {
+          switch (event.kind) {
+            case "change-created":
+              console.log(`Created Change ${event.changeId} on the live Worker`);
+              break;
+            case "wave":
+              console.log(
+                `Wave [${event.wave.trigger}]: ${event.wave.agents
+                  .map((a) => `${a.unitId}@${a.workspaceName}`)
+                  .join(", ")} (${event.wave.concurrency} at once)`,
+              );
+              break;
+            case "escalation-raised":
+              console.log(`Escalation raised (waiting on a human): ${event.escalation.question}`);
+              break;
+            case "escalation-resolved":
+              console.log(`Escalation resolved: ${event.escalation.decision}`);
+              break;
+            case "verifying":
+              console.log("Verifying and integrating (mechanical ground truth)...");
+              break;
+            case "promoting":
+              console.log(`Promoting to local Git branch ${event.branch}...`);
+              break;
+            case "cleaned-up":
+              console.log(`Cleaned up ${event.archived.length} real Artifact repo(s).`);
+              break;
+          }
+        },
+      });
+
+      console.log("");
+      console.log(`Change ${result.changeId} on ${result.workerUrl}`);
+      console.log(`  wave trigger: ${result.waveTrigger}`);
+      console.log(`  peak concurrency: ${result.peakConcurrency}`);
+      console.log(`  distinct real repos held: ${result.workspaces.length}`);
+      console.log(`  any live (non-fallback) repo: ${result.anyLive ? "yes" : "no"}`);
+      console.log(`  real repo names: ${result.workspaces.join(", ") || "(none)"}`);
+      console.log(`  completed: ${result.completed.join(", ") || "(none)"}`);
+      if (result.escalation.raised) {
+        console.log(
+          `  escalation: raised ${result.escalation.raised.id} (waited: ${result.escalation.waited ? "yes" : "no"}), ` +
+            `resolved -> ${result.escalation.resolved?.decision ?? "(none)"}`,
+        );
+      } else {
+        console.log("  escalation: none raised (no contested shared path)");
+      }
+      console.log(`  verification: ${result.evidence.integration.verdict}`);
+      if (result.promotion.committed) {
+        console.log(
+          `  promoted: ${result.promotion.branch} (${result.promotion.commit.slice(0, 10)}) in ${result.sourceRepoDir}`,
+        );
+      } else {
+        console.log("  promoted: nothing to promote (no changes)");
+      }
+      console.log(`  cleaned up repos: ${result.cleanedUp.join(", ") || "(none)"}`);
+      return result.promotion.committed && result.completed.length === change.work.length ? 0 : 1;
+    },
+  },
+  {
     name: "promote",
     summary: "Run a Change and promote the verified result into local Git.",
     usage: `${CLI_NAME} promote <change.yaml> [--project <dir>]`,
@@ -438,6 +566,9 @@ async function main(argv: string[]): Promise<number> {
     return await command.run(rest);
   } catch (error) {
     console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    if (process.env.SCF_DEBUG && error instanceof Error) {
+      console.error(error.stack);
+    }
     return 1;
   }
 }

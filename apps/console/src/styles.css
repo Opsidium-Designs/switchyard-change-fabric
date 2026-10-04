@@ -445,3 +445,41 @@ body {
   overflow-x: auto;
   font-size: 0.8rem;
 }
+
+/* Human escalation panel: the pending decisions the engine is waiting on. */
+.escalation-panel {
+  border-left: 3px solid #f85149;
+}
+
+.escalation-list {
+  list-style: none;
+  margin: 0.75rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.escalation.pending {
+  padding: 0.75rem;
+  border: 1px solid #f85149;
+  border-radius: 6px;
+  background: rgba(248, 81, 73, 0.08);
+}
+
+.escalation-question {
+  margin: 0 0 0.4rem;
+  font-weight: 600;
+}
+
+.escalation-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.escalation-resolved {
+  margin-top: 0.75rem;
+  font-size: 0.85rem;
+}

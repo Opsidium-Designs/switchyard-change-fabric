@@ -32,3 +32,21 @@ export type {
   ProposedEdit,
 } from "./openai-compatible.ts";
 export { OpenAiCompatibleExecutor } from "./openai-compatible.ts";
+
+export type {
+  WorkersAiEdit,
+  WorkersAiExecutorOptions,
+  WorkersAiInvoke,
+  WorkersAiInvokeRequest,
+  WorkersAiInvokeResult,
+  WorkersAiMessage,
+  WorkersAiRestOptions,
+  WorkersAiUsage,
+} from "./workers-ai.ts";
+export {
+  createWorkersAiRestInvoke,
+  DEFAULT_WORKERS_AI_FALLBACK_MODEL,
+  DEFAULT_WORKERS_AI_MODEL,
+  UnusableModelOutputError,
+  WorkersAiExecutor,
+} from "./workers-ai.ts";

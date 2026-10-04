@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   buildWorkGraphModel,
   type ChangeStateSnapshot,
+  type EscalationSnapshot,
   type GraphNode,
   type WorkGraphModel,
 } from "@switchyard-change/orchestration/graph-model";
@@ -259,6 +260,25 @@ export function App() {
         </section>
       ) : null}
 
+      {snapshot && (snapshot.escalations?.length ?? 0) > 0 ? (
+        <EscalationPanel
+          escalations={snapshot.escalations ?? []}
+          busy={busy}
+          onResolve={async (id, decision) => {
+            setBusy(true);
+            const ok = await post(
+              `/changes/${encodeURIComponent(changeId)}/escalations/${encodeURIComponent(id)}/resolve`,
+              { decision },
+            );
+            if (ok) {
+              setNotice(`escalation ${id} resolved: ${decision}`);
+              await load(changeId);
+            }
+            setBusy(false);
+          }}
+        />
+      ) : null}
+
       {model ? (
         <section className="app-panel graph-panel" aria-label="Living work graph">
           <GraphView model={model} selectedId={selectedId} onSelect={setSelectedId} />
@@ -282,13 +302,92 @@ function Legend() {
       <li><span className="swatch sw-agent" /> recruited agent (real repo)</li>
       <li><span className="swatch sw-verified" /> verified / integrated</li>
       <li><span className="swatch sw-tool" /> agent-built tool (real repo)</li>
-      <li><span className="swatch sw-escalated" /> escalation (reserved)</li>
+      <li><span className="swatch sw-escalated" /> pending human escalation</li>
       <li><span className="line ln-dependency" /> dependency</li>
       <li><span className="line ln-dataflow" /> data flow</li>
       <li><span className="line ln-spawn" /> event-driven spawn</li>
       <li><span className="line ln-tool" /> consumed tool</li>
       <li><span className="line ln-lease" /> write-lease (waiter to owner)</li>
     </ul>
+  );
+}
+
+/**
+ * The escalation panel: the pending human decisions the engine is waiting on,
+ * plus the resolved ones for context. A pending escalation is a durable wait in
+ * ChangeState (the engine does not self-certify past it); resolving one here
+ * POSTs the human decision to the Worker, which ends the wait and lets the
+ * graph advance. Each pending escalation also lights its node red in the graph.
+ */
+function EscalationPanel({
+  escalations,
+  busy,
+  onResolve,
+}: {
+  escalations: readonly EscalationSnapshot[];
+  busy: boolean;
+  onResolve: (id: string, decision: string) => void | Promise<void>;
+}) {
+  const pending = escalations.filter((e) => e.status === "pending");
+  const resolved = escalations.filter((e) => e.status === "resolved");
+  return (
+    <section className="app-panel escalation-panel" aria-label="Human escalations">
+      <h2>Human escalations</h2>
+      <p className="muted">
+        A fork mechanical evidence cannot settle. The engine recorded it and is
+        waiting on a human decision; it does not self-certify past it.
+      </p>
+      {pending.length === 0 ? (
+        <p className="muted">No pending escalation.</p>
+      ) : (
+        <ul className="escalation-list">
+          {pending.map((escalation) => (
+            <li key={escalation.id} className="escalation pending">
+              <p className="escalation-question">{escalation.question}</p>
+              <p className="muted">
+                {escalation.kind}
+                {escalation.unitId ? ` on ${escalation.unitId}` : ""}
+                {escalation.path ? ` (${escalation.path})` : ""}
+              </p>
+              <div className="escalation-options">
+                {(escalation.options ?? []).length > 0 ? (
+                  (escalation.options ?? []).map((option) => (
+                    <button
+                      key={option}
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void onResolve(escalation.id, option)}
+                    >
+                      {option}
+                    </button>
+                  ))
+                ) : (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void onResolve(escalation.id, "proceed")}
+                  >
+                    Resolve
+                  </button>
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      {resolved.length > 0 ? (
+        <details className="escalation-resolved">
+          <summary>{resolved.length} resolved</summary>
+          <ul>
+            {resolved.map((escalation) => (
+              <li key={escalation.id} className="muted">
+                {escalation.question} -&gt; <strong>{escalation.decision}</strong>
+              </li>
+            ))}
+          </ul>
+        </details>
+      ) : null}
+    </section>
   );
 }
 

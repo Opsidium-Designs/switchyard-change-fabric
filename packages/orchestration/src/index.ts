@@ -21,8 +21,12 @@
 export type {
   ChangeStateView,
   CostEvent,
+  Escalation,
+  EscalationKind,
+  EscalationStatus,
   LeaseEdge,
   LeaseRecord,
+  RaiseEscalationInput,
   RecruitmentEvent,
   RecruitmentPlan,
   RepoPushedResult,
@@ -50,6 +54,16 @@ export type {
   RunRecruitmentLiveResult,
 } from "./recruit-live.ts";
 export { runRecruitmentLive } from "./recruit-live.ts";
+
+export type {
+  EscalationReport,
+  EscalationResolution,
+  EscalationResolver,
+  FullLiveEvent,
+  RunFullLiveOptions,
+  RunFullLiveResult,
+} from "./run-live.ts";
+export { runFullLive } from "./run-live.ts";
 
 export type {
   RunChangeOptions,
@@ -93,6 +107,7 @@ export type {
   DependencySnapshot,
   DialSnapshot,
   EdgeBacking,
+  EscalationSnapshot,
   GraphEdge,
   GraphEdgeKind,
   GraphNode,
@@ -111,3 +126,6 @@ export { assertBacked, buildWorkGraphModel, goalNodeId, toolNodeId, unitNodeId }
 
 export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor.ts";
 export { formatDoctorReport, runDoctor } from "./doctor.ts";
+
+export type { ExecutorEnv, SelectedExecutor } from "./executor-select.ts";
+export { selectExecutor } from "./executor-select.ts";

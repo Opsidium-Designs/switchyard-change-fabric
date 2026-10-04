@@ -20,8 +20,9 @@
  * edge kind are populated from real state (an agent-built tool published to its
  * own repo, and the downstream units that actually ran it); the `lease` edge
  * kind surfaces the write-lease coordination (owner vs waiter) on a contested
- * path. The `escalated` node flag remains reserved for the human escalation
- * milestone and is always false until the engine surfaces an escalation.
+ * path. The `escalated` node flag is populated from real escalation state: a
+ * pending human escalation lights the flag on its unit's node (or the goal node
+ * for a change-scoped escalation) until a human decision resolves it.
  */
 
 /** The WorkUnit lifecycle status, mirrored from change-core without importing it. */
@@ -140,6 +141,25 @@ export interface DialSnapshot {
 }
 
 /**
+ * A recorded human escalation, as reported by the state. A pending escalation
+ * is a fork mechanical evidence could not settle: it lights the `escalated`
+ * flag on its node (a unit-scoped escalation on that unit's node, a
+ * change-scoped one on the goal node) until a human decision resolves it.
+ */
+export interface EscalationSnapshot {
+  readonly id: string;
+  readonly kind: "lease-owner" | "verification-ambiguous" | "decision";
+  readonly unitId?: string;
+  readonly path?: string;
+  readonly question: string;
+  readonly options?: readonly string[];
+  readonly status: "pending" | "resolved";
+  readonly decision?: string;
+  readonly raisedAt: string;
+  readonly resolvedAt?: string;
+}
+
+/**
  * The subset of the live ChangeState projection the graph model reads. Both the
  * Worker's `ChangeStateView` and the offline control surface's view are
  * structurally assignable to this, so the model projects either without a
@@ -170,6 +190,12 @@ export interface ChangeStateSnapshot {
    * Each becomes `lease` edges surfacing the single-writer coordination.
    */
   readonly leaseEdges?: readonly LeaseEdgeSnapshot[];
+  /**
+   * The human escalations recorded for this Change. A pending one lights the
+   * `escalated` flag on its node; this is the state that finally populates the
+   * reserved flag in the graph model.
+   */
+  readonly escalations?: readonly EscalationSnapshot[];
 }
 
 /** The kind of a node in the rendered graph. */
@@ -397,6 +423,23 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
   const unitIds = new Set(snapshot.work.map((u) => u.id));
   const nodes: GraphNode[] = [];
 
+  // Pending escalations light the reserved `escalated` flag. A unit-scoped
+  // pending escalation lights that unit's node; a change-scoped one (no unitId)
+  // lights the goal node. This is the state that finally populates the flag the
+  // graph model reserved for the human escalation beat.
+  const escalatedUnits = new Set<string>();
+  let goalEscalated = false;
+  for (const escalation of snapshot.escalations ?? []) {
+    if (escalation.status !== "pending") {
+      continue;
+    }
+    if (escalation.unitId && unitIds.has(escalation.unitId)) {
+      escalatedUnits.add(escalation.unitId);
+    } else {
+      goalEscalated = true;
+    }
+  }
+
   // The goal node: the Change root the graph self-organizes toward.
   nodes.push(
     assertBacked(
@@ -410,7 +453,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
           : "running",
         verified:
           snapshot.work.length > 0 && snapshot.work.every((u) => isVerified(u.status)),
-        escalated: false,
+        escalated: goalEscalated,
         backing: { kind: "change", changeId: snapshot.id },
       },
       snapshot,
@@ -422,6 +465,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
   // every unit node has concrete backing.
   for (const unit of snapshot.work) {
     const hasWorkspace = unit.workspace !== undefined;
+    const unitEscalated = escalatedUnits.has(unit.id);
     const node: GraphNode = hasWorkspace
       ? {
           id: unitNodeId(unit.id),
@@ -429,7 +473,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
           label: unit.id,
           status: unit.status,
           verified: isVerified(unit.status),
-          escalated: false,
+          escalated: unitEscalated,
           workspace: unit.workspace,
           backing: { kind: "workspace", unitId: unit.id, workspace: unit.workspace! },
         }
@@ -439,7 +483,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
           label: unit.id,
           status: unit.status,
           verified: isVerified(unit.status),
-          escalated: false,
+          escalated: unitEscalated,
           backing: { kind: "work-unit", unitId: unit.id, status: unit.status },
         };
     nodes.push(assertBacked(node, snapshot));

@@ -16,7 +16,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live artifacts-subscribe build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -114,6 +114,31 @@ WORKER ?= http://127.0.0.1:8787
 recruit-live:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- recruit-live "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" --min $(MIN) --max $(MAX)
+
+# The full live headline run against a running Worker (start it with `make dev`
+# in another terminal). It decomposes a goal, recruits real agents into real
+# Cloudflare Artifact repos, runs the chosen executor per agent (set
+# EXECUTOR=workers-ai in .env for real inference; otherwise the deterministic
+# noop), drives event-driven waves, runs the human escalation beat, then
+# verifies, integrates, promotes to local Git, and cleans up the real repos.
+# Keep inference cheap: a small seeded project and a low MAX. Override GOAL /
+# PROJECT / OWNER as needed; OWNER answers the escalation non-interactively.
+OWNER ?=
+
+run-live:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	npm -w apps/cli run dev -- run-live "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" \
+	  --min $(MIN) --max $(MAX) $(if $(OWNER),--owner $(OWNER),)
+
+# Provision the Artifacts event subscription that delivers repo-pushed events to
+# the Worker's Queue consumer, against the live account. This is the real
+# event-driven nervous system (the Queue consumer in apps/worker/src/index.ts).
+# It needs a scoped CLOUDFLARE_API_TOKEN with Queues + Artifacts access. See
+# docs/EVENT-SUBSCRIPTION.md for the exact steps and the honest status of the
+# feature on this account.
+artifacts-subscribe:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	bash tools/artifacts-subscribe.sh
 
 build:
 	npm run build
