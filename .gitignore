@@ -23,6 +23,10 @@ coverage/
 reports/
 *.log
 
+# Per-app live deployment markers (a manual Deploy writes the stable workers.dev
+# URL here so a later run can redeploy IN PLACE to the same URL; never committed)
+.deployments/
+
 # Editor / OS
 .DS_Store
 .idea/

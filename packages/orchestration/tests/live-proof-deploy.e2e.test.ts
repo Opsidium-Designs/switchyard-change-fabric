@@ -1,14 +1,15 @@
 /**
- * Live-URL proof: at the end of a VERIFIED real-app run, the fabric deploys the
- * fixed app to a live workers.dev URL as end-of-run proof and records that URL
- * on the Change state so the console surfaces a clickable link, then tears the
- * app down on cleanup. A run whose fix FAILS verification does NOT deploy; it
- * shows the failure honestly instead of a fake-green URL.
+ * Redeploy-in-place proof (M8.4): deploy is a MANUAL human step taken BEFORE a
+ * fix, and the run NEVER deploys fresh. On a verified fix, when a prior manual
+ * deployment already exists for the app, the run REDEPLOYS the fixed code to the
+ * app's STABLE worker name, updating that existing deployment in place at the
+ * same URL. When no manual deploy happened, the run deploys NOTHING, yet it still
+ * promotes to Git and completes normally (the console simply shows no live URL).
+ * A run whose fix FAILS verification does NOT redeploy either.
  *
- * The deployer and teardown are injected (a deterministic fake here), and the
- * Worker is the in-process LocalChangeControl, so this runs under `make check`
- * with no Cloudflare account and no network: the deploy step is faked exactly as
- * the Workers AI executor is faked elsewhere.
+ * The redeployer and the already-deployed lookup are injected (deterministic
+ * fakes here), and the Worker is the in-process LocalChangeControl, so this runs
+ * under `make check` with no Cloudflare account and no network.
  */
 
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
@@ -22,7 +23,7 @@ import { ScopedNoopExecutor } from "@switchyard-change/model-adapters";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 
 import { LocalChangeControl } from "../src/local-control.ts";
-import { runFullLive, type DeployApp, type TeardownApp } from "../src/run-live.ts";
+import { runFullLive, type DeployApp } from "../src/run-live.ts";
 
 const SPEC = `
 id: change-deploy
@@ -151,8 +152,8 @@ afterEach(async () => {
   await rm(workRoot, { recursive: true, force: true });
 });
 
-describe("M8.3 live-URL proof: deploy the fixed app and surface a clickable URL", () => {
-  it("deploys after a verified run, records the URL on state, and tears it down", async () => {
+describe("M8.4 redeploy-in-place proof: the run only refreshes an existing manual deployment", () => {
+  it("REDEPLOYS to the stable name when the app was already deployed, and records the URL", async () => {
     const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, "artifacts") });
     const control = new LocalChangeControl(workspaces);
     const { fetchFn } = fakeWorker(control);
@@ -162,15 +163,15 @@ describe("M8.3 live-URL proof: deploy the fixed app and surface a clickable URL"
     await mkdir(projectDir, { recursive: true });
     await writeFile(join(projectDir, "index.js"), "export default {};\n", "utf8");
 
-    const deployed: string[] = [];
-    const tornDown: string[] = [];
+    const redeployed: string[] = [];
     const deployApp: DeployApp = async ({ appName }) => {
-      deployed.push(appName);
+      redeployed.push(appName);
+      // The redeploy returns the SAME stable URL the manual deploy used.
       return { url: `https://${appName}.example.workers.dev` };
     };
-    const teardownApp: TeardownApp = async ({ appName }) => {
-      tornDown.push(appName);
-    };
+    // The app WAS manually deployed before the run: the lookup resolves its URL.
+    const appAlreadyDeployed = async ({ appName }: { appName: string }) =>
+      `https://${appName}.example.workers.dev`;
 
     const result = await runFullLive({
       change,
@@ -182,25 +183,72 @@ describe("M8.3 live-URL proof: deploy the fixed app and surface a clickable URL"
       fetchFn,
       executor: new ScopedNoopExecutor(),
       deployAppDir: join(workRoot, "project"),
-      deployAppName: "demo-app",
+      deployAppName: "switchyard-change-fabric-demo-app",
       deployApp,
-      teardownApp,
+      appAlreadyDeployed,
     });
 
-    // The verified run deployed the app and recorded the URL in the result and
-    // on the Change state (so the console surfaces a clickable link).
+    // The verified run redeployed the fixed code to the SAME stable name and
+    // recorded the URL on state (so the console surfaces the clickable link).
     expect(result.evidence.integration.verdict).toBe("verified");
-    expect(deployed).toEqual(["demo-app"]);
-    expect(result.deployment?.url).toBe("https://demo-app.example.workers.dev");
-    expect(result.deployment?.app).toBe("demo-app");
+    expect(redeployed).toEqual(["switchyard-change-fabric-demo-app"]);
+    expect(result.deployment?.url).toBe(
+      "https://switchyard-change-fabric-demo-app.example.workers.dev",
+    );
+    expect(result.deployment?.app).toBe("switchyard-change-fabric-demo-app");
     const snapshot = control.state("change-deploy") as { deployment?: { url: string } };
-    expect(snapshot.deployment?.url).toBe("https://demo-app.example.workers.dev");
-
-    // Cleanup (non-watch) tore the deployed app down so nothing leaks.
-    expect(tornDown).toEqual(["demo-app"]);
+    expect(snapshot.deployment?.url).toBe(
+      "https://switchyard-change-fabric-demo-app.example.workers.dev",
+    );
+    // The run still promoted the fix to Git.
+    expect(result.promotion.committed).toBe(true);
   });
 
-  it("does NOT deploy when the fix fails verification (no fake-green URL)", async () => {
+  it("does NOT deploy when nothing was pre-deployed, but still promotes to Git", async () => {
+    const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, "a3") });
+    const control = new LocalChangeControl(workspaces);
+    const { fetchFn } = fakeWorker(control);
+    const change = parseChangeSpec(SPEC);
+
+    const projectDir = join(workRoot, "p3", "src");
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(join(projectDir, "index.js"), "export default {};\n", "utf8");
+
+    const redeployed: string[] = [];
+    const deployApp: DeployApp = async ({ appName }) => {
+      redeployed.push(appName);
+      return { url: `https://${appName}.example.workers.dev` };
+    };
+    // No manual deploy happened: the lookup resolves undefined, so the run must
+    // NOT deploy at all.
+    const appAlreadyDeployed = async () => undefined;
+
+    const result = await runFullLive({
+      change,
+      dial: { minConcurrency: 1, maxConcurrency: 2 },
+      workerUrl: "http://w",
+      specYaml: SPEC,
+      projectDir: join(workRoot, "p3"),
+      workRoot: join(workRoot, "run3"),
+      fetchFn,
+      executor: new ScopedNoopExecutor(),
+      deployAppDir: join(workRoot, "p3"),
+      deployAppName: "switchyard-change-fabric-demo-app",
+      deployApp,
+      appAlreadyDeployed,
+    });
+
+    // The run verified and promoted, but deployed nothing because no manual
+    // deploy preceded it. The console simply shows no live URL.
+    expect(result.evidence.integration.verdict).toBe("verified");
+    expect(result.promotion.committed).toBe(true);
+    expect(redeployed).toEqual([]);
+    expect(result.deployment).toBeUndefined();
+    const snapshot = control.state("change-deploy") as { deployment?: unknown };
+    expect(snapshot.deployment).toBeUndefined();
+  });
+
+  it("does NOT redeploy when the fix fails verification (even if pre-deployed)", async () => {
     const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, "a2") });
     const control = new LocalChangeControl(workspaces);
     const { fetchFn } = fakeWorker(control);
@@ -210,17 +258,18 @@ describe("M8.3 live-URL proof: deploy the fixed app and surface a clickable URL"
     await mkdir(projectDir, { recursive: true });
     await writeFile(join(projectDir, "index.js"), "export default {};\n", "utf8");
 
-    const deployed: string[] = [];
-    // A deployer that would record a URL if ever called; it must NOT be called
-    // because the fix fails verification (the executor writes out of scope).
+    const redeployed: string[] = [];
     const deployApp: DeployApp = async ({ appName }) => {
-      deployed.push(appName);
+      redeployed.push(appName);
       return { url: `https://${appName}.example.workers.dev` };
     };
+    // The app WAS pre-deployed, but the fix fails, so the run must NOT redeploy a
+    // broken app over the working one.
+    const appAlreadyDeployed = async ({ appName }: { appName: string }) =>
+      `https://${appName}.example.workers.dev`;
 
-    // Force an unverified run: an executor that always FAILS (throws past its
-    // bounded retries), so the only unit fails, nothing is integrated, and the
-    // integration verdict is not "verified". A failed fix must NOT deploy.
+    // Force an unverified run: an executor that always FAILS, so nothing is
+    // integrated and the integration verdict is not "verified".
     const failing = {
       name: "always-fails",
       async execute() {
@@ -238,14 +287,15 @@ describe("M8.3 live-URL proof: deploy the fixed app and surface a clickable URL"
       fetchFn,
       executor: failing,
       deployAppDir: join(workRoot, "p2"),
-      deployAppName: "demo-app",
+      deployAppName: "switchyard-change-fabric-demo-app",
       deployApp,
+      appAlreadyDeployed,
     });
 
-    // The fix did not land (no unit integrated), so the app was NOT deployed and
-    // no URL is recorded, even though an empty integration verifies vacuously.
+    // The fix did not land, so nothing was redeployed and no URL was recorded,
+    // even though the app was pre-deployed.
     expect(result.evidence.integration.integratedUnits.length).toBe(0);
-    expect(deployed).toEqual([]);
+    expect(redeployed).toEqual([]);
     expect(result.deployment).toBeUndefined();
     const snapshot = control.state("change-deploy") as { deployment?: unknown };
     expect(snapshot.deployment).toBeUndefined();

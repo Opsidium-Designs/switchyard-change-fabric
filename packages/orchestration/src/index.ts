@@ -70,6 +70,16 @@ export type {
 } from "./run-live.ts";
 export { cleanupLive, runFullLive } from "./run-live.ts";
 
+export type { AppDeploymentMarker } from "./app-deploy.ts";
+export {
+  clearAppDeployment,
+  deploymentsDir,
+  markerPath,
+  readAppDeployment,
+  recordAppDeployment,
+  stableAppWorkerName,
+} from "./app-deploy.ts";
+
 export type {
   RunChangeOptions,
   RunChangeResult,

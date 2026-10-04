@@ -18,10 +18,12 @@
 
 import { readFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   changeToSpecYaml,
   cleanupLive,
+  clearAppDeployment,
   decomposeGoal,
   describeChange,
   formatChangePlan,
@@ -29,12 +31,15 @@ import {
   formatDoctorReport,
   formatRecruitmentSummary,
   formatRunSummary,
+  readAppDeployment,
+  recordAppDeployment,
   runChange,
   runDoctor,
   runFullLive,
   runRecruitment,
   runRecruitmentLive,
   selectExecutor,
+  stableAppWorkerName,
   type Change,
   type ConcurrencyDial,
   type DeployApp,
@@ -45,6 +50,12 @@ import { DiscoveringExecutor } from "@switchyard-change/model-adapters";
 
 const CLI_NAME = "switchyard-change";
 const VERSION = "0.0.0";
+
+/** The repository root, resolved from this CLI file (apps/cli/src/index.ts). */
+function repoRoot(): string {
+  const here = dirname(fileURLToPath(import.meta.url));
+  return resolve(here, "..", "..", "..");
+}
 
 interface Command {
   readonly name: string;
@@ -396,14 +407,24 @@ const commands: Command[] = [
           })
         : selected.executor;
 
-      // Live-URL proof: when a deploy app is supplied, deploy the fixed app to a
-      // live workers.dev URL at the end of a verified run (reusing the M8.0
-      // deploy hop: `wrangler deploy` in the app dir), surface the URL, and tear
-      // it down on cleanup. The deploy is a REAL step; a failed fix is never
-      // deployed. Offline/in tests the deployer is injected, so make check never
-      // touches the network. On a live CLI run this uses wrangler directly.
+      // Redeploy-in-place proof: when a real app is supplied, the run NEVER
+      // deploys fresh. Deploy is a manual human step (the `deploy-app` command /
+      // the console Deploy button) taken BEFORE the fix. On a verified fix, when
+      // a prior manual deploy exists for this app (its per-app marker holds the
+      // live URL), the run REDEPLOYS the fixed code to the app's STABLE worker
+      // name, updating that existing deployment in place at the SAME URL. When no
+      // manual deploy happened, the run deploys nothing and still promotes to
+      // Git. Offline/in tests the redeployer and the already-deployed lookup are
+      // injected, so make check never touches the network. The app name is the
+      // examples/apps/<app> directory basename, so the stable name is derived
+      // from the app, not the per-run id.
       const deployAppDir = optionValue(args, "--deploy-app");
-      const deployAppName = optionValue(args, "--deploy-app-name");
+      const deployAppBase = deployAppDir
+        ? deployAppDir.replace(/[/\\]+$/, "").split(/[/\\]/).pop() ?? ""
+        : "";
+      const deployAppName =
+        optionValue(args, "--deploy-app-name") ??
+        (deployAppBase ? stableAppWorkerName(deployAppBase) : undefined);
       const deployApp: DeployApp | undefined = deployAppDir
         ? async ({ appDir }) => ({ url: await wranglerDeploy(appDir) })
         : undefined;
@@ -411,6 +432,11 @@ const commands: Command[] = [
         ? async ({ appDir }) => {
             await wranglerDelete(appDir);
           }
+        : undefined;
+      // The run only redeploys IN PLACE when a manual deploy already recorded a
+      // live URL for this app (keyed by the app basename, the stable identity).
+      const appAlreadyDeployed = deployAppBase
+        ? async () => (await readAppDeployment(repoRoot(), deployAppBase))?.url
         : undefined;
 
       const result = await runFullLive({
@@ -424,6 +450,7 @@ const commands: Command[] = [
         ...(deployAppName ? { deployAppName } : {}),
         ...(deployApp ? { deployApp } : {}),
         ...(teardownApp ? { teardownApp } : {}),
+        ...(appAlreadyDeployed ? { appAlreadyDeployed } : {}),
         // Block on the browser answer when --await-escalation is set; otherwise
         // auto-answer non-interactively through the CLI resolver.
         ...(awaitEscalation
@@ -468,8 +495,10 @@ const commands: Command[] = [
                   `${event.added.join(", ")} (the graph grew)`,
               );
               break;
-            case "deployed":
-              console.log(`Deployed the fixed app ${event.app} to a live URL: ${event.url}`);
+            case "redeployed":
+              console.log(
+                `Redeployed the fixed app ${event.app} in place to the same live URL: ${event.url}`,
+              );
               break;
             case "deploy-skipped":
               console.log(`Deploy skipped: ${event.reason}`);
@@ -514,7 +543,9 @@ const commands: Command[] = [
       }
       console.log(`  cleaned up repos: ${result.cleanedUp.join(", ") || "(none)"}`);
       if (result.deployment) {
-        console.log(`  live proof URL: ${result.deployment.url} (app ${result.deployment.app})`);
+        console.log(
+          `  live proof URL (redeployed in place): ${result.deployment.url} (app ${result.deployment.app})`,
+        );
       }
       if (watch) {
         console.log("");
@@ -529,31 +560,66 @@ const commands: Command[] = [
     },
   },
   {
+    name: "deploy-app",
+    summary: "Manually deploy an example app to its STABLE live URL (before a fix).",
+    usage: `${CLI_NAME} deploy-app --app <name> [--worker <url>]`,
+    async run(args) {
+      // The MANUAL deploy: deploy examples/apps/<app> in its CURRENT (possibly
+      // broken) state to its STABLE worker name, so a human sees the break at a
+      // real URL BEFORE launching a fix. It records a per-app marker holding the
+      // live URL, which a later verified run reads to redeploy IN PLACE to the
+      // same URL. This never auto-runs a fix; it is purely the deploy hop.
+      const app = optionValue(args, "--app") ?? optionValue(args, "--deploy-app");
+      if (!app) {
+        console.error(`Usage: ${CLI_NAME} deploy-app --app <name> [--worker <url>]`);
+        return 1;
+      }
+      const appDir = resolve(repoRoot(), "examples/apps", app);
+      try {
+        const url = await wranglerDeploy(appDir);
+        const marker = await recordAppDeployment(repoRoot(), app, url);
+        console.log(`Deployed ${app} to its stable worker ${marker.workerName}`);
+        console.log(`  live URL: ${url}`);
+        console.log(`  (this is the CURRENT state; launch a fix to redeploy in place to the same URL)`);
+        return 0;
+      } catch (error) {
+        console.error(`Deploy failed: ${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      }
+    },
+  },
+  {
     name: "cleanup-live",
     summary: "Tear down the real Artifact repos a watch-mode run left in place.",
-    usage: `${CLI_NAME} cleanup-live --change-id <id> [--worker <url>]`,
+    usage: `${CLI_NAME} cleanup-live --change-id <id> [--app <name>] [--worker <url>]`,
     async run(args) {
       const changeId = optionValue(args, "--change-id") ?? optionValue(args, "--change");
       if (!changeId) {
-        console.error(`Usage: ${CLI_NAME} cleanup-live --change-id <id> [--worker <url>]`);
+        console.error(`Usage: ${CLI_NAME} cleanup-live --change-id <id> [--app <name>] [--worker <url>]`);
         return 1;
       }
       const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
-      // Tear down the deployed app too (when the run recorded one), by deleting
-      // its Worker with wrangler in examples/apps/<app>. The app dir is resolved
-      // from the repo root relative to this CLI file.
+      // The app to tear down may be passed explicitly (the console knows the
+      // active template's app even when the run never redeployed), falling back
+      // to whatever the run recorded on state. Deployment is per-app and keyed by
+      // the stable worker name, so teardown deletes that stable worker in
+      // examples/apps/<app>, and the per-app marker is cleared.
+      const app = optionValue(args, "--app");
       const teardownApp: TeardownApp = async ({ appDir }) => {
-        const { fileURLToPath } = await import("node:url");
-        const here = dirname(fileURLToPath(import.meta.url));
-        const repoRoot = resolve(here, "..", "..", "..");
-        await wranglerDelete(resolve(repoRoot, "examples/apps", appDir));
+        await wranglerDelete(resolve(repoRoot(), "examples/apps", appDir));
       };
-      const result = await cleanupLive({ changeId, workerUrl, teardownApp });
+      const result = await cleanupLive({
+        changeId,
+        workerUrl,
+        teardownApp,
+        onAppTornDown: async (tornApp) => clearAppDeployment(repoRoot(), tornApp),
+        ...(app ? { app } : {}),
+      });
       console.log(`Cleaning up Change ${result.changeId} on ${result.workerUrl}`);
       console.log(`  recorded repos: ${result.workspaces.join(", ") || "(none)"}`);
       console.log(`  archived repos: ${result.archived.join(", ") || "(none)"}`);
       if (result.appTornDown) {
-        console.log(`  torn down app: ${result.appTornDown}`);
+        console.log(`  torn down app: ${result.appTornDown} (stable worker ${stableAppWorkerName(result.appTornDown)})`);
       }
       // A clean teardown archived every recorded repo.
       return result.archived.length === result.workspaces.length ? 0 : 1;

@@ -64,6 +64,7 @@ import {
 } from "@switchyard-change/git-promotion";
 
 import { maybeBuildTool, type ToolBuildResult } from "./tool-build.ts";
+import { stableAppWorkerName } from "./app-deploy.ts";
 import type { Escalation } from "./local-control.ts";
 import type { LiveTrigger } from "./recruit-live.ts";
 
@@ -262,21 +263,37 @@ export interface RunFullLiveOptions {
   /** Optional progress sink for human-readable console output. */
   readonly onEvent?: (event: FullLiveEvent) => void;
   /**
-   * For a real-app run, the app directory (under examples/apps) and its name.
-   * When both are set and verification passed, the run deploys the fixed app to
-   * a live workers.dev URL as end-of-run proof, records that URL on the Change
-   * state (so the console surfaces a clickable link), and (unless skipCleanup)
-   * tears it down on cleanup so repeated runs never leak a billable Worker.
+   * For a real-app run, the app directory (under examples/apps) and its STABLE
+   * worker name (derived from the app, e.g. switchyard-change-fabric-<app>), not
+   * the per-run id. The run NEVER deploys fresh: deploy is a manual, pre-run
+   * human step. When a prior manual deploy exists for this app (see
+   * `appAlreadyDeployed`) AND verification passed, the run REDEPLOYS the fixed
+   * code to that same stable name, updating the existing deployment in place at
+   * the same URL. When no manual deploy exists, the run deploys nothing and still
+   * promotes to Git and completes normally.
    */
   readonly deployAppDir?: string;
   readonly deployAppName?: string;
   /**
-   * The injectable deployer and teardown. The live path runs wrangler; a test
-   * passes deterministic fakes so `make check` stays offline. The deployer is
-   * only called when verification passed, so a broken fix is never deployed.
+   * The injectable redeployer and teardown. The live path runs wrangler against
+   * the app's stable name; a test passes deterministic fakes so `make check`
+   * stays offline. The redeployer is only called when verification passed AND a
+   * prior manual deployment already exists, so the run only ever REFRESHES an
+   * existing deployment, never creates one.
    */
   readonly deployApp?: DeployApp;
   readonly teardownApp?: TeardownApp;
+  /**
+   * An injectable lookup for whether this app was ALREADY deployed by a manual,
+   * pre-run human Deploy. It returns the existing stable workers.dev URL when a
+   * deployment exists, or undefined when none does. The run redeploys in place
+   * only when this resolves a URL; otherwise it does not deploy at all. The live
+   * path reads a per-app marker a manual deploy wrote; a test injects it, so the
+   * run's deploy-or-not decision is deterministic offline.
+   */
+  readonly appAlreadyDeployed?: (input: {
+    readonly appName: string;
+  }) => Promise<string | undefined>;
 }
 
 /** A progress event emitted during a full live run. */
@@ -290,7 +307,7 @@ export type FullLiveEvent =
   | { readonly kind: "escalation-resolved"; readonly escalation: Escalation }
   | { readonly kind: "verifying" }
   | { readonly kind: "promoting"; readonly branch: string }
-  | { readonly kind: "deployed"; readonly url: string; readonly app: string }
+  | { readonly kind: "redeployed"; readonly url: string; readonly app: string }
   | { readonly kind: "deploy-skipped"; readonly reason: string }
   | { readonly kind: "cleaned-up"; readonly archived: readonly string[] };
 
@@ -688,31 +705,50 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     { repoDir: sourceRepoDir, startPoint, identity },
   );
 
-  // 6b. Live-URL proof: deploy the fixed app to a live workers.dev URL as the
-  // end-of-run proof the fix works, but ONLY when verification passed. A failed
-  // fix is never deployed; the run shows the failure honestly instead. The
-  // deployer is injectable (wrangler live, a fake in tests), so this is a real
-  // step live and deterministic offline. The URL is recorded on the Change state
-  // so the console surfaces a clickable link, and the app is torn down on cleanup
-  // (unless watch mode) so repeated runs never leak a billable Worker.
+  // 6b. Redeploy-in-place proof: the run NEVER deploys fresh. Deploy is a manual
+  // human step taken BEFORE the fix (so a watcher sees the break at a stable
+  // URL). On a verified fix, when a prior manual deployment already exists for
+  // this app, the run REDEPLOYS the fixed code to the app's STABLE worker name,
+  // updating that existing deployment in place at the SAME URL. When no manual
+  // deploy happened, the run deploys nothing: it still promotes to Git and
+  // completes normally, and the console simply shows no live URL. So the only way
+  // a deployment exists is a human Deploy; the run only refreshes it. The
+  // redeployer and the already-deployed lookup are injectable (wrangler + a
+  // per-app marker live, fakes in tests), so this is deterministic offline.
   let deployment: { url: string; app: string } | undefined;
-  if (options.deployAppDir && options.deployAppName && options.deployApp) {
+  if (
+    options.deployAppDir &&
+    options.deployAppName &&
+    options.deployApp &&
+    options.appAlreadyDeployed
+  ) {
     const verdict = evidence.integration.verdict;
     const integratedCount = evidence.integration.integratedUnits.length;
-    // Deploy only when verification verified AND at least one unit was actually
-    // integrated (a real fix landed). A run where nothing integrated has no fix
-    // to prove, so it is not deployed even though an empty integration verifies
-    // vacuously; a failed fix is shown honestly, never deployed as fake-green.
-    if (verdict !== "verified" || integratedCount === 0) {
+    // Only a verified run where at least one unit integrated has a real fix to
+    // refresh. A run where nothing integrated has no fix to redeploy even though
+    // an empty integration verifies vacuously; a failed fix is shown honestly.
+    const existingUrl = await options
+      .appAlreadyDeployed({ appName: options.deployAppName })
+      .catch(() => undefined);
+    if (!existingUrl) {
+      // No manual pre-deploy: the run does NOT deploy. It still promoted to Git.
+      emit({
+        kind: "deploy-skipped",
+        reason:
+          "app was not deployed before the run (no manual Deploy): not deploying; the fix was still promoted to Git",
+      });
+    } else if (verdict !== "verified" || integratedCount === 0) {
       emit({
         kind: "deploy-skipped",
         reason:
           verdict !== "verified"
-            ? `verification verdict was "${verdict}", not "verified": not deploying a broken app`
-            : "no unit was integrated (no fix landed): not deploying",
+            ? `verification verdict was "${verdict}", not "verified": not redeploying a broken app`
+            : "no unit was integrated (no fix landed): not redeploying",
       });
     } else {
       try {
+        // Redeploy the fixed code to the SAME stable worker name, so the
+        // existing deployment is updated in place at the same URL.
         const { url } = await options.deployApp({
           appDir: options.deployAppDir,
           appName: options.deployAppName,
@@ -722,9 +758,9 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
           url,
           app: options.deployAppName,
         }).catch(() => {});
-        emit({ kind: "deployed", url, app: options.deployAppName });
+        emit({ kind: "redeployed", url, app: options.deployAppName });
       } catch (error) {
-        emit({ kind: "deploy-skipped", reason: `deploy failed: ${failureReason(error)}` });
+        emit({ kind: "deploy-skipped", reason: `redeploy failed: ${failureReason(error)}` });
       }
     }
   }
@@ -741,14 +777,11 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     : await cleanup(base, fetchFn, [...allWorkspaces]);
   if (!options.skipCleanup) {
     await integrationProvider.archive(integrationRef).catch(() => {});
-    // Tear the deployed app down too, so a real-app run never leaves a billable
-    // Worker behind. Watch mode leaves it up for inspection; the per-run cleanup
-    // (console teardown / cleanup-live) removes it later via the same hook.
-    if (deployment && options.deployAppDir && options.deployAppName && options.teardownApp) {
-      await options
-        .teardownApp({ appDir: options.deployAppDir, appName: options.deployAppName })
-        .catch(() => {});
-    }
+    // The redeployed app is intentionally NOT torn down here. A deployment is
+    // owned by the manual human Deploy, not by the run: it exists before the run
+    // and must survive the run so the same stable URL shows the break, then the
+    // fix. Teardown is the explicit Tear down control (console) / cleanup-live,
+    // which deletes the app by its stable name and clears its marker.
   }
   emit({ kind: "cleaned-up", archived: cleanedUp });
 
@@ -1121,15 +1154,24 @@ export interface CleanupLiveResult {
  * archives each through the Worker's archive path. This is the human-triggered
  * cleanup the `--watch` / `--no-cleanup` run defers to, so a watcher can study
  * the finished graph in the console first and then remove the repos on demand.
- * When the run recorded a live app deployment and a teardown is supplied, it also
- * tears the deployed app down so a real-app run never leaves a billable Worker.
+ *
+ * It also tears down the manually DEPLOYED app so nothing leaks. A deployment is
+ * per-app and keyed by the stable worker name, so teardown deletes the app by
+ * that stable name. The app is taken from `options.app` when the caller knows it
+ * (the console passes the active template's app), falling back to the app the
+ * run recorded on state. The optional `onAppTornDown` hook clears the per-app
+ * deployment marker so a later run sees the app as no longer deployed.
  */
 export async function cleanupLive(options: {
   readonly changeId: string;
   readonly workerUrl: string;
   readonly fetchFn?: typeof fetch;
-  /** Injectable app teardown; when the run recorded a deployment, it is called. */
+  /** The app to tear down (its examples/apps/<app> dir name). Preferred source. */
+  readonly app?: string;
+  /** Injectable app teardown; called with the stable worker name. */
   readonly teardownApp?: TeardownApp;
+  /** Called with the app name after a successful teardown, to clear its marker. */
+  readonly onAppTornDown?: (app: string) => Promise<void>;
 }): Promise<CleanupLiveResult> {
   const fetchFn = options.fetchFn ?? fetch;
   const base = options.workerUrl.replace(/\/$/, "");
@@ -1148,15 +1190,18 @@ export async function cleanupLive(options: {
     .filter((n): n is string => typeof n === "string" && n !== "")
     .sort();
   const archived = await cleanup(base, fetchFn, workspaces);
-  // Tear down the deployed app too, when the run recorded one and a teardown was
-  // supplied. The app name maps to examples/apps/<app>; a worker already gone is
-  // a safe no-op.
+  // Tear down the manually deployed app too. Prefer the caller-supplied app (the
+  // console knows the active template's app even when the run never redeployed),
+  // falling back to whatever the run recorded on state. Deployment is per-app and
+  // keyed by the stable worker name, so teardown deletes that stable worker. A
+  // worker already gone is a safe no-op. The marker is cleared on success.
   let appTornDown: string | undefined;
-  const app = state.deployment?.app;
+  const app = options.app ?? state.deployment?.app;
   if (app && options.teardownApp) {
     try {
-      await options.teardownApp({ appDir: app, appName: `switchyard-change-fabric-${app}` });
+      await options.teardownApp({ appDir: app, appName: stableAppWorkerName(app) });
       appTornDown = app;
+      await options.onAppTornDown?.(app).catch(() => {});
     } catch {
       // Best-effort: the Makefile delete-app is the authoritative teardown path.
     }

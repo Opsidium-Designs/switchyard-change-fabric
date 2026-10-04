@@ -68,6 +68,12 @@ export function App() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [launchStatus, setLaunchStatus] = useState<LaunchStatus | null>(null);
+  // Per-app live deployment URLs from a MANUAL Deploy (app name -> workers.dev
+  // URL). A deployment is created only by a human Deploy, surfaced persistently
+  // here from the moment of deploy, through the run (which redeploys the fix in
+  // place to the SAME URL), to teardown. This is the pre-run break the watcher
+  // sees before launching a fix.
+  const [deployedUrls, setDeployedUrls] = useState<Record<string, string>>({});
 
   // Load the gallery from the launcher so the UI and the launcher share one
   // source of truth; fall back to the bundled descriptors when the launcher is
@@ -255,6 +261,38 @@ export function App() {
     setBusy(false);
   }, [min, max]);
 
+  // Manual Deploy (BEFORE a fix): deploy an app template's app in its CURRENT
+  // (broken) state to its STABLE workers.dev URL, so the watcher sees the break
+  // first. The URL is surfaced persistently and the fix later redeploys in place
+  // to the SAME URL. This never launches a run; it is purely the deploy hop.
+  const deployApp = useCallback(async (template: Template) => {
+    if (!template.app) {
+      return;
+    }
+    setBusy(true);
+    setNotice(null);
+    try {
+      const res = await fetch("/api/deploy-app", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ templateId: template.id, app: template.app }),
+      });
+      const body = (await res.json().catch(() => ({}))) as { url?: string; error?: string };
+      if (res.ok && body.url) {
+        setDeployedUrls((prev) => ({ ...prev, [template.app as string]: body.url as string }));
+        setNotice(
+          `deployed ${template.name} in its current (broken) state to ${body.url}. ` +
+            `Open it to see the break, then launch the fix to redeploy in place to the same URL.`,
+        );
+      } else {
+        setNotice(body.error ?? `could not deploy ${template.name} (${res.status}).`);
+      }
+    } catch {
+      setNotice("cannot reach the launcher to deploy. Is `make dev-all` running?");
+    }
+    setBusy(false);
+  }, []);
+
   // Per-run cleanup: tear down THIS run's real Artifact repos (scoped to its
   // unique id), so clicking through templates repeatedly never leaves billable
   // repos. A new run uses a fresh unique id, so it never collides with a prior
@@ -265,10 +303,11 @@ export function App() {
     }
     setBusy(true);
     try {
+      const teardownApp = activeTemplate?.app;
       const res = await fetch("/api/cleanup", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ changeId }),
+        body: JSON.stringify({ changeId, ...(teardownApp ? { app: teardownApp } : {}) }),
       });
       const body = (await res.json().catch(() => ({}))) as {
         ok?: boolean;
@@ -282,6 +321,13 @@ export function App() {
         setChangeId(null);
         setActiveTemplate(null);
         setLaunchStatus(null);
+        if (teardownApp) {
+          setDeployedUrls((prev) => {
+            const next = { ...prev };
+            delete next[teardownApp];
+            return next;
+          });
+        }
       } else {
         setNotice(body.error ?? `cleanup did not complete for ${changeId}.`);
       }
@@ -289,7 +335,7 @@ export function App() {
       setNotice("cannot reach the launcher to clean up. Is `make dev-all` running?");
     }
     setBusy(false);
-  }, [changeId]);
+  }, [changeId, activeTemplate]);
 
   return (
     <main className="app-shell">
@@ -302,8 +348,21 @@ export function App() {
         templates={templates}
         activeId={activeTemplate?.id ?? null}
         busy={busy}
+        deployedUrls={deployedUrls}
         onLaunch={launchTemplate}
+        onDeploy={deployApp}
       />
+
+      <section className="app-panel" aria-label="How this works">
+        <p className="muted">
+          The flow for an app template: <strong>Deploy</strong> to see it broken
+          at a stable URL, then <strong>Launch the fix</strong> and watch the same
+          URL become correct (the run redeploys the fix in place, it never creates
+          a new URL), then <strong>Tear down</strong> to delete the deployment and
+          the run&apos;s repos. A run with no prior Deploy still fixes the code and
+          promotes it to Git; it simply shows no live URL.
+        </p>
+      </section>
 
       <section className="app-panel" aria-label="Run status">
         {changeId ? (
@@ -327,23 +386,36 @@ export function App() {
                 <dd>{activeTemplate.problemItSolves}</dd>
               </dl>
             ) : null}
-            {snapshot?.deployment ? (
-              <p className="deploy-proof">
-                Live proof the fix works:{" "}
-                <a href={snapshot.deployment.url} target="_blank" rel="noreferrer">
-                  {snapshot.deployment.url}
-                </a>{" "}
-                <span className="muted">(deployed {snapshot.deployment.app}; torn down on cleanup)</span>
-              </p>
-            ) : null}
+            {(() => {
+              const app = activeTemplate?.app;
+              const manualUrl = app ? deployedUrls[app] : undefined;
+              const liveUrl = snapshot?.deployment?.url ?? manualUrl;
+              if (!liveUrl) {
+                return null;
+              }
+              const redeployed = Boolean(snapshot?.deployment?.url);
+              return (
+                <p className="deploy-proof">
+                  {redeployed ? "Live URL (fix redeployed in place): " : "Live URL (deployed before the fix): "}
+                  <a href={liveUrl} target="_blank" rel="noreferrer">
+                    {liveUrl}
+                  </a>{" "}
+                  <span className="muted">
+                    {redeployed
+                      ? "the same URL now serves the fixed app; torn down on Tear down"
+                      : "this shows the CURRENT (broken) app; launch the fix to update it in place"}
+                  </span>
+                </p>
+              );
+            })()}
             <button
               type="button"
               className="secondary"
               onClick={() => void cleanupRun()}
               disabled={busy}
-              title="Delete this run's real Artifact repos and the deployed app (scoped to its unique id)"
+              title="Delete this run's real Artifact repos and, if the app was deployed, its stable deployed Worker"
             >
-              Tear down this run&apos;s repos
+              Tear down (repos{activeTemplate?.app ? " + deployed app" : ""})
             </button>
           </div>
         ) : (
@@ -480,49 +552,75 @@ function TemplateGallery({
   templates,
   activeId,
   busy,
+  deployedUrls,
   onLaunch,
+  onDeploy,
 }: {
   templates: readonly Template[];
   activeId: string | null;
   busy: boolean;
+  deployedUrls: Record<string, string>;
   onLaunch: (template: Template) => void | Promise<void>;
+  onDeploy: (template: Template) => void | Promise<void>;
 }) {
   return (
     <section className="app-panel template-gallery" aria-label="Template gallery">
       <h2>Templates</h2>
       <p className="muted">
         Pick a scenario to launch a live run. The browser is the launcher: there
-        is no CLI step.
+        is no CLI step. For an app template, Deploy it first to see it broken at a
+        stable URL, then launch the fix to update that same URL in place.
       </p>
       <ul className="template-list">
-        {templates.map((template) => (
-          <li
-            key={template.id}
-            className={`template-card${template.id === activeId ? " active" : ""}`}
-          >
-            <div className="template-head">
-              <h3>{template.name}</h3>
-              <span className={`template-badge ${template.escalates ? "escalates" : "autonomous"}`}>
-                {template.escalates ? "pauses for you" : "autonomous"}
-              </span>
-            </div>
-            <p className="template-desc">{template.description}</p>
-            <dl className="template-detail">
-              <dt>What this does</dt>
-              <dd>{template.whatItDoes}</dd>
-              <dt>What this run solves</dt>
-              <dd>{template.problemItSolves}</dd>
-            </dl>
-            <p className="muted template-count">{template.agentCountHint}</p>
-            <button
-              type="button"
-              onClick={() => void onLaunch(template)}
-              disabled={busy}
+        {templates.map((template) => {
+          const deployedUrl = template.app ? deployedUrls[template.app] : undefined;
+          return (
+            <li
+              key={template.id}
+              className={`template-card${template.id === activeId ? " active" : ""}`}
             >
-              Launch {template.name}
-            </button>
-          </li>
-        ))}
+              <div className="template-head">
+                <h3>{template.name}</h3>
+                <span className={`template-badge ${template.escalates ? "escalates" : "autonomous"}`}>
+                  {template.escalates ? "pauses for you" : "autonomous"}
+                </span>
+              </div>
+              <p className="template-desc">{template.description}</p>
+              <dl className="template-detail">
+                <dt>What this does</dt>
+                <dd>{template.whatItDoes}</dd>
+                <dt>What this run solves</dt>
+                <dd>{template.problemItSolves}</dd>
+              </dl>
+              <p className="muted template-count">{template.agentCountHint}</p>
+              {deployedUrl ? (
+                <p className="deploy-proof template-deployed">
+                  Deployed (current state):{" "}
+                  <a href={deployedUrl} target="_blank" rel="noreferrer">
+                    {deployedUrl}
+                  </a>{" "}
+                  <span className="muted">the fix will update this same URL in place</span>
+                </p>
+              ) : null}
+              <div className="template-actions">
+                {template.app ? (
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={() => void onDeploy(template)}
+                    disabled={busy}
+                    title="Deploy this app in its CURRENT (broken) state to its stable live URL, before any fix"
+                  >
+                    {deployedUrl ? "Redeploy current state" : "Deploy app (see it broken)"}
+                  </button>
+                ) : null}
+                <button type="button" onClick={() => void onLaunch(template)} disabled={busy}>
+                  Launch {template.name}
+                </button>
+              </div>
+            </li>
+          );
+        })}
       </ul>
     </section>
   );

@@ -97,3 +97,29 @@ make delete-app APP=<your-app>
 
 Each app is standalone (its own `package.json` and `wrangler.jsonc`), so
 deploying it does not touch the offline demo or the root `make check`.
+
+## The console flow: Deploy, fix, redeploy in place, tear down
+
+In the console an app template is driven as a legible sequence, built on the same
+deploy hop above:
+
+1. **Deploy (see it broken).** The per-app "Deploy app" button deploys the app in
+   its CURRENT (broken) state to its STABLE live URL and surfaces that clickable
+   URL. The stable worker name is derived from the app
+   (`switchyard-change-fabric-<app>`), not a per-run id, so the URL is fixed.
+2. **Launch the fix.** Launching the template starts a run. The run NEVER deploys
+   fresh. On a verified fix, when the app was already deployed in step 1, the run
+   REDEPLOYS the fixed code IN PLACE to the same stable name, so the SAME URL now
+   serves the fixed app. If no Deploy happened first, the run deploys nothing: it
+   still fixes the code and promotes it to Git, and the console simply shows no
+   live URL.
+3. **Tear down.** The "Tear down" control deletes the run's real Artifact repos
+   and, when the app was deployed, the app's stable deployed Worker, so nothing
+   leaks.
+
+Under the hood a manual Deploy records a small, gitignored per-app marker under
+`.deployments/<app>.json` holding only the public URL (never a secret). The run
+reads it to decide whether to redeploy in place, and teardown clears it. The
+`switchyard-change deploy-app --app <name>` and
+`switchyard-change cleanup-live --change-id <id> --app <name>` commands are the
+CLI equivalents the console launcher calls.

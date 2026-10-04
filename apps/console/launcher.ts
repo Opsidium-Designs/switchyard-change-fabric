@@ -10,8 +10,13 @@
  *   GET  /api/templates          the shipped template gallery descriptors
  *   POST /api/launch {templateId} start a live run with a FRESH UNIQUE Change id
  *                                  and return that id for the UI to follow
+ *   POST /api/deploy-app {templateId|app}  MANUALLY deploy that app in its
+ *                                  CURRENT (broken) state to its STABLE live URL,
+ *                                  BEFORE any fix, and return the workers.dev URL
  *   GET  /api/runs/:id            the launcher-side status of a launched run
- *   POST /api/cleanup {changeId}  tear down that run's real Artifact repos
+ *   POST /api/cleanup {changeId, app?}  tear down that run's real Artifact repos
+ *                                  and (when app is given) the app's stable
+ *                                  deployed Worker
  *
  * A launch spawns the existing `switchyard-change run-live` CLI (so the live run
  * driver and the CLI commands stay the single underlying implementation; the
@@ -141,8 +146,11 @@ function runLiveArgs(template: Template, changeId: string, dial: LaunchDial): st
     args.push("--discover-project", resolve(REPO_ROOT, template.projectDir));
   }
   // A real-app template carries an app under examples/apps: pass it so a verified
-  // run deploys the fixed app to a live workers.dev URL as end-of-run proof and
-  // tears it down on cleanup.
+  // run REDEPLOYS the fixed app IN PLACE to the app's stable worker name, but
+  // ONLY when the app was already deployed by a manual Deploy before the run.
+  // The run never deploys fresh; without a prior manual deploy it deploys nothing
+  // and still promotes to Git. The stable name is derived from the app, not the
+  // run id, so the manual broken deploy and the post-fix redeploy share one URL.
   if (template.app) {
     args.push("--deploy-app", resolve(REPO_ROOT, "examples/apps", template.app));
     args.push("--deploy-app-name", `switchyard-change-fabric-${template.app}`);
@@ -257,6 +265,53 @@ export function launcherPlugin(): Plugin {
         });
       });
 
+      server.middlewares.use("/api/deploy-app", (req, res, next) => {
+        if (req.method !== "POST") {
+          next();
+          return;
+        }
+        // The MANUAL deploy: deploy a real-app template's app in its CURRENT
+        // (broken) state to its STABLE workers.dev URL, so a human sees the break
+        // BEFORE launching a fix. This runs the `deploy-app` CLI (which records a
+        // per-app marker holding the live URL), then returns that URL. The run
+        // the human launches later redeploys the fixed code IN PLACE to the same
+        // URL. Resolves the app only from a fixed template id or an app that
+        // belongs to a template, never a browser-supplied path.
+        void readJson(req).then((body) => {
+          const templateId = typeof body.templateId === "string" ? body.templateId : "";
+          const appFromBody = typeof body.app === "string" ? body.app : "";
+          const template = templateId !== "" ? templateById(templateId) : undefined;
+          const app = template?.app ?? (appFromBody !== "" ? appFromBody : "");
+          const known = TEMPLATES.some((t) => t.app === app);
+          if (app === "" || !known) {
+            sendJson(res, 400, { error: `unknown or non-app template/app: ${templateId || appFromBody || "(none)"}` });
+            return;
+          }
+          const child = spawn(
+            "npm",
+            ["-w", "apps/cli", "run", "dev", "--", "deploy-app", "--app", app, "--worker", WORKER_URL],
+            { cwd: REPO_ROOT, env: process.env, stdio: ["ignore", "pipe", "pipe"] },
+          );
+          const out: string[] = [];
+          child.stdout?.on("data", (d: Buffer) => out.push(d.toString("utf8")));
+          child.stderr?.on("data", (d: Buffer) => out.push(d.toString("utf8")));
+          child.on("exit", (code) => {
+            const text = out.join("");
+            const match = text.match(/https:\/\/[^\s]+\.workers\.dev[^\s]*/);
+            const url = match ? match[0] : undefined;
+            if (code === 0 && url) {
+              sendJson(res, 201, { app, url });
+            } else {
+              sendJson(res, 502, {
+                app,
+                error: "deploy did not complete (is the app deployable and the account authenticated?)",
+                output: text.split(/\r?\n/).filter((line) => line.trim() !== ""),
+              });
+            }
+          });
+        });
+      });
+
       server.middlewares.use("/api/runs", (req, res, next) => {
         if (req.method !== "GET") {
           next();
@@ -290,23 +345,31 @@ export function launcherPlugin(): Plugin {
             return;
           }
           // Tear down this run's real Artifact repos through the existing
-          // cleanup-live CLI, scoped to that run's unique id.
-          const child = spawn(
-            "npm",
-            [
-              "-w",
-              "apps/cli",
-              "run",
-              "dev",
-              "--",
-              "cleanup-live",
-              "--change-id",
-              changeId,
-              "--worker",
-              WORKER_URL,
-            ],
-            { cwd: REPO_ROOT, env: process.env, stdio: ["ignore", "pipe", "pipe"] },
-          );
+          // cleanup-live CLI, scoped to that run's unique id. When the body names
+          // an app (the active template's app), tear its STABLE deployed Worker
+          // down too and clear its per-app marker, so a manual Deploy never leaks
+          // even when the run itself never redeployed.
+          const app = typeof body.app === "string" ? body.app : "";
+          const cleanupArgs = [
+            "-w",
+            "apps/cli",
+            "run",
+            "dev",
+            "--",
+            "cleanup-live",
+            "--change-id",
+            changeId,
+            "--worker",
+            WORKER_URL,
+          ];
+          if (app !== "") {
+            cleanupArgs.push("--app", app);
+          }
+          const child = spawn("npm", cleanupArgs, {
+            cwd: REPO_ROOT,
+            env: process.env,
+            stdio: ["ignore", "pipe", "pipe"],
+          });
           const out: string[] = [];
           child.stdout?.on("data", (d: Buffer) => out.push(d.toString("utf8")));
           child.stderr?.on("data", (d: Buffer) => out.push(d.toString("utf8")));

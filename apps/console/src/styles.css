@@ -822,6 +822,30 @@ body {
   cursor: default;
 }
 
+/* The Deploy / Launch action row on an app card: two buttons side by side so the
+   "Deploy to see it broken, then Launch the fix" flow reads as one unit. */
+.template-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.4rem;
+}
+
+.template-actions button {
+  margin-top: 0;
+}
+
+/* The Deploy button is a secondary action next to the primary Launch. */
+.template-card button.secondary {
+  background: transparent;
+  color: var(--accent);
+}
+
+/* The per-card deployed-URL note (shown once an app is manually deployed). */
+.template-deployed {
+  font-size: 0.82rem;
+}
+
 /* --- Run status row --- */
 
 .run-status {
