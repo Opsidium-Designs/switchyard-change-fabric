@@ -5,7 +5,8 @@
 #   1. the Artifacts repo.pushed event subscription named
 #      'switchyard-change-fabric-repo-pushed';
 #   2. the Queue 'switchyard-change-fabric-repo-pushed';
-#   3. the deployed Worker 'switchyard-change-fabric';
+#   3. the deployed control-plane Worker 'switchyard-change-fabric' AND
+#      every app Worker it deploys, named 'switchyard-change-fabric-<app>';
 #   4. ALL leftover Artifact repos in the 'switchyard-change-fabric' namespace
 #      (so nothing keeps billing). The namespace is itself the project boundary,
 #      so every repo in it (control-plane runs, 'console-*' template runs,
@@ -55,7 +56,7 @@ echo "== Change Fabric infrastructure spin-down =="
 echo "This deletes ONLY these named resources on account ${CLOUDFLARE_ACCOUNT_ID}:"
 echo "  - subscription '${SUBSCRIPTION_NAME}'"
 echo "  - queue '${QUEUE_NAME}'"
-echo "  - worker '${WORKER_NAME}'"
+echo "  - workers '${WORKER_NAME}' and '${WORKER_NAME}-*' (deployed apps)"
 echo "  - ALL Artifact repos in namespace '${NAMESPACE}'${REPO_PREFIX:+ named '${REPO_PREFIX}*'}"
 echo ""
 
@@ -111,26 +112,39 @@ fi
 echo ""
 
 # ---------------------------------------------------------------------------
-# Step 3: delete the deployed Worker.
+# Step 3: delete the deployed Workers. This is the control-plane Worker
+# '${WORKER_NAME}' AND every app Worker it deploys, which are named
+# '${WORKER_NAME}-<app>' (the example apps from the Deploy control). Listing
+# the account's scripts and sweeping the prefix means a forgotten app deploy
+# (e.g. '${WORKER_NAME}-metrics-dashboard') is torn down too, so nothing bills.
 # ---------------------------------------------------------------------------
-echo "== Step 3: deployed Worker '${WORKER_NAME}' =="
-SCRIPT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "${AUTH}" \
-  "${ACCT}/workers/scripts/${WORKER_NAME}")
-if [ "${SCRIPT_STATUS}" != "200" ]; then
-  echo "already absent (no deployed script); nothing to delete."
+echo "== Step 3: deployed Workers '${WORKER_NAME}' and '${WORKER_NAME}-*' =="
+SCRIPTS=$(curl -s -H "${AUTH}" "${ACCT}/workers/scripts")
+if ! echo "${SCRIPTS}" | jq -e '.success == true' >/dev/null 2>&1; then
+  echo "could not list workers; attempting a direct delete of '${WORKER_NAME}' only."
+  WORKER_NAMES="${WORKER_NAME}"
 else
-  echo "DELETING worker '${WORKER_NAME}'..."
-  # Prefer the REST delete (force=true also detaches queue consumer bindings),
-  # so the queue in Step 2 is deletable on a single pass.
-  RESP=$(curl -s -w "\nHTTP:%{http_code}" -X DELETE -H "${AUTH}" \
-    "${ACCT}/workers/scripts/${WORKER_NAME}?force=true")
-  STATUS=$(echo "${RESP}" | sed -n 's/.*HTTP:\([0-9]*\).*/\1/p')
-  if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "202" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
-    echo "  deleted."
-  else
-    echo "${RESP}" | sed 's/"token":"[^"]*"/"token":"REDACTED"/g'
-    echo "  WARNING: unexpected status ${STATUS:-unknown} deleting the worker."
-  fi
+  # The control-plane worker first (force=true also detaches the queue consumer
+  # binding so Step 2b can delete the queue), then any '${WORKER_NAME}-*' apps.
+  WORKER_NAMES=$(echo "${SCRIPTS}" | jq -r --arg w "${WORKER_NAME}" \
+    '(.result // [])[] | .id | select(. == $w or startswith($w + "-"))' \
+    | sort -u)
+fi
+if [ -z "${WORKER_NAMES}" ]; then
+  echo "already absent (no deployed scripts); nothing to delete."
+else
+  for wname in ${WORKER_NAMES}; do
+    echo "DELETING worker '${wname}'..."
+    RESP=$(curl -s -w "\nHTTP:%{http_code}" -X DELETE -H "${AUTH}" \
+      "${ACCT}/workers/scripts/${wname}?force=true")
+    STATUS=$(echo "${RESP}" | sed -n 's/.*HTTP:\([0-9]*\).*/\1/p')
+    if [ "${STATUS}" = "200" ] || [ "${STATUS}" = "202" ] || [ "${STATUS}" = "204" ] || [ "${STATUS}" = "404" ]; then
+      echo "  deleted (or already gone)."
+    else
+      echo "${RESP}" | sed 's/"token":"[^"]*"/"token":"REDACTED"/g'
+      echo "  WARNING: unexpected status ${STATUS:-unknown} deleting worker '${wname}'."
+    fi
+  done
 fi
 echo ""
 

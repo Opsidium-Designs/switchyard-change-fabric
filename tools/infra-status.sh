@@ -66,6 +66,17 @@ if [ "${SCRIPT_STATUS}" = "200" ]; then
 else
   echo "deployed:    no"
 fi
+# Also list any deployed app workers ('${WORKER_NAME}-*'), e.g. a forgotten
+# example-app deploy, so a leak is never hidden by only checking the one name.
+APP_WORKERS=$(curl -s -H "${AUTH}" "${ACCT}/workers/scripts" \
+  | jq -r --arg w "${WORKER_NAME}" \
+    '(.result // [])[] | .id | select(startswith($w + "-"))' | sort -u)
+if [ -n "${APP_WORKERS}" ]; then
+  echo "app workers: PRESENT (torn down by 'make infra-down'):"
+  echo "${APP_WORKERS}" | sed 's/^/  - /'
+else
+  echo "app workers: none"
+fi
 echo ""
 
 # 2. Queue.
