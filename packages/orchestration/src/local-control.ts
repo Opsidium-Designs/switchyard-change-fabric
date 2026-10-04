@@ -56,6 +56,26 @@ export interface LeaseRecord {
   readonly leasedAt: string;
 }
 
+/** One ordered real run step a runner reported for a unit (mirrors the DO). */
+export interface ActivityStep {
+  readonly phase: string;
+  readonly message: string;
+  readonly at: string;
+}
+
+/** The rich per-unit model detail a runner reported (mirrors the DO). */
+export interface UnitDetail {
+  readonly promptSummary?: string;
+  readonly model?: string;
+  readonly editedPaths?: readonly string[];
+  readonly diff?: string;
+  readonly commitMessage?: string;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly usd?: number;
+  readonly at?: string;
+}
+
 /** A read-only view of one WorkUnit's live state. */
 export interface WorkUnitView {
   readonly id: string;
@@ -71,6 +91,17 @@ export interface WorkUnitView {
    * The plaintext token is never included (only the token id).
    */
   readonly workspace?: WorkspaceIdentity;
+  /**
+   * The ordered real run steps the agent for this unit emitted (mirrors the DO),
+   * so the console's per-node activity log is backed by real steps offline too.
+   */
+  readonly activity?: readonly ActivityStep[];
+  /**
+   * The rich per-unit detail (prompt summary, proposed edit/diff, model, tokens
+   * and cost) the runner reported (mirrors the DO), so click-detail reads real
+   * state offline too.
+   */
+  readonly detail?: UnitDetail;
 }
 
 /** The real backing identity of a WorkUnit's workspace, mirroring the Worker. */
@@ -221,6 +252,12 @@ class ChangeRecord {
   readonly escalations: Escalation[] = [];
   /** WorkUnits an agent ultimately failed on (mirrors the DO's failed set). */
   readonly failed = new Map<string, FailureRecord>();
+  /** Per-unit ordered real run steps (mirrors the DO's activity log). */
+  readonly activity = new Map<string, ActivityStep[]>();
+  /** Per-unit rich model detail (mirrors the DO's detail). */
+  readonly detail = new Map<string, UnitDetail>();
+  /** Per-unit live model-output stream buffer (mirrors the DO's stream). */
+  readonly stream = new Map<string, string>();
   constructor(change: Change) {
     this.change = change;
   }
@@ -366,6 +403,75 @@ export class LocalChangeControl {
     }
     record.leases.delete(unitId);
     return failure;
+  }
+
+  /**
+   * Record one ordered real run step a runner reported for a WorkUnit (mirrors
+   * the DO's recordStep): the real step in the run (leased, cloning, calling the
+   * model, applying the edit, committing, pushing, verified, failed). The unit
+   * must exist; the message is bounded and secret-stripped before storage, so
+   * the offline activity log is backed by real steps just like the live Worker.
+   */
+  recordStep(changeId: string, unitId: string, phase: string, message: string): ActivityStep {
+    const record = this.require(changeId);
+    if (!record.change.work.some((u) => u.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    const step: ActivityStep = {
+      phase: boundedPhase(phase),
+      message: sanitizeText(message, 300) || "step",
+      at: new Date().toISOString(),
+    };
+    const list = record.activity.get(unitId) ?? [];
+    list.push(step);
+    record.activity.set(unitId, list.length > 200 ? list.slice(-200) : list);
+    return step;
+  }
+
+  /**
+   * Record (merge) the rich per-unit model detail a runner reported (mirrors the
+   * DO's recordDetail): prompt summary, proposed edit/diff, model, commit
+   * message, tokens, and cost. Merging lets detail accrue across calls. The unit
+   * must exist; the free-text fields are bounded and secret-stripped.
+   */
+  recordDetail(changeId: string, unitId: string, detail: UnitDetail): UnitDetail {
+    const record = this.require(changeId);
+    if (!record.change.work.some((u) => u.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    const merged: UnitDetail = {
+      ...(record.detail.get(unitId) ?? {}),
+      ...sanitizeDetail(detail),
+      at: new Date().toISOString(),
+    };
+    record.detail.set(unitId, merged);
+    return merged;
+  }
+
+  /**
+   * Append a chunk of REAL streamed model output for a WorkUnit (mirrors the
+   * DO's appendStream). The runner relays the tokens the model streamed; the
+   * console reads the growing buffer for a live view. Bounded per unit.
+   */
+  appendStream(changeId: string, unitId: string, chunk: string): number {
+    const record = this.require(changeId);
+    if (!record.change.work.some((u) => u.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    const current = record.stream.get(unitId) ?? "";
+    const next = current + (typeof chunk === "string" ? chunk : String(chunk ?? ""));
+    record.stream.set(unitId, next.length > 20_000 ? next.slice(-20_000) : next);
+    return record.stream.get(unitId)!.length;
+  }
+
+  /** Read the buffered live model-output stream for a WorkUnit (mirrors the DO). */
+  getStream(changeId: string, unitId: string): string {
+    return this.require(changeId).stream.get(unitId) ?? "";
+  }
+
+  /** The ordered real run steps recorded for a WorkUnit (mirrors the DO). */
+  activityFor(changeId: string, unitId: string): readonly ActivityStep[] {
+    return this.require(changeId).activity.get(unitId) ?? [];
   }
 
   /**
@@ -539,6 +645,10 @@ export class LocalChangeControl {
         status,
         leased,
         ...(workspace ? { workspace } : {}),
+        ...(record.activity.get(unit.id) && record.activity.get(unit.id)!.length > 0
+          ? { activity: record.activity.get(unit.id) }
+          : {}),
+        ...(record.detail.get(unit.id) ? { detail: record.detail.get(unit.id) } : {}),
       };
     });
     return {
@@ -585,6 +695,28 @@ export class LocalChangeControl {
     const fail = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/fail$/);
     if (method === "POST" && fail) {
       return this.handleFail(dec(fail[1]), dec(fail[2]), parseBody(init));
+    }
+    const step = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/step$/);
+    if (method === "POST" && step) {
+      const b = parseBody(init);
+      const recorded = this.recordStep(
+        dec(step[1]),
+        dec(step[2]),
+        String(b.phase ?? "step"),
+        String(b.message ?? ""),
+      );
+      return json({ step: recorded }, 201);
+    }
+    const detail = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/detail$/);
+    if (method === "POST" && detail) {
+      const recorded = this.recordDetail(dec(detail[1]), dec(detail[2]), parseBody(init) as UnitDetail);
+      return json({ detail: recorded }, 201);
+    }
+    const streamPost = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/stream$/);
+    if (method === "POST" && streamPost) {
+      const chunk = typeof init?.body === "string" ? init.body : "";
+      const length = this.appendStream(dec(streamPost[1]), dec(streamPost[2]), chunk);
+      return json({ length }, 201);
     }
     return json({ error: "not found" }, 404);
   };
@@ -743,4 +875,39 @@ function numberOr(value: unknown, fallback: number): number {
 
 function dec(segment: string | undefined): string {
   return decodeURIComponent(segment ?? "");
+}
+
+/** Keep an activity-step phase short, lowercase, and metadata-safe. */
+function boundedPhase(phase: string | undefined): string {
+  const text = (phase ?? "step").toString().replace(/\s+/g, "-").trim().toLowerCase();
+  const bounded = text.length > 40 ? text.slice(0, 40) : text;
+  return bounded === "" ? "step" : bounded;
+}
+
+/** Bound a text field and strip credential-looking fragments defensively. */
+function sanitizeText(text: string, max: number): string {
+  const redacted = (text ?? "")
+    .toString()
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
+    .replace(/\b[A-Za-z0-9_-]{40,}\b/g, "[redacted]");
+  return redacted.length > max ? `${redacted.slice(0, max - 3)}...` : redacted;
+}
+
+/** Sanitize a reported UnitDetail (bound text, keep finite numbers). */
+function sanitizeDetail(detail: UnitDetail): UnitDetail {
+  const out: Record<string, unknown> = {};
+  if (typeof detail.promptSummary === "string") out.promptSummary = sanitizeText(detail.promptSummary, 20_000);
+  if (typeof detail.model === "string") out.model = detail.model.slice(0, 120);
+  if (Array.isArray(detail.editedPaths)) {
+    out.editedPaths = detail.editedPaths
+      .filter((p): p is string => typeof p === "string")
+      .slice(0, 50)
+      .map((p) => p.slice(0, 300));
+  }
+  if (typeof detail.diff === "string") out.diff = sanitizeText(detail.diff, 20_000);
+  if (typeof detail.commitMessage === "string") out.commitMessage = sanitizeText(detail.commitMessage, 500);
+  if (typeof detail.inputTokens === "number" && Number.isFinite(detail.inputTokens)) out.inputTokens = detail.inputTokens;
+  if (typeof detail.outputTokens === "number" && Number.isFinite(detail.outputTokens)) out.outputTokens = detail.outputTokens;
+  if (typeof detail.usd === "number" && Number.isFinite(detail.usd)) out.usd = detail.usd;
+  return out as UnitDetail;
 }

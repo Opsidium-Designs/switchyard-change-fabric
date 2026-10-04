@@ -67,13 +67,44 @@ export interface WorkersAiInvokeResult {
 }
 
 /**
+ * Optional streaming callbacks the executor passes into the transport so a
+ * streaming Workers AI call can relay the model output live, token by token, and
+ * surface tool-call steps the executor exposes. A non-streaming transport simply
+ * ignores this second argument (it is optional), which keeps every existing fake
+ * and the REST transport working unchanged while a streaming transport can relay
+ * the real tokens. The callbacks are best-effort: a thrown callback must never
+ * fail the model call, so the executor wraps each in a guard.
+ */
+export interface WorkersAiStreamCallbacks {
+  /** Called with each chunk of REAL streamed model text as it arrives. */
+  readonly onToken?: (chunk: string) => void;
+  /** Called with a tool-call / reasoning step the executor exposes, if any. */
+  readonly onStep?: (step: WorkersAiStreamStep) => void;
+}
+
+/** A tool-call or reasoning step surfaced by a streaming transport. */
+export interface WorkersAiStreamStep {
+  /** A short machine phase for the step (e.g. "tool-call", "reasoning"). */
+  readonly phase: string;
+  /** A short human-readable description of the step (never a secret). */
+  readonly message: string;
+}
+
+/**
  * The injected Workers AI transport. An implementor calls Workers AI (through
  * the Worker `env.AI` binding, or the REST API with a scoped token) and returns
  * the model's reply. No credential is passed through this package, so the key
  * stays out of the repo and the model call is fakeable in tests.
+ *
+ * The optional second argument carries streaming callbacks: a streaming
+ * transport relays each token through `onToken` (and any tool-call step through
+ * `onStep`) as the model produces them, then still returns the full assembled
+ * reply so the edit-parsing path is unchanged. A non-streaming transport ignores
+ * the argument. The streamed text is the genuine model output.
  */
 export type WorkersAiInvoke = (
   request: WorkersAiInvokeRequest,
+  callbacks?: WorkersAiStreamCallbacks,
 ) => Promise<WorkersAiInvokeResult>;
 
 /** A single file edit the model proposed, applied by this executor. */
@@ -133,6 +164,25 @@ export interface WorkersAiExecutorOptions {
   ) => Promise<readonly WorkersAiEdit[]>;
   /** Injectable writer, for tests. Defaults to writing the real worktree. */
   readonly writeFile?: (absPath: string, contents: string) => Promise<void>;
+  /**
+   * Called once with the chat messages before the model is invoked, so a caller
+   * (the live runner) can record a readable summary of the agent's real prompt
+   * for the console's click-detail. Best-effort; a thrown callback never fails
+   * the run. The messages are the genuine prompt, so the summary is real.
+   */
+  readonly onPrompt?: (messages: readonly WorkersAiMessage[]) => void;
+  /**
+   * Called with each chunk of REAL streamed model text as it arrives (when the
+   * injected transport streams). The live runner relays these to the Worker so
+   * the console renders the model output live on the running node. Best-effort.
+   */
+  readonly onToken?: (chunk: string) => void;
+  /**
+   * Called with a tool-call / reasoning step a streaming transport exposes.
+   * Best-effort; relayed by the runner as an activity step. The executor also
+   * emits its own concrete steps (model-call, applied-edit) through this.
+   */
+  readonly onStep?: (step: WorkersAiStreamStep) => void;
 }
 
 const DEFAULT_MAX_CONTEXT_FILES = 6;
@@ -224,6 +274,32 @@ export class WorkersAiExecutor implements ExecutorProvider {
 
     const messages = buildMessages(context, contextFiles);
 
+    // Resolve the observability callbacks: a per-unit context callback (set by
+    // the live runner) takes precedence over an executor-wide option. Both are
+    // best-effort and never receive a credential.
+    const onToken = context.onToken ?? this.options.onToken;
+    const onStep = (step: WorkersAiStreamStep): void => {
+      guard(() => context.onStep?.(step));
+      guard(() => this.options.onStep?.(step));
+    };
+
+    // Surface the real prompt to a caller so the console's click-detail shows a
+    // readable summary of what the agent actually asked. Best-effort: a thrown
+    // callback must never fail the run. The summary is derived from the genuine
+    // messages (objective, declared scope, and the in-scope file names), with no
+    // file contents dumped, so it stays readable and carries no secret.
+    const promptSummary = summarizePrompt(context, contextFiles);
+    guard(() => context.onPromptSummary?.(promptSummary));
+    guard(() => this.options.onPrompt?.(messages));
+
+    // Streaming callbacks relayed into the transport: a streaming transport
+    // calls onToken with each real token and onStep with any tool-call step, so
+    // the console renders the live model output and step events on the node.
+    const streamCallbacks: WorkersAiStreamCallbacks = {
+      onToken: (chunk) => guard(() => onToken?.(chunk)),
+      onStep: (step) => onStep(step),
+    };
+
     const maxRetries = Math.max(0, this.options.maxRetries ?? DEFAULT_MAX_RETRIES);
     const backoffMs = this.options.retryBackoffMs ?? DEFAULT_RETRY_BACKOFF_MS;
     const isTransient = this.options.isTransientError ?? isTransientWorkersAiError;
@@ -239,11 +315,13 @@ export class WorkersAiExecutor implements ExecutorProvider {
     // forever, and a non-transient failure is thrown immediately.
     const attempt = async (): Promise<{ result: WorkersAiInvokeResult; usedModel: string }> => {
       try {
-        return { result: await this.options.invoke({ model: this.model, messages }), usedModel: this.model };
+        onStep({ phase: "model-call", message: `calling model ${this.model}` });
+        return { result: await this.options.invoke({ model: this.model, messages }, streamCallbacks), usedModel: this.model };
       } catch (headlineError) {
         if (this.fallbackModel && this.fallbackModel !== this.model) {
+          onStep({ phase: "model-call", message: `headline model failed, trying fallback ${this.fallbackModel}` });
           return {
-            result: await this.options.invoke({ model: this.fallbackModel, messages }),
+            result: await this.options.invoke({ model: this.fallbackModel, messages }, streamCallbacks),
             usedModel: this.fallbackModel,
           };
         }
@@ -294,6 +372,12 @@ export class WorkersAiExecutor implements ExecutorProvider {
       await write(abs, edit.contents);
       changedPaths.push(edit.path);
     }
+    guard(() => {
+      onStep({
+        phase: "applied-edit",
+        message: `applied ${changedPaths.length} model edit(s): ${changedPaths.join(", ")}`,
+      });
+    });
 
     const inputTokens = result.usage?.inputTokens;
     const outputTokens = result.usage?.outputTokens;
@@ -321,6 +405,29 @@ export class WorkersAiExecutor implements ExecutorProvider {
           : `WorkUnit ${context.workUnitId}: ${context.objective}`,
     };
   }
+}
+
+/**
+ * A readable, secret-free summary of the prompt the agent sends the model, for
+ * the console's click-detail. It names the objective, the declared path scope,
+ * and the in-scope file NAMES sent as context (not their contents), so a human
+ * can see what the agent was actually asked without dumping file bodies.
+ */
+function summarizePrompt(
+  context: ExecutorContext,
+  contextFiles: readonly WorkersAiEdit[],
+): string {
+  const scope = context.paths.length > 0 ? context.paths.join(", ") : "(no declared paths)";
+  const files =
+    contextFiles.length > 0
+      ? contextFiles.map((f) => f.path).join(", ")
+      : "(no in-scope files; the agent may create one in scope)";
+  return [
+    `Objective: ${context.objective}`,
+    `Allowed paths: ${scope}`,
+    `Context files sent: ${files}`,
+    `Instruction: make the smallest concrete edit satisfying the objective, returned as one JSON edit document.`,
+  ].join("\n");
 }
 
 /** The strict JSON contract the model is asked to return. */
@@ -582,6 +689,19 @@ function defaultSleep(ms: number): Promise<void> {
 }
 
 /**
+ * Run a best-effort callback, swallowing any error. The streaming / step / prompt
+ * callbacks are observability hooks: a thrown callback must never fail the model
+ * call or the edit it would otherwise have applied.
+ */
+function guard(fn: () => void): void {
+  try {
+    fn();
+  } catch {
+    // Best-effort: an observability callback must not break the run.
+  }
+}
+
+/**
  * Build a live Workers AI transport that calls the Cloudflare REST API with a
  * scoped token. This is the local-runner path: a runner is an ordinary Node
  * process (it runs Git), so it reaches Workers AI over HTTPS rather than through
@@ -600,8 +720,17 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
   const fetchFn = options.fetchFn ?? fetch;
   const base = (options.baseUrl ?? "https://api.cloudflare.com/client/v4").replace(/\/$/, "");
   const timeoutMs = options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS;
-  return async (request: WorkersAiInvokeRequest): Promise<WorkersAiInvokeResult> => {
+  return async (
+    request: WorkersAiInvokeRequest,
+    callbacks?: WorkersAiStreamCallbacks,
+  ): Promise<WorkersAiInvokeResult> => {
     const url = `${base}/accounts/${encodeURIComponent(options.accountId)}/ai/run/${request.model}`;
+    // Stream only when a caller actually wants tokens relayed. Workers AI
+    // streams chat text generation as SSE when `stream: true` is set, each event
+    // carrying `{ "response": "<delta>" }` and a final `[DONE]`. When no token
+    // callback is given, keep the simpler non-streaming request so the existing
+    // behavior (and the account's default usage reporting) is unchanged.
+    const wantStream = typeof callbacks?.onToken === "function";
     // Bound the call with an AbortController so a slow or hung model cannot hang
     // the agent forever. The timer is always cleared on settle, and an abort is
     // surfaced as a distinct timeout error rather than an opaque fetch failure.
@@ -618,7 +747,7 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
           authorization: `Bearer ${options.apiToken}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ messages: request.messages }),
+        body: JSON.stringify({ messages: request.messages, ...(wantStream ? { stream: true } : {}) }),
         ...(controller ? { signal: controller.signal } : {}),
       });
     } catch (error) {
@@ -635,11 +764,17 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
         clearTimeout(timer);
       }
     }
-    const text = await res.text();
     if (res.status >= 400) {
-      // Do not include the request body or headers in the error (no token leak).
+      // Drain the body (do not include it in the error) and fail without leaking.
+      await res.text().catch(() => "");
       throw new Error(`Workers AI call failed for ${request.model} (HTTP ${res.status})`);
     }
+    if (wantStream && res.body) {
+      // Relay the SSE token stream: emit each delta through onToken as it lands
+      // and assemble the full reply so the executor's edit parser is unchanged.
+      return readStreamingResponse(res, request.model, callbacks);
+    }
+    const text = await res.text();
     let body: {
       result?: {
         response?: unknown;
@@ -676,4 +811,74 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
         : {}),
     };
   };
+}
+
+/**
+ * Read a Workers AI SSE streaming response: parse each `data:` line (the chat
+ * models stream `{ "response": "<delta>" }` events, ending with `[DONE]`),
+ * relay each delta through onToken as it arrives, and assemble the full reply
+ * text (plus usage if a final event carries it) so the executor parses the
+ * complete JSON edit document exactly as the non-streaming path does. The
+ * streamed deltas are the genuine model output.
+ */
+async function readStreamingResponse(
+  res: Response,
+  model: string,
+  callbacks?: WorkersAiStreamCallbacks,
+): Promise<WorkersAiInvokeResult> {
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let assembled = "";
+  let usage: WorkersAiUsage | undefined;
+  const handleEvent = (dataLine: string): void => {
+    const payload = dataLine.replace(/^data:\s*/, "").trim();
+    if (payload === "" || payload === "[DONE]") {
+      return;
+    }
+    try {
+      const event = JSON.parse(payload) as {
+        response?: unknown;
+        usage?: { prompt_tokens?: number; completion_tokens?: number };
+      };
+      const delta = typeof event.response === "string" ? event.response : "";
+      if (delta !== "") {
+        assembled += delta;
+        callbacks?.onToken?.(delta);
+      }
+      if (event.usage) {
+        usage = {
+          ...(event.usage.prompt_tokens !== undefined ? { inputTokens: event.usage.prompt_tokens } : {}),
+          ...(event.usage.completion_tokens !== undefined
+            ? { outputTokens: event.usage.completion_tokens }
+            : {}),
+        };
+      }
+    } catch {
+      // A non-JSON SSE line (a keep-alive or comment) is ignored.
+    }
+  };
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    let newlineIdx: number;
+    while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, newlineIdx);
+      buffer = buffer.slice(newlineIdx + 1);
+      if (line.startsWith("data:")) {
+        handleEvent(line);
+      }
+    }
+  }
+  // Flush any trailing buffered line.
+  if (buffer.startsWith("data:")) {
+    handleEvent(buffer);
+  }
+  if (assembled === "") {
+    throw new Error(`Workers AI returned an empty stream for ${model}`);
+  }
+  return { text: assembled, ...(usage ? { usage } : {}) };
 }

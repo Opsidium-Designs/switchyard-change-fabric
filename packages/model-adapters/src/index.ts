@@ -41,6 +41,8 @@ export type {
   WorkersAiInvokeResult,
   WorkersAiMessage,
   WorkersAiRestOptions,
+  WorkersAiStreamCallbacks,
+  WorkersAiStreamStep,
   WorkersAiUsage,
 } from "./workers-ai.ts";
 export {

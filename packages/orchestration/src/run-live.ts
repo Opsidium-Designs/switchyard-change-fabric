@@ -63,6 +63,7 @@ import {
   type PromotionResult,
 } from "@switchyard-change/git-promotion";
 
+import { maybeBuildTool, type ToolBuildResult } from "./tool-build.ts";
 import type { Escalation } from "./local-control.ts";
 import type { LiveTrigger } from "./recruit-live.ts";
 
@@ -156,6 +157,15 @@ export interface RunFullLiveResult {
   readonly failedUnits: readonly { readonly unitId: string; readonly reason: string }[];
   /** The escalation beat: what was raised, how it was resolved, and that it waited. */
   readonly escalation: EscalationReport;
+  /**
+   * The agent-built tool for this Change, when the work needed a capability the
+   * repo lacked and a tool-builder agent produced one; otherwise undefined. The
+   * tool is built in its OWN real Artifact repo (the honest local fallback
+   * offline) and recorded on the Worker, so the live console graph shows it as a
+   * real tool node (its own repo) genuinely cloned and run by downstream units,
+   * never a decorative edge. Its repo is torn down with the run.
+   */
+  readonly tool?: ToolBuildResult;
   /** The deterministic verification + integration evidence. */
   readonly evidence: EvidenceSummary;
   /** The local-Git promotion result (a real branch and commit). */
@@ -232,6 +242,7 @@ export interface RunFullLiveOptions {
 /** A progress event emitted during a full live run. */
 export type FullLiveEvent =
   | { readonly kind: "change-created"; readonly changeId: string }
+  | { readonly kind: "tool-built"; readonly tool: ToolBuildResult }
   | { readonly kind: "wave"; readonly wave: LiveWave }
   | { readonly kind: "agent-failed"; readonly unitId: string; readonly reason: string }
   | { readonly kind: "escalation-raised"; readonly escalation: Escalation }
@@ -279,6 +290,23 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     return (text === "" ? {} : safeJson(text)) as Record<string, unknown>;
   };
 
+  // Fire-and-forget reporters for the live per-node feedback. They post the REAL
+  // run steps, the model detail, and the streamed model tokens to the Worker so
+  // the console's activity log, click-detail, and live stream render real state.
+  // They never throw into the run: a feedback post failing must not fail the
+  // agent (the run's correctness does not depend on observability landing).
+  const unitPath = (unitId: string, suffix: string) =>
+    `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/${suffix}`;
+  const reportStep = (unitId: string, phase: string, message: string): void => {
+    void post(unitPath(unitId, "step"), { phase, message }).catch(() => {});
+  };
+  const reportDetail = (unitId: string, detail: Record<string, unknown>): void => {
+    void post(unitPath(unitId, "detail"), detail).catch(() => {});
+  };
+  const reportStream = (unitId: string, chunk: string): void => {
+    void post(unitPath(unitId, "stream"), chunk, "text/plain").catch(() => {});
+  };
+
   // 1. Create the Change and set the dial.
   await post(`/changes`, options.specYaml, "text/plain");
   await post(`/changes/${encodeURIComponent(changeId)}/dial`, {
@@ -304,7 +332,12 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   const runAgent = async (agent: RecruitedAgent): Promise<LiveAgentReport> => {
     const worktreeDir = await mkdtemp(join(worktreeRoot, `scf-${agent.unitId}-`));
     const remote = authenticatedRemote(agent.gitUrl, agent.token);
+    // The lease was recorded by the Worker when this agent was recruited; record
+    // it as the first real step in this unit's activity log so the console shows
+    // the run beginning. Each step below corresponds to a concrete run action.
+    reportStep(agent.unitId, "leased", `leased ${agent.workspaceName} (${agent.backend})`);
     try {
+      reportStep(agent.unitId, "cloning", `cloning ${agent.workspaceName}`);
       await clone(remote, worktreeDir);
       const result = await executor.execute({
         worktreeDir,
@@ -312,12 +345,37 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
         objective: agent.objective,
         paths: agent.paths,
         baselineRef: agent.baselineRef,
+        // Per-unit observability callbacks: the executor surfaces the real agent
+        // activity through these, and the runner relays it to the Worker so the
+        // console renders it live. A deterministic executor ignores them.
+        onPromptSummary: (summary) => reportDetail(agent.unitId, { promptSummary: summary }),
+        onToken: (chunk) => reportStream(agent.unitId, chunk),
+        onStep: (step) => reportStep(agent.unitId, step.phase, step.message),
+      });
+      // Record the model's proposed edit as rich detail: the model id, the
+      // changed paths, a readable diff reconstructed from the real worktree, the
+      // proposed commit message, and token usage / cost the executor reported.
+      // This is read straight from the real executor result, not synthesized.
+      const diff = await buildEditDiff(worktreeDir, result.changedPaths);
+      reportDetail(agent.unitId, {
+        ...(result.cost.model ? { model: result.cost.model } : {}),
+        editedPaths: result.changedPaths,
+        ...(diff ? { diff } : {}),
+        commitMessage: result.commitMessage,
+        ...(result.cost.inputTokens !== undefined ? { inputTokens: result.cost.inputTokens } : {}),
+        ...(result.cost.outputTokens !== undefined ? { outputTokens: result.cost.outputTokens } : {}),
+        ...(result.cost.usd !== undefined ? { usd: result.cost.usd } : {}),
       });
       let commit = "";
       if (await hasChanges(worktreeDir)) {
+        reportStep(agent.unitId, "commit", `committing: ${result.commitMessage}`);
         commit = await commitAll(worktreeDir, result.commitMessage, identity);
+        reportStep(agent.unitId, "push", `pushing to ${agent.defaultBranch}`);
         await push(worktreeDir, remote, agent.defaultBranch);
+      } else {
+        reportStep(agent.unitId, "no-change", "the executor produced no change to push");
       }
+      reportStep(agent.unitId, "pushed", "work pushed; awaiting verification");
       if (!agent.fallback) {
         anyLive = true;
       }
@@ -344,6 +402,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       // the wave aggregation records it; we do NOT rethrow.
       const reason = failureReason(error);
       allWorkspaces.add(agent.workspaceName);
+      reportStep(agent.unitId, "failed", reason);
       let recruitedAfterFail: RecruitedAgent[] = [];
       try {
         const outcome = await post(
@@ -447,6 +506,23 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     await runWave("repo-pushed", next);
   };
 
+  // The agent-for-agent tooling moment on the live path. When the WORK (not the
+  // goal string) needs a capability the repo lacks, one agent provisions its OWN
+  // real Artifact repo (the honest local fallback offline), builds the codemod
+  // there, commits and pushes it, and downstream agents CLONE that repo and run
+  // the tool. The tool build itself is Node-side Git work (the Worker runtime
+  // cannot run Git), exactly like the agent runners; we then RECORD the tool and
+  // its real consumptions on the Worker so the live console graph shows the tool
+  // node (its own repo) and consumed-tool edges backed by real state, not a
+  // decorative edge. The trigger is structural, so a layered Change builds no
+  // tool and this is a no-op. The tool's own repo is tracked in allWorkspaces so
+  // cleanup tears it down with the run.
+  const tool = await buildAndRecordTool(options.change, workRoot, post);
+  if (tool) {
+    allWorkspaces.add(tool.workspace.workspaceName);
+    emit({ kind: "tool-built", tool });
+  }
+
   // 2 + 3. Kickoff recruitment under the dial, then run to completion driven by
   // the repo-pushed events each push produces.
   const kickoff = await post(`/changes/${encodeURIComponent(changeId)}/recruit`);
@@ -504,6 +580,21 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     identity,
   });
 
+  // Record the mechanical verification verdict per unit as a real activity step,
+  // so a completed node's log ends with the honest, deterministic outcome (the
+  // model never grades its own work; this is the verifier's verdict).
+  const integratedSet = new Set(evidence.integration.integratedUnits);
+  for (const unit of options.change.work) {
+    if (!unitWorkspaceGitUrls.has(unit.id)) {
+      continue;
+    }
+    if (integratedSet.has(unit.id)) {
+      reportStep(unit.id, "verified", "deterministic verification passed; integrated");
+    } else {
+      reportStep(unit.id, "not-integrated", "verification did not integrate this unit");
+    }
+  }
+
   // 6. Promote the integrated result into a local Git repository.
   const sourceRepoDir = join(workRoot, "source");
   await cloneProjectForPromotion(options.projectDir, sourceRepoDir);
@@ -553,7 +644,65 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     promotion,
     sourceRepoDir,
     cleanedUp,
+    ...(tool ? { tool } : {}),
   };
+}
+
+/**
+ * The agent-for-agent tool-build step for the live run. If the Change's WORK
+ * needs a capability the repo lacks, one agent provisions its OWN real Artifact
+ * repo (the honest local-filesystem fallback when offline, exactly as the agent
+ * runners use), builds the codemod there, commits and pushes it, and downstream
+ * agents clone that repo and genuinely run the tool (a real effect, changed=
+ * true). We then record the tool and each real consumption on the Worker so the
+ * live console graph projects the tool node (backed by its own repo) and the
+ * consumed-tool edges from real state. Returns undefined when the work needs no
+ * such tool (the trigger is structural), so a layered Change records nothing.
+ */
+async function buildAndRecordTool(
+  change: Change,
+  workRoot: string,
+  post: (path: string, body?: unknown, contentType?: string) => Promise<Record<string, unknown>>,
+): Promise<ToolBuildResult | undefined> {
+  const { LocalFilesystemWorkspaceProvider } = await import(
+    "@switchyard-change/artifact-workspace/local"
+  );
+  const toolRoot = join(workRoot, "tool-build");
+  await mkdir(toolRoot, { recursive: true });
+  const workspaces = new LocalFilesystemWorkspaceProvider({
+    rootDir: join(toolRoot, "artifacts"),
+  });
+  // The builder is a REAL recruited agent (the first fanned-out unit of the
+  // group), so the tool node hangs off a backed agent that already exists in the
+  // Change and the Worker accepts the record; the remaining units consume it.
+  const { detectToolRequirement } = await import("@switchyard-change/change-core");
+  const requirement = detectToolRequirement(change);
+  const builderUnitId = requirement?.consumers[0];
+  const tool = await maybeBuildTool({
+    change,
+    workRoot: toolRoot,
+    workspaces,
+    ...(builderUnitId ? { builderUnitId } : {}),
+  });
+  if (!tool) {
+    return undefined;
+  }
+  // Record the tool and its real downstream consumptions on the Worker, so the
+  // console's tool node is backed by the Change's live state. Only consumers
+  // that actually ran the tool (changed=true) are recorded as consumed-tool
+  // edges, keeping the graph honest about genuine use.
+  await post(`/changes/${encodeURIComponent(change.id)}/tool`, {
+    builderUnitId: tool.builderUnitId,
+    capability: tool.capability,
+    toolPath: tool.toolPath,
+    label: tool.label,
+    workspace: tool.workspace,
+    consumers: tool.consumptions.filter((c) => c.changed).map((c) => c.consumerUnitId),
+  }).catch(() => {
+    // Best-effort: a Worker that does not know the tool route still runs the
+    // rest of the chain; the tool repo is already real and tracked for cleanup.
+  });
+  return tool;
 }
 
 /**
@@ -889,5 +1038,55 @@ function safeJson(text: string): unknown {
     return JSON.parse(text);
   } catch {
     return {};
+  }
+}
+
+/**
+ * Build a readable unified diff of the model's edit from the cloned worktree,
+ * for the console's click-detail. The edit was written into the worktree but not
+ * yet committed, so `git diff` (including untracked files) shows exactly what the
+ * model proposed against the baseline. The result is bounded so a huge edit does
+ * not bloat the state, and it is the REAL diff of the real edit, not synthesized.
+ * Returns an empty string when there is nothing to diff or Git is unavailable.
+ */
+async function buildEditDiff(
+  worktreeDir: string,
+  changedPaths: readonly string[],
+): Promise<string> {
+  if (changedPaths.length === 0) {
+    return "";
+  }
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  try {
+    // Stage intent-to-add so untracked new files appear in the diff too.
+    await run("git", ["-C", worktreeDir, "add", "-AN"]).catch(() => {});
+    // Diff against HEAD when the repo has one; otherwise diff against the empty
+    // tree so a brand-new file in a freshly-provisioned (commitless) workspace
+    // still shows its full added contents rather than nothing.
+    let hasHead = true;
+    try {
+      await run("git", ["-C", worktreeDir, "rev-parse", "--verify", "HEAD"]);
+    } catch {
+      hasHead = false;
+    }
+    const against = hasHead
+      ? ["HEAD"]
+      : // The well-known empty-tree object id; diffing against it shows new files.
+        ["4b825dc642cb6eb9a060e54bf8d69288fbee4904"];
+    const { stdout } = await run(
+      "git",
+      ["-C", worktreeDir, "--no-pager", "diff", "--no-color", ...against],
+      { maxBuffer: 2 * 1024 * 1024 },
+    );
+    const text = stdout.trim();
+    if (text === "") {
+      return "";
+    }
+    // Bound the stored diff; the console shows the head of a very large edit.
+    return text.length > 16_000 ? `${text.slice(0, 16_000)}\n... (diff truncated)` : text;
+  } catch {
+    return "";
   }
 }

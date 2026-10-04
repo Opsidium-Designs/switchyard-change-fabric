@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   buildWorkGraphModel,
+  type ActivityStepSnapshot,
   type ChangeStateSnapshot,
   type EscalationSnapshot,
   type GraphNode,
+  type UnitDetailSnapshot,
   type WorkGraphModel,
 } from "@switchyard-change/orchestration/graph-model";
 
@@ -426,7 +428,12 @@ export function App() {
       ) : null}
 
       {selectedNode ? (
-        <NodeDetail node={selectedNode} onClose={() => setSelectedId(null)} />
+        <NodeDetail
+          node={selectedNode}
+          changeId={changeId}
+          workerBase={WORKER_BASE}
+          onClose={() => setSelectedId(null)}
+        />
       ) : null}
     </main>
   );
@@ -584,14 +591,42 @@ function EscalationPanel({
 }
 
 /**
- * The node detail panel: the real backing of the clicked node. For an agent
- * node this is its real Artifact repo identity (name, clone URL, backend, and
- * whether it is the honest fallback) and its real status; for a work node it is
- * the real WorkUnit it stands for. Nothing here is synthesized: every field is
- * read straight from the node's backing, which was validated against the state.
+ * The node detail panel: the real backing of the clicked node, now with three
+ * tiers of live per-node feedback, all read from real state:
+ *
+ *   1. RICH CLICK-DETAIL: the agent's real prompt summary, the model's proposed
+ *      edit (changed paths + a readable diff), the model id, and tokens/cost,
+ *      read from the unit's recorded `detail` in state (never synthesized).
+ *   2. PER-NODE ACTIVITY LOG: the ordered real run steps the runner reported
+ *      (leased, cloning, calling model, applying edit, committing, pushing,
+ *      verified/failed), read from the unit's recorded `activity` in state.
+ *   3. LIVE LLM STREAMING: for a running agent node, the real streamed model
+ *      output relayed from Workers AI through the Worker, subscribed over SSE
+ *      and rendered live.
+ *
+ * The Artifact repo identity and the raw backing remain, so nothing here is
+ * synthesized: every field is read straight from the node's backing or the
+ * unit's recorded steps/detail, which were validated against the state.
  */
-function NodeDetail({ node, onClose }: { node: GraphNode; onClose: () => void }) {
+function NodeDetail({
+  node,
+  changeId,
+  workerBase,
+  onClose,
+}: {
+  node: GraphNode;
+  changeId: string | null;
+  workerBase: string;
+  onClose: () => void;
+}) {
   const backing = node.backing;
+  const detail = node.detail;
+  const activity = node.activity ?? [];
+  const isRunning = node.status === "running";
+  // The unit id this node stands for (work/agent nodes carry it in the backing).
+  const unitId =
+    backing.kind === "work-unit" || backing.kind === "workspace" ? backing.unitId : null;
+
   return (
     <section className="app-panel detail-panel" aria-label="Node detail">
       <div className="detail-head">
@@ -617,6 +652,21 @@ function NodeDetail({ node, onClose }: { node: GraphNode; onClose: () => void })
           <dd>{backing.kind}</dd>
         </div>
       </dl>
+
+      {detail ? <ModelDetail detail={detail} /> : null}
+
+      {unitId ? (
+        <ActivityLog steps={activity} />
+      ) : null}
+
+      {unitId && changeId ? (
+        <LiveStream
+          workerBase={workerBase}
+          changeId={changeId}
+          unitId={unitId}
+          running={isRunning}
+        />
+      ) : null}
 
       {node.workspace ? (
         <>
@@ -662,4 +712,222 @@ function NodeDetail({ node, onClose }: { node: GraphNode; onClose: () => void })
       </details>
     </section>
   );
+}
+
+/**
+ * The rich click-detail: the agent's real prompt summary, the model id, token
+ * usage and cost, the proposed edit (changed paths), and a readable diff. Every
+ * field comes from the unit's recorded `detail` in state; absent fields are
+ * simply not shown, so this reflects exactly what the run has produced so far.
+ */
+function ModelDetail({ detail }: { detail: UnitDetailSnapshot }) {
+  const hasTokens =
+    detail.inputTokens !== undefined ||
+    detail.outputTokens !== undefined ||
+    detail.usd !== undefined;
+  return (
+    <div className="model-detail">
+      <h3>Agent detail</h3>
+      {detail.model ? (
+        <p className="muted">
+          model <code>{detail.model}</code>
+        </p>
+      ) : null}
+      {hasTokens ? (
+        <dl className="meta">
+          {detail.inputTokens !== undefined ? (
+            <div>
+              <dt>Input tokens</dt>
+              <dd>{detail.inputTokens}</dd>
+            </div>
+          ) : null}
+          {detail.outputTokens !== undefined ? (
+            <div>
+              <dt>Output tokens</dt>
+              <dd>{detail.outputTokens}</dd>
+            </div>
+          ) : null}
+          {detail.usd !== undefined ? (
+            <div>
+              <dt>Cost (USD)</dt>
+              <dd>{detail.usd}</dd>
+            </div>
+          ) : null}
+        </dl>
+      ) : null}
+      {detail.promptSummary ? (
+        <>
+          <h4>Prompt</h4>
+          <pre className="detail-pre">{detail.promptSummary}</pre>
+        </>
+      ) : null}
+      {detail.commitMessage ? (
+        <p className="muted">
+          proposed commit: <strong>{detail.commitMessage}</strong>
+        </p>
+      ) : null}
+      {detail.editedPaths && detail.editedPaths.length > 0 ? (
+        <>
+          <h4>Proposed edit ({detail.editedPaths.length} file(s))</h4>
+          <ul className="paths">
+            {detail.editedPaths.map((p) => (
+              <li key={p}>
+                <code>{p}</code>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+      {detail.diff ? (
+        <>
+          <h4>Diff</h4>
+          <pre className="detail-diff">{detail.diff}</pre>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The per-node activity log: the ordered REAL run steps the runner reported for
+ * this unit (leased, cloning, calling model, applying edit, committing, pushing,
+ * verified/failed). It renders the unit's recorded `activity` from state, so
+ * every line corresponds to a real step the run emitted, not a UI-synthesized
+ * one. An empty log means the run has not reported any step for this unit yet.
+ */
+function ActivityLog({ steps }: { steps: readonly ActivityStepSnapshot[] }) {
+  return (
+    <div className="activity-log">
+      <h3>Activity log</h3>
+      {steps.length === 0 ? (
+        <p className="muted">No activity reported for this unit yet.</p>
+      ) : (
+        <ol className="activity-steps">
+          {steps.map((step, i) => (
+            <li key={`${step.at}-${i}`} className={`activity-step phase-${step.phase}`}>
+              <span className="activity-phase">{step.phase}</span>
+              <span className="activity-message">{step.message}</span>
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The live LLM stream: for a running agent node, subscribe to the Worker's SSE
+ * stream route and render the REAL model output as it arrives, token by token.
+ * The streamed text is the genuine model output the runner relayed through the
+ * Worker (Workers AI streaming), not a synthesized animation. When the node is
+ * not running, this shows the last buffered stream (if any) via a one-shot read
+ * rather than holding an open subscription.
+ */
+function LiveStream({
+  workerBase,
+  changeId,
+  unitId,
+  running,
+}: {
+  workerBase: string;
+  changeId: string;
+  unitId: string;
+  running: boolean;
+}) {
+  const [text, setText] = useState("");
+  const [live, setLive] = useState(false);
+  const preRef = useRef<HTMLPreElement | null>(null);
+
+  useEffect(() => {
+    setText("");
+    setLive(false);
+    const url = `${workerBase}/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/stream`;
+    if (!running) {
+      // Not running: do a single read of whatever the stream route emits (it
+      // closes promptly for a terminal unit), so a finished node still shows the
+      // model output it streamed, without holding an open subscription.
+      let cancelled = false;
+      void fetch(url)
+        .then((res) => (res.ok ? res.text() : ""))
+        .then((raw) => {
+          if (!cancelled) {
+            setText(decodeSsePayload(raw));
+          }
+        })
+        .catch(() => {
+          /* best-effort: no stream to show */
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+    // Running: open an EventSource and append each real token delta live.
+    const source = new EventSource(url);
+    setLive(true);
+    source.addEventListener("token", (event) => {
+      const data = (event as MessageEvent).data as string;
+      setText((prev) => prev + decodeSseToken(data));
+    });
+    source.addEventListener("done", () => {
+      setLive(false);
+      source.close();
+    });
+    source.addEventListener("error", () => {
+      setLive(false);
+      source.close();
+    });
+    return () => {
+      source.close();
+    };
+  }, [workerBase, changeId, unitId, running]);
+
+  // Keep the newest output in view as it streams.
+  useEffect(() => {
+    if (preRef.current) {
+      preRef.current.scrollTop = preRef.current.scrollHeight;
+    }
+  }, [text]);
+
+  return (
+    <div className="live-stream">
+      <h3>
+        Live model output{" "}
+        {live ? <span className="stream-live">streaming</span> : null}
+      </h3>
+      {text === "" ? (
+        <p className="muted">
+          {running
+            ? "waiting for the model to stream output..."
+            : "no streamed model output for this unit."}
+        </p>
+      ) : (
+        <pre className="stream-pre" ref={preRef}>
+          {text}
+        </pre>
+      )}
+    </div>
+  );
+}
+
+/** Turn an SSE `token` payload (newlines escaped by the Worker) back to text. */
+function decodeSseToken(data: string): string {
+  return data.replace(/\\n/g, "\n").replace(/\\\\/g, "\\");
+}
+
+/**
+ * Best-effort extraction of streamed text from a one-shot read of the SSE route
+ * for a terminal unit: concatenate the `data:` payloads of `token` events. The
+ * live path uses EventSource; this only runs for a finished node.
+ */
+function decodeSsePayload(raw: string): string {
+  const out: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (line.startsWith("data:")) {
+      const payload = line.slice(5).trim();
+      if (payload !== "" && !/^\d+$/.test(payload)) {
+        out.push(decodeSseToken(payload));
+      }
+    }
+  }
+  return out.join("");
 }

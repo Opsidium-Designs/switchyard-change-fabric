@@ -1,6 +1,7 @@
 import { parseChangeSpec } from "@switchyard-change/change-core";
 
-import type { EscalationKind, LeaseWorkspace, WorkspaceIdentity } from "./change-state.ts";
+import type { EscalationKind, LeaseWorkspace, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
+import type { ChangeState } from "./change-state.ts";
 import type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 import { selectProvisioner } from "./workspace-provisioner.ts";
 
@@ -38,6 +39,80 @@ function corsPreflight(): Response {
       "access-control-max-age": "86400",
     },
   });
+}
+
+/**
+ * Build a Server-Sent-Events response that relays the live model-output stream
+ * a runner is appending for one WorkUnit. It polls the durable stream buffer on
+ * the DO and pushes only the newly appended text as `token` events, so the
+ * console renders the real streamed model output live on the selected node. It
+ * emits a `done` event and closes once the unit reaches a terminal state
+ * (integrated or failed) or the stream is idle long enough, so an EventSource
+ * does not hang forever. This is a read-only projection of the durable buffer:
+ * it can only ever emit text a runner actually appended, keeping the live view
+ * as honest as the polled snapshot.
+ */
+function streamResponse(stub: DurableObjectStub<ChangeState>, unitId: string): Response {
+  const encoder = new TextEncoder();
+  const POLL_MS = 400;
+  // Give a run time to start streaming and to finish; bounded so an abandoned
+  // subscription cannot poll forever. 5 minutes of 400ms polls.
+  const MAX_POLLS = 750;
+  let sent = 0;
+  let polls = 0;
+  let idlePolls = 0;
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const buffered = await stub.getStream(unitId);
+        if (buffered.length > sent) {
+          const chunk = buffered.slice(sent);
+          sent = buffered.length;
+          idlePolls = 0;
+          controller.enqueue(encoder.encode(`event: token\ndata: ${encodeSse(chunk)}\n\n`));
+        } else {
+          idlePolls += 1;
+        }
+        polls += 1;
+        // Stop once the unit is terminal (so a finished run closes the stream),
+        // or after a long idle gap, or at the hard poll ceiling.
+        const state = await stub.getState();
+        const unit = state.work.find((u) => u.id === unitId);
+        const terminal =
+          unit !== undefined && (unit.status === "integrated" || unit.status === "failed");
+        if (terminal || polls >= MAX_POLLS || idlePolls >= 150) {
+          controller.enqueue(encoder.encode(`event: done\ndata: ${sent}\n\n`));
+          controller.close();
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+      } catch (error) {
+        controller.enqueue(
+          encoder.encode(`event: error\ndata: ${encodeSse(errorMessage(error))}\n\n`),
+        );
+        controller.close();
+      }
+    },
+  });
+  return new Response(body, {
+    status: 200,
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache",
+      connection: "keep-alive",
+      "access-control-allow-origin": "*",
+    },
+  });
+}
+
+/**
+ * Encode a chunk of streamed text as a single SSE `data:` payload. Newlines in
+ * the model output would otherwise be read as SSE field separators, so they are
+ * escaped to a literal marker the console turns back into newlines; nothing is
+ * dropped and the real text is preserved.
+ */
+function encodeSse(text: string): string {
+  return text.replace(/\\/g, "\\\\").replace(/\n/g, "\\n").replace(/\r/g, "");
 }
 
 /** Get the ChangeState Durable Object stub addressed by Change id. */
@@ -144,6 +219,101 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
       await provisioner.revoke(provisioned.workspaceName, provisioned.tokenId).catch(() => {});
       return json({ error: errorMessage(error) }, 409);
     }
+  }
+
+  // Record one ordered activity step a runner reported for a WorkUnit (a real
+  // run step: leased, cloning, calling the model, applying the edit, committing,
+  // pushing, verified, or failed). The runner emits these from the ACTUAL run
+  // steps, so the console's per-node activity log is backed by real steps, never
+  // synthesized in the UI.
+  const stepMatch = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/step$/);
+  if (request.method === "POST" && stepMatch) {
+    const changeId = decodeURIComponent(stepMatch[1] ?? "");
+    const unitId = decodeURIComponent(stepMatch[2] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: StepBody;
+    try {
+      body = (await request.json()) as StepBody;
+    } catch {
+      return json({ error: "invalid step body" }, 400);
+    }
+    if (!body.phase && !body.message) {
+      return json({ error: "a step requires a phase or a message" }, 400);
+    }
+    try {
+      const step = await stub.recordStep(unitId, body.phase ?? "step", body.message ?? "");
+      return json({ step }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Record (merge) the rich per-unit detail a runner reported: a readable prompt
+  // summary, the model's proposed edit (changed paths and a readable diff), the
+  // model id, the proposed commit message, and token usage / cost. This is what
+  // the console's click-detail reads from real state.
+  const detailMatch = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/detail$/);
+  if (request.method === "POST" && detailMatch) {
+    const changeId = decodeURIComponent(detailMatch[1] ?? "");
+    const unitId = decodeURIComponent(detailMatch[2] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: DetailBody;
+    try {
+      body = (await request.json()) as DetailBody;
+    } catch {
+      return json({ error: "invalid detail body" }, 400);
+    }
+    try {
+      const detail = await stub.recordDetail(unitId, body);
+      return json({ detail }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Append a chunk of REAL streamed model output for a WorkUnit. The runner
+  // relays the tokens Workers AI streams as the model produces them; the console
+  // subscribes to the GET route below to render them live on the selected node.
+  const streamPostMatch = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/stream$/);
+  if (request.method === "POST" && streamPostMatch) {
+    const changeId = decodeURIComponent(streamPostMatch[1] ?? "");
+    const unitId = decodeURIComponent(streamPostMatch[2] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    const chunk = await request.text();
+    try {
+      const length = await stub.appendStream(unitId, chunk);
+      return json({ length }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Subscribe to the live model-output stream for a running WorkUnit as
+  // Server-Sent Events. The console opens an EventSource here for the selected
+  // running node; the Worker polls the durable buffer and pushes only the newly
+  // appended text as `token` events, then a `done` event when the unit reaches a
+  // terminal state. The streamed text is the genuine model output the runner
+  // relayed, not a synthesized line. This is a read-only projection of the
+  // durable stream buffer, so it stays honest: it can only emit what a runner
+  // actually appended.
+  const streamGetMatch = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/stream$/);
+  if (request.method === "GET" && streamGetMatch) {
+    const changeId = decodeURIComponent(streamGetMatch[1] ?? "");
+    const unitId = decodeURIComponent(streamGetMatch[2] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    return streamResponse(stub, unitId);
   }
 
   // Record a runner cost heartbeat for a WorkUnit.
@@ -601,6 +771,15 @@ interface ToolBody {
   readonly workspace?: WorkspaceIdentity;
   readonly consumers?: readonly string[];
 }
+
+/** Body of POST /changes/:id/work/:unit/step: one real run step. */
+interface StepBody {
+  readonly phase?: string;
+  readonly message?: string;
+}
+
+/** Body of POST /changes/:id/work/:unit/detail: rich per-unit model detail. */
+type DetailBody = UnitDetail;
 
 /** Body of POST /events/repo-pushed. */
 interface RepoPushedBody {

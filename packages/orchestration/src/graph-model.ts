@@ -47,6 +47,51 @@ export interface WorkspaceIdentitySnapshot {
   readonly leasedAt?: string;
 }
 
+/**
+ * One ordered step the agent for a WorkUnit actually performed, as reported by
+ * the state. These are the REAL run steps the runner/agent emitted (leased,
+ * cloning, calling the model, applying the edit, committing, pushing, verified
+ * or failed), not UI-synthesized lines: each entry corresponds to a concrete
+ * step the live run reported to the Worker. The console renders them as the
+ * per-node activity log. A `phase` groups the step for display; `at` is when the
+ * step was recorded.
+ */
+export interface ActivityStepSnapshot {
+  /** A short machine phase, e.g. "leased" | "cloning" | "model" | "edit" | ... */
+  readonly phase: string;
+  /** A short human-readable line describing the step (never a secret/token). */
+  readonly message: string;
+  readonly at: string;
+}
+
+/**
+ * The rich per-unit detail the state exposes so the node detail panel is read
+ * from real state rather than synthesized: a readable summary of the agent's
+ * prompt, the model's proposed edit (the changed paths and a unified-style diff
+ * or the full proposed contents), the model id, and token usage when the
+ * provider reported it. Every field is optional because it is only known once
+ * the agent has run far enough to produce it.
+ */
+export interface UnitDetailSnapshot {
+  /** A readable summary of the prompt the agent sent the model. */
+  readonly promptSummary?: string;
+  /** The model id the agent used, when an inference executor reported one. */
+  readonly model?: string;
+  /** The repo-relative paths the model proposed to change. */
+  readonly editedPaths?: readonly string[];
+  /** A readable unified-style diff (or the proposed contents) of the edit. */
+  readonly diff?: string;
+  /** The commit message the model proposed, when it did. */
+  readonly commitMessage?: string;
+  /** Input tokens consumed, when the provider reported them. */
+  readonly inputTokens?: number;
+  /** Output tokens produced, when the provider reported them. */
+  readonly outputTokens?: number;
+  /** Explicit cost in US dollars, when the executor reported one. */
+  readonly usd?: number;
+  readonly at?: string;
+}
+
 /** One WorkUnit as the state projection reports it. */
 export interface WorkUnitSnapshot {
   readonly id: string;
@@ -57,6 +102,18 @@ export interface WorkUnitSnapshot {
   readonly leased: boolean;
   /** Present once an agent has been recruited (a lease recorded) for the unit. */
   readonly workspace?: WorkspaceIdentitySnapshot;
+  /**
+   * The ordered log of real run steps the agent for this unit emitted, present
+   * once the run started reporting them. Each entry is a concrete step, so the
+   * activity log the console renders is backed by real steps, not synthesized.
+   */
+  readonly activity?: readonly ActivityStepSnapshot[];
+  /**
+   * The rich per-unit detail (prompt summary, proposed edit/diff, model, tokens
+   * and cost), present once the agent has produced it. The node detail panel
+   * reads these fields straight from state.
+   */
+  readonly detail?: UnitDetailSnapshot;
 }
 
 /** A dependency edge between two WorkUnits, as reported by the state. */
@@ -282,6 +339,18 @@ export interface GraphNode {
   readonly escalated: boolean;
   /** The real Artifact repo backing an agent node, when one exists. */
   readonly workspace?: WorkspaceIdentitySnapshot;
+  /**
+   * The ordered real run steps the agent for this unit emitted (the per-node
+   * activity log). Carried through from the unit snapshot so the detail panel
+   * renders real steps; absent for the goal node and for units with no steps.
+   */
+  readonly activity?: readonly ActivityStepSnapshot[];
+  /**
+   * The rich per-unit detail (prompt summary, proposed edit/diff, model, tokens
+   * and cost) carried through from the unit snapshot, so the detail panel reads
+   * it straight from real state. Absent until the agent has produced it.
+   */
+  readonly detail?: UnitDetailSnapshot;
   /** The concrete state element this node was derived from. */
   readonly backing: NodeBacking;
 }
@@ -471,6 +540,13 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
   for (const unit of snapshot.work) {
     const hasWorkspace = unit.workspace !== undefined;
     const unitEscalated = escalatedUnits.has(unit.id);
+    // Carry the real per-unit activity log and detail through additively, so the
+    // detail panel reads real recorded steps and real model detail rather than
+    // synthesizing them. Both are absent until the run reports them.
+    const extras = {
+      ...(unit.activity ? { activity: unit.activity } : {}),
+      ...(unit.detail ? { detail: unit.detail } : {}),
+    };
     const node: GraphNode = hasWorkspace
       ? {
           id: unitNodeId(unit.id),
@@ -480,6 +556,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
           verified: isVerified(unit.status),
           escalated: unitEscalated,
           workspace: unit.workspace,
+          ...extras,
           backing: { kind: "workspace", unitId: unit.id, workspace: unit.workspace! },
         }
       : {
@@ -489,6 +566,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
           status: unit.status,
           verified: isVerified(unit.status),
           escalated: unitEscalated,
+          ...extras,
           backing: { kind: "work-unit", unitId: unit.id, status: unit.status },
         };
     nodes.push(assertBacked(node, snapshot));

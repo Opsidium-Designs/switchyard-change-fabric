@@ -165,6 +165,149 @@ describe("WorkersAiExecutor", () => {
   });
 });
 
+describe("WorkersAiExecutor streaming and step callbacks (fake transport, deterministic/offline)", () => {
+  const okReply = JSON.stringify({
+    edits: [{ path: "src/x.ts", contents: "export const x = 1;\n" }],
+  });
+
+  /**
+   * A deterministic FAKE streaming transport: it ignores the network and simply
+   * relays a fixed sequence of token deltas through the streaming callbacks (as
+   * a real Workers AI streaming call would), then returns the assembled reply.
+   * This is what keeps the streaming path testable offline: no fetch, no SSE, no
+   * real model, yet the executor's token/step relay is exercised exactly.
+   */
+  const fakeStreamingInvoke = (chunks: readonly string[]): WorkersAiInvoke => {
+    return async (_request, callbacks) => {
+      for (const chunk of chunks) {
+        callbacks?.onToken?.(chunk);
+      }
+      return { text: chunks.join(""), usage: { inputTokens: 11, outputTokens: 7 } };
+    };
+  };
+
+  it("relays streamed tokens through the context onToken callback deterministically", async () => {
+    const chunks = ['{"edits":[{"path":"src/x.ts",', '"contents":"export ', 'const x = 1;\\n"}]}'];
+    const streamed: string[] = [];
+    const result = await new WorkersAiExecutor({ invoke: fakeStreamingInvoke(chunks) }).execute({
+      worktreeDir: worktree,
+      workUnitId: "x",
+      objective: "add x",
+      paths: ["src/x.ts"],
+      baselineRef: "HEAD",
+      onToken: (chunk) => streamed.push(chunk),
+    });
+    // The tokens the console would render are exactly the real deltas the
+    // transport streamed, in order, assembling the real model output.
+    expect(streamed).toEqual(chunks);
+    expect(streamed.join("")).toBe(chunks.join(""));
+    // The assembled stream was still parsed into the real edit and applied.
+    expect(result.changedPaths).toEqual(["src/x.ts"]);
+    const written = await readFile(join(worktree, "src/x.ts"), "utf8");
+    expect(written).toBe("export const x = 1;\n");
+  });
+
+  it("surfaces a prompt summary and concrete run steps through the context callbacks", async () => {
+    let promptSummary = "";
+    const steps: Array<{ phase: string; message: string }> = [];
+    await new WorkersAiExecutor({ invoke: fakeStreamingInvoke([okReply]) }).execute({
+      worktreeDir: worktree,
+      workUnitId: "x",
+      objective: "add input validation",
+      paths: ["src/x.ts"],
+      baselineRef: "HEAD",
+      onPromptSummary: (summary) => {
+        promptSummary = summary;
+      },
+      onStep: (step) => steps.push(step),
+    });
+    // The prompt summary is the REAL prompt (objective + scope), readable and
+    // carrying no file contents and no secret.
+    expect(promptSummary).toContain("add input validation");
+    expect(promptSummary).toContain("src/x.ts");
+    // The executor emitted concrete run steps for the model call and the applied
+    // edit, so the activity log is built from real steps rather than UI guesses.
+    expect(steps.some((s) => s.phase === "model-call")).toBe(true);
+    expect(steps.some((s) => s.phase === "applied-edit")).toBe(true);
+    const applied = steps.find((s) => s.phase === "applied-edit");
+    expect(applied?.message).toContain("src/x.ts");
+  });
+
+  it("a best-effort callback that throws never fails the run", async () => {
+    const result = await new WorkersAiExecutor({ invoke: fakeStreamingInvoke([okReply]) }).execute({
+      worktreeDir: worktree,
+      workUnitId: "x",
+      objective: "add x",
+      paths: ["src/x.ts"],
+      baselineRef: "HEAD",
+      onToken: () => {
+        throw new Error("observer blew up");
+      },
+      onStep: () => {
+        throw new Error("observer blew up");
+      },
+      onPromptSummary: () => {
+        throw new Error("observer blew up");
+      },
+    });
+    // The edit still applied despite every observability callback throwing.
+    expect(result.changedPaths).toEqual(["src/x.ts"]);
+  });
+});
+
+describe("createWorkersAiRestInvoke streaming", () => {
+  it("parses a Workers AI SSE stream, relays each real delta, and assembles the full reply", async () => {
+    // A fake fetch returning a Workers AI style SSE body: one event per delta,
+    // each `data: {"response":"<delta>"}`, ending with `[DONE]`. This exercises
+    // the real stream-parsing path with no network and no live model.
+    const deltas = ['{"edits":[', '{"path":"src/x.ts",', '"contents":"ok"}]}'];
+    const sse =
+      deltas.map((d) => `data: ${JSON.stringify({ response: d })}\n\n`).join("") +
+      `data: ${JSON.stringify({ usage: { prompt_tokens: 3, completion_tokens: 9 } })}\n\n` +
+      "data: [DONE]\n\n";
+    const fakeFetch = (async () =>
+      new Response(sse, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      })) as unknown as typeof fetch;
+
+    const invoke = createWorkersAiRestInvoke({
+      accountId: "acct",
+      apiToken: "secret-token-value",
+      fetchFn: fakeFetch,
+    });
+    const relayed: string[] = [];
+    const result = await invoke(
+      { model: DEFAULT_WORKERS_AI_MODEL, messages: [{ role: "user", content: "hi" }] },
+      { onToken: (chunk) => relayed.push(chunk) },
+    );
+    // Each streamed delta was relayed in order; the assembled text is the full
+    // real reply the executor then parses.
+    expect(relayed).toEqual(deltas);
+    expect(result.text).toBe(deltas.join(""));
+    expect(result.usage?.inputTokens).toBe(3);
+    expect(result.usage?.outputTokens).toBe(9);
+  });
+
+  it("does not stream (no stream flag) when no token callback is given", async () => {
+    let sawStreamFlag = false;
+    const fakeFetch = (async (_url: string, init?: RequestInit) => {
+      sawStreamFlag = String(init?.body ?? "").includes('"stream":true');
+      return new Response(
+        JSON.stringify({ result: { response: '{"edits":[]}' }, success: true }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const invoke = createWorkersAiRestInvoke({
+      accountId: "acct",
+      apiToken: "secret-token-value",
+      fetchFn: fakeFetch,
+    });
+    await invoke({ model: "m", messages: [{ role: "user", content: "x" }] });
+    expect(sawStreamFlag).toBe(false);
+  });
+});
+
 describe("createWorkersAiRestInvoke", () => {
   it("posts to the account model run endpoint with a bearer token and parses the reply", async () => {
     let seenUrl = "";

@@ -19,6 +19,20 @@ export interface ExecutorContext {
   readonly paths: readonly string[];
   /** The Git ref the workspace was seeded from (e.g. "HEAD" or a branch). */
   readonly baselineRef: string;
+  /**
+   * Optional, best-effort observability callbacks a caller (the live runner)
+   * sets per WorkUnit so an inference executor can surface the real agent
+   * activity as it happens: a readable summary of the prompt, each streamed
+   * model token, and tool-call / phase steps. A deterministic executor simply
+   * ignores them. A thrown callback must never fail the run (the executor wraps
+   * each in a guard), and no callback is ever passed a credential: the prompt
+   * summary and steps are the genuine agent activity, bounded and secret-free.
+   */
+  readonly onPromptSummary?: (summary: string) => void;
+  /** Called with each chunk of REAL streamed model text as it arrives. */
+  readonly onToken?: (chunk: string) => void;
+  /** Called with a tool-call / phase step the executor exposes. */
+  readonly onStep?: (step: { readonly phase: string; readonly message: string }) => void;
 }
 
 /** Status of an executor run. */

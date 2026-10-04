@@ -55,6 +55,39 @@ export interface WorkspaceIdentity {
   readonly leasedAt: string;
 }
 
+/**
+ * One ordered activity step a runner/agent reported for a WorkUnit: a real step
+ * in the run (leased, cloning, calling the model, applying the edit, committing,
+ * pushing, verified, or failed). These are recorded by the actual run steps, so
+ * the console's per-node activity log is backed by real steps, never synthesized
+ * in the UI. The message is bounded and secret-stripped before storage.
+ */
+export interface ActivityStep {
+  readonly phase: string;
+  readonly message: string;
+  readonly at: string;
+}
+
+/**
+ * The rich per-unit detail a runner reports so the console's click-detail reads
+ * from real state: a readable summary of the agent's prompt, the model's
+ * proposed edit (changed paths and a readable diff/contents), the model id, the
+ * proposed commit message, and token usage / cost when the provider reported it.
+ * Every field is optional because detail accrues as the agent runs. No field is
+ * ever a credential; the diff and prompt summary are bounded before storage.
+ */
+export interface UnitDetail {
+  readonly promptSummary?: string;
+  readonly model?: string;
+  readonly editedPaths?: readonly string[];
+  readonly diff?: string;
+  readonly commitMessage?: string;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly usd?: number;
+  readonly at?: string;
+}
+
 /** The live view of a single WorkUnit, as served to the console and CLI. */
 export interface WorkUnitView {
   readonly id: string;
@@ -70,6 +103,18 @@ export interface WorkUnitView {
    * honest backing the console reveals on click; it is never fabricated.
    */
   readonly workspace?: WorkspaceIdentity;
+  /**
+   * The ordered log of real run steps the agent for this unit emitted. Present
+   * once the run reported them; each entry is a concrete step, so the console's
+   * per-node activity log is backed by real steps rather than synthesized.
+   */
+  readonly activity?: readonly ActivityStep[];
+  /**
+   * The rich per-unit detail (prompt summary, proposed edit/diff, model, tokens
+   * and cost) the runner reported, present once produced. The node detail panel
+   * reads these fields straight from state.
+   */
+  readonly detail?: UnitDetail;
 }
 
 /** A recorded cost event emitted by a runner for a WorkUnit. */
@@ -351,6 +396,16 @@ export class ChangeState extends DurableObject<Env> {
     // completed, so its dependents stay blocked rather than running on a missing
     // prerequisite. The failure reason is kept so the state can report why.
     await this.ctx.storage.put("failed", {} as Record<string, FailureRecord>);
+    // Per-unit activity logs (the real ordered run steps a runner reports) and
+    // per-unit rich detail (prompt summary, proposed edit/diff, model, tokens).
+    // Both start empty and accrue only from real steps the run reports; they are
+    // what the console's activity log and click-detail render from real state.
+    await this.ctx.storage.put("activity", {} as Record<string, ActivityStep[]>);
+    await this.ctx.storage.put("detail", {} as Record<string, UnitDetail>);
+    // Per-unit live model-output stream buffer (the real streamed tokens the
+    // executor relayed through the runner). Appended to as a run streams and
+    // read by the console's live-stream subscription. Bounded per unit.
+    await this.ctx.storage.put("stream", {} as Record<string, string>);
     return this.view();
   }
 
@@ -655,6 +710,86 @@ export class ChangeState extends DurableObject<Env> {
     return leases[unitId];
   }
 
+  /**
+   * Record one ordered activity step a runner/agent reported for a WorkUnit: a
+   * real step in the run (for example "leased", "cloning", "model", "edit",
+   * "commit", "push", "verified", or "failed"). This is the step the ACTUAL run
+   * emitted, so the console's per-node activity log is backed by real steps and
+   * never synthesized in the UI. The unit must exist in the Change; the message
+   * is bounded and secret-stripped before storage. The step is appended in the
+   * order it was reported.
+   */
+  async recordStep(unitId: string, phase: string, message: string): Promise<ActivityStep> {
+    const change = await this.loadChange();
+    if (!change.work.some((unit) => unit.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    const activity = await this.loadActivity();
+    const step: ActivityStep = {
+      phase: boundedPhase(phase),
+      message: sanitizeReason(message),
+      at: new Date().toISOString(),
+    };
+    const list = activity[unitId] ?? [];
+    list.push(step);
+    // Bound the per-unit log so a long run cannot grow it without limit.
+    activity[unitId] = list.length > MAX_ACTIVITY_STEPS ? list.slice(-MAX_ACTIVITY_STEPS) : list;
+    await this.ctx.storage.put("activity", activity);
+    return step;
+  }
+
+  /**
+   * Record (merge) the rich per-unit detail a runner reports: a readable prompt
+   * summary, the model's proposed edit (changed paths and a readable diff), the
+   * model id, the proposed commit message, and token usage / cost when the
+   * provider reported it. Merging lets a run fill the detail in pieces (the
+   * prompt summary when it calls the model, then the diff and tokens when the
+   * reply lands). The unit must exist; the prompt summary and diff are bounded
+   * and secret-stripped before storage, so no credential is ever persisted.
+   */
+  async recordDetail(unitId: string, detail: UnitDetail): Promise<UnitDetail> {
+    const change = await this.loadChange();
+    if (!change.work.some((unit) => unit.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    const all = await this.loadDetail();
+    const merged: UnitDetail = {
+      ...(all[unitId] ?? {}),
+      ...sanitizeDetail(detail),
+      at: new Date().toISOString(),
+    };
+    all[unitId] = merged;
+    await this.ctx.storage.put("detail", all);
+    return merged;
+  }
+
+  /**
+   * Append a chunk of REAL streamed model output for a WorkUnit. The runner
+   * relays the tokens Workers AI streams back as the model produces them; this
+   * buffers them so the console's live-stream subscription can read the growing
+   * text for the selected running node. The buffer is bounded per unit so a long
+   * stream cannot grow it without limit (the console still sees the live tail).
+   * The streamed text is the genuine model output, never a synthesized line.
+   */
+  async appendStream(unitId: string, chunk: string): Promise<number> {
+    const change = await this.loadChange();
+    if (!change.work.some((unit) => unit.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    const streams = await this.loadStream();
+    const current = streams[unitId] ?? "";
+    const next = current + (typeof chunk === "string" ? chunk : String(chunk ?? ""));
+    streams[unitId] = next.length > MAX_STREAM_CHARS ? next.slice(-MAX_STREAM_CHARS) : next;
+    await this.ctx.storage.put("stream", streams);
+    return streams[unitId]!.length;
+  }
+
+  /** Read the buffered live model-output stream for a WorkUnit (empty if none). */
+  async getStream(unitId: string): Promise<string> {
+    const streams = await this.loadStream();
+    return streams[unitId] ?? "";
+  }
+
   /** Record a cost event emitted by a runner (heartbeat or completion). */
   async recordCost(event: Omit<CostEvent, "at">): Promise<ChangeStateView> {
     const change = await this.loadChange();
@@ -821,6 +956,8 @@ export class ChangeState extends DurableObject<Env> {
     const toolConsumptions = await this.loadToolConsumptions();
     const escalations = await this.loadEscalations();
     const failed = await this.loadFailed();
+    const activity = await this.loadActivity();
+    const detail = await this.loadDetail();
     const statuses = workUnitStatuses(change, completed);
     const graph = buildWorkGraph(change);
     const collisions = detectPathCollisions(change);
@@ -850,6 +987,12 @@ export class ChangeState extends DurableObject<Env> {
         // Present once an agent has been recruited for this unit; kept past
         // completion so the node always reveals the real repo it ran in.
         ...(workspace ? { workspace } : {}),
+        // The real ordered run steps and rich detail the runner reported, when
+        // present. These back the console's activity log and click-detail.
+        ...(activity[unit.id] && activity[unit.id]!.length > 0
+          ? { activity: activity[unit.id] }
+          : {}),
+        ...(detail[unit.id] ? { detail: detail[unit.id] } : {}),
       };
     });
 
@@ -945,6 +1088,18 @@ export class ChangeState extends DurableObject<Env> {
   private async loadFailed(): Promise<Record<string, FailureRecord>> {
     return (await this.ctx.storage.get<Record<string, FailureRecord>>("failed")) ?? {};
   }
+
+  private async loadActivity(): Promise<Record<string, ActivityStep[]>> {
+    return (await this.ctx.storage.get<Record<string, ActivityStep[]>>("activity")) ?? {};
+  }
+
+  private async loadDetail(): Promise<Record<string, UnitDetail>> {
+    return (await this.ctx.storage.get<Record<string, UnitDetail>>("detail")) ?? {};
+  }
+
+  private async loadStream(): Promise<Record<string, string>> {
+    return (await this.ctx.storage.get<Record<string, string>>("stream")) ?? {};
+  }
 }
 
 /**
@@ -976,4 +1131,68 @@ function sanitizeReason(reason: string | undefined): string {
     .replace(/\b[A-Za-z0-9_-]{40,}\b/g, "[redacted]");
   const bounded = redacted.length > 300 ? `${redacted.slice(0, 297)}...` : redacted;
   return bounded === "" ? "agent failed" : bounded;
+}
+
+/** Keep a bounded per-unit activity log and a bounded live-stream buffer. */
+const MAX_ACTIVITY_STEPS = 200;
+const MAX_STREAM_CHARS = 20_000;
+/** The maximum stored length of a prompt summary or a proposed diff. */
+const MAX_DETAIL_TEXT = 20_000;
+
+/** Keep an activity-step phase short, lowercase, and metadata-safe. */
+function boundedPhase(phase: string | undefined): string {
+  const text = (phase ?? "step").toString().replace(/\s+/g, "-").trim().toLowerCase();
+  const bounded = text.length > 40 ? text.slice(0, 40) : text;
+  return bounded === "" ? "step" : bounded;
+}
+
+/**
+ * Strip credential-looking fragments from a stored text field and bound it. The
+ * prompt summary and the proposed diff are stored and shown, so defensively
+ * redact a bearer token or a long credential-looking token even though neither
+ * should ever appear in a prompt or a model edit.
+ */
+function sanitizeText(text: string, max: number): string {
+  const redacted = text
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [redacted]")
+    .replace(/\b[A-Za-z0-9_-]{40,}\b/g, "[redacted]");
+  return redacted.length > max ? `${redacted.slice(0, max - 3)}...` : redacted;
+}
+
+/**
+ * Sanitize a reported UnitDetail: bound and secret-strip the free-text fields,
+ * keep only finite numeric usage/cost, and bound the edited-paths list, so no
+ * credential and no unbounded blob is ever persisted. Fields that are absent are
+ * left out so recordDetail can merge pieces across calls.
+ */
+function sanitizeDetail(detail: UnitDetail): UnitDetail {
+  const out: Record<string, unknown> = {};
+  if (typeof detail.promptSummary === "string") {
+    out.promptSummary = sanitizeText(detail.promptSummary, MAX_DETAIL_TEXT);
+  }
+  if (typeof detail.model === "string") {
+    out.model = detail.model.slice(0, 120);
+  }
+  if (Array.isArray(detail.editedPaths)) {
+    out.editedPaths = detail.editedPaths
+      .filter((p): p is string => typeof p === "string")
+      .slice(0, 50)
+      .map((p) => p.slice(0, 300));
+  }
+  if (typeof detail.diff === "string") {
+    out.diff = sanitizeText(detail.diff, MAX_DETAIL_TEXT);
+  }
+  if (typeof detail.commitMessage === "string") {
+    out.commitMessage = sanitizeText(detail.commitMessage, 500);
+  }
+  if (typeof detail.inputTokens === "number" && Number.isFinite(detail.inputTokens)) {
+    out.inputTokens = detail.inputTokens;
+  }
+  if (typeof detail.outputTokens === "number" && Number.isFinite(detail.outputTokens)) {
+    out.outputTokens = detail.outputTokens;
+  }
+  if (typeof detail.usd === "number" && Number.isFinite(detail.usd)) {
+    out.usd = detail.usd;
+  }
+  return out as UnitDetail;
 }
