@@ -24,6 +24,22 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+// A CORS preflight reply. It must be a bodiless 204: a 204 response cannot
+// carry a body, so this cannot reuse json(). Browsers fire this OPTIONS
+// preflight before any POST that sets a content-type, so a dial or recruit
+// action from the console depends on it.
+function corsPreflight(): Response {
+  return new Response(null, {
+    status: 204,
+    headers: {
+      "access-control-allow-origin": "*",
+      "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
+      "access-control-allow-headers": "content-type",
+      "access-control-max-age": "86400",
+    },
+  });
+}
+
 /** Get the ChangeState Durable Object stub addressed by Change id. */
 function changeStateStub(env: EnvWithProvisioner, changeId: string) {
   const id = env.CHANGE_STATE.idFromName(changeId);
@@ -48,7 +64,7 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
   const url = new URL(request.url);
 
   if (request.method === "OPTIONS") {
-    return json({}, 204);
+    return corsPreflight();
   }
 
   // Health / readiness probe.
