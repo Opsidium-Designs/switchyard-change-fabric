@@ -51,5 +51,27 @@
       "namespace": "switchyard-change-fabric",
       "remote": true
     }
-  ]
+  ],
+
+  // Event-driven recruitment nervous system.
+  //
+  // Cloudflare Artifacts event subscriptions deliver repo lifecycle events (the
+  // `repo.pushed` event among them) to a Queue. This Worker consumes that queue
+  // (the `queue` handler in src/index.ts), so an agent finishing a WorkUnit and
+  // pushing to its own Artifact repo drives the next recruitment wave through a
+  // real event, not a poll or a timer.
+  //
+  // The subscription itself is created out of band against the live account
+  // (see `make artifacts-subscribe` / the README), pointed at this queue. The
+  // offline test substrate drives the identical downstream path with a faked
+  // event via `POST /events/repo-pushed`, so `make check` stays deterministic.
+  "queues": {
+    "consumers": [
+      {
+        "queue": "switchyard-change-fabric-repo-pushed",
+        "max_batch_size": 10,
+        "max_batch_timeout": 5
+      }
+    ]
+  }
 }

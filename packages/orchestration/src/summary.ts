@@ -13,6 +13,7 @@ import type { Change } from "@switchyard-change/change-core";
 
 import type { ChangeStateView } from "./local-control.ts";
 import type { RunChangeResult } from "./run-change.ts";
+import type { RunRecruitmentResult } from "./recruit-run.ts";
 
 /** Render the full end-to-end run as a readable report. */
 export function formatRunSummary(result: RunChangeResult): string {
@@ -156,4 +157,45 @@ export function formatStateView(state: ChangeStateView): string {
 
 function short(commit: string): string {
   return commit.length >= 10 ? commit.slice(0, 10) : commit;
+}
+
+/**
+ * Render a dial-bounded, event-driven recruitment run as a readable report. It
+ * tells the M2 story: the dial in force, each recruitment wave and what
+ * triggered it (kickoff vs a repo-pushed event), the peak concurrency reached,
+ * and the distinct per-agent workspaces.
+ */
+export function formatRecruitmentSummary(result: RunRecruitmentResult): string {
+  const lines: string[] = [];
+  lines.push(`Recruitment for Change ${result.changeId}`);
+  lines.push(
+    `  dial: min ${result.dial.minConcurrency}, max ${result.dial.maxConcurrency} ` +
+      `(${result.offline ? "offline local fallback" : "live Cloudflare Artifacts"})`,
+  );
+  lines.push(`  peak concurrency reached: ${result.peakConcurrency}`);
+  lines.push("");
+
+  lines.push("Recruitment waves (each after the first driven by a repo-pushed event):");
+  let waveNo = 0;
+  for (const wave of result.waves) {
+    waveNo += 1;
+    const trig = wave.trigger === "kickoff" ? "kickoff" : "repo-pushed event";
+    const units = wave.agents.map((a) => a.unitId).join(", ");
+    lines.push(`  Wave ${waveNo} [${trig}]: ${units} (${wave.agents.length} agent(s) at once)`);
+  }
+  lines.push("");
+
+  lines.push("Agents (each in its OWN workspace):");
+  for (const wave of result.waves) {
+    for (const agent of wave.agents) {
+      const commit = agent.commit === "" ? "(no change)" : short(agent.commit);
+      lines.push(`  - ${agent.unitId}: ${agent.workspaceName} [${agent.backend}] commit ${commit}`);
+    }
+  }
+  lines.push("");
+
+  lines.push(`Distinct workspaces provisioned: ${result.workspaces.length}`);
+  lines.push(`Repo-pushed events that drove waves: ${result.pushEvents.length}`);
+  lines.push(`Completed: ${result.completed.join(", ")}`);
+  return lines.join("\n");
 }

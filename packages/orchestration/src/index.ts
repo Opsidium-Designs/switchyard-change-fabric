@@ -22,9 +22,30 @@ export type {
   ChangeStateView,
   CostEvent,
   LeaseRecord,
+  RecruitmentEvent,
+  RecruitmentPlan,
+  RepoPushedResult,
   WorkUnitView,
 } from "./local-control.ts";
 export { LocalChangeControl, workspaceNameFor } from "./local-control.ts";
+
+export type {
+  AgentRunReport,
+  RecruitmentWave,
+  RepoPushedEvent,
+  RunRecruitmentOptions,
+  RunRecruitmentResult,
+} from "./recruit-run.ts";
+export { cleanupRunRoot, runRecruitment } from "./recruit-run.ts";
+
+export type {
+  LiveAgentReport,
+  LiveTrigger,
+  LiveWave,
+  RunRecruitmentLiveOptions,
+  RunRecruitmentLiveResult,
+} from "./recruit-live.ts";
+export { runRecruitmentLive } from "./recruit-live.ts";
 
 export type {
   RunChangeOptions,
@@ -37,6 +58,11 @@ export { describeChange, runChange } from "./run-change.ts";
 export type { RepoFile, RepoSnapshot } from "@switchyard-change/change-core";
 export { scanRepoFiles, scanRepoSnapshot } from "./scan-repo.ts";
 
+export type { ConcurrencyDial } from "@switchyard-change/change-core";
+export { DEFAULT_DIAL } from "@switchyard-change/change-core";
+
+export type { Change, WorkUnit } from "@switchyard-change/change-core";
+
 export type { DecomposeGoalOptions, DecomposeGoalResult } from "./decompose-goal.ts";
 export {
   decomposeGoal,
@@ -44,7 +70,7 @@ export {
   changeToSpecYaml,
 } from "./decompose-goal.ts";
 
-export { formatChangePlan, formatRunSummary, formatStateView } from "./summary.ts";
+export { formatChangePlan, formatRecruitmentSummary, formatRunSummary, formatStateView } from "./summary.ts";
 
 export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor.ts";
 export { formatDoctorReport, runDoctor } from "./doctor.ts";

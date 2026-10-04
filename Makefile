@@ -16,7 +16,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -80,6 +80,31 @@ decompose-audit:
 # in a promoted local Git commit. Same GOAL/PROJECT overrides as `make decompose`.
 run-goal:
 	npm -w apps/cli run dev -- run-goal "$(GOAL)" --project "$(PROJECT)"
+
+# Recruit agents against a goal under a min/max concurrency dial, offline and
+# deterministically: each recruited agent gets its own local-fallback workspace,
+# and each wave after the first is driven by a repo-pushed event (not a timer).
+# Override MIN/MAX to turn the dial and watch concurrency widen through the same
+# code path. Defaults to the flat calc-project goal so all units are runnable at
+# once and the dial is the only bound.
+MIN ?= 1
+MAX ?= 3
+
+recruit:
+	npm -w apps/cli run dev -- recruit "$(GOAL)" --project "$(PROJECT)" --min $(MIN) --max $(MAX)
+
+# Recruit agents into REAL Cloudflare Artifact repos through a running Worker.
+# Start the Worker first in another terminal with `make dev` (wrangler dev with
+# the Artifacts binding remote=true; authenticate with `wrangler login` or a
+# scoped CLOUDFLARE_API_TOKEN in a gitignored .env). Then run this: multiple
+# agents concurrently hold distinct real Artifact repos and push to them, each
+# wave after the first driven by the repo-pushed event. Raise MAX to widen
+# concurrency. The run deletes the real repos it created on the way out.
+WORKER ?= http://127.0.0.1:8787
+
+recruit-live:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	npm -w apps/cli run dev -- recruit-live "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" --min $(MIN) --max $(MAX)
 
 build:
 	npm run build

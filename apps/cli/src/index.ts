@@ -26,9 +26,14 @@ import {
   formatChangePlan,
   formatDecomposition,
   formatDoctorReport,
+  formatRecruitmentSummary,
   formatRunSummary,
   runChange,
   runDoctor,
+  runRecruitment,
+  runRecruitmentLive,
+  type Change,
+  type ConcurrencyDial,
 } from "@switchyard-change/orchestration";
 
 const CLI_NAME = "switchyard-change";
@@ -202,6 +207,80 @@ const commands: Command[] = [
     },
   },
   {
+    name: "recruit",
+    summary: "Recruit agents against a goal under a min/max dial, driven by push events (offline).",
+    usage: `${CLI_NAME} recruit "<goal>" --project <dir> [--min N] [--max N]`,
+    async run(args) {
+      const change = await resolveChange(args);
+      if (!change) {
+        console.error(
+          `Usage: ${CLI_NAME} recruit "<goal text>" --project <dir> [--min N] [--max N]\n` +
+            `   or: ${CLI_NAME} recruit --change <change.yaml> [--min N] [--max N]`,
+        );
+        return 1;
+      }
+      const dial = dialFromArgs(args);
+      console.log(
+        `Recruiting for ${change.id} under dial min ${dial.minConcurrency}, max ${dial.maxConcurrency} (offline substrate)...`,
+      );
+      console.log("");
+      const result = await runRecruitment({ change, dial });
+      console.log(formatRecruitmentSummary(result));
+      return result.completed.length === change.work.length ? 0 : 1;
+    },
+  },
+  {
+    name: "recruit-live",
+    summary: "Recruit agents into real Cloudflare Artifact repos via a running Worker (wrangler dev).",
+    usage: `${CLI_NAME} recruit-live "<goal>" --project <dir> --worker <url> [--min N] [--max N]`,
+    async run(args) {
+      const change = await resolveChange(args);
+      if (!change) {
+        console.error(
+          `Usage: ${CLI_NAME} recruit-live "<goal text>" --project <dir> --worker <url> [--min N] [--max N]\n` +
+            `   or: ${CLI_NAME} recruit-live --change <change.yaml> --worker <url> [--min N] [--max N]`,
+        );
+        return 1;
+      }
+      const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
+      const dial = dialFromArgs(args);
+      // Give each live run a unique Change id so the real Artifact repo names it
+      // provisions never collide with a prior run's just-deleted repos. Artifacts
+      // repo deletion is eventually consistent, so recreating an identical repo
+      // name immediately after a cleanup can be rejected; a fresh id per run side
+      // steps that rough edge without weakening the per-unit isolation.
+      const runId = Date.now().toString(36);
+      const liveChange: Change = { ...change, id: `${change.id}-${runId}` };
+      console.log(
+        `Recruiting for ${liveChange.id} under dial min ${dial.minConcurrency}, max ${dial.maxConcurrency} ` +
+          `against live Worker ${workerUrl}...`,
+      );
+      console.log("");
+      const result = await runRecruitmentLive({
+        change: liveChange,
+        dial,
+        workerUrl,
+        specYaml: changeToSpecYaml(liveChange),
+      });
+      console.log(`Change ${result.changeId} on ${result.workerUrl}`);
+      console.log(`  wave trigger: ${result.waveTrigger}`);
+      console.log(`  peak concurrency: ${result.peakConcurrency}`);
+      console.log(`  distinct real repos held: ${result.workspaces.length}`);
+      console.log(`  any live (non-fallback) repo: ${result.anyLive ? "yes" : "no"}`);
+      console.log(`  completed: ${result.completed.join(", ") || "(none)"}`);
+      console.log("  waves:");
+      for (const [i, wave] of result.waves.entries()) {
+        console.log(
+          `    ${i + 1} [${wave.trigger}]: ${wave.agents
+            .map((a) => `${a.unitId}@${a.workspaceName}`)
+            .join(", ")} (${wave.agents.length} at once)`,
+        );
+      }
+      console.log(`  cleaned up repos: ${result.cleanedUp.join(", ") || "(none)"}`);
+      return result.completed.length === change.work.length ? 0 : 1;
+    },
+  },
+  {
     name: "promote",
     summary: "Run a Change and promote the verified result into local Git.",
     usage: `${CLI_NAME} promote <change.yaml> [--project <dir>]`,
@@ -274,6 +353,40 @@ async function resolveGoal(args: readonly string[]): Promise<string | undefined>
 function requireProjectDir(args: readonly string[]): string | undefined {
   const explicit = optionValue(args, "--project");
   return explicit ? resolve(explicit) : undefined;
+}
+
+/**
+ * Resolve a Change for a recruitment command from either a goal (decomposed
+ * against a target project) or a hand-authored Change YAML (--change). Returns
+ * undefined when neither a goal+project nor a --change file was provided.
+ */
+async function resolveChange(args: readonly string[]): Promise<Change | undefined> {
+  const changeFile = optionValue(args, "--change");
+  if (changeFile) {
+    const specYaml = await readFile(resolve(changeFile), "utf8");
+    return describeChange(specYaml).change;
+  }
+  const goal = await resolveGoal(args);
+  const projectDir = requireProjectDir(args);
+  if (goal === undefined || !projectDir) {
+    return undefined;
+  }
+  const decomposition = await decomposeGoal({ goal, projectDir });
+  return decomposition.change;
+}
+
+/**
+ * Parse the min/max concurrency dial from CLI flags, defaulting to a floor of
+ * one and a ceiling of three. The dial is the single lever that governs how many
+ * agents recruitment runs at once.
+ */
+function dialFromArgs(args: readonly string[]): ConcurrencyDial {
+  const min = Number(optionValue(args, "--min") ?? "1");
+  const max = Number(optionValue(args, "--max") ?? "3");
+  return {
+    minConcurrency: Number.isFinite(min) ? min : 1,
+    maxConcurrency: Number.isFinite(max) ? max : 3,
+  };
 }
 
 /** True when `value` is the argument consumed by a preceding --flag. */

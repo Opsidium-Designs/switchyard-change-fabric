@@ -59,3 +59,10 @@ export { decompose, decomposeToChange } from "./decompose.ts";
 
 export type { DriveOptions, DriveTrace, DriveWave } from "./scheduler.ts";
 export { driveWorkGraph } from "./scheduler.ts";
+
+export type {
+  ConcurrencyDial,
+  RecruitDecision,
+  RecruitInput,
+} from "./recruit.ts";
+export { DEFAULT_DIAL, normalizeDial, recruit } from "./recruit.ts";

@@ -101,24 +101,30 @@ class CloudflareProvisioner implements WorkspaceProvisioner {
 
   async revoke(workspaceName: string, tokenId: string): Promise<void> {
     if (!this.refs.has(workspaceName)) {
-      return this.fallback.revoke(workspaceName, tokenId);
+      // The token was issued in a different request (a fresh provisioner), so the
+      // in-memory ref is gone; address the repo by name directly to revoke.
+      const ref = this.refByName(workspaceName);
+      await this.provider.revokeToken(ref, tokenId);
+      return;
     }
-    const ref = {
-      id: "",
-      name: workspaceName,
-      gitUrl: "",
-      defaultBranch: "main",
-      backend: "cloudflare-artifacts" as const,
-      fallback: false,
-    };
+    const ref = this.refByName(workspaceName);
     await this.provider.revokeToken(ref, tokenId);
   }
 
   async archive(workspaceName: string): Promise<void> {
-    if (!this.refs.has(workspaceName)) {
-      return this.fallback.archive(workspaceName);
-    }
-    const ref = {
+    // Delete the real Artifact repo by name. The binding's delete only needs the
+    // repo name, so this works even when the repo was created in a different
+    // request (a fresh provisioner with an empty in-memory ref map), which is
+    // exactly the recruit-then-cleanup case. Gating on the in-memory map here
+    // would silently skip the real delete and leak repos.
+    const ref = this.refByName(workspaceName);
+    await this.provider.archive(ref);
+    this.refs.delete(workspaceName);
+  }
+
+  /** A minimal ref addressing a repo by name (all the provider needs by name). */
+  private refByName(workspaceName: string) {
+    return {
       id: "",
       name: workspaceName,
       gitUrl: "",
@@ -126,8 +132,6 @@ class CloudflareProvisioner implements WorkspaceProvisioner {
       backend: "cloudflare-artifacts" as const,
       fallback: false,
     };
-    await this.provider.archive(ref);
-    this.refs.delete(workspaceName);
   }
 }
 

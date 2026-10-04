@@ -17,11 +17,15 @@
 
 import {
   detectPathCollisions,
+  normalizeDial,
   parseChangeSpec,
+  recruit,
   runnableUnits,
   workUnitStatuses,
   type Change,
+  type ConcurrencyDial,
   type PathCollision,
+  type RecruitDecision,
   type WorkUnitStatus,
 } from "@switchyard-change/change-core";
 import type {
@@ -71,12 +75,44 @@ export interface ChangeStateView {
   readonly costEvents: readonly CostEvent[];
 }
 
+/** A recruitment plan for one wave in the offline substrate (mirrors the DO). */
+export interface RecruitmentPlan extends RecruitDecision {
+  readonly inFlight: number;
+  readonly dial: ConcurrencyDial;
+  readonly runnable: readonly string[];
+}
+
+/** A recorded recruitment event (mirrors the DO's inspectable log). */
+export interface RecruitmentEvent {
+  readonly trigger: "kickoff" | "repo-pushed";
+  readonly pushedWorkspace?: string;
+  readonly completedUnit?: string;
+  readonly recruited: readonly string[];
+  readonly ceiling: number;
+  readonly inFlightAfter: number;
+  readonly at: string;
+}
+
+/** The outcome of ingesting a repo-pushed event offline (mirrors the DO). */
+export interface RepoPushedResult {
+  readonly completedUnit: string | null;
+  readonly recruited: readonly string[];
+  readonly done: boolean;
+  readonly event: RecruitmentEvent;
+}
+
 /** One Change's in-process bookkeeping. */
 class ChangeRecord {
   readonly completed = new Set<string>();
   readonly leases = new Map<string, LeaseRecord>();
   readonly costEvents: CostEvent[] = [];
   readonly change: Change;
+  /** The min/max concurrency dial governing recruitment. */
+  dial: ConcurrencyDial = normalizeDial(undefined);
+  /** The inspectable recruitment-event log. */
+  readonly recruitments: RecruitmentEvent[] = [];
+  /** Backend workspace name -> unit id, so a repo-pushed event resolves a unit. */
+  readonly workspaceUnits = new Map<string, string>();
   constructor(change: Change) {
     this.change = change;
   }
@@ -98,6 +134,84 @@ export class LocalChangeControl {
     const change = parseChangeSpec(specYaml);
     this.records.set(change.id, new ChangeRecord(change));
     return change;
+  }
+
+  /** Set the min/max concurrency dial (as POST /changes/:id/dial does). */
+  configureDial(changeId: string, dial: Partial<ConcurrencyDial> | undefined): ConcurrencyDial {
+    const record = this.require(changeId);
+    record.dial = normalizeDial(dial);
+    return record.dial;
+  }
+
+  /** The dial currently in force for a Change. */
+  dial(changeId: string): ConcurrencyDial {
+    return this.require(changeId).dial;
+  }
+
+  /** The inspectable recruitment-event log for a Change. */
+  recruitments(changeId: string): readonly RecruitmentEvent[] {
+    return this.require(changeId).recruitments;
+  }
+
+  /**
+   * Compute the recruitment plan for the next wave: exactly the DO's policy,
+   * sharing the same `recruit` function from change-core. The window over the
+   * runnable set is bounded by the dial and by how many agents are in flight.
+   */
+  planRecruitment(changeId: string): RecruitmentPlan {
+    const record = this.require(changeId);
+    const runnable = runnableUnits(record.change, record.completed);
+    const openRunnable = runnable.filter((id) => !record.leases.has(id));
+    // In flight = agents still running: leased but not yet completed. Completed
+    // leases are retained for later verification, so they must not count toward
+    // the concurrency ceiling or recruitment would stall after the first wave.
+    const inFlight = [...record.leases.keys()].filter((id) => !record.completed.has(id)).length;
+    const decision = recruit({ runnable: openRunnable, inFlight, dial: record.dial });
+    return { ...decision, inFlight, dial: record.dial, runnable: openRunnable };
+  }
+
+  /** Append a recruitment event to the log (as the Worker does after a wave). */
+  recordRecruitment(changeId: string, event: Omit<RecruitmentEvent, "at">): RecruitmentEvent {
+    const record = this.require(changeId);
+    const stored: RecruitmentEvent = { ...event, at: new Date().toISOString() };
+    record.recruitments.push(stored);
+    return stored;
+  }
+
+  /**
+   * Ingest a repo-pushed event: the offline mirror of the DO's recordRepoPushed.
+   * It resolves the pushed workspace to its WorkUnit, marks that unit complete
+   * (idempotent), and computes the next recruitment plan under the dial. This is
+   * the identical event-driven code path the live Worker runs; offline it is
+   * driven by a faked event rather than a real queued one.
+   */
+  recordRepoPushed(changeId: string, workspaceName: string): RepoPushedResult {
+    const record = this.require(changeId);
+    const unitId = record.workspaceUnits.get(workspaceName);
+
+    let completedUnit: string | null = null;
+    if (unitId && record.change.work.some((u) => u.id === unitId)) {
+      // The push event names the unit it pertains to. Mark it complete if it is
+      // not already (a runner may have reported completion first); either way,
+      // this event is what drives recruitment of the next wave, so report the
+      // unit the push completed so the log names it.
+      record.completed.add(unitId);
+      record.leases.delete(unitId);
+      completedUnit = unitId;
+    }
+
+    const plan = this.planRecruitment(changeId);
+    const done = record.completed.size >= record.change.work.length && plan.recruit.length === 0;
+    const event: RecruitmentEvent = {
+      trigger: "repo-pushed",
+      pushedWorkspace: workspaceName,
+      completedUnit: completedUnit ?? undefined,
+      recruited: plan.recruit,
+      ceiling: plan.ceiling,
+      inFlightAfter: plan.inFlight + plan.recruit.length,
+      at: new Date().toISOString(),
+    };
+    return { completedUnit, recruited: plan.recruit, done, event };
   }
 
   /** The parsed Change held under an id. */
@@ -197,6 +311,7 @@ export class LocalChangeControl {
     const ref = await this.workspaces.create(workspaceName, { defaultBranch: "main" });
     const token = await this.workspaces.issueWriteToken(ref);
     record.leases.set(unitId, { unitId, ref, token });
+    record.workspaceUnits.set(ref.name, unitId);
     return json(
       {
         unitId,

@@ -186,8 +186,53 @@ complete. Every mutation is inside a `step.do` boundary, and the Durable Object
 advance is idempotent, so the loop is restartable and cannot double-advance on
 resume. The offline substrate drives the same graph through the same scheduling
 kernel (`driveWorkGraph` in `change-core`), so the live and offline paths cannot
-drift. Live agent recruitment and the morphing graph visualization build on this
-loop in later work.
+drift. Agent recruitment (below) builds on this loop; the morphing graph
+visualization builds on it in later work.
+
+## Evidence-governed recruitment and the concurrency dial
+
+The durable loop advances the graph; **recruitment** decides how many agents work
+it at once. Each wave, a recruiter spawns a runner for the currently-runnable
+WorkUnits, bounded by a **min/max concurrency dial** (`{ minConcurrency,
+maxConcurrency }`). Recruitment is a **policy over the runnable set and the dial**,
+not a hardcoded count and not one agent per named unit: the recruiter takes a
+bounded window over the runnable units sized by `maxConcurrency - inFlight`, so
+raising `maxConcurrency` widens how many run at once through the same code path
+(`recruit` in `change-core`). Both the live Worker and the offline substrate call
+that one function, so they cannot diverge on how the dial governs concurrency.
+Every recruited agent gets its **own** isolated workspace (its own Artifact repo)
+and its own short-lived scoped token.
+
+Waves are driven by an **event**, not a poll or a timer. When a runner finishes a
+WorkUnit it pushes to its own Artifact repo, which emits a **repo-pushed** event.
+That event is the trigger for the next recruitment wave: the live Worker consumes
+it from a Cloudflare Artifacts event subscription (a Queue consumer, see
+`apps/worker/src/index.ts`), and the offline substrate drives the identical
+downstream handler with a deterministic faked event through the
+`POST /events/repo-pushed` ingress, so `make check` stays deterministic while the
+live path uses the real queued event. The recruitment log records what triggered
+each wave (kickoff versus a repo-pushed event, and which workspace pushed), so the
+trigger is explicit and inspectable.
+
+```bash
+# Offline, deterministic: recruit under a dial, each wave after the first driven
+# by a repo-pushed event. Turn the dial with MIN/MAX and watch concurrency widen
+# through the same code path.
+make recruit MAX=2       # peak concurrency 2
+make recruit MAX=5       # peak concurrency 5, same engine, only the dial changed
+
+# Live: multiple agents concurrently hold distinct REAL Artifact repos and push.
+# Start the Worker first (make dev, with wrangler authenticated), then:
+make recruit-live MAX=3 WORKER=http://127.0.0.1:8787
+```
+
+The live `recruit-live` run creates a real Artifact repo per recruited agent,
+clones and pushes over Git HTTPS with each agent's scoped token, drives the next
+wave from the repo-pushed event, and deletes the real repos it created on the way
+out. A note on an open-beta rough edge: Artifacts repo deletion is eventually
+consistent, so the live driver gives each run a unique Change id to avoid
+recreating a just-deleted repo name; and `wrangler artifacts repos delete` is
+interactive, so pass `--force` when deleting from a script.
 
 ## Running against real Cloudflare Artifacts
 
