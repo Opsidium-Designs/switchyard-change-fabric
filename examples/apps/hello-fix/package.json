@@ -1,0 +1,16 @@
+{
+  "name": "switchyard-change-fabric-hello-fix",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Smallest real web app the Change Fabric morphs and deploys to a live Cloudflare Worker URL (de-risk example).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "delete": "wrangler delete --name switchyard-change-fabric-hello-fix"
+  },
+  "devDependencies": {
+    "wrangler": "^4.40.0"
+  }
+}

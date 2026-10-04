@@ -14,6 +14,8 @@
 #   make clean-live  tear down the real repos a watch run left up
 #   make seed-change seed the demo Change into a running Worker (for the console)
 #   make deploy    deploy the Worker to Cloudflare (wrangler deploy)
+#   make deploy-app APP=hello-fix  deploy an example web app to a live workers.dev URL
+#   make delete-app APP=hello-fix  tear that deployed example app down (stop billing)
 #   make infra-up      spin the hosted Cloudflare infra up (deploy + queue + subscription), idempotent
 #   make infra-status  read-only: what is live right now (am I paying for anything?)
 #   make infra-down    spin the hosted Cloudflare infra down (delete worker + queue + subscription + repos), idempotent
@@ -24,7 +26,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch demo-live clean-live seed-change deploy artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -236,6 +238,37 @@ infra-status:
 infra-down:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	bash tools/infra-down.sh
+
+# --- example web apps (deploy-to-live-URL de-risk) ---
+
+# Deploy one example web app under examples/apps/<APP> to a live Cloudflare
+# `workers.dev` URL and print the reachable URL. This is the deploy-to-live-URL
+# hop: a tiny real Worker goes from source to a clickable page in one command.
+# Authenticate first with a scoped CLOUDFLARE_API_TOKEN in a gitignored .env
+# (sourced below) or `wrangler login`. Tear it down with `make delete-app`.
+# See docs/LIVE-DEPLOY.md. Defaults to the hello-fix example.
+APP ?= hello-fix
+
+deploy-app:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	cd examples/apps/$(APP) && npx wrangler deploy
+
+# Tear the deployed example app down so it stops billing. It reads the worker
+# name from the app's wrangler.jsonc and deletes it over the Cloudflare REST API
+# using CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_API_TOKEN. This works with a scoped
+# deploy token (plain `wrangler delete` also tries to read account membership
+# roles, which a narrowly scoped token may lack). Idempotent: a worker that is
+# already gone is reported and treated as success. See docs/LIVE-DEPLOY.md.
+delete-app:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	name=$$(sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' examples/apps/$(APP)/wrangler.jsonc | head -1); \
+	echo "Deleting Worker $$name ..."; \
+	curl -sS -X DELETE \
+	  "https://api.cloudflare.com/client/v4/accounts/$$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$$name?force=true" \
+	  -H "Authorization: Bearer $$CLOUDFLARE_API_TOKEN" | \
+	  grep -qE '"success"[[:space:]]*:[[:space:]]*true|does not exist' \
+	  && echo "Teardown complete: $$name is not deployed." \
+	  || { echo "Teardown may have failed; check the account."; exit 1; }
 
 build:
 	npm run build
