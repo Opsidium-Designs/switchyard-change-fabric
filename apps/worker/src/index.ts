@@ -1,4 +1,5 @@
 import { parseChangeSpec } from "@switchyard-change/change-core";
+import type { DiscoveredWorkUnit } from "@switchyard-change/change-core";
 
 import type { EscalationKind, LeaseWorkspace, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
 import type { ChangeState } from "./change-state.ts";
@@ -434,6 +435,59 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
   }
 
+  // Append DISCOVERED follow-up WorkUnits a completing unit reported (dynamic
+  // branching). The runner POSTs the units an executor found while fixing its
+  // own unit; the DO admits them to the live WorkGraph as real backed units, so
+  // the next recruitment wave recruits them and the graph grows mid-run. This is
+  // a real state append, not a UI animation: the appended units are scoped,
+  // rooted under the discovering parent, and projected by the same graph model.
+  const discoveredMatch = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/discovered$/);
+  if (request.method === "POST" && discoveredMatch) {
+    const changeId = decodeURIComponent(discoveredMatch[1] ?? "");
+    const unitId = decodeURIComponent(discoveredMatch[2] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: DiscoveredBody;
+    try {
+      body = (await request.json()) as DiscoveredBody;
+    } catch {
+      return json({ error: "invalid discovered-units body" }, 400);
+    }
+    const units = Array.isArray(body.units) ? body.units : [];
+    try {
+      const added = await stub.addWorkUnits(unitId, units);
+      return json({ added }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Record the live deployment of the fixed app: the clickable workers.dev URL
+  // the run deployed as end-of-run proof the fix works. The run posts this only
+  // after verification passed and the deploy succeeded, so the console surfaces
+  // a real reachable URL, never one for a broken or undeployed app.
+  const deploymentMatch = url.pathname.match(/^\/changes\/([^/]+)\/deployment$/);
+  if (request.method === "POST" && deploymentMatch) {
+    const changeId = decodeURIComponent(deploymentMatch[1] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: DeploymentBody;
+    try {
+      body = (await request.json()) as DeploymentBody;
+    } catch {
+      return json({ error: "invalid deployment body" }, 400);
+    }
+    if (!body.url || !body.app) {
+      return json({ error: "deployment requires url and app" }, 400);
+    }
+    const deployment = await stub.recordDeployment({ url: body.url, app: body.app });
+    return json({ deployment }, 201);
+  }
+
   // Configure the min/max concurrency dial for a Change. The dial is the single
   // lever that governs how many agents recruitment runs at once.
   const dialMatch = url.pathname.match(/^\/changes\/([^/]+)\/dial$/);
@@ -752,6 +806,17 @@ interface CompleteBody {
 /** Body of POST /changes/:id/work/:unit/fail: an optional short failure reason. */
 interface FailBody {
   readonly reason?: string;
+}
+
+/** Body of POST /changes/:id/work/:unit/discovered: discovered follow-up units. */
+interface DiscoveredBody {
+  readonly units?: readonly DiscoveredWorkUnit[];
+}
+
+/** Body of POST /changes/:id/deployment: the live app deployment proof. */
+interface DeploymentBody {
+  readonly url?: string;
+  readonly app?: string;
 }
 
 /** Body of POST /changes/:id/dial. Accepts min/max under either spelling. */

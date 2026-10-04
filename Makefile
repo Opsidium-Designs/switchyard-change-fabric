@@ -246,7 +246,8 @@ infra-down:
 # hop: a tiny real Worker goes from source to a clickable page in one command.
 # Authenticate first with a scoped CLOUDFLARE_API_TOKEN in a gitignored .env
 # (sourced below) or `wrangler login`. Tear it down with `make delete-app`.
-# See docs/LIVE-DEPLOY.md. Defaults to the hello-fix example.
+# See docs/LIVE-DEPLOY.md. The example apps are: hello-fix, todo-api,
+# url-shortener, unit-converter, metrics-dashboard. Defaults to hello-fix.
 APP ?= hello-fix
 
 deploy-app:

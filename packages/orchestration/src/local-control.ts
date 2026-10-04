@@ -16,6 +16,7 @@
  */
 
 import {
+  appendDiscoveredUnits,
   buildWorkGraph,
   detectPathCollisions,
   normalizeDial,
@@ -27,6 +28,7 @@ import {
   type Change,
   type ConcurrencyDial,
   type Dependency,
+  type DiscoveredWorkUnit,
   type LeaseDecision,
   type PathCollision,
   type RecruitDecision,
@@ -145,6 +147,8 @@ export interface ChangeStateView {
    * the Worker's ChangeStateView so the console projects both identically.
    */
   readonly failed: readonly FailureRecord[];
+  /** The live deployment of the fixed app for this run (mirrors the Worker). */
+  readonly deployment?: DeploymentRecord;
 }
 
 /** A recorded WorkUnit failure (mirrors the Worker's FailureRecord). */
@@ -167,6 +171,13 @@ export interface ToolRecord {
 export interface ToolConsumption {
   readonly capability: string;
   readonly consumerUnitId: string;
+  readonly at: string;
+}
+
+/** A recorded live deployment of the fixed app (mirrors the Worker). */
+export interface DeploymentRecord {
+  readonly url: string;
+  readonly app: string;
   readonly at: string;
 }
 
@@ -237,13 +248,29 @@ class ChangeRecord {
   readonly completed = new Set<string>();
   readonly leases = new Map<string, LeaseRecord>();
   readonly costEvents: CostEvent[] = [];
-  readonly change: Change;
+  /**
+   * The Change this record coordinates. Mutable because dynamic branching
+   * appends DISCOVERED WorkUnits to the live graph: a completing unit can reveal
+   * follow-up work, which is admitted as real backed units via addWorkUnits,
+   * replacing this with an augmented Change whose `work` includes them. Every
+   * downstream read (runnable/waiting, recruitment, state projection) reads this
+   * field, so appended units are picked up with no other change.
+   */
+  change: Change;
   /** The min/max concurrency dial governing recruitment. */
   dial: ConcurrencyDial = normalizeDial(undefined);
   /** The inspectable recruitment-event log. */
   readonly recruitments: RecruitmentEvent[] = [];
   /** Backend workspace name -> unit id, so a repo-pushed event resolves a unit. */
   readonly workspaceUnits = new Map<string, string>();
+  /**
+   * Per-unit real workspace (Artifact repo) identity, recorded at lease time and
+   * KEPT past completion so a completed node still reveals the real repo it ran
+   * in. Mirrors the Worker DO's `workspaces` map; without it a completed unit
+   * (whose lease is released on the repo-pushed event) would lose its workspace
+   * and project back to a plain work node, diverging from the live Worker.
+   */
+  readonly workspaceIdentities = new Map<string, WorkspaceIdentity>();
   /** The agent-built tool recorded for this Change, when one was built. */
   tool: ToolRecord | null = null;
   /** Real tool-consumption records (downstream units that ran the tool). */
@@ -258,6 +285,8 @@ class ChangeRecord {
   readonly detail = new Map<string, UnitDetail>();
   /** Per-unit live model-output stream buffer (mirrors the DO's stream). */
   readonly stream = new Map<string, string>();
+  /** The live deployment of the fixed app recorded for this run (mirrors DO). */
+  deployment: DeploymentRecord | null = null;
   constructor(change: Change) {
     this.change = change;
   }
@@ -579,9 +608,57 @@ export class LocalChangeControl {
     return this.require(changeId).change;
   }
 
+  /**
+   * Append DISCOVERED follow-up WorkUnits to the live Change (the offline mirror
+   * of the DO's addWorkUnits). This is the dynamic-branching mechanism: a
+   * completing unit reported that fixing one thing revealed more work, so the
+   * engine adds those units to the live WorkGraph and the next wave recruits
+   * them. The append is validated by the shared change-core guard (parent must
+   * exist, each discovered unit must declare a path, each is rooted under the
+   * parent, ids are namespaced and unique). Already-present ids are treated as a
+   * no-op (an idempotent re-report), so a re-driven engine does not pile up
+   * duplicates. The augmented Change replaces the stored one; everything
+   * downstream reads change.work, so the new units are scheduled, recruited, and
+   * projected with no other change.
+   */
+  addWorkUnits(
+    changeId: string,
+    parentUnitId: string,
+    discovered: readonly DiscoveredWorkUnit[],
+  ): readonly string[] {
+    const record = this.require(changeId);
+    // Filter out any discovered unit whose namespaced id already exists, so a
+    // repeated report is an idempotent no-op rather than an error.
+    const existing = new Set(record.change.work.map((u) => u.id));
+    const fresh = discovered.filter(
+      (u) =>
+        !existing.has(
+          `${parentUnitId}+${u.idSuffix.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "found"}`,
+        ),
+    );
+    if (fresh.length === 0) {
+      return [];
+    }
+    const { change, added } = appendDiscoveredUnits(record.change, parentUnitId, fresh);
+    record.change = change;
+    return added.map((u) => u.id);
+  }
+
   /** The lease records held for a Change, keyed by WorkUnit id. */
   leases(changeId: string): ReadonlyMap<string, LeaseRecord> {
     return this.require(changeId).leases;
+  }
+
+  /**
+   * Record the live deployment of the fixed app (mirrors the DO). Recorded only
+   * after verification passed and the deploy succeeded, so the console surfaces
+   * a real reachable URL and never one for a broken or undeployed app.
+   */
+  recordDeployment(changeId: string, deployment: Omit<DeploymentRecord, "at">): DeploymentRecord {
+    const record = this.require(changeId);
+    const stored: DeploymentRecord = { ...deployment, at: new Date().toISOString() };
+    record.deployment = stored;
+    return stored;
   }
 
   /** The completed WorkUnit ids for a Change. */
@@ -618,7 +695,12 @@ export class LocalChangeControl {
       const base = statuses.get(unit.id) ?? "waiting";
       const leased = record.leases.has(unit.id);
       const lease = record.leases.get(unit.id);
-      const workspace: WorkspaceIdentity | undefined = lease
+      // Prefer the retained workspace identity (kept past completion) so a
+      // completed node still reveals its real repo, mirroring the Worker DO.
+      const retained = record.workspaceIdentities.get(unit.id);
+      const workspace: WorkspaceIdentity | undefined = retained
+        ? retained
+        : lease
         ? {
             workspaceId: lease.ref.id,
             workspaceName: lease.ref.name,
@@ -672,6 +754,7 @@ export class LocalChangeControl {
       failed: [...record.failed.values()].sort((a, b) =>
         a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0,
       ),
+      ...(record.deployment ? { deployment: record.deployment } : {}),
     };
   }
 
@@ -696,6 +779,17 @@ export class LocalChangeControl {
     if (method === "POST" && fail) {
       return this.handleFail(dec(fail[1]), dec(fail[2]), parseBody(init));
     }
+    const discovered = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/discovered$/);
+    if (method === "POST" && discovered) {
+      const b = parseBody(init);
+      const units = Array.isArray(b.units) ? (b.units as DiscoveredWorkUnit[]) : [];
+      try {
+        const added = this.addWorkUnits(dec(discovered[1]), dec(discovered[2]), units);
+        return json({ added }, 201);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
     const step = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/step$/);
     if (method === "POST" && step) {
       const b = parseBody(init);
@@ -717,6 +811,15 @@ export class LocalChangeControl {
       const chunk = typeof init?.body === "string" ? init.body : "";
       const length = this.appendStream(dec(streamPost[1]), dec(streamPost[2]), chunk);
       return json({ length }, 201);
+    }
+    const deploymentRoute = url.pathname.match(/^\/changes\/([^/]+)\/deployment$/);
+    if (method === "POST" && deploymentRoute) {
+      const b = parseBody(init);
+      const recorded = this.recordDeployment(dec(deploymentRoute[1]), {
+        url: String(b.url ?? ""),
+        app: String(b.app ?? ""),
+      });
+      return json({ deployment: recorded }, 201);
     }
     return json({ error: "not found" }, 404);
   };
@@ -741,6 +844,18 @@ export class LocalChangeControl {
     const token = await this.workspaces.issueWriteToken(ref);
     record.leases.set(unitId, { unitId, ref, token, leasedAt: new Date().toISOString() });
     record.workspaceUnits.set(ref.name, unitId);
+    // Keep the workspace identity past completion (mirrors the Worker DO) so a
+    // completed node still reveals the real repo it ran in.
+    record.workspaceIdentities.set(unitId, {
+      workspaceId: ref.id,
+      workspaceName: ref.name,
+      gitUrl: ref.gitUrl,
+      defaultBranch: ref.defaultBranch,
+      backend: ref.backend,
+      fallback: ref.fallback,
+      tokenId: token.id,
+      leasedAt: new Date().toISOString(),
+    });
     return json(
       {
         unitId,

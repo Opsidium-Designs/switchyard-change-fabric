@@ -1,0 +1,1 @@
+Guard and round the average in every metric handler

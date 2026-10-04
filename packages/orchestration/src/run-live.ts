@@ -174,7 +174,31 @@ export interface RunFullLiveResult {
   readonly sourceRepoDir: string;
   /** Workspace names the fabric archived (deleted) on cleanup. */
   readonly cleanedUp: readonly string[];
+  /**
+   * The live deployment of the fixed app, when this run deployed one as
+   * end-of-run proof. Present only when a deployer and app were supplied AND
+   * verification passed; absent otherwise (so a failed fix never reports a URL).
+   */
+  readonly deployment?: { readonly url: string; readonly app: string };
 }
+
+/**
+ * An injectable app deployer: given the app directory and name, deploy it to a
+ * live workers.dev URL and return the reachable URL. The live implementation
+ * runs `wrangler deploy` in the app directory (the M8.0 deploy hop); a test
+ * passes a deterministic fake so `make check` never touches the network. It is
+ * only ever called AFTER verification passed, so a broken fix is never deployed.
+ */
+export type DeployApp = (input: {
+  readonly appDir: string;
+  readonly appName: string;
+}) => Promise<{ readonly url: string }>;
+
+/** An injectable app teardown: delete the deployed app so it stops billing. */
+export type TeardownApp = (input: {
+  readonly appDir: string;
+  readonly appName: string;
+}) => Promise<void>;
 
 /** Options for a full live run. */
 export interface RunFullLiveOptions {
@@ -237,6 +261,22 @@ export interface RunFullLiveOptions {
   readonly fetchFn?: typeof fetch;
   /** Optional progress sink for human-readable console output. */
   readonly onEvent?: (event: FullLiveEvent) => void;
+  /**
+   * For a real-app run, the app directory (under examples/apps) and its name.
+   * When both are set and verification passed, the run deploys the fixed app to
+   * a live workers.dev URL as end-of-run proof, records that URL on the Change
+   * state (so the console surfaces a clickable link), and (unless skipCleanup)
+   * tears it down on cleanup so repeated runs never leak a billable Worker.
+   */
+  readonly deployAppDir?: string;
+  readonly deployAppName?: string;
+  /**
+   * The injectable deployer and teardown. The live path runs wrangler; a test
+   * passes deterministic fakes so `make check` stays offline. The deployer is
+   * only called when verification passed, so a broken fix is never deployed.
+   */
+  readonly deployApp?: DeployApp;
+  readonly teardownApp?: TeardownApp;
 }
 
 /** A progress event emitted during a full live run. */
@@ -245,10 +285,13 @@ export type FullLiveEvent =
   | { readonly kind: "tool-built"; readonly tool: ToolBuildResult }
   | { readonly kind: "wave"; readonly wave: LiveWave }
   | { readonly kind: "agent-failed"; readonly unitId: string; readonly reason: string }
+  | { readonly kind: "discovered"; readonly unitId: string; readonly added: readonly string[] }
   | { readonly kind: "escalation-raised"; readonly escalation: Escalation }
   | { readonly kind: "escalation-resolved"; readonly escalation: Escalation }
   | { readonly kind: "verifying" }
   | { readonly kind: "promoting"; readonly branch: string }
+  | { readonly kind: "deployed"; readonly url: string; readonly app: string }
+  | { readonly kind: "deploy-skipped"; readonly reason: string }
   | { readonly kind: "cleaned-up"; readonly archived: readonly string[] };
 
 /**
@@ -376,6 +419,34 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
         reportStep(agent.unitId, "no-change", "the executor produced no change to push");
       }
       reportStep(agent.unitId, "pushed", "work pushed; awaiting verification");
+      // Dynamic branching: if the executor DISCOVERED follow-up work while
+      // fixing this unit (more files/call sites needing the same fix), report it
+      // to the control plane so those units are appended to the live WorkGraph
+      // as real backed units BEFORE the next wave is driven from this push. The
+      // repo-pushed event below then recomputes the runnable set over the grown
+      // graph and recruits the freshly-added units, so the graph grows mid-run.
+      // This is a real state append (scoped, rooted under this unit), not a UI
+      // animation; a feedback/append failure never fails the agent's own result.
+      if (result.discoveredUnits && result.discoveredUnits.length > 0) {
+        try {
+          const outcome = await post(
+            `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(agent.unitId)}/discovered`,
+            { units: result.discoveredUnits },
+          );
+          const added = (outcome.added as string[] | undefined) ?? [];
+          if (added.length > 0) {
+            reportStep(
+              agent.unitId,
+              "discovered",
+              `discovered ${added.length} follow-up unit(s): ${added.join(", ")}`,
+            );
+            emit({ kind: "discovered", unitId: agent.unitId, added });
+          }
+        } catch {
+          // Best-effort: a control plane that does not know the discovered route
+          // still runs the rest of the chain; the agent's own push is unaffected.
+        }
+      }
       if (!agent.fallback) {
         anyLive = true;
       }
@@ -552,8 +623,14 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   // deterministically, then integrate the verified work. Ground truth is
   // mechanical; the model never grades its own work.
   emit({ kind: "verifying" });
+  // Read the live state so the Change we verify/integrate includes any units
+  // DISCOVERED mid-run (dynamic branching appended them to the Worker's state,
+  // not to options.change). The effective Change's work set is the state's work
+  // set, so discovered units are verified and integrated like declared ones.
+  const grownState = await getJson(`/changes/${encodeURIComponent(changeId)}`);
+  const effectiveChange = effectiveChangeFromState(options.change, grownState);
   const completedInputs: CompletedWorkUnit[] = [];
-  for (const unit of options.change.work) {
+  for (const unit of effectiveChange.work) {
     const gitUrl = unitWorkspaceGitUrls.get(unit.id);
     if (!gitUrl) {
       continue;
@@ -561,7 +638,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     // Use the authenticated remote so verification can clone the real Artifacts
     // repo over HTTPS with the scoped token (a file:// fallback ignores it).
     const authRemote = unitAuthRemotes.get(unit.id) ?? gitUrl;
-    completedInputs.push({ unitId: unit.id, gitUrl: authRemote, baselineRef: options.change.baseline });
+    completedInputs.push({ unitId: unit.id, gitUrl: authRemote, baselineRef: effectiveChange.baseline });
   }
 
   // The integration workspace is a disposable local bare repo seeded from the
@@ -572,7 +649,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
 
   const verification = new ChangeVerification(integrationProvider);
   const evidence = await verification.verifyAndIntegrate({
-    change: options.change,
+    change: effectiveChange,
     completed: completedInputs,
     integrationRef,
     integrationToken,
@@ -584,7 +661,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   // so a completed node's log ends with the honest, deterministic outcome (the
   // model never grades its own work; this is the verifier's verdict).
   const integratedSet = new Set(evidence.integration.integratedUnits);
-  for (const unit of options.change.work) {
+  for (const unit of effectiveChange.work) {
     if (!unitWorkspaceGitUrls.has(unit.id)) {
       continue;
     }
@@ -611,6 +688,47 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     { repoDir: sourceRepoDir, startPoint, identity },
   );
 
+  // 6b. Live-URL proof: deploy the fixed app to a live workers.dev URL as the
+  // end-of-run proof the fix works, but ONLY when verification passed. A failed
+  // fix is never deployed; the run shows the failure honestly instead. The
+  // deployer is injectable (wrangler live, a fake in tests), so this is a real
+  // step live and deterministic offline. The URL is recorded on the Change state
+  // so the console surfaces a clickable link, and the app is torn down on cleanup
+  // (unless watch mode) so repeated runs never leak a billable Worker.
+  let deployment: { url: string; app: string } | undefined;
+  if (options.deployAppDir && options.deployAppName && options.deployApp) {
+    const verdict = evidence.integration.verdict;
+    const integratedCount = evidence.integration.integratedUnits.length;
+    // Deploy only when verification verified AND at least one unit was actually
+    // integrated (a real fix landed). A run where nothing integrated has no fix
+    // to prove, so it is not deployed even though an empty integration verifies
+    // vacuously; a failed fix is shown honestly, never deployed as fake-green.
+    if (verdict !== "verified" || integratedCount === 0) {
+      emit({
+        kind: "deploy-skipped",
+        reason:
+          verdict !== "verified"
+            ? `verification verdict was "${verdict}", not "verified": not deploying a broken app`
+            : "no unit was integrated (no fix landed): not deploying",
+      });
+    } else {
+      try {
+        const { url } = await options.deployApp({
+          appDir: options.deployAppDir,
+          appName: options.deployAppName,
+        });
+        deployment = { url, app: options.deployAppName };
+        await post(`/changes/${encodeURIComponent(changeId)}/deployment`, {
+          url,
+          app: options.deployAppName,
+        }).catch(() => {});
+        emit({ kind: "deployed", url, app: options.deployAppName });
+      } catch (error) {
+        emit({ kind: "deploy-skipped", reason: `deploy failed: ${failureReason(error)}` });
+      }
+    }
+  }
+
   // 7. Clean up the real Artifact repos the run created (and the local
   // integration repo). Only now, after the whole chain ran against them. In
   // watch mode (skipCleanup) this final step is skipped so a human can watch the
@@ -623,6 +741,14 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     : await cleanup(base, fetchFn, [...allWorkspaces]);
   if (!options.skipCleanup) {
     await integrationProvider.archive(integrationRef).catch(() => {});
+    // Tear the deployed app down too, so a real-app run never leaves a billable
+    // Worker behind. Watch mode leaves it up for inspection; the per-run cleanup
+    // (console teardown / cleanup-live) removes it later via the same hook.
+    if (deployment && options.deployAppDir && options.deployAppName && options.teardownApp) {
+      await options
+        .teardownApp({ appDir: options.deployAppDir, appName: options.deployAppName })
+        .catch(() => {});
+    }
   }
   emit({ kind: "cleaned-up", archived: cleanedUp });
 
@@ -645,6 +771,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     sourceRepoDir,
     cleanedUp,
     ...(tool ? { tool } : {}),
+    ...(deployment ? { deployment } : {}),
   };
 }
 
@@ -984,6 +1111,8 @@ export interface CleanupLiveResult {
   readonly workspaces: readonly string[];
   /** The workspace names actually archived (deleted). */
   readonly archived: readonly string[];
+  /** The app name torn down (its deployed Worker deleted), when one was. */
+  readonly appTornDown?: string;
 }
 
 /**
@@ -992,11 +1121,15 @@ export interface CleanupLiveResult {
  * archives each through the Worker's archive path. This is the human-triggered
  * cleanup the `--watch` / `--no-cleanup` run defers to, so a watcher can study
  * the finished graph in the console first and then remove the repos on demand.
+ * When the run recorded a live app deployment and a teardown is supplied, it also
+ * tears the deployed app down so a real-app run never leaves a billable Worker.
  */
 export async function cleanupLive(options: {
   readonly changeId: string;
   readonly workerUrl: string;
   readonly fetchFn?: typeof fetch;
+  /** Injectable app teardown; when the run recorded a deployment, it is called. */
+  readonly teardownApp?: TeardownApp;
 }): Promise<CleanupLiveResult> {
   const fetchFn = options.fetchFn ?? fetch;
   const base = options.workerUrl.replace(/\/$/, "");
@@ -1008,13 +1141,33 @@ export async function cleanupLive(options: {
   }
   const state = (safeJson(await res.text()) as {
     work?: ReadonlyArray<{ workspace?: { workspaceName?: string } }>;
+    deployment?: { url?: string; app?: string };
   });
   const workspaces = (state.work ?? [])
     .map((u) => u.workspace?.workspaceName)
     .filter((n): n is string => typeof n === "string" && n !== "")
     .sort();
   const archived = await cleanup(base, fetchFn, workspaces);
-  return { changeId: options.changeId, workerUrl: base, workspaces, archived };
+  // Tear down the deployed app too, when the run recorded one and a teardown was
+  // supplied. The app name maps to examples/apps/<app>; a worker already gone is
+  // a safe no-op.
+  let appTornDown: string | undefined;
+  const app = state.deployment?.app;
+  if (app && options.teardownApp) {
+    try {
+      await options.teardownApp({ appDir: app, appName: `switchyard-change-fabric-${app}` });
+      appTornDown = app;
+    } catch {
+      // Best-effort: the Makefile delete-app is the authoritative teardown path.
+    }
+  }
+  return {
+    changeId: options.changeId,
+    workerUrl: base,
+    workspaces,
+    archived,
+    ...(appTornDown ? { appTornDown } : {}),
+  };
 }
 
 /**
@@ -1039,6 +1192,37 @@ function safeJson(text: string): unknown {
   } catch {
     return {};
   }
+}
+
+/**
+ * Build the effective Change to verify, integrate, and promote from the live
+ * Worker state. Dynamic branching appends DISCOVERED units to the Worker's state
+ * (not to the in-memory options.change), so the state's work set is the grown
+ * graph. This reconstructs a Change whose `work` is that grown set (keeping the
+ * original id/objective/baseline/budget/assurance), so verification and
+ * integration cover the discovered units exactly like the declared ones. When
+ * the state carries no work (an unexpected read failure), it falls back to the
+ * original Change rather than dropping the whole run.
+ */
+function effectiveChangeFromState(original: Change, state: Record<string, unknown>): Change {
+  const rawWork = state.work as
+    | ReadonlyArray<{
+        id?: string;
+        objective?: string;
+        dependsOn?: readonly string[];
+        paths?: readonly string[];
+      }>
+    | undefined;
+  if (!Array.isArray(rawWork) || rawWork.length === 0) {
+    return original;
+  }
+  const work = rawWork.map((u) => ({
+    id: String(u.id ?? ""),
+    objective: String(u.objective ?? ""),
+    dependsOn: Array.isArray(u.dependsOn) ? u.dependsOn.map((d: unknown) => String(d)) : [],
+    paths: Array.isArray(u.paths) ? u.paths.map((p: unknown) => String(p)) : [],
+  }));
+  return { ...original, work };
 }
 
 /**

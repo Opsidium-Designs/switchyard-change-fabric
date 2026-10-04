@@ -695,6 +695,41 @@ body {
   margin: 0;
 }
 
+/* "What this does" / "What this run solves" detail lists on cards and the run
+   header, so the human-readable description is visible before and during a run. */
+.template-detail,
+.run-header-detail {
+  margin: 0.4rem 0 0;
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.template-detail dt,
+.run-header-detail dt {
+  font-weight: 600;
+  color: var(--accent);
+  margin-top: 0.4rem;
+}
+
+.template-detail dd,
+.run-header-detail dd {
+  margin: 0.1rem 0 0;
+  color: var(--text);
+}
+
+/* The end-of-run live-URL proof link. */
+.deploy-proof {
+  margin: 0.3rem 0;
+  font-size: 0.9rem;
+  width: 100%;
+}
+
+.deploy-proof a {
+  color: var(--accent);
+  font-weight: 600;
+  word-break: break-all;
+}
+
 .template-card button {
   margin-top: 0.4rem;
   padding: 0.45rem 0.9rem;

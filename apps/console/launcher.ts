@@ -86,6 +86,21 @@ function runLiveArgs(template: Template, changeId: string): string[] {
   }
   args.push("--project", resolve(REPO_ROOT, template.projectDir));
   args.push("--worker", WORKER_URL);
+  // A dynamic-branching template carries a discovery marker: pass it so a
+  // completing unit discovers follow-up work carrying that marker in the target
+  // repo, growing the live WorkGraph. The marker is a generic repo fact, not a
+  // per-template script, so discovery stays goal-agnostic.
+  if (template.discoverMarker) {
+    args.push("--discover-marker", template.discoverMarker);
+    args.push("--discover-project", resolve(REPO_ROOT, template.projectDir));
+  }
+  // A real-app template carries an app under examples/apps: pass it so a verified
+  // run deploys the fixed app to a live workers.dev URL as end-of-run proof and
+  // tears it down on cleanup.
+  if (template.app) {
+    args.push("--deploy-app", resolve(REPO_ROOT, "examples/apps", template.app));
+    args.push("--deploy-app-name", `switchyard-change-fabric-${template.app}`);
+  }
   // Give the run the fresh unique id the UI will follow, and leave the repos in
   // place at the end (watch) so the finished graph can be studied before the
   // human triggers per-run cleanup from the UI.

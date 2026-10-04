@@ -1,0 +1,16 @@
+{
+  "name": "switchyard-change-fabric-metrics-dashboard",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A tiny metrics endpoint Worker with a planted raw-average bug across sibling metric handlers (dynamic-branching example).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "delete": "wrangler delete --name switchyard-change-fabric-metrics-dashboard"
+  },
+  "devDependencies": {
+    "wrangler": "^4.40.0"
+  }
+}

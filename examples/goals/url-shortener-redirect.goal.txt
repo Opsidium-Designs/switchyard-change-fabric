@@ -1,0 +1,1 @@
+Fix the short link redirect to return a real redirect status

@@ -331,12 +331,29 @@ export function App() {
                     : ` - the run exited (code ${launchStatus.exitCode ?? "?"})`
                 : ""}
             </p>
+            {activeTemplate ? (
+              <dl className="run-header-detail">
+                <dt>What this does</dt>
+                <dd>{activeTemplate.whatItDoes}</dd>
+                <dt>What this run solves</dt>
+                <dd>{activeTemplate.problemItSolves}</dd>
+              </dl>
+            ) : null}
+            {snapshot?.deployment ? (
+              <p className="deploy-proof">
+                Live proof the fix works:{" "}
+                <a href={snapshot.deployment.url} target="_blank" rel="noreferrer">
+                  {snapshot.deployment.url}
+                </a>{" "}
+                <span className="muted">(deployed {snapshot.deployment.app}; torn down on cleanup)</span>
+              </p>
+            ) : null}
             <button
               type="button"
               className="secondary"
               onClick={() => void cleanupRun()}
               disabled={busy}
-              title="Delete this run's real Artifact repos (scoped to its unique id)"
+              title="Delete this run's real Artifact repos and the deployed app (scoped to its unique id)"
             >
               Tear down this run&apos;s repos
             </button>
@@ -351,46 +368,59 @@ export function App() {
         {notice ? <p className="notice">{notice}</p> : null}
       </section>
 
-      {snapshot ? (
-        <section className="app-panel dial-panel" aria-label="Concurrency dial">
-          <h2>Concurrency dial</h2>
+      {/*
+        The concurrency dial is ALWAYS part of the run surface, not gated behind
+        a launched run. Before a run it shows the min/max you can set and reads
+        as the pre-run default; "Apply dial" is only active once a run exists,
+        since the dial applies to a live Change. During a run its values sync
+        from the real reported dial and "Apply dial" POSTs the live config.
+      */}
+      <section className="app-panel dial-panel" aria-label="Concurrency dial">
+        <h2>Concurrency dial</h2>
+        <p className="muted">
+          The min/max dial is the real recruitment config. Raise max to widen
+          how many agent nodes run at once, by the same engine mechanism.
+          {changeId ? "" : " Pick a template to launch a run, then apply it live."}
+        </p>
+        <div className="dial-row">
+          <label htmlFor="dial-min">min</label>
+          <input
+            id="dial-min"
+            type="range"
+            min={0}
+            max={8}
+            value={min}
+            onChange={(event) => setMin(Number(event.target.value))}
+          />
+          <span className="dial-value">{min}</span>
+          <label htmlFor="dial-max">max</label>
+          <input
+            id="dial-max"
+            type="range"
+            min={1}
+            max={8}
+            value={max}
+            onChange={(event) => setMax(Number(event.target.value))}
+          />
+          <span className="dial-value">{max}</span>
+          <button
+            type="button"
+            onClick={() => void applyDial()}
+            disabled={busy || !changeId}
+            title={changeId ? "Apply this dial to the live run" : "Launch a run to apply the dial live"}
+          >
+            Apply dial
+          </button>
+        </div>
+        {reportedDial ? (
           <p className="muted">
-            The min/max dial is the real recruitment config. Raise max to widen
-            how many agent nodes run at once, by the same engine mechanism.
+            in force now: min {reportedDial.minConcurrency}, max{" "}
+            {reportedDial.maxConcurrency}
           </p>
-          <div className="dial-row">
-            <label htmlFor="dial-min">min</label>
-            <input
-              id="dial-min"
-              type="range"
-              min={0}
-              max={8}
-              value={min}
-              onChange={(event) => setMin(Number(event.target.value))}
-            />
-            <span className="dial-value">{min}</span>
-            <label htmlFor="dial-max">max</label>
-            <input
-              id="dial-max"
-              type="range"
-              min={1}
-              max={8}
-              value={max}
-              onChange={(event) => setMax(Number(event.target.value))}
-            />
-            <span className="dial-value">{max}</span>
-            <button type="button" onClick={() => void applyDial()} disabled={busy}>
-              Apply dial
-            </button>
-          </div>
-          {reportedDial ? (
-            <p className="muted">
-              in force now: min {reportedDial.minConcurrency}, max{" "}
-              {reportedDial.maxConcurrency}
-            </p>
-          ) : null}
-        </section>
-      ) : null}
+        ) : (
+          <p className="muted">no run yet: this is the dial you will apply once one is launched</p>
+        )}
+      </section>
 
       {backingError ? (
         <section className="app-panel" aria-label="Honesty guard">
@@ -476,6 +506,12 @@ function TemplateGallery({
               </span>
             </div>
             <p className="template-desc">{template.description}</p>
+            <dl className="template-detail">
+              <dt>What this does</dt>
+              <dd>{template.whatItDoes}</dd>
+              <dt>What this run solves</dt>
+              <dd>{template.problemItSolves}</dd>
+            </dl>
             <p className="muted template-count">{template.agentCountHint}</p>
             <button
               type="button"

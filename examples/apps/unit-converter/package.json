@@ -1,0 +1,16 @@
+{
+  "name": "switchyard-change-fabric-unit-converter",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A one-page Celsius/Fahrenheit converter Worker with a planted wrong-formula bug (missing +32 offset).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "delete": "wrangler delete --name switchyard-change-fabric-unit-converter"
+  },
+  "devDependencies": {
+    "wrangler": "^4.40.0"
+  }
+}

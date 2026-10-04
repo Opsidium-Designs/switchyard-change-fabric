@@ -198,6 +198,17 @@ export interface DialSnapshot {
 }
 
 /**
+ * A recorded live deployment of the fixed app, as reported by the state: the
+ * clickable workers.dev URL the run deployed as end-of-run proof the fix works,
+ * recorded only after verification passed. Surfaced by the console as a link.
+ */
+export interface DeploymentSnapshot {
+  readonly url: string;
+  readonly app: string;
+  readonly at?: string;
+}
+
+/**
  * A recorded human escalation, as reported by the state. A pending escalation
  * is a fork mechanical evidence could not settle: it lights the `escalated`
  * flag on its node (a unit-scoped escalation on that unit's node, a
@@ -253,6 +264,12 @@ export interface ChangeStateSnapshot {
    * reserved flag in the graph model.
    */
   readonly escalations?: readonly EscalationSnapshot[];
+  /**
+   * The live deployment of the fixed app for this run, when the run deployed one
+   * as end-of-run proof (a real-app template). The console surfaces it as a
+   * clickable workers.dev link. Absent for the intro template or a failed fix.
+   */
+  readonly deployment?: DeploymentSnapshot;
 }
 
 /** The kind of a node in the rendered graph. */

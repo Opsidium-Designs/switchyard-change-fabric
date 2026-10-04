@@ -10,6 +10,7 @@
  */
 
 export type {
+  DiscoveredUnit,
   ExecutionCost,
   ExecutionResult,
   ExecutionStatus,
@@ -22,6 +23,9 @@ export { NoopExecutor } from "./noop.ts";
 
 export type { ScopedNoopExecutorOptions } from "./scoped-noop.ts";
 export { ScopedNoopExecutor } from "./scoped-noop.ts";
+
+export type { DiscoveringExecutorOptions } from "./discovering.ts";
+export { DiscoveringExecutor } from "./discovering.ts";
 
 export type {
   ChatFn,

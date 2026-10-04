@@ -1,0 +1,16 @@
+{
+  "name": "switchyard-change-fabric-url-shortener",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A tiny URL shortener Worker with a planted non-redirect bug (returns 200 instead of 302).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "delete": "wrangler delete --name switchyard-change-fabric-url-shortener"
+  },
+  "devDependencies": {
+    "wrangler": "^4.40.0"
+  }
+}

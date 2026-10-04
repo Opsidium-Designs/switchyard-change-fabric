@@ -53,6 +53,35 @@ export interface ExecutionCost {
   readonly model?: string;
 }
 
+/**
+ * A newly DISCOVERED unit of work an executor found while completing its own
+ * WorkUnit: fixing one thing revealed more work (for example the agent fixing a
+ * bug finds the same fix is needed in other files or call sites). It is a
+ * genuine finding derived from the real worktree, not a scripted step: the
+ * executor only reports a discovered unit it actually found in the repo it is
+ * editing. The runner feeds these to the control plane, which appends them to
+ * the live WorkGraph as real, backed WorkUnits so the graph grows mid-run.
+ *
+ * Discovery is goal-agnostic: the executor derives it from the work it did and
+ * the repo it saw, never from a per-template table. Each discovered unit must
+ * declare at least one real path it will touch so the appended unit is scoped
+ * and backed exactly like a declared one.
+ */
+export interface DiscoveredUnit {
+  /**
+   * A short id suffix for the discovered unit, unique among the siblings this
+   * run discovered. The control plane roots it under the discovering parent and
+   * namespaces it, so this need only be locally unique (e.g. a file label).
+   */
+  readonly idSuffix: string;
+  /** What the discovered unit is for (becomes the WorkUnit objective). */
+  readonly objective: string;
+  /** The repo-relative path globs the discovered unit will touch (its scope). */
+  readonly paths: readonly string[];
+  /** A short, human-readable reason this follow-up work was discovered. */
+  readonly reason: string;
+}
+
 /** The result of an executor run inside a worktree. */
 export interface ExecutionResult {
   readonly status: ExecutionStatus;
@@ -64,6 +93,18 @@ export interface ExecutionResult {
   readonly cost: ExecutionCost;
   /** A suggested commit message describing the change. */
   readonly commitMessage: string;
+  /**
+   * Follow-up WorkUnits the executor DISCOVERED while doing this unit's work:
+   * fixing one thing revealed more work it found in the real worktree. Optional
+   * and usually empty; when present, the runner reports them to the control
+   * plane, which appends them to the live WorkGraph as real backed units so the
+   * graph grows mid-run and the new units get recruited in later waves. A
+   * deterministic executor can report a fixed, repo-derived set so the growth is
+   * reproducible offline; an inference executor can report what it genuinely
+   * found. Either way the units are real (scoped, backed, scheduled), never a UI
+   * animation.
+   */
+  readonly discoveredUnits?: readonly DiscoveredUnit[];
 }
 
 /**

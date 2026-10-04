@@ -37,8 +37,11 @@ import {
   selectExecutor,
   type Change,
   type ConcurrencyDial,
+  type DeployApp,
   type Escalation,
+  type TeardownApp,
 } from "@switchyard-change/orchestration";
+import { DiscoveringExecutor } from "@switchyard-change/model-adapters";
 
 const CLI_NAME = "switchyard-change";
 const VERSION = "0.0.0";
@@ -378,13 +381,49 @@ const commands: Command[] = [
       console.log(`  executor: ${selected.description}`);
       console.log("");
 
+      // Dynamic branching: when a discovery marker is supplied, wrap the chosen
+      // executor so a completing unit reports follow-up work it finds carrying
+      // that marker in the target repo, which the engine appends to the live
+      // WorkGraph (the graph grows mid-run). The marker is a generic repo fact,
+      // not a per-template script, so discovery stays goal-agnostic. The project
+      // the fix targets is scanned for the marker; it defaults to --project.
+      const discoverMarker = optionValue(args, "--discover-marker");
+      const discoverProject = optionValue(args, "--discover-project") ?? projectDir;
+      const executor = discoverMarker
+        ? new DiscoveringExecutor(selected.executor, {
+            marker: discoverMarker,
+            projectDir: resolve(discoverProject),
+          })
+        : selected.executor;
+
+      // Live-URL proof: when a deploy app is supplied, deploy the fixed app to a
+      // live workers.dev URL at the end of a verified run (reusing the M8.0
+      // deploy hop: `wrangler deploy` in the app dir), surface the URL, and tear
+      // it down on cleanup. The deploy is a REAL step; a failed fix is never
+      // deployed. Offline/in tests the deployer is injected, so make check never
+      // touches the network. On a live CLI run this uses wrangler directly.
+      const deployAppDir = optionValue(args, "--deploy-app");
+      const deployAppName = optionValue(args, "--deploy-app-name");
+      const deployApp: DeployApp | undefined = deployAppDir
+        ? async ({ appDir }) => ({ url: await wranglerDeploy(appDir) })
+        : undefined;
+      const teardownApp: TeardownApp | undefined = deployAppDir
+        ? async ({ appDir }) => {
+            await wranglerDelete(appDir);
+          }
+        : undefined;
+
       const result = await runFullLive({
         change: liveChange,
         dial,
         workerUrl,
         specYaml: changeToSpecYaml(liveChange),
         projectDir,
-        executor: selected.executor,
+        executor,
+        ...(deployAppDir ? { deployAppDir: resolve(deployAppDir) } : {}),
+        ...(deployAppName ? { deployAppName } : {}),
+        ...(deployApp ? { deployApp } : {}),
+        ...(teardownApp ? { teardownApp } : {}),
         // Block on the browser answer when --await-escalation is set; otherwise
         // auto-answer non-interactively through the CLI resolver.
         ...(awaitEscalation
@@ -422,6 +461,18 @@ const commands: Command[] = [
               break;
             case "promoting":
               console.log(`Promoting to local Git branch ${event.branch}...`);
+              break;
+            case "discovered":
+              console.log(
+                `Discovered ${event.added.length} follow-up unit(s) from ${event.unitId}: ` +
+                  `${event.added.join(", ")} (the graph grew)`,
+              );
+              break;
+            case "deployed":
+              console.log(`Deployed the fixed app ${event.app} to a live URL: ${event.url}`);
+              break;
+            case "deploy-skipped":
+              console.log(`Deploy skipped: ${event.reason}`);
               break;
             case "cleaned-up":
               console.log(`Cleaned up ${event.archived.length} real Artifact repo(s).`);
@@ -462,6 +513,9 @@ const commands: Command[] = [
         console.log("  promoted: nothing to promote (no changes)");
       }
       console.log(`  cleaned up repos: ${result.cleanedUp.join(", ") || "(none)"}`);
+      if (result.deployment) {
+        console.log(`  live proof URL: ${result.deployment.url} (app ${result.deployment.app})`);
+      }
       if (watch) {
         console.log("");
         console.log("Watch mode: the real Artifact repos and Change state are LEFT in place.");
@@ -485,10 +539,22 @@ const commands: Command[] = [
         return 1;
       }
       const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
-      const result = await cleanupLive({ changeId, workerUrl });
+      // Tear down the deployed app too (when the run recorded one), by deleting
+      // its Worker with wrangler in examples/apps/<app>. The app dir is resolved
+      // from the repo root relative to this CLI file.
+      const teardownApp: TeardownApp = async ({ appDir }) => {
+        const { fileURLToPath } = await import("node:url");
+        const here = dirname(fileURLToPath(import.meta.url));
+        const repoRoot = resolve(here, "..", "..", "..");
+        await wranglerDelete(resolve(repoRoot, "examples/apps", appDir));
+      };
+      const result = await cleanupLive({ changeId, workerUrl, teardownApp });
       console.log(`Cleaning up Change ${result.changeId} on ${result.workerUrl}`);
       console.log(`  recorded repos: ${result.workspaces.join(", ") || "(none)"}`);
       console.log(`  archived repos: ${result.archived.join(", ") || "(none)"}`);
+      if (result.appTornDown) {
+        console.log(`  torn down app: ${result.appTornDown}`);
+      }
       // A clean teardown archived every recorded repo.
       return result.archived.length === result.workspaces.length ? 0 : 1;
     },
@@ -617,6 +683,48 @@ function isOptionValue(args: readonly string[], value: string): boolean {
   return prev.startsWith("--");
 }
 
+/**
+ * Deploy an example app to a live workers.dev URL by running `wrangler deploy`
+ * in the app directory (the M8.0 deploy hop), and return the reachable URL
+ * wrangler prints. This is the real live-URL step; offline runs and tests inject
+ * a fake deployer instead, so `make check` never calls the network. The scoped
+ * Cloudflare token is read by wrangler from the already-sourced environment; this
+ * never reads, prints, or forwards it.
+ */
+async function wranglerDeploy(appDir: string): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  const { stdout, stderr } = await run("npx", ["wrangler", "deploy"], {
+    cwd: appDir,
+    env: process.env,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  const text = `${stdout}\n${stderr}`;
+  const match = text.match(/https:\/\/[^\s]+\.workers\.dev[^\s]*/);
+  if (!match) {
+    throw new Error("wrangler deploy did not print a workers.dev URL");
+  }
+  return match[0];
+}
+
+/**
+ * Tear a deployed example app down with `wrangler delete` in the app directory,
+ * so a real-app run never leaves a billable Worker behind. Best-effort: a worker
+ * already gone is not an error.
+ */
+async function wranglerDelete(appDir: string): Promise<void> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  await run("npx", ["wrangler", "delete"], {
+    cwd: appDir,
+    env: process.env,
+    maxBuffer: 4 * 1024 * 1024,
+  }).catch(() => {
+    /* best-effort teardown; the Makefile delete-app is the authoritative path */
+  });
+}
 async function main(argv: string[]): Promise<number> {
   const args = argv.slice(2);
 

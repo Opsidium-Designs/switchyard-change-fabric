@@ -21,6 +21,7 @@
 export type {
   ChangeStateView,
   CostEvent,
+  DeploymentRecord,
   Escalation,
   EscalationKind,
   EscalationStatus,
@@ -58,12 +59,14 @@ export { runRecruitmentLive } from "./recruit-live.ts";
 
 export type {
   CleanupLiveResult,
+  DeployApp,
   EscalationReport,
   EscalationResolution,
   EscalationResolver,
   FullLiveEvent,
   RunFullLiveOptions,
   RunFullLiveResult,
+  TeardownApp,
 } from "./run-live.ts";
 export { cleanupLive, runFullLive } from "./run-live.ts";
 
@@ -107,6 +110,7 @@ export type {
   ChangeStateSnapshot,
   CostEventSnapshot,
   DependencySnapshot,
+  DeploymentSnapshot,
   DialSnapshot,
   EdgeBacking,
   EscalationSnapshot,

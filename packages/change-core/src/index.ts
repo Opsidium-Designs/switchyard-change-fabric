@@ -74,3 +74,6 @@ export {
   detectToolRequirement,
   toolUnitId,
 } from "./toolneed.ts";
+
+export type { AppendResult, DiscoveredWorkUnit } from "./discover.ts";
+export { appendDiscoveredUnits, discoveredUnitId, DiscoverError } from "./discover.ts";

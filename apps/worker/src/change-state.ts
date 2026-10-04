@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 import {
+  appendDiscoveredUnits,
   buildWorkGraph,
   detectPathCollisions,
   normalizeDial,
@@ -12,6 +13,7 @@ import {
   type Change,
   type ConcurrencyDial,
   type Dependency,
+  type DiscoveredWorkUnit,
   type LeaseDecision,
   type LeasePlan,
   type PathCollision,
@@ -150,6 +152,21 @@ export interface ToolConsumption {
 }
 
 /**
+ * A recorded LIVE DEPLOYMENT of the fixed app: the clickable workers.dev URL the
+ * run deployed as end-of-run proof the fix works, plus the app name and when it
+ * was deployed. Recorded only after verification passed and the app was actually
+ * deployed, so the console surfaces a real, reachable URL and never a URL for a
+ * broken or undeployed app. Torn down by the per-run cleanup.
+ */
+export interface DeploymentRecord {
+  /** The clickable live URL (https://<name>.<subdomain>.workers.dev). */
+  readonly url: string;
+  /** The app name (the examples/apps/<name> directory) that was deployed. */
+  readonly app: string;
+  readonly at: string;
+}
+
+/**
  * A write-lease coordination record for a contested path: the single owner and
  * the waiters ordered behind it. Projected from the lease plan so the console
  * surfaces the single-writer coordination as a graph edge.
@@ -205,6 +222,13 @@ export interface ChangeStateView {
    * failed node distinctly, and the run summary reports which units failed.
    */
   readonly failed: readonly FailureRecord[];
+  /**
+   * The live deployment of the fixed app for this run, when the run deployed one
+   * as end-of-run proof. Present only after verification passed and the deploy
+   * succeeded, so the console surfaces a real reachable workers.dev URL. Absent
+   * for a run that did not deploy (the intro template) or whose fix failed.
+   */
+  readonly deployment?: DeploymentRecord;
 }
 
 /**
@@ -406,6 +430,9 @@ export class ChangeState extends DurableObject<Env> {
     // executor relayed through the runner). Appended to as a run streams and
     // read by the console's live-stream subscription. Bounded per unit.
     await this.ctx.storage.put("stream", {} as Record<string, string>);
+    // The live deployment of the fixed app (recorded at the end of a real-app
+    // run after verification passed). Null until the run deploys one.
+    await this.ctx.storage.put("deployment", null);
     return this.view();
   }
 
@@ -711,6 +738,62 @@ export class ChangeState extends DurableObject<Env> {
   }
 
   /**
+   * Record the live deployment of the fixed app: the clickable workers.dev URL
+   * the run deployed as end-of-run proof. The run records this only after
+   * verification passed and the deploy succeeded, so the console surfaces a real
+   * reachable URL, never a URL for a broken or undeployed app.
+   */
+  async recordDeployment(deployment: Omit<DeploymentRecord, "at">): Promise<DeploymentRecord> {
+    const stored: DeploymentRecord = { ...deployment, at: new Date().toISOString() };
+    await this.ctx.storage.put("deployment", stored);
+    return stored;
+  }
+
+  /** The recorded live deployment for this run, if any. */
+  async getDeployment(): Promise<DeploymentRecord | null> {
+    return this.loadDeployment();
+  }
+
+  /**
+   * Append DISCOVERED follow-up WorkUnits to the live Change. This is the
+   * dynamic-branching mechanism: a completing unit reported that fixing one
+   * thing revealed more work (follow-up fixes it found in the real repo), so the
+   * engine admits those units to the live WorkGraph as real backed units and the
+   * next recruitment wave picks them up. The append is validated by the shared
+   * change-core guard (the parent must exist, each discovered unit must declare a
+   * path, each is rooted under its parent so its node and edge are backed, and
+   * ids are namespaced and unique). Already-present ids are skipped so a repeated
+   * report is idempotent and a re-driven engine does not pile up duplicates. The
+   * augmented Change is persisted along with a recomputed write-lease plan (new
+   * units may add path collisions); everything downstream reads the stored
+   * Change, so the new units are scheduled, recruited, and projected unchanged.
+   */
+  async addWorkUnits(
+    parentUnitId: string,
+    discovered: readonly DiscoveredWorkUnit[],
+  ): Promise<readonly string[]> {
+    const change = await this.loadChange();
+    const existing = new Set(change.work.map((u) => u.id));
+    const fresh = discovered.filter(
+      (u) =>
+        !existing.has(
+          `${parentUnitId}+${u.idSuffix.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "found"}`,
+        ),
+    );
+    if (fresh.length === 0) {
+      return [];
+    }
+    const { change: newChange, added } = appendDiscoveredUnits(change, parentUnitId, fresh);
+    await this.ctx.storage.put("change", newChange);
+    // Recompute the write-lease plan: a discovered unit may declare a path that
+    // now collides with an existing unit, so the single-owner coordination must
+    // reflect the grown graph.
+    const leasePlan = planWriteLeases(newChange, detectPathCollisions(newChange));
+    await this.ctx.storage.put("leasePlan", leasePlan);
+    return added.map((u) => u.id);
+  }
+
+  /**
    * Record one ordered activity step a runner/agent reported for a WorkUnit: a
    * real step in the run (for example "leased", "cloning", "model", "edit",
    * "commit", "push", "verified", or "failed"). This is the step the ACTUAL run
@@ -958,6 +1041,7 @@ export class ChangeState extends DurableObject<Env> {
     const failed = await this.loadFailed();
     const activity = await this.loadActivity();
     const detail = await this.loadDetail();
+    const deployment = await this.loadDeployment();
     const statuses = workUnitStatuses(change, completed);
     const graph = buildWorkGraph(change);
     const collisions = detectPathCollisions(change);
@@ -1020,6 +1104,7 @@ export class ChangeState extends DurableObject<Env> {
       leaseEdges,
       escalations,
       failed: Object.values(failed).sort((a, b) => (a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0)),
+      ...(deployment ? { deployment } : {}),
     };
   }
 
@@ -1099,6 +1184,10 @@ export class ChangeState extends DurableObject<Env> {
 
   private async loadStream(): Promise<Record<string, string>> {
     return (await this.ctx.storage.get<Record<string, string>>("stream")) ?? {};
+  }
+
+  private async loadDeployment(): Promise<DeploymentRecord | null> {
+    return (await this.ctx.storage.get<DeploymentRecord | null>("deployment")) ?? null;
   }
 }
 
