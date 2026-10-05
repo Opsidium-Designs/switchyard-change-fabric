@@ -935,15 +935,16 @@ function ModelDetail({ detail }: { detail: UnitDetailSnapshot }) {
 }
 
 /**
- * The per-node detail for the model-escalation ladder's own nodes, read straight
- * from the node's real backing (never synthesized):
+ * The per-node detail for the CHANGE-LEVEL model-escalation ladder's own nodes,
+ * read straight from the node's real backing (never synthesized):
  *
- *   - a VERIFY node shows the attempt number and the mechanical verdict (pass or
- *     fail) of that single gate run. The verdict is ground truth: the gate is
- *     mechanical on every attempt, so the model never grades its own output.
- *   - a RETRY node shows which attempt it produced and the stronger model the
- *     ladder escalated TO. This is the smarter-model re-attempt beat, wholly
- *     separate from any human escalation.
+ *   - a VERIFY node shows the round, the mechanical verdict (pass or fail) of
+ *     that single whole-change gate run, the gate command that ran, and, on a
+ *     fail, the real failing gate output. The verdict is ground truth: the gate
+ *     is mechanical on every round, so the model never grades its own output.
+ *   - a RETRY node shows the round, the escalation reason, the implicated unit
+ *     ids it re-fanned, and the base -> escalation model hop. This is the
+ *     smarter-model re-attempt beat, wholly separate from any human escalation.
  *
  * Both come from the backing variant the graph model attached, so this panel can
  * only show a ladder beat that genuinely happened.
@@ -956,11 +957,11 @@ function LadderDetail({
   if (backing.kind === "verify-attempt") {
     return (
       <div className="ladder-detail">
-        <h3>Verify attempt</h3>
+        <h3>Verify round</h3>
         <dl className="meta">
           <div>
-            <dt>Attempt</dt>
-            <dd>#{backing.attempt}</dd>
+            <dt>Round</dt>
+            <dd>#{backing.round}</dd>
           </div>
           <div>
             <dt>Verdict</dt>
@@ -968,11 +969,25 @@ function LadderDetail({
               {backing.outcome === "pass" ? "pass" : "fail"}
             </dd>
           </div>
+          {backing.gateCommand ? (
+            <div>
+              <dt>Gate command</dt>
+              <dd>
+                <code>{backing.gateCommand}</code>
+              </dd>
+            </div>
+          ) : null}
         </dl>
         <p className="muted">
-          A mechanical per-app gate ran against this attempt&apos;s candidate edit.
-          The verdict is real evidence, not the model grading itself.
+          The per-app gate ran ONCE against the whole integrated change for this
+          round. The verdict is real evidence, not the model grading itself.
         </p>
+        {backing.outcome === "fail" && backing.failingOutput ? (
+          <>
+            <h4>Failing gate output</h4>
+            <pre className="detail-pre">{backing.failingOutput}</pre>
+          </>
+        ) : null}
       </div>
     );
   }
@@ -981,19 +996,34 @@ function LadderDetail({
       <h3>Model escalation retry</h3>
       <dl className="meta">
         <div>
-          <dt>Attempt</dt>
-          <dd>#{backing.attempt}</dd>
+          <dt>Round</dt>
+          <dd>#{backing.round}</dd>
         </div>
         <div>
-          <dt>Escalated to</dt>
+          <dt>Model hop</dt>
           <dd>
+            <code>{backing.fromModel || "base"}</code> {"->"}{" "}
             <code>{backing.toModel || "escalation model"}</code>
           </dd>
         </div>
       </dl>
+      {backing.reason ? <p className="muted">{backing.reason}</p> : null}
+      <h4>Implicated units ({backing.implicatedUnits.length})</h4>
+      {backing.implicatedUnits.length === 0 ? (
+        <p className="muted">No specific unit was recorded for this retry.</p>
+      ) : (
+        <ul className="paths">
+          {backing.implicatedUnits.map((u) => (
+            <li key={u}>
+              <code>{u}</code>
+            </li>
+          ))}
+        </ul>
+      )}
       <p className="muted">
-        A verify-fail handed this attempt to a stronger model, fed the failing
-        evidence. This is a distinct beat from a human escalation.
+        A change-level verify-fail re-fanned the implicated units on a stronger
+        model, fed the failing evidence. This is a distinct beat from a human
+        escalation.
       </p>
     </div>
   );

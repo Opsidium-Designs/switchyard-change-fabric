@@ -375,18 +375,17 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     return json({ deployment }, 201);
   }
 
-  // Record one mechanical VERIFY attempt for a WorkUnit: a single run of the
-  // per-app behavioral gate against a candidate edit. This is the real backing
-  // for a `verify` graph node, so a verify node can only exist once this record
-  // does. The verifier is mechanical on every attempt (the escalation model gets
-  // another attempt, never grades its own output), so this is the ground-truth
-  // verdict the ladder and the console read.
-  const verifyAttemptMatch = url.pathname.match(
-    /^\/changes\/([^/]+)\/work\/([^/]+)\/verify-attempt$/,
-  );
+  // Record one mechanical CHANGE-LEVEL VERIFY attempt: a single run of the
+  // per-app behavioral gate against the integrated change for one ladder round.
+  // This is the real backing for a `verify` graph node, so a verify node can
+  // only exist once this record does. The verifier is mechanical on every round
+  // (the escalation model gets another round, never grades its own output), so
+  // this is the ground-truth verdict the ladder and the console read. The gate
+  // command and failing output are recorded so the console can show what ran and
+  // why it failed.
+  const verifyAttemptMatch = url.pathname.match(/^\/changes\/([^/]+)\/verify-attempt$/);
   if (request.method === "POST" && verifyAttemptMatch) {
     const changeId = decodeURIComponent(verifyAttemptMatch[1] ?? "");
-    const unitId = decodeURIComponent(verifyAttemptMatch[2] ?? "");
     const stub = changeStateStub(env, changeId);
     if (!(await stub.isInitialized())) {
       return json({ error: `no such Change: ${changeId}` }, 404);
@@ -399,11 +398,11 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
     try {
       const attempt = await stub.recordVerifyAttempt({
-        unitId,
-        attempt: numberOr(body.attempt, 1),
+        round: numberOr(body.round, 1),
         outcome: body.outcome === "pass" ? "pass" : "fail",
         model: body.model ?? "",
-        ...(body.evidence ? { evidence: body.evidence } : {}),
+        ...(body.gateCommand ? { gateCommand: body.gateCommand } : {}),
+        ...(body.failingOutput ? { failingOutput: body.failingOutput } : {}),
       });
       return json({ verifyAttempt: attempt }, 201);
     } catch (error) {
@@ -411,16 +410,14 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
   }
 
-  // Record one model-escalation RETRY for a WorkUnit: after a verify-fail, the
-  // ladder ran another attempt on a stronger model fed the failing evidence.
-  // This is the real backing for a `retry` graph node and the `model-escalation`
-  // edge; it is kept wholly separate from the human-escalation `escalated` flag.
-  const retryAttemptMatch = url.pathname.match(
-    /^\/changes\/([^/]+)\/work\/([^/]+)\/retry-attempt$/,
-  );
+  // Record one CHANGE-LEVEL model-escalation RETRY: after a change-level
+  // verify-fail, the ladder re-fanned the implicated units on a stronger model
+  // fed the failing evidence. This is the real backing for a `retry` graph node
+  // and the `model-escalation` edge; it is kept wholly separate from the
+  // human-escalation `escalated` flag. It carries the implicated unit ids.
+  const retryAttemptMatch = url.pathname.match(/^\/changes\/([^/]+)\/retry-attempt$/);
   if (request.method === "POST" && retryAttemptMatch) {
     const changeId = decodeURIComponent(retryAttemptMatch[1] ?? "");
-    const unitId = decodeURIComponent(retryAttemptMatch[2] ?? "");
     const stub = changeStateStub(env, changeId);
     if (!(await stub.isInitialized())) {
       return json({ error: `no such Change: ${changeId}` }, 404);
@@ -433,10 +430,10 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
     try {
       const attempt = await stub.recordRetryAttempt({
-        unitId,
-        attempt: numberOr(body.attempt, 2),
+        round: numberOr(body.round, 2),
         fromModel: body.fromModel ?? "",
         toModel: body.toModel ?? "",
+        implicatedUnits: Array.isArray(body.implicatedUnits) ? body.implicatedUnits : [],
         reason: body.reason ?? "verify-fail escalation",
       });
       return json({ retryAttempt: attempt }, 201);
@@ -808,19 +805,21 @@ interface DeploymentBody {
   readonly app?: string;
 }
 
-/** Body of POST /changes/:id/work/:unit/verify-attempt: one mechanical gate run. */
+/** Body of POST /changes/:id/verify-attempt: one change-level mechanical gate run. */
 interface VerifyAttemptBody {
-  readonly attempt?: number;
+  readonly round?: number;
   readonly outcome?: "pass" | "fail";
   readonly model?: string;
-  readonly evidence?: string;
+  readonly gateCommand?: string;
+  readonly failingOutput?: string;
 }
 
-/** Body of POST /changes/:id/work/:unit/retry-attempt: one model-escalation retry. */
+/** Body of POST /changes/:id/retry-attempt: one change-level model-escalation retry. */
 interface RetryAttemptBody {
-  readonly attempt?: number;
+  readonly round?: number;
   readonly fromModel?: string;
   readonly toModel?: string;
+  readonly implicatedUnits?: readonly string[];
   readonly reason?: string;
 }
 

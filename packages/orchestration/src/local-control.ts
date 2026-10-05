@@ -195,22 +195,22 @@ export interface LeaseEdge {
 /** The outcome of one mechanical verification attempt (mirrors the Worker). */
 export type VerifyOutcome = "pass" | "fail";
 
-/** One recorded mechanical VERIFY attempt for a WorkUnit (mirrors the Worker). */
+/** One recorded CHANGE-LEVEL mechanical VERIFY attempt (mirrors the Worker). */
 export interface VerifyAttempt {
-  readonly unitId: string;
-  readonly attempt: number;
+  readonly round: number;
   readonly outcome: VerifyOutcome;
   readonly model: string;
-  readonly evidence?: string;
+  readonly gateCommand?: string;
+  readonly failingOutput?: string;
   readonly at: string;
 }
 
-/** One recorded model-escalation RETRY for a WorkUnit (mirrors the Worker). */
+/** One recorded CHANGE-LEVEL model-escalation RETRY (mirrors the Worker). */
 export interface RetryAttempt {
-  readonly unitId: string;
-  readonly attempt: number;
+  readonly round: number;
   readonly fromModel: string;
   readonly toModel: string;
+  readonly implicatedUnits: readonly string[];
   readonly reason: string;
   readonly at: string;
 }
@@ -670,23 +670,22 @@ export class LocalChangeControl {
   }
 
   /**
-   * Record one mechanical VERIFY attempt for a WorkUnit (mirrors the DO). This
-   * is the real backing for a `verify` graph node, so a verify node can only
-   * exist once this record does. The verifier is mechanical on every attempt, so
-   * this is the ground-truth verdict, never the model grading itself.
+   * Record one mechanical CHANGE-LEVEL VERIFY attempt (mirrors the DO). This is
+   * the real backing for a `verify` graph node, so a verify node can only exist
+   * once this record does. The verifier is mechanical on every round, so this is
+   * the ground-truth verdict, never the model grading itself.
    */
   recordVerifyAttempt(changeId: string, input: Omit<VerifyAttempt, "at">): VerifyAttempt {
     const record = this.require(changeId);
-    if (!record.change.work.some((u) => u.id === input.unitId)) {
-      throw new Error(`unknown WorkUnit: ${input.unitId}`);
-    }
     const stored: VerifyAttempt = {
-      unitId: input.unitId,
-      attempt: Number.isFinite(input.attempt) && input.attempt > 0 ? Math.floor(input.attempt) : 1,
+      round: Number.isFinite(input.round) && input.round > 0 ? Math.floor(input.round) : 1,
       outcome: input.outcome === "pass" ? "pass" : "fail",
       model: typeof input.model === "string" ? input.model.slice(0, 120) : "",
-      ...(typeof input.evidence === "string" && input.evidence !== ""
-        ? { evidence: sanitizeText(input.evidence, 20_000) }
+      ...(typeof input.gateCommand === "string" && input.gateCommand !== ""
+        ? { gateCommand: sanitizeText(input.gateCommand, 500) }
+        : {}),
+      ...(typeof input.failingOutput === "string" && input.failingOutput !== ""
+        ? { failingOutput: sanitizeText(input.failingOutput, 20_000) }
         : {}),
       at: new Date().toISOString(),
     };
@@ -695,20 +694,24 @@ export class LocalChangeControl {
   }
 
   /**
-   * Record one model-escalation RETRY for a WorkUnit (mirrors the DO). This is
-   * the real backing for a `retry` graph node and the `model-escalation` edge,
-   * kept wholly separate from the human-escalation `escalated` flag.
+   * Record one CHANGE-LEVEL model-escalation RETRY (mirrors the DO). This is the
+   * real backing for a `retry` graph node and the `model-escalation` edge, kept
+   * wholly separate from the human-escalation `escalated` flag. It carries the
+   * implicated units it re-fanned; each must exist in the Change.
    */
   recordRetryAttempt(changeId: string, input: Omit<RetryAttempt, "at">): RetryAttempt {
     const record = this.require(changeId);
-    if (!record.change.work.some((u) => u.id === input.unitId)) {
-      throw new Error(`unknown WorkUnit: ${input.unitId}`);
+    const implicated = Array.isArray(input.implicatedUnits) ? input.implicatedUnits : [];
+    for (const unitId of implicated) {
+      if (!record.change.work.some((u) => u.id === unitId)) {
+        throw new Error(`unknown implicated WorkUnit: ${unitId}`);
+      }
     }
     const stored: RetryAttempt = {
-      unitId: input.unitId,
-      attempt: Number.isFinite(input.attempt) && input.attempt > 1 ? Math.floor(input.attempt) : 2,
+      round: Number.isFinite(input.round) && input.round > 1 ? Math.floor(input.round) : 2,
       fromModel: typeof input.fromModel === "string" ? input.fromModel.slice(0, 120) : "",
       toModel: typeof input.toModel === "string" ? input.toModel.slice(0, 120) : "",
+      implicatedUnits: implicated.map((u) => String(u)),
       reason: sanitizeText(input.reason ?? "verify-fail escalation", 300) || "verify-fail escalation",
       at: new Date().toISOString(),
     };
@@ -905,19 +908,19 @@ export class LocalChangeControl {
       });
       return json({ deployment: recorded }, 201);
     }
-    const verifyAttemptRoute = url.pathname.match(
-      /^\/changes\/([^/]+)\/work\/([^/]+)\/verify-attempt$/,
-    );
+    const verifyAttemptRoute = url.pathname.match(/^\/changes\/([^/]+)\/verify-attempt$/);
     if (method === "POST" && verifyAttemptRoute) {
       const b = parseBody(init);
       try {
         const recorded = this.recordVerifyAttempt(dec(verifyAttemptRoute[1]), {
-          unitId: dec(verifyAttemptRoute[2]),
-          attempt: numberOr(b.attempt, 1),
+          round: numberOr(b.round, 1),
           outcome: b.outcome === "pass" ? "pass" : "fail",
           model: String(b.model ?? ""),
-          ...(typeof b.evidence === "string" && b.evidence !== ""
-            ? { evidence: String(b.evidence) }
+          ...(typeof b.gateCommand === "string" && b.gateCommand !== ""
+            ? { gateCommand: String(b.gateCommand) }
+            : {}),
+          ...(typeof b.failingOutput === "string" && b.failingOutput !== ""
+            ? { failingOutput: String(b.failingOutput) }
             : {}),
         });
         return json({ verifyAttempt: recorded }, 201);
@@ -925,17 +928,17 @@ export class LocalChangeControl {
         return json({ error: error instanceof Error ? error.message : String(error) }, 400);
       }
     }
-    const retryAttemptRoute = url.pathname.match(
-      /^\/changes\/([^/]+)\/work\/([^/]+)\/retry-attempt$/,
-    );
+    const retryAttemptRoute = url.pathname.match(/^\/changes\/([^/]+)\/retry-attempt$/);
     if (method === "POST" && retryAttemptRoute) {
       const b = parseBody(init);
       try {
         const recorded = this.recordRetryAttempt(dec(retryAttemptRoute[1]), {
-          unitId: dec(retryAttemptRoute[2]),
-          attempt: numberOr(b.attempt, 2),
+          round: numberOr(b.round, 2),
           fromModel: String(b.fromModel ?? ""),
           toModel: String(b.toModel ?? ""),
+          implicatedUnits: Array.isArray(b.implicatedUnits)
+            ? (b.implicatedUnits as unknown[]).map((u) => String(u))
+            : [],
           reason: String(b.reason ?? "verify-fail escalation"),
         });
         return json({ retryAttempt: recorded }, 201);

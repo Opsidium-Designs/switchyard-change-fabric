@@ -326,7 +326,7 @@ describe("M3: the model morphs purely as a function of successive snapshots", ()
 function ladderSnapshot(): ChangeStateSnapshot {
   return {
     id: "change-ladder",
-    objective: "One unit whose base attempt fails and escalation passes",
+    objective: "A change whose round-1 gate fails and the escalation round passes",
     completed: ["fix"],
     work: [
       {
@@ -340,57 +340,103 @@ function ladderSnapshot(): ChangeStateSnapshot {
       },
     ],
     edges: [],
-    // base attempt failed, escalation attempt passed.
+    // The ladder is CHANGE-LEVEL: round 1 (the whole-change gate) failed, round 2
+    // (after re-fanning the implicated units) passed. One attempt per round.
     verifyAttempts: [
-      { unitId: "fix", attempt: 1, outcome: "fail", model: "base-model", evidence: "gate failed", at: "2026-10-04T10:00:00.000Z" },
-      { unitId: "fix", attempt: 2, outcome: "pass", model: "escalation-model", at: "2026-10-04T10:01:00.000Z" },
+      {
+        round: 1,
+        outcome: "fail",
+        model: "base-model",
+        gateCommand: "npm run gate",
+        failingOutput: "FAIL src/fix.js: the planted bug is still present",
+        at: "2026-10-04T10:00:00.000Z",
+      },
+      { round: 2, outcome: "pass", model: "escalation-model", gateCommand: "npm run gate", at: "2026-10-04T10:01:00.000Z" },
     ],
     retryAttempts: [
-      { unitId: "fix", attempt: 2, fromModel: "base-model", toModel: "escalation-model", reason: "verify #1 failed", at: "2026-10-04T10:00:30.000Z" },
+      {
+        round: 2,
+        fromModel: "base-model",
+        toModel: "escalation-model",
+        implicatedUnits: ["fix"],
+        reason: "verify round 1 failed",
+        at: "2026-10-04T10:00:30.000Z",
+      },
     ],
   };
 }
 
-describe("T4: the model-escalation ladder renders as backed verify/retry nodes and a model-escalation edge", () => {
-  it("emits a verify node per recorded attempt, green on pass and red on fail", () => {
+describe("T4: the change-level model-escalation ladder renders as backed verify/retry nodes and a model-escalation edge", () => {
+  it("emits one change-level verify node per round, green on pass and red on fail, with readable labels", () => {
     const model = buildWorkGraphModel(ladderSnapshot());
-    const v1 = model.nodes.find((n) => n.id === verifyNodeId("fix", 1));
-    const v2 = model.nodes.find((n) => n.id === verifyNodeId("fix", 2));
+    const v1 = model.nodes.find((n) => n.id === verifyNodeId("change-ladder", 1));
+    const v2 = model.nodes.find((n) => n.id === verifyNodeId("change-ladder", 2));
     expect(v1?.kind).toBe("verify");
     expect(v1?.status).toBe("failed");
     expect(v1?.verified).toBe(false);
+    // A readable label like "verify round 1 (app gate) fail", not a cryptic id.
+    expect(v1?.label).toContain("verify round 1 (app gate)");
+    expect(v1?.label).toContain("fail");
     expect(v2?.kind).toBe("verify");
     expect(v2?.status).toBe("verified");
     expect(v2?.verified).toBe(true);
+    expect(v2?.label).toContain("verify round 2 (app gate)");
+    expect(v2?.label).toContain("pass");
   });
 
-  it("emits a retry node for the escalation reached by a model-escalation edge from the failing verify", () => {
+  it("backs the round-1 verify node with the gate command and the real failing output", () => {
     const model = buildWorkGraphModel(ladderSnapshot());
-    const retry = model.nodes.find((n) => n.id === retryNodeId("fix", 2));
+    const v1 = model.nodes.find((n) => n.id === verifyNodeId("change-ladder", 1));
+    expect(v1?.backing).toMatchObject({
+      kind: "verify-attempt",
+      changeId: "change-ladder",
+      round: 1,
+      outcome: "fail",
+      gateCommand: "npm run gate",
+      failingOutput: "FAIL src/fix.js: the planted bug is still present",
+    });
+  });
+
+  it("emits a change-level retry node carrying implicated units + from/to model, reached by a model-escalation edge", () => {
+    const model = buildWorkGraphModel(ladderSnapshot());
+    const retry = model.nodes.find((n) => n.id === retryNodeId("change-ladder", 2));
     expect(retry?.kind).toBe("retry");
     expect(retry?.backing.kind).toBe("retry-attempt");
+    // A readable label like "retry round 2: escalation-model (1 unit)".
+    expect(retry?.label).toContain("retry round 2");
+    expect(retry?.label).toContain("escalation-model");
+    expect(retry?.label).toContain("1 unit");
+    expect(retry?.backing).toMatchObject({
+      kind: "retry-attempt",
+      changeId: "change-ladder",
+      round: 2,
+      fromModel: "base-model",
+      toModel: "escalation-model",
+      implicatedUnits: ["fix"],
+    });
 
     const escalationEdge = model.edges.find((e) => e.kind === "model-escalation");
     expect(escalationEdge).toBeDefined();
-    expect(escalationEdge?.from).toBe(verifyNodeId("fix", 1));
-    expect(escalationEdge?.to).toBe(retryNodeId("fix", 2));
+    expect(escalationEdge?.from).toBe(verifyNodeId("change-ladder", 1));
+    expect(escalationEdge?.to).toBe(retryNodeId("change-ladder", 2));
     expect(escalationEdge?.backing).toMatchObject({
       kind: "model-escalation",
-      unitId: "fix",
+      changeId: "change-ladder",
+      round: 2,
       fromModel: "base-model",
       toModel: "escalation-model",
     });
   });
 
-  it("renders the chain unit -> verify#1 -> retry#2 -> verify#2 (base edit from unit, retried edit from retry)", () => {
+  it("renders the chain goal -> verify round 1 -> retry round 2 -> verify round 2 (round-1 edit from goal, round-2 edit from retry)", () => {
     const model = buildWorkGraphModel(ladderSnapshot());
-    // verify #1 edit flows from the unit; verify #2 edit flows from the retry.
-    const flow1 = model.edges.find((e) => e.id === "verify-flow:fix#1");
-    const flow2 = model.edges.find((e) => e.id === "verify-flow:fix#2");
-    expect(flow1?.from).toBe(unitNodeId("fix"));
-    expect(flow1?.to).toBe(verifyNodeId("fix", 1));
-    expect(flow2?.from).toBe(retryNodeId("fix", 2));
-    expect(flow2?.to).toBe(verifyNodeId("fix", 2));
+    // round-1 verify flows from the goal (the whole change); round-2 from the retry.
+    const flow1 = model.edges.find((e) => e.id === "verify-flow:change-ladder#1");
+    const flow2 = model.edges.find((e) => e.id === "verify-flow:change-ladder#2");
+    expect(flow1?.from).toBe(goalNodeId("change-ladder"));
+    expect(flow1?.to).toBe(verifyNodeId("change-ladder", 1));
+    expect(flow2?.from).toBe(retryNodeId("change-ladder", 2));
+    expect(flow2?.to).toBe(verifyNodeId("change-ladder", 2));
   });
 
   it("does NOT light the human-escalation flag on any node from a model-escalation retry", () => {
@@ -407,30 +453,38 @@ describe("T4: the model-escalation ladder renders as backed verify/retry nodes a
     }
   });
 
-  it("rejects a verify node with no recorded attempt (cannot render unbacked)", () => {
+  it("rejects a change-level verify node with no recorded round (cannot render unbacked)", () => {
     const snapshot = ladderSnapshot();
     const bogus: GraphNode = {
-      id: verifyNodeId("fix", 9),
+      id: verifyNodeId("change-ladder", 9),
       kind: "verify",
-      label: "verify #9",
+      label: "verify round 9 (app gate) pass",
       status: "verified",
       verified: true,
       escalated: false,
-      backing: { kind: "verify-attempt", unitId: "fix", attempt: 9, outcome: "pass" },
+      backing: { kind: "verify-attempt", changeId: "change-ladder", round: 9, outcome: "pass" },
     };
     expect(() => assertBacked(bogus, snapshot)).toThrow(/no recorded verify attempt/);
   });
 
-  it("rejects a retry node with no recorded retry attempt (cannot render unbacked)", () => {
+  it("rejects a change-level retry node with no recorded round (cannot render unbacked)", () => {
     const snapshot = ladderSnapshot();
     const bogus: GraphNode = {
-      id: retryNodeId("fix", 9),
+      id: retryNodeId("change-ladder", 9),
       kind: "retry",
-      label: "retry #9",
+      label: "retry round 9",
       status: "running",
       verified: false,
       escalated: false,
-      backing: { kind: "retry-attempt", unitId: "fix", attempt: 9, toModel: "ghost-model" },
+      backing: {
+        kind: "retry-attempt",
+        changeId: "change-ladder",
+        round: 9,
+        fromModel: "base-model",
+        toModel: "ghost-model",
+        implicatedUnits: ["fix"],
+        reason: "ghost",
+      },
     };
     expect(() => assertBacked(bogus, snapshot)).toThrow(/no recorded model-escalation retry/);
   });

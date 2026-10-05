@@ -25,21 +25,138 @@ import { goalNodeId } from "@switchyard-change/orchestration/graph-model";
  * fades in where its layer puts it.
  */
 
-const WIDTH = 960;
-const LAYER_HEIGHT = 170;
+const WIDTH = 1100;
+const LAYER_HEIGHT = 210;
 const TOP_MARGIN = 80;
 const NODE_RADIUS = 24;
 const GOAL_RADIUS = 32;
 /** Vertical gap between a node's circle edge and its label row (outside it). */
 const LABEL_GAP = 10;
+/** Minimum horizontal gap between adjacent node centers in a dense row. */
+const MIN_NODE_GAP = 150;
 
 interface Placed {
   readonly node: GraphNode;
   readonly x: number;
   readonly y: number;
+  /**
+   * A small vertical offset applied to this node's label row so adjacent dense
+   * labels do not overlap: even columns sit at the normal gap, odd columns are
+   * pushed further below. Purely a label concern; the node coordinate is
+   * unchanged, so edges and layout determinism are untouched.
+   */
+  readonly labelTier: number;
 }
 
-/** Compute each unit node's dependency layer (its longest path from a root). */
+/**
+ * Build the per-node parent list from the ladder/dependency edges (the same
+ * edges computeLayers follows), so a node can be ordered within its layer by the
+ * mean x of its parents (its barycenter). Goal-rooting and spawn edges are
+ * ignored, exactly as in computeLayers, so the barycenter follows the real
+ * dependency/data-flow/model-escalation chain.
+ */
+function buildParentLists(model: WorkGraphModel): Map<string, string[]> {
+  const parents = new Map<string, string[]>();
+  for (const node of model.nodes) {
+    if (node.kind !== "goal") {
+      parents.set(node.id, []);
+    }
+  }
+  for (const edge of model.edges) {
+    if (edge.from === goalNodeId(model.changeId)) {
+      continue;
+    }
+    if (
+      edge.kind === "dependency" ||
+      edge.kind === "data-flow" ||
+      edge.kind === "model-escalation"
+    ) {
+      const list = parents.get(edge.to);
+      if (list) {
+        list.push(edge.from);
+      }
+    }
+  }
+  return parents;
+}
+
+/** Place the goal and every unit node at a deterministic coordinate. */
+function placeNodes(model: WorkGraphModel): { placed: Placed[]; height: number; width: number } {
+  const layers = computeLayers(model);
+  const parents = buildParentLists(model);
+  const unitNodes = model.nodes.filter((n) => n.kind !== "goal");
+  // Group unit nodes by layer (layer 0 is the first row beneath the goal).
+  const byLayer = new Map<number, GraphNode[]>();
+  for (const node of unitNodes) {
+    const l = layers.get(node.id) ?? 0;
+    const row = byLayer.get(l) ?? [];
+    row.push(node);
+    byLayer.set(l, row);
+  }
+  const placed: Placed[] = [];
+  const xOf = new Map<string, number>();
+  const goal = model.nodes.find((n) => n.kind === "goal");
+  // The row width is the widest layer, so a dense row gets enough horizontal
+  // room (MIN_NODE_GAP per node) instead of cramming labels together.
+  const widest = byLayer.size === 0 ? 1 : Math.max(1, ...[...byLayer.values()].map((r) => r.length));
+  const width = Math.max(WIDTH, (widest + 1) * MIN_NODE_GAP);
+  if (goal) {
+    placed.push({ node: goal, x: width / 2, y: TOP_MARGIN, labelTier: 0 });
+    xOf.set(goal.id, width / 2);
+  }
+  const maxLayer = byLayer.size === 0 ? 0 : Math.max(...byLayer.keys());
+  for (const [l, row] of [...byLayer.entries()].sort((a, b) => a[0] - b[0])) {
+    // Order each row by its BARYCENTER: the mean x of a node's already-placed
+    // parents, so a node sits beneath the nodes it depends on and edges do not
+    // cross. Nodes with no placed parent fall back to a stable id order. The
+    // ladder chain (goal -> verify -> retry -> verify) reads top to bottom
+    // because each verify/retry node's single parent fixes its column.
+    const sorted = [...row].sort((a, b) => {
+      const ba = barycenter(a.id, parents, xOf);
+      const bb = barycenter(b.id, parents, xOf);
+      if (ba !== null && bb !== null && ba !== bb) {
+        return ba - bb;
+      }
+      if (ba !== null && bb === null) {
+        return -1;
+      }
+      if (ba === null && bb !== null) {
+        return 1;
+      }
+      return a.id.localeCompare(b.id);
+    });
+    const y = TOP_MARGIN + (l + 1) * LAYER_HEIGHT;
+    const n = sorted.length;
+    sorted.forEach((node, i) => {
+      const x = n === 1 ? width / 2 : ((i + 1) * width) / (n + 1);
+      // Alternate the label tier so adjacent labels in a dense row do not
+      // collide: even columns at tier 0, odd columns pushed down one tier.
+      placed.push({ node, x, y, labelTier: i % 2 });
+      xOf.set(node.id, x);
+    });
+  }
+  const height = TOP_MARGIN + (maxLayer + 2) * LAYER_HEIGHT;
+  return { placed, height, width };
+}
+
+/**
+ * The barycenter (mean x) of a node's already-placed parents, or null when none
+ * of its parents has been placed yet (so it falls back to id order). Reading
+ * from the running xOf map makes earlier layers anchor later ones, so the whole
+ * graph settles top-down with few crossings.
+ */
+function barycenter(
+  id: string,
+  parents: Map<string, string[]>,
+  xOf: Map<string, number>,
+): number | null {
+  const ps = parents.get(id) ?? [];
+  const xs = ps.map((p) => xOf.get(p)).filter((x): x is number => x !== undefined);
+  if (xs.length === 0) {
+    return null;
+  }
+  return xs.reduce((sum, x) => sum + x, 0) / xs.length;
+}
 function computeLayers(model: WorkGraphModel): Map<string, number> {
   const deps = new Map<string, string[]>();
   // Build the per-unit dependency list from the declared dependency/data-flow
@@ -90,38 +207,6 @@ function computeLayers(model: WorkGraphModel): Map<string, number> {
     depthOf(id);
   }
   return layer;
-}
-
-/** Place the goal and every unit node at a deterministic coordinate. */
-function placeNodes(model: WorkGraphModel): { placed: Placed[]; height: number } {
-  const layers = computeLayers(model);
-  const unitNodes = model.nodes.filter((n) => n.kind !== "goal");
-  // Group unit nodes by layer (layer 0 is the first row beneath the goal).
-  const byLayer = new Map<number, GraphNode[]>();
-  for (const node of unitNodes) {
-    const l = layers.get(node.id) ?? 0;
-    const row = byLayer.get(l) ?? [];
-    row.push(node);
-    byLayer.set(l, row);
-  }
-  const placed: Placed[] = [];
-  const goal = model.nodes.find((n) => n.kind === "goal");
-  if (goal) {
-    placed.push({ node: goal, x: WIDTH / 2, y: TOP_MARGIN });
-  }
-  const maxLayer = byLayer.size === 0 ? 0 : Math.max(...byLayer.keys());
-  for (const [l, row] of [...byLayer.entries()].sort((a, b) => a[0] - b[0])) {
-    // Sort each row by id for a stable left-to-right order between polls.
-    const sorted = [...row].sort((a, b) => a.id.localeCompare(b.id));
-    const y = TOP_MARGIN + (l + 1) * LAYER_HEIGHT;
-    const n = sorted.length;
-    sorted.forEach((node, i) => {
-      const x = n === 1 ? WIDTH / 2 : ((i + 1) * WIDTH) / (n + 1);
-      placed.push({ node, x, y });
-    });
-  }
-  const height = TOP_MARGIN + (maxLayer + 2) * LAYER_HEIGHT;
-  return { placed, height };
 }
 
 /** The stroke style per edge kind. */
@@ -233,7 +318,7 @@ function clampScale(k: number): number {
 }
 
 export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
-  const { placed, height } = useMemo(() => placeNodes(model), [model]);
+  const { placed, height, width } = useMemo(() => placeNodes(model), [model]);
   const byId = useMemo(() => {
     const map = new Map<string, Placed>();
     for (const p of placed) {
@@ -270,11 +355,11 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
         return { x: 0, y: 0 };
       }
       const rect = svg.getBoundingClientRect();
-      const x = ((clientX - rect.left) / rect.width) * WIDTH;
+      const x = ((clientX - rect.left) / rect.width) * width;
       const y = ((clientY - rect.top) / rect.height) * height;
       return { x, y };
     },
-    [height],
+    [height, width],
   );
 
   // Wheel to zoom, centered on the cursor: solve for the translation that keeps
@@ -338,7 +423,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
       const rect = svg?.getBoundingClientRect();
       // Scale the client-pixel delta into SVG-space so panning tracks the cursor
       // one-to-one regardless of how the SVG is sized in the layout.
-      const scaleX = rect ? WIDTH / rect.width : 1;
+      const scaleX = rect ? width / rect.width : 1;
       const scaleY = rect ? height / rect.height : 1;
       setView((prev) => ({
         ...prev,
@@ -346,7 +431,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
         ty: d.originTy + dyClient * scaleY,
       }));
     },
-    [height],
+    [height, width],
   );
 
   const endDrag = useCallback(() => {
@@ -388,7 +473,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
       <svg
         ref={svgRef}
         className={`graph-svg${drag.current ? " is-panning" : ""}`}
-        viewBox={`0 0 ${WIDTH} ${height}`}
+        viewBox={`0 0 ${width} ${height}`}
         role="img"
         aria-label="Living work graph"
         onWheel={onWheel}
@@ -479,9 +564,12 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
           {/* Nodes. Each is keyed by its stable id so React fades it in/out as
               the state gains or loses it, rather than redrawing the whole set. */}
           <g className="nodes">
-            {placed.map(({ node, x, y }) => {
+            {placed.map(({ node, x, y, labelTier }) => {
               const r = node.kind === "goal" ? GOAL_RADIUS : NODE_RADIUS;
               const selected = node.id === selectedId;
+              // Offset dense-row labels so adjacent ones do not collide: tier 1
+              // (odd columns) sits one label-row lower than tier 0.
+              const labelOffset = labelTier * 26;
               return (
                 <g
                   key={node.id}
@@ -529,14 +617,14 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                   <text
                     className="node-label"
                     textAnchor="middle"
-                    y={r + LABEL_GAP + 11}
+                    y={r + LABEL_GAP + 11 + labelOffset}
                   >
                     {node.label}
                   </text>
                   <text
                     className="node-kind"
                     textAnchor="middle"
-                    y={r + LABEL_GAP + 24}
+                    y={r + LABEL_GAP + 24 + labelOffset}
                   >
                     {node.kind}
                   </text>

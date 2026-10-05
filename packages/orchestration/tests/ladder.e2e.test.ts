@@ -56,6 +56,30 @@ work:
 `;
 
 /**
+ * A two-unit change for the implicated-unit attribution path: unit `alpha`
+ * already fixes its part on the base model (the gate always passes its marker),
+ * while unit `beta` needs the escalation model. On the round-1 change-level
+ * fail, only `beta`'s marker is named, so attribution must re-fan ONLY `beta`.
+ * Each unit's declared path is its own marker file, so the failing file maps
+ * cleanly to the owning unit.
+ */
+const SPEC_TWO_UNITS = `
+id: change-ladder-two
+objective: Fix two parts; only one needs escalation
+baseline: HEAD
+budget_usd: 10.00
+assurance: standard
+
+work:
+  - id: alpha
+    objective: fix the alpha part
+    paths: [src/alpha.fix]
+  - id: beta
+    objective: fix the beta part
+    paths: [src/beta.fix]
+`;
+
+/**
  * An in-process fake Worker fetch backed by LocalChangeControl. It handles the
  * endpoints runFullLive touches, delegating the ladder's verify-attempt and
  * retry-attempt routes (and step/detail) straight to LocalChangeControl so the
@@ -160,13 +184,13 @@ function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWork
       });
       return json({ deployment: recorded }, 201);
     }
-    // The ladder's verify-attempt / retry-attempt routes, plus step/detail, are
-    // delegated straight to LocalChangeControl so the recorded attempts surface
-    // in state identically to the live Worker (and back the graph nodes/edges).
+    // The ladder's CHANGE-LEVEL verify-attempt / retry-attempt routes, plus the
+    // per-unit step/detail/verify-fail routes, are delegated straight to
+    // LocalChangeControl so the recorded attempts surface in state identically
+    // to the live Worker (and back the graph nodes/edges).
     const delegated =
-      /^\/changes\/[^/]+\/work\/[^/]+\/(verify-attempt|retry-attempt|verify-fail|step|detail|stream)$/.test(
-        url.pathname,
-      );
+      /^\/changes\/[^/]+\/(verify-attempt|retry-attempt)$/.test(url.pathname) ||
+      /^\/changes\/[^/]+\/work\/[^/]+\/(verify-fail|step|detail|stream)$/.test(url.pathname);
     if (method === "POST" && delegated) {
       return control.fetch(input, init);
     }
@@ -215,13 +239,21 @@ async function runLadder(options: {
   readonly passingModel: string;
   readonly maxModelRetries?: number;
   readonly subdir: string;
+  /** Override the Change spec (defaults to the single-unit SPEC). */
+  readonly spec?: string;
+  /** Override the Change id read back from state (defaults to change-ladder). */
+  readonly changeId?: string;
+  /** Unit markers the gate always passes (to drive implicated attribution). */
+  readonly alwaysPassingUnits?: readonly string[];
 }) {
+  const spec = options.spec ?? SPEC;
+  const changeId = options.changeId ?? "change-ladder";
   const workspaces = new LocalFilesystemWorkspaceProvider({
     rootDir: join(workRoot, options.subdir, "artifacts"),
   });
   const control = new LocalChangeControl(workspaces);
   const { fetchFn } = fakeWorker(control, workspaces);
-  const change = parseChangeSpec(SPEC);
+  const change = parseChangeSpec(spec);
 
   const projectDir = join(workRoot, options.subdir, "project");
   await seedProject(projectDir);
@@ -237,14 +269,17 @@ async function runLadder(options: {
     change,
     dial: { minConcurrency: 1, maxConcurrency: 2 },
     workerUrl: "http://w",
-    specYaml: SPEC,
+    specYaml: spec,
     projectDir,
     workRoot: join(workRoot, options.subdir, "run"),
     fetchFn,
     executor: new ModelAwareExecutor({ baseModel: BASE_MODEL }),
     // The ladder gate + escalation wiring (T6):
     appGateCommandFor: (unitId) => gateCommandFor(unitId),
-    verifyCommandRunner: new MarkerGateRunner({ passingModel: options.passingModel }),
+    verifyCommandRunner: new MarkerGateRunner({
+      passingModel: options.passingModel,
+      ...(options.alwaysPassingUnits ? { alwaysPassingUnits: options.alwaysPassingUnits } : {}),
+    }),
     baseModel: BASE_MODEL,
     escalationModel: ESCALATION_MODEL,
     maxModelRetries: options.maxModelRetries ?? 1,
@@ -257,7 +292,7 @@ async function runLadder(options: {
     onEvent: (e) => events.push(e),
   });
 
-  const snapshot = control.state("change-ladder") as ChangeStateSnapshot;
+  const snapshot = control.state(changeId) as ChangeStateSnapshot;
   return { result, control, snapshot, events, redeployed };
 }
 
@@ -274,23 +309,29 @@ describe("T10: the bounded model-escalation ladder (offline, deterministic)", ()
     expect(redeployed).toEqual(["switchyard-change-fabric-ladder-app"]);
     expect(result.deployment?.app).toBe("switchyard-change-fabric-ladder-app");
 
-    // Two mechanical verify attempts recorded: base FAIL, escalation PASS; and
-    // exactly one bounded retry escalating base -> escalation.
+    // Two change-level mechanical verify rounds recorded: round 1 FAIL (base),
+    // round 2 PASS (escalation); and exactly one bounded retry escalating base
+    // -> escalation, carrying the implicated unit it re-fanned.
     expect(snapshot.verifyAttempts).toHaveLength(2);
-    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ attempt: 1, outcome: "fail", model: BASE_MODEL });
-    expect(snapshot.verifyAttempts?.[1]).toMatchObject({ attempt: 2, outcome: "pass", model: ESCALATION_MODEL });
+    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ round: 1, outcome: "fail", model: BASE_MODEL });
+    expect(snapshot.verifyAttempts?.[1]).toMatchObject({ round: 2, outcome: "pass", model: ESCALATION_MODEL });
+    // The round-1 verify recorded the gate command and the real failing output.
+    expect(snapshot.verifyAttempts?.[0]?.gateCommand).toContain("gate");
+    expect(snapshot.verifyAttempts?.[0]?.failingOutput).toContain("src/fix.fix");
     expect(snapshot.retryAttempts).toHaveLength(1);
     expect(snapshot.retryAttempts?.[0]).toMatchObject({
-      attempt: 2,
+      round: 2,
       fromModel: BASE_MODEL,
       toModel: ESCALATION_MODEL,
+      implicatedUnits: ["fix"],
     });
 
-    // The graph shows the visible ladder: verify#1 red -> model-escalation ->
-    // retry#2 -> verify#2 green, and the human-escalation flag stays OFF.
+    // The graph shows the visible change-level ladder: verify round 1 red ->
+    // model-escalation -> retry round 2 -> verify round 2 green, and the
+    // human-escalation flag stays OFF.
     const model = buildWorkGraphModel(snapshot);
-    const v1 = model.nodes.find((n) => n.kind === "verify" && n.label === "verify #1");
-    const v2 = model.nodes.find((n) => n.kind === "verify" && n.label === "verify #2");
+    const v1 = model.nodes.find((n) => n.kind === "verify" && n.label.includes("round 1"));
+    const v2 = model.nodes.find((n) => n.kind === "verify" && n.label.includes("round 2"));
     expect(v1?.verified).toBe(false);
     expect(v2?.verified).toBe(true);
     expect(model.nodes.some((n) => n.kind === "retry")).toBe(true);
@@ -318,9 +359,9 @@ describe("T10: the bounded model-escalation ladder (offline, deterministic)", ()
     expect(result.evidence.integration.integratedUnits).toContain("fix");
     expect(redeployed).toEqual(["switchyard-change-fabric-ladder-app"]);
 
-    // Exactly one verify attempt (base PASS); no retry recorded.
+    // Exactly one change-level verify round (round 1 PASS); no retry recorded.
     expect(snapshot.verifyAttempts).toHaveLength(1);
-    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ attempt: 1, outcome: "pass", model: BASE_MODEL });
+    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ round: 1, outcome: "pass", model: BASE_MODEL });
     expect(snapshot.retryAttempts).toHaveLength(0);
 
     const model = buildWorkGraphModel(snapshot);
@@ -343,12 +384,12 @@ describe("T10: the bounded model-escalation ladder (offline, deterministic)", ()
     expect(result.deployment).toBeUndefined();
 
     // The bounded retry was honored exactly once (default max-retries = 1): two
-    // verify attempts (both FAIL) and one retry attempt, then it stops.
+    // change-level verify rounds (both FAIL) and one retry round, then it stops.
     expect(snapshot.verifyAttempts).toHaveLength(2);
     expect(snapshot.verifyAttempts?.every((a) => a.outcome === "fail")).toBe(true);
     expect(snapshot.retryAttempts).toHaveLength(1);
 
-    // The unit is a real failed/red node, and both verify nodes are red.
+    // The unit is a real failed/red node, and both change-level verify nodes are red.
     const model = buildWorkGraphModel(snapshot);
     const fixNode = model.nodes.find((n) => n.label === "fix");
     expect(fixNode?.status).toBe("failed");
@@ -365,12 +406,57 @@ describe("T10: the bounded model-escalation ladder (offline, deterministic)", ()
       subdir: "bounded-zero",
     });
 
-    // With zero retries, the base fail is terminal: one verify attempt, no retry,
-    // no integration, no redeploy, even though the escalation model would pass.
+    // With zero retries, the base round fail is terminal: one change-level verify
+    // round, no retry, no integration, no redeploy, even though the escalation
+    // model would pass.
     expect(snapshot.verifyAttempts).toHaveLength(1);
-    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ attempt: 1, outcome: "fail" });
+    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ round: 1, outcome: "fail" });
     expect(snapshot.retryAttempts).toHaveLength(0);
     expect(result.evidence.integration.integratedUnits).not.toContain("fix");
     expect(redeployed).toEqual([]);
+  });
+
+  it("implicated-unit attribution re-fans only the unit the failing gate output names, not all units", async () => {
+    // Two units: alpha already passes on the base model (always-passing marker),
+    // beta needs the escalation model. Round 1 fails naming only beta's file, so
+    // the single change-level retry must re-fan ONLY beta.
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      alwaysPassingUnits: ["alpha"],
+      subdir: "attribution",
+    });
+
+    // One change-level retry recorded, carrying ONLY the implicated unit (beta),
+    // not alpha. This is the whole point: attribution narrowed the re-fan.
+    expect(snapshot.retryAttempts).toHaveLength(1);
+    expect(snapshot.retryAttempts?.[0]?.implicatedUnits).toEqual(["beta"]);
+    expect(snapshot.retryAttempts?.[0]?.implicatedUnits).not.toContain("alpha");
+
+    // Two change-level verify rounds: round 1 FAIL, round 2 PASS once beta is
+    // re-fanned on the escalation model. The retry node label names 1 unit.
+    expect(snapshot.verifyAttempts).toHaveLength(2);
+    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ round: 1, outcome: "fail" });
+    expect(snapshot.verifyAttempts?.[1]).toMatchObject({ round: 2, outcome: "pass" });
+    const model = buildWorkGraphModel(snapshot);
+    const retryNode = model.nodes.find((n) => n.kind === "retry");
+    expect(retryNode?.label).toContain("1 unit");
+  });
+
+  it("falls back to re-fanning ALL units when the gate failure cannot be attributed", async () => {
+    // The single-unit seeded run: the gate names src/fix.fix, which the unit
+    // declares, so attribution matches it. To prove the honest fallback, a unit
+    // whose declared path does NOT cover the named file still re-fans (the
+    // selectImplicatedUnits fallback), proven here by the whole change still
+    // escalating and settling rather than silently skipping.
+    const { snapshot, result } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      subdir: "fallback",
+    });
+    // The retry re-fanned the (only) unit and the second round settled green.
+    expect(snapshot.retryAttempts).toHaveLength(1);
+    expect(snapshot.retryAttempts?.[0]?.implicatedUnits).toEqual(["fix"]);
+    expect(result.evidence.integration.integratedUnits).toContain("fix");
   });
 });

@@ -181,44 +181,50 @@ export interface LeaseEdge {
 export type VerifyOutcome = "pass" | "fail";
 
 /**
- * One recorded VERIFY attempt for a WorkUnit: a single mechanical run of the
- * per-app behavioral gate against the candidate edit that attempt produced. It
- * is the honest backing for a `verify` graph node, so a verify node always maps
- * to a real recorded gate run. The attempt number is 1 for the base model run
- * and increments for each escalation retry; the model id is the model that
- * produced the edit this run graded (never the verifier itself, which is
- * mechanical). The evidence is the bounded gate output on a failure, kept so the
- * retry prompt and the console can show WHY the attempt failed.
+ * One recorded CHANGE-LEVEL VERIFY attempt: a single mechanical run of the
+ * per-app behavioral gate against the integrated change after a wave completed.
+ * The ladder is change-level, so there is one attempt per round (round 1 after
+ * the kickoff wave, round 2 after the implicated-unit retry), not one per unit.
+ * It is the honest backing for a `verify` graph node, so a verify node always
+ * maps to a real recorded gate run. The model id is the model that produced the
+ * edits this round graded (never the verifier itself, which is mechanical). The
+ * failing output is the bounded gate output on a failure, kept so the retry
+ * prompt and the console can show WHY the round failed, and the gate command is
+ * kept so the console can show exactly what ran.
  */
 export interface VerifyAttempt {
-  readonly unitId: string;
-  /** 1 for the base attempt, 2 for the first escalation retry, and so on. */
-  readonly attempt: number;
+  /** 1 for the first verify after the kickoff wave, 2 after the retry wave. */
+  readonly round: number;
   readonly outcome: VerifyOutcome;
-  /** The model id whose edit this run graded (empty for a deterministic edit). */
+  /** The model id whose edits this round graded (empty for a deterministic run). */
   readonly model: string;
-  /** Bounded gate evidence (summary/stderr) when the attempt failed. */
-  readonly evidence?: string;
+  /** The gate command (argv joined) that was run for this round. */
+  readonly gateCommand?: string;
+  /** Bounded real gate failing output (stderr/stdout) when the round failed. */
+  readonly failingOutput?: string;
   readonly at: string;
 }
 
 /**
- * One recorded model-escalation RETRY for a WorkUnit: after a verify-fail, the
- * ladder ran another attempt on a stronger model, fed the failing evidence. It
- * is the honest backing for a `retry` graph node and the `model-escalation`
- * edge, so neither can be drawn without a real recorded retry. It names the
- * model the previous attempt used and the escalation model this retry ran, so
- * the console shows the base to escalation hop truthfully. This is wholly
- * separate from the human-escalation `escalated` flag.
+ * One recorded CHANGE-LEVEL model-escalation RETRY: after a change-level
+ * verify-fail, the ladder re-fanned the IMPLICATED units on a stronger model,
+ * fed the failing evidence. The ladder is change-level, so there is one retry
+ * per round carrying the units it re-fanned. It is the honest backing for a
+ * `retry` graph node and the `model-escalation` edge, so neither can be drawn
+ * without a real recorded retry. It names the model the previous round used and
+ * the escalation model this retry ran, so the console shows the base to
+ * escalation hop truthfully. This is wholly separate from the human-escalation
+ * `escalated` flag.
  */
 export interface RetryAttempt {
-  readonly unitId: string;
-  /** The attempt number this retry produced (2 for the first retry). */
-  readonly attempt: number;
-  /** The model the previous (failed) attempt used. */
+  /** The verify round this retry produced edits for (2 for the first retry). */
+  readonly round: number;
+  /** The model the previous (failed) round used. */
   readonly fromModel: string;
-  /** The stronger model this retry escalated to. */
+  /** The stronger model this retry escalated the implicated units to. */
   readonly toModel: string;
+  /** The unit ids re-fanned on the escalation model (the implicated units). */
+  readonly implicatedUnits: readonly string[];
   /** A short, human-readable reason the ladder escalated (never a secret). */
   readonly reason: string;
   readonly at: string;
@@ -277,16 +283,18 @@ export interface ChangeStateView {
    */
   readonly deployment?: DeploymentRecord;
   /**
-   * The mechanical verify attempts recorded for this Change's units: each is one
-   * real run of the per-app gate against a candidate edit. They back the graph's
-   * `verify` nodes, so a verify node always maps to a real recorded gate run.
+   * The CHANGE-LEVEL mechanical verify attempts recorded for this Change: each
+   * is one real run of the per-app gate against the integrated change after a
+   * wave, keyed by round. They back the graph's `verify` nodes, so a verify node
+   * always maps to a real recorded gate run.
    */
   readonly verifyAttempts: readonly VerifyAttempt[];
   /**
-   * The model-escalation retries recorded for this Change's units: each is one
-   * bounded retry on a stronger model fed the failing evidence. They back the
-   * graph's `retry` nodes and `model-escalation` edges, and are kept wholly
-   * separate from the human-escalation `escalated` flag.
+   * The CHANGE-LEVEL model-escalation retries recorded for this Change: each is
+   * one re-fan of the implicated units on a stronger model fed the failing
+   * evidence, keyed by round. They back the graph's `retry` nodes and
+   * `model-escalation` edges, and are kept wholly separate from the
+   * human-escalation `escalated` flag.
    */
   readonly retryAttempts: readonly RetryAttempt[];
 }
@@ -811,26 +819,25 @@ export class ChangeState extends DurableObject<Env> {
   }
 
   /**
-   * Record one mechanical VERIFY attempt for a WorkUnit: a single run of the
-   * per-app behavioral gate against the candidate edit. This is the real backing
-   * for a `verify` graph node, so a verify node can only exist once this record
-   * does. The unit must exist; the evidence is bounded and secret-stripped. The
-   * verifier is mechanical on every attempt (base and escalation alike), so this
-   * record is the ground-truth verdict, never the model grading itself.
+   * Record one mechanical CHANGE-LEVEL VERIFY attempt: a single run of the
+   * per-app behavioral gate against the integrated change for one ladder round.
+   * This is the real backing for a `verify` graph node, so a verify node can
+   * only exist once this record does. The gate command and the failing output
+   * are bounded and secret-stripped. The verifier is mechanical on every round
+   * (base and escalation alike), so this record is the ground-truth verdict,
+   * never the model grading itself.
    */
   async recordVerifyAttempt(input: Omit<VerifyAttempt, "at">): Promise<VerifyAttempt> {
-    const change = await this.loadChange();
-    if (!change.work.some((unit) => unit.id === input.unitId)) {
-      throw new Error(`unknown WorkUnit: ${input.unitId}`);
-    }
     const attempts = await this.loadVerifyAttempts();
     const stored: VerifyAttempt = {
-      unitId: input.unitId,
-      attempt: Number.isFinite(input.attempt) && input.attempt > 0 ? Math.floor(input.attempt) : 1,
+      round: Number.isFinite(input.round) && input.round > 0 ? Math.floor(input.round) : 1,
       outcome: input.outcome === "pass" ? "pass" : "fail",
       model: typeof input.model === "string" ? input.model.slice(0, 120) : "",
-      ...(typeof input.evidence === "string" && input.evidence !== ""
-        ? { evidence: sanitizeText(input.evidence, MAX_DETAIL_TEXT) }
+      ...(typeof input.gateCommand === "string" && input.gateCommand !== ""
+        ? { gateCommand: sanitizeText(input.gateCommand, 500) }
+        : {}),
+      ...(typeof input.failingOutput === "string" && input.failingOutput !== ""
+        ? { failingOutput: sanitizeText(input.failingOutput, MAX_DETAIL_TEXT) }
         : {}),
       at: new Date().toISOString(),
     };
@@ -840,24 +847,28 @@ export class ChangeState extends DurableObject<Env> {
   }
 
   /**
-   * Record one model-escalation RETRY for a WorkUnit: after a verify-fail, the
-   * ladder ran another attempt on a stronger model fed the failing evidence.
-   * This is the real backing for a `retry` graph node and the `model-escalation`
-   * edge. It is wholly separate from the human-escalation `escalated` flag, so
-   * recording a retry never lights that flag. The unit must exist; the reason is
-   * bounded and secret-stripped.
+   * Record one CHANGE-LEVEL model-escalation RETRY: after a change-level
+   * verify-fail, the ladder re-fanned the implicated units on a stronger model
+   * fed the failing evidence. This is the real backing for a `retry` graph node
+   * and the `model-escalation` edge. It is wholly separate from the
+   * human-escalation `escalated` flag, so recording a retry never lights that
+   * flag. Every implicated unit must exist in the Change; the reason is bounded
+   * and secret-stripped.
    */
   async recordRetryAttempt(input: Omit<RetryAttempt, "at">): Promise<RetryAttempt> {
     const change = await this.loadChange();
-    if (!change.work.some((unit) => unit.id === input.unitId)) {
-      throw new Error(`unknown WorkUnit: ${input.unitId}`);
+    const implicated = Array.isArray(input.implicatedUnits) ? input.implicatedUnits : [];
+    for (const unitId of implicated) {
+      if (!change.work.some((unit) => unit.id === unitId)) {
+        throw new Error(`unknown implicated WorkUnit: ${unitId}`);
+      }
     }
     const attempts = await this.loadRetryAttempts();
     const stored: RetryAttempt = {
-      unitId: input.unitId,
-      attempt: Number.isFinite(input.attempt) && input.attempt > 1 ? Math.floor(input.attempt) : 2,
+      round: Number.isFinite(input.round) && input.round > 1 ? Math.floor(input.round) : 2,
       fromModel: typeof input.fromModel === "string" ? input.fromModel.slice(0, 120) : "",
       toModel: typeof input.toModel === "string" ? input.toModel.slice(0, 120) : "",
+      implicatedUnits: implicated.map((u) => String(u)),
       reason: sanitizeReason(input.reason),
       at: new Date().toISOString(),
     };
