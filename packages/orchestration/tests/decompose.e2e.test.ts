@@ -196,3 +196,61 @@ describe("G2: cohesion-aware module decomposition over the real service-api app"
     expect(result.leasePlan.needsAttention).toBe(false);
   });
 });
+
+describe("the blueprint (frozen contracts) survives the spec YAML round-trip the live run uses", () => {
+  it("serializes blueprint.contracts into the spec and parses them back, so a Worker-reconstructed Change keeps the frozen seams", async () => {
+    const serviceGoal = (await readFile(SERVICE_GOAL_FILE, "utf8")).trim();
+    const decomposition = await decomposeGoal({ goal: serviceGoal, projectDir: SERVICE_API });
+
+    // The in-memory decomposed Change carries the blueprint (G2 proves this).
+    expect(decomposition.change.blueprint).toBeDefined();
+    const inMemoryContracts = decomposition.change
+      .blueprint!.contracts.map((c) => c.path)
+      .sort();
+    expect(inMemoryContracts).toEqual([
+      "src/contracts/auth.js",
+      "src/contracts/response.js",
+    ]);
+
+    // The live run POSTs this spec YAML to the Worker, which reconstructs the
+    // Change by parsing it. BEFORE the fix the blueprint was not serialized, so
+    // the reconstructed Change had blueprint undefined and the run's frozen
+    // contracts came out empty. Prove the blueprint now rides the YAML.
+    const specYaml = changeToSpecYaml(decomposition.change);
+    expect(specYaml).toContain("blueprint:");
+    expect(specYaml).toContain("src/contracts/auth.js");
+    expect(specYaml).toContain("src/contracts/response.js");
+
+    const { parseChangeSpec } = await import("@switchyard-change/change-core");
+    const reconstructed = parseChangeSpec(specYaml);
+
+    // The Worker-side (reconstructed) Change carries the blueprint, so the live
+    // run's `frozenContracts = change.blueprint.contracts.map(c => c.path)` is
+    // NON-EMPTY and includes both frozen read-only seam files.
+    expect(reconstructed.blueprint).toBeDefined();
+    const frozenContracts = (reconstructed.blueprint?.contracts ?? [])
+      .map((c) => c.path)
+      .sort();
+    expect(frozenContracts.length).toBeGreaterThan(0);
+    expect(frozenContracts).toEqual([
+      "src/contracts/auth.js",
+      "src/contracts/response.js",
+    ]);
+
+    // The module ownership also rides the round-trip (unit ids + owned paths),
+    // so the prompt's module-ownership context survives too.
+    const reModules = reconstructed.blueprint?.modules ?? [];
+    expect(reModules.length).toBeGreaterThan(0);
+    const ownedFiles = reModules.flatMap((m) => [...m.paths]).sort();
+    expect(ownedFiles).toEqual([
+      "src/resources/auth.js",
+      "src/resources/notifications.js",
+      "src/resources/orders.js",
+      "src/resources/products.js",
+      "src/resources/search.js",
+      "src/resources/users.js",
+    ]);
+    // The round-tripped frozen contracts match the in-memory ones exactly.
+    expect(frozenContracts).toEqual(inMemoryContracts);
+  });
+});

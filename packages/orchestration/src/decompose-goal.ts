@@ -112,6 +112,41 @@ export function changeToSpecYaml(change: Change): string {
       lines.push(`      - ${quote(path)}`);
     }
   }
+  // Serialize the cohesion blueprint when the Change carries one, so the frozen
+  // read-only contracts and the module ownership survive the spec round-trip to
+  // the Worker (which reconstructs the Change from this YAML). Without this the
+  // Worker-side Change would have no blueprint, so the live run's frozen-contract
+  // list would be empty and the agents would never be told which files are the
+  // frozen read-only seams. The loader parses these keys back into the blueprint.
+  if (change.blueprint) {
+    const { modules, contracts } = change.blueprint;
+    lines.push("blueprint:");
+    if (modules.length > 0) {
+      lines.push("  modules:");
+      for (const module of modules) {
+        lines.push(`    - unit_id: ${quote(module.unitId)}`);
+        if (module.paths.length > 0) {
+          lines.push("      paths:");
+          for (const path of module.paths) {
+            lines.push(`        - ${quote(path)}`);
+          }
+        }
+        if (module.dependsOn.length > 0) {
+          lines.push("      depends_on:");
+          for (const dep of module.dependsOn) {
+            lines.push(`        - ${quote(dep)}`);
+          }
+        }
+      }
+    }
+    if (contracts.length > 0) {
+      lines.push("  contracts:");
+      for (const contract of contracts) {
+        lines.push(`    - path: ${quote(contract.path)}`);
+        lines.push(`      imported_by_count: ${contract.importedByCount}`);
+      }
+    }
+  }
   return lines.join("\n");
 }
 

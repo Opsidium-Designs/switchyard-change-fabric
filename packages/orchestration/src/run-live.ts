@@ -397,6 +397,24 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   const worktreeRoot = join(workRoot, "worktrees");
   await mkdir(worktreeRoot, { recursive: true });
 
+  // Make the app's shared gate harness resolvable inside every composed worktree
+  // the gate runs in. An app's per-app gate test lives at `<app>/gate/*.test.mjs`
+  // and may import a SHARED helper one level above the app directory (for
+  // example `import ... from "../../gate-harness.mjs"`). The worktrees the gate
+  // runs in are seeded from the app project directory ALONE (the per-unit verify
+  // clone, the integrator's integration checkout, and the change-level ladder
+  // overlay are all created directly under `worktreeRoot`), so that sibling file
+  // lives OUTSIDE the copied tree and `node --test gate/gate.test.mjs` would fail
+  // to resolve its import (ERR_MODULE_NOT_FOUND) before any assertion runs.
+  //
+  // Copy the app project's sibling shared `.mjs` files into `worktreeRoot` once,
+  // so a gate test at `<worktreeRoot>/<worktree>/gate/gate.test.mjs` resolves
+  // `../../gate-harness.mjs` to `<worktreeRoot>/gate-harness.mjs`. This is
+  // app-agnostic (it copies whatever shared `.mjs` siblings the app dir has, not
+  // a service-api-specific file) and preserves the gate's authoring unchanged, so
+  // the gate fails only on real assertions, never on a missing module.
+  await materializeSiblingGateDeps(options.projectDir, worktreeRoot);
+
   const post = async (path: string, body?: unknown, contentType = "application/json") => {
     const res = await fetchFn(`${base}${path}`, {
       method: "POST",
@@ -1790,6 +1808,52 @@ async function seedFromProject(
   } finally {
     await rm(work, { recursive: true, force: true });
   }
+}
+
+/**
+ * Materialize an app's SHARED gate dependencies so its per-app gate resolves
+ * inside a composed worktree. An app under a shared apps directory keeps its
+ * per-app gate test at `<app>/gate/*.test.mjs` and may import a shared helper
+ * one directory ABOVE the app (for example `../../gate-harness.mjs`). The
+ * worktrees the gate runs in are seeded from the app directory alone and are
+ * created directly under `parentDir`, so a gate test at
+ * `<parentDir>/<worktree>/gate/gate.test.mjs` resolves `../../gate-harness.mjs`
+ * to `<parentDir>/gate-harness.mjs`. Copying the app's sibling shared `.mjs`
+ * files into `parentDir` therefore makes that import resolve for ANY app that
+ * follows this shared-harness layout, without editing the gate or the app.
+ *
+ * It copies only top-level `.mjs` files that sit BESIDE the app directory (the
+ * shared seam helpers), never the app dir itself or anything deeper, so it does
+ * not drag unrelated apps or large trees into the worktree parent. A missing
+ * sibling directory, or a project directory with no parent (a repo-root target),
+ * is a no-op: an app with no shared sibling simply needs nothing copied.
+ */
+async function materializeSiblingGateDeps(projectDir: string, parentDir: string): Promise<void> {
+  const { readdir, copyFile } = await import("node:fs/promises");
+  const { resolve, dirname, join: joinPath } = await import("node:path");
+  const appDir = resolve(projectDir);
+  const siblingDir = dirname(appDir);
+  if (siblingDir === appDir) {
+    // projectDir is a filesystem root; there is no sibling directory to read.
+    return;
+  }
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await readdir(siblingDir, { withFileTypes: true });
+  } catch {
+    // No readable parent directory: nothing shared to materialize.
+    return;
+  }
+  await Promise.all(
+    entries
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".mjs"))
+      .map((entry) =>
+        copyFile(joinPath(siblingDir, entry.name), joinPath(parentDir, entry.name)).catch(() => {
+          // Best-effort: a copy that fails leaves the gate to fail honestly with
+          // its own resolution error rather than masking it here.
+        }),
+      ),
+  );
 }
 
 /**

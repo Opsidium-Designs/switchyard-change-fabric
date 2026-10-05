@@ -27,7 +27,14 @@
 
 import { parse as parseYaml } from "yaml";
 
-import type { AssuranceLevel, Change, WorkUnit } from "./types.ts";
+import type {
+  AssuranceLevel,
+  Change,
+  ChangeBlueprint,
+  ChangeBlueprintContract,
+  ChangeBlueprintModule,
+  WorkUnit,
+} from "./types.ts";
 
 /** Thrown when a Change spec is malformed or inconsistent. */
 export class ChangeSpecError extends Error {
@@ -73,7 +80,89 @@ export function normalizeChange(doc: unknown): Change {
   assertUniqueIds(work);
   assertKnownDependencies(work);
 
-  return { id, objective, baseline, budgetUsd, assurance, work };
+  const blueprint = parseBlueprint(doc["blueprint"], work);
+  return {
+    id,
+    objective,
+    baseline,
+    budgetUsd,
+    assurance,
+    work,
+    ...(blueprint ? { blueprint } : {}),
+  };
+}
+
+/**
+ * Parse the optional cohesion blueprint carried on a Change spec. The blueprint
+ * is the module boundaries and the frozen read-only contracts at the seams,
+ * expressed in terms of the Change's own WorkUnit ids. It is OPTIONAL: a
+ * hand-authored or non-modular Change omits it, in which case this returns
+ * undefined and the Change simply carries no blueprint. When present it is
+ * validated so a malformed blueprint is rejected with a clear error rather than
+ * silently dropped, which keeps the frozen contracts honest once they survive
+ * the spec round-trip (the live run reads blueprint.contracts to tell the agents
+ * which files are the frozen read-only seams).
+ */
+function parseBlueprint(
+  value: unknown,
+  work: readonly WorkUnit[],
+): ChangeBlueprint | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!isRecord(value)) {
+    throw new ChangeSpecError("blueprint must be a mapping when present");
+  }
+  const knownUnitIds = new Set(work.map((unit) => unit.id));
+  const modules = parseBlueprintModules(value["modules"], knownUnitIds);
+  const contracts = parseBlueprintContracts(value["contracts"]);
+  return { modules, contracts };
+}
+
+function parseBlueprintModules(
+  value: unknown,
+  knownUnitIds: ReadonlySet<string>,
+): readonly ChangeBlueprintModule[] {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new ChangeSpecError("blueprint.modules must be a list when present");
+  }
+  return value.map((item, index) => {
+    if (!isRecord(item)) {
+      throw new ChangeSpecError(`blueprint.modules[${index}] must be a mapping`);
+    }
+    const unitId = requireString(item, "unit_id", `blueprint.modules[${index}]`);
+    if (!knownUnitIds.has(unitId)) {
+      throw new ChangeSpecError(
+        `blueprint.modules[${index}] names unknown WorkUnit id: ${unitId}`,
+      );
+    }
+    const paths = parseStringList(item["paths"], `blueprint.modules[${index}].paths`);
+    const dependsOn = parseStringList(
+      item["depends_on"],
+      `blueprint.modules[${index}].depends_on`,
+    );
+    return { unitId, paths, dependsOn };
+  });
+}
+
+function parseBlueprintContracts(value: unknown): readonly ChangeBlueprintContract[] {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new ChangeSpecError("blueprint.contracts must be a list when present");
+  }
+  return value.map((item, index) => {
+    if (!isRecord(item)) {
+      throw new ChangeSpecError(`blueprint.contracts[${index}] must be a mapping`);
+    }
+    const path = requireString(item, "path", `blueprint.contracts[${index}]`);
+    const importedByCount = optionalNumber(item, "imported_by_count") ?? 0;
+    return { path, importedByCount };
+  });
 }
 
 function parseWorkUnit(item: unknown, index: number): WorkUnit {
