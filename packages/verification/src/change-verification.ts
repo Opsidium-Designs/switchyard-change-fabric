@@ -75,6 +75,25 @@ export interface VerifyAndIntegrateOptions {
   readonly integrationToken: string;
   /** The final test command run over the combined workspace, as argv. */
   readonly finalTestCommand?: readonly string[];
+  /**
+   * The per-app BEHAVIORAL gate command to run over the INTEGRATED tree, as
+   * argv. When supplied, it is the AUTHORITATIVE verdict: it runs on the exact
+   * combined tree the integrator produces, pushes, and promotion then clones and
+   * deploys (baseline + verified units, with yielded contested paths and every
+   * excluded unit removed), so the gated composition is identical to the
+   * promoted/deployed composition. A pass therefore means the SHIPPED artifact is
+   * fixed. Prefer this over `finalTestCommand` for app changes.
+   */
+  readonly integrationGateCommand?: readonly string[];
+  /**
+   * True when the integrated tree MUST satisfy the per-app behavioral gate. When
+   * true and no `integrationGateCommand` is supplied, the integration verdict is
+   * FAILED (absence of a required gate is cannot-pass, never auto-pass). The
+   * driver sets this automatically when any completed unit required an app gate,
+   * so a change whose fix depends on an app gate can never green a tree that
+   * cannot be gated.
+   */
+  readonly requiresIntegrationGate?: boolean;
   readonly workRoot?: string;
   readonly identity?: GitIdentity;
 }
@@ -120,6 +139,14 @@ export class ChangeVerification {
    * A waiter's contested files are then kept out of integration so the owner is
    * the only contributor, which turns a would-be silent merge collision into a
    * coordinated single-writer result.
+   *
+   * The authoritative verdict is the per-app behavioral gate run on the
+   * INTEGRATED tree (after lease yields and unit exclusions), which is the exact
+   * tree the integrator pushes and promotion deploys. Running the gate there, not
+   * on a separate overlay, guarantees the gated composition is identical to the
+   * promoted/deployed composition, so a pass means the shipped artifact is fixed.
+   * When the integrated tree requires an app gate but none is available, the
+   * integration verdict is FAILED (absence is cannot-pass, never a green).
    */
   async verifyAndIntegrate(options: VerifyAndIntegrateOptions): Promise<EvidenceSummary> {
     const { change, completed } = options;
@@ -173,12 +200,30 @@ export class ChangeVerification {
       }
     }
 
+    // The integrated tree requires the authoritative app gate when any completed
+    // unit required a per-app gate (or the caller forced it). This drives the
+    // honesty invariant in the integrator: a tree that depends on an app gate but
+    // has none cannot green. A unit's gate command is per-app, so when the caller
+    // did not pass an explicit `integrationGateCommand` we fall back to the first
+    // app-gate command any completed unit declared, since every app unit shares
+    // the one per-app gate.
+    const unitGateCommand = completed.find(
+      (c) => c.appGateCommand && c.appGateCommand.length > 0,
+    )?.appGateCommand;
+    const requiresIntegrationGate =
+      options.requiresIntegrationGate ?? completed.some((c) => c.requiresAppGate === true);
+    const integrationGateCommand = options.integrationGateCommand ?? unitGateCommand;
+
     const integration: IntegrationResult = await this.integrator.integrate({
       integrationRef: options.integrationRef,
       integrationToken: options.integrationToken,
       verified: verifiedWorkspaces,
       excludedUnits,
       finalTestCommand: options.finalTestCommand,
+      ...(integrationGateCommand && integrationGateCommand.length > 0
+        ? { integrationGateCommand }
+        : {}),
+      requiresIntegrationGate,
       workRoot,
       identity: options.identity,
     });

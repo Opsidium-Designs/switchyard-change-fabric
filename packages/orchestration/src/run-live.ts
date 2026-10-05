@@ -709,23 +709,33 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   const effectiveChange = effectiveChangeFromState(options.change, grownState);
 
   // T6: the bounded, verify-verdict-driven CHANGE-LEVEL model-escalation ladder.
-  // After the wave completed and its work is integrated into one worktree, run
-  // the per-app gate ONCE for the whole change (round 1, a `verify` node hung
-  // off the goal). On a change-level verify-FAIL, if a stronger escalation model
-  // and a retry budget remain, identify the IMPLICATED units (those whose
-  // declared paths cover the file[s] named in the failing gate output; falling
-  // back to ALL units when the failure cannot be attributed), re-fan ONLY those
-  // units on the escalation model fed the failing evidence (a `retry` node + a
-  // `model-escalation` edge carrying the implicated units), push their new
-  // edits, and re-run the gate ONCE more (round 2, a second `verify` node). The
-  // second verify settles success or failure. This is bounded by the max-retries
-  // dial (default 1, kept N-capable) and is a DIFFERENT axis from the executor's
-  // transport fallback: it fires on a mechanical gate verdict, never on a thrown
-  // call. When the change never passes the gate, every gated unit is marked
-  // FAILED (real red nodes) and kept out of integration, so a non-fixing or
-  // broken change can never green or redeploy. The verifier is mechanical on
-  // every round (the escalation model gets another round, it never grades
-  // itself).
+  // After the wave completed, run the per-app gate ONCE for the whole change
+  // (round 1, a `verify` node hung off the goal). On a change-level verify-FAIL,
+  // if a stronger escalation model and a retry budget remain, identify the
+  // IMPLICATED units (those whose declared paths cover the file[s] named in the
+  // failing gate output; falling back to ALL units when the failure cannot be
+  // attributed), re-fan ONLY those units on the escalation model fed the failing
+  // evidence (a `retry` node + a `model-escalation` edge carrying the implicated
+  // units), push their new edits, and re-run the gate ONCE more (round 2, a
+  // second `verify` node). This is bounded by the max-retries dial (default 1,
+  // kept N-capable) and is a DIFFERENT axis from the executor's transport
+  // fallback: it fires on a mechanical gate verdict, never on a thrown call.
+  //
+  // HONESTY NOTE on which composition the ladder gates: the ladder's per-round
+  // gate runs over an ADVISORY naive overlay (baseline + every gated unit's
+  // changed files) only to decide whether to RETRY/escalate. It is NOT the thing
+  // that declares final success, because that overlay is NOT the tree that
+  // ships: the authoritative integrator applies write-lease coordination
+  // (yielded contested paths and excluded units are removed), so the promoted
+  // tree can differ from this overlay. Final success is settled later by running
+  // the SAME per-app gate on the real INTEGRATED tree inside verifyAndIntegrate
+  // (see completedInputs below, which carry appGateCommand/requiresAppGate so the
+  // integrator gates the exact tree it promotes). That guarantees the gated
+  // composition equals the promoted/deployed composition. When the ladder never
+  // passes its advisory overlay, every gated unit is marked FAILED (real red
+  // nodes) and kept out of integration, so a non-fixing or broken change can
+  // never green or redeploy. The verifier is mechanical on every round (the
+  // escalation model gets another round, it never grades itself).
   const gateCommandRunner = options.verifyCommandRunner;
   const maxModelRetries = Math.max(0, Math.floor(options.maxModelRetries ?? 1));
   const escalationModel = (options.escalationModel ?? "").trim();

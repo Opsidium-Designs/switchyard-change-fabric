@@ -64,6 +64,26 @@ export interface IntegrateOptions {
   readonly excludedUnits: readonly string[];
   /** The final test command to run over the combined result, as argv. */
   readonly finalTestCommand?: readonly string[];
+  /**
+   * The per-app BEHAVIORAL gate command to run over the INTEGRATED tree, as
+   * argv. This is the authoritative gate: it runs on the exact combined tree the
+   * integrator produces and pushes (baseline + verified units, with each unit's
+   * yielded contested paths and every excluded unit removed), which is the same
+   * tree promotion then clones and deploys. Running the gate here guarantees the
+   * gated composition is identical to the promoted/deployed composition, so a
+   * pass means the SHIPPED artifact is fixed, not some other overlay. When
+   * supplied, this result settles the integration verdict (it takes precedence
+   * over the optional finalTestCommand).
+   */
+  readonly integrationGateCommand?: readonly string[];
+  /**
+   * True when the integrated tree MUST satisfy the per-app behavioral gate. When
+   * true and no `integrationGateCommand` is supplied, the integration verdict is
+   * FAILED (absence of a required gate is cannot-pass, never auto-pass). This is
+   * the integration-level analog of the per-unit `requiresAppGate` rule and is
+   * what makes it impossible to green a tree that cannot be gated.
+   */
+  readonly requiresIntegrationGate?: boolean;
   /** Root under which disposable worktrees are created. Defaults to OS temp. */
   readonly workRoot?: string;
   /** Deterministic committer identity for the integration commit. */
@@ -97,6 +117,8 @@ export class Integrator {
       verified,
       excludedUnits,
       finalTestCommand,
+      integrationGateCommand,
+      requiresIntegrationGate,
       identity,
     } = options;
 
@@ -125,12 +147,31 @@ export class Integrator {
         ]);
       }
 
-      const finalCheck = await this.runFinalSuite(finalTestCommand, integrationDir);
+      // The AUTHORITATIVE gate. It runs the per-app behavioral gate on THIS exact
+      // integrationDir, which is the tree we just committed and pushed to the
+      // integration workspace and which promotion then clones and deploys. So the
+      // composition that is gated here is byte-for-byte the composition that
+      // promotes/deploys (baseline + verified units, with yielded contested paths
+      // and every excluded unit already removed above). This is what makes a pass
+      // mean the SHIPPED artifact is fixed, rather than some other overlay. When
+      // an integration gate is configured it SETTLES the verdict; the optional
+      // finalTestCommand remains only as a secondary check when no app gate is
+      // configured (so existing non-app callers are unchanged).
+      const finalCheck = await this.runIntegrationGate(
+        integrationGateCommand,
+        requiresIntegrationGate ?? false,
+        finalTestCommand,
+        integrationDir,
+      );
       const verdict: Verdict = finalCheck.skipped || finalCheck.passed ? "verified" : "failed";
 
       return {
         verdict,
-        integratedUnits: verified.map((u) => u.unitId),
+        // On a failed integration gate NOTHING is treated as integrated: the
+        // promoted tree did not pass, so no unit may be reported as a landed fix.
+        // This keeps the integratedUnits list honest about what actually shipped,
+        // which the redeploy guard reads to decide whether a fix landed.
+        integratedUnits: verdict === "failed" ? [] : verified.map((u) => u.unitId),
         excludedUnits: [...excludedUnits],
         finalCheck,
       };
@@ -170,6 +211,72 @@ export class Integrator {
     } finally {
       await rm(unitDir, { recursive: true, force: true });
     }
+  }
+
+  /**
+   * Run the AUTHORITATIVE per-app behavioral gate over the integrated checkout
+   * and return it as the final check. This is the gate on the promoted artifact:
+   *
+   *   - When an `integrationGateCommand` is supplied, run it on the integrated
+   *     tree. Its exit code settles the verdict (exit 0 passes, anything else
+   *     fails). This takes precedence over any finalTestCommand.
+   *   - When no gate command is supplied but the integrated tree REQUIRES one
+   *     (`requiresIntegrationGate`), FAIL honestly: absence of a required gate is
+   *     cannot-pass, never auto-pass, so a tree that cannot be gated can never
+   *     green. This is the honesty invariant at the integration level.
+   *   - Otherwise fall back to the optional finalTestCommand (or skip when none),
+   *     preserving the behavior of existing non-app callers unchanged.
+   */
+  private async runIntegrationGate(
+    gateArgv: readonly string[] | undefined,
+    requiresGate: boolean,
+    finalTestCommand: readonly string[] | undefined,
+    integrationDir: string,
+  ): Promise<CheckResult> {
+    if (gateArgv && gateArgv.length > 0) {
+      let outcome: CommandOutcome;
+      try {
+        outcome = await this.commandRunner.run(gateArgv, integrationDir);
+      } catch (error) {
+        const text = error instanceof Error ? error.message : String(error);
+        return {
+          kind: "app-gate",
+          passed: false,
+          skipped: false,
+          summary: `integration app-gate could not run over the promoted tree: ${text}`,
+          outputs: [{ stream: "summary", text }],
+        };
+      }
+      const outputs: OutputRef[] = [];
+      if (outcome.stdout.trim() !== "") {
+        outputs.push({ stream: "stdout", text: boundOutput(outcome.stdout) });
+      }
+      if (outcome.stderr.trim() !== "") {
+        outputs.push({ stream: "stderr", text: boundOutput(outcome.stderr) });
+      }
+      const ok = outcome.code === 0;
+      return {
+        kind: "app-gate",
+        passed: ok,
+        skipped: false,
+        summary: ok
+          ? "integration app-gate passed over the promoted tree (exit 0)"
+          : `integration app-gate failed over the promoted tree (exit ${outcome.code ?? "none"})`,
+        outputs,
+      };
+    }
+    if (requiresGate) {
+      // Honesty invariant: a tree that requires a gate but has none cannot pass.
+      return {
+        kind: "app-gate",
+        passed: false,
+        skipped: false,
+        summary:
+          "integrated tree requires a per-app behavioral gate but none was supplied: cannot verify the promoted artifact (absence of a gate is cannot-pass, not auto-pass)",
+        outputs: [{ stream: "summary", text: "no integration app-gate for a tree that requires one" }],
+      };
+    }
+    return this.runFinalSuite(finalTestCommand, integrationDir);
   }
 
   /** Run the final suite over the combined checkout, or skip when none set. */

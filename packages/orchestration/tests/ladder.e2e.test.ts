@@ -36,6 +36,8 @@ import { runFullLive, type DeployApp, type FullLiveEvent } from "../src/run-live
 import {
   MarkerGateRunner,
   ModelAwareExecutor,
+  SharedPathExecutor,
+  SharedPathGateRunner,
   gateCommandFor,
 } from "./ladder-fakes.ts";
 
@@ -211,6 +213,27 @@ function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWork
         app: String(b.app ?? ""),
       });
       return json({ deployment: recorded }, 201);
+    }
+    // The human escalation beat raises a lease-owner escalation on a contested
+    // shared path and (in the unattended self-resolve path) resolves it with the
+    // default owner. Delegate both to LocalChangeControl so a collision change
+    // (needed to force a write-lease yield) runs the beat exactly as live.
+    const escalate = url.pathname.match(/^\/changes\/([^/]+)\/escalations$/);
+    if (method === "POST" && escalate) {
+      const b = body() as Record<string, unknown>;
+      const escalation = control.raiseEscalation(dec(escalate[1]), {
+        kind: b.kind as "lease-owner",
+        path: b.path as string | undefined,
+        question: String(b.question),
+        options: b.options as string[] | undefined,
+      });
+      return json({ escalation }, 201);
+    }
+    const resolve = url.pathname.match(/^\/changes\/([^/]+)\/escalations\/([^/]+)\/resolve$/);
+    if (method === "POST" && resolve) {
+      const b = body() as { decision?: string };
+      const escalation = control.resolveEscalation(dec(resolve[1]), dec(resolve[2]), String(b.decision));
+      return json({ escalation });
     }
     // The ladder's CHANGE-LEVEL verify-attempt / retry-attempt routes, plus the
     // per-unit step/detail/verify-fail routes, are delegated straight to
@@ -574,5 +597,181 @@ describe("T10b: the retry round is a VISIBLE second wave (re-fan edges + per-uni
     });
     expect(executor.maxInFlight).toBe(2);
     expect([...result.evidence.integration.integratedUnits].sort()).toEqual(["one", "three", "two"]);
+  });
+});
+
+/**
+ * The HONESTY-CRITICAL divergence case. The bug this proves against: the ladder
+ * gates a NAIVE OVERLAY (baseline + every unit's changed files, no lease/exclusion
+ * handling) while the integrator promotes a WRITE-LEASE-COORDINATED tree (yielded
+ * contested paths and excluded units removed). When those two compositions differ,
+ * a pass on the overlay did NOT mean the shipped tree was fixed, so a run could
+ * report verify pass / green / redeploy while the deployed app was still broken.
+ *
+ * This change is built so the two compositions genuinely diverge:
+ *   - `blocker` and `fixer` both declare the SAME contested path (src/shared.fix),
+ *     so write-lease coordination grants ONE owner and makes the other yield it.
+ *   - `blocker` is declared first, so it is the lease OWNER and writes the NON-fix
+ *     (BROKEN_CONTENT). `fixer` is declared second, so it YIELDS the contested
+ *     path and writes the real fix (FIXED_CONTENT).
+ *   - Naive overlay (the ladder's advisory round): both edits are copied, last
+ *     writer wins, so `fixer`'s FIXED_CONTENT lands and the gate PASSES.
+ *   - Lease-coordinated integrated tree (what promotes/deploys): `fixer` yields
+ *     src/shared.fix to the owner, so its fix is STRIPPED and the shipped tree has
+ *     only `blocker`'s non-fix (or nothing), so the gate FAILS.
+ *
+ * The fix under test makes the AUTHORITATIVE verdict the per-app gate run on the
+ * real integrated tree inside verifyAndIntegrate, so this divergence now fails
+ * HONEST: the integration verdict is "failed", nothing is reported integrated,
+ * and the app is NOT redeployed. Before the fix the integrated tree was never
+ * gated (vacuous "verified"), so the overlay pass would have shipped a broken app.
+ */
+describe("T12: honesty invariant: a lease-coordinated integrated tree that diverges from the overlay fails HONEST", () => {
+  const DIVERGENCE_SPEC = `
+id: change-divergence
+objective: Two units both write the same contested file; only the yielder fixes it
+baseline: HEAD
+budget_usd: 10.00
+assurance: standard
+
+work:
+  - id: blocker
+    objective: owns the contested path, writes a non-fix
+    paths: [src/shared.fix]
+  - id: fixer
+    objective: yields the contested path, writes the real fix
+    paths: [src/shared.fix]
+`;
+
+  it("the overlay would pass but the promoted tree does not: FINAL FAIL, no redeploy", async () => {
+    const subdir = "divergence";
+    const changeId = "change-divergence";
+    const workspaces = new LocalFilesystemWorkspaceProvider({
+      rootDir: join(workRoot, subdir, "artifacts"),
+    });
+    const control = new LocalChangeControl(workspaces);
+    const { fetchFn } = fakeWorker(control, workspaces);
+    const change = parseChangeSpec(DIVERGENCE_SPEC);
+
+    const projectDir = join(workRoot, subdir, "project");
+    await seedProject(projectDir);
+
+    const events: FullLiveEvent[] = [];
+    const redeployed: string[] = [];
+    const deployApp: DeployApp = async ({ appName }) => {
+      redeployed.push(appName);
+      return { url: `https://${appName}.example.workers.dev` };
+    };
+
+    // One shared gate runner is used for BOTH the ladder's advisory overlay gate
+    // and the authoritative integrated-tree gate, so the only difference between
+    // a pass and a fail is the COMPOSITION it reads, not the gate. The executor
+    // makes `fixer` write the fix and `blocker` write the non-fix into the one
+    // shared file. maxModelRetries=0 keeps this purely about composition, not
+    // model escalation.
+    const gate = new SharedPathGateRunner();
+    const result = await runFullLive({
+      change,
+      dial: { minConcurrency: 1, maxConcurrency: 3 },
+      workerUrl: "http://w",
+      specYaml: DIVERGENCE_SPEC,
+      projectDir,
+      workRoot: join(workRoot, subdir, "run"),
+      fetchFn,
+      executor: new SharedPathExecutor("fixer"),
+      appGateCommandFor: (unitId) => gateCommandFor(unitId),
+      verifyCommandRunner: gate,
+      baseModel: BASE_MODEL,
+      escalationModel: ESCALATION_MODEL,
+      maxModelRetries: 0,
+      deployAppDir: projectDir,
+      deployAppName: "switchyard-change-fabric-divergence-app",
+      deployApp,
+      appAlreadyDeployed: async ({ appName }) => `https://${appName}.example.workers.dev`,
+      onEvent: (e) => events.push(e),
+    });
+
+    const snapshot = control.state(changeId) as ChangeStateSnapshot;
+
+    // The ladder's advisory overlay round PASSED (both edits overlaid, fixer's
+    // fix won last-writer), which is exactly the misleading signal the old code
+    // treated as final success.
+    expect(snapshot.verifyAttempts).toHaveLength(1);
+    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ round: 1, outcome: "pass" });
+
+    // But the AUTHORITATIVE verdict is the gate on the promoted/integrated tree,
+    // where fixer yielded the contested path, so the shipped tree is NOT fixed.
+    // The honesty invariant holds: integration is FAILED, nothing is reported
+    // integrated, and the app is NOT redeployed.
+    expect(result.evidence.integration.verdict).toBe("failed");
+    expect(result.evidence.integration.integratedUnits).toEqual([]);
+    expect(result.evidence.integration.finalCheck.passed).toBe(false);
+    expect(result.deployment).toBeUndefined();
+    expect(redeployed).toEqual([]);
+
+    // The run reported deploy-skipped (verdict not verified), never redeployed,
+    // so it is impossible to show green while the integrated artifact fails.
+    expect(events.some((e) => e.kind === "redeployed")).toBe(false);
+    expect(events.some((e) => e.kind === "deploy-skipped")).toBe(true);
+  });
+
+  it("honesty invariant control: when the shipped tree carries the fix, the authoritative gate passes and redeploys", async () => {
+    // The mirror case proves the fix did not just hard-fail everything: when the
+    // promoted (lease-coordinated) tree genuinely carries the fix, the
+    // authoritative gate passes and the app redeploys. Both units write the fix,
+    // so whichever one yields the contested path, the lease OWNER still
+    // contributes FIXED_CONTENT and the integrated tree is fixed. Same fakes,
+    // same gate: the pass is tied to the promoted composition being correct.
+    const subdir = "divergence-pass";
+    const changeId = "change-divergence";
+    const workspaces = new LocalFilesystemWorkspaceProvider({
+      rootDir: join(workRoot, subdir, "artifacts"),
+    });
+    const control = new LocalChangeControl(workspaces);
+    const { fetchFn } = fakeWorker(control, workspaces);
+    const change = parseChangeSpec(DIVERGENCE_SPEC);
+
+    const projectDir = join(workRoot, subdir, "project");
+    await seedProject(projectDir);
+
+    const redeployed: string[] = [];
+    const deployApp: DeployApp = async ({ appName }) => {
+      redeployed.push(appName);
+      return { url: `https://${appName}.example.workers.dev` };
+    };
+
+    const result = await runFullLive({
+      change,
+      dial: { minConcurrency: 1, maxConcurrency: 3 },
+      workerUrl: "http://w",
+      specYaml: DIVERGENCE_SPEC,
+      projectDir,
+      workRoot: join(workRoot, subdir, "run"),
+      fetchFn,
+      // Every unit writes the fix, so the promoted tree is fixed whichever one
+      // yields the contested path.
+      executor: new SharedPathExecutor("*"),
+      appGateCommandFor: (unitId) => gateCommandFor(unitId),
+      verifyCommandRunner: new SharedPathGateRunner(),
+      baseModel: BASE_MODEL,
+      escalationModel: ESCALATION_MODEL,
+      maxModelRetries: 0,
+      deployAppDir: projectDir,
+      deployAppName: "switchyard-change-fabric-divergence-app",
+      deployApp,
+      appAlreadyDeployed: async ({ appName }) => `https://${appName}.example.workers.dev`,
+    });
+
+    const snapshot = control.state(changeId) as ChangeStateSnapshot;
+    // The advisory overlay round passes too (the fix is present), but the point
+    // is the AUTHORITATIVE gate on the promoted tree, asserted below.
+    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ round: 1, outcome: "pass" });
+
+    // The promoted tree carries the fix, so the authoritative gate passes and a
+    // single owner integrates and redeploys (the yielder's contested path was
+    // stripped, but the owner provides the same fix).
+    expect(result.evidence.integration.verdict).toBe("verified");
+    expect(result.evidence.integration.integratedUnits.length).toBeGreaterThan(0);
+    expect(redeployed).toEqual(["switchyard-change-fabric-divergence-app"]);
   });
 });
