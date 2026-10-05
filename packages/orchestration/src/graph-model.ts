@@ -350,7 +350,8 @@ export type GraphEdgeKind =
   | "spawn" // an event-driven recruitment: a push recruited the target
   | "consumed-tool" // a downstream agent actually ran an agent-built tool
   | "lease" // a write-lease coordination: owner <- waiter on a contested path
-  | "model-escalation"; // a verify-fail escalated the next attempt to a stronger model
+  | "model-escalation" // a verify-fail escalated the next attempt to a stronger model
+  | "re-fan"; // a retry round re-ran an implicated unit on the escalation model
 
 /**
  * The real state element a node is backed by. Every node carries one. There is
@@ -435,6 +436,18 @@ export type EdgeBacking =
       readonly changeId: string;
       readonly round: number;
       readonly fromModel: string;
+      readonly toModel: string;
+    }
+  | {
+      // A re-fan edge is backed by a real recorded CHANGE-LEVEL retry AND a real
+      // implicated unit id that retry re-fanned: the retry round re-ran that unit
+      // on the escalation model. The edge is only drawn from the retry node to a
+      // unit the recorded retry-attempt.implicatedUnits actually names and that
+      // exists in the Change, so it is never a decorative link.
+      readonly kind: "re-fan";
+      readonly changeId: string;
+      readonly round: number;
+      readonly unitId: string;
       readonly toModel: string;
     };
 
@@ -988,6 +1001,35 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
           changeId: snapshot.id,
           round: retry.round,
           fromModel: retry.fromModel,
+          toModel: retry.toModel,
+        },
+      });
+    }
+
+    // The re-fan edges: one edge from this retry node to EACH implicated unit
+    // node it re-ran on the escalation model, so the console visibly links the
+    // retry to the agents it re-fanned (the second wave the user expected to
+    // see). Each edge is backed by the real recorded implicated unit id, and is
+    // only drawn when that unit exists in the snapshot (the retry record already
+    // validates its implicated units, but the projection stays defensive so a
+    // stale id never produces a dangling edge). Combined with the per-unit
+    // "retry round N" activity steps the runner posts, the user can SEE which
+    // units re-ran and that they ran.
+    for (const unitId of retry.implicatedUnits) {
+      const unit = snapshot.work.find((u) => u.id === unitId);
+      if (!unit) {
+        continue;
+      }
+      edges.push({
+        id: `re-fan:${snapshot.id}#${retry.round}->${unitId}`,
+        kind: "re-fan",
+        from: retryNodeId(snapshot.id, retry.round),
+        to: unitNodeId(unitId),
+        backing: {
+          kind: "re-fan",
+          changeId: snapshot.id,
+          round: retry.round,
+          unitId,
           toModel: retry.toModel,
         },
       });

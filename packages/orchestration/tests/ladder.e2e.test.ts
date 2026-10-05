@@ -80,6 +80,34 @@ work:
 `;
 
 /**
+ * A three-unit change where EVERY unit needs the escalation model (no
+ * always-passing unit), so the round-1 change-level fail names all three files
+ * and the single retry re-fans all three units at once. Used to prove the
+ * re-fan runs with BOUNDED CONCURRENCY: with a dial max of 3 and an artificial
+ * executor delay, all three re-fan calls overlap (peak in-flight = 3), where a
+ * strictly sequential loop would peak at 1. Each unit's declared path is its own
+ * marker file so attribution maps every failing file to its owning unit.
+ */
+const SPEC_THREE_UNITS = `
+id: change-ladder-three
+objective: Fix three parts; all need escalation
+baseline: HEAD
+budget_usd: 10.00
+assurance: standard
+
+work:
+  - id: one
+    objective: fix part one
+    paths: [src/one.fix]
+  - id: two
+    objective: fix part two
+    paths: [src/two.fix]
+  - id: three
+    objective: fix part three
+    paths: [src/three.fix]
+`;
+
+/**
  * An in-process fake Worker fetch backed by LocalChangeControl. It handles the
  * endpoints runFullLive touches, delegating the ladder's verify-attempt and
  * retry-attempt routes (and step/detail) straight to LocalChangeControl so the
@@ -245,6 +273,10 @@ async function runLadder(options: {
   readonly changeId?: string;
   /** Unit markers the gate always passes (to drive implicated attribution). */
   readonly alwaysPassingUnits?: readonly string[];
+  /** The dial max concurrency the run uses (also the ladder re-fan cap). */
+  readonly maxConcurrency?: number;
+  /** An artificial per-execute delay so a re-fan can overlap observably. */
+  readonly executorDelayMs?: number;
 }) {
   const spec = options.spec ?? SPEC;
   const changeId = options.changeId ?? "change-ladder";
@@ -265,15 +297,21 @@ async function runLadder(options: {
     return { url: `https://${appName}.example.workers.dev` };
   };
 
+  const maxConcurrency = options.maxConcurrency ?? 2;
+  const executor = new ModelAwareExecutor({
+    baseModel: BASE_MODEL,
+    ...(options.executorDelayMs ? { delayMs: options.executorDelayMs } : {}),
+  });
+
   const result = await runFullLive({
     change,
-    dial: { minConcurrency: 1, maxConcurrency: 2 },
+    dial: { minConcurrency: 1, maxConcurrency },
     workerUrl: "http://w",
     specYaml: spec,
     projectDir,
     workRoot: join(workRoot, options.subdir, "run"),
     fetchFn,
-    executor: new ModelAwareExecutor({ baseModel: BASE_MODEL }),
+    executor,
     // The ladder gate + escalation wiring (T6):
     appGateCommandFor: (unitId) => gateCommandFor(unitId),
     verifyCommandRunner: new MarkerGateRunner({
@@ -293,7 +331,7 @@ async function runLadder(options: {
   });
 
   const snapshot = control.state(changeId) as ChangeStateSnapshot;
-  return { result, control, snapshot, events, redeployed };
+  return { result, control, snapshot, events, redeployed, executor };
 }
 
 describe("T10: the bounded model-escalation ladder (offline, deterministic)", () => {
@@ -458,5 +496,83 @@ describe("T10: the bounded model-escalation ladder (offline, deterministic)", ()
     expect(snapshot.retryAttempts).toHaveLength(1);
     expect(snapshot.retryAttempts?.[0]?.implicatedUnits).toEqual(["fix"]);
     expect(result.evidence.integration.integratedUnits).toContain("fix");
+  });
+});
+
+describe("T10b: the retry round is a VISIBLE second wave (re-fan edges + per-unit activity steps)", () => {
+  it("links the retry node to each implicated unit it re-fanned and logs a real retry-round step on each", async () => {
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      subdir: "visible-single",
+    });
+
+    // The graph model draws a re-fan edge from the retry node to the implicated
+    // unit it re-ran, backed by the recorded implicatedUnits: the user can SEE
+    // which agent the retry re-fanned.
+    const model = buildWorkGraphModel(snapshot);
+    const retry = model.nodes.find((n) => n.kind === "retry");
+    expect(retry).toBeDefined();
+    const refan = model.edges.filter((e) => e.kind === "re-fan");
+    expect(refan).toHaveLength(1);
+    expect(refan[0]?.from).toBe(retry?.id);
+    expect(refan[0]?.to).toBe(`unit:fix`);
+    expect(refan[0]?.backing).toMatchObject({ kind: "re-fan", unitId: "fix", round: 2 });
+
+    // The implicated unit logged a REAL retry-round activity step (the second
+    // wave in its activity log), naming the round and the escalation model.
+    const fixUnit = snapshot.work.find((u) => u.id === "fix");
+    const phases = (fixUnit?.activity ?? []).map((s) => s.phase);
+    expect(phases).toContain("retrying");
+    const retryingStep = (fixUnit?.activity ?? []).find((s) => s.phase === "retrying");
+    expect(retryingStep?.message).toContain("retry round 2");
+    expect(retryingStep?.message).toContain(ESCALATION_MODEL);
+    // And a settled step once the round's re-fan committed/pushed its edit.
+    expect(phases).toContain("retried");
+  });
+
+  it("re-fans the implicated units with BOUNDED CONCURRENCY up to the dial cap, not strictly one-after-another", async () => {
+    // Three units all need escalation, so the single retry re-fans all three.
+    // With a dial max of 3 and an artificial per-execute delay, a bounded-
+    // concurrency re-fan overlaps all three calls (peak in-flight = 3), while a
+    // strictly sequential loop would peak at 1.
+    const { snapshot, executor, result } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_THREE_UNITS,
+      changeId: "change-ladder-three",
+      subdir: "concurrent",
+      maxConcurrency: 3,
+      executorDelayMs: 25,
+    });
+
+    // All three units were re-fanned in the single retry round.
+    expect(snapshot.retryAttempts).toHaveLength(1);
+    expect([...(snapshot.retryAttempts?.[0]?.implicatedUnits ?? [])].sort()).toEqual([
+      "one",
+      "three",
+      "two",
+    ]);
+    // The re-fan overlapped: the peak in-flight reached the cap (3), proving it
+    // is NOT strictly sequential. It never exceeds the cap (bounded, not
+    // unbounded parallel).
+    expect(executor.maxInFlight).toBe(3);
+    expect(executor.maxInFlight).toBeLessThanOrEqual(3);
+    // The change still settled green with every unit integrated.
+    expect([...result.evidence.integration.integratedUnits].sort()).toEqual(["one", "three", "two"]);
+  });
+
+  it("holds the re-fan to the dial cap when there are more implicated units than the cap", async () => {
+    // Same three-unit change but a dial max of 2: the re-fan may run at most 2
+    // units at once, so the peak in-flight is exactly 2 (bounded below N=3),
+    // proving the cap is honored rather than fanning all units out at once.
+    const { executor, result } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_THREE_UNITS,
+      changeId: "change-ladder-three",
+      subdir: "capped",
+      maxConcurrency: 2,
+      executorDelayMs: 25,
+    });
+    expect(executor.maxInFlight).toBe(2);
+    expect([...result.evidence.integration.integratedUnits].sort()).toEqual(["one", "three", "two"]);
   });
 });

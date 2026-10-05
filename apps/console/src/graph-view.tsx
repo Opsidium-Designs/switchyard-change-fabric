@@ -233,6 +233,13 @@ function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
       // escalation red/amber highlight, so the smarter-model hop reads as its own
       // beat and is never confused with human escalation or lease coordination.
       return { stroke: "#db61a2", dash: "7 4" };
+    case "re-fan":
+      // The re-fan beat: a retry round re-ran an implicated unit on the
+      // escalation model. Drawn as a magenta short-dashed edge from the retry
+      // node down to each unit it re-ran, so it reads as a sibling of the
+      // model-escalation hop (same magenta family) while its tighter dash marks
+      // it as the per-unit re-run rather than the base -> smarter-model hop.
+      return { stroke: "#db61a2", dash: "3 3" };
     case "dependency":
     default:
       return { stroke: "#5a6472" };

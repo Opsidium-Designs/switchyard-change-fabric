@@ -761,6 +761,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       escalationModel,
       maxModelRetries,
       baseModel: options.baseModel ?? "",
+      refanConcurrency: options.dial.maxConcurrency,
       defaultBranch: "main",
       worktreeRoot,
       identity,
@@ -989,6 +990,14 @@ interface ChangeLevelLadderInput {
   readonly maxModelRetries: number;
   /** The base model id, recorded on the round-1 verify attempt (informational). */
   readonly baseModel: string;
+  /**
+   * The bounded concurrency cap for re-fanning implicated units on a retry
+   * round. Reuses the run's dial max so a retry round completes in roughly one
+   * model-latency instead of N (each implicated unit has its own cloned
+   * worktree, so running them in parallel is safe). Never unbounded: when the
+   * dial max is absent or non-positive the ladder falls back to a small cap.
+   */
+  readonly refanConcurrency: number;
   readonly defaultBranch: string;
   readonly worktreeRoot: string;
   readonly identity: GitIdentity;
@@ -1033,6 +1042,15 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
     post,
     emit,
   } = input;
+
+  // The bounded concurrency cap for re-fanning implicated units. Reuse the run's
+  // dial max when it is a positive number; otherwise fall back to a small cap so
+  // the re-fan is never strictly sequential (slow on Workers AI) and never
+  // unbounded parallel.
+  const refanConcurrency =
+    Number.isFinite(input.refanConcurrency) && input.refanConcurrency >= 1
+      ? Math.floor(input.refanConcurrency)
+      : 3;
 
   // The per-unit worktrees the ladder clones/re-runs, created lazily and torn
   // down at the end. Each gated unit's repo is cloned once; a retry re-runs the
@@ -1126,11 +1144,31 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
         implicatedUnits: implicated.map((u) => u.unitId),
       });
 
-      // Re-fan ONLY the implicated units on the escalation model, fed the failing
-      // gate evidence. We do not escalate on a thrown call here (that is the
-      // transport axis); a genuinely unusable reply is an honest round fail that
-      // the re-verify below settles.
-      for (const unit of implicated) {
+      // Re-fan the implicated units on the escalation model, fed the failing
+      // gate evidence, with BOUNDED CONCURRENCY (never unbounded parallel). Each
+      // implicated unit has its own cloned worktree, so running them in parallel
+      // is isolation-safe: a unit's clone, executor run, commit, and push touch
+      // only that unit's repo. The cap reuses the run's dial max so a round
+      // completes in roughly one model-latency instead of N sequential calls,
+      // which matters because Workers AI is slow. We do not escalate on a thrown
+      // call here (that is the transport axis); a genuinely unusable reply is an
+      // honest round fail that the re-verify below settles.
+      //
+      // Each implicated unit also gets a real per-unit activity step recording
+      // that it re-ran in this round on the escalation model, so the console
+      // renders a visible SECOND WAVE: the unit shows a transient "retrying" step
+      // while the round runs, then a settled step once its edit is committed or
+      // the round produced no change. Combined with the re-fan edges the graph
+      // model draws from the retry node to each implicated unit, the user can SEE
+      // which agents the retry re-ran and that they ran.
+      const refanOne = async (unit: GatedUnitInput): Promise<void> => {
+        reportLadderStep(
+          post,
+          changeId,
+          unit.unitId,
+          "retrying",
+          `retry round ${nextRound} on ${escalationModel}`,
+        );
         const worktreeDir = await ensureWorktree(unit.unitId, unit.authRemote);
         try {
           await executor.execute({
@@ -1152,8 +1190,24 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             identity,
           );
           await push(worktreeDir, unit.authRemote, input.defaultBranch);
+          reportLadderStep(
+            post,
+            changeId,
+            unit.unitId,
+            "retried",
+            `retry round ${nextRound} on ${escalationModel}: pushed re-fanned edit`,
+          );
+        } else {
+          reportLadderStep(
+            post,
+            changeId,
+            unit.unitId,
+            "retried",
+            `retry round ${nextRound} on ${escalationModel}: no change produced`,
+          );
         }
-      }
+      };
+      await runBounded(implicated, refanConcurrency, refanOne);
 
       currentModel = escalationModel;
       round = nextRound;
@@ -1370,6 +1424,60 @@ async function recordVerifyAttempt(
     // DO), so the console can show WHY the round failed. Never on a pass.
     ...(passed ? {} : { failingOutput: evidence }),
   }).catch(() => {});
+}
+
+/**
+ * Record one REAL per-unit activity step for the change-level ladder (best-effort,
+ * never throws into the run). This is the same `/work/<unit>/step` route the
+ * kickoff wave posts to, so a retry round's re-fan surfaces in the unit's
+ * activity log exactly like its first-wave steps: the console renders it as a
+ * visible second wave for that unit (a transient "retrying" step while the round
+ * runs, then a settled "retried" step). The step is backed by a real re-fan
+ * action, so it is not a synthesized log line.
+ */
+function reportLadderStep(
+  post: (path: string, body?: unknown, contentType?: string) => Promise<Record<string, unknown>>,
+  changeId: string,
+  unitId: string,
+  phase: string,
+  message: string,
+): void {
+  void post(
+    `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/step`,
+    { phase, message },
+  ).catch(() => {});
+}
+
+/**
+ * Run `task` over `items` with BOUNDED concurrency: at most `limit` tasks are
+ * in flight at once, never unbounded parallel and never strictly sequential
+ * (unless the limit is 1). A small fixed pool of workers pulls from a shared
+ * cursor, so N items complete in roughly ceil(N / limit) waves of task latency.
+ * Rejections propagate (the first failure rejects the whole run) after the
+ * in-flight tasks settle, matching an awaited sequential loop's error behavior.
+ */
+async function runBounded<T>(
+  items: readonly T[],
+  limit: number,
+  task: (item: T) => Promise<void>,
+): Promise<void> {
+  const cap = Math.max(1, Math.min(Math.floor(limit) || 1, items.length || 1));
+  let cursor = 0;
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= items.length) {
+        return;
+      }
+      await task(items[index]!);
+    }
+  };
+  const workers: Promise<void>[] = [];
+  for (let i = 0; i < cap && i < items.length; i += 1) {
+    workers.push(worker());
+  }
+  await Promise.all(workers);
 }
 
 /** Fold the failing gate evidence into the escalation attempt's objective. */

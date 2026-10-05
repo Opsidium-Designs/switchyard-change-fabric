@@ -450,6 +450,11 @@ body {
    lease edge and from the human-escalation red, so the base -> smarter-model hop
    reads as its own beat in both the graph and the legend. */
 .ln-escalation { border-top-color: #db61a2; border-top-style: dashed; }
+/* The re-fan edge is the same magenta family as the model-escalation hop but a
+   tighter dotted dash, mirroring graph-view edgeStyle: it links the retry node
+   to each unit it re-ran, so the per-unit second wave reads as a sibling of the
+   base -> smarter-model hop without being confused for it. */
+.ln-refan { border-top-color: #db61a2; border-top-style: dotted; }
 
 /* --- Dial control --- */
 

@@ -662,6 +662,10 @@ function Legend() {
           the teal dotted lease edge and from the human-escalation red, so the
           base -> smarter-model hop reads as its own beat. */}
       <li><span className="line ln-escalation" /> model escalation (base to smarter model)</li>
+      {/* The re-fan edge links a retry node to each unit it re-ran on the
+          escalation model: a magenta short-dashed sibling of the escalation hop,
+          so the second wave the retry fanned out is visible per unit. */}
+      <li><span className="line ln-refan" /> re-fan (retry re-ran this unit)</li>
     </ul>
   );
 }

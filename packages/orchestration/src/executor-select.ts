@@ -6,7 +6,7 @@
  * path. For `workers-ai`, this builds the live Workers AI executor over the REST
  * transport, reading the base model from `WORKERS_AI_MODEL` (defaulting to the
  * llama-3.3-70b fast model), the verify-fail escalation model from
- * `WORKERS_AI_ESCALATION_MODEL` (defaulting to glm-5.3), and the credential from
+ * `WORKERS_AI_ESCALATION_MODEL` (defaulting to qwen2.5-coder-32b), and the credential from
  * `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`. The token is read from the
  * environment and passed into the transport closure only; it is never returned,
  * logged, or written here.
@@ -30,7 +30,7 @@ import {
  * axis from the executor's transport fallback (that fires on a thrown call, not
  * a verify verdict), so it has its own default and its own env override.
  */
-export const DEFAULT_WORKERS_AI_ESCALATION_MODEL = "@cf/zai-org/glm-5.3";
+export const DEFAULT_WORKERS_AI_ESCALATION_MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct";
 
 /** A minimal environment view, so this is testable without process.env. */
 export interface ExecutorEnv {

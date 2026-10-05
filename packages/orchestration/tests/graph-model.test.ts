@@ -428,6 +428,26 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
     });
   });
 
+  it("draws a re-fan edge from the retry node to each implicated unit it re-ran, backed by the recorded implicatedUnits", () => {
+    const model = buildWorkGraphModel(ladderSnapshot());
+    // The retry round re-ran "fix" on the escalation model, so there is one
+    // re-fan edge from the retry node to the fix unit node, visibly linking the
+    // retry to the agent it re-fanned (the second wave the user expected to see).
+    const refan = model.edges.filter((e) => e.kind === "re-fan");
+    expect(refan).toHaveLength(1);
+    expect(refan[0]?.id).toBe("re-fan:change-ladder#2->fix");
+    expect(refan[0]?.from).toBe(retryNodeId("change-ladder", 2));
+    expect(refan[0]?.to).toBe(unitNodeId("fix"));
+    // The edge is backed by the real recorded retry round + implicated unit id.
+    expect(refan[0]?.backing).toMatchObject({
+      kind: "re-fan",
+      changeId: "change-ladder",
+      round: 2,
+      unitId: "fix",
+      toModel: "escalation-model",
+    });
+  });
+
   it("renders the chain goal -> verify round 1 -> retry round 2 -> verify round 2 (round-1 edit from goal, round-2 edit from retry)", () => {
     const model = buildWorkGraphModel(ladderSnapshot());
     // round-1 verify flows from the goal (the whole change); round-2 from the retry.
@@ -494,5 +514,6 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
     expect(model.nodes.some((n) => n.kind === "verify")).toBe(false);
     expect(model.nodes.some((n) => n.kind === "retry")).toBe(false);
     expect(model.edges.some((e) => e.kind === "model-escalation")).toBe(false);
+    expect(model.edges.some((e) => e.kind === "re-fan")).toBe(false);
   });
 });

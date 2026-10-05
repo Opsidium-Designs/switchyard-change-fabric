@@ -753,13 +753,16 @@ function gateFlagFromArgs(args: readonly string[]): boolean | undefined {
  * to a whole number of retries.
  */
 function maxModelRetriesFromArgs(args: readonly string[]): number {
-  const raw = optionValue(args, "--max-model-retries");
+  // The flag wins; otherwise read WORKERS_AI_MAX_MODEL_RETRIES from the env, and
+  // fall back to 3 bounded rounds. Workers AI is slow on the larger escalation
+  // model, so more rounds trade latency for a better chance the fix lands.
+  const raw = optionValue(args, "--max-model-retries") ?? process.env.WORKERS_AI_MAX_MODEL_RETRIES;
   if (raw === undefined) {
-    return 1;
+    return 3;
   }
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) {
-    return 1;
+    return 3;
   }
   return Math.floor(n);
 }

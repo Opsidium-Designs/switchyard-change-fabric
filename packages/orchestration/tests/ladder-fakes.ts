@@ -41,6 +41,13 @@ export function markerPathFor(unitId: string): string {
 export interface ModelAwareExecutorOptions {
   /** The base model id recorded when a call runs with no per-attempt model. */
   readonly baseModel: string;
+  /**
+   * Optional artificial delay (ms) each execute awaits before writing its
+   * marker. A non-zero delay lets a bounded-concurrency re-fan overlap in-flight
+   * calls so a test can observe the peak concurrency the cap allows (a strictly
+   * sequential loop would peak at 1 regardless of the delay).
+   */
+  readonly delayMs?: number;
 }
 
 /**
@@ -50,24 +57,55 @@ export interface ModelAwareExecutorOptions {
  * that id; otherwise it records the configured base model. The edit is a real
  * file in the unit's declared scope, so path-scope verification passes and the
  * gate reads a real artifact.
+ *
+ * It also tracks concurrency deterministically: `inFlight` is the number of
+ * escalation execute calls currently running and `maxInFlight` is the peak
+ * observed. A bounded-concurrency re-fan drives `maxInFlight` up to its cap
+ * (never past it), while a strictly sequential loop keeps it at 1, so a test can
+ * assert the re-fan parallelism from these counters without any real time
+ * dependence. Only ESCALATION calls (those carrying a per-attempt
+ * `context.model`) count toward the peak, so the kickoff wave's own fan-out
+ * never pollutes the re-fan measurement.
  */
 export class ModelAwareExecutor implements ExecutorProvider {
   readonly name = "model-aware-fake";
+  /** The number of escalation (model-set) execute calls currently in flight. */
+  inFlight = 0;
+  /** The peak number of concurrently in-flight escalation execute calls. */
+  maxInFlight = 0;
   constructor(private readonly options: ModelAwareExecutorOptions) {}
 
   async execute(context: ExecutorContext): Promise<ExecutionResult> {
-    const model = (context.model ?? "").trim() || this.options.baseModel;
-    const rel = markerPathFor(context.workUnitId);
-    const abs = join(context.worktreeDir, rel);
-    await mkdir(dirname(abs), { recursive: true });
-    await writeFile(abs, `model: ${model}\n`, "utf8");
-    return {
-      status: "changed",
-      changedPaths: [rel],
-      logs: [`model-aware fake wrote ${rel} for model ${model}`],
-      cost: { usd: 0, inputTokens: 0, outputTokens: 0, model },
-      commitMessage: `WorkUnit ${context.workUnitId}: edit by ${model}`,
-    };
+    // Only an escalation retry carries a per-attempt model id; the kickoff wave
+    // runs with no model. Count re-fan concurrency only, so the kickoff wave's
+    // own fan-out does not inflate the observed peak.
+    const isEscalation = (context.model ?? "").trim() !== "";
+    if (isEscalation) {
+      this.inFlight += 1;
+      this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
+    }
+    try {
+      const delay = this.options.delayMs ?? 0;
+      if (delay > 0) {
+        await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      }
+      const model = (context.model ?? "").trim() || this.options.baseModel;
+      const rel = markerPathFor(context.workUnitId);
+      const abs = join(context.worktreeDir, rel);
+      await mkdir(dirname(abs), { recursive: true });
+      await writeFile(abs, `model: ${model}\n`, "utf8");
+      return {
+        status: "changed",
+        changedPaths: [rel],
+        logs: [`model-aware fake wrote ${rel} for model ${model}`],
+        cost: { usd: 0, inputTokens: 0, outputTokens: 0, model },
+        commitMessage: `WorkUnit ${context.workUnitId}: edit by ${model}`,
+      };
+    } finally {
+      if (isEscalation) {
+        this.inFlight -= 1;
+      }
+    }
   }
 }
 
