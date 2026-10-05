@@ -15,6 +15,9 @@
 export type {
   AssuranceLevel,
   Change,
+  ChangeBlueprint,
+  ChangeBlueprintContract,
+  ChangeBlueprintModule,
   Dependency,
   PathCollision,
   WorkGraph,
@@ -56,6 +59,13 @@ export { HeuristicGoalAnalyzer } from "./goal.ts";
 
 export type { DecomposeOptions, DecomposeResult } from "./decompose.ts";
 export { decompose, decomposeToChange } from "./decompose.ts";
+
+export type {
+  BlueprintContract,
+  BlueprintModule,
+  CohesionBlueprint,
+} from "./blueprint.ts";
+export { deriveCohesionBlueprint } from "./blueprint.ts";
 
 export type { DriveOptions, DriveTrace, DriveWave } from "./scheduler.ts";
 export { driveWorkGraph } from "./scheduler.ts";

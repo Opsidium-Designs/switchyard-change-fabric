@@ -24,7 +24,7 @@ const SKIP_DIRS = new Set([
   ".wrangler",
 ]);
 
-const TS_SOURCE_PATTERN = /\.[cm]?tsx?$/i;
+const SOURCE_PATTERN = /\.[cm]?[jt]sx?$/i;
 
 /** Read a project directory into a sorted list of TypeScript RepoFile entries. */
 export async function scanRepoFiles(projectDir: string): Promise<RepoFile[]> {
@@ -55,7 +55,7 @@ async function walk(root: string, dir: string, out: RepoFile[]): Promise<void> {
       await walk(root, join(dir, entry.name), out);
       continue;
     }
-    if (!entry.isFile() || !TS_SOURCE_PATTERN.test(entry.name)) {
+    if (!entry.isFile() || !SOURCE_PATTERN.test(entry.name)) {
       continue;
     }
     const abs = join(dir, entry.name);

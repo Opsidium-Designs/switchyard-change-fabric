@@ -38,6 +38,45 @@ export interface Change {
   readonly budgetUsd: number;
   readonly assurance: AssuranceLevel;
   readonly work: readonly WorkUnit[];
+  /**
+   * The cohesion blueprint, when the Change was decomposed by module from a
+   * clearly modular repo. It names the owned modules, the frozen read-only
+   * contracts at the seams (owned by no WorkUnit), and the inter-module
+   * dependency edges, so later stages (the scheduler, the integrator, the graph
+   * projection) can read the module boundaries and the frozen interface without
+   * re-deriving them. Absent for a non-modular Change (the single-unit or
+   * per-file shape), in which case there are no frozen contracts to carry.
+   */
+  readonly blueprint?: ChangeBlueprint;
+}
+
+/** One owned module carried on a Change: exactly one WorkUnit writes its file(s). */
+export interface ChangeBlueprintModule {
+  /** The owning WorkUnit's id. */
+  readonly unitId: string;
+  /** The source file paths this module owns (disjoint across modules). */
+  readonly paths: readonly string[];
+  /** The ids of other owner units this module depends on (import order). */
+  readonly dependsOn: readonly string[];
+}
+
+/** A frozen read-only interface carried on a Change (owned by no WorkUnit). */
+export interface ChangeBlueprintContract {
+  /** The seam file path (read-only; no WorkUnit may rewrite it). */
+  readonly path: string;
+  /** How many source files import this seam (its import in-degree). */
+  readonly importedByCount: number;
+}
+
+/**
+ * The portable projection of the cohesion blueprint carried on a Change. It is
+ * the module boundaries and the frozen interface, expressed in terms of the
+ * Change's own WorkUnit ids, so any later stage reading the Change can see which
+ * unit owns which module and which seam files are frozen read-only.
+ */
+export interface ChangeBlueprint {
+  readonly modules: readonly ChangeBlueprintModule[];
+  readonly contracts: readonly ChangeBlueprintContract[];
 }
 
 /** A dependency edge in the WorkGraph (from a prerequisite to a dependent). */

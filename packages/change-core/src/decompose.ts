@@ -48,6 +48,10 @@ import {
   type RepoSnapshot,
   type SourceFileFacts,
 } from "./repo-snapshot.ts";
+import {
+  deriveCohesionBlueprint,
+  type CohesionBlueprint,
+} from "./blueprint.ts";
 import type { AssuranceLevel, Change, WorkUnit } from "./types.ts";
 import { normalizeChange } from "./loader.ts";
 
@@ -77,6 +81,14 @@ export interface DecomposeResult {
   readonly change: Change;
   readonly intent: GoalIntent;
   readonly snapshot: RepoSnapshot;
+  /**
+   * The cohesion blueprint, when the repo was clearly modular and the work was
+   * decomposed by module. It names the owned modules, the frozen read-only
+   * contracts at the seams (owned by no unit), and the inter-module dependency
+   * edges. Absent when the repo was not modular enough to parallelize, in which
+   * case the Change keeps its single-unit / per-file shape.
+   */
+  readonly blueprint?: CohesionBlueprint;
 }
 
 /**
@@ -89,7 +101,14 @@ export function decompose(options: DecomposeOptions): DecomposeResult {
   const snapshot = isSnapshot(options.repo) ? options.repo : buildRepoSnapshot(options.repo);
   const intent = analyzer.analyze(options.goal);
 
-  const work = planWorkUnits(intent, snapshot);
+  // The cohesion blueprint is a goal-agnostic structural pass: it groups work by
+  // module and marks the shared seams frozen read-only when the repo is clearly
+  // modular, and is undefined otherwise (the do-not-parallelize guard). When it
+  // is present the decomposer projects one owner unit per module from it; when
+  // absent the decomposer keeps its per-file / per-module shape.
+  const blueprint = deriveCohesionBlueprint(snapshot);
+
+  const work = planWorkUnits(intent, snapshot, blueprint);
   if (work.length === 0) {
     // A goal that matched nothing in the repo still yields one honest unit so the
     // graph is never empty; it targets the repo's primary source directory.
@@ -110,7 +129,48 @@ export function decompose(options: DecomposeOptions): DecomposeResult {
     })),
   });
 
-  return { change, intent, snapshot };
+  if (!blueprint) {
+    return { change, intent, snapshot };
+  }
+
+  // Project the structural blueprint onto the Change's own WorkUnit ids, so a
+  // later stage reading the Change sees which unit owns which module file and
+  // which seam files are frozen read-only. The owner unit for a module is the
+  // one whose declared paths are exactly that module's file(s); a module whose
+  // owner was not emitted (a narrowed goal) is simply left off the carried
+  // blueprint, keeping it consistent with the Change's actual units.
+  const unitByPath = new Map<string, string>();
+  for (const unit of change.work) {
+    for (const path of unit.paths) {
+      unitByPath.set(path, unit.id);
+    }
+  }
+  const carriedModules = blueprint.modules
+    .map((module) => {
+      const unitId = module.paths.map((p) => unitByPath.get(p)).find((id) => id !== undefined);
+      if (!unitId) {
+        return undefined;
+      }
+      const dependsOn = module.dependsOn
+        .map((depLabel) => {
+          const dep = blueprint.modules.find((m) => m.label === depLabel);
+          const depPath = dep?.paths[0];
+          return depPath ? unitByPath.get(depPath) : undefined;
+        })
+        .filter((id): id is string => id !== undefined);
+      return { unitId, paths: [...module.paths], dependsOn };
+    })
+    .filter((m): m is NonNullable<typeof m> => m !== undefined);
+
+  const changeBlueprint = {
+    modules: carriedModules,
+    contracts: blueprint.contracts.map((c) => ({
+      path: c.path,
+      importedByCount: c.importedByCount,
+    })),
+  };
+
+  return { change: { ...change, blueprint: changeBlueprint }, intent, snapshot, blueprint };
 }
 
 /** Convenience: decompose and return just the Change. */
@@ -123,13 +183,41 @@ export function decomposeToChange(options: DecomposeOptions): Change {
  * every goal flows through; the branches below are over generic goal FEATURES
  * and repo STRUCTURE, never over the goal string.
  */
-function planWorkUnits(intent: GoalIntent, snapshot: RepoSnapshot): WorkUnit[] {
+function planWorkUnits(
+  intent: GoalIntent,
+  snapshot: RepoSnapshot,
+  blueprint: CohesionBlueprint | undefined,
+): WorkUnit[] {
   const matched = matchSurface(intent, snapshot);
   const action = primaryAction(intent.actions);
 
   const units: WorkUnit[] = [];
 
-  if (intent.isUniversal) {
+  if (blueprint) {
+    // Cohesion-aware shape: one owner unit per module, with the shared seams
+    // frozen read-only (no unit owns a contract path). This is the honest shape
+    // for a modular repo and replaces both the universal per-file fan-out and
+    // the per-module directory grouping below. It is still goal-sensitive: the
+    // goal's matched surface narrows WHICH modules are owned when the goal
+    // singles some out, and the goal's structural actions still add their own
+    // dependent units; only the module boundary and the frozen contracts come
+    // from structure. The dependency edges are the blueprint's inter-module
+    // import order, so a repo with real inter-module deps orders correctly and a
+    // repo of independent siblings fans out in one wave.
+    const selected = selectBlueprintModules(blueprint, matched);
+    for (const module of selected) {
+      units.push({
+        id: unitId(action, module.label),
+        objective: `${verbPhrase(action, intent)} in ${module.paths[0] ?? module.label}`,
+        // Only depend on selected owners, so a narrowed selection never dangles
+        // an edge to a module that was not emitted.
+        dependsOn: module.dependsOn.filter((dep) =>
+          selected.some((m) => m.label === dep),
+        ).map((dep) => unitId(action, dep)),
+        paths: [...module.paths],
+      });
+    }
+  } else if (intent.isUniversal) {
     // Universal quantifier: fan out one WorkUnit per matching source file.
     const files = matched.files.length > 0 ? matched.files : snapshot.sourceFiles;
     for (const file of files) {
@@ -169,10 +257,13 @@ function planWorkUnits(intent: GoalIntent, snapshot: RepoSnapshot): WorkUnit[] {
   }
 
   // A wiring/integration action adds a dependent unit that connects the produced
-  // work into the repo's entry/router surface, when such a surface exists.
+  // work into the repo's entry/router surface, when such a surface exists. The
+  // wiring target must not be a frozen contract: a contract is read-only and
+  // owned by no unit, so a wire unit never claims a contract path.
   if (intent.actions.includes("wire")) {
     const target = wiringTarget(snapshot);
-    if (target && units.length > 0) {
+    const frozen = new Set((blueprint?.contracts ?? []).map((c) => c.path));
+    if (target && units.length > 0 && !frozen.has(target.path)) {
       units.push({
         id: unitId("wire", moduleLabel(target.path)),
         objective: `Wire the new work into ${target.path}`,
@@ -195,6 +286,35 @@ function planWorkUnits(intent: GoalIntent, snapshot: RepoSnapshot): WorkUnit[] {
   }
 
   return dedupeUnits(units);
+}
+
+/**
+ * Choose which blueprint modules to emit as owner units. When the goal singled
+ * out particular modules (its matched surface names some owner files or a
+ * directory containing them), scope to those; otherwise own every module in the
+ * blueprint. This keeps the module shape goal-sensitive (a goal about one
+ * resource owns one module) while a service-wide goal owns them all, all through
+ * the one structural blueprint. The selection is derived from the match, never
+ * from the goal string.
+ */
+function selectBlueprintModules(
+  blueprint: CohesionBlueprint,
+  matched: MatchedSurface,
+): readonly CohesionBlueprint["modules"][number][] {
+  const matchedPaths = new Set(matched.files.map((f) => f.path));
+  const matchedDirs = new Set(matched.modules.map((m) => m.dir));
+  const narrowed = blueprint.modules.filter(
+    (module) =>
+      module.paths.some((p) => matchedPaths.has(p)) ||
+      module.paths.some((p) => matchedDirs.has(dirOf(p))),
+  );
+  // A narrowed selection only applies when it is a strict, non-empty subset; a
+  // match that touches every module (or none specifically) owns them all, which
+  // is the service-wide case.
+  if (narrowed.length > 0 && narrowed.length < blueprint.modules.length) {
+    return narrowed;
+  }
+  return blueprint.modules;
 }
 
 /**
@@ -411,6 +531,11 @@ function slug(text: string): string {
 
 function depth(dir: string): number {
   return dir === "" ? 0 : dir.split("/").length;
+}
+
+function dirOf(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index === -1 ? "" : path.slice(0, index);
 }
 
 function comparePath(a: string, b: string): number {

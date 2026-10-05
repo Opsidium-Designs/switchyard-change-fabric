@@ -42,6 +42,20 @@ export interface SourceFileFacts {
   readonly isEntryPoint: boolean;
   /** True when the file looks like an HTTP router or request dispatcher. */
   readonly isRouterLike: boolean;
+  /**
+   * How many OTHER source files in the repo import this file (its local
+   * import in-degree). A high in-degree marks a shared seam the rest of the repo
+   * depends on (a contract); a low in-degree marks a leaf consumed by few. This
+   * is a purely structural fact derived from the repo's resolved import graph,
+   * independent of any goal.
+   */
+  readonly importedByCount: number;
+  /**
+   * The paths of the OTHER source files this file imports (its resolved local
+   * out-edges). Specifiers that do not resolve to a known source file are
+   * dropped. Sorted and de-duplicated.
+   */
+  readonly importsFiles: readonly string[];
 }
 
 /** A directory grouping of source files, used as a candidate module boundary. */
@@ -65,34 +79,66 @@ export interface RepoSnapshot {
 }
 
 const TEST_PATTERN = /(^|\/)tests?\//i;
-const SPEC_PATTERN = /\.(test|spec)\.[cm]?tsx?$/i;
-const TS_SOURCE_PATTERN = /\.[cm]?tsx?$/i;
+const SPEC_PATTERN = /\.(test|spec)\.[cm]?[jt]sx?$/i;
+const SOURCE_PATTERN = /\.[cm]?[jt]sx?$/i;
 const DECLARATION_PATTERN = /\.d\.ts$/i;
 
 /**
- * Build a structural snapshot from a flat list of repo files. Non-TypeScript
- * files and declaration files are ignored. Files are classified as tests when
- * they live under a `test`/`tests` directory or match a `.test.`/`.spec.`
- * suffix; everything else TypeScript is a source file.
+ * Build a structural snapshot from a flat list of repo files. Non-source files
+ * (anything that is not a JavaScript or TypeScript module) and TypeScript
+ * declaration files are ignored. A repo may be authored in either language or a
+ * mix; the structural facts the decomposer keys on (modules, exports, imports,
+ * entry points) are the same for both. Files are classified as tests when they
+ * live under a `test`/`tests` directory or match a `.test.`/`.spec.` suffix;
+ * everything else is a source file.
  */
 export function buildRepoSnapshot(files: readonly RepoFile[]): RepoSnapshot {
-  const sourceFiles: SourceFileFacts[] = [];
+  const rawSources: RawSourceFacts[] = [];
   const testFiles: string[] = [];
 
   for (const file of files) {
     const path = normalizePath(file.path);
-    if (!TS_SOURCE_PATTERN.test(path) || DECLARATION_PATTERN.test(path)) {
+    if (!SOURCE_PATTERN.test(path) || DECLARATION_PATTERN.test(path)) {
       continue;
     }
     if (isTestPath(path)) {
       testFiles.push(path);
       continue;
     }
-    sourceFiles.push(analyzeSourceFile(path, file.content));
+    rawSources.push(analyzeSourceFile(path, file.content));
   }
 
-  sourceFiles.sort((a, b) => comparePath(a.path, b.path));
+  rawSources.sort((a, b) => comparePath(a.path, b.path));
   testFiles.sort(comparePath);
+
+  // Second pass: resolve each file's local import specifiers to actual source
+  // files and compute the import graph (out-edges per file and the in-degree
+  // per file). This is a pure structural fact derived from the resolved edges,
+  // independent of any goal, and is what the cohesion blueprint keys on to tell
+  // a shared seam (high in-degree) from a leaf module (low in-degree).
+  const knownPaths = new Set(rawSources.map((f) => f.path));
+  const importsByPath = new Map<string, string[]>();
+  const inDegree = new Map<string, number>();
+  for (const file of rawSources) {
+    const resolved = new Set<string>();
+    for (const spec of file.localImports) {
+      const target = resolveLocalImport(file.path, spec, knownPaths);
+      if (target && target !== file.path) {
+        resolved.add(target);
+      }
+    }
+    const out = [...resolved].sort(comparePath);
+    importsByPath.set(file.path, out);
+    for (const target of out) {
+      inDegree.set(target, (inDegree.get(target) ?? 0) + 1);
+    }
+  }
+
+  const sourceFiles: SourceFileFacts[] = rawSources.map((file) => ({
+    ...file,
+    importsFiles: importsByPath.get(file.path) ?? [],
+    importedByCount: inDegree.get(file.path) ?? 0,
+  }));
 
   const modules = groupIntoModules(sourceFiles);
 
@@ -104,13 +150,16 @@ export function buildRepoSnapshot(files: readonly RepoFile[]): RepoSnapshot {
   };
 }
 
+/** The structural facts of a source file before the import graph is resolved. */
+type RawSourceFacts = Omit<SourceFileFacts, "importsFiles" | "importedByCount">;
+
 /** Classify a path as a test file by its location or filename suffix. */
 export function isTestPath(path: string): boolean {
   return TEST_PATTERN.test(path) || SPEC_PATTERN.test(path);
 }
 
 /** Derive the structural facts of a single source file from its text. */
-function analyzeSourceFile(path: string, content: string): SourceFileFacts {
+function analyzeSourceFile(path: string, content: string): RawSourceFacts {
   const dir = dirOf(path);
   const base = baseName(path).toLowerCase();
   return {
@@ -240,7 +289,63 @@ function dirOf(path: string): string {
 
 function baseName(path: string): string {
   const file = path.slice(path.lastIndexOf("/") + 1);
-  return file.replace(/\.[cm]?tsx?$/i, "");
+  return file.replace(/\.[cm]?[jt]sx?$/i, "");
+}
+
+/**
+ * Resolve a repo-local import specifier (one starting with ".") from the
+ * importing file to an actual source file path in the repo, or undefined when
+ * it does not resolve to a known source file. Honors the common module
+ * resolution forms: an explicit extension, a bare path tried with each known
+ * source extension, and a directory index. Pure and deterministic; it only ever
+ * returns a path the snapshot already knows about, so a resolved edge always
+ * points at a real file.
+ */
+function resolveLocalImport(
+  fromPath: string,
+  spec: string,
+  known: ReadonlySet<string>,
+): string | undefined {
+  const fromDir = dirOf(fromPath);
+  const base = normalizePath(joinPosix(fromDir, spec));
+  // An authored specifier commonly points at a sibling with a .js extension even
+  // when the source file is .ts; try the specifier as-written, then the same
+  // path with its extension swapped for each known source extension, then an
+  // index file inside it (a directory import).
+  const candidates: string[] = [];
+  candidates.push(base);
+  const withoutExt = base.replace(/\.[cm]?[jt]sx?$/i, "");
+  const EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
+  for (const ext of EXTENSIONS) {
+    candidates.push(`${withoutExt}${ext}`);
+  }
+  for (const ext of EXTENSIONS) {
+    candidates.push(`${base}${ext}`);
+    candidates.push(`${base}/index${ext}`);
+  }
+  for (const candidate of candidates) {
+    if (known.has(candidate)) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
+/** Join two POSIX path fragments and collapse "." / ".." segments. */
+function joinPosix(dir: string, rel: string): string {
+  const segments = (dir === "" ? [] : dir.split("/")).concat(rel.split("/"));
+  const out: string[] = [];
+  for (const segment of segments) {
+    if (segment === "" || segment === ".") {
+      continue;
+    }
+    if (segment === "..") {
+      out.pop();
+      continue;
+    }
+    out.push(segment);
+  }
+  return out.join("/");
 }
 
 /** Deterministic lexicographic path order. */
