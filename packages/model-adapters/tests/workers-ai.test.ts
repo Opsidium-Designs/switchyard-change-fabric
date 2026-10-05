@@ -175,93 +175,29 @@ describe("WorkersAiExecutor", () => {
     // The reported model stays the base model, never a different one.
     expect(result.cost.model).toBe(DEFAULT_WORKERS_AI_MODEL);
   });
-
-  it("drops streaming on the retry after a transient streaming failure (same model, no onToken)", async () => {
-    const sawStream: boolean[] = [];
-    const seenModels: string[] = [];
-    const invoke: WorkersAiInvoke = async (request, callbacks) => {
-      seenModels.push(request.model);
-      const wantStream = typeof callbacks?.onToken === "function";
-      sawStream.push(wantStream);
-      if (seenModels.length === 1) {
-        // The FIRST (streaming) attempt throws transiently.
-        expect(wantStream).toBe(true);
-        throw new Error("internal error; reference=stream-blip");
-      }
-      // The retry is the SAME model and must NOT stream (no onToken given).
-      return {
-        text: JSON.stringify({ edits: [{ path: "src/x.ts", contents: "export const x = 3;\n" }] }),
-      };
-    };
-    const streamed: string[] = [];
-    const result = await new WorkersAiExecutor({
-      invoke,
-      maxRetries: 2,
-      retryBackoffMs: 0,
-    }).execute({
-      worktreeDir: worktree,
-      workUnitId: "x",
-      objective: "add x",
-      paths: ["src/x.ts"],
-      baselineRef: "HEAD",
-      // Providing onToken makes the first attempt a streaming request.
-      onToken: (chunk) => streamed.push(chunk),
-    });
-    // Same model both times; the first streamed, the retry did not.
-    expect(seenModels).toEqual([DEFAULT_WORKERS_AI_MODEL, DEFAULT_WORKERS_AI_MODEL]);
-    expect(sawStream).toEqual([true, false]);
-    expect(result.cost.model).toBe(DEFAULT_WORKERS_AI_MODEL);
-    const written = await readFile(join(worktree, "src/x.ts"), "utf8");
-    expect(written).toBe("export const x = 3;\n");
-  });
 });
 
-describe("WorkersAiExecutor streaming and step callbacks (fake transport, deterministic/offline)", () => {
+describe("WorkersAiExecutor step and prompt callbacks (fake transport, deterministic/offline)", () => {
   const okReply = JSON.stringify({
     edits: [{ path: "src/x.ts", contents: "export const x = 1;\n" }],
   });
 
   /**
-   * A deterministic FAKE streaming transport: it ignores the network and simply
-   * relays a fixed sequence of token deltas through the streaming callbacks (as
-   * a real Workers AI streaming call would), then returns the assembled reply.
-   * This is what keeps the streaming path testable offline: no fetch, no SSE, no
-   * real model, yet the executor's token/step relay is exercised exactly.
+   * A deterministic FAKE non-streaming transport: it ignores the network and
+   * simply returns a fixed reply (as a real non-streaming Workers AI call
+   * would). This is what keeps the model-call path testable offline: no fetch,
+   * no SSE, no real model, yet the executor's prompt/step relay is exercised.
    */
-  const fakeStreamingInvoke = (chunks: readonly string[]): WorkersAiInvoke => {
-    return async (_request, callbacks) => {
-      for (const chunk of chunks) {
-        callbacks?.onToken?.(chunk);
-      }
-      return { text: chunks.join(""), usage: { inputTokens: 11, outputTokens: 7 } };
+  const fakeInvoke = (reply: string): WorkersAiInvoke => {
+    return async () => {
+      return { text: reply, usage: { inputTokens: 11, outputTokens: 7 } };
     };
   };
-
-  it("relays streamed tokens through the context onToken callback deterministically", async () => {
-    const chunks = ['{"edits":[{"path":"src/x.ts",', '"contents":"export ', 'const x = 1;\\n"}]}'];
-    const streamed: string[] = [];
-    const result = await new WorkersAiExecutor({ invoke: fakeStreamingInvoke(chunks) }).execute({
-      worktreeDir: worktree,
-      workUnitId: "x",
-      objective: "add x",
-      paths: ["src/x.ts"],
-      baselineRef: "HEAD",
-      onToken: (chunk) => streamed.push(chunk),
-    });
-    // The tokens the console would render are exactly the real deltas the
-    // transport streamed, in order, assembling the real model output.
-    expect(streamed).toEqual(chunks);
-    expect(streamed.join("")).toBe(chunks.join(""));
-    // The assembled stream was still parsed into the real edit and applied.
-    expect(result.changedPaths).toEqual(["src/x.ts"]);
-    const written = await readFile(join(worktree, "src/x.ts"), "utf8");
-    expect(written).toBe("export const x = 1;\n");
-  });
 
   it("surfaces a prompt summary and concrete run steps through the context callbacks", async () => {
     let promptSummary = "";
     const steps: Array<{ phase: string; message: string }> = [];
-    await new WorkersAiExecutor({ invoke: fakeStreamingInvoke([okReply]) }).execute({
+    await new WorkersAiExecutor({ invoke: fakeInvoke(okReply) }).execute({
       worktreeDir: worktree,
       workUnitId: "x",
       objective: "add input validation",
@@ -285,15 +221,12 @@ describe("WorkersAiExecutor streaming and step callbacks (fake transport, determ
   });
 
   it("a best-effort callback that throws never fails the run", async () => {
-    const result = await new WorkersAiExecutor({ invoke: fakeStreamingInvoke([okReply]) }).execute({
+    const result = await new WorkersAiExecutor({ invoke: fakeInvoke(okReply) }).execute({
       worktreeDir: worktree,
       workUnitId: "x",
       objective: "add x",
       paths: ["src/x.ts"],
       baselineRef: "HEAD",
-      onToken: () => {
-        throw new Error("observer blew up");
-      },
       onStep: () => {
         throw new Error("observer blew up");
       },
@@ -306,46 +239,16 @@ describe("WorkersAiExecutor streaming and step callbacks (fake transport, determ
   });
 });
 
-describe("createWorkersAiRestInvoke streaming", () => {
-  it("parses a Workers AI SSE stream, relays each real delta, and assembles the full reply", async () => {
-    // A fake fetch returning a Workers AI style SSE body: one event per delta,
-    // each `data: {"response":"<delta>"}`, ending with `[DONE]`. This exercises
-    // the real stream-parsing path with no network and no live model.
-    const deltas = ['{"edits":[', '{"path":"src/x.ts",', '"contents":"ok"}]}'];
-    const sse =
-      deltas.map((d) => `data: ${JSON.stringify({ response: d })}\n\n`).join("") +
-      `data: ${JSON.stringify({ usage: { prompt_tokens: 3, completion_tokens: 9 } })}\n\n` +
-      "data: [DONE]\n\n";
-    const fakeFetch = (async () =>
-      new Response(sse, {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
-      })) as unknown as typeof fetch;
-
-    const invoke = createWorkersAiRestInvoke({
-      accountId: "acct",
-      apiToken: "secret-token-value",
-      fetchFn: fakeFetch,
-    });
-    const relayed: string[] = [];
-    const result = await invoke(
-      { model: DEFAULT_WORKERS_AI_MODEL, messages: [{ role: "user", content: "hi" }] },
-      { onToken: (chunk) => relayed.push(chunk) },
-    );
-    // Each streamed delta was relayed in order; the assembled text is the full
-    // real reply the executor then parses.
-    expect(relayed).toEqual(deltas);
-    expect(result.text).toBe(deltas.join(""));
-    expect(result.usage?.inputTokens).toBe(3);
-    expect(result.usage?.outputTokens).toBe(9);
-  });
-
-  it("does not stream (no stream flag) when no token callback is given", async () => {
+describe("createWorkersAiRestInvoke (always non-streaming)", () => {
+  it("never sends a stream flag and parses the non-streaming reply", async () => {
     let sawStreamFlag = false;
     const fakeFetch = (async (_url: string, init?: RequestInit) => {
-      sawStreamFlag = String(init?.body ?? "").includes('"stream":true');
+      sawStreamFlag = String(init?.body ?? "").includes('"stream"');
       return new Response(
-        JSON.stringify({ result: { response: '{"edits":[]}' }, success: true }),
+        JSON.stringify({
+          result: { response: '{"edits":[{"path":"src/x.ts","contents":"ok"}]}' },
+          success: true,
+        }),
         { status: 200 },
       );
     }) as unknown as typeof fetch;
@@ -354,8 +257,11 @@ describe("createWorkersAiRestInvoke streaming", () => {
       apiToken: "secret-token-value",
       fetchFn: fakeFetch,
     });
-    await invoke({ model: "m", messages: [{ role: "user", content: "x" }] });
+    const result = await invoke({ model: "m", messages: [{ role: "user", content: "x" }] });
+    // No stream flag is ever sent, even if a (now ignored) callbacks argument is
+    // passed: the model is always called non-streaming.
     expect(sawStreamFlag).toBe(false);
+    expect(result.text).toBe('{"edits":[{"path":"src/x.ts","contents":"ok"}]}');
   });
 });
 
@@ -604,43 +510,6 @@ describe("createWorkersAiRestInvoke response parsing (OpenAI shape and legacy sh
     expect(result.text).toBe(editDoc);
   });
 
-  it("assembles an OpenAI-style SSE stream (choices[].delta.content) and ignores reasoning deltas", async () => {
-    // The qwen3.8 streaming shape: each event carries a `choices[0].delta.content`
-    // token, with chain-of-thought in a separate `reasoning` delta that must not
-    // be assembled into the edit text. Exercised offline with no live model.
-    const deltas = ['{"edits":[', '{"path":"src/x.ts",', '"contents":"ok"}]}'];
-    const sse =
-      // A leading reasoning-only event that must be ignored.
-      `data: ${JSON.stringify({ choices: [{ delta: { reasoning: "thinking first" } }] })}\n\n` +
-      deltas
-        .map((d) => `data: ${JSON.stringify({ choices: [{ delta: { content: d } }] })}\n\n`)
-        .join("") +
-      `data: ${JSON.stringify({ usage: { prompt_tokens: 4, completion_tokens: 6 } })}\n\n` +
-      "data: [DONE]\n\n";
-    const fakeFetch = (async () =>
-      new Response(sse, {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
-      })) as unknown as typeof fetch;
-    const invoke = createWorkersAiRestInvoke({
-      accountId: "acct",
-      apiToken: "secret-token-value",
-      fetchFn: fakeFetch,
-    });
-    const relayed: string[] = [];
-    const result = await invoke(
-      { model: DEFAULT_WORKERS_AI_MODEL, messages: [{ role: "user", content: "hi" }] },
-      { onToken: (chunk) => relayed.push(chunk) },
-    );
-    // Only the content deltas were relayed and assembled; the reasoning delta
-    // was dropped, so the assembled reply is the exact edit JSON.
-    expect(relayed).toEqual(deltas);
-    expect(result.text).toBe(deltas.join(""));
-    expect(result.text).not.toContain("thinking first");
-    expect(result.usage?.inputTokens).toBe(4);
-    expect(result.usage?.outputTokens).toBe(6);
-  });
-
   it("parses an OpenAI-shape reply into the exact edit JSON the executor would apply (no network)", async () => {
     // The REST transport (called directly, non-streaming) turns a qwen3.8-shape
     // reply into the edit JSON text, instead of a silently empty "" that would
@@ -707,44 +576,5 @@ describe("WorkersAiExecutor per-attempt model id (so a retry can escalate, offli
     });
     expect(seen).toEqual([escalationModel]);
     expect(result.cost.model).toBe(escalationModel);
-  });
-});
-
-describe("createWorkersAiRestInvoke streaming deadline (a stalled stream must not hang)", () => {
-  // Regression: a streaming SSE body that opens but never closes (the model
-  // errored mid-stream) previously hung forever because the deadline timer was
-  // cleared when the response HEADERS arrived, before the body was read. The
-  // Worker then got cancelled by the runtime for "hanging". The fix keeps the
-  // deadline live through the stream read. This test gives a body that emits one
-  // delta then never ends, with a tiny timeout, and asserts a clean timeout.
-  it("aborts a never-closing stream with a timeout error instead of hanging", async () => {
-    // A ReadableStream that sends one SSE delta then stalls forever (never
-    // enqueues again and never closes), simulating a server-side mid-stream
-    // failure. No real network; deterministic and offline.
-    const body = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new TextEncoder().encode('data: {"response":"partial"}\n'));
-        // Intentionally never close and never enqueue again.
-      },
-    });
-    const fetchFn = (async () =>
-      new Response(body, {
-        status: 200,
-        headers: { "content-type": "text/event-stream" },
-      })) as unknown as typeof fetch;
-
-    const invoke = createWorkersAiRestInvoke({
-      accountId: "acct",
-      apiToken: "token-not-logged",
-      fetchFn,
-      timeoutMs: 50,
-    });
-
-    await expect(
-      invoke(
-        { model: DEFAULT_WORKERS_AI_MODEL, messages: [{ role: "user", content: "hi" }] },
-        { onToken: () => {} },
-      ),
-    ).rejects.toBeInstanceOf(WorkersAiTimeoutError);
   });
 });

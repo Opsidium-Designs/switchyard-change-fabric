@@ -310,8 +310,6 @@ class ChangeRecord {
   readonly activity = new Map<string, ActivityStep[]>();
   /** Per-unit rich model detail (mirrors the DO's detail). */
   readonly detail = new Map<string, UnitDetail>();
-  /** Per-unit live model-output stream buffer (mirrors the DO's stream). */
-  readonly stream = new Map<string, string>();
   /** The live deployment of the fixed app recorded for this run (mirrors DO). */
   deployment: DeploymentRecord | null = null;
   /** Mechanical verify attempts recorded for this Change (mirrors the DO). */
@@ -506,27 +504,6 @@ export class LocalChangeControl {
     };
     record.detail.set(unitId, merged);
     return merged;
-  }
-
-  /**
-   * Append a chunk of REAL streamed model output for a WorkUnit (mirrors the
-   * DO's appendStream). The runner relays the tokens the model streamed; the
-   * console reads the growing buffer for a live view. Bounded per unit.
-   */
-  appendStream(changeId: string, unitId: string, chunk: string): number {
-    const record = this.require(changeId);
-    if (!record.change.work.some((u) => u.id === unitId)) {
-      throw new Error(`unknown WorkUnit: ${unitId}`);
-    }
-    const current = record.stream.get(unitId) ?? "";
-    const next = current + (typeof chunk === "string" ? chunk : String(chunk ?? ""));
-    record.stream.set(unitId, next.length > 20_000 ? next.slice(-20_000) : next);
-    return record.stream.get(unitId)!.length;
-  }
-
-  /** Read the buffered live model-output stream for a WorkUnit (mirrors the DO). */
-  getStream(changeId: string, unitId: string): string {
-    return this.require(changeId).stream.get(unitId) ?? "";
   }
 
   /** The ordered real run steps recorded for a WorkUnit (mirrors the DO). */
@@ -918,12 +895,6 @@ export class LocalChangeControl {
     if (method === "POST" && detail) {
       const recorded = this.recordDetail(dec(detail[1]), dec(detail[2]), parseBody(init) as UnitDetail);
       return json({ detail: recorded }, 201);
-    }
-    const streamPost = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/stream$/);
-    if (method === "POST" && streamPost) {
-      const chunk = typeof init?.body === "string" ? init.body : "";
-      const length = this.appendStream(dec(streamPost[1]), dec(streamPost[2]), chunk);
-      return json({ length }, 201);
     }
     const deploymentRoute = url.pathname.match(/^\/changes\/([^/]+)\/deployment$/);
     if (method === "POST" && deploymentRoute) {

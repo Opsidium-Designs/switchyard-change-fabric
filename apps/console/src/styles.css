@@ -590,8 +590,7 @@ body {
 }
 
 .detail-pre,
-.detail-diff,
-.stream-pre {
+.detail-diff {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -671,36 +670,6 @@ body {
 .activity-step.phase-failed .activity-phase,
 .activity-step.phase-not-integrated .activity-phase {
   color: #ff7b72;
-}
-
-/* --- Live model-output stream --- */
-
-.live-stream {
-  margin-top: 1rem;
-}
-
-.stream-live {
-  margin-left: 0.5rem;
-  font-size: 0.68rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  padding: 0.1rem 0.45rem;
-  border-radius: 999px;
-  background: rgba(88, 166, 255, 0.15);
-  border: 1px solid var(--accent);
-  color: var(--accent);
-  animation: stream-pulse 1.2s ease-in-out infinite;
-}
-
-@keyframes stream-pulse {
-  50% {
-    opacity: 0.45;
-  }
-}
-
-.stream-pre {
-  max-height: 24rem;
-  overflow-y: auto;
 }
 
 /* Human escalation panel: the pending decisions the engine is waiting on. */

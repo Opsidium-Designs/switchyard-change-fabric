@@ -486,10 +486,6 @@ export class ChangeState extends DurableObject<Env> {
     // what the console's activity log and click-detail render from real state.
     await this.ctx.storage.put("activity", {} as Record<string, ActivityStep[]>);
     await this.ctx.storage.put("detail", {} as Record<string, UnitDetail>);
-    // Per-unit live model-output stream buffer (the real streamed tokens the
-    // executor relayed through the runner). Appended to as a run streams and
-    // read by the console's live-stream subscription. Bounded per unit.
-    await this.ctx.storage.put("stream", {} as Record<string, string>);
     // The live deployment of the fixed app (recorded at the end of a real-app
     // run after verification passed). Null until the run deploys one.
     await this.ctx.storage.put("deployment", null);
@@ -1003,33 +999,6 @@ export class ChangeState extends DurableObject<Env> {
     return merged;
   }
 
-  /**
-   * Append a chunk of REAL streamed model output for a WorkUnit. The runner
-   * relays the tokens Workers AI streams back as the model produces them; this
-   * buffers them so the console's live-stream subscription can read the growing
-   * text for the selected running node. The buffer is bounded per unit so a long
-   * stream cannot grow it without limit (the console still sees the live tail).
-   * The streamed text is the genuine model output, never a synthesized line.
-   */
-  async appendStream(unitId: string, chunk: string): Promise<number> {
-    const change = await this.loadChange();
-    if (!change.work.some((unit) => unit.id === unitId)) {
-      throw new Error(`unknown WorkUnit: ${unitId}`);
-    }
-    const streams = await this.loadStream();
-    const current = streams[unitId] ?? "";
-    const next = current + (typeof chunk === "string" ? chunk : String(chunk ?? ""));
-    streams[unitId] = next.length > MAX_STREAM_CHARS ? next.slice(-MAX_STREAM_CHARS) : next;
-    await this.ctx.storage.put("stream", streams);
-    return streams[unitId]!.length;
-  }
-
-  /** Read the buffered live model-output stream for a WorkUnit (empty if none). */
-  async getStream(unitId: string): Promise<string> {
-    const streams = await this.loadStream();
-    return streams[unitId] ?? "";
-  }
-
   /** Record a cost event emitted by a runner (heartbeat or completion). */
   async recordCost(event: Omit<CostEvent, "at">): Promise<ChangeStateView> {
     const change = await this.loadChange();
@@ -1343,10 +1312,6 @@ export class ChangeState extends DurableObject<Env> {
     return (await this.ctx.storage.get<Record<string, UnitDetail>>("detail")) ?? {};
   }
 
-  private async loadStream(): Promise<Record<string, string>> {
-    return (await this.ctx.storage.get<Record<string, string>>("stream")) ?? {};
-  }
-
   private async loadDeployment(): Promise<DeploymentRecord | null> {
     return (await this.ctx.storage.get<DeploymentRecord | null>("deployment")) ?? null;
   }
@@ -1391,9 +1356,8 @@ function sanitizeReason(reason: string | undefined): string {
   return bounded === "" ? "agent failed" : bounded;
 }
 
-/** Keep a bounded per-unit activity log and a bounded live-stream buffer. */
+/** Keep a bounded per-unit activity log. */
 const MAX_ACTIVITY_STEPS = 200;
-const MAX_STREAM_CHARS = 20_000;
 /** The maximum stored length of a prompt summary or a proposed diff. */
 const MAX_DETAIL_TEXT = 20_000;
 

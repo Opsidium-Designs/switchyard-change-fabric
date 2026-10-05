@@ -1,24 +1,23 @@
 /**
- * M8.2: rich, live, honest per-node feedback.
+ * Rich, honest per-node feedback.
  *
- * These tests pin the three tiers the milestone adds, all proven offline and
+ * These tests pin the two tiers of per-node feedback, both proven offline and
  * deterministically under `make check` (no Cloudflare account, no real model,
- * no network): the transport is a FAKE streaming transport, the control surface
- * is the real `LocalChangeControl` (the same change-core logic the Durable
- * Object uses), and the executor is the real `WorkersAiExecutor` wired to the
- * fake transport.
+ * no network): the transport is a FAKE non-streaming transport, the control
+ * surface is the real `LocalChangeControl` (the same change-core logic the
+ * Durable Object uses), and the executor is the real `WorkersAiExecutor` wired
+ * to the fake transport.
  *
- *   1. RICH CLICK-DETAIL: after a run, each unit's state carries the REAL prompt
- *      summary, the model's proposed edit (changed paths + diff), the model id,
- *      and token usage, and the graph projection carries that detail onto the
- *      node, so click-detail reads real state (not synthesized).
+ *   1. MODEL TRANSCRIPT: after a run, each unit's state carries the REAL prompt
+ *      summary, the model's proposed edit (changed paths + diff), the proposed
+ *      commit message, the model id, and token usage, and the graph projection
+ *      carries that detail onto the node, so the console's static transcript
+ *      reads real state (not synthesized). The transcript is posted when the
+ *      unit is done; there is no live token stream.
  *   2. PER-NODE ACTIVITY LOG: the unit's activity log is the ordered REAL run
  *      steps the runner reported (leased, cloning, model-call, applied-edit,
  *      commit, push, pushed, verified), built from recorded steps, never in the
  *      UI; the graph node carries them unchanged.
- *   3. LIVE LLM STREAMING: the fake streaming transport relays token deltas
- *      which the runner appends to the Worker's per-unit stream buffer, so the
- *      buffered stream is exactly the real assembled model output.
  */
 
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
@@ -53,16 +52,13 @@ work:
 `;
 
 /**
- * A deterministic FAKE Workers AI streaming transport. It relays a fixed set of
- * token deltas through the streaming callbacks (as a real streaming call would),
- * then returns the assembled JSON edit document with usage. No network, no model.
+ * A deterministic FAKE Workers AI non-streaming transport. It ignores the
+ * network and returns a fixed JSON edit document with usage, as a real
+ * non-streaming call would. No network, no model.
  */
-function fakeStreamingInvoke(deltas: readonly string[]): WorkersAiInvoke {
-  return async (_request, callbacks) => {
-    for (const delta of deltas) {
-      callbacks?.onToken?.(delta);
-    }
-    return { text: deltas.join(""), usage: { inputTokens: 42, outputTokens: 13 } };
+function fakeInvoke(reply: string): WorkersAiInvoke {
+  return async () => {
+    return { text: reply, usage: { inputTokens: 42, outputTokens: 13 } };
   };
 }
 
@@ -148,9 +144,9 @@ function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWork
       });
       return json({ recruited });
     }
-    // The M8.2 per-node feedback routes: step, detail, stream. These are the
-    // real recording paths the control surface mirrors from the Worker's DO.
-    const unitRoute = url.pathname.match(/^\/changes\/[^/]+\/work\/[^/]+\/(step|detail|stream)$/);
+    // The per-node feedback routes: step and detail. These are the real
+    // recording paths the control surface mirrors from the Worker's DO.
+    const unitRoute = url.pathname.match(/^\/changes\/[^/]+\/work\/[^/]+\/(step|detail)$/);
     if (method === "POST" && unitRoute) {
       return control.fetch(input, init);
     }
@@ -210,8 +206,8 @@ afterEach(async () => {
   await rm(workRoot, { recursive: true, force: true });
 });
 
-describe("M8.2: rich live per-node feedback, all backed by real state", () => {
-  it("records a real activity log, real model detail, and the real streamed output for a run", async () => {
+describe("rich per-node feedback, all backed by real state", () => {
+  it("records a real activity log and a real model transcript for a run", async () => {
     const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, "artifacts") });
     const control = new LocalChangeControl(workspaces);
     const { fetchFn } = fakeWorker(control, workspaces);
@@ -223,15 +219,14 @@ describe("M8.2: rich live per-node feedback, all backed by real state", () => {
     // diff reflects a real change against the baseline.
     await writeFile(join(projectDir, "src", "add.ts"), "export const add = (a, b) => a + b;\n", "utf8");
 
-    // The model's streamed reply: a real JSON edit document, delivered as token
-    // deltas by the fake streaming transport.
+    // The model's reply: a real JSON edit document, returned non-streaming by
+    // the fake transport.
     const edit = JSON.stringify({
       commitMessage: "type the add inputs",
       edits: [{ path: "src/add.ts", contents: "export const add = (a: number, b: number) => a + b;\n" }],
     });
-    const deltas = [edit.slice(0, 20), edit.slice(20, 55), edit.slice(55)];
     const executor = new WorkersAiExecutor({
-      invoke: fakeStreamingInvoke(deltas),
+      invoke: fakeInvoke(edit),
       model: "@cf/qwen/qwen2.5-coder-32b-instruct",
     });
 
@@ -264,9 +259,13 @@ describe("M8.2: rich live per-node feedback, all backed by real state", () => {
     expect(phases).toContain("verified");
     // The leased step comes before the model-call step (ordered real steps).
     expect(phases.indexOf("leased")).toBeLessThan(phases.indexOf("model-call"));
+    // No streaming step is ever recorded: the model is called non-streaming.
+    expect(phases).not.toContain("stream");
 
-    // (1) RICH CLICK-DETAIL: the real prompt summary, model id, changed paths,
-    // a real diff, and token usage, read straight from recorded state.
+    // (1) MODEL TRANSCRIPT: the real prompt summary, the proposed edit (changed
+    // paths + a real diff), the proposed commit message, the model id, and token
+    // usage, read straight from recorded state. These ARE the static transcript
+    // the console renders when the unit is done.
     const detail = unit!.detail;
     expect(detail).toBeDefined();
     expect(detail!.model).toBe("@cf/qwen/qwen2.5-coder-32b-instruct");
@@ -278,17 +277,17 @@ describe("M8.2: rich live per-node feedback, all backed by real state", () => {
     expect(detail!.commitMessage).toBe("type the add inputs");
 
     // The graph projection carries the activity and detail onto the node, so the
-    // console's click-detail is a projection of real state (no-unbacked rule
-    // intact: the node still passes the backing guard).
+    // console's transcript is a projection of real state (no-unbacked rule
+    // intact: the node still passes the backing guard). The transcript fields
+    // the console renders (prompt summary + edit/diff + commit message) are all
+    // present on the projected node.
     const model = buildWorkGraphModel(snapshot);
     const node = model.nodes.find((n) => n.id === unitNodeId("add"));
     expect(node?.detail?.promptSummary).toBe(detail!.promptSummary);
+    expect(node?.detail?.diff).toBe(detail!.diff);
+    expect(node?.detail?.editedPaths).toEqual(detail!.editedPaths);
+    expect(node?.detail?.commitMessage).toBe(detail!.commitMessage);
     expect((node?.activity ?? []).length).toBe((unit!.activity ?? []).length);
-
-    // (3) LIVE LLM STREAMING: the per-unit stream buffer is exactly the real
-    // assembled model output the fake transport streamed (the deltas joined).
-    const streamed = control.getStream("change-m82", "add");
-    expect(streamed).toBe(deltas.join(""));
   });
 
   it("an activity log entry is only ever a real recorded step (nothing synthesized)", () => {
@@ -308,14 +307,5 @@ describe("M8.2: rich live per-node feedback, all backed by real state", () => {
     const node = after.nodes.find((n) => n.id === unitNodeId("add"));
     expect((node?.activity ?? []).map((s) => s.phase)).toEqual(["cloning"]);
     expect(node?.activity?.[0]?.message).toBe("cloning the repo");
-  });
-
-  it("the stream buffer reflects only appended (real) chunks", () => {
-    const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, "a3") });
-    const control = new LocalChangeControl(workspaces);
-    control.createChange(SPEC);
-    control.appendStream("change-m82", "add", "hello ");
-    control.appendStream("change-m82", "add", "world");
-    expect(control.getStream("change-m82", "add")).toBe("hello world");
   });
 });

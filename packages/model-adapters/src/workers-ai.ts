@@ -76,17 +76,19 @@ export interface WorkersAiInvokeResult {
 }
 
 /**
- * Optional streaming callbacks the executor passes into the transport so a
- * streaming Workers AI call can relay the model output live, token by token, and
- * surface tool-call steps the executor exposes. A non-streaming transport simply
- * ignores this second argument (it is optional), which keeps every existing fake
- * and the REST transport working unchanged while a streaming transport can relay
- * the real tokens. The callbacks are best-effort: a thrown callback must never
- * fail the model call, so the executor wraps each in a guard.
+ * Optional callbacks the executor passes into the transport so a Workers AI call
+ * can surface tool-call / reasoning steps the executor exposes. A transport that
+ * does not surface steps simply ignores this second argument (it is optional),
+ * which keeps every existing fake and the REST transport working unchanged. The
+ * callbacks are best-effort: a thrown callback must never fail the model call, so
+ * the executor wraps each in a guard.
+ *
+ * Note: live token streaming has been removed. The model is always called
+ * non-streaming, and the console shows a static transcript (the prompt summary
+ * plus the proposed edit and commit message) once a unit is done, so there is no
+ * per-token relay here.
  */
 export interface WorkersAiStreamCallbacks {
-  /** Called with each chunk of REAL streamed model text as it arrives. */
-  readonly onToken?: (chunk: string) => void;
   /** Called with a tool-call / reasoning step the executor exposes, if any. */
   readonly onStep?: (step: WorkersAiStreamStep) => void;
 }
@@ -105,11 +107,10 @@ export interface WorkersAiStreamStep {
  * the model's reply. No credential is passed through this package, so the key
  * stays out of the repo and the model call is fakeable in tests.
  *
- * The optional second argument carries streaming callbacks: a streaming
- * transport relays each token through `onToken` (and any tool-call step through
- * `onStep`) as the model produces them, then still returns the full assembled
- * reply so the edit-parsing path is unchanged. A non-streaming transport ignores
- * the argument. The streamed text is the genuine model output.
+ * The optional second argument carries step callbacks only. The model is always
+ * called non-streaming, so the transport makes one request and returns the full
+ * assembled reply for the edit-parsing path. A transport that surfaces no steps
+ * ignores the argument.
  */
 export type WorkersAiInvoke = (
   request: WorkersAiInvokeRequest,
@@ -186,15 +187,8 @@ export interface WorkersAiExecutorOptions {
    */
   readonly onPrompt?: (messages: readonly WorkersAiMessage[]) => void;
   /**
-   * Called with each chunk of REAL streamed model text as it arrives (when the
-   * injected transport streams). The live runner relays these to the Worker so
-   * the console renders the model output live on the running node. Best-effort.
-   */
-  readonly onToken?: (chunk: string) => void;
-  /**
-   * Called with a tool-call / reasoning step a streaming transport exposes.
-   * Best-effort; relayed by the runner as an activity step. The executor also
-   * emits its own concrete steps (model-call, applied-edit) through this.
+   * Called with a tool-call / reasoning step the executor exposes (model-call,
+   * applied-edit). Best-effort; relayed by the runner as an activity step.
    */
   readonly onStep?: (step: WorkersAiStreamStep) => void;
 }
@@ -305,7 +299,6 @@ export class WorkersAiExecutor implements ExecutorProvider {
     // Resolve the observability callbacks: a per-unit context callback (set by
     // the live runner) takes precedence over an executor-wide option. Both are
     // best-effort and never receive a credential.
-    const onToken = context.onToken ?? this.options.onToken;
     const onStep = (step: WorkersAiStreamStep): void => {
       guard(() => context.onStep?.(step));
       guard(() => this.options.onStep?.(step));
@@ -320,11 +313,10 @@ export class WorkersAiExecutor implements ExecutorProvider {
     guard(() => context.onPromptSummary?.(promptSummary));
     guard(() => this.options.onPrompt?.(messages));
 
-    // Streaming callbacks relayed into the transport: a streaming transport
-    // calls onToken with each real token and onStep with any tool-call step, so
-    // the console renders the live model output and step events on the node.
-    const streamCallbacks: WorkersAiStreamCallbacks = {
-      onToken: (chunk) => guard(() => onToken?.(chunk)),
+    // Step callbacks relayed into the transport: a transport that surfaces
+    // tool-call steps calls onStep. There is no per-token relay; the model is
+    // always called non-streaming and the console shows a static transcript.
+    const stepCallbacks: WorkersAiStreamCallbacks = {
       onStep: (step) => onStep(step),
     };
 
@@ -333,52 +325,30 @@ export class WorkersAiExecutor implements ExecutorProvider {
     const isTransient = this.options.isTransientError ?? isTransientWorkersAiError;
     const sleep = this.options.sleep ?? defaultSleep;
 
-    // Every attempt runs the SAME chosen model: a streaming or transport hiccup
-    // must never change which model does the work. The model only ever changes
-    // through the deliberate, visible verify-fail escalation, which is a
-    // separate axis handled by the caller (it passes a per-attempt
-    // `context.model`); it is NOT this transient-retry path.
+    // Every attempt runs the SAME chosen model: a transport hiccup must never
+    // change which model does the work. The model only ever changes through the
+    // deliberate, visible verify-fail escalation, which is a separate axis
+    // handled by the caller (it passes a per-attempt `context.model`); it is NOT
+    // this transient-retry path.
     //
     // The attempt is wrapped in a bounded retry: a transient provider failure or
     // a timeout (a flaky hosted-model call) is retried up to `maxRetries` times
     // with a short backoff, so one wedged or internal-error call does not fail
     // the unit. The retry cap is hard, so it can never loop forever, and a
     // non-transient failure (for example a bad model reply) is thrown
-    // immediately rather than retried.
-    //
-    // Streaming is decided by the presence of an onToken callback. If the FIRST
-    // (streaming) attempt throws a transient error, the retry of the SAME model
-    // drops streaming (invokes without the streaming callbacks) so a
-    // persistently-flaky stream still yields the same model's output as a plain
-    // non-streaming request. The live token view is lost for that attempt only;
-    // the model is unchanged. `usedModel` is always `baseModel`.
-    const wantStream = typeof onToken === "function";
+    // immediately rather than retried. `usedModel` is always `baseModel`.
     const usedModel = baseModel;
 
-    // The first attempt streams when a token callback is present; a retry after a
-    // transient failure drops streaming so a flaky stream still produces output
-    // from the same model.
-    const invokeOnce = async (stream: boolean): Promise<WorkersAiInvokeResult> => {
-      onStep({
-        phase: "model-call",
-        message: stream
-          ? `calling model ${baseModel}`
-          : `streaming call failed (transient); retrying ${baseModel} without streaming`,
-      });
-      return this.options.invoke(
-        { model: baseModel, messages },
-        stream ? streamCallbacks : undefined,
-      );
+    const invokeOnce = async (): Promise<WorkersAiInvokeResult> => {
+      onStep({ phase: "model-call", message: `calling model ${baseModel}` });
+      return this.options.invoke({ model: baseModel, messages }, stepCallbacks);
     };
 
     let result: WorkersAiInvokeResult;
     let lastError: unknown;
     for (let tryNo = 0; tryNo <= maxRetries; tryNo += 1) {
-      // Stream only on the first try when a token callback is present; any retry
-      // of the same model drops streaming to survive a persistently-flaky stream.
-      const stream = wantStream && tryNo === 0;
       try {
-        result = await invokeOnce(stream);
+        result = await invokeOnce();
         lastError = undefined;
         break;
       } catch (error) {
@@ -807,10 +777,11 @@ function extractReplyText(body: {
  * a Worker `env.AI` binding. The token is held in this closure only and is never
  * returned, logged, or written anywhere.
  *
- * The call is bounded by a timeout via an AbortController: if the model does not
- * respond within `timeoutMs` the request is aborted and surfaced as a distinct
- * WorkersAiTimeoutError, so a hung call cannot wedge the agent forever. The
- * executor's bounded retry treats that timeout as a transient failure.
+ * The call is always NON-STREAMING: it makes one request and parses the full
+ * reply. It is bounded by a timeout via an AbortController: if the model does
+ * not respond within `timeoutMs` the request is aborted and surfaced as a
+ * distinct WorkersAiTimeoutError, so a hung call cannot wedge the agent forever.
+ * The executor's bounded retry treats that timeout as a transient failure.
  *
  * The REST response shape is `{ result: { response: "..." }, ... }` for the chat
  * text-generation models; usage, when present, is read from `result.usage`.
@@ -821,15 +792,9 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
   const timeoutMs = options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS;
   return async (
     request: WorkersAiInvokeRequest,
-    callbacks?: WorkersAiStreamCallbacks,
+    _callbacks?: WorkersAiStreamCallbacks,
   ): Promise<WorkersAiInvokeResult> => {
     const url = `${base}/accounts/${encodeURIComponent(options.accountId)}/ai/run/${request.model}`;
-    // Stream only when a caller actually wants tokens relayed. Workers AI
-    // streams chat text generation as SSE when `stream: true` is set, each event
-    // carrying `{ "response": "<delta>" }` and a final `[DONE]`. When no token
-    // callback is given, keep the simpler non-streaming request so the existing
-    // behavior (and the account's default usage reporting) is unchanged.
-    const wantStream = typeof callbacks?.onToken === "function";
     // Bound the call with an AbortController so a slow or hung model cannot hang
     // the agent forever. The timer is always cleared on settle, and an abort is
     // surfaced as a distinct timeout error rather than an opaque fetch failure.
@@ -846,7 +811,7 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
           authorization: `Bearer ${options.apiToken}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ messages: request.messages, ...(wantStream ? { stream: true } : {}) }),
+        body: JSON.stringify({ messages: request.messages }),
         ...(controller ? { signal: controller.signal } : {}),
       });
     } catch (error) {
@@ -859,32 +824,16 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
       }
       throw error instanceof Error ? error : new Error(String(error));
     } finally {
-      // For a NON-streaming call the whole body is read below within this
-      // function, so the timer is cleared here on settle. For a STREAMING call
-      // the body is consumed later in readStreamingResponse, so clearing the
-      // timer here would leave the SSE read unbounded (a stalled or server-erroring
-      // stream would then hang the Worker until the runtime cancels it). In the
-      // streaming case we therefore DEFER clearing the timer to the reader, which
-      // clears it when the stream completes or aborts.
-      if (timer !== undefined && !(wantStream && res! !== undefined && res!.body)) {
+      // The whole body is read below within this function, so the timer is
+      // cleared here on settle.
+      if (timer !== undefined) {
         clearTimeout(timer);
       }
     }
     if (res.status >= 400) {
       // Drain the body (do not include it in the error) and fail without leaking.
       await res.text().catch(() => "");
-      if (timer !== undefined) {
-        clearTimeout(timer);
-      }
       throw new Error(`Workers AI call failed for ${request.model} (HTTP ${res.status})`);
-    }
-    if (wantStream && res.body) {
-      // Relay the SSE token stream: emit each delta through onToken as it lands
-      // and assemble the full reply so the executor's edit parser is unchanged.
-      // The controller + timer are passed in so the deadline stays live for the
-      // whole read: a stalled or server-erroring stream aborts and fails cleanly
-      // rather than hanging the Worker forever (the hang the runtime cancels).
-      return readStreamingResponse(res, request.model, callbacks, controller, timer);
     }
     const text = await res.text();
     let body: {
@@ -930,164 +879,4 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
         : {}),
     };
   };
-}
-
-/**
- * Read a Workers AI SSE streaming response: parse each `data:` line (the chat
- * models stream `{ "response": "<delta>" }` events, ending with `[DONE]`),
- * relay each delta through onToken as it arrives, and assemble the full reply
- * text (plus usage if a final event carries it) so the executor parses the
- * complete JSON edit document exactly as the non-streaming path does. The
- * streamed deltas are the genuine model output.
- */
-async function readStreamingResponse(
-  res: Response,
-  model: string,
-  callbacks?: WorkersAiStreamCallbacks,
-  controller?: AbortController,
-  timer?: ReturnType<typeof setTimeout>,
-): Promise<WorkersAiInvokeResult> {
-  const reader = res.body!.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let assembled = "";
-  let usage: WorkersAiUsage | undefined;
-  const handleEvent = (dataLine: string): void => {
-    const payload = dataLine.replace(/^data:\s*/, "").trim();
-    if (payload === "" || payload === "[DONE]") {
-      return;
-    }
-    try {
-      const event = JSON.parse(payload) as {
-        response?: unknown;
-        choices?: ReadonlyArray<{
-          delta?: { content?: unknown; reasoning?: unknown };
-          message?: { content?: unknown };
-        }>;
-        usage?: { prompt_tokens?: number; completion_tokens?: number };
-      };
-      // The classic chat text-generation stream carries `response` deltas; the
-      // OpenAI-style stream (the qwen3.8 family) carries them in
-      // `choices[0].delta.content`, with any chain-of-thought in a separate
-      // `reasoning` delta we intentionally ignore. Reading both keeps every
-      // model honest instead of assembling an empty reply for a shape it does
-      // not recognize.
-      const choice = event.choices?.[0];
-      const openAiDelta =
-        typeof choice?.delta?.content === "string"
-          ? choice.delta.content
-          : typeof choice?.message?.content === "string"
-            ? choice.message.content
-            : "";
-      const delta = typeof event.response === "string" && event.response !== "" ? event.response : openAiDelta;
-      if (delta !== "") {
-        assembled += delta;
-        callbacks?.onToken?.(delta);
-      }
-      if (event.usage) {
-        usage = {
-          ...(event.usage.prompt_tokens !== undefined ? { inputTokens: event.usage.prompt_tokens } : {}),
-          ...(event.usage.completion_tokens !== undefined
-            ? { outputTokens: event.usage.completion_tokens }
-            : {}),
-        };
-      }
-    } catch {
-      // A non-JSON SSE line (a keep-alive or comment) is ignored.
-    }
-  };
-  // A per-read stall watchdog: if no chunk (and no clean `done`) arrives within
-  // this window, abort the body so the read cannot block forever. This is a
-  // second guard beneath the overall AbortController deadline, covering the case
-  // where the stream stays open but silent (e.g. the model errored mid-stream).
-  const STALL_MS = 30000;
-  let aborted = false;
-  const abortStream = (): void => {
-    aborted = true;
-    try {
-      controller?.abort();
-    } catch {
-      // ignore
-    }
-    void reader.cancel().catch(() => {});
-  };
-  try {
-    for (;;) {
-      let stall: ReturnType<typeof setTimeout> | undefined;
-      const read = reader.read();
-      const stalled = new Promise<{ stalled: true }>((resolve) => {
-        stall = setTimeout(() => resolve({ stalled: true }), STALL_MS);
-      });
-      // Also race the overall deadline: when the caller's AbortController fires
-      // (the timeoutMs elapsed), a stalled reader.read() would otherwise block
-      // until the 30s stall watchdog. Listening for the abort event lets the
-      // deadline interrupt the read immediately, so the stream can never outlive
-      // the deadline that bounds the whole call.
-      const abortedP = new Promise<{ aborted: true }>((resolve) => {
-        const sig = controller?.signal;
-        if (!sig) {
-          return;
-        }
-        if (sig.aborted) {
-          resolve({ aborted: true });
-          return;
-        }
-        sig.addEventListener("abort", () => resolve({ aborted: true }), { once: true });
-      });
-      let outcome:
-        | { done?: boolean; value?: Uint8Array }
-        | { stalled: true }
-        | { aborted: true };
-      try {
-        outcome = await Promise.race([read, stalled, abortedP]);
-      } finally {
-        if (stall !== undefined) {
-          clearTimeout(stall);
-        }
-      }
-      if ("aborted" in outcome) {
-        abortStream();
-        throw new WorkersAiTimeoutError(`Workers AI stream for ${model} timed out`);
-      }
-      if ("stalled" in outcome) {
-        abortStream();
-        throw new WorkersAiTimeoutError(
-          `Workers AI stream for ${model} stalled with no data for ${STALL_MS}ms`,
-        );
-      }
-      const { done, value } = outcome;
-      if (done) {
-        break;
-      }
-      if (controller?.signal.aborted) {
-        throw new WorkersAiTimeoutError(`Workers AI stream for ${model} timed out`);
-      }
-      buffer += decoder.decode(value, { stream: true });
-      let newlineIdx: number;
-      while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
-        const line = buffer.slice(0, newlineIdx);
-        buffer = buffer.slice(newlineIdx + 1);
-        if (line.startsWith("data:")) {
-          handleEvent(line);
-        }
-      }
-    }
-    // Flush any trailing buffered line.
-    if (buffer.startsWith("data:")) {
-      handleEvent(buffer);
-    }
-    if (assembled === "") {
-      throw new Error(`Workers AI returned an empty stream for ${model}`);
-    }
-    return { text: assembled, ...(usage ? { usage } : {}) };
-  } finally {
-    // Always clear the overall deadline timer when the stream settles (success,
-    // error, or abort), so the deferred timer from the caller is never leaked.
-    if (timer !== undefined) {
-      clearTimeout(timer);
-    }
-    if (!aborted) {
-      void reader.cancel().catch(() => {});
-    }
-  }
 }

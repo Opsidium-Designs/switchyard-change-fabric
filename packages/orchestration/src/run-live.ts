@@ -410,10 +410,11 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   };
 
   // Fire-and-forget reporters for the live per-node feedback. They post the REAL
-  // run steps, the model detail, and the streamed model tokens to the Worker so
-  // the console's activity log, click-detail, and live stream render real state.
-  // They never throw into the run: a feedback post failing must not fail the
-  // agent (the run's correctness does not depend on observability landing).
+  // run steps and the model detail to the Worker so the console's activity log
+  // and the static model transcript (prompt summary + proposed edit/diff +
+  // commit message) render real state. They never throw into the run: a feedback
+  // post failing must not fail the agent (the run's correctness does not depend
+  // on observability landing).
   const unitPath = (unitId: string, suffix: string) =>
     `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/${suffix}`;
   const reportStep = (unitId: string, phase: string, message: string): void => {
@@ -421,9 +422,6 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   };
   const reportDetail = (unitId: string, detail: Record<string, unknown>): void => {
     void post(unitPath(unitId, "detail"), detail).catch(() => {});
-  };
-  const reportStream = (unitId: string, chunk: string): void => {
-    void post(unitPath(unitId, "stream"), chunk, "text/plain").catch(() => {});
   };
 
   // 1. Create the Change and set the dial.
@@ -466,15 +464,20 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
         baselineRef: agent.baselineRef,
         // Per-unit observability callbacks: the executor surfaces the real agent
         // activity through these, and the runner relays it to the Worker so the
-        // console renders it live. A deterministic executor ignores them.
+        // console renders it. A deterministic executor ignores them. There is no
+        // live token relay: the model is called non-streaming and the console
+        // shows a static transcript once the unit is done.
         onPromptSummary: (summary) => reportDetail(agent.unitId, { promptSummary: summary }),
-        onToken: (chunk) => reportStream(agent.unitId, chunk),
         onStep: (step) => reportStep(agent.unitId, step.phase, step.message),
       });
-      // Record the model's proposed edit as rich detail: the model id, the
-      // changed paths, a readable diff reconstructed from the real worktree, the
-      // proposed commit message, and token usage / cost the executor reported.
-      // This is read straight from the real executor result, not synthesized.
+      // Record the model transcript as rich detail: the model id, the proposed
+      // edit (changed paths), a readable diff reconstructed from the real
+      // worktree, the proposed commit message, and token usage / cost the
+      // executor reported. Together with the prompt summary reported above
+      // (onPromptSummary), these ARE the static transcript the console renders
+      // when the unit is done: the real recorded prompt + the real proposed
+      // edit + the real commit message, read straight from the executor result,
+      // never synthesized.
       const diff = await buildEditDiff(worktreeDir, result.changedPaths);
       reportDetail(agent.unitId, {
         ...(result.cost.model ? { model: result.cost.model } : {}),
