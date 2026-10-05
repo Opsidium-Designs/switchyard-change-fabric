@@ -293,7 +293,7 @@ describe("createWorkersAiRestInvoke", () => {
       messages: [{ role: "user", content: "hi" }],
     });
 
-    expect(seenUrl).toContain("/accounts/acct-123/ai/run/@cf/qwen/qwen3.8-27b");
+    expect(seenUrl).toContain("/accounts/acct-123/ai/run/@cf/meta/llama-3.3-70b-instruct-fp8-fast");
     expect(seenAuth).toBe("Bearer secret-token-value");
     expect(seenBody).toContain("\"messages\"");
     // Regression: the request MUST send a generous max_tokens. Workers AI

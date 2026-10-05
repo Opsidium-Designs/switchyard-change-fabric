@@ -5,7 +5,7 @@
  * The selection mirrors the `.env` contract: `EXECUTOR` picks the inference
  * path. For `workers-ai`, this builds the live Workers AI executor over the REST
  * transport, reading the base model from `WORKERS_AI_MODEL` (defaulting to the
- * qwen3.8 headline model), the verify-fail escalation model from
+ * llama-3.3-70b fast model), the verify-fail escalation model from
  * `WORKERS_AI_ESCALATION_MODEL` (defaulting to glm-5.3), and the credential from
  * `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`. The token is read from the
  * environment and passed into the transport closure only; it is never returned,

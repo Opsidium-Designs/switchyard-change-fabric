@@ -45,7 +45,7 @@ describe("buildAppGateWiring", () => {
       projectHasGate: true,
       executorLive: true,
       escalationModel: "@cf/zai-org/glm-5.3",
-      baseModel: "@cf/qwen/qwen3.8-27b",
+      baseModel: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
       maxModelRetries: 1,
       commandRunner: runner,
     });
@@ -60,7 +60,7 @@ describe("buildAppGateWiring", () => {
     expect(wiring.verifyCommandRunner).toBe(runner);
     // On a live executor the escalation + base model ids drive the ladder.
     expect(wiring.escalationModel).toBe("@cf/zai-org/glm-5.3");
-    expect(wiring.baseModel).toBe("@cf/qwen/qwen3.8-27b");
+    expect(wiring.baseModel).toBe("@cf/meta/llama-3.3-70b-instruct-fp8-fast");
     expect(wiring.maxModelRetries).toBe(1);
   });
 
@@ -69,7 +69,7 @@ describe("buildAppGateWiring", () => {
       projectHasGate: false,
       executorLive: true,
       escalationModel: "@cf/zai-org/glm-5.3",
-      baseModel: "@cf/qwen/qwen3.8-27b",
+      baseModel: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
       maxModelRetries: 1,
       commandRunner: new FakeRunner(),
     });
@@ -88,7 +88,7 @@ describe("buildAppGateWiring", () => {
       projectHasGate: true,
       executorLive: false,
       escalationModel: "@cf/zai-org/glm-5.3",
-      baseModel: "@cf/qwen/qwen3.8-27b",
+      baseModel: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
       maxModelRetries: 2,
       commandRunner: new FakeRunner(),
     });
@@ -121,7 +121,7 @@ describe("buildAppGateWiring", () => {
       gateFlag: false,
       executorLive: true,
       escalationModel: "@cf/zai-org/glm-5.3",
-      baseModel: "@cf/qwen/qwen3.8-27b",
+      baseModel: "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
       maxModelRetries: 1,
       commandRunner: new FakeRunner(),
     });

@@ -33,7 +33,7 @@ import type {
 } from "./types.ts";
 
 /** The headline Workers AI model for the agent's coding reasoning. */
-export const DEFAULT_WORKERS_AI_MODEL = "@cf/qwen/qwen3.8-27b";
+export const DEFAULT_WORKERS_AI_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 /**
  * Deprecated. This id used to be a cross-model transport fallback that ran a
