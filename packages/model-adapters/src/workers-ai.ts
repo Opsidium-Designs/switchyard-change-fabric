@@ -36,11 +36,14 @@ import type {
 export const DEFAULT_WORKERS_AI_MODEL = "@cf/qwen/qwen3.8-27b";
 
 /**
- * A cheaper, smaller fallback model tried only when the headline model CALL
- * THROWS (a transport error). This is a different axis from a verify-fail
- * escalation: it is the transport fallback, not the bounded model-escalation
- * ladder. It stays a small, cheap model so a flaky headline call still has a
- * chance to produce an edit without paying for a second large model.
+ * Deprecated. This id used to be a cross-model transport fallback that ran a
+ * different, cheaper model when the base model call threw. That behavior is
+ * removed: a transient streaming or transport error must never change which
+ * model does the work, so the base model now stays attached and a transient
+ * failure retries the SAME model (non-streaming on a retry). The constant is
+ * kept exported so existing imports and config do not break, but it no longer
+ * drives a model swap. The only deliberate model change is the verify-fail
+ * escalation handled by the live runner.
  */
 export const DEFAULT_WORKERS_AI_FALLBACK_MODEL = "@cf/meta/llama-3.1-8b-instruct";
 
@@ -52,7 +55,7 @@ export interface WorkersAiMessage {
 
 /** What the executor hands to the injected transport. */
 export interface WorkersAiInvokeRequest {
-  /** The model id to run (the headline model or its configured fallback). */
+  /** The model id to run (the chosen base model, or a per-attempt escalation). */
   readonly model: string;
   /** The chat messages (a system prompt plus the user task). */
   readonly messages: readonly WorkersAiMessage[];
@@ -125,7 +128,12 @@ export interface WorkersAiEdit {
 export interface WorkersAiExecutorOptions {
   /** The headline model id. Defaults to the qwen coder model. */
   readonly model?: string;
-  /** A cheaper small model tried when the headline model call fails. */
+  /**
+   * Deprecated and unused: previously a cheaper model tried when the base model
+   * call threw. A transient failure now retries the SAME model instead of
+   * switching, so this never changes which model runs. The field is still
+   * accepted so existing config does not error.
+   */
   readonly fallbackModel?: string;
   /** The transport that performs the real Workers AI call (holds any credential). */
   readonly invoke: WorkersAiInvoke;
@@ -141,10 +149,10 @@ export interface WorkersAiExecutorOptions {
    * How many times to retry a TRANSIENT model-call failure (a provider internal
    * error, a 5xx, or a timeout) before giving up. This is a small bounded cap so
    * a single flaky call on a hosted model does not fail the whole unit, while a
-   * hard cap keeps it from looping forever. Each attempt still tries the headline
-   * model then the fallback once, so the retry sits on top of the existing
-   * two-model path. Defaults to 2. A non-transient failure (for example a bad
-   * model reply) is not retried: that is an honest failure, not a flaky call.
+   * hard cap keeps it from looping forever. Each retry runs the SAME model (a
+   * retry after a streaming failure drops streaming), so the model stays
+   * attached. Defaults to 2. A non-transient failure (for example a bad model
+   * reply) is not retried: that is an honest failure, not a flaky call.
    */
   readonly maxRetries?: number;
   /**
@@ -255,7 +263,6 @@ export class WorkersAiExecutor implements ExecutorProvider {
   readonly name = "workers-ai";
 
   private readonly model: string;
-  private readonly fallbackModel: string;
 
   constructor(private readonly options: WorkersAiExecutorOptions) {
     if (typeof options.invoke !== "function") {
@@ -264,7 +271,14 @@ export class WorkersAiExecutor implements ExecutorProvider {
       );
     }
     this.model = options.model ?? DEFAULT_WORKERS_AI_MODEL;
-    this.fallbackModel = options.fallbackModel ?? DEFAULT_WORKERS_AI_FALLBACK_MODEL;
+    // `options.fallbackModel` (and WORKERS_AI_FALLBACK_MODEL) is deprecated and
+    // intentionally unused: a transient streaming or transport error must never
+    // switch which model does the work. The chosen model stays attached and a
+    // transient failure retries the SAME model (non-streaming on a retry). The
+    // option is still accepted so existing config does not error. The only place
+    // the model changes is the deliberate verify-fail escalation, which lives in
+    // the live runner, not here.
+    void options.fallbackModel;
   }
 
   async execute(context: ExecutorContext): Promise<ExecutionResult> {
@@ -276,9 +290,9 @@ export class WorkersAiExecutor implements ExecutorProvider {
     // The model this attempt runs. A caller that escalates on a verify-fail
     // passes a per-attempt `context.model` (for example the stronger escalation
     // model); when unset we run the executor's configured base model, so every
-    // existing caller is unchanged. This selects WHICH model runs; it is a
-    // different axis from the transport fallback below (which only fires when a
-    // model call throws).
+    // existing caller is unchanged. This selects WHICH model runs, and once
+    // chosen it stays attached: a transient streaming or transport error retries
+    // the SAME model rather than switching to another one.
     const baseModel = (context.model ?? "").trim() || this.model;
 
     const contextFiles = await readScoped(context.worktreeDir, context.paths, {
@@ -319,45 +333,58 @@ export class WorkersAiExecutor implements ExecutorProvider {
     const isTransient = this.options.isTransientError ?? isTransientWorkersAiError;
     const sleep = this.options.sleep ?? defaultSleep;
 
-    // One attempt tries the headline model, then the cheaper fallback model once
-    // if the headline call throws (a provider error, not a bad reply). A bad
-    // reply from either model is an honest failure, not grounds for a silent
-    // noop. The whole attempt is wrapped in a bounded retry: a transient
-    // provider failure or a timeout (a flaky hosted-model call) is retried up to
-    // `maxRetries` times with a short backoff, so one wedged or internal-error
-    // call does not fail the unit. The retry cap is hard, so it can never loop
-    // forever, and a non-transient failure is thrown immediately.
-    const attempt = async (): Promise<{ result: WorkersAiInvokeResult; usedModel: string }> => {
-      try {
-        onStep({ phase: "model-call", message: `calling model ${baseModel}` });
-        return { result: await this.options.invoke({ model: baseModel, messages }, streamCallbacks), usedModel: baseModel };
-      } catch (headlineError) {
-        if (this.fallbackModel && this.fallbackModel !== baseModel) {
-          onStep({ phase: "model-call", message: `headline model failed, trying fallback ${this.fallbackModel}` });
-          return {
-            result: await this.options.invoke({ model: this.fallbackModel, messages }, streamCallbacks),
-            usedModel: this.fallbackModel,
-          };
-        }
-        throw headlineError;
-      }
+    // Every attempt runs the SAME chosen model: a streaming or transport hiccup
+    // must never change which model does the work. The model only ever changes
+    // through the deliberate, visible verify-fail escalation, which is a
+    // separate axis handled by the caller (it passes a per-attempt
+    // `context.model`); it is NOT this transient-retry path.
+    //
+    // The attempt is wrapped in a bounded retry: a transient provider failure or
+    // a timeout (a flaky hosted-model call) is retried up to `maxRetries` times
+    // with a short backoff, so one wedged or internal-error call does not fail
+    // the unit. The retry cap is hard, so it can never loop forever, and a
+    // non-transient failure (for example a bad model reply) is thrown
+    // immediately rather than retried.
+    //
+    // Streaming is decided by the presence of an onToken callback. If the FIRST
+    // (streaming) attempt throws a transient error, the retry of the SAME model
+    // drops streaming (invokes without the streaming callbacks) so a
+    // persistently-flaky stream still yields the same model's output as a plain
+    // non-streaming request. The live token view is lost for that attempt only;
+    // the model is unchanged. `usedModel` is always `baseModel`.
+    const wantStream = typeof onToken === "function";
+    const usedModel = baseModel;
+
+    // The first attempt streams when a token callback is present; a retry after a
+    // transient failure drops streaming so a flaky stream still produces output
+    // from the same model.
+    const invokeOnce = async (stream: boolean): Promise<WorkersAiInvokeResult> => {
+      onStep({
+        phase: "model-call",
+        message: stream
+          ? `calling model ${baseModel}`
+          : `streaming call failed (transient); retrying ${baseModel} without streaming`,
+      });
+      return this.options.invoke(
+        { model: baseModel, messages },
+        stream ? streamCallbacks : undefined,
+      );
     };
 
     let result: WorkersAiInvokeResult;
-    let usedModel = baseModel;
     let lastError: unknown;
     for (let tryNo = 0; tryNo <= maxRetries; tryNo += 1) {
+      // Stream only on the first try when a token callback is present; any retry
+      // of the same model drops streaming to survive a persistently-flaky stream.
+      const stream = wantStream && tryNo === 0;
       try {
-        const outcome = await attempt();
-        result = outcome.result;
-        usedModel = outcome.usedModel;
+        result = await invokeOnce(stream);
         lastError = undefined;
         break;
       } catch (error) {
         lastError = error;
         // Stop immediately on a hard (non-transient) failure, or once the bounded
-        // retries are exhausted. Otherwise back off and try the whole two-model
-        // attempt again.
+        // retries are exhausted. Otherwise back off and retry the SAME model.
         if (tryNo >= maxRetries || !isTransient(error)) {
           throw error;
         }

@@ -142,26 +142,77 @@ describe("WorkersAiExecutor", () => {
     ).rejects.toThrow(/worktree-relative|escapes the worktree/);
   });
 
-  it("falls back to the small model when the headline model call throws", async () => {
+  it("retries the SAME base model on a transient throw (never switches to a different model)", async () => {
     const calls: string[] = [];
     const invoke: WorkersAiInvoke = async (request) => {
       calls.push(request.model);
-      if (request.model === DEFAULT_WORKERS_AI_MODEL) {
-        throw new Error("headline model unavailable");
+      if (calls.length === 1) {
+        // The base model's first call throws transiently.
+        throw new Error("internal error; reference=abc123");
       }
+      // The retry must be the SAME base model, not a different one.
       return {
         text: JSON.stringify({ edits: [{ path: "src/x.ts", contents: "export const x = 2;\n" }] }),
       };
     };
-    const result = await new WorkersAiExecutor({ invoke, fallbackModel: "@cf/small/model" }).execute({
+    // A deprecated fallbackModel is set but must be ignored: no model swap.
+    const result = await new WorkersAiExecutor({
+      invoke,
+      fallbackModel: "@cf/small/model",
+      maxRetries: 2,
+      retryBackoffMs: 0,
+    }).execute({
       worktreeDir: worktree,
       workUnitId: "x",
       objective: "add x",
       paths: ["src/x.ts"],
       baselineRef: "HEAD",
     });
-    expect(calls).toEqual([DEFAULT_WORKERS_AI_MODEL, "@cf/small/model"]);
-    expect(result.cost.model).toBe("@cf/small/model");
+    // Both the failing attempt and the retry used the SAME base model id; the
+    // configured fallback model was never called.
+    expect(calls).toEqual([DEFAULT_WORKERS_AI_MODEL, DEFAULT_WORKERS_AI_MODEL]);
+    expect(calls).not.toContain("@cf/small/model");
+    // The reported model stays the base model, never a different one.
+    expect(result.cost.model).toBe(DEFAULT_WORKERS_AI_MODEL);
+  });
+
+  it("drops streaming on the retry after a transient streaming failure (same model, no onToken)", async () => {
+    const sawStream: boolean[] = [];
+    const seenModels: string[] = [];
+    const invoke: WorkersAiInvoke = async (request, callbacks) => {
+      seenModels.push(request.model);
+      const wantStream = typeof callbacks?.onToken === "function";
+      sawStream.push(wantStream);
+      if (seenModels.length === 1) {
+        // The FIRST (streaming) attempt throws transiently.
+        expect(wantStream).toBe(true);
+        throw new Error("internal error; reference=stream-blip");
+      }
+      // The retry is the SAME model and must NOT stream (no onToken given).
+      return {
+        text: JSON.stringify({ edits: [{ path: "src/x.ts", contents: "export const x = 3;\n" }] }),
+      };
+    };
+    const streamed: string[] = [];
+    const result = await new WorkersAiExecutor({
+      invoke,
+      maxRetries: 2,
+      retryBackoffMs: 0,
+    }).execute({
+      worktreeDir: worktree,
+      workUnitId: "x",
+      objective: "add x",
+      paths: ["src/x.ts"],
+      baselineRef: "HEAD",
+      // Providing onToken makes the first attempt a streaming request.
+      onToken: (chunk) => streamed.push(chunk),
+    });
+    // Same model both times; the first streamed, the retry did not.
+    expect(seenModels).toEqual([DEFAULT_WORKERS_AI_MODEL, DEFAULT_WORKERS_AI_MODEL]);
+    expect(sawStream).toEqual([true, false]);
+    expect(result.cost.model).toBe(DEFAULT_WORKERS_AI_MODEL);
+    const written = await readFile(join(worktree, "src/x.ts"), "utf8");
+    expect(written).toBe("export const x = 3;\n");
   });
 });
 
@@ -401,9 +452,9 @@ describe("WorkersAiExecutor bounded retry (tolerating transient model errors)", 
     const sleeps: number[] = [];
     const invoke: WorkersAiInvoke = async () => {
       calls += 1;
-      // Fail transiently on the first attempt (both headline and fallback within
-      // that attempt), then succeed on the retry.
-      if (calls <= 2) {
+      // Each try is exactly one invoke of the SAME model. Fail transiently on the
+      // first attempt, then succeed on the retry.
+      if (calls <= 1) {
         throw new Error("internal error: 5xx from the provider");
       }
       return { text: okReply };
@@ -423,6 +474,7 @@ describe("WorkersAiExecutor bounded retry (tolerating transient model errors)", 
       baselineRef: "HEAD",
     });
     expect(result.changedPaths).toEqual(["src/x.ts"]);
+    expect(result.cost.model).toBe(DEFAULT_WORKERS_AI_MODEL);
     // One backoff happened (one retry), with no real delay (injected sleep).
     expect(sleeps.length).toBe(1);
   });
@@ -436,10 +488,7 @@ describe("WorkersAiExecutor bounded retry (tolerating transient model errors)", 
     await expect(
       new WorkersAiExecutor({
         invoke,
-        // Disable the second model so each attempt is exactly one invoke call,
-        // making the attempt count easy to assert.
         model: "m",
-        fallbackModel: "m",
         maxRetries: 2,
         retryBackoffMs: 0,
       }).execute({
@@ -450,7 +499,8 @@ describe("WorkersAiExecutor bounded retry (tolerating transient model errors)", 
         baselineRef: "HEAD",
       }),
     ).rejects.toThrow(/internal error/);
-    // 1 initial attempt + 2 bounded retries = 3 invoke calls, then it gives up.
+    // 1 initial attempt + 2 bounded retries = 3 invoke calls of the SAME model,
+    // then it gives up. No model swap ever happens.
     expect(attempts).toBe(3);
   });
 
@@ -469,9 +519,8 @@ describe("WorkersAiExecutor bounded retry (tolerating transient model errors)", 
         baselineRef: "HEAD",
       }),
     ).rejects.toThrow(UnusableModelOutputError);
-    // A bad reply is not transient, so it is not retried: exactly one attempt
-    // (headline model only, since the default fallback differs but a bad reply
-    // is not a thrown provider error, so the fallback path is not taken).
+    // A bad reply is not transient, so it is not retried and the model is never
+    // swapped: exactly one attempt of the base model.
     expect(attempts).toBe(1);
   });
 
