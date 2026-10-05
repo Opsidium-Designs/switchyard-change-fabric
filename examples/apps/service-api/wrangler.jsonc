@@ -1,0 +1,10 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "switchyard-change-fabric-service-api",
+  "main": "src/index.js",
+  "compatibility_date": "2025-09-23",
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  }
+}

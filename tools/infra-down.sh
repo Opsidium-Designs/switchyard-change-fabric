@@ -116,7 +116,7 @@ echo ""
 # '${WORKER_NAME}' AND every app Worker it deploys, which are named
 # '${WORKER_NAME}-<app>' (the example apps from the Deploy control). Listing
 # the account's scripts and sweeping the prefix means a forgotten app deploy
-# (e.g. '${WORKER_NAME}-metrics-dashboard') is torn down too, so nothing bills.
+# (e.g. '${WORKER_NAME}-service-api') is torn down too, so nothing bills.
 # ---------------------------------------------------------------------------
 echo "== Step 3: deployed Workers '${WORKER_NAME}' and '${WORKER_NAME}-*' =="
 SCRIPTS=$(curl -s -H "${AUTH}" "${ACCT}/workers/scripts")

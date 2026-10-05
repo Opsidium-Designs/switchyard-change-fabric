@@ -1,0 +1,1 @@
+Add input validation and require auth on every resource

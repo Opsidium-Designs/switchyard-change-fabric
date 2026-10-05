@@ -14,8 +14,8 @@
 #   make clean-live  tear down the real repos a watch run left up
 #   make seed-change seed the demo Change into a running Worker (for the console)
 #   make deploy    deploy the Worker to Cloudflare (wrangler deploy)
-#   make deploy-app APP=hello-fix  deploy an example web app to a live workers.dev URL
-#   make delete-app APP=hello-fix  tear that deployed example app down (stop billing)
+#   make deploy-app APP=service-api  deploy an example web app to a live workers.dev URL
+#   make delete-app APP=service-api  tear that deployed example app down (stop billing)
 #   make infra-up      spin the hosted Cloudflare infra up (deploy + queue + subscription), idempotent
 #   make infra-status  read-only: what is live right now (am I paying for anything?)
 #   make infra-down    spin the hosted Cloudflare infra down (delete worker + queue + subscription + repos), idempotent
@@ -246,9 +246,9 @@ infra-down:
 # hop: a tiny real Worker goes from source to a clickable page in one command.
 # Authenticate first with a scoped CLOUDFLARE_API_TOKEN in a gitignored .env
 # (sourced below) or `wrangler login`. Tear it down with `make delete-app`.
-# See docs/LIVE-DEPLOY.md. The example apps are: hello-fix, todo-api,
-# url-shortener, unit-converter, metrics-dashboard. Defaults to hello-fix.
-APP ?= hello-fix
+# See docs/LIVE-DEPLOY.md. The example app is: service-api.
+# Defaults to service-api.
+APP ?= service-api
 
 deploy-app:
 	set -a; [ -f .env ] && . ./.env; set +a; \

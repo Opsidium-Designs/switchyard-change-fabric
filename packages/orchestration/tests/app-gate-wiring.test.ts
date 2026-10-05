@@ -132,11 +132,11 @@ describe("buildAppGateWiring", () => {
 
 describe("projectHasGateScript (real shipped fixtures)", () => {
   it("reports a gate script for a real example app and none for the intro change target", async () => {
-    // A real app (todo-api) declares a `gate` script, so a run against it is
+    // A real app (service-api) declares a `gate` script, so a run against it is
     // gated; the intro change target (demo-project) does not, so a run against
     // it is NOT forced through a gate it does not have (honest cannot-pass vs
     // auto-pass split).
-    const realApp = resolve(REPO_ROOT, "examples/apps/todo-api");
+    const realApp = resolve(REPO_ROOT, "examples/apps/service-api");
     const introTarget = resolve(REPO_ROOT, "examples/demo-project");
 
     expect(await projectHasGateScript(realApp)).toBe(true);

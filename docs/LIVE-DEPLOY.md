@@ -3,9 +3,10 @@
 This is the deploy-to-live-URL hop: take a tiny real Worker in
 `examples/apps/<name>` and put it on a public, clickable `workers.dev` URL in one
 command, then tear it down so it stops billing. The reference example is
-[`examples/apps/hello-fix`](../examples/apps/hello-fix/README.md), which carries
-one deliberate, observable bug (wrong `Content-Type`) so a before/after is obvious
-on the live page.
+[`examples/apps/service-api`](../examples/apps/service-api/README.md), a
+multi-resource JSON API whose every resource carries a deliberate, observable gap
+(it skips input validation and the shared auth check) so a before/after is obvious
+on the live service.
 
 ## What path this uses and why
 
@@ -39,10 +40,10 @@ can run `npx wrangler login` once and skip the `.env` entry.
 From the repository root:
 
 ```bash
-make deploy-app APP=hello-fix
+make deploy-app APP=service-api
 ```
 
-This sources `.env` and runs `npx wrangler deploy` in `examples/apps/hello-fix`.
+This sources `.env` and runs `npx wrangler deploy` in `examples/apps/service-api`.
 On success wrangler prints the live URL, of the form:
 
 ```
@@ -50,8 +51,8 @@ https://<worker-name>.<your-subdomain>.workers.dev
 ```
 
 For the reference example the worker name is
-`switchyard-change-fabric-hello-fix`, so the URL is
-`https://switchyard-change-fabric-hello-fix.<your-subdomain>.workers.dev`.
+`switchyard-change-fabric-service-api`, so the URL is
+`https://switchyard-change-fabric-service-api.<your-subdomain>.workers.dev`.
 
 Note: the first ever deploy to a brand-new `workers.dev` subdomain can briefly
 return `523` for about a minute while the subdomain propagates. Wait and retry.
@@ -59,18 +60,20 @@ return `523` for about a minute while the subdomain propagates. Wait and retry.
 ## Verify the fix is live
 
 ```bash
-curl -sS -D - -o /dev/null https://switchyard-change-fabric-hello-fix.<subdomain>.workers.dev | grep -i content-type
-# fixed:   content-type: text/html; charset=utf-8
-# buggy:   content-type: text/plain; charset=utf-8
+URL=https://switchyard-change-fabric-service-api.<subdomain>.workers.dev
+# unauthenticated write: fixed -> 401, buggy -> 201
+curl -sS -o /dev/null -w "%{http_code}\n" -X POST "$URL/users" \
+  -H "content-type: application/json" -d '{"email":"a@example.com"}'
 ```
 
-Open the same URL in a browser: with the fix it renders as a styled page; with
-the planted bug the raw HTML markup shows as plain text.
+Open the same URL in a browser: `GET /` renders a styled page listing the
+resources. With the fix, an unauthenticated or invalid request to any resource is
+rejected (401 or 400); with the planted gap it wrongly succeeds.
 
 ## Tear it down (stop billing)
 
 ```bash
-make delete-app APP=hello-fix
+make delete-app APP=service-api
 ```
 
 This reads the worker name from the app's `wrangler.jsonc` and deletes the worker
@@ -83,7 +86,7 @@ has full account permissions you can also run `npx wrangler delete` directly fro
 the app directory (add `--dry-run` to preview):
 
 ```bash
-cd examples/apps/hello-fix && npx wrangler delete --dry-run
+cd examples/apps/service-api && npx wrangler delete --dry-run
 ```
 
 ## Deploy a different example app

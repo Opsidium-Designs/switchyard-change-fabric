@@ -1,0 +1,19 @@
+{
+  "name": "switchyard-change-fabric-service-api",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A multi-resource JSON API Worker with a planted cross-resource gap: every resource skips input validation and auth. Each resource owns its own fix over two frozen shared contracts (requireAuth, json/problem).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "delete": "wrangler delete --name switchyard-change-fabric-service-api",
+    "typecheck": "node --check src/index.js && node --check src/contracts/auth.js && node --check src/contracts/response.js && node --check src/resources/users.js && node --check src/resources/orders.js && node --check src/resources/products.js && node --check src/resources/auth.js && node --check src/resources/search.js && node --check src/resources/notifications.js",
+    "gate": "npm run typecheck && node --test gate/gate.test.mjs",
+    "verify": "npm run typecheck && node --test gate/gate.test.mjs gate/bugfix.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.40.0"
+  }
+}
