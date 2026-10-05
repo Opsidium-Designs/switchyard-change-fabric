@@ -150,3 +150,11 @@ export { formatDoctorReport, runDoctor } from "./doctor.ts";
 
 export type { ExecutorEnv, SelectedExecutor } from "./executor-select.ts";
 export { DEFAULT_WORKERS_AI_ESCALATION_MODEL, selectExecutor } from "./executor-select.ts";
+
+export type { AppGateWiring, AppGateWiringInput } from "./app-gate-wiring.ts";
+export {
+  APP_GATE_COMMAND,
+  APP_GATE_SCRIPT,
+  buildAppGateWiring,
+  projectHasGateScript,
+} from "./app-gate-wiring.ts";

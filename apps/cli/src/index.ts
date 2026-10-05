@@ -31,6 +31,8 @@ import {
   formatDoctorReport,
   formatRecruitmentSummary,
   formatRunSummary,
+  buildAppGateWiring,
+  projectHasGateScript,
   readAppDeployment,
   recordAppDeployment,
   runChange,
@@ -309,7 +311,7 @@ const commands: Command[] = [
     name: "run-live",
     summary:
       "Full live run: decompose -> recruit real agents (Workers AI) -> escalate -> verify -> integrate -> promote -> cleanup.",
-    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--id <changeId>] [--watch] [--await-escalation]`,
+    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--id <changeId>] [--watch] [--await-escalation] [--gate|--no-gate] [--max-model-retries N]`,
     async run(args) {
       const change = await resolveChange(args);
       if (!change) {
@@ -439,6 +441,38 @@ const commands: Command[] = [
         ? async () => (await readAppDeployment(repoRoot(), deployAppBase))?.url
         : undefined;
 
+      // The per-app verification gate + bounded model-escalation ladder. A real
+      // app (its package.json declares a `gate` script) runs the mechanical gate
+      // on every unit and drives the ladder; a non-app project (no `gate` script,
+      // for example the intro change target) keeps today's behavior and is never
+      // forced through a gate it does not have. --gate / --no-gate overrides the
+      // auto-enable, and --max-model-retries bounds the ladder (default 1). The
+      // escalation/base model ids are only meaningful on the live Workers AI
+      // executor, so they are passed only then. The real child-process command
+      // runner is used, which runs `npm run gate` in each unit's cloned worktree
+      // (a seeded copy of the app project, where package.json + gate/ live).
+      const gateFlag = gateFlagFromArgs(args);
+      const maxModelRetries = maxModelRetriesFromArgs(args);
+      const gateWiring = buildAppGateWiring({
+        projectHasGate: await projectHasGateScript(projectDir),
+        ...(gateFlag !== undefined ? { gateFlag } : {}),
+        executorLive: selected.live,
+        escalationModel: selected.escalationModel,
+        baseModel: selected.baseModel,
+        maxModelRetries,
+      });
+      if (gateWiring.enabled) {
+        const gateCommand = gateWiring.appGateCommandFor?.("") ?? [];
+        console.log(
+          `  per-app gate: ON (${gateCommand.join(" ")}), max model retries ${maxModelRetries}` +
+            (selected.live && selected.escalationModel
+              ? `, escalation model ${selected.escalationModel}`
+              : ""),
+        );
+      } else {
+        console.log("  per-app gate: OFF (no gate script for this project, or --no-gate)");
+      }
+
       const result = await runFullLive({
         change: liveChange,
         dial,
@@ -446,6 +480,19 @@ const commands: Command[] = [
         specYaml: changeToSpecYaml(liveChange),
         projectDir,
         executor,
+        // Spread the gate wiring: when enabled, this threads the per-app gate
+        // command, the command runner, and the model-escalation dials into the
+        // run so the gate and the bounded ladder actually run; when disabled it
+        // is empty, so a non-app project runs unchanged.
+        ...(gateWiring.appGateCommandFor ? { appGateCommandFor: gateWiring.appGateCommandFor } : {}),
+        ...(gateWiring.verifyCommandRunner
+          ? { verifyCommandRunner: gateWiring.verifyCommandRunner }
+          : {}),
+        ...(gateWiring.escalationModel ? { escalationModel: gateWiring.escalationModel } : {}),
+        ...(gateWiring.baseModel ? { baseModel: gateWiring.baseModel } : {}),
+        ...(gateWiring.maxModelRetries !== undefined
+          ? { maxModelRetries: gateWiring.maxModelRetries }
+          : {}),
         ...(deployAppDir ? { deployAppDir: resolve(deployAppDir) } : {}),
         ...(deployAppName ? { deployAppName } : {}),
         ...(deployApp ? { deployApp } : {}),
@@ -680,6 +727,41 @@ function optionValue(args: readonly string[], flag: string): string | undefined 
 /** True when a boolean flag like --watch is present in the args. */
 function hasFlag(args: readonly string[], flag: string): boolean {
   return args.includes(flag);
+}
+
+/**
+ * Resolve the --gate / --no-gate toggle for the per-app gate. Returns true when
+ * --gate forces it on, false when --no-gate forces it off, and undefined when
+ * neither is given, so the caller applies the default (gate on when the project
+ * has a `gate` script). --no-gate wins if both are somehow present, so an
+ * explicit opt-out is never overridden.
+ */
+function gateFlagFromArgs(args: readonly string[]): boolean | undefined {
+  if (hasFlag(args, "--no-gate")) {
+    return false;
+  }
+  if (hasFlag(args, "--gate")) {
+    return true;
+  }
+  return undefined;
+}
+
+/**
+ * Parse the bounded max model-escalation retries from --max-model-retries,
+ * defaulting to one (the base attempt, then one escalation retry). A missing,
+ * non-finite, or negative value falls back to the default; the value is floored
+ * to a whole number of retries.
+ */
+function maxModelRetriesFromArgs(args: readonly string[]): number {
+  const raw = optionValue(args, "--max-model-retries");
+  if (raw === undefined) {
+    return 1;
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    return 1;
+  }
+  return Math.floor(n);
 }
 
 /**

@@ -154,6 +154,15 @@ function runLiveArgs(template: Template, changeId: string, dial: LaunchDial): st
   if (template.app) {
     args.push("--deploy-app", resolve(REPO_ROOT, "examples/apps", template.app));
     args.push("--deploy-app-name", `switchyard-change-fabric-${template.app}`);
+    // A real-app template MUST run the per-app verification gate and the bounded
+    // model-escalation ladder, so a console-launched real-app run is held to the
+    // same mechanical ground truth as the CLI. The run-live CLI already
+    // auto-enables the gate when the target project declares a `gate` script
+    // (every examples/apps/<app> does), but we pass --gate explicitly so a
+    // console app run is gated by intent, not only by the auto-default. The
+    // intro (non-app) template has no app and no gate script, so it is NOT
+    // forced through a gate it does not have (absence of a gate stays honest).
+    args.push("--gate");
   }
   // Give the run the fresh unique id the UI will follow, and leave the repos in
   // place at the end (watch) so the finished graph can be studied before the
