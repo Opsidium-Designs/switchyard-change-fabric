@@ -144,7 +144,11 @@ function parseBlueprintModules(
       item["depends_on"],
       `blueprint.modules[${index}].depends_on`,
     );
-    return { unitId, paths, dependsOn };
+    const exports = parseStringList(
+      item["exports"],
+      `blueprint.modules[${index}].exports`,
+    );
+    return { unitId, paths, dependsOn, exports };
   });
 }
 

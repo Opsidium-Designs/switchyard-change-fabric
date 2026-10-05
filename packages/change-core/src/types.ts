@@ -58,6 +58,16 @@ export interface ChangeBlueprintModule {
   readonly paths: readonly string[];
   /** The ids of other owner units this module depends on (import order). */
   readonly dependsOn: readonly string[];
+  /**
+   * The names of the symbols this module's file(s) export: its EXPORTED
+   * INTERFACE, a contract other modules (and the entry point) import by name.
+   * Carried on the Change so a later stage can tell the owning unit's agent to
+   * keep every one of these present and exported when it changes the
+   * implementation. A pure structural projection of the snapshot's parsed
+   * exports; empty when the module exports nothing (then no instruction is
+   * added, so existing callers are unchanged).
+   */
+  readonly exports: readonly string[];
 }
 
 /** A frozen read-only interface carried on a Change (owned by no WorkUnit). */

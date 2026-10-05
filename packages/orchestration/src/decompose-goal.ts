@@ -137,6 +137,15 @@ export function changeToSpecYaml(change: Change): string {
             lines.push(`        - ${quote(dep)}`);
           }
         }
+        if (module.exports.length > 0) {
+          // The module's exported interface rides the spec round-trip so the
+          // Worker-reconstructed Change can tell the owning unit's agent to keep
+          // these exports present. Omitted when the module exports nothing.
+          lines.push("      exports:");
+          for (const name of module.exports) {
+            lines.push(`        - ${quote(name)}`);
+          }
+        }
       }
     }
     if (contracts.length > 0) {

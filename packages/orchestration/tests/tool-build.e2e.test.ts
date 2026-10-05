@@ -77,7 +77,7 @@ describe("M4: an agent builds a tool in its own repo and downstream units run it
     }).change;
 
     const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, "artifacts") });
-    const built = await maybeBuildTool({ change, workRoot, workspaces });
+    const built = await maybeBuildTool({ change, workRoot, workspaces, enableToolBuild: true });
 
     expect(built).toBeDefined();
     const tool = built!;
@@ -112,6 +112,22 @@ describe("M4: an agent builds a tool in its own repo and downstream units run it
     const specYaml = await readFile(AUDIT_SPEC, "utf8");
     const change = parseChangeSpec(specYaml);
     const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, "artifacts") });
+    // Opt in: even with the tool path enabled, the layered Change's distinct
+    // units do not repeat one transform over many files, so the structural
+    // trigger still returns no tool.
+    const built = await maybeBuildTool({ change, workRoot, workspaces, enableToolBuild: true });
+    expect(built).toBeUndefined();
+  });
+
+  it("builds NO tool when the tool path is not opted in, even for a fan-out Change", async () => {
+    // The default path is off: a Change whose work WOULD warrant a tool still
+    // builds none unless the caller explicitly opts in, so an ordinary run emits
+    // no tool node.
+    const change = decompose({
+      goal: "Add input validation to every exported function",
+      repo: FLAT_REPO,
+    }).change;
+    const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, "artifacts") });
     const built = await maybeBuildTool({ change, workRoot, workspaces });
     expect(built).toBeUndefined();
   });
@@ -126,6 +142,7 @@ describe("M4: runChange surfaces the tool and the write lease in the result", ()
       specYaml: await import("../src/decompose-goal.ts").then((m) => m.changeToSpecYaml(change)),
       projectDir: CALC_PROJECT,
       workRoot,
+      enableToolBuild: true,
     });
 
     expect(result.tool).toBeDefined();

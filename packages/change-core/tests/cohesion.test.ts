@@ -132,6 +132,24 @@ describe("cohesion-aware module decomposition", () => {
     }
   });
 
+  it("captures each module's exported interface so the owner is told to preserve it", () => {
+    const result = decompose({ goal: SERVICE_GOAL, repo: SERVICE_REPO });
+    const carried = result.change.blueprint;
+    expect(carried).toBeDefined();
+    // Every resource module exports `handle` (the public export src/index.js
+    // imports), so the captured exported interface is exactly ["handle"]. This is
+    // a pure structural read of the snapshot's parsed exports, not a goal branch.
+    for (const module of carried!.modules) {
+      expect(module.exports).toEqual(["handle"]);
+    }
+    // The users resource module specifically carries its real export name.
+    const usersModule = carried!.modules.find((m) =>
+      m.paths.some((p) => p.endsWith("resources/users.js")),
+    );
+    expect(usersModule).toBeDefined();
+    expect(usersModule!.exports).toEqual(["handle"]);
+  });
+
   it("holds single-writer ownership: no two units declare the same path", () => {
     const result = decompose({ goal: SERVICE_GOAL, repo: SERVICE_REPO });
     const seen = new Map<string, string>();

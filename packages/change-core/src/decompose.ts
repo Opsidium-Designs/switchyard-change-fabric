@@ -158,7 +158,7 @@ export function decompose(options: DecomposeOptions): DecomposeResult {
           return depPath ? unitByPath.get(depPath) : undefined;
         })
         .filter((id): id is string => id !== undefined);
-      return { unitId, paths: [...module.paths], dependsOn };
+      return { unitId, paths: [...module.paths], dependsOn, exports: [...module.exports] };
     })
     .filter((m): m is NonNullable<typeof m> => m !== undefined);
 

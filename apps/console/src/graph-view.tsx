@@ -53,7 +53,7 @@ interface Placed {
  * edges computeLayers follows), so a node can be ordered within its layer by the
  * mean x of its parents (its barycenter). Goal-rooting and spawn edges are
  * ignored, exactly as in computeLayers, so the barycenter follows the real
- * dependency/data-flow/model-escalation chain.
+ * dependency/data-flow/model-escalation/re-fan chain.
  */
 function buildParentLists(model: WorkGraphModel): Map<string, string[]> {
   const parents = new Map<string, string[]>();
@@ -69,7 +69,8 @@ function buildParentLists(model: WorkGraphModel): Map<string, string[]> {
     if (
       edge.kind === "dependency" ||
       edge.kind === "data-flow" ||
-      edge.kind === "model-escalation"
+      edge.kind === "model-escalation" ||
+      edge.kind === "re-fan"
     ) {
       const list = parents.get(edge.to);
       if (list) {
@@ -175,10 +176,14 @@ function computeLayers(model: WorkGraphModel): Map<string, number> {
     // escalated from (the model-escalation edge). Following the escalation edge
     // for layering keeps the chain unit -> verify#1 -> retry#2 -> verify#2
     // ordered down the rows instead of letting the retry float to the top row.
+    // The re-fan edge is layered too, so a round-N agent instance lays out
+    // BENEATH its retry node (its only layered parent) rather than floating at
+    // the original unit's row.
     if (
       edge.kind === "dependency" ||
       edge.kind === "data-flow" ||
-      edge.kind === "model-escalation"
+      edge.kind === "model-escalation" ||
+      edge.kind === "re-fan"
     ) {
       const list = deps.get(edge.to);
       if (list) {

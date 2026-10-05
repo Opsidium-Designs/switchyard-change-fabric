@@ -135,6 +135,14 @@ export interface RunChangeOptions {
   readonly identity?: GitIdentity;
   /** An optional progress sink for human-readable console output. */
   readonly onEvent?: (event: RunEvent) => void;
+  /**
+   * Opt in to the agent-for-agent tool build. Off by default: an ordinary change
+   * builds no tool and emits no tool node. The tool-capability path (the
+   * repeated-transform fan-out demo) sets this to exercise the feature; the
+   * structural `detectToolRequirement` still decides whether a tool is actually
+   * warranted once opted in.
+   */
+  readonly enableToolBuild?: boolean;
 }
 
 /** A progress event emitted during a run, for live console output. */
@@ -185,7 +193,12 @@ export async function runChange(options: RunChangeOptions): Promise<RunChangeRes
   // Change with distinct units builds no tool and this is undefined.
   const toolRoot = join(workRoot, "tools");
   await mkdir(toolRoot, { recursive: true });
-  const tool = await maybeBuildTool({ change, workRoot: toolRoot, workspaces });
+  const tool = await maybeBuildTool({
+    change,
+    workRoot: toolRoot,
+    workspaces,
+    ...(options.enableToolBuild ? { enableToolBuild: true } : {}),
+  });
   if (tool) {
     emit({ kind: "tool-built", tool });
   }

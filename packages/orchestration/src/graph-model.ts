@@ -401,6 +401,19 @@ export type NodeBacking =
       readonly toModel: string;
       readonly implicatedUnits: readonly string[];
       readonly reason: string;
+    }
+  | {
+      // A round-N agent-instance node is backed by a real recorded CHANGE-LEVEL
+      // retry AND that retry's membership of this unit: the retry round re-fanned
+      // this unit on the escalation model, so a fresh agent instance keyed by
+      // (unitId, round) exists beneath the retry. It can never be drawn without a
+      // genuine retry record that names this unit among its implicated units and
+      // a WorkUnit that actually exists, so it is backed like every other node.
+      readonly kind: "round-agent";
+      readonly changeId: string;
+      readonly round: number;
+      readonly unitId: string;
+      readonly toModel: string;
     };
 
 /** The real state element an edge is backed by. */
@@ -529,6 +542,17 @@ export function retryNodeId(changeId: string, round: number): string {
 }
 
 /**
+ * The id used for a round-N agent-instance node: a FRESH agent node materialized
+ * beneath a retry node for one implicated unit re-fanned in that round. It is
+ * keyed by (changeId, round, unitId) so round N and round N+1 each get their own
+ * instance node for the same unit, laid out beneath their own retry node rather
+ * than pointing back at the original unit node.
+ */
+export function roundAgentNodeId(changeId: string, round: number, unitId: string): string {
+  return `round-agent:${changeId}#${round}:${unitId}`;
+}
+
+/**
  * The honesty guard every node passes through. It verifies the node carries a
  * backing that actually resolves against the snapshot, and throws otherwise. A
  * node whose backing does not name a real Change, a real WorkUnit, or a real
@@ -629,6 +653,39 @@ export function assertBacked(node: GraphNode, snapshot: ChangeStateSnapshot): Gr
       if (!retry) {
         throw new Error(
           `unbacked node ${node.id}: no recorded model-escalation retry round ${backing.round} to ${backing.toModel} for change ${backing.changeId}`,
+        );
+      }
+      return node;
+    }
+    case "round-agent": {
+      // A round-N agent node must map to a real recorded CHANGE-LEVEL retry that
+      // re-fanned this unit: its change must match, a retry attempt with the same
+      // round and escalation model must be present, that attempt must name this
+      // unit among its implicated units, and the unit must exist in the Change.
+      // A round-N node with no backing retry (or for a unit that retry did not
+      // re-fan) is exactly the unbacked node the rule forbids.
+      if (backing.changeId !== snapshot.id) {
+        throw new Error(
+          `unbacked node ${node.id}: round-agent names change ${backing.changeId}, not ${snapshot.id}`,
+        );
+      }
+      const retry = (snapshot.retryAttempts ?? []).find(
+        (a) => a.round === backing.round && a.toModel === backing.toModel,
+      );
+      if (!retry) {
+        throw new Error(
+          `unbacked node ${node.id}: no recorded model-escalation retry round ${backing.round} to ${backing.toModel} for change ${backing.changeId}`,
+        );
+      }
+      if (!retry.implicatedUnits.includes(backing.unitId)) {
+        throw new Error(
+          `unbacked node ${node.id}: retry round ${backing.round} did not re-fan unit ${backing.unitId}`,
+        );
+      }
+      const unit = snapshot.work.find((u) => u.id === backing.unitId);
+      if (!unit) {
+        throw new Error(
+          `unbacked node ${node.id}: round-agent unit ${backing.unitId} is not a WorkUnit in the state`,
         );
       }
       return node;
@@ -1006,25 +1063,45 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
       });
     }
 
-    // The re-fan edges: one edge from this retry node to EACH implicated unit
-    // node it re-ran on the escalation model, so the console visibly links the
-    // retry to the agents it re-fanned (the second wave the user expected to
-    // see). Each edge is backed by the real recorded implicated unit id, and is
-    // only drawn when that unit exists in the snapshot (the retry record already
-    // validates its implicated units, but the projection stays defensive so a
-    // stale id never produces a dangling edge). Combined with the per-unit
-    // "retry round N" activity steps the runner posts, the user can SEE which
-    // units re-ran and that they ran.
+    // The round-N agent instances: one FRESH agent node per implicated unit the
+    // retry re-ran on the escalation model, materialized BENEATH the retry node
+    // rather than pointing an edge back at the original unit node. Each is keyed
+    // by (unitId, round) and backed by the real recorded retry-attempt plus that
+    // retry's membership of the unit, so round N and round N+1 get distinct
+    // instances for the same unit. The edge runs retry -> round-N agent, so the
+    // console lays the re-run agents out below their retry (the second wave the
+    // user expected to see), and the original unit node is left untouched. Only
+    // drawn for a unit that exists in the snapshot (the retry record already
+    // validates its implicated units; the projection stays defensive).
     for (const unitId of retry.implicatedUnits) {
       const unit = snapshot.work.find((u) => u.id === unitId);
       if (!unit) {
         continue;
       }
+      const roundNode: GraphNode = {
+        id: roundAgentNodeId(snapshot.id, retry.round, unitId),
+        kind: "agent",
+        // A readable label, e.g. "users (retry 2)", so the console shows which
+        // unit this round-N instance re-ran.
+        label: `${unitId} (retry ${retry.round})`,
+        status: "running",
+        verified: false,
+        escalated: false,
+        backing: {
+          kind: "round-agent",
+          changeId: snapshot.id,
+          round: retry.round,
+          unitId,
+          toModel: retry.toModel,
+        },
+      };
+      nodes.push(assertBacked(roundNode, snapshot));
+
       edges.push({
         id: `re-fan:${snapshot.id}#${retry.round}->${unitId}`,
         kind: "re-fan",
         from: retryNodeId(snapshot.id, retry.round),
-        to: unitNodeId(unitId),
+        to: roundAgentNodeId(snapshot.id, retry.round, unitId),
         backing: {
           kind: "re-fan",
           changeId: snapshot.id,

@@ -252,5 +252,19 @@ describe("the blueprint (frozen contracts) survives the spec YAML round-trip the
     ]);
     // The round-tripped frozen contracts match the in-memory ones exactly.
     expect(frozenContracts).toEqual(inMemoryContracts);
+
+    // Each resource module's EXPORTED INTERFACE also rides the round-trip, so a
+    // Worker-reconstructed Change can tell the owning unit's agent to keep its
+    // public exports present. Every service-api resource exports `handle`.
+    expect(specYaml).toContain("exports:");
+    for (const module of reModules) {
+      expect(module.exports).toEqual(["handle"]);
+    }
+    // The users resource module specifically carries its real export name.
+    const usersModule = reModules.find((m) =>
+      m.paths.some((p) => p.endsWith("resources/users.js")),
+    );
+    expect(usersModule).toBeDefined();
+    expect(usersModule!.exports).toEqual(["handle"]);
   });
 });

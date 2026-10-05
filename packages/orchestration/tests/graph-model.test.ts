@@ -31,6 +31,7 @@ import {
   buildWorkGraphModel,
   goalNodeId,
   retryNodeId,
+  roundAgentNodeId,
   unitNodeId,
   verifyNodeId,
   type ChangeStateSnapshot,
@@ -428,16 +429,44 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
     });
   });
 
-  it("draws a re-fan edge from the retry node to each implicated unit it re-ran, backed by the recorded implicatedUnits", () => {
+  it("materializes a FRESH round-N agent node beneath the retry for each implicated unit, backed by the retry", () => {
     const model = buildWorkGraphModel(ladderSnapshot());
-    // The retry round re-ran "fix" on the escalation model, so there is one
-    // re-fan edge from the retry node to the fix unit node, visibly linking the
-    // retry to the agent it re-fanned (the second wave the user expected to see).
+    // The retry round re-ran "fix" on the escalation model, so a NEW agent node
+    // keyed by (unit, round) is materialized beneath the retry (not a back-edge
+    // to the original fix unit node). It is a distinct id from the original unit.
+    const roundNode = model.nodes.find(
+      (n) => n.id === roundAgentNodeId("change-ladder", 2, "fix"),
+    );
+    expect(roundNode).toBeDefined();
+    expect(roundNode?.kind).toBe("agent");
+    // A readable label like "fix (retry 2)".
+    expect(roundNode?.label).toContain("fix");
+    expect(roundNode?.label).toContain("retry 2");
+    expect(roundNode?.id).not.toBe(unitNodeId("fix"));
+    // Backed by the real recorded retry round + implicated unit membership.
+    expect(roundNode?.backing).toMatchObject({
+      kind: "round-agent",
+      changeId: "change-ladder",
+      round: 2,
+      unitId: "fix",
+      toModel: "escalation-model",
+    });
+  });
+
+  it("draws the re-fan edge from the retry node to the round-N agent node (not back to the original unit)", () => {
+    const model = buildWorkGraphModel(ladderSnapshot());
     const refan = model.edges.filter((e) => e.kind === "re-fan");
     expect(refan).toHaveLength(1);
     expect(refan[0]?.id).toBe("re-fan:change-ladder#2->fix");
     expect(refan[0]?.from).toBe(retryNodeId("change-ladder", 2));
-    expect(refan[0]?.to).toBe(unitNodeId("fix"));
+    // The edge targets the FRESH round-N agent node beneath the retry, never the
+    // original unit node.
+    expect(refan[0]?.to).toBe(roundAgentNodeId("change-ladder", 2, "fix"));
+    expect(refan[0]?.to).not.toBe(unitNodeId("fix"));
+    // No re-fan edge points back at the original unit node.
+    expect(model.edges.some((e) => e.kind === "re-fan" && e.to === unitNodeId("fix"))).toBe(
+      false,
+    );
     // The edge is backed by the real recorded retry round + implicated unit id.
     expect(refan[0]?.backing).toMatchObject({
       kind: "re-fan",
@@ -507,6 +536,27 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
       },
     };
     expect(() => assertBacked(bogus, snapshot)).toThrow(/no recorded model-escalation retry/);
+  });
+
+  it("rejects a round-N agent node for a unit the retry did not re-fan (cannot render unbacked)", () => {
+    const snapshot = ladderSnapshot();
+    const bogus: GraphNode = {
+      id: roundAgentNodeId("change-ladder", 2, "ghost"),
+      kind: "agent",
+      label: "ghost (retry 2)",
+      status: "running",
+      verified: false,
+      escalated: false,
+      backing: {
+        kind: "round-agent",
+        changeId: "change-ladder",
+        round: 2,
+        unitId: "ghost",
+        toModel: "escalation-model",
+      },
+    };
+    // "ghost" is not among the retry's implicated units, so it is unbacked.
+    expect(() => assertBacked(bogus, snapshot)).toThrow(/did not re-fan unit ghost/);
   });
 
   it("emits no verify/retry nodes or model-escalation edge when the state records none", () => {

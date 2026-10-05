@@ -29,6 +29,16 @@ export interface ExecutorContext {
    */
   readonly frozenContracts?: readonly string[];
   /**
+   * Optional names of the symbols THIS unit's module must keep exporting: its
+   * EXPORTED INTERFACE, which other modules (and the entry point) import by
+   * name. An inference executor lists these in the prompt so the model changes
+   * the implementation without dropping or renaming an export an importer
+   * depends on, which is what keeps one module's rewrite from breaking the whole
+   * service. Optional and defaulting to empty, so a deterministic executor and
+   * every existing caller are unchanged, and a module with no exports omits it.
+   */
+  readonly requiredExports?: readonly string[];
+  /**
    * Optional per-attempt model id. A caller that runs more than one attempt for
    * the same unit (for example a verify-fail retry that escalates to a stronger
    * model) sets this to the model id that attempt should use. An executor that

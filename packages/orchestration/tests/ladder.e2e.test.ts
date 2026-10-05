@@ -31,7 +31,12 @@ import { parseChangeSpec } from "@switchyard-change/change-core";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 
 import { LocalChangeControl } from "../src/local-control.ts";
-import { buildWorkGraphModel, type ChangeStateSnapshot } from "../src/graph-model.ts";
+import {
+  assertBacked,
+  buildWorkGraphModel,
+  roundAgentNodeId,
+  type ChangeStateSnapshot,
+} from "../src/graph-model.ts";
 import { runFullLive, type DeployApp, type FullLiveEvent } from "../src/run-live.ts";
 import {
   MarkerGateRunner,
@@ -536,17 +541,27 @@ describe("T10b: the retry round is a VISIBLE second wave (re-fan edges + per-uni
       subdir: "visible-single",
     });
 
-    // The graph model draws a re-fan edge from the retry node to the implicated
-    // unit it re-ran, backed by the recorded implicatedUnits: the user can SEE
-    // which agent the retry re-fanned.
+    // The graph model draws a re-fan edge from the retry node to a FRESH round-N
+    // agent node materialized beneath the retry (not a back-edge to the original
+    // unit), backed by the recorded implicatedUnits: the user can SEE which agent
+    // the retry re-fanned, laid out below the retry.
     const model = buildWorkGraphModel(snapshot);
     const retry = model.nodes.find((n) => n.kind === "retry");
     expect(retry).toBeDefined();
     const refan = model.edges.filter((e) => e.kind === "re-fan");
     expect(refan).toHaveLength(1);
     expect(refan[0]?.from).toBe(retry?.id);
-    expect(refan[0]?.to).toBe(`unit:fix`);
+    // The target is the round-N agent instance, never the original unit node.
+    expect(refan[0]?.to).toBe(roundAgentNodeId(snapshot.id, 2, "fix"));
+    expect(refan[0]?.to).not.toBe("unit:fix");
     expect(refan[0]?.backing).toMatchObject({ kind: "re-fan", unitId: "fix", round: 2 });
+    // The round-N agent node exists beneath the retry and is backed.
+    const roundNode = model.nodes.find((n) => n.id === roundAgentNodeId(snapshot.id, 2, "fix"));
+    expect(roundNode?.kind).toBe("agent");
+    expect(roundNode?.label).toContain("retry 2");
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
 
     // The implicated unit logged a REAL retry-round activity step (the second
     // wave in its activity log), naming the round and the escalation model.

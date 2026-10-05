@@ -461,6 +461,7 @@ function buildMessages(
     "You are given one WorkUnit objective, the exact file paths you are allowed to change, and the current contents of the in-scope files.",
     "Make the SMALLEST concrete code edit that satisfies the objective. Do not rewrite a whole file from scratch when a focused change is enough, and do not restyle or reformat code unrelated to the objective.",
     "Some files are FROZEN CONTRACTS: shared read-only interfaces other modules import. You must IMPORT and honor a frozen contract as it is; never rewrite, re-export, or change its shape, and never list it as an edit.",
+    "Your own module has a PUBLIC EXPORTED INTERFACE other modules import by name. Preserve the exported interface your module already provides: change the implementation, not the exported names or signatures, and keep every listed export present and exported. Dropping or renaming an export other modules import breaks them.",
     "Reply with ONE JSON document and nothing else, in this exact shape:",
     '{"commitMessage": "<short message>", "edits": [{"path": "<repo-relative path within the declared scope>", "contents": "<full new file contents>"}]}',
     "Each edit must give the FULL new contents of the file, not a diff.",
@@ -474,6 +475,7 @@ function buildMessages(
     frozenContracts.length > 0
       ? frozenContracts.join("\n")
       : "(none declared for this change)";
+  const requiredExports = context.requiredExports ?? [];
   const fileBlocks =
     contextFiles.length > 0
       ? contextFiles
@@ -491,6 +493,16 @@ function buildMessages(
     "",
     "Frozen contract files (READ-ONLY; import and honor these, never rewrite or edit them):",
     frozenLines,
+    // The required-exports block only appears when this module has a captured
+    // exported interface, so a module with no exports (or any existing caller
+    // that passes none) produces the exact same prompt as before.
+    ...(requiredExports.length > 0
+      ? [
+          "",
+          "Required exports (your module MUST keep exporting these names; change the implementation, not the exported names/signatures):",
+          requiredExports.join("\n"),
+        ]
+      : []),
     "",
     "Current in-scope file contents:",
     fileBlocks,

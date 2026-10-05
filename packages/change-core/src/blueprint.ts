@@ -41,6 +41,17 @@ export interface BlueprintModule {
    * contract has no owner), so this is only the real inter-module write order.
    */
   readonly dependsOn: readonly string[];
+  /**
+   * The names of the symbols this module's file(s) export. This is the module's
+   * EXPORTED INTERFACE: the public surface other modules (and the entry point)
+   * import by name, so it is a contract the rest of the service depends on. The
+   * owner unit must keep every one of these present and exported when it changes
+   * the implementation, or an importer breaks. It is a pure structural read of
+   * the snapshot's already-parsed exports (the union across the module's files,
+   * sorted and de-duplicated), so it never branches on the goal or any single
+   * symbol name. A module whose files export nothing yields an empty list.
+   */
+  readonly exports: readonly string[];
 }
 
 /**
@@ -156,6 +167,10 @@ export function deriveCohesionBlueprint(snapshot: RepoSnapshot): CohesionBluepri
         label,
         paths: [owner.path],
         dependsOn: dedupe(dependsOn).sort(compareString),
+        // The module's exported interface: the union of its file(s)' exported
+        // symbol names from the snapshot's already-parsed exports. A pure
+        // structural read (sorted, de-duplicated), never a goal/name branch.
+        exports: moduleExports([owner.path], byPath),
       });
     }
 
@@ -183,6 +198,34 @@ function moduleLabel(path: string): string {
     .replace(/[^A-Za-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .toLowerCase();
+}
+
+/**
+ * The exported interface of a module: the union of the exported symbol names of
+ * its file(s), read from the snapshot's already-parsed `SourceFileFacts.exports`
+ * (sorted and de-duplicated). This is a pure structural read of the repo, not a
+ * goal-specific or named-symbol branch, so it stays goal-agnostic: a module that
+ * exports `handle` carries `["handle"]` for exactly the same reason a module that
+ * exports anything else carries those names. A module whose files export nothing
+ * yields an empty list.
+ */
+function moduleExports(
+  paths: readonly string[],
+  byPath: ReadonlyMap<string, SourceFileFacts>,
+): readonly string[] {
+  const names = new Set<string>();
+  for (const path of paths) {
+    const file = byPath.get(path);
+    if (!file) {
+      continue;
+    }
+    for (const symbol of file.exports) {
+      if (symbol.name !== "") {
+        names.add(symbol.name);
+      }
+    }
+  }
+  return [...names].sort(compareString);
 }
 
 function dedupe(values: readonly string[]): string[] {

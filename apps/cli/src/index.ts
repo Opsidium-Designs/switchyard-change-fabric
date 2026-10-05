@@ -228,6 +228,12 @@ const commands: Command[] = [
       const result = await runChange({
         specYaml: changeToSpecYaml(decomposition.change),
         projectDir,
+        // run-goal is the agent-for-agent tool-capability path: opt in so a goal
+        // whose work repeats one mechanical transform across many files builds
+        // the shared codemod (the structural detector still decides if one is
+        // warranted). The plain `run` command stays off, so an ordinary change
+        // emits no tool node.
+        enableToolBuild: true,
       });
       console.log(formatRunSummary(result));
       return result.promotion.committed ? 0 : 1;

@@ -339,6 +339,15 @@ export interface RunFullLiveOptions {
    * empty for the deterministic noop path.
    */
   readonly baseModel?: string;
+  /**
+   * Opt in to the agent-for-agent tool build. Off by default: an ordinary
+   * multi-module change does NOT build or emit a tool node (the tool path is a
+   * leftover of the old file-split model and must not fire on a normal change).
+   * The tool-capability path sets this to exercise the feature; the structural
+   * `detectToolRequirement` still decides whether a tool is warranted once opted
+   * in, and no tool node can appear when none is built.
+   */
+  readonly enableToolBuild?: boolean;
 }
 
 /** A progress event emitted during a full live run. */
@@ -391,6 +400,20 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   const frozenContracts: readonly string[] = (options.change.blueprint?.contracts ?? []).map(
     (c) => c.path,
   );
+
+  // The per-unit exported interface the Change's cohesion blueprint captured for
+  // each owner module: the names other modules import from that unit. Threaded
+  // into THAT unit's executor call (the kickoff wave below and the ladder re-fan)
+  // so its base and retry prompts tell the model to keep those exports present
+  // rather than drop one and break an importer. Empty for a Change with no
+  // blueprint modules, so a non-modular Change and every existing caller are
+  // unchanged.
+  const requiredExportsByUnit = new Map<string, readonly string[]>();
+  for (const module of options.change.blueprint?.modules ?? []) {
+    if (module.exports.length > 0) {
+      requiredExportsByUnit.set(module.unitId, module.exports);
+    }
+  }
 
   const workRoot = options.workRoot ?? (await mkdtemp(join(tmpdir(), "scf-full-")));
   await mkdir(workRoot, { recursive: true });
@@ -489,6 +512,9 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
         paths: agent.paths,
         baselineRef: agent.baselineRef,
         ...(frozenContracts.length > 0 ? { frozenContracts } : {}),
+        ...((requiredExportsByUnit.get(agent.unitId) ?? []).length > 0
+          ? { requiredExports: requiredExportsByUnit.get(agent.unitId)! }
+          : {}),
         // Per-unit observability callbacks: the executor surfaces the real agent
         // activity through these, and the runner relays it to the Worker so the
         // console renders it. A deterministic executor ignores them. There is no
@@ -694,7 +720,12 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   // decorative edge. The trigger is structural, so a layered Change builds no
   // tool and this is a no-op. The tool's own repo is tracked in allWorkspaces so
   // cleanup tears it down with the run.
-  const tool = await buildAndRecordTool(options.change, workRoot, post);
+  const tool = await buildAndRecordTool(
+    options.change,
+    workRoot,
+    post,
+    options.enableToolBuild ?? false,
+  );
   if (tool) {
     allWorkspaces.add(tool.workspace.workspaceName);
     emit({ kind: "tool-built", tool });
@@ -793,6 +824,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
         paths: unit.paths,
         authRemote: unitAuthRemotes.get(unit.id)!,
         gateCommand: options.appGateCommandFor!(unit.id)!,
+        requiredExports: requiredExportsByUnit.get(unit.id) ?? [],
       })),
       gateCommandRunner,
       executor,
@@ -1011,6 +1043,13 @@ interface GatedUnitInput {
   readonly authRemote: string;
   /** The per-app gate argv (same command for every unit of the app). */
   readonly gateCommand: readonly string[];
+  /**
+   * The names this unit's module must keep exporting (its captured exported
+   * interface), threaded into the re-fan prompt so an escalation retry does not
+   * drop an export other modules import. Empty when the unit has no captured
+   * exports.
+   */
+  readonly requiredExports: readonly string[];
 }
 
 /** Inputs to run the bounded CHANGE-LEVEL model-escalation ladder. */
@@ -1226,6 +1265,9 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             model: escalationModel,
             ...(input.frozenContracts.length > 0
               ? { frozenContracts: input.frozenContracts }
+              : {}),
+            ...(unit.requiredExports.length > 0
+              ? { requiredExports: unit.requiredExports }
               : {}),
           });
         } catch {
@@ -1586,7 +1628,14 @@ async function buildAndRecordTool(
   change: Change,
   workRoot: string,
   post: (path: string, body?: unknown, contentType?: string) => Promise<Record<string, unknown>>,
+  enableToolBuild: boolean,
 ): Promise<ToolBuildResult | undefined> {
+  // Off by default: an ordinary multi-module change builds no tool, so no tool
+  // node (backed or otherwise) can appear. Only an explicit opt-in takes the
+  // tool path.
+  if (!enableToolBuild) {
+    return undefined;
+  }
   const { LocalFilesystemWorkspaceProvider } = await import(
     "@switchyard-change/artifact-workspace/local"
   );
@@ -1605,6 +1654,7 @@ async function buildAndRecordTool(
     change,
     workRoot: toolRoot,
     workspaces,
+    enableToolBuild: true,
     ...(builderUnitId ? { builderUnitId } : {}),
   });
   if (!tool) {

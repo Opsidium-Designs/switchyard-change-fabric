@@ -103,20 +103,39 @@ export interface BuildToolOptions {
    * the consumers so it does not consume its own tool.
    */
   readonly builderUnitId?: string;
+  /**
+   * Explicit opt-in to build the agent-built tool. The tool path is a bounded,
+   * special capability (one agent builds a codemod the fanned-out units run); it
+   * is NOT part of an ordinary multi-module change, so a normal run must not emit
+   * a tool node. The structural `detectToolRequirement` still decides WHETHER a
+   * tool is warranted, but a tool is only actually built when a caller opts in by
+   * setting this. Defaults to false, so an ordinary change builds no tool and no
+   * tool node appears; the tool-capability callers (and the M8.1 tests) set it to
+   * exercise the feature.
+   */
+  readonly enableToolBuild?: boolean;
 }
 
 const DEFAULT_STAMP = "1970-01-01T00:00:00.000Z";
 
 /**
- * If the Change needs an agent-built tool, build it in its own workspace and run
- * it against each consumer's content, returning the real tool record and
- * consumptions. Returns undefined when the work needs no such tool (the
+ * If the caller opted in (`enableToolBuild`) AND the Change needs an agent-built
+ * tool, build it in its own workspace and run it against each consumer's
+ * content, returning the real tool record and consumptions. Returns undefined
+ * when the caller did not opt in, or when the work needs no such tool (the
  * trigger is structural, so a layered Change with distinct units returns
- * undefined here).
+ * undefined here). Off by default so an ordinary multi-module change builds no
+ * tool and emits no tool node.
  */
 export async function maybeBuildTool(
   options: BuildToolOptions,
 ): Promise<ToolBuildResult | undefined> {
+  // Off by default: a normal multi-module change must not build or emit a tool.
+  // The tool path is only taken when a caller explicitly opts in, so an ordinary
+  // run never produces a tool node (and therefore never an unbacked one).
+  if (!options.enableToolBuild) {
+    return undefined;
+  }
   const requirement = detectToolRequirement(options.change);
   if (!requirement) {
     return undefined;

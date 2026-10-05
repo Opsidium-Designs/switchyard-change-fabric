@@ -85,8 +85,76 @@ describe("WorkersAiExecutor", () => {
     expect(written).toContain("a: number, b: number");
   });
 
-  it("tolerates a markdown-fenced JSON reply", async () => {
-    const invoke: WorkersAiInvoke = async () => ({
+  it("includes the preserve-exports instruction with the module's real export names", async () => {
+    await mkdir(join(worktree, "src", "resources"), { recursive: true });
+    await writeFile(
+      join(worktree, "src/resources/users.js"),
+      "export async function handle(request, parts) { return request; }\n",
+      "utf8",
+    );
+
+    let seenSystem = "";
+    let seenUser = "";
+    const invoke: WorkersAiInvoke = async (request) => {
+      seenSystem = request.messages.find((m) => m.role === "system")?.content ?? "";
+      seenUser = request.messages.find((m) => m.role === "user")?.content ?? "";
+      return {
+        text: JSON.stringify({
+          commitMessage: "fix users resource",
+          edits: [
+            {
+              path: "src/resources/users.js",
+              contents: "export async function handle(request, parts) { return request; }\n",
+            },
+          ],
+        }),
+      };
+    };
+
+    await new WorkersAiExecutor({ invoke }).execute({
+      worktreeDir: worktree,
+      workUnitId: "add-src-resources-users",
+      objective: "require auth and validate input in users",
+      paths: ["src/resources/users.js"],
+      baselineRef: "HEAD",
+      requiredExports: ["handle"],
+    });
+
+    // The system prompt steers the model to keep its exported interface intact.
+    expect(seenSystem).toMatch(/preserve the exported interface/i);
+    // The user prompt lists the real export name the service-api resource keeps.
+    expect(seenUser).toMatch(/Required exports/);
+    expect(seenUser).toContain("handle");
+  });
+
+  it("omits the required-exports block when the module has no captured exports", async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/leaf.ts"), "const internal = 1;\n", "utf8");
+
+    let seenUser = "";
+    const invoke: WorkersAiInvoke = async (request) => {
+      seenUser = request.messages.find((m) => m.role === "user")?.content ?? "";
+      return {
+        text: JSON.stringify({
+          edits: [{ path: "src/leaf.ts", contents: "const internal = 2;\n" }],
+        }),
+      };
+    };
+
+    await new WorkersAiExecutor({ invoke }).execute({
+      worktreeDir: worktree,
+      workUnitId: "leaf",
+      objective: "tweak leaf",
+      paths: ["src/leaf.ts"],
+      baselineRef: "HEAD",
+    });
+
+    // No captured exports means no required-exports block (existing callers
+    // produce the exact same prompt they did before).
+    expect(seenUser).not.toMatch(/Required exports/);
+  });
+
+  it("tolerates a markdown-fenced JSON reply", async () => {    const invoke: WorkersAiInvoke = async () => ({
       text: "```json\n{\"edits\":[{\"path\":\"src/x.ts\",\"contents\":\"export const x = 1;\\n\"}]}\n```",
     });
     const result = await new WorkersAiExecutor({ invoke }).execute({

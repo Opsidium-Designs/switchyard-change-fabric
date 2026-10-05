@@ -454,6 +454,9 @@ describe("M8.1: the live run builds the tool its OWN real repo and records it as
       workRoot: join(workRoot, "tool-run"),
       fetchFn,
       // The flat goal has no contested path, so no escalation is raised.
+      // Opt in to the tool path: this is the M8.1 tool-capability test, so it
+      // drives the tool build explicitly (a normal change leaves it off).
+      enableToolBuild: true,
     });
 
     // (1) a tool was built in its OWN real repo (the honest local fallback),
@@ -538,5 +541,55 @@ describe("M8.1: the live run builds the tool its OWN real repo and records it as
     const model = buildWorkGraphModel(snapshot);
     expect(model.nodes.some((n) => n.kind === "tool")).toBe(false);
     expect(model.edges.some((e) => e.kind === "consumed-tool")).toBe(false);
+  });
+
+  it("a normal fan-out change builds NO tool by default (the tool path is opt-in)", async () => {
+    // Even a Change whose work WOULD warrant a tool (the fan-out TOOL_REPO) must
+    // build none on a normal run: the tool path is off unless the caller opts in,
+    // so an ordinary multi-module change never emits a tool node, and the
+    // no-unbacked-node rule holds trivially (no tool node to back).
+    const artifactsRoot = join(workRoot, "default-off-artifacts");
+    const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: artifactsRoot });
+    const control = new LocalChangeControl(workspaces);
+    const { fetchFn } = fakeWorker(control, workspaces);
+
+    const change = decompose({
+      goal: "Add input validation to every exported function",
+      repo: TOOL_REPO,
+    }).change;
+    const specYaml = await import("../src/decompose-goal.ts").then((m) =>
+      m.changeToSpecYaml(change),
+    );
+
+    const projectDir = join(workRoot, "default-off-project");
+    await mkdir(join(projectDir, "src"), { recursive: true });
+    for (const file of TOOL_REPO) {
+      await mkdir(join(projectDir, file.path.slice(0, file.path.lastIndexOf("/"))), {
+        recursive: true,
+      });
+      await writeFile(join(projectDir, file.path), file.content, "utf8");
+    }
+
+    const result = await runFullLive({
+      change,
+      dial: { minConcurrency: 1, maxConcurrency: 4 },
+      workerUrl: "http://w",
+      specYaml,
+      projectDir,
+      workRoot: join(workRoot, "default-off-run"),
+      fetchFn,
+      // No enableToolBuild: the default path must build no tool.
+    });
+
+    expect(result.tool).toBeUndefined();
+    const snapshot = control.state(change.id) as ChangeStateSnapshot;
+    expect(snapshot.tool).toBeUndefined();
+    const model = buildWorkGraphModel(snapshot);
+    expect(model.nodes.some((n) => n.kind === "tool")).toBe(false);
+    expect(model.edges.some((e) => e.kind === "consumed-tool")).toBe(false);
+    // The no-unbacked-node rule still holds for every emitted node.
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
   });
 });

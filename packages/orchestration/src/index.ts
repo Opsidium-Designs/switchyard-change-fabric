@@ -143,7 +143,7 @@ export type {
   WorkUnitSnapshot,
   WorkUnitStatus,
 } from "./graph-model.ts";
-export { assertBacked, buildWorkGraphModel, goalNodeId, retryNodeId, toolNodeId, unitNodeId, verifyNodeId } from "./graph-model.ts";
+export { assertBacked, buildWorkGraphModel, goalNodeId, retryNodeId, roundAgentNodeId, toolNodeId, unitNodeId, verifyNodeId } from "./graph-model.ts";
 
 export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor.ts";
 export { formatDoctorReport, runDoctor } from "./doctor.ts";
