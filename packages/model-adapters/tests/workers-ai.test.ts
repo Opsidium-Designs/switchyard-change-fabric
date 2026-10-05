@@ -296,6 +296,12 @@ describe("createWorkersAiRestInvoke", () => {
     expect(seenUrl).toContain("/accounts/acct-123/ai/run/@cf/qwen/qwen3.8-27b");
     expect(seenAuth).toBe("Bearer secret-token-value");
     expect(seenBody).toContain("\"messages\"");
+    // Regression: the request MUST send a generous max_tokens. Workers AI
+    // otherwise caps output at a small default (around 256) that truncates a
+    // full-file edit mid-string, so the reply fails to parse and the unit fails
+    // with "no usable edit". Assert the body carries max_tokens.
+    expect(seenBody).toContain("\"max_tokens\"");
+    expect(JSON.parse(seenBody).max_tokens).toBeGreaterThanOrEqual(2048);
     expect(result.text).toBe('{"edits":[]}');
     expect(result.usage?.inputTokens).toBe(5);
     expect(result.usage?.outputTokens).toBe(3);

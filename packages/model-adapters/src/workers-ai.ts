@@ -687,12 +687,27 @@ export interface WorkersAiRestOptions {
    * recommended for a live run).
    */
   readonly timeoutMs?: number;
+  /**
+   * The maximum number of tokens the model may generate for one call. Workers AI
+   * applies a SMALL default (around 256) when this is omitted, which truncates a
+   * full-file edit mid-string and makes the reply unparseable. A real edit must
+   * fit the whole new file contents, so this defaults to a generous value. Raise
+   * it for very large files; lower it only if you know replies are small.
+   */
+  readonly maxTokens?: number;
   /** Injectable fetch, for tests. Defaults to the global fetch. */
   readonly fetchFn?: typeof fetch;
 }
 
 /** The default per-call timeout for the live REST transport (75 seconds). */
 export const DEFAULT_WORKERS_AI_TIMEOUT_MS = 75_000;
+
+/**
+ * The default max output tokens for one call. Workers AI otherwise caps output
+ * at a small default (around 256) that truncates a full-file edit, so a generous
+ * ceiling is required for the edit JSON to come back complete and parseable.
+ */
+export const DEFAULT_WORKERS_AI_MAX_TOKENS = 4096;
 
 /** A real (non-injected) sleep used between bounded retries. */
 function defaultSleep(ms: number): Promise<void> {
@@ -790,6 +805,7 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
   const fetchFn = options.fetchFn ?? fetch;
   const base = (options.baseUrl ?? "https://api.cloudflare.com/client/v4").replace(/\/$/, "");
   const timeoutMs = options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS;
+  const maxTokens = options.maxTokens ?? DEFAULT_WORKERS_AI_MAX_TOKENS;
   return async (
     request: WorkersAiInvokeRequest,
     _callbacks?: WorkersAiStreamCallbacks,
@@ -811,7 +827,7 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
           authorization: `Bearer ${options.apiToken}`,
           "content-type": "application/json",
         },
-        body: JSON.stringify({ messages: request.messages }),
+        body: JSON.stringify({ messages: request.messages, max_tokens: maxTokens }),
         ...(controller ? { signal: controller.signal } : {}),
       });
     } catch (error) {
