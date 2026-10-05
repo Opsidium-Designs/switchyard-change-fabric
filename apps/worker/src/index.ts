@@ -62,39 +62,72 @@ function streamResponse(stub: DurableObjectStub<ChangeState>, unitId: string): R
   let sent = 0;
   let polls = 0;
   let idlePolls = 0;
+  let closed = false;
+
   const body = new ReadableStream<Uint8Array>({
-    async pull(controller) {
+    async start(controller) {
+      // Emit an SSE comment immediately so the response starts producing output
+      // the instant it is opened. Without this the first poll cycle (two awaited
+      // Durable Object round-trips plus a 400ms sleep) can elapse before any byte
+      // is written, and the Workers runtime cancels a request that has produced
+      // nothing yet as "hung". A leading heartbeat makes the stream live at once.
+      controller.enqueue(encoder.encode(`: open\n\n`));
+
+      // Drive the poll loop here (not in pull) so the loop owns its own cadence
+      // and always writes something each cycle, keeping the response alive. It
+      // closes on a terminal unit, a long idle gap, the poll ceiling, or an error.
       try {
-        const buffered = await stub.getStream(unitId);
-        if (buffered.length > sent) {
-          const chunk = buffered.slice(sent);
-          sent = buffered.length;
-          idlePolls = 0;
-          controller.enqueue(encoder.encode(`event: token\ndata: ${encodeSse(chunk)}\n\n`));
-        } else {
-          idlePolls += 1;
+        for (;;) {
+          if (closed) {
+            return;
+          }
+          let buffered = "";
+          let terminal = false;
+          try {
+            buffered = await stub.getStream(unitId);
+            const state = await stub.getState();
+            const unit = state.work.find((u) => u.id === unitId);
+            terminal =
+              unit !== undefined && (unit.status === "integrated" || unit.status === "failed");
+          } catch (error) {
+            controller.enqueue(
+              encoder.encode(`event: error\ndata: ${encodeSse(errorMessage(error))}\n\n`),
+            );
+            controller.close();
+            return;
+          }
+
+          if (buffered.length > sent) {
+            const chunk = buffered.slice(sent);
+            sent = buffered.length;
+            idlePolls = 0;
+            controller.enqueue(encoder.encode(`event: token\ndata: ${encodeSse(chunk)}\n\n`));
+          } else {
+            idlePolls += 1;
+            // A heartbeat comment on an idle poll: nothing new to send, but the
+            // response keeps producing output so it is never seen as hung.
+            controller.enqueue(encoder.encode(`: heartbeat\n\n`));
+          }
+          polls += 1;
+
+          if (terminal || polls >= MAX_POLLS || idlePolls >= 150) {
+            controller.enqueue(encoder.encode(`event: done\ndata: ${sent}\n\n`));
+            controller.close();
+            return;
+          }
+          await new Promise((resolve) => setTimeout(resolve, POLL_MS));
         }
-        polls += 1;
-        // Stop once the unit is terminal (so a finished run closes the stream),
-        // or after a long idle gap, or at the hard poll ceiling.
-        const state = await stub.getState();
-        const unit = state.work.find((u) => u.id === unitId);
-        const terminal =
-          unit !== undefined && (unit.status === "integrated" || unit.status === "failed");
-        if (terminal || polls >= MAX_POLLS || idlePolls >= 150) {
-          controller.enqueue(encoder.encode(`event: done\ndata: ${sent}\n\n`));
-          controller.close();
-          return;
-        }
-        await new Promise((resolve) => setTimeout(resolve, POLL_MS));
-      } catch (error) {
-        controller.enqueue(
-          encoder.encode(`event: error\ndata: ${encodeSse(errorMessage(error))}\n\n`),
-        );
-        controller.close();
+      } catch {
+        // The consumer went away (cancel) or the controller is already closed;
+        // nothing to do, the stream is finished.
       }
     },
+    cancel() {
+      // The browser closed the EventSource: stop the loop cleanly.
+      closed = true;
+    },
   });
+
   return new Response(body, {
     status: 200,
     headers: {
