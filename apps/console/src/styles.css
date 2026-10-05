@@ -413,10 +413,23 @@ body {
 .sw-verify-fail { background: #da3633; border-color: #f85149; }
 .sw-retry { background: #a371f7; }
 
-/* The tool legend glyph is a DIAMOND (a CSS-rotated square), matching the
-   diamond tool node drawn in the graph, so the legend and the graph agree that
-   the agent-built tool is a distinct shape, not a circle. It keeps the same
-   footprint as the circular swatches. */
+/* The tool legend glyph is a YELLOW SQUARE, matching the yellow square tool
+   node drawn in the graph, so the legend and the graph agree the agent-built
+   tool is a distinct yellow square, not a circle. */
+.swatch-square {
+  width: 0.8rem;
+  height: 0.8rem;
+  display: inline-block;
+  border: 1px solid #0d1117;
+}
+
+.swatch-square.sw-tool {
+  background: #e3b341;
+}
+
+/* The goal legend glyph is a DIAMOND (a CSS-rotated square), matching the
+   diamond goal node drawn in the graph. It keeps the same footprint as the
+   circular swatches. */
 .swatch-diamond {
   width: 0.8rem;
   height: 0.8rem;
@@ -425,8 +438,18 @@ body {
   border: 1px solid #0d1117;
 }
 
-.swatch-diamond.sw-tool {
-  background: #9e6a03;
+.swatch-diamond.sw-goal {
+  background: #1f6feb;
+}
+
+/* The verify/retry legend glyphs are HEXAGONS, matching the hexagon verify and
+   retry nodes drawn in the graph (verify and retry share the hexagon shape and
+   differ only by color). The clip-path cuts a regular hexagon out of the box. */
+.swatch-hex {
+  width: 0.9rem;
+  height: 0.9rem;
+  display: inline-block;
+  clip-path: polygon(50% 0%, 100% 25%, 100% 75%, 50% 100%, 0% 75%, 0% 25%);
 }
 
 .line {
@@ -445,16 +468,6 @@ body {
    the same as the graph and the two are never confusable. */
 .ln-tool { border-top-color: #f0883e; border-top-style: solid; }
 .ln-lease { border-top-color: #2dd4bf; border-top-style: dotted; }
-/* The model-escalation edge is a magenta long-dashed line, mirroring graph-view
-   edgeStyle. It is deliberately a different hue AND pattern from the teal dotted
-   lease edge and from the human-escalation red, so the base -> smarter-model hop
-   reads as its own beat in both the graph and the legend. */
-.ln-escalation { border-top-color: #db61a2; border-top-style: dashed; }
-/* The re-fan edge is the same magenta family as the model-escalation hop but a
-   tighter dotted dash, mirroring graph-view edgeStyle: it links the retry node
-   to each unit it re-ran, so the per-unit second wave reads as a sibling of the
-   base -> smarter-model hop without being confused for it. */
-.ln-refan { border-top-color: #db61a2; border-top-style: dotted; }
 
 /* --- Dial control --- */
 

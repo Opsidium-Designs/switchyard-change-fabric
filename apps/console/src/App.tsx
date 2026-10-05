@@ -625,47 +625,38 @@ function TemplateGallery({
   );
 }
 
-/** The legend explaining node and edge kinds, including the reserved ones. */
+/** The legend explaining node and edge kinds, matching graph-view exactly. */
 function Legend() {
   return (
     <ul className="legend" aria-label="Legend">
-      <li><span className="swatch sw-goal" /> goal</li>
+      {/* The goal is a DIAMOND, matching the diamond goal node in the graph. */}
+      <li><span className="swatch-diamond sw-goal" aria-hidden="true" /> goal</li>
       <li><span className="swatch sw-work" /> work unit</li>
       <li><span className="swatch sw-agent" /> recruited agent (real repo)</li>
       <li><span className="swatch sw-verified" /> verified / integrated</li>
       <li><span className="swatch sw-failed" /> failed unit</li>
-      {/* The model-escalation ladder's own kinds: a verify node is a mechanical
-          gate run (green pass / red fail), a retry node is the smarter-model
-          re-attempt, and the model-escalation edge is the base -> escalation hop.
-          They are a DISTINCT beat from the human escalation highlight below and
-          from the lease edge, matching graph-view's nodeFill/edgeStyle. */}
-      <li><span className="swatch sw-verify-pass" /> verify passed (gate ran, green)</li>
-      <li><span className="swatch sw-verify-fail" /> verify failed (gate ran, red)</li>
-      <li><span className="swatch sw-retry" /> retry (escalated to a stronger model)</li>
-      {/* The tool entry uses a DIAMOND glyph so it matches the diamond tool node
-          drawn in the graph, not a circular swatch like the other node kinds. */}
-      <li>
-        <span className="swatch-diamond sw-tool" aria-hidden="true" /> agent-built tool (real repo)
-      </li>
+      {/* The ladder's own node kinds are HEXAGONS, matching graph-view: a verify
+          node is a mechanical gate run (green pass / red fail), and a retry node
+          is the SAME hexagon shape in the smarter-model magenta, so verify and
+          retry share a shape and differ only by color. */}
+      <li><span className="swatch-hex sw-verify-pass" aria-hidden="true" /> verify passed (gate ran, green)</li>
+      <li><span className="swatch-hex sw-verify-fail" aria-hidden="true" /> verify failed (gate ran, red)</li>
+      <li><span className="swatch-hex sw-retry" aria-hidden="true" /> retry (escalated to a stronger model)</li>
+      {/* The tool entry uses a YELLOW SQUARE glyph so it matches the yellow
+          square tool node drawn in the graph. */}
+      <li><span className="swatch-square sw-tool" aria-hidden="true" /> agent-built tool (real repo)</li>
       <li><span className="swatch sw-escalated" /> pending human escalation</li>
+      {/* The rendered edge vocabulary is exactly these five kinds. */}
       <li><span className="line ln-dependency" /> dependency</li>
       <li><span className="line ln-dataflow" /> data flow</li>
       <li><span className="line ln-spawn" /> event-driven spawn</li>
-      {/* The two edges that used to both read as "orange dashed" are now plainly
-          distinct (see graph-view edgeStyle and styles.css): a consumed-tool
-          edge is a solid amber tool run, a write-lease is a dotted teal
-          owner-coordination edge, so they are never confusable. A consumed-tool
-          edge only ever appears alongside a diamond tool node by construction. */}
+      {/* A consumed-tool edge is a solid amber tool run; a write-lease is a
+          dotted teal owner-coordination edge, mirroring graph-view edgeStyle so
+          the legend reads the same as the graph and the two never confuse. A
+          consumed-tool edge only ever appears alongside a yellow square tool
+          node by construction. */}
       <li><span className="line ln-tool" /> consumed tool (agent ran a built tool)</li>
       <li><span className="line ln-lease" /> write-lease (waiter waits for owner)</li>
-      {/* The model-escalation edge is a magenta long-dashed line, distinct from
-          the teal dotted lease edge and from the human-escalation red, so the
-          base -> smarter-model hop reads as its own beat. */}
-      <li><span className="line ln-escalation" /> model escalation (base to smarter model)</li>
-      {/* The re-fan edge links a retry node to each unit it re-ran on the
-          escalation model: a magenta short-dashed sibling of the escalation hop,
-          so the second wave the retry fanned out is visible per unit. */}
-      <li><span className="line ln-refan" /> re-fan (retry re-ran this unit)</li>
     </ul>
   );
 }

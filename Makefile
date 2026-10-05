@@ -10,6 +10,7 @@
 #   make doctor    run the readiness check (switchyard-change doctor)
 #   make demo      run the example audit-logging Change end to end (offline)
 #   make run-live-watch  watchable live run: stable id, escalation fires, repos left up
+#   make run-live-service  live run of the MODULAR service-api app (carries the blueprint)
 #   make demo-live   one-command watchable live demo (needs `make dev-all` running)
 #   make clean-live  tear down the real repos a watch run left up
 #   make seed-change seed the demo Change into a running Worker (for the console)
@@ -26,7 +27,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -143,6 +144,24 @@ run-live:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- run-live "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" \
 	  --min $(MIN) --max $(MAX) $(if $(OWNER),--owner $(OWNER),)
+
+# The live run against the MODULAR service-api app. `make run-live` defaults to
+# the flat calc-project, whose decomposition is a wide, flat fan-out with no
+# cohesion blueprint (deriveCohesionBlueprint returns nothing for a non-modular
+# repo), so a live run of it carries no frozen contracts and no per-module
+# exports. This target mirrors the console's service-api template instead: it
+# decomposes the modular examples/apps/service-api with its own goal, so the run
+# carries the cohesion blueprint (the src/contracts/* frozen seams and each
+# resource module's exports) all the way to the agent prompt. Use this to run the
+# multi-resource API fix from the CLI; the browser "Fix a multi-resource API"
+# template already uses the same modular target.
+SERVICE_GOAL = $(CURDIR)/examples/goals/service-api-validation-auth.goal.txt
+SERVICE_PROJECT = $(CURDIR)/examples/apps/service-api
+
+run-live-service:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	npm -w apps/cli run dev -- run-live --goal-file "$(SERVICE_GOAL)" --project "$(SERVICE_PROJECT)" \
+	  --worker "$(WORKER)" --min $(MIN) --max $(MAX) $(if $(OWNER),--owner $(OWNER),)
 
 # The watchable live headline run. It uses the seeded audit-logging Change (which
 # has the hardcoded src/audit/events.ts collision), so the human escalation beat

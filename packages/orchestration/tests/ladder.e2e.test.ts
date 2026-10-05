@@ -408,7 +408,7 @@ describe("T10: the bounded model-escalation ladder (offline, deterministic)", ()
     expect(v1?.verified).toBe(false);
     expect(v2?.verified).toBe(true);
     expect(model.nodes.some((n) => n.kind === "retry")).toBe(true);
-    expect(model.edges.some((e) => e.kind === "model-escalation")).toBe(true);
+    expect(model.edges.some((e) => e.backing.kind === "model-escalation")).toBe(true);
     expect(model.nodes.every((n) => n.escalated === false)).toBe(true);
 
     // The run emitted the honest ladder events in order: a fail verify, an
@@ -439,7 +439,7 @@ describe("T10: the bounded model-escalation ladder (offline, deterministic)", ()
 
     const model = buildWorkGraphModel(snapshot);
     expect(model.nodes.some((n) => n.kind === "retry")).toBe(false);
-    expect(model.edges.some((e) => e.kind === "model-escalation")).toBe(false);
+    expect(model.edges.some((e) => e.backing.kind === "model-escalation")).toBe(false);
     const v1 = model.nodes.find((n) => n.kind === "verify");
     expect(v1?.verified).toBe(true);
   });
@@ -548,7 +548,7 @@ describe("T10b: the retry round is a VISIBLE second wave (re-fan edges + per-uni
     const model = buildWorkGraphModel(snapshot);
     const retry = model.nodes.find((n) => n.kind === "retry");
     expect(retry).toBeDefined();
-    const refan = model.edges.filter((e) => e.kind === "re-fan");
+    const refan = model.edges.filter((e) => e.backing.kind === "re-fan");
     expect(refan).toHaveLength(1);
     expect(refan[0]?.from).toBe(retry?.id);
     // The target is the round-N agent instance, never the original unit node.

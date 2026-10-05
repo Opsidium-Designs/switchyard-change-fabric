@@ -49,11 +49,12 @@ interface Placed {
 }
 
 /**
- * Build the per-node parent list from the ladder/dependency edges (the same
+ * Build the per-node parent list from the dependency/data-flow edges (the same
  * edges computeLayers follows), so a node can be ordered within its layer by the
  * mean x of its parents (its barycenter). Goal-rooting and spawn edges are
- * ignored, exactly as in computeLayers, so the barycenter follows the real
- * dependency/data-flow/model-escalation/re-fan chain.
+ * ignored, exactly as in computeLayers. The ladder chain (escalation hop,
+ * per-unit re-fan) rides the dependency/data-flow kinds, so following those two
+ * kinds also follows the ladder.
  */
 function buildParentLists(model: WorkGraphModel): Map<string, string[]> {
   const parents = new Map<string, string[]>();
@@ -66,12 +67,7 @@ function buildParentLists(model: WorkGraphModel): Map<string, string[]> {
     if (edge.from === goalNodeId(model.changeId)) {
       continue;
     }
-    if (
-      edge.kind === "dependency" ||
-      edge.kind === "data-flow" ||
-      edge.kind === "model-escalation" ||
-      edge.kind === "re-fan"
-    ) {
+    if (edge.kind === "dependency" || edge.kind === "data-flow") {
       const list = parents.get(edge.to);
       if (list) {
         list.push(edge.from);
@@ -172,19 +168,12 @@ function computeLayers(model: WorkGraphModel): Map<string, number> {
       continue;
     }
     // The ladder reads top to bottom: a verify node hangs below its unit (fed by
-    // a data-flow edge), and a retry node hangs below the failing verify it
-    // escalated from (the model-escalation edge). Following the escalation edge
-    // for layering keeps the chain unit -> verify#1 -> retry#2 -> verify#2
-    // ordered down the rows instead of letting the retry float to the top row.
-    // The re-fan edge is layered too, so a round-N agent instance lays out
-    // BENEATH its retry node (its only layered parent) rather than floating at
-    // the original unit's row.
-    if (
-      edge.kind === "dependency" ||
-      edge.kind === "data-flow" ||
-      edge.kind === "model-escalation" ||
-      edge.kind === "re-fan"
-    ) {
+    // a data-flow edge), a retry node hangs below the failing verify it escalated
+    // from (a dependency edge), and a round-N agent hangs below its retry (a
+    // data-flow re-fan edge). The escalation hop and the per-unit re-fan now ride
+    // the dependency/data-flow kinds, so following those two kinds lays the whole
+    // chain down the rows instead of letting the retry or round-N agent float up.
+    if (edge.kind === "dependency" || edge.kind === "data-flow") {
       const list = deps.get(edge.to);
       if (list) {
         list.push(edge.from);
@@ -214,7 +203,7 @@ function computeLayers(model: WorkGraphModel): Map<string, number> {
   return layer;
 }
 
-/** The stroke style per edge kind. */
+/** The stroke style per edge kind. The vocabulary is exactly five kinds. */
 function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
   switch (kind) {
     case "data-flow":
@@ -224,27 +213,13 @@ function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
     case "consumed-tool":
       // A real tool run: a bright AMBER edge, drawn solid (no dash), so it reads
       // as a distinct tool-consumption and is never confused with the lease
-      // edge. A consumed-tool edge only ever appears next to a diamond tool node.
+      // edge. A consumed-tool edge only ever appears next to a tool node.
       return { stroke: "#f0883e" };
     case "lease":
       // Owner-coordination (a waiter waiting for the single write lease): a TEAL
       // dotted edge, a clearly different hue and pattern from the amber tool
       // edge, so the two are visually unmistakable even at render scale.
       return { stroke: "#2dd4bf", dash: "1 5" };
-    case "model-escalation":
-      // The bounded model-escalation beat: a verify-fail handed the next attempt
-      // to a stronger model. Drawn as a bright MAGENTA long-dashed edge, a hue
-      // and pattern distinct from BOTH the lease teal dotted edge AND the human
-      // escalation red/amber highlight, so the smarter-model hop reads as its own
-      // beat and is never confused with human escalation or lease coordination.
-      return { stroke: "#db61a2", dash: "7 4" };
-    case "re-fan":
-      // The re-fan beat: a retry round re-ran an implicated unit on the
-      // escalation model. Drawn as a magenta short-dashed edge from the retry
-      // node down to each unit it re-ran, so it reads as a sibling of the
-      // model-escalation hop (same magenta family) while its tighter dash marks
-      // it as the per-unit re-run rather than the base -> smarter-model hop.
-      return { stroke: "#db61a2", dash: "3 3" };
     case "dependency":
     default:
       return { stroke: "#5a6472" };
@@ -253,12 +228,39 @@ function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
 
 /**
  * The four points of a diamond (a square rotated 45deg) whose half-diagonal is
- * `r`, centered at the node origin. Used for the tool node so it reads as a
- * distinct tool/output artifact rather than another agent circle, while keeping
- * the same visual footprint as a circle of radius `r`.
+ * `r`, centered at the node origin. Used for the GOAL node so the Change root
+ * reads as a distinct diamond among the agent circles, while keeping the same
+ * visual footprint as a circle of radius `r`.
  */
 function diamondPoints(r: number): string {
   return `0,${-r} ${r},0 0,${r} ${-r},0`;
+}
+
+/**
+ * The six points of a regular hexagon with circumradius `r`, centered at the
+ * node origin (flat-ish top). Used for BOTH the verify and the retry node so
+ * the mechanical gate run and its smarter-model re-attempt share one distinct
+ * shape (set apart from the agent circles and the goal diamond); the two are
+ * told apart by COLOR, not shape (see nodeFill).
+ */
+function hexagonPoints(r: number): string {
+  const pts: string[] = [];
+  for (let i = 0; i < 6; i += 1) {
+    const angle = (Math.PI / 3) * i - Math.PI / 2; // start at the top
+    const x = r * Math.cos(angle);
+    const y = r * Math.sin(angle);
+    pts.push(`${x.toFixed(2)},${y.toFixed(2)}`);
+  }
+  return pts.join(" ");
+}
+
+/**
+ * The four points of an axis-aligned square whose half-side is `r`, centered at
+ * the node origin. Used for the agent-built TOOL node (drawn yellow) so it reads
+ * as a distinct yellow square tool/output artifact, not another agent circle.
+ */
+function squarePoints(r: number): string {
+  return `${-r},${-r} ${r},${-r} ${r},${r} ${-r},${r}`;
 }
 
 /** The fill color for a node from its kind and verified/escalated/failed state. */
@@ -289,7 +291,7 @@ function nodeFill(node: GraphNode): string {
     return "#8b2c22";
   }
   if (node.kind === "tool") {
-    return "#9e6a03"; // agent-built tool, published to its own repo
+    return "#e3b341"; // agent-built tool: a distinct YELLOW square, its own repo
   }
   if (node.verified) {
     return "#238636"; // greened: evidence landed (verified/integrated)
@@ -378,10 +380,10 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
   // the SVG-space point under the pointer fixed as the scale changes.
   const onWheel = useCallback(
     (event: React.WheelEvent<SVGSVGElement>) => {
-      // Zoom is gated behind the ctrl (or cmd) key: a plain wheel scrolls the
-      // page as normal, and ctrl/cmd + wheel zooms the graph. Without the
-      // modifier we do not preventDefault, so page scrolling is never hijacked.
-      if (!event.ctrlKey && !event.metaKey) {
+      // Zoom is gated behind the ALT key: a plain wheel scrolls the page as
+      // normal, and alt + wheel zooms the graph. Without the modifier we do not
+      // preventDefault, so page scrolling is never hijacked.
+      if (!event.altKey) {
         return;
       }
       event.preventDefault();
@@ -480,7 +482,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
         >
           Reset view
         </button>
-        <span className="graph-hint muted">ctrl + scroll to zoom, drag to pan</span>
+        <span className="graph-hint muted">alt + scroll to zoom, drag to pan</span>
       </div>
       <svg
         ref={svgRef}
@@ -522,13 +524,13 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                 return null;
               }
               const style = edgeStyle(edge.kind);
-              // The model-escalation edge carries the real model ids from its
-              // backing: the base model that failed and the stronger model the
-              // ladder escalated to. Render that hop as a label on the edge
-              // ("base -> escalation") so a watcher sees WHICH model took over,
-              // read straight from state, never synthesized.
+              // The escalation hop now rides the `dependency` kind, so read the
+              // model ids from its BACKING (which still records the base model
+              // that failed and the stronger model the ladder escalated to) and
+              // render that hop as a label on the edge ("base -> escalation") so
+              // a watcher sees WHICH model took over, straight from state.
               const escalationLabel =
-                edge.kind === "model-escalation" && edge.backing.kind === "model-escalation"
+                edge.backing.kind === "model-escalation"
                   ? `${edge.backing.fromModel || "base"} -> ${edge.backing.toModel || "escalation"}`
                   : null;
               const midX = (from.x + to.x) / 2;
@@ -541,13 +543,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                     x2={to.x}
                     y2={to.y}
                     stroke={style.stroke}
-                    strokeWidth={
-                      edge.kind === "data-flow"
-                        ? 2.5
-                        : edge.kind === "model-escalation"
-                          ? 2.5
-                          : 1.5
-                    }
+                    strokeWidth={edge.kind === "data-flow" ? 2.5 : 1.5}
                     strokeDasharray={style.dash}
                     markerEnd="url(#arrow)"
                     className={`edge edge-${edge.kind}`}
@@ -600,16 +596,37 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                     }
                   }}
                 >
-                  {/* The tool node is a DISTINCT shape (a diamond), so an
-                      agent-built tool published to its own repo reads as a tool/
-                      output artifact at a glance, not another agent circle.
-                      Every other node stays a circle. The diamond's
-                      half-diagonal matches the circle radius so it occupies the
-                      same visual footprint and the deterministic layout is
-                      unchanged. */}
-                  {node.kind === "tool" ? (
+                  {/* The node SHAPE encodes its kind, and the selection ring
+                      (a bright stroke) is applied uniformly to EVERY shape, so a
+                      click selects any kind of node and draws the white ring on
+                      all of them (goal, agent, verify, retry, tool, work):
+                        goal   -> diamond
+                        agent  -> circle (a round-N retry agent is an agent too)
+                        verify -> hexagon
+                        retry  -> hexagon, SAME shape as verify but a different
+                                  color (its magenta fill, set in nodeFill)
+                        tool   -> yellow square
+                        work   -> circle (a declared unit before recruitment)
+                      The polygon half-extents match the circle radius so each
+                      shape keeps the same footprint and the deterministic layout
+                      is unchanged. */}
+                  {node.kind === "goal" ? (
                     <polygon
                       points={diamondPoints(r)}
+                      fill={nodeFill(node)}
+                      stroke={selected ? "#e6edf3" : "#0d1117"}
+                      strokeWidth={selected ? 3 : 1.5}
+                    />
+                  ) : node.kind === "tool" ? (
+                    <polygon
+                      points={squarePoints(r)}
+                      fill={nodeFill(node)}
+                      stroke={selected ? "#e6edf3" : "#0d1117"}
+                      strokeWidth={selected ? 3 : 1.5}
+                    />
+                  ) : node.kind === "verify" || node.kind === "retry" ? (
+                    <polygon
+                      points={hexagonPoints(r)}
                       fill={nodeFill(node)}
                       stroke={selected ? "#e6edf3" : "#0d1117"}
                       strokeWidth={selected ? 3 : 1.5}

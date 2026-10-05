@@ -343,15 +343,20 @@ export type GraphNodeKind =
   | "verify" // one mechanical gate run against a unit's candidate edit (pass/fail)
   | "retry"; // one bounded model-escalation retry on a stronger model after a verify-fail
 
-/** The kind of an edge in the rendered graph. */
+/**
+ * The kind of an edge in the rendered graph. The vocabulary is exactly these
+ * five: the ladder's escalation hop and per-unit re-fan reuse `dependency` and
+ * `data-flow` rather than carrying their own bespoke kinds, so the rendered edge
+ * set stays small and legible. The edge's `backing` still records the precise
+ * provenance (including the model-escalation / re-fan state it came from), so no
+ * honesty is lost by folding them onto the shared kinds.
+ */
 export type GraphEdgeKind =
-  | "dependency" // a declared WorkGraph dependency between two units
-  | "data-flow" // a dependency an agent push has made live (data has flowed)
+  | "dependency" // a declared WorkGraph dependency (also the ladder escalation hop)
+  | "data-flow" // a dependency an agent push has made live (also a ladder re-fan)
   | "spawn" // an event-driven recruitment: a push recruited the target
   | "consumed-tool" // a downstream agent actually ran an agent-built tool
-  | "lease" // a write-lease coordination: owner <- waiter on a contested path
-  | "model-escalation" // a verify-fail escalated the next attempt to a stronger model
-  | "re-fan"; // a retry round re-ran an implicated unit on the escalation model
+  | "lease"; // a write-lease coordination: owner <- waiter on a contested path
 
 /**
  * The real state element a node is backed by. Every node carries one. There is
@@ -703,6 +708,66 @@ function isVerified(status: WorkUnitStatus): boolean {
   return status === "verified" || status === "integrated";
 }
 
+/** The goal node's status + green flag, derived from the whole-change verdict. */
+interface GoalOutcome {
+  readonly status: WorkUnitStatus;
+  readonly verified: boolean;
+}
+
+/**
+ * Derive the goal node's state from the AUTHORITATIVE change outcome, not from
+ * the first wave finishing.
+ *
+ * The authoritative verdict for the whole change is the promoted-artifact gate
+ * run: the change-level verify attempts the ladder records. When the ladder has
+ * run, the latest round's outcome is ground truth, so:
+ *
+ *   - green (integrated) ONLY when the latest recorded verify round PASSED (the
+ *     authoritative gate passed on the promoted artifact);
+ *   - red (failed) when the latest recorded verify round FAILED and the ladder
+ *     has exhausted its retries (no later round is coming), so the change is a
+ *     terminal failure;
+ *   - running otherwise (a round failed but a retry round is still in flight).
+ *
+ * This closes the two reported bugs: the goal never greens on the first wave
+ * finishing BEFORE the authoritative verify (there is no passing verify round
+ * yet, so it stays running), and once the ladder has exhausted on a failing
+ * round the goal is terminal red and never flips back to running.
+ *
+ * When the state records NO verify attempts (the offline demo / no-gate path),
+ * there is no authoritative gate to defer to, so the goal falls back to the
+ * every-unit-integrated reading it has always used for that path.
+ */
+function goalOutcome(snapshot: ChangeStateSnapshot): GoalOutcome {
+  const verifyAttempts = snapshot.verifyAttempts ?? [];
+  if (verifyAttempts.length === 0) {
+    // No authoritative gate recorded: fall back to every-unit-integrated.
+    const allIntegrated =
+      snapshot.work.length > 0 && snapshot.work.every((u) => isVerified(u.status));
+    return {
+      status: allIntegrated ? "integrated" : "running",
+      verified: allIntegrated,
+    };
+  }
+
+  // The authoritative verdict is the latest recorded verify round.
+  const latest = verifyAttempts.reduce((a, b) => (b.round >= a.round ? b : a));
+  if (latest.outcome === "pass") {
+    return { status: "integrated", verified: true };
+  }
+
+  // The latest round FAILED. The change is terminal red only when the ladder has
+  // exhausted (no retry round is in flight past this failing round). A retry
+  // whose round is beyond the latest recorded verify means another verify is
+  // still coming, so the change is still running rather than terminally failed.
+  const retryAttempts = snapshot.retryAttempts ?? [];
+  const retryPending = retryAttempts.some((r) => r.round > latest.round);
+  return {
+    status: retryPending ? "running" : "failed",
+    verified: false,
+  };
+}
+
 /**
  * Project a live ChangeState snapshot into the typed graph the console renders.
  *
@@ -752,19 +817,21 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     }
   }
 
-  // The goal node: the Change root the graph self-organizes toward.
+  // The goal node: the Change root the graph self-organizes toward. Its status
+  // comes from the authoritative whole-change verdict (see goalOutcome).
+  const goal = goalOutcome(snapshot);
   nodes.push(
     assertBacked(
       {
         id: goalNodeId(snapshot.id),
         kind: "goal",
         label: snapshot.objective || snapshot.id,
-        // The goal reads verified only when every unit is integrated.
-        status: snapshot.work.every((u) => isVerified(u.status)) && snapshot.work.length > 0
-          ? "integrated"
-          : "running",
-        verified:
-          snapshot.work.length > 0 && snapshot.work.every((u) => isVerified(u.status)),
+        // The goal reads from the AUTHORITATIVE change verdict (the promoted
+        // -artifact gate the ladder records), not from the first wave finishing:
+        // green only after a passing verify round, terminal red once the ladder
+        // exhausts on a failing round, running otherwise. See goalOutcome.
+        status: goal.status,
+        verified: goal.verified,
         escalated: goalEscalated,
         backing: { kind: "change", changeId: snapshot.id },
       },
@@ -1050,7 +1117,10 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     if (prevVerifyFailed) {
       edges.push({
         id: `model-escalation:${snapshot.id}#${prevRound}->${retry.round}`,
-        kind: "model-escalation",
+        // The escalation hop reuses the `dependency` kind (the retry depends on
+        // the failing verify of the previous round). Its backing still records
+        // the full model-escalation provenance, so nothing honest is lost.
+        kind: "dependency",
         from: verifyNodeId(snapshot.id, prevRound),
         to: retryNodeId(snapshot.id, retry.round),
         backing: {
@@ -1099,7 +1169,10 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
 
       edges.push({
         id: `re-fan:${snapshot.id}#${retry.round}->${unitId}`,
-        kind: "re-fan",
+        // The per-unit re-fan reuses the `data-flow` kind (the retry fed this
+        // round-N agent its escalation edit). Its backing still records the full
+        // re-fan provenance, so the shared kind loses no honesty.
+        kind: "data-flow",
         from: retryNodeId(snapshot.id, retry.round),
         to: roundAgentNodeId(snapshot.id, retry.round, unitId),
         backing: {

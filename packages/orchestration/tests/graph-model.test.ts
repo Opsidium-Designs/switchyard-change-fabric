@@ -416,8 +416,12 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
       implicatedUnits: ["fix"],
     });
 
-    const escalationEdge = model.edges.find((e) => e.kind === "model-escalation");
+    // The escalation hop reuses the `dependency` kind in the rendered vocabulary
+    // (the five kinds), but still carries its full model-escalation provenance on
+    // its backing. Assert via the backing so the beat remains pinned.
+    const escalationEdge = model.edges.find((e) => e.backing.kind === "model-escalation");
     expect(escalationEdge).toBeDefined();
+    expect(escalationEdge?.kind).toBe("dependency");
     expect(escalationEdge?.from).toBe(verifyNodeId("change-ladder", 1));
     expect(escalationEdge?.to).toBe(retryNodeId("change-ladder", 2));
     expect(escalationEdge?.backing).toMatchObject({
@@ -455,8 +459,11 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
 
   it("draws the re-fan edge from the retry node to the round-N agent node (not back to the original unit)", () => {
     const model = buildWorkGraphModel(ladderSnapshot());
-    const refan = model.edges.filter((e) => e.kind === "re-fan");
+    // The per-unit re-fan reuses the `data-flow` kind in the rendered vocabulary
+    // but still carries its re-fan provenance on its backing; assert via backing.
+    const refan = model.edges.filter((e) => e.backing.kind === "re-fan");
     expect(refan).toHaveLength(1);
+    expect(refan[0]?.kind).toBe("data-flow");
     expect(refan[0]?.id).toBe("re-fan:change-ladder#2->fix");
     expect(refan[0]?.from).toBe(retryNodeId("change-ladder", 2));
     // The edge targets the FRESH round-N agent node beneath the retry, never the
@@ -464,9 +471,9 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
     expect(refan[0]?.to).toBe(roundAgentNodeId("change-ladder", 2, "fix"));
     expect(refan[0]?.to).not.toBe(unitNodeId("fix"));
     // No re-fan edge points back at the original unit node.
-    expect(model.edges.some((e) => e.kind === "re-fan" && e.to === unitNodeId("fix"))).toBe(
-      false,
-    );
+    expect(
+      model.edges.some((e) => e.backing.kind === "re-fan" && e.to === unitNodeId("fix")),
+    ).toBe(false);
     // The edge is backed by the real recorded retry round + implicated unit id.
     expect(refan[0]?.backing).toMatchObject({
       kind: "re-fan",
@@ -563,7 +570,179 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
     const model = buildWorkGraphModel(layeredSnapshot());
     expect(model.nodes.some((n) => n.kind === "verify")).toBe(false);
     expect(model.nodes.some((n) => n.kind === "retry")).toBe(false);
-    expect(model.edges.some((e) => e.kind === "model-escalation")).toBe(false);
-    expect(model.edges.some((e) => e.kind === "re-fan")).toBe(false);
+    expect(model.edges.some((e) => e.backing.kind === "model-escalation")).toBe(false);
+    expect(model.edges.some((e) => e.backing.kind === "re-fan")).toBe(false);
+  });
+
+  it("renders the ladder edges within the five-kind vocabulary (no bespoke model-escalation/re-fan edge kinds)", () => {
+    const model = buildWorkGraphModel(ladderSnapshot());
+    // The rendered edge vocabulary is exactly these five kinds; the escalation
+    // hop and the per-unit re-fan ride dependency/data-flow, never a bespoke
+    // kind, so the console legend stays the five-kind set.
+    const allowed = new Set(["dependency", "data-flow", "spawn", "consumed-tool", "lease"]);
+    for (const edge of model.edges) {
+      expect(allowed.has(edge.kind)).toBe(true);
+    }
+    // The escalation hop and the re-fan are still present, just under the shared
+    // kinds, with their provenance intact on the backing.
+    expect(model.edges.some((e) => e.backing.kind === "model-escalation" && e.kind === "dependency")).toBe(true);
+    expect(model.edges.some((e) => e.backing.kind === "re-fan" && e.kind === "data-flow")).toBe(true);
+  });
+});
+
+/**
+ * The goal node reflects the AUTHORITATIVE whole-change verdict (the promoted
+ * -artifact gate the ladder records), not the first wave finishing. The two
+ * reported bugs were: the goal greened as soon as the first wave finished
+ * (BEFORE the gate ran), then flipped back to running/blue after the final
+ * failure. The fix derives the goal from the change-level verify attempts.
+ */
+describe("the goal node reflects the authoritative verify verdict, not the first wave", () => {
+  /** A one-unit change whose single unit is already integrated (first wave done). */
+  function firstWaveDone(): ChangeStateSnapshot {
+    return {
+      id: "change-goal",
+      objective: "fix the thing",
+      completed: ["fix"],
+      work: [
+        {
+          id: "fix",
+          objective: "fix",
+          dependsOn: [],
+          paths: ["src/fix.js"],
+          status: "integrated",
+          leased: false,
+          workspace: workspace("fix"),
+        },
+      ],
+      edges: [],
+    };
+  }
+
+  it("never greens on the integrated first wave before the gate, then goes terminal red at exhaustion (never flips back to running)", () => {
+    // Snapshot A: the first wave is integrated and the gate FAILED round 1, with
+    // the round-2 retry recorded and in flight. The goal must be RUNNING here:
+    // the old bug greened it the moment the first wave integrated, before the
+    // authoritative gate had passed.
+    const a = buildWorkGraphModel({
+      ...firstWaveDone(),
+      verifyAttempts: [{ round: 1, outcome: "fail", model: "base", at: "t1" }],
+      retryAttempts: [
+        {
+          round: 2,
+          fromModel: "base",
+          toModel: "escalation",
+          implicatedUnits: ["fix"],
+          reason: "round 1 failed",
+          at: "t1b",
+        },
+      ],
+    });
+    const goalA = a.nodes.find((n) => n.kind === "goal");
+    expect(goalA?.verified).toBe(false);
+    expect(goalA?.status).toBe("running");
+
+    // Snapshot B: round 2 also failed and the ladder exhausted. The goal is now a
+    // TERMINAL red failure and must NOT flip back to running/blue, which was the
+    // second half of the reported bug.
+    const b = buildWorkGraphModel({
+      ...firstWaveDone(),
+      work: firstWaveDone().work.map((u) => ({ ...u, status: "failed" as const })),
+      verifyAttempts: [
+        { round: 1, outcome: "fail", model: "base", at: "t1" },
+        { round: 2, outcome: "fail", model: "escalation", at: "t2" },
+      ],
+      retryAttempts: [
+        {
+          round: 2,
+          fromModel: "base",
+          toModel: "escalation",
+          implicatedUnits: ["fix"],
+          reason: "round 1 failed",
+          at: "t1b",
+        },
+      ],
+    });
+    const goalB = b.nodes.find((n) => n.kind === "goal");
+    expect(goalB?.verified).toBe(false);
+    expect(goalB?.status).toBe("failed");
+    expect(goalB?.status).not.toBe("running");
+  });
+
+  it("greens ONLY once the authoritative verify round passes", () => {
+    const model = buildWorkGraphModel({
+      ...firstWaveDone(),
+      verifyAttempts: [
+        { round: 1, outcome: "pass", model: "base", gateCommand: "npm run gate", at: "t1" },
+      ],
+    });
+    const goal = model.nodes.find((n) => n.kind === "goal");
+    expect(goal?.verified).toBe(true);
+    expect(goal?.status).toBe("integrated");
+  });
+
+  it("goes terminal RED (failed) when the ladder exhausts on a failing round, and never flips back to running", () => {
+    // Both rounds failed and the single retry round is already recorded (the
+    // ladder exhausted): the goal is a terminal failure, never green, never
+    // flipped back to running.
+    const model = buildWorkGraphModel({
+      ...firstWaveDone(),
+      // The failing final gate marked the unit failed, as the real ladder does.
+      work: firstWaveDone().work.map((u) => ({ ...u, status: "failed" as const })),
+      verifyAttempts: [
+        { round: 1, outcome: "fail", model: "base", at: "t1" },
+        { round: 2, outcome: "fail", model: "escalation", at: "t2" },
+      ],
+      retryAttempts: [
+        {
+          round: 2,
+          fromModel: "base",
+          toModel: "escalation",
+          implicatedUnits: ["fix"],
+          reason: "round 1 failed",
+          at: "t1b",
+        },
+      ],
+    });
+    const goal = model.nodes.find((n) => n.kind === "goal");
+    expect(goal?.verified).toBe(false);
+    expect(goal?.status).toBe("failed");
+  });
+
+  it("stays RUNNING (not terminal) when a round failed but a later retry round is still in flight", () => {
+    // Round 1 failed and a round-2 retry is in flight (its verify has not landed
+    // yet): the change is still running, not terminally failed, so the goal does
+    // not prematurely go red.
+    const model = buildWorkGraphModel({
+      ...firstWaveDone(),
+      verifyAttempts: [{ round: 1, outcome: "fail", model: "base", at: "t1" }],
+      retryAttempts: [
+        {
+          round: 2,
+          fromModel: "base",
+          toModel: "escalation",
+          implicatedUnits: ["fix"],
+          reason: "round 1 failed",
+          at: "t1b",
+        },
+      ],
+    });
+    const goal = model.nodes.find((n) => n.kind === "goal");
+    expect(goal?.verified).toBe(false);
+    expect(goal?.status).toBe("running");
+  });
+
+  it("falls back to every-unit-integrated when the state records NO verify attempts (the offline no-gate path)", () => {
+    // The demo / no-gate path records no verify attempts, so the goal keeps its
+    // historical every-unit-integrated reading (what the existing demo relies on).
+    const allIntegrated = buildWorkGraphModel(firstWaveDone());
+    expect(allIntegrated.nodes.find((n) => n.kind === "goal")?.verified).toBe(true);
+
+    const notAllIntegrated = buildWorkGraphModel({
+      ...firstWaveDone(),
+      completed: [],
+      work: firstWaveDone().work.map((u) => ({ ...u, status: "running" as const })),
+    });
+    expect(notAllIntegrated.nodes.find((n) => n.kind === "goal")?.verified).toBe(false);
   });
 });
