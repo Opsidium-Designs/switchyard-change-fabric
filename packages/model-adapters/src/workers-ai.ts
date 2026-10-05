@@ -832,19 +832,32 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
       }
       throw error instanceof Error ? error : new Error(String(error));
     } finally {
-      if (timer !== undefined) {
+      // For a NON-streaming call the whole body is read below within this
+      // function, so the timer is cleared here on settle. For a STREAMING call
+      // the body is consumed later in readStreamingResponse, so clearing the
+      // timer here would leave the SSE read unbounded (a stalled or server-erroring
+      // stream would then hang the Worker until the runtime cancels it). In the
+      // streaming case we therefore DEFER clearing the timer to the reader, which
+      // clears it when the stream completes or aborts.
+      if (timer !== undefined && !(wantStream && res! !== undefined && res!.body)) {
         clearTimeout(timer);
       }
     }
     if (res.status >= 400) {
       // Drain the body (do not include it in the error) and fail without leaking.
       await res.text().catch(() => "");
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
       throw new Error(`Workers AI call failed for ${request.model} (HTTP ${res.status})`);
     }
     if (wantStream && res.body) {
       // Relay the SSE token stream: emit each delta through onToken as it lands
       // and assemble the full reply so the executor's edit parser is unchanged.
-      return readStreamingResponse(res, request.model, callbacks);
+      // The controller + timer are passed in so the deadline stays live for the
+      // whole read: a stalled or server-erroring stream aborts and fails cleanly
+      // rather than hanging the Worker forever (the hang the runtime cancels).
+      return readStreamingResponse(res, request.model, callbacks, controller, timer);
     }
     const text = await res.text();
     let body: {
@@ -904,6 +917,8 @@ async function readStreamingResponse(
   res: Response,
   model: string,
   callbacks?: WorkersAiStreamCallbacks,
+  controller?: AbortController,
+  timer?: ReturnType<typeof setTimeout>,
 ): Promise<WorkersAiInvokeResult> {
   const reader = res.body!.getReader();
   const decoder = new TextDecoder();
@@ -954,27 +969,98 @@ async function readStreamingResponse(
       // A non-JSON SSE line (a keep-alive or comment) is ignored.
     }
   };
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
+  // A per-read stall watchdog: if no chunk (and no clean `done`) arrives within
+  // this window, abort the body so the read cannot block forever. This is a
+  // second guard beneath the overall AbortController deadline, covering the case
+  // where the stream stays open but silent (e.g. the model errored mid-stream).
+  const STALL_MS = 30000;
+  let aborted = false;
+  const abortStream = (): void => {
+    aborted = true;
+    try {
+      controller?.abort();
+    } catch {
+      // ignore
     }
-    buffer += decoder.decode(value, { stream: true });
-    let newlineIdx: number;
-    while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
-      const line = buffer.slice(0, newlineIdx);
-      buffer = buffer.slice(newlineIdx + 1);
-      if (line.startsWith("data:")) {
-        handleEvent(line);
+    void reader.cancel().catch(() => {});
+  };
+  try {
+    for (;;) {
+      let stall: ReturnType<typeof setTimeout> | undefined;
+      const read = reader.read();
+      const stalled = new Promise<{ stalled: true }>((resolve) => {
+        stall = setTimeout(() => resolve({ stalled: true }), STALL_MS);
+      });
+      // Also race the overall deadline: when the caller's AbortController fires
+      // (the timeoutMs elapsed), a stalled reader.read() would otherwise block
+      // until the 30s stall watchdog. Listening for the abort event lets the
+      // deadline interrupt the read immediately, so the stream can never outlive
+      // the deadline that bounds the whole call.
+      const abortedP = new Promise<{ aborted: true }>((resolve) => {
+        const sig = controller?.signal;
+        if (!sig) {
+          return;
+        }
+        if (sig.aborted) {
+          resolve({ aborted: true });
+          return;
+        }
+        sig.addEventListener("abort", () => resolve({ aborted: true }), { once: true });
+      });
+      let outcome:
+        | { done?: boolean; value?: Uint8Array }
+        | { stalled: true }
+        | { aborted: true };
+      try {
+        outcome = await Promise.race([read, stalled, abortedP]);
+      } finally {
+        if (stall !== undefined) {
+          clearTimeout(stall);
+        }
+      }
+      if ("aborted" in outcome) {
+        abortStream();
+        throw new WorkersAiTimeoutError(`Workers AI stream for ${model} timed out`);
+      }
+      if ("stalled" in outcome) {
+        abortStream();
+        throw new WorkersAiTimeoutError(
+          `Workers AI stream for ${model} stalled with no data for ${STALL_MS}ms`,
+        );
+      }
+      const { done, value } = outcome;
+      if (done) {
+        break;
+      }
+      if (controller?.signal.aborted) {
+        throw new WorkersAiTimeoutError(`Workers AI stream for ${model} timed out`);
+      }
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIdx: number;
+      while ((newlineIdx = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newlineIdx);
+        buffer = buffer.slice(newlineIdx + 1);
+        if (line.startsWith("data:")) {
+          handleEvent(line);
+        }
       }
     }
+    // Flush any trailing buffered line.
+    if (buffer.startsWith("data:")) {
+      handleEvent(buffer);
+    }
+    if (assembled === "") {
+      throw new Error(`Workers AI returned an empty stream for ${model}`);
+    }
+    return { text: assembled, ...(usage ? { usage } : {}) };
+  } finally {
+    // Always clear the overall deadline timer when the stream settles (success,
+    // error, or abort), so the deferred timer from the caller is never leaked.
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+    if (!aborted) {
+      void reader.cancel().catch(() => {});
+    }
   }
-  // Flush any trailing buffered line.
-  if (buffer.startsWith("data:")) {
-    handleEvent(buffer);
-  }
-  if (assembled === "") {
-    throw new Error(`Workers AI returned an empty stream for ${model}`);
-  }
-  return { text: assembled, ...(usage ? { usage } : {}) };
 }

@@ -660,3 +660,42 @@ describe("WorkersAiExecutor per-attempt model id (so a retry can escalate, offli
     expect(result.cost.model).toBe(escalationModel);
   });
 });
+
+describe("createWorkersAiRestInvoke streaming deadline (a stalled stream must not hang)", () => {
+  // Regression: a streaming SSE body that opens but never closes (the model
+  // errored mid-stream) previously hung forever because the deadline timer was
+  // cleared when the response HEADERS arrived, before the body was read. The
+  // Worker then got cancelled by the runtime for "hanging". The fix keeps the
+  // deadline live through the stream read. This test gives a body that emits one
+  // delta then never ends, with a tiny timeout, and asserts a clean timeout.
+  it("aborts a never-closing stream with a timeout error instead of hanging", async () => {
+    // A ReadableStream that sends one SSE delta then stalls forever (never
+    // enqueues again and never closes), simulating a server-side mid-stream
+    // failure. No real network; deterministic and offline.
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('data: {"response":"partial"}\n'));
+        // Intentionally never close and never enqueue again.
+      },
+    });
+    const fetchFn = (async () =>
+      new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      })) as unknown as typeof fetch;
+
+    const invoke = createWorkersAiRestInvoke({
+      accountId: "acct",
+      apiToken: "token-not-logged",
+      fetchFn,
+      timeoutMs: 50,
+    });
+
+    await expect(
+      invoke(
+        { model: DEFAULT_WORKERS_AI_MODEL, messages: [{ role: "user", content: "hi" }] },
+        { onToken: () => {} },
+      ),
+    ).rejects.toBeInstanceOf(WorkersAiTimeoutError);
+  });
+});
