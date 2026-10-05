@@ -488,6 +488,108 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     return json({ deployment }, 201);
   }
 
+  // Record one mechanical VERIFY attempt for a WorkUnit: a single run of the
+  // per-app behavioral gate against a candidate edit. This is the real backing
+  // for a `verify` graph node, so a verify node can only exist once this record
+  // does. The verifier is mechanical on every attempt (the escalation model gets
+  // another attempt, never grades its own output), so this is the ground-truth
+  // verdict the ladder and the console read.
+  const verifyAttemptMatch = url.pathname.match(
+    /^\/changes\/([^/]+)\/work\/([^/]+)\/verify-attempt$/,
+  );
+  if (request.method === "POST" && verifyAttemptMatch) {
+    const changeId = decodeURIComponent(verifyAttemptMatch[1] ?? "");
+    const unitId = decodeURIComponent(verifyAttemptMatch[2] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: VerifyAttemptBody;
+    try {
+      body = (await request.json()) as VerifyAttemptBody;
+    } catch {
+      return json({ error: "invalid verify-attempt body" }, 400);
+    }
+    try {
+      const attempt = await stub.recordVerifyAttempt({
+        unitId,
+        attempt: numberOr(body.attempt, 1),
+        outcome: body.outcome === "pass" ? "pass" : "fail",
+        model: body.model ?? "",
+        ...(body.evidence ? { evidence: body.evidence } : {}),
+      });
+      return json({ verifyAttempt: attempt }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Record one model-escalation RETRY for a WorkUnit: after a verify-fail, the
+  // ladder ran another attempt on a stronger model fed the failing evidence.
+  // This is the real backing for a `retry` graph node and the `model-escalation`
+  // edge; it is kept wholly separate from the human-escalation `escalated` flag.
+  const retryAttemptMatch = url.pathname.match(
+    /^\/changes\/([^/]+)\/work\/([^/]+)\/retry-attempt$/,
+  );
+  if (request.method === "POST" && retryAttemptMatch) {
+    const changeId = decodeURIComponent(retryAttemptMatch[1] ?? "");
+    const unitId = decodeURIComponent(retryAttemptMatch[2] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: RetryAttemptBody;
+    try {
+      body = (await request.json()) as RetryAttemptBody;
+    } catch {
+      return json({ error: "invalid retry-attempt body" }, 400);
+    }
+    try {
+      const attempt = await stub.recordRetryAttempt({
+        unitId,
+        attempt: numberOr(body.attempt, 2),
+        fromModel: body.fromModel ?? "",
+        toModel: body.toModel ?? "",
+        reason: body.reason ?? "verify-fail escalation",
+      });
+      return json({ retryAttempt: attempt }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Mark a WorkUnit FAILED on a verify-fail verdict: its candidate edit did not
+  // pass the mechanical per-app gate after the bounded model-escalation ladder.
+  // Unlike /fail (agent-infra failure), this is the VERDICT on the pushed edit,
+  // so it overrides a prior pushed/completed marker: the unit becomes a real RED
+  // node and is kept out of integration, closing the vacuous-green trap.
+  const verifyFailMatch = url.pathname.match(
+    /^\/changes\/([^/]+)\/work\/([^/]+)\/verify-fail$/,
+  );
+  if (request.method === "POST" && verifyFailMatch) {
+    const changeId = decodeURIComponent(verifyFailMatch[1] ?? "");
+    const unitId = decodeURIComponent(verifyFailMatch[2] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: FailBody = {};
+    const raw = await request.text();
+    if (raw.trim() !== "") {
+      try {
+        body = JSON.parse(raw) as FailBody;
+      } catch {
+        return json({ error: "invalid verify-fail body" }, 400);
+      }
+    }
+    try {
+      const state = await stub.recordVerifyFailure(unitId, body.reason);
+      return json(state);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
   // Configure the min/max concurrency dial for a Change. The dial is the single
   // lever that governs how many agents recruitment runs at once.
   const dialMatch = url.pathname.match(/^\/changes\/([^/]+)\/dial$/);
@@ -817,6 +919,22 @@ interface DiscoveredBody {
 interface DeploymentBody {
   readonly url?: string;
   readonly app?: string;
+}
+
+/** Body of POST /changes/:id/work/:unit/verify-attempt: one mechanical gate run. */
+interface VerifyAttemptBody {
+  readonly attempt?: number;
+  readonly outcome?: "pass" | "fail";
+  readonly model?: string;
+  readonly evidence?: string;
+}
+
+/** Body of POST /changes/:id/work/:unit/retry-attempt: one model-escalation retry. */
+interface RetryAttemptBody {
+  readonly attempt?: number;
+  readonly fromModel?: string;
+  readonly toModel?: string;
+  readonly reason?: string;
 }
 
 /** Body of POST /changes/:id/dial. Accepts min/max under either spelling. */

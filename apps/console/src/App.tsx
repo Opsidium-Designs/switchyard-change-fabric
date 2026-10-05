@@ -7,6 +7,7 @@ import {
   type EscalationSnapshot,
   type GraphNode,
   type UnitDetailSnapshot,
+  type NodeBacking,
   type WorkGraphModel,
 } from "@switchyard-change/orchestration/graph-model";
 
@@ -635,6 +636,14 @@ function Legend() {
       <li><span className="swatch sw-agent" /> recruited agent (real repo)</li>
       <li><span className="swatch sw-verified" /> verified / integrated</li>
       <li><span className="swatch sw-failed" /> failed unit</li>
+      {/* The model-escalation ladder's own kinds: a verify node is a mechanical
+          gate run (green pass / red fail), a retry node is the smarter-model
+          re-attempt, and the model-escalation edge is the base -> escalation hop.
+          They are a DISTINCT beat from the human escalation highlight below and
+          from the lease edge, matching graph-view's nodeFill/edgeStyle. */}
+      <li><span className="swatch sw-verify-pass" /> verify passed (gate ran, green)</li>
+      <li><span className="swatch sw-verify-fail" /> verify failed (gate ran, red)</li>
+      <li><span className="swatch sw-retry" /> retry (escalated to a stronger model)</li>
       {/* The tool entry uses a DIAMOND glyph so it matches the diamond tool node
           drawn in the graph, not a circular swatch like the other node kinds. */}
       <li>
@@ -651,6 +660,10 @@ function Legend() {
           edge only ever appears alongside a diamond tool node by construction. */}
       <li><span className="line ln-tool" /> consumed tool (agent ran a built tool)</li>
       <li><span className="line ln-lease" /> write-lease (waiter waits for owner)</li>
+      {/* The model-escalation edge is a magenta long-dashed line, distinct from
+          the teal dotted lease edge and from the human-escalation red, so the
+          base -> smarter-model hop reads as its own beat. */}
+      <li><span className="line ln-escalation" /> model escalation (base to smarter model)</li>
     </ul>
   );
 }
@@ -799,6 +812,10 @@ function NodeDetail({
 
       {detail ? <ModelDetail detail={detail} /> : null}
 
+      {backing.kind === "verify-attempt" || backing.kind === "retry-attempt" ? (
+        <LadderDetail backing={backing} />
+      ) : null}
+
       {unitId ? (
         <ActivityLog steps={activity} />
       ) : null}
@@ -928,6 +945,71 @@ function ModelDetail({ detail }: { detail: UnitDetailSnapshot }) {
           <pre className="detail-diff">{detail.diff}</pre>
         </>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * The per-node detail for the model-escalation ladder's own nodes, read straight
+ * from the node's real backing (never synthesized):
+ *
+ *   - a VERIFY node shows the attempt number and the mechanical verdict (pass or
+ *     fail) of that single gate run. The verdict is ground truth: the gate is
+ *     mechanical on every attempt, so the model never grades its own output.
+ *   - a RETRY node shows which attempt it produced and the stronger model the
+ *     ladder escalated TO. This is the smarter-model re-attempt beat, wholly
+ *     separate from any human escalation.
+ *
+ * Both come from the backing variant the graph model attached, so this panel can
+ * only show a ladder beat that genuinely happened.
+ */
+function LadderDetail({
+  backing,
+}: {
+  backing: Extract<NodeBacking, { kind: "verify-attempt" | "retry-attempt" }>;
+}) {
+  if (backing.kind === "verify-attempt") {
+    return (
+      <div className="ladder-detail">
+        <h3>Verify attempt</h3>
+        <dl className="meta">
+          <div>
+            <dt>Attempt</dt>
+            <dd>#{backing.attempt}</dd>
+          </div>
+          <div>
+            <dt>Verdict</dt>
+            <dd className={backing.outcome === "pass" ? "verdict-pass" : "verdict-fail"}>
+              {backing.outcome === "pass" ? "pass" : "fail"}
+            </dd>
+          </div>
+        </dl>
+        <p className="muted">
+          A mechanical per-app gate ran against this attempt&apos;s candidate edit.
+          The verdict is real evidence, not the model grading itself.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="ladder-detail">
+      <h3>Model escalation retry</h3>
+      <dl className="meta">
+        <div>
+          <dt>Attempt</dt>
+          <dd>#{backing.attempt}</dd>
+        </div>
+        <div>
+          <dt>Escalated to</dt>
+          <dd>
+            <code>{backing.toModel || "escalation model"}</code>
+          </dd>
+        </div>
+      </dl>
+      <p className="muted">
+        A verify-fail handed this attempt to a stronger model, fed the failing
+        evidence. This is a distinct beat from a human escalation.
+      </p>
     </div>
   );
 }

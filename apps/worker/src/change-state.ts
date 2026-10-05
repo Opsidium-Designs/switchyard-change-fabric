@@ -177,6 +177,53 @@ export interface LeaseEdge {
   readonly waiters: readonly string[];
 }
 
+/** The outcome of one mechanical verification attempt. */
+export type VerifyOutcome = "pass" | "fail";
+
+/**
+ * One recorded VERIFY attempt for a WorkUnit: a single mechanical run of the
+ * per-app behavioral gate against the candidate edit that attempt produced. It
+ * is the honest backing for a `verify` graph node, so a verify node always maps
+ * to a real recorded gate run. The attempt number is 1 for the base model run
+ * and increments for each escalation retry; the model id is the model that
+ * produced the edit this run graded (never the verifier itself, which is
+ * mechanical). The evidence is the bounded gate output on a failure, kept so the
+ * retry prompt and the console can show WHY the attempt failed.
+ */
+export interface VerifyAttempt {
+  readonly unitId: string;
+  /** 1 for the base attempt, 2 for the first escalation retry, and so on. */
+  readonly attempt: number;
+  readonly outcome: VerifyOutcome;
+  /** The model id whose edit this run graded (empty for a deterministic edit). */
+  readonly model: string;
+  /** Bounded gate evidence (summary/stderr) when the attempt failed. */
+  readonly evidence?: string;
+  readonly at: string;
+}
+
+/**
+ * One recorded model-escalation RETRY for a WorkUnit: after a verify-fail, the
+ * ladder ran another attempt on a stronger model, fed the failing evidence. It
+ * is the honest backing for a `retry` graph node and the `model-escalation`
+ * edge, so neither can be drawn without a real recorded retry. It names the
+ * model the previous attempt used and the escalation model this retry ran, so
+ * the console shows the base to escalation hop truthfully. This is wholly
+ * separate from the human-escalation `escalated` flag.
+ */
+export interface RetryAttempt {
+  readonly unitId: string;
+  /** The attempt number this retry produced (2 for the first retry). */
+  readonly attempt: number;
+  /** The model the previous (failed) attempt used. */
+  readonly fromModel: string;
+  /** The stronger model this retry escalated to. */
+  readonly toModel: string;
+  /** A short, human-readable reason the ladder escalated (never a secret). */
+  readonly reason: string;
+  readonly at: string;
+}
+
 /** The live, serializable projection of a Change's orchestration state. */
 export interface ChangeStateView {
   readonly id: string;
@@ -229,6 +276,19 @@ export interface ChangeStateView {
    * for a run that did not deploy (the intro template) or whose fix failed.
    */
   readonly deployment?: DeploymentRecord;
+  /**
+   * The mechanical verify attempts recorded for this Change's units: each is one
+   * real run of the per-app gate against a candidate edit. They back the graph's
+   * `verify` nodes, so a verify node always maps to a real recorded gate run.
+   */
+  readonly verifyAttempts: readonly VerifyAttempt[];
+  /**
+   * The model-escalation retries recorded for this Change's units: each is one
+   * bounded retry on a stronger model fed the failing evidence. They back the
+   * graph's `retry` nodes and `model-escalation` edges, and are kept wholly
+   * separate from the human-escalation `escalated` flag.
+   */
+  readonly retryAttempts: readonly RetryAttempt[];
 }
 
 /**
@@ -755,6 +815,103 @@ export class ChangeState extends DurableObject<Env> {
   }
 
   /**
+   * Record one mechanical VERIFY attempt for a WorkUnit: a single run of the
+   * per-app behavioral gate against the candidate edit. This is the real backing
+   * for a `verify` graph node, so a verify node can only exist once this record
+   * does. The unit must exist; the evidence is bounded and secret-stripped. The
+   * verifier is mechanical on every attempt (base and escalation alike), so this
+   * record is the ground-truth verdict, never the model grading itself.
+   */
+  async recordVerifyAttempt(input: Omit<VerifyAttempt, "at">): Promise<VerifyAttempt> {
+    const change = await this.loadChange();
+    if (!change.work.some((unit) => unit.id === input.unitId)) {
+      throw new Error(`unknown WorkUnit: ${input.unitId}`);
+    }
+    const attempts = await this.loadVerifyAttempts();
+    const stored: VerifyAttempt = {
+      unitId: input.unitId,
+      attempt: Number.isFinite(input.attempt) && input.attempt > 0 ? Math.floor(input.attempt) : 1,
+      outcome: input.outcome === "pass" ? "pass" : "fail",
+      model: typeof input.model === "string" ? input.model.slice(0, 120) : "",
+      ...(typeof input.evidence === "string" && input.evidence !== ""
+        ? { evidence: sanitizeText(input.evidence, MAX_DETAIL_TEXT) }
+        : {}),
+      at: new Date().toISOString(),
+    };
+    attempts.push(stored);
+    await this.ctx.storage.put("verifyAttempts", attempts);
+    return stored;
+  }
+
+  /**
+   * Record one model-escalation RETRY for a WorkUnit: after a verify-fail, the
+   * ladder ran another attempt on a stronger model fed the failing evidence.
+   * This is the real backing for a `retry` graph node and the `model-escalation`
+   * edge. It is wholly separate from the human-escalation `escalated` flag, so
+   * recording a retry never lights that flag. The unit must exist; the reason is
+   * bounded and secret-stripped.
+   */
+  async recordRetryAttempt(input: Omit<RetryAttempt, "at">): Promise<RetryAttempt> {
+    const change = await this.loadChange();
+    if (!change.work.some((unit) => unit.id === input.unitId)) {
+      throw new Error(`unknown WorkUnit: ${input.unitId}`);
+    }
+    const attempts = await this.loadRetryAttempts();
+    const stored: RetryAttempt = {
+      unitId: input.unitId,
+      attempt: Number.isFinite(input.attempt) && input.attempt > 1 ? Math.floor(input.attempt) : 2,
+      fromModel: typeof input.fromModel === "string" ? input.fromModel.slice(0, 120) : "",
+      toModel: typeof input.toModel === "string" ? input.toModel.slice(0, 120) : "",
+      reason: sanitizeReason(input.reason),
+      at: new Date().toISOString(),
+    };
+    attempts.push(stored);
+    await this.ctx.storage.put("retryAttempts", attempts);
+    return stored;
+  }
+
+  /**
+   * Mark a WorkUnit FAILED because its candidate edit did not pass the mechanical
+   * per-app gate after the bounded model-escalation ladder. This is the honesty
+   * terminal of the ladder: a unit that pushed an edit but whose edit does NOT
+   * fix the planted bug must be a real RED node, never greened. Unlike the
+   * agent-infra `failUnit` (which treats an already-completed unit as a real
+   * success and refuses to override it), a verify-fail is the VERDICT on the
+   * pushed edit, so it overrides a prior "pushed/completed" marker: the unit is
+   * removed from completed and recorded failed. Verification is the authority on
+   * green vs red here, not the mere fact that an agent pushed something.
+   */
+  async recordVerifyFailure(unitId: string, reason?: string): Promise<ChangeStateView> {
+    const change = await this.loadChange();
+    if (!change.work.some((unit) => unit.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    // The mechanical verdict overrides a prior pushed/completed marker.
+    const completed = await this.loadCompleted();
+    const idx = completed.indexOf(unitId);
+    if (idx !== -1) {
+      completed.splice(idx, 1);
+      await this.ctx.storage.put("completed", completed);
+    }
+    const failed = await this.loadFailed();
+    if (!failed[unitId]) {
+      failed[unitId] = {
+        unitId,
+        reason: sanitizeReason(reason ?? "verify failed after the bounded model-escalation ladder"),
+        at: new Date().toISOString(),
+      };
+      await this.ctx.storage.put("failed", failed);
+      await this.recordTransition(unitId, "running", "failed", "runner");
+    }
+    const leases = await this.loadLeases();
+    if (leases[unitId]) {
+      delete leases[unitId];
+      await this.ctx.storage.put("leases", leases);
+    }
+    return this.view();
+  }
+
+  /**
    * Append DISCOVERED follow-up WorkUnits to the live Change. This is the
    * dynamic-branching mechanism: a completing unit reported that fixing one
    * thing revealed more work (follow-up fixes it found in the real repo), so the
@@ -1042,6 +1199,8 @@ export class ChangeState extends DurableObject<Env> {
     const activity = await this.loadActivity();
     const detail = await this.loadDetail();
     const deployment = await this.loadDeployment();
+    const verifyAttempts = await this.loadVerifyAttempts();
+    const retryAttempts = await this.loadRetryAttempts();
     const statuses = workUnitStatuses(change, completed);
     const graph = buildWorkGraph(change);
     const collisions = detectPathCollisions(change);
@@ -1105,6 +1264,8 @@ export class ChangeState extends DurableObject<Env> {
       escalations,
       failed: Object.values(failed).sort((a, b) => (a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0)),
       ...(deployment ? { deployment } : {}),
+      verifyAttempts,
+      retryAttempts,
     };
   }
 
@@ -1188,6 +1349,14 @@ export class ChangeState extends DurableObject<Env> {
 
   private async loadDeployment(): Promise<DeploymentRecord | null> {
     return (await this.ctx.storage.get<DeploymentRecord | null>("deployment")) ?? null;
+  }
+
+  private async loadVerifyAttempts(): Promise<VerifyAttempt[]> {
+    return (await this.ctx.storage.get<VerifyAttempt[]>("verifyAttempts")) ?? [];
+  }
+
+  private async loadRetryAttempts(): Promise<RetryAttempt[]> {
+    return (await this.ctx.storage.get<RetryAttempt[]>("retryAttempts")) ?? [];
   }
 }
 

@@ -15,7 +15,7 @@
  */
 
 /** The kind of check a verification run performs. */
-export type CheckKind = "clean-state" | "path-scope" | "test" | "lint";
+export type CheckKind = "clean-state" | "path-scope" | "test" | "lint" | "app-gate";
 
 /** Overall verdict for a WorkUnit or for the integration. */
 export type Verdict = "verified" | "failed";
@@ -51,6 +51,26 @@ export interface VerificationContract {
    * omitted, the lint check is skipped and reported as such.
    */
   readonly lintCommand?: readonly string[];
+  /**
+   * The per-app BEHAVIORAL gate command to run inside the checkout, as argv
+   * (program plus args). This is the real mechanical check that the planted bug
+   * is actually fixed (it imports the app's fetch handler and asserts on the
+   * Response, with a syntax/typecheck step so a broken edit fails). Unlike the
+   * optional `testCommand`/`lintCommand`, when a unit declares it is an app-gate
+   * unit (see `requiresAppGate`) and this command is absent, the app-gate check
+   * is a FAIL, not a skip: absence of a gate is cannot-pass, never auto-pass.
+   * This is what closes the vacuous-verify trap, so a unit with no real gate can
+   * never green by having nothing to run.
+   */
+  readonly appGateCommand?: readonly string[];
+  /**
+   * True when this unit MUST satisfy a per-app behavioral gate to be verified.
+   * When true and `appGateCommand` is absent, the app-gate check FAILS (cannot
+   * auto-pass). When false (the default), a unit with no gate command behaves as
+   * before (the app-gate check is simply not applicable), so declared-scope-only
+   * units such as a marker-writing demo keep their existing behavior.
+   */
+  readonly requiresAppGate?: boolean;
   /**
    * The repository-relative paths the WorkUnit actually changed, as reported by
    * the runner. The path-scope check compares these against `paths`. When the

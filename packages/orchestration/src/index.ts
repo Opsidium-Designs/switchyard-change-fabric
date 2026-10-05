@@ -34,6 +34,9 @@ export type {
   RepoPushedResult,
   ToolConsumption,
   ToolRecord,
+  VerifyAttempt,
+  VerifyOutcome,
+  RetryAttempt,
   WorkspaceIdentity,
   WorkUnitView,
 } from "./local-control.ts";
@@ -133,15 +136,17 @@ export type {
   RecruitmentEventSnapshot,
   ToolConsumptionSnapshot,
   ToolSnapshot,
+  VerifyAttemptSnapshot,
+  RetryAttemptSnapshot,
   WorkGraphModel,
   WorkspaceIdentitySnapshot,
   WorkUnitSnapshot,
   WorkUnitStatus,
 } from "./graph-model.ts";
-export { assertBacked, buildWorkGraphModel, goalNodeId, toolNodeId, unitNodeId } from "./graph-model.ts";
+export { assertBacked, buildWorkGraphModel, goalNodeId, retryNodeId, toolNodeId, unitNodeId, verifyNodeId } from "./graph-model.ts";
 
 export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor.ts";
 export { formatDoctorReport, runDoctor } from "./doctor.ts";
 
 export type { ExecutorEnv, SelectedExecutor } from "./executor-select.ts";
-export { selectExecutor } from "./executor-select.ts";
+export { DEFAULT_WORKERS_AI_ESCALATION_MODEL, selectExecutor } from "./executor-select.ts";

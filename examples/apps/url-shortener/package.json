@@ -8,7 +8,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "delete": "wrangler delete --name switchyard-change-fabric-url-shortener"
+    "delete": "wrangler delete --name switchyard-change-fabric-url-shortener",
+    "typecheck": "node --check src/index.js",
+    "gate": "npm run typecheck && node --test gate/gate.test.mjs",
+    "verify": "npm run typecheck && node --test gate/gate.test.mjs gate/bugfix.test.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.40.0"

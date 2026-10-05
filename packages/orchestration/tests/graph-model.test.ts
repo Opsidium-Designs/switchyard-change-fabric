@@ -30,7 +30,9 @@ import {
   assertBacked,
   buildWorkGraphModel,
   goalNodeId,
+  retryNodeId,
   unitNodeId,
+  verifyNodeId,
   type ChangeStateSnapshot,
   type GraphNode,
   type WorkspaceIdentitySnapshot,
@@ -311,5 +313,132 @@ describe("M3: the model morphs purely as a function of successive snapshots", ()
     // The whole goal greens only when every unit is integrated.
     expect(after.nodes.find((n) => n.kind === "goal")?.verified).toBe(true);
     expect(before.nodes.find((n) => n.kind === "goal")?.verified).toBe(false);
+  });
+});
+
+/**
+ * T4: the bounded model-escalation ladder renders as its own honest, backed
+ * graph kinds (verify nodes, a retry node, a model-escalation edge), distinct
+ * from the human-escalation `escalated` flag. Each new node/edge must resolve
+ * against a real recorded attempt in the snapshot, and a node whose backing
+ * record is absent must be rejected (cannot render unbacked).
+ */
+function ladderSnapshot(): ChangeStateSnapshot {
+  return {
+    id: "change-ladder",
+    objective: "One unit whose base attempt fails and escalation passes",
+    completed: ["fix"],
+    work: [
+      {
+        id: "fix",
+        objective: "fix the planted bug",
+        dependsOn: [],
+        paths: ["src/fix.js"],
+        status: "integrated",
+        leased: false,
+        workspace: workspace("fix"),
+      },
+    ],
+    edges: [],
+    // base attempt failed, escalation attempt passed.
+    verifyAttempts: [
+      { unitId: "fix", attempt: 1, outcome: "fail", model: "base-model", evidence: "gate failed", at: "2026-10-04T10:00:00.000Z" },
+      { unitId: "fix", attempt: 2, outcome: "pass", model: "escalation-model", at: "2026-10-04T10:01:00.000Z" },
+    ],
+    retryAttempts: [
+      { unitId: "fix", attempt: 2, fromModel: "base-model", toModel: "escalation-model", reason: "verify #1 failed", at: "2026-10-04T10:00:30.000Z" },
+    ],
+  };
+}
+
+describe("T4: the model-escalation ladder renders as backed verify/retry nodes and a model-escalation edge", () => {
+  it("emits a verify node per recorded attempt, green on pass and red on fail", () => {
+    const model = buildWorkGraphModel(ladderSnapshot());
+    const v1 = model.nodes.find((n) => n.id === verifyNodeId("fix", 1));
+    const v2 = model.nodes.find((n) => n.id === verifyNodeId("fix", 2));
+    expect(v1?.kind).toBe("verify");
+    expect(v1?.status).toBe("failed");
+    expect(v1?.verified).toBe(false);
+    expect(v2?.kind).toBe("verify");
+    expect(v2?.status).toBe("verified");
+    expect(v2?.verified).toBe(true);
+  });
+
+  it("emits a retry node for the escalation reached by a model-escalation edge from the failing verify", () => {
+    const model = buildWorkGraphModel(ladderSnapshot());
+    const retry = model.nodes.find((n) => n.id === retryNodeId("fix", 2));
+    expect(retry?.kind).toBe("retry");
+    expect(retry?.backing.kind).toBe("retry-attempt");
+
+    const escalationEdge = model.edges.find((e) => e.kind === "model-escalation");
+    expect(escalationEdge).toBeDefined();
+    expect(escalationEdge?.from).toBe(verifyNodeId("fix", 1));
+    expect(escalationEdge?.to).toBe(retryNodeId("fix", 2));
+    expect(escalationEdge?.backing).toMatchObject({
+      kind: "model-escalation",
+      unitId: "fix",
+      fromModel: "base-model",
+      toModel: "escalation-model",
+    });
+  });
+
+  it("renders the chain unit -> verify#1 -> retry#2 -> verify#2 (base edit from unit, retried edit from retry)", () => {
+    const model = buildWorkGraphModel(ladderSnapshot());
+    // verify #1 edit flows from the unit; verify #2 edit flows from the retry.
+    const flow1 = model.edges.find((e) => e.id === "verify-flow:fix#1");
+    const flow2 = model.edges.find((e) => e.id === "verify-flow:fix#2");
+    expect(flow1?.from).toBe(unitNodeId("fix"));
+    expect(flow1?.to).toBe(verifyNodeId("fix", 1));
+    expect(flow2?.from).toBe(retryNodeId("fix", 2));
+    expect(flow2?.to).toBe(verifyNodeId("fix", 2));
+  });
+
+  it("does NOT light the human-escalation flag on any node from a model-escalation retry", () => {
+    const model = buildWorkGraphModel(ladderSnapshot());
+    // The ladder is a different beat; no node's human `escalated` flag is set.
+    expect(model.nodes.every((n) => n.escalated === false)).toBe(true);
+  });
+
+  it("every emitted verify/retry node passes the backing guard against the snapshot", () => {
+    const snapshot = ladderSnapshot();
+    const model = buildWorkGraphModel(snapshot);
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
+  });
+
+  it("rejects a verify node with no recorded attempt (cannot render unbacked)", () => {
+    const snapshot = ladderSnapshot();
+    const bogus: GraphNode = {
+      id: verifyNodeId("fix", 9),
+      kind: "verify",
+      label: "verify #9",
+      status: "verified",
+      verified: true,
+      escalated: false,
+      backing: { kind: "verify-attempt", unitId: "fix", attempt: 9, outcome: "pass" },
+    };
+    expect(() => assertBacked(bogus, snapshot)).toThrow(/no recorded verify attempt/);
+  });
+
+  it("rejects a retry node with no recorded retry attempt (cannot render unbacked)", () => {
+    const snapshot = ladderSnapshot();
+    const bogus: GraphNode = {
+      id: retryNodeId("fix", 9),
+      kind: "retry",
+      label: "retry #9",
+      status: "running",
+      verified: false,
+      escalated: false,
+      backing: { kind: "retry-attempt", unitId: "fix", attempt: 9, toModel: "ghost-model" },
+    };
+    expect(() => assertBacked(bogus, snapshot)).toThrow(/no recorded model-escalation retry/);
+  });
+
+  it("emits no verify/retry nodes or model-escalation edge when the state records none", () => {
+    const model = buildWorkGraphModel(layeredSnapshot());
+    expect(model.nodes.some((n) => n.kind === "verify")).toBe(false);
+    expect(model.nodes.some((n) => n.kind === "retry")).toBe(false);
+    expect(model.edges.some((e) => e.kind === "model-escalation")).toBe(false);
   });
 });

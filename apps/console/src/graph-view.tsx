@@ -53,7 +53,16 @@ function computeLayers(model: WorkGraphModel): Map<string, number> {
     if (edge.from === goalNodeId(model.changeId)) {
       continue;
     }
-    if (edge.kind === "dependency" || edge.kind === "data-flow") {
+    // The ladder reads top to bottom: a verify node hangs below its unit (fed by
+    // a data-flow edge), and a retry node hangs below the failing verify it
+    // escalated from (the model-escalation edge). Following the escalation edge
+    // for layering keeps the chain unit -> verify#1 -> retry#2 -> verify#2
+    // ordered down the rows instead of letting the retry float to the top row.
+    if (
+      edge.kind === "dependency" ||
+      edge.kind === "data-flow" ||
+      edge.kind === "model-escalation"
+    ) {
       const list = deps.get(edge.to);
       if (list) {
         list.push(edge.from);
@@ -132,6 +141,13 @@ function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
       // dotted edge, a clearly different hue and pattern from the amber tool
       // edge, so the two are visually unmistakable even at render scale.
       return { stroke: "#2dd4bf", dash: "1 5" };
+    case "model-escalation":
+      // The bounded model-escalation beat: a verify-fail handed the next attempt
+      // to a stronger model. Drawn as a bright MAGENTA long-dashed edge, a hue
+      // and pattern distinct from BOTH the lease teal dotted edge AND the human
+      // escalation red/amber highlight, so the smarter-model hop reads as its own
+      // beat and is never confused with human escalation or lease coordination.
+      return { stroke: "#db61a2", dash: "7 4" };
     case "dependency":
     default:
       return { stroke: "#5a6472" };
@@ -152,6 +168,21 @@ function diamondPoints(r: number): string {
 function nodeFill(node: GraphNode): string {
   if (node.escalated) {
     return "#f85149"; // a pending human escalation lights this node (the human beat)
+  }
+  // A verify node is a mechanical gate run: GREEN on a real pass, a bright RED on
+  // a real fail. This is the ladder's pass/fail beat and is checked before the
+  // generic failed-unit case so a failing gate run reads as a vivid red verdict
+  // (not the muted dead-unit red), and before the kind switch so a verify node is
+  // never drawn as a generic running node.
+  if (node.kind === "verify") {
+    return node.verified ? "#238636" : "#da3633";
+  }
+  // A retry node is the smarter-model re-attempt beat: a MAGENTA fill matching
+  // the model-escalation edge that reaches it, so the escalation hop (edge) and
+  // the escalated attempt (node) read as one beat, visibly distinct from both a
+  // normal running agent (blue) and the human-escalation red.
+  if (node.kind === "retry") {
+    return "#a371f7";
   }
   if (node.status === "failed") {
     // A failed unit is a distinct terminal state: a dark, muted red, clearly not
@@ -394,21 +425,53 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                 return null;
               }
               const style = edgeStyle(edge.kind);
+              // The model-escalation edge carries the real model ids from its
+              // backing: the base model that failed and the stronger model the
+              // ladder escalated to. Render that hop as a label on the edge
+              // ("base -> escalation") so a watcher sees WHICH model took over,
+              // read straight from state, never synthesized.
+              const escalationLabel =
+                edge.kind === "model-escalation" && edge.backing.kind === "model-escalation"
+                  ? `${edge.backing.fromModel || "base"} -> ${edge.backing.toModel || "escalation"}`
+                  : null;
+              const midX = (from.x + to.x) / 2;
+              const midY = (from.y + to.y) / 2;
               return (
-                <line
-                  key={edge.id}
-                  x1={from.x}
-                  y1={from.y}
-                  x2={to.x}
-                  y2={to.y}
-                  stroke={style.stroke}
-                  strokeWidth={edge.kind === "data-flow" ? 2.5 : 1.5}
-                  strokeDasharray={style.dash}
-                  markerEnd="url(#arrow)"
-                  className={`edge edge-${edge.kind}`}
-                >
-                  <title>{`${edge.kind}: ${edge.from} to ${edge.to}`}</title>
-                </line>
+                <g key={edge.id} className={`edge-group edge-group-${edge.kind}`}>
+                  <line
+                    x1={from.x}
+                    y1={from.y}
+                    x2={to.x}
+                    y2={to.y}
+                    stroke={style.stroke}
+                    strokeWidth={
+                      edge.kind === "data-flow"
+                        ? 2.5
+                        : edge.kind === "model-escalation"
+                          ? 2.5
+                          : 1.5
+                    }
+                    strokeDasharray={style.dash}
+                    markerEnd="url(#arrow)"
+                    className={`edge edge-${edge.kind}`}
+                  >
+                    <title>
+                      {escalationLabel
+                        ? `model-escalation: ${escalationLabel} (${edge.from} to ${edge.to})`
+                        : `${edge.kind}: ${edge.from} to ${edge.to}`}
+                    </title>
+                  </line>
+                  {escalationLabel ? (
+                    <text
+                      className="edge-escalation-label"
+                      x={midX}
+                      y={midY - 4}
+                      textAnchor="middle"
+                    >
+                      {escalationLabel}
+                    </text>
+                  ) : null}
+                </g>
               );
             })}
           </g>

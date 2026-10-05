@@ -228,6 +228,48 @@ export interface EscalationSnapshot {
 }
 
 /**
+ * A recorded mechanical VERIFY attempt for a WorkUnit, as reported by the state.
+ * This is the real backing for a `verify` node: a single run of the per-app
+ * behavioral gate against a candidate edit. A verify node is only emitted when
+ * this record is present, so a verify node always maps to a real recorded gate
+ * run (the no-unbacked-node rule for the new kind). The verifier is mechanical
+ * on every attempt, so this verdict is ground truth, never the model grading
+ * itself.
+ */
+export interface VerifyAttemptSnapshot {
+  readonly unitId: string;
+  /** 1 for the base attempt, 2 for the first escalation retry, and so on. */
+  readonly attempt: number;
+  readonly outcome: "pass" | "fail";
+  /** The model id whose edit this run graded (empty for a deterministic edit). */
+  readonly model: string;
+  /** Bounded gate evidence (summary/stderr) when the attempt failed. */
+  readonly evidence?: string;
+  readonly at: string;
+}
+
+/**
+ * A recorded model-escalation RETRY for a WorkUnit, as reported by the state.
+ * This is the real backing for a `retry` node AND the `model-escalation` edge:
+ * after a verify-fail, the ladder ran another attempt on a stronger model fed
+ * the failing evidence. Neither the retry node nor the escalation edge is
+ * emitted without this record. It is wholly separate from the human-escalation
+ * `escalated` flag, which this never lights.
+ */
+export interface RetryAttemptSnapshot {
+  readonly unitId: string;
+  /** The attempt number this retry produced (2 for the first retry). */
+  readonly attempt: number;
+  /** The model the previous (failed) attempt used. */
+  readonly fromModel: string;
+  /** The stronger model this retry escalated to. */
+  readonly toModel: string;
+  /** A short, human-readable reason the ladder escalated. */
+  readonly reason: string;
+  readonly at: string;
+}
+
+/**
  * The subset of the live ChangeState projection the graph model reads. Both the
  * Worker's `ChangeStateView` and the offline control surface's view are
  * structurally assignable to this, so the model projects either without a
@@ -270,6 +312,18 @@ export interface ChangeStateSnapshot {
    * clickable workers.dev link. Absent for the intro template or a failed fix.
    */
   readonly deployment?: DeploymentSnapshot;
+  /**
+   * The mechanical verify attempts recorded for this Change's units. Each is one
+   * real run of the per-app gate against a candidate edit and becomes one
+   * `verify` node hanging off its unit. Optional/absent until the ladder runs.
+   */
+  readonly verifyAttempts?: readonly VerifyAttemptSnapshot[];
+  /**
+   * The model-escalation retries recorded for this Change's units. Each becomes
+   * one `retry` node plus one `model-escalation` edge from the base attempt to
+   * the retry. Optional/absent until a verify-fail triggers an escalation.
+   */
+  readonly retryAttempts?: readonly RetryAttemptSnapshot[];
 }
 
 /** The kind of a node in the rendered graph. */
@@ -277,7 +331,9 @@ export type GraphNodeKind =
   | "goal" // the Change itself: the root the graph self-organizes toward
   | "work" // a declared WorkUnit before an agent is recruited for it
   | "agent" // a WorkUnit an agent has been recruited for (a real repo exists)
-  | "tool"; // an agent-built tool published to its own repo, consumed downstream
+  | "tool" // an agent-built tool published to its own repo, consumed downstream
+  | "verify" // one mechanical gate run against a unit's candidate edit (pass/fail)
+  | "retry"; // one bounded model-escalation retry on a stronger model after a verify-fail
 
 /** The kind of an edge in the rendered graph. */
 export type GraphEdgeKind =
@@ -285,7 +341,8 @@ export type GraphEdgeKind =
   | "data-flow" // a dependency an agent push has made live (data has flowed)
   | "spawn" // an event-driven recruitment: a push recruited the target
   | "consumed-tool" // a downstream agent actually ran an agent-built tool
-  | "lease"; // a write-lease coordination: owner <- waiter on a contested path
+  | "lease" // a write-lease coordination: owner <- waiter on a contested path
+  | "model-escalation"; // a verify-fail escalated the next attempt to a stronger model
 
 /**
  * The real state element a node is backed by. Every node carries one. There is
@@ -311,6 +368,22 @@ export type NodeBacking =
       readonly builderUnitId: string;
       readonly capability: string;
       readonly workspace: WorkspaceIdentitySnapshot;
+    }
+  | {
+      // A verify node is backed by a real recorded mechanical gate run against a
+      // unit's candidate edit, so it can never be a decorative "it passed" node.
+      readonly kind: "verify-attempt";
+      readonly unitId: string;
+      readonly attempt: number;
+      readonly outcome: "pass" | "fail";
+    }
+  | {
+      // A retry node is backed by a real recorded model-escalation retry, so it
+      // can never be drawn without a genuine escalation having happened.
+      readonly kind: "retry-attempt";
+      readonly unitId: string;
+      readonly attempt: number;
+      readonly toModel: string;
     };
 
 /** The real state element an edge is backed by. */
@@ -336,6 +409,16 @@ export type EdgeBacking =
       readonly path: string;
       readonly owner: string;
       readonly waiter: string;
+    }
+  | {
+      // A model-escalation edge is backed by a real recorded retry: a verify-fail
+      // escalated the next attempt from one model to a stronger one. It is a
+      // different beat from the human-escalation `escalated` flag.
+      readonly kind: "model-escalation";
+      readonly unitId: string;
+      readonly attempt: number;
+      readonly fromModel: string;
+      readonly toModel: string;
     };
 
 /** A node in the rendered graph. */
@@ -405,6 +488,16 @@ export function toolNodeId(capability: string): string {
   return `tool:${capability}`;
 }
 
+/** The id used for a unit's verify node for a given attempt (one per gate run). */
+export function verifyNodeId(unitId: string, attempt: number): string {
+  return `verify:${unitId}#${attempt}`;
+}
+
+/** The id used for a unit's retry node for a given attempt (one per escalation). */
+export function retryNodeId(unitId: string, attempt: number): string {
+  return `retry:${unitId}#${attempt}`;
+}
+
 /**
  * The honesty guard every node passes through. It verifies the node carries a
  * backing that actually resolves against the snapshot, and throws otherwise. A
@@ -465,6 +558,54 @@ export function assertBacked(node: GraphNode, snapshot: ChangeStateSnapshot): Gr
       if (!snapshot.tool.workspace || snapshot.tool.workspace.workspaceName !== backing.workspace.workspaceName) {
         throw new Error(
           `unbacked node ${node.id}: tool has no recorded builder workspace in the state`,
+        );
+      }
+      return node;
+    }
+    case "verify-attempt": {
+      // A verify node must map to a real recorded mechanical gate run: its unit
+      // must exist AND a verify attempt with the same unit/attempt/outcome must
+      // be present in the state. A verify node with no backing attempt record is
+      // exactly the decorative "it passed" node the no-unbacked-node rule forbids.
+      const unit = snapshot.work.find((u) => u.id === backing.unitId);
+      if (!unit) {
+        throw new Error(
+          `unbacked node ${node.id}: verify attempt names a unit ${backing.unitId} not in the state`,
+        );
+      }
+      const attempt = (snapshot.verifyAttempts ?? []).find(
+        (a) =>
+          a.unitId === backing.unitId &&
+          a.attempt === backing.attempt &&
+          a.outcome === backing.outcome,
+      );
+      if (!attempt) {
+        throw new Error(
+          `unbacked node ${node.id}: no recorded verify attempt ${backing.attempt} (${backing.outcome}) for unit ${backing.unitId}`,
+        );
+      }
+      return node;
+    }
+    case "retry-attempt": {
+      // A retry node must map to a real recorded model-escalation retry: its unit
+      // must exist AND a retry attempt with the same unit/attempt/escalation
+      // model must be present. A retry node with no backing retry record is a
+      // decorative escalation the rule forbids.
+      const unit = snapshot.work.find((u) => u.id === backing.unitId);
+      if (!unit) {
+        throw new Error(
+          `unbacked node ${node.id}: retry attempt names a unit ${backing.unitId} not in the state`,
+        );
+      }
+      const retry = (snapshot.retryAttempts ?? []).find(
+        (a) =>
+          a.unitId === backing.unitId &&
+          a.attempt === backing.attempt &&
+          a.toModel === backing.toModel,
+      );
+      if (!retry) {
+        throw new Error(
+          `unbacked node ${node.id}: no recorded model-escalation retry ${backing.attempt} to ${backing.toModel} for unit ${backing.unitId}`,
         );
       }
       return node;
@@ -734,6 +875,103 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
         from: unitNodeId(waiter),
         to: unitNodeId(lease.owner),
         backing: { kind: "lease", path: lease.path, owner: lease.owner, waiter },
+      });
+    }
+  }
+
+  // The bounded model-escalation ladder, drawn as its own honest nodes and edges
+  // and kept wholly separate from the human-escalation `escalated` flag. Each
+  // recorded verify attempt is one `verify` node (green on pass, red on fail);
+  // each recorded retry is one `retry` node reached by a `model-escalation` edge
+  // from the failing verify of the previous attempt. The chain renders as
+  // unit -> verify#1 -> [fail] -> retry#2 -> verify#2 -> outcome, so the beat is
+  // visible and every node/edge is backed by a real recorded attempt.
+  const verifyAttempts = snapshot.verifyAttempts ?? [];
+  const retryAttempts = snapshot.retryAttempts ?? [];
+
+  for (const attempt of verifyAttempts) {
+    if (!unitIds.has(attempt.unitId)) {
+      continue;
+    }
+    const status: WorkUnitStatus = attempt.outcome === "pass" ? "verified" : "failed";
+    const verifyNode: GraphNode = {
+      id: verifyNodeId(attempt.unitId, attempt.attempt),
+      kind: "verify",
+      label: `verify #${attempt.attempt}`,
+      status,
+      verified: attempt.outcome === "pass",
+      escalated: false,
+      backing: {
+        kind: "verify-attempt",
+        unitId: attempt.unitId,
+        attempt: attempt.attempt,
+        outcome: attempt.outcome,
+      },
+    };
+    nodes.push(assertBacked(verifyNode, snapshot));
+
+    // The candidate edit flows from its producing node into verification: the
+    // base attempt's edit comes from the unit, a retried attempt's edit comes
+    // from that retry node. Drawn as a data-flow edge, backed by the attempt's
+    // own existence (its unit is in the work set).
+    const fromId =
+      attempt.attempt <= 1
+        ? unitNodeId(attempt.unitId)
+        : retryNodeId(attempt.unitId, attempt.attempt);
+    edges.push({
+      id: `verify-flow:${attempt.unitId}#${attempt.attempt}`,
+      kind: "data-flow",
+      from: fromId,
+      to: verifyNodeId(attempt.unitId, attempt.attempt),
+      backing: { kind: "dependency", from: attempt.unitId, to: `verify#${attempt.attempt}` },
+    });
+  }
+
+  for (const retry of retryAttempts) {
+    if (!unitIds.has(retry.unitId)) {
+      continue;
+    }
+    const retryNode: GraphNode = {
+      id: retryNodeId(retry.unitId, retry.attempt),
+      kind: "retry",
+      // Running until its own verify lands; the following verify node carries
+      // the pass/fail. The retry itself is the smarter-model re-attempt beat.
+      label: `retry #${retry.attempt} (${retry.toModel || "escalation"})`,
+      status: "running",
+      verified: false,
+      escalated: false,
+      backing: {
+        kind: "retry-attempt",
+        unitId: retry.unitId,
+        attempt: retry.attempt,
+        toModel: retry.toModel,
+      },
+    };
+    nodes.push(assertBacked(retryNode, snapshot));
+
+    // The model-escalation edge: the FAILING verify of the previous attempt
+    // escalated to this retry on a stronger model. Only drawn when the previous
+    // verify is a real recorded failing attempt, so the hop is backed by both
+    // the retry record and the failing verify it followed. This is the base ->
+    // escalation beat, distinct from the human-escalation flag and the lease
+    // edge.
+    const prevAttempt = retry.attempt - 1;
+    const prevVerifyFailed = verifyAttempts.some(
+      (a) => a.unitId === retry.unitId && a.attempt === prevAttempt && a.outcome === "fail",
+    );
+    if (prevVerifyFailed) {
+      edges.push({
+        id: `model-escalation:${retry.unitId}#${prevAttempt}->${retry.attempt}`,
+        kind: "model-escalation",
+        from: verifyNodeId(retry.unitId, prevAttempt),
+        to: retryNodeId(retry.unitId, retry.attempt),
+        backing: {
+          kind: "model-escalation",
+          unitId: retry.unitId,
+          attempt: retry.attempt,
+          fromModel: retry.fromModel,
+          toModel: retry.toModel,
+        },
       });
     }
   }

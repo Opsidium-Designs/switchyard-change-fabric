@@ -4,10 +4,12 @@
  *
  * The selection mirrors the `.env` contract: `EXECUTOR` picks the inference
  * path. For `workers-ai`, this builds the live Workers AI executor over the REST
- * transport, reading the model from `WORKERS_AI_MODEL` (defaulting to the qwen
- * coder headline model) and the credential from `CLOUDFLARE_ACCOUNT_ID` /
- * `CLOUDFLARE_API_TOKEN`. The token is read from the environment and passed into
- * the transport closure only; it is never returned, logged, or written here.
+ * transport, reading the base model from `WORKERS_AI_MODEL` (defaulting to the
+ * qwen3.8 headline model), the verify-fail escalation model from
+ * `WORKERS_AI_ESCALATION_MODEL` (defaulting to glm-5.3), and the credential from
+ * `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`. The token is read from the
+ * environment and passed into the transport closure only; it is never returned,
+ * logged, or written here.
  *
  * Any other value (or an unset `EXECUTOR`) selects the deterministic scoped-noop
  * executor, so an offline run and `make check` never call the network.
@@ -21,11 +23,21 @@ import {
   WorkersAiExecutor,
 } from "@switchyard-change/model-adapters";
 
+/**
+ * The default escalation model for the bounded verify-fail retry ladder. The
+ * base attempt runs the headline model (DEFAULT_WORKERS_AI_MODEL); a verify-fail
+ * retry runs this stronger model fed the failing evidence. It is a different
+ * axis from the executor's transport fallback (that fires on a thrown call, not
+ * a verify verdict), so it has its own default and its own env override.
+ */
+export const DEFAULT_WORKERS_AI_ESCALATION_MODEL = "@cf/zai-org/glm-5.3";
+
 /** A minimal environment view, so this is testable without process.env. */
 export interface ExecutorEnv {
   readonly EXECUTOR?: string;
   readonly WORKERS_AI_MODEL?: string;
   readonly WORKERS_AI_FALLBACK_MODEL?: string;
+  readonly WORKERS_AI_ESCALATION_MODEL?: string;
   readonly CLOUDFLARE_ACCOUNT_ID?: string;
   readonly CLOUDFLARE_API_TOKEN?: string;
 }
@@ -37,6 +49,14 @@ export interface SelectedExecutor {
   readonly description: string;
   /** True when a real inference path (Workers AI) was selected. */
   readonly live: boolean;
+  /** The base model id for the first attempt (empty for the noop path). */
+  readonly baseModel: string;
+  /**
+   * The model id a verify-fail retry escalates to, so the ladder can run
+   * attempt 2 on a stronger model by passing it as the per-attempt model id.
+   * Empty for the deterministic noop path (no inference, no escalation).
+   */
+  readonly escalationModel: string;
 }
 
 /**
@@ -56,6 +76,8 @@ export function selectExecutor(env: ExecutorEnv = process.env): SelectedExecutor
       );
     }
     const model = (env.WORKERS_AI_MODEL ?? "").trim() || DEFAULT_WORKERS_AI_MODEL;
+    const escalationModel =
+      (env.WORKERS_AI_ESCALATION_MODEL ?? "").trim() || DEFAULT_WORKERS_AI_ESCALATION_MODEL;
     const invoke = createWorkersAiRestInvoke({ accountId, apiToken });
     const executor = new WorkersAiExecutor({
       model,
@@ -66,13 +88,17 @@ export function selectExecutor(env: ExecutorEnv = process.env): SelectedExecutor
     });
     return {
       executor,
-      description: `workers-ai (model ${model})`,
+      description: `workers-ai (base ${model}, escalation ${escalationModel})`,
       live: true,
+      baseModel: model,
+      escalationModel,
     };
   }
   return {
     executor: new ScopedNoopExecutor(),
     description: "noop (deterministic, zero inference)",
     live: false,
+    baseModel: "",
+    escalationModel: "",
   };
 }

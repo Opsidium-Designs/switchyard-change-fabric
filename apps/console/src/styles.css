@@ -359,6 +359,20 @@ body {
   transition: stroke 0.6s ease, stroke-width 0.4s ease;
 }
 
+/* The on-canvas label for a model-escalation edge: the real "base -> smarter
+   model" hop, read from state. A magenta fill ties it to the edge; a dark halo
+   keeps it legible over edges and nodes, as the node labels do. */
+.edge-escalation-label {
+  fill: #f0a8d0;
+  font-size: 0.62rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  pointer-events: none;
+  paint-order: stroke;
+  stroke: #0a0e14;
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
 .legend {
   display: flex;
   flex-wrap: wrap;
@@ -391,6 +405,13 @@ body {
 .sw-failed { background: #8b2c22; border-color: #f85149; }
 .sw-tool { background: #9e6a03; }
 .sw-escalated { background: #f85149; }
+/* The ladder's own node kinds, mirroring graph-view nodeFill exactly: a verify
+   pass is the healthy green, a verify fail is a vivid gate-fail red (distinct
+   from the muted dead-unit red), and a retry is the magenta smarter-model beat
+   (the same hue as the model-escalation edge that reaches it). */
+.sw-verify-pass { background: #238636; }
+.sw-verify-fail { background: #da3633; border-color: #f85149; }
+.sw-retry { background: #a371f7; }
 
 /* The tool legend glyph is a DIAMOND (a CSS-rotated square), matching the
    diamond tool node drawn in the graph, so the legend and the graph agree that
@@ -424,6 +445,11 @@ body {
    the same as the graph and the two are never confusable. */
 .ln-tool { border-top-color: #f0883e; border-top-style: solid; }
 .ln-lease { border-top-color: #2dd4bf; border-top-style: dotted; }
+/* The model-escalation edge is a magenta long-dashed line, mirroring graph-view
+   edgeStyle. It is deliberately a different hue AND pattern from the teal dotted
+   lease edge and from the human-escalation red, so the base -> smarter-model hop
+   reads as its own beat in both the graph and the legend. */
+.ln-escalation { border-top-color: #db61a2; border-top-style: dashed; }
 
 /* --- Dial control --- */
 
@@ -524,9 +550,7 @@ body {
 
 .raw-backing {
   margin-top: 1rem;
-}
-
-.raw-backing summary {
+}.raw-backing summary {
   cursor: pointer;
   color: var(--muted);
   font-size: 0.85rem;
@@ -539,6 +563,22 @@ body {
   padding: 0.75rem;
   overflow-x: auto;
   font-size: 0.8rem;
+}
+
+/* The model-escalation ladder's per-node detail: the verify verdict reads green
+   on a pass and red on a fail, so the detail panel matches the node's own fill. */
+.ladder-detail {
+  margin-top: 1rem;
+}
+
+.ladder-detail .verdict-pass {
+  color: #3fb950;
+  font-weight: 600;
+}
+
+.ladder-detail .verdict-fail {
+  color: #ff7b72;
+  font-weight: 600;
 }
 
 /* --- Rich click-detail: prompt, proposed edit, tokens/cost --- */

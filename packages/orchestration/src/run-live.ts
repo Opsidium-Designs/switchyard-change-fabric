@@ -54,6 +54,8 @@ import {
 } from "@switchyard-change/local-runner";
 import {
   ChangeVerification,
+  type CommandOutcome as VerificationCommandOutcome,
+  type CommandRunner as VerificationCommandRunner,
   type CompletedWorkUnit,
   type EvidenceSummary,
 } from "@switchyard-change/verification";
@@ -294,6 +296,49 @@ export interface RunFullLiveOptions {
   readonly appAlreadyDeployed?: (input: {
     readonly appName: string;
   }) => Promise<string | undefined>;
+  /**
+   * The per-unit per-app BEHAVIORAL gate command, as argv. Given a WorkUnit id,
+   * return the argv the verifier runs to prove that unit's candidate edit fixes
+   * the planted bug (it imports the app's fetch handler and asserts on the
+   * Response, with a syntax/typecheck step so a broken edit fails first), or
+   * undefined when the unit has no app gate. When this resolves a command for a
+   * unit, that unit REQUIRES the gate: a missing or failing gate is a verify-fail
+   * (absence of a gate is cannot-pass, never auto-pass), which drives the bounded
+   * model-escalation ladder and, on exhaustion, a real red node with no redeploy.
+   * The live path returns the real gate argv; a test injects a fake command the
+   * injected `verifyCommandRunner` interprets, so the ladder stays offline.
+   */
+  readonly appGateCommandFor?: (unitId: string) => readonly string[] | undefined;
+  /**
+   * The injectable command runner the per-app gate runs through, used by BOTH
+   * the ladder's per-attempt gate and the final integration verify, so a single
+   * deterministic fake keeps `make check` offline. Defaults to the verification
+   * package's real child-process runner on the live path.
+   */
+  readonly verifyCommandRunner?: VerificationCommandRunner;
+  /**
+   * The bounded max-retries dial for the model-escalation ladder: how many RETRY
+   * attempts past the base attempt the ladder may run on a verify-fail. Default
+   * 1 (base attempt, then one escalation retry). Data-driven and N-capable: a
+   * higher value allows more escalation attempts with no code change, each still
+   * gated mechanically. Zero disables escalation (base attempt only).
+   */
+  readonly maxModelRetries?: number;
+  /**
+   * The model id a verify-fail retry escalates to (the stronger model the ladder
+   * runs attempt 2+ on, passed to the executor as the per-attempt model id). On
+   * the live path this is the selected escalation model; a test passes the id its
+   * model-id-aware executor fake treats as the passing model. When empty, the
+   * ladder cannot escalate (no stronger model), so a base verify-fail is terminal.
+   */
+  readonly escalationModel?: string;
+  /**
+   * The base model id for the first ladder attempt, recorded on the base
+   * verify attempt so the console shows which model produced the graded edit.
+   * Informational only (the base edit was already produced by the executor);
+   * empty for the deterministic noop path.
+   */
+  readonly baseModel?: string;
 }
 
 /** A progress event emitted during a full live run. */
@@ -306,6 +351,20 @@ export type FullLiveEvent =
   | { readonly kind: "escalation-raised"; readonly escalation: Escalation }
   | { readonly kind: "escalation-resolved"; readonly escalation: Escalation }
   | { readonly kind: "verifying" }
+  | {
+      readonly kind: "verify-attempt";
+      readonly unitId: string;
+      readonly attempt: number;
+      readonly outcome: "pass" | "fail";
+      readonly model: string;
+    }
+  | {
+      readonly kind: "model-escalation";
+      readonly unitId: string;
+      readonly attempt: number;
+      readonly fromModel: string;
+      readonly toModel: string;
+    }
   | { readonly kind: "promoting"; readonly branch: string }
   | { readonly kind: "redeployed"; readonly url: string; readonly app: string }
   | { readonly kind: "deploy-skipped"; readonly reason: string }
@@ -646,6 +705,58 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   // set, so discovered units are verified and integrated like declared ones.
   const grownState = await getJson(`/changes/${encodeURIComponent(changeId)}`);
   const effectiveChange = effectiveChangeFromState(options.change, grownState);
+
+  // T6: the bounded, verify-verdict-driven model-escalation ladder. For each
+  // completed unit that has a per-app gate, run the gate on the base attempt's
+  // candidate edit (a `verify` node). On a verify-FAIL, if a stronger escalation
+  // model and a retry budget remain, re-run the executor on that model fed the
+  // failing evidence (a `retry` node + a `model-escalation` edge), push the new
+  // edit, and re-run the gate (another `verify` node). This is bounded by the
+  // max-retries dial (default 1) and is a DIFFERENT axis from the executor's
+  // transport fallback: it fires on a mechanical gate verdict, never on a thrown
+  // call. A unit that never passes the gate is marked FAILED (a real red node)
+  // and kept out of integration, so a non-fixing or broken edit can never green
+  // or redeploy. The verifier is mechanical on every attempt (the escalation
+  // model gets another attempt, it never grades itself).
+  const gateCommandRunner = options.verifyCommandRunner;
+  const maxModelRetries = Math.max(0, Math.floor(options.maxModelRetries ?? 1));
+  const escalationModel = (options.escalationModel ?? "").trim();
+  const ladderFailed = new Set<string>();
+  if (options.appGateCommandFor && gateCommandRunner) {
+    for (const unit of effectiveChange.work) {
+      const gateCommand = options.appGateCommandFor(unit.id);
+      if (!gateCommand || gateCommand.length === 0) {
+        continue; // this unit has no app gate; the ladder does not apply to it
+      }
+      const authRemote = unitAuthRemotes.get(unit.id);
+      if (!authRemote) {
+        continue; // a unit that never pushed a repo (e.g. already failed) is skipped
+      }
+      const passed = await runEscalationLadderForUnit({
+        unitId: unit.id,
+        objective: unit.objective,
+        paths: unit.paths,
+        baselineRef: effectiveChange.baseline,
+        authRemote,
+        defaultBranch: "main",
+        gateCommand,
+        gateCommandRunner,
+        executor,
+        escalationModel,
+        maxModelRetries,
+        baseModel: options.baseModel ?? "",
+        worktreeRoot,
+        identity,
+        changeId,
+        post,
+        emit,
+      });
+      if (!passed) {
+        ladderFailed.add(unit.id);
+      }
+    }
+  }
+
   const completedInputs: CompletedWorkUnit[] = [];
   for (const unit of effectiveChange.work) {
     const gitUrl = unitWorkspaceGitUrls.get(unit.id);
@@ -655,7 +766,30 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     // Use the authenticated remote so verification can clone the real Artifacts
     // repo over HTTPS with the scoped token (a file:// fallback ignores it).
     const authRemote = unitAuthRemotes.get(unit.id) ?? gitUrl;
-    completedInputs.push({ unitId: unit.id, gitUrl: authRemote, baselineRef: effectiveChange.baseline });
+    // When the unit has a per-app gate, thread it into the final verify so the
+    // integration gate runs the SAME mechanical check against the final edit the
+    // ladder left on the repo HEAD. A unit that requires a gate but has no
+    // command cannot auto-pass (the verifier fails the absent gate).
+    const gateCommand = options.appGateCommandFor?.(unit.id);
+    const requiresAppGate = Boolean(gateCommand && gateCommand.length > 0);
+    completedInputs.push({
+      unitId: unit.id,
+      gitUrl: authRemote,
+      baselineRef: effectiveChange.baseline,
+      ...(requiresAppGate ? { appGateCommand: gateCommand, requiresAppGate: true } : {}),
+    });
+  }
+
+  // Units the ladder exhausted (never passed the gate after the bounded retries)
+  // are marked FAILED on the Worker, so they become real red nodes, are excluded
+  // from integration, and block any redeploy. This is the honest terminal of the
+  // ladder: a non-fixing or broken edit is never greened.
+  for (const unitId of ladderFailed) {
+    await post(
+      `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/verify-fail`,
+      { reason: "model-escalation ladder exhausted: the candidate edit did not pass the per-app gate" },
+    ).catch(() => {});
+    reportStep(unitId, "failed", "verify failed after the bounded model-escalation ladder");
   }
 
   // The integration workspace is a disposable local bare repo seeded from the
@@ -664,7 +798,10 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   const { integrationRef, integrationToken, workspaces: integrationProvider } =
     await createIntegrationWorkspace(workRoot, options.projectDir, options.change.id, identity);
 
-  const verification = new ChangeVerification(integrationProvider);
+  const verification = new ChangeVerification(
+    integrationProvider,
+    gateCommandRunner ? { commandRunner: gateCommandRunner } : {},
+  );
   const evidence = await verification.verifyAndIntegrate({
     change: effectiveChange,
     completed: completedInputs,
@@ -806,6 +943,218 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     ...(tool ? { tool } : {}),
     ...(deployment ? { deployment } : {}),
   };
+}
+
+/** Inputs to run the bounded model-escalation ladder for one WorkUnit. */
+interface EscalationLadderInput {
+  readonly unitId: string;
+  readonly objective: string;
+  readonly paths: readonly string[];
+  readonly baselineRef: string;
+  /** The authenticated clone/push remote for the unit's repo. */
+  readonly authRemote: string;
+  readonly defaultBranch: string;
+  /** The per-app gate argv the mechanical verifier runs each attempt. */
+  readonly gateCommand: readonly string[];
+  readonly gateCommandRunner: VerificationCommandRunner;
+  readonly executor: ExecutorProvider;
+  /** The stronger model id a verify-fail retry escalates to (empty disables it). */
+  readonly escalationModel: string;
+  /** The bounded max RETRY attempts past the base attempt (default 1). */
+  readonly maxModelRetries: number;
+  /** The base model id, recorded on the base verify attempt (informational). */
+  readonly baseModel: string;
+  readonly worktreeRoot: string;
+  readonly identity: GitIdentity;
+  readonly changeId: string;
+  readonly post: (path: string, body?: unknown, contentType?: string) => Promise<Record<string, unknown>>;
+  readonly emit: (event: FullLiveEvent) => void;
+}
+
+/**
+ * Run the bounded, verify-verdict-driven model-escalation ladder for one unit
+ * and return whether it finally PASSED the per-app gate.
+ *
+ * The chain is: clone the unit's pushed repo -> run the gate on the base
+ * attempt's edit (verify #1). If it passes, done (green). If it fails and a
+ * stronger escalation model and a retry budget remain, re-run the executor on
+ * the escalation model id (slice A's per-attempt `context.model`) fed the
+ * failing gate evidence in its objective, commit and push the new edit, record a
+ * retry + a model-escalation edge, then re-run the gate (verify #2). Repeat up
+ * to the max-retries bound. A unit that never passes returns false, so the
+ * caller marks it FAILED (a real red node) with no redeploy.
+ *
+ * Honesty rails enforced here: the gate (the verifier) runs mechanically on
+ * EVERY attempt, so the escalation model never grades its own output; the retry
+ * count is strictly bounded by maxModelRetries; escalation is driven only by the
+ * gate verdict, never by a thrown executor call (that is the separate transport
+ * fallback inside the executor). Each verify/retry attempt is recorded as real
+ * durable state on the Worker, so the graph nodes/edges that render are backed.
+ */
+async function runEscalationLadderForUnit(input: EscalationLadderInput): Promise<boolean> {
+  const {
+    unitId,
+    gateCommand,
+    gateCommandRunner,
+    executor,
+    escalationModel,
+    maxModelRetries,
+    worktreeRoot,
+    identity,
+    changeId,
+    post,
+    emit,
+  } = input;
+
+  const worktreeDir = await mkdtemp(join(worktreeRoot, `scf-ladder-${unitId}-`));
+  try {
+    await clone(input.authRemote, worktreeDir);
+
+    // Attempt 1: the base model's edit is already on the repo HEAD (the agent
+    // pushed it). Run the gate mechanically against it.
+    let attempt = 1;
+    let currentModel = input.baseModel;
+    let lastEvidence = "";
+    let outcome = await runGate(gateCommand, gateCommandRunner, worktreeDir);
+    await recordVerifyAttempt(post, changeId, unitId, attempt, outcome.passed, currentModel, outcome.evidence);
+    emit({
+      kind: "verify-attempt",
+      unitId,
+      attempt,
+      outcome: outcome.passed ? "pass" : "fail",
+      model: currentModel,
+    });
+    if (outcome.passed) {
+      return true;
+    }
+    lastEvidence = outcome.evidence;
+
+    // Bounded escalation retries. Each retry runs a STRONGER model fed the
+    // failing evidence, then re-verifies mechanically. Bounded by maxModelRetries
+    // and only possible when an escalation model is configured.
+    for (let retry = 0; retry < maxModelRetries; retry += 1) {
+      if (escalationModel === "") {
+        break; // no stronger model to escalate to; the base fail is terminal
+      }
+      const fromModel = currentModel;
+      const nextAttempt = attempt + 1;
+      // Record the model-escalation beat (a retry node + a model-escalation edge)
+      // as real state BEFORE running it, so the console shows the hop.
+      await post(
+        `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/retry-attempt`,
+        {
+          attempt: nextAttempt,
+          fromModel,
+          toModel: escalationModel,
+          reason: `verify #${attempt} failed; escalating to a stronger model fed the failing evidence`,
+        },
+      ).catch(() => {});
+      emit({
+        kind: "model-escalation",
+        unitId,
+        attempt: nextAttempt,
+        fromModel,
+        toModel: escalationModel,
+      });
+
+      // Re-run the executor on the ESCALATION model id, fed the failing gate
+      // evidence so the smarter model has the real reason the last edit failed.
+      // This is slice A's per-attempt model id (context.model), a different axis
+      // from the executor's transport fallback.
+      try {
+        await executor.execute({
+          worktreeDir,
+          workUnitId: unitId,
+          objective: escalationObjective(input.objective, lastEvidence),
+          paths: input.paths,
+          baselineRef: input.baselineRef,
+          model: escalationModel,
+        });
+      } catch {
+        // A genuinely unusable escalation reply is an honest attempt FAIL, not a
+        // crash: fall through to re-verify, which will fail the gate and, if the
+        // budget is exhausted, mark the unit red. We do not escalate on a thrown
+        // call here (that is the transport axis); the gate verdict decides.
+      }
+      // Commit and push the escalation edit so the repo HEAD holds the final
+      // candidate the integration verify will see.
+      if (await hasChanges(worktreeDir)) {
+        await commitAll(worktreeDir, `WorkUnit ${unitId}: model-escalation retry ${nextAttempt}`, identity);
+        await push(worktreeDir, input.authRemote, input.defaultBranch);
+      }
+
+      currentModel = escalationModel;
+      attempt = nextAttempt;
+      outcome = await runGate(gateCommand, gateCommandRunner, worktreeDir);
+      await recordVerifyAttempt(post, changeId, unitId, attempt, outcome.passed, currentModel, outcome.evidence);
+      emit({
+        kind: "verify-attempt",
+        unitId,
+        attempt,
+        outcome: outcome.passed ? "pass" : "fail",
+        model: currentModel,
+      });
+      if (outcome.passed) {
+        return true;
+      }
+      lastEvidence = outcome.evidence;
+    }
+
+    return false;
+  } finally {
+    await rm(worktreeDir, { recursive: true, force: true });
+  }
+}
+
+/** Run the per-app gate once and return a mechanical pass/fail plus evidence. */
+async function runGate(
+  gateCommand: readonly string[],
+  runner: VerificationCommandRunner,
+  worktreeDir: string,
+): Promise<{ readonly passed: boolean; readonly evidence: string }> {
+  let outcome: VerificationCommandOutcome;
+  try {
+    outcome = await runner.run(gateCommand, worktreeDir);
+  } catch (error) {
+    return { passed: false, evidence: failureReason(error) };
+  }
+  const passed = outcome.code === 0;
+  const evidence = [outcome.stderr, outcome.stdout]
+    .map((s) => (s ?? "").trim())
+    .filter((s) => s !== "")
+    .join("\n")
+    .slice(0, 4000);
+  return { passed, evidence };
+}
+
+/** Record one mechanical verify attempt on the Worker (best-effort). */
+async function recordVerifyAttempt(
+  post: (path: string, body?: unknown, contentType?: string) => Promise<Record<string, unknown>>,
+  changeId: string,
+  unitId: string,
+  attempt: number,
+  passed: boolean,
+  model: string,
+  evidence: string,
+): Promise<void> {
+  await post(
+    `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/verify-attempt`,
+    {
+      attempt,
+      outcome: passed ? "pass" : "fail",
+      model,
+      ...(passed ? {} : { evidence }),
+    },
+  ).catch(() => {});
+}
+
+/** Fold the failing gate evidence into the escalation attempt's objective. */
+function escalationObjective(objective: string, evidence: string): string {
+  const trimmed = evidence.trim();
+  if (trimmed === "") {
+    return objective;
+  }
+  return `${objective}\n\nThe previous attempt failed the behavioral gate with this evidence; fix the cause:\n${trimmed.slice(0, 2000)}`;
 }
 
 /**

@@ -69,8 +69,9 @@ export class VerificationProvider {
     const pathScope = await this.checkPathScope(worktreeDir, baselineRef, contract);
     const test = await this.checkCommand("test", contract.testCommand, worktreeDir);
     const lint = await this.checkCommand("lint", contract.lintCommand, worktreeDir);
+    const appGate = await this.checkAppGate(worktreeDir, contract);
 
-    const checks: readonly CheckResult[] = [cleanState, pathScope, test, lint];
+    const checks: readonly CheckResult[] = [cleanState, pathScope, test, lint, appGate];
     const verdict: Verdict = checks.every((c) => c.skipped || c.passed) ? "verified" : "failed";
     return { unitId: contract.unitId, verdict, checks };
   }
@@ -190,6 +191,69 @@ export class VerificationProvider {
       passed: false,
       skipped: false,
       summary: `${kind} command failed (exit ${outcome.code ?? "none"})`,
+      outputs,
+    };
+  }
+
+  /**
+   * app-gate: run the per-app BEHAVIORAL gate against the candidate edit. This
+   * is the real mechanical check that the planted bug is actually fixed (the
+   * gate imports the app's fetch handler and asserts on the Response, with a
+   * syntax/typecheck step so a broken edit fails before the behavioral one).
+   *
+   * CRITICAL honesty rule: absence of a gate is cannot-pass, NOT auto-pass. When
+   * the unit declares it REQUIRES an app gate (`requiresAppGate`) but no gate
+   * command is supplied, this is a FAIL, so a unit can never green by having no
+   * gate to run. This closes the vacuous-verify trap that let a wrong or broken
+   * edit "verify" by skipping. When the unit does not require a gate, the check
+   * is simply skipped (not applicable), so existing non-app units are unchanged.
+   */
+  private async checkAppGate(
+    worktreeDir: string,
+    contract: VerificationContract,
+  ): Promise<CheckResult> {
+    const argv = contract.appGateCommand;
+    if (!argv || argv.length === 0) {
+      if (contract.requiresAppGate) {
+        // Absence of a required gate is a FAIL, never a silent pass: a unit with
+        // no mechanical gate cannot prove its edit fixed anything.
+        return failed(
+          "app-gate",
+          "unit requires a per-app behavioral gate but none was supplied: cannot verify (absence of a gate is cannot-pass, not auto-pass)",
+          [{ stream: "summary", text: "no app-gate command for a unit that requires one" }],
+        );
+      }
+      return skipped("app-gate", "no app-gate command configured");
+    }
+    let outcome: CommandOutcome;
+    try {
+      outcome = await this.commandRunner.run(argv, worktreeDir);
+    } catch (error) {
+      return failed("app-gate", `app-gate command could not run: ${messageOf(error)}`, [
+        { stream: "summary", text: messageOf(error) },
+      ]);
+    }
+    const outputs: OutputRef[] = [];
+    if (outcome.stdout.trim() !== "") {
+      outputs.push({ stream: "stdout", text: boundOutput(outcome.stdout) });
+    }
+    if (outcome.stderr.trim() !== "") {
+      outputs.push({ stream: "stderr", text: boundOutput(outcome.stderr) });
+    }
+    if (outcome.code === 0) {
+      return {
+        kind: "app-gate",
+        passed: true,
+        skipped: false,
+        summary: "app-gate passed: the candidate edit fixes the planted bug (exit 0)",
+        outputs,
+      };
+    }
+    return {
+      kind: "app-gate",
+      passed: false,
+      skipped: false,
+      summary: `app-gate failed: the candidate edit did not fix the planted bug (exit ${outcome.code ?? "none"})`,
       outputs,
     };
   }

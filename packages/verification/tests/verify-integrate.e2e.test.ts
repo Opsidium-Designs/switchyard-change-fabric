@@ -223,6 +223,7 @@ describe("verify then integrate multiple WorkUnits into one result", () => {
         "path-scope",
         "test",
         "lint",
+        "app-gate",
       ]);
     }
 

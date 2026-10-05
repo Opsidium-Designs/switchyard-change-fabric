@@ -33,9 +33,15 @@ import type {
 } from "./types.ts";
 
 /** The headline Workers AI model for the agent's coding reasoning. */
-export const DEFAULT_WORKERS_AI_MODEL = "@cf/qwen/qwen2.5-coder-32b-instruct";
+export const DEFAULT_WORKERS_AI_MODEL = "@cf/qwen/qwen3.8-27b";
 
-/** A cheaper, smaller fallback model when the headline model is unavailable. */
+/**
+ * A cheaper, smaller fallback model tried only when the headline model CALL
+ * THROWS (a transport error). This is a different axis from a verify-fail
+ * escalation: it is the transport fallback, not the bounded model-escalation
+ * ladder. It stays a small, cheap model so a flaky headline call still has a
+ * chance to produce an edit without paying for a second large model.
+ */
 export const DEFAULT_WORKERS_AI_FALLBACK_MODEL = "@cf/meta/llama-3.1-8b-instruct";
 
 /** One chat message handed to the Workers AI transport. */
@@ -267,6 +273,14 @@ export class WorkersAiExecutor implements ExecutorProvider {
     const readScoped = this.options.readScopedFiles ?? defaultReadScopedFiles;
     const write = this.options.writeFile ?? defaultWriteFile;
 
+    // The model this attempt runs. A caller that escalates on a verify-fail
+    // passes a per-attempt `context.model` (for example the stronger escalation
+    // model); when unset we run the executor's configured base model, so every
+    // existing caller is unchanged. This selects WHICH model runs; it is a
+    // different axis from the transport fallback below (which only fires when a
+    // model call throws).
+    const baseModel = (context.model ?? "").trim() || this.model;
+
     const contextFiles = await readScoped(context.worktreeDir, context.paths, {
       maxFiles,
       maxBytes,
@@ -315,10 +329,10 @@ export class WorkersAiExecutor implements ExecutorProvider {
     // forever, and a non-transient failure is thrown immediately.
     const attempt = async (): Promise<{ result: WorkersAiInvokeResult; usedModel: string }> => {
       try {
-        onStep({ phase: "model-call", message: `calling model ${this.model}` });
-        return { result: await this.options.invoke({ model: this.model, messages }, streamCallbacks), usedModel: this.model };
+        onStep({ phase: "model-call", message: `calling model ${baseModel}` });
+        return { result: await this.options.invoke({ model: baseModel, messages }, streamCallbacks), usedModel: baseModel };
       } catch (headlineError) {
-        if (this.fallbackModel && this.fallbackModel !== this.model) {
+        if (this.fallbackModel && this.fallbackModel !== baseModel) {
           onStep({ phase: "model-call", message: `headline model failed, trying fallback ${this.fallbackModel}` });
           return {
             result: await this.options.invoke({ model: this.fallbackModel, messages }, streamCallbacks),
@@ -330,7 +344,7 @@ export class WorkersAiExecutor implements ExecutorProvider {
     };
 
     let result: WorkersAiInvokeResult;
-    let usedModel = this.model;
+    let usedModel = baseModel;
     let lastError: unknown;
     for (let tryNo = 0; tryNo <= maxRetries; tryNo += 1) {
       try {
@@ -701,6 +715,64 @@ function guard(fn: () => void): void {
   }
 }
 
+/** Coerce a reply value to the text the edit parser expects. */
+function coerceReplyText(value: unknown): string {
+  // Workers AI usually returns a string, but some models return an
+  // already-parsed JSON object when the reply itself is JSON. Coerce an object
+  // back to its JSON text so the executor's parser always sees a string.
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === undefined || value === null) {
+    return "";
+  }
+  return JSON.stringify(value);
+}
+
+/**
+ * Pull the model's reply text out of a Workers AI non-streaming body, supporting
+ * BOTH shapes the account returns:
+ *
+ *   - the classic chat text-generation shape `{ result: { response: "..." } }`;
+ *   - the OpenAI-style chat completion shape `choices[0].message.content`
+ *     (seen on the qwen3.8 family), whether nested under `result` or at the top
+ *     level. The separate `reasoning` field some models emit alongside the
+ *     content is intentionally IGNORED: it is the model's chain-of-thought, not
+ *     the edit JSON, so reading it would feed the parser the wrong text.
+ *
+ * Trying `result.response` first keeps every existing model working unchanged;
+ * the OpenAI-shape fallback is what stops the qwen3.8 base (and the glm-5.3
+ * escalation) model from returning a silently empty reply that would otherwise
+ * trip UnusableModelOutputError for a parsing reason rather than a real one.
+ */
+function extractReplyText(body: {
+  result?: {
+    response?: unknown;
+    choices?: ReadonlyArray<{ message?: { content?: unknown }; text?: unknown }>;
+  };
+  choices?: ReadonlyArray<{ message?: { content?: unknown }; text?: unknown }>;
+}): string {
+  const classic = coerceReplyText(body.result?.response);
+  if (classic !== "") {
+    return classic;
+  }
+  // Prefer the OpenAI shape nested under `result`, then at the top level.
+  const choices = body.result?.choices ?? body.choices;
+  const choice = choices?.[0];
+  if (choice) {
+    const content = coerceReplyText(choice.message?.content);
+    if (content !== "") {
+      return content;
+    }
+    // Some providers expose the text as `choices[0].text` for a completion.
+    const legacyText = coerceReplyText(choice.text);
+    if (legacyText !== "") {
+      return legacyText;
+    }
+  }
+  return "";
+}
+
 /**
  * Build a live Workers AI transport that calls the Cloudflare REST API with a
  * scoped token. This is the local-runner path: a runner is an ordinary Node
@@ -778,25 +850,32 @@ export function createWorkersAiRestInvoke(options: WorkersAiRestOptions): Worker
     let body: {
       result?: {
         response?: unknown;
+        // Some Workers AI models (the qwen3.8 family) return an OpenAI-style
+        // chat completion under `result`: the reply text lives in
+        // `choices[0].message.content`, with any chain-of-thought in a SEPARATE
+        // `reasoning` field we intentionally ignore (it is not the edit JSON).
+        choices?: ReadonlyArray<{
+          message?: { content?: unknown; reasoning?: unknown };
+          text?: unknown;
+        }>;
         usage?: { prompt_tokens?: number; completion_tokens?: number };
       };
+      // A few deployments return the OpenAI shape at the TOP level rather than
+      // nested under `result`; accept that too so neither base nor escalation
+      // model returns a silently empty reply for a shape difference.
+      choices?: ReadonlyArray<{
+        message?: { content?: unknown; reasoning?: unknown };
+        text?: unknown;
+      }>;
+      usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
     try {
       body = JSON.parse(text) as typeof body;
     } catch {
       throw new Error(`Workers AI returned a non-JSON response for ${request.model}`);
     }
-    const rawResponse = body.result?.response;
-    // Workers AI usually returns `result.response` as a string, but some models
-    // return it as an already-parsed JSON object when the reply is JSON. Coerce
-    // an object back to its JSON text so the executor's parser sees a string.
-    const response =
-      typeof rawResponse === "string"
-        ? rawResponse
-        : rawResponse === undefined || rawResponse === null
-          ? ""
-          : JSON.stringify(rawResponse);
-    const usage = body.result?.usage;
+    const response = extractReplyText(body);
+    const usage = body.result?.usage ?? body.usage;
     return {
       text: response,
       ...(usage
@@ -839,9 +918,26 @@ async function readStreamingResponse(
     try {
       const event = JSON.parse(payload) as {
         response?: unknown;
+        choices?: ReadonlyArray<{
+          delta?: { content?: unknown; reasoning?: unknown };
+          message?: { content?: unknown };
+        }>;
         usage?: { prompt_tokens?: number; completion_tokens?: number };
       };
-      const delta = typeof event.response === "string" ? event.response : "";
+      // The classic chat text-generation stream carries `response` deltas; the
+      // OpenAI-style stream (the qwen3.8 family) carries them in
+      // `choices[0].delta.content`, with any chain-of-thought in a separate
+      // `reasoning` delta we intentionally ignore. Reading both keeps every
+      // model honest instead of assembling an empty reply for a shape it does
+      // not recognize.
+      const choice = event.choices?.[0];
+      const openAiDelta =
+        typeof choice?.delta?.content === "string"
+          ? choice.delta.content
+          : typeof choice?.message?.content === "string"
+            ? choice.message.content
+            : "";
+      const delta = typeof event.response === "string" && event.response !== "" ? event.response : openAiDelta;
       if (delta !== "") {
         assembled += delta;
         callbacks?.onToken?.(delta);

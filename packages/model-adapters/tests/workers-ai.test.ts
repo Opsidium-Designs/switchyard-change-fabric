@@ -336,7 +336,7 @@ describe("createWorkersAiRestInvoke", () => {
       messages: [{ role: "user", content: "hi" }],
     });
 
-    expect(seenUrl).toContain("/accounts/acct-123/ai/run/@cf/qwen/qwen2.5-coder-32b-instruct");
+    expect(seenUrl).toContain("/accounts/acct-123/ai/run/@cf/qwen/qwen3.8-27b");
     expect(seenAuth).toBe("Bearer secret-token-value");
     expect(seenBody).toContain("\"messages\"");
     expect(result.text).toBe('{"edits":[]}');
@@ -481,5 +481,182 @@ describe("WorkersAiExecutor bounded retry (tolerating transient model errors)", 
     expect(isTransientWorkersAiError(new Error("internal error"))).toBe(true);
     expect(isTransientWorkersAiError(new UnusableModelOutputError("no edits"))).toBe(false);
     expect(isTransientWorkersAiError(new Error("HTTP 400 bad request"))).toBe(false);
+  });
+});
+
+describe("createWorkersAiRestInvoke response parsing (OpenAI shape and legacy shape, offline)", () => {
+  // Build an offline fake fetch that returns a fixed JSON body with status 200,
+  // so the parsing path is exercised with no network and no live model.
+  const bodyFetch = (payload: unknown): typeof fetch =>
+    (async () =>
+      new Response(JSON.stringify(payload), { status: 200 })) as unknown as typeof fetch;
+
+  const editDoc = JSON.stringify({
+    edits: [{ path: "src/x.ts", contents: "export const x = 1;\n" }],
+  });
+
+  it("reads the OpenAI-style choices[0].message.content and ignores the separate reasoning field", async () => {
+    // The qwen3.8 shape: the real edit JSON is in message.content, with the
+    // model's chain-of-thought in a separate `reasoning` field that must NOT be
+    // read as the reply (it is not the edit document).
+    const invoke = createWorkersAiRestInvoke({
+      accountId: "acct",
+      apiToken: "secret-token-value",
+      fetchFn: bodyFetch({
+        result: {
+          choices: [
+            {
+              message: {
+                content: editDoc,
+                reasoning: "First I will consider the types, then edit the file.",
+              },
+            },
+          ],
+          usage: { prompt_tokens: 12, completion_tokens: 8 },
+        },
+        success: true,
+      }),
+    });
+    const result = await invoke({
+      model: DEFAULT_WORKERS_AI_MODEL,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    // The parsed text is exactly the content, not the reasoning.
+    expect(result.text).toBe(editDoc);
+    expect(result.text).not.toContain("chain-of-thought");
+    expect(result.text).not.toContain("consider the types");
+    expect(result.usage?.inputTokens).toBe(12);
+    expect(result.usage?.outputTokens).toBe(8);
+  });
+
+  it("still reads the legacy result.response shape for models that use it", async () => {
+    const invoke = createWorkersAiRestInvoke({
+      accountId: "acct",
+      apiToken: "secret-token-value",
+      fetchFn: bodyFetch({ result: { response: editDoc }, success: true }),
+    });
+    const result = await invoke({
+      model: DEFAULT_WORKERS_AI_MODEL,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(result.text).toBe(editDoc);
+  });
+
+  it("reads a top-level OpenAI shape (choices at the root, not nested under result)", async () => {
+    const invoke = createWorkersAiRestInvoke({
+      accountId: "acct",
+      apiToken: "secret-token-value",
+      fetchFn: bodyFetch({ choices: [{ message: { content: editDoc } }], success: true }),
+    });
+    const result = await invoke({
+      model: DEFAULT_WORKERS_AI_MODEL,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(result.text).toBe(editDoc);
+  });
+
+  it("assembles an OpenAI-style SSE stream (choices[].delta.content) and ignores reasoning deltas", async () => {
+    // The qwen3.8 streaming shape: each event carries a `choices[0].delta.content`
+    // token, with chain-of-thought in a separate `reasoning` delta that must not
+    // be assembled into the edit text. Exercised offline with no live model.
+    const deltas = ['{"edits":[', '{"path":"src/x.ts",', '"contents":"ok"}]}'];
+    const sse =
+      // A leading reasoning-only event that must be ignored.
+      `data: ${JSON.stringify({ choices: [{ delta: { reasoning: "thinking first" } }] })}\n\n` +
+      deltas
+        .map((d) => `data: ${JSON.stringify({ choices: [{ delta: { content: d } }] })}\n\n`)
+        .join("") +
+      `data: ${JSON.stringify({ usage: { prompt_tokens: 4, completion_tokens: 6 } })}\n\n` +
+      "data: [DONE]\n\n";
+    const fakeFetch = (async () =>
+      new Response(sse, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" },
+      })) as unknown as typeof fetch;
+    const invoke = createWorkersAiRestInvoke({
+      accountId: "acct",
+      apiToken: "secret-token-value",
+      fetchFn: fakeFetch,
+    });
+    const relayed: string[] = [];
+    const result = await invoke(
+      { model: DEFAULT_WORKERS_AI_MODEL, messages: [{ role: "user", content: "hi" }] },
+      { onToken: (chunk) => relayed.push(chunk) },
+    );
+    // Only the content deltas were relayed and assembled; the reasoning delta
+    // was dropped, so the assembled reply is the exact edit JSON.
+    expect(relayed).toEqual(deltas);
+    expect(result.text).toBe(deltas.join(""));
+    expect(result.text).not.toContain("thinking first");
+    expect(result.usage?.inputTokens).toBe(4);
+    expect(result.usage?.outputTokens).toBe(6);
+  });
+
+  it("parses an OpenAI-shape reply into the exact edit JSON the executor would apply (no network)", async () => {
+    // The REST transport (called directly, non-streaming) turns a qwen3.8-shape
+    // reply into the edit JSON text, instead of a silently empty "" that would
+    // trip UnusableModelOutputError downstream. The executor's own
+    // apply-the-edit behavior is covered by the fake-transport tests above; here
+    // we prove the parsed text is exactly the edit document, reasoning ignored.
+    const invoke = createWorkersAiRestInvoke({
+      accountId: "acct",
+      apiToken: "secret-token-value",
+      fetchFn: bodyFetch({
+        result: { choices: [{ message: { content: editDoc, reasoning: "ignored" } }] },
+        success: true,
+      }),
+    });
+    const parsed = await invoke({
+      model: DEFAULT_WORKERS_AI_MODEL,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(parsed.text).toBe(editDoc);
+    expect(JSON.parse(parsed.text).edits[0].path).toBe("src/x.ts");
+  });
+});
+
+describe("WorkersAiExecutor per-attempt model id (so a retry can escalate, offline)", () => {
+  const okReply = JSON.stringify({
+    edits: [{ path: "src/x.ts", contents: "export const x = 1;\n" }],
+  });
+
+  it("defaults to the configured base model when no per-attempt model is given", async () => {
+    const seen: string[] = [];
+    const invoke: WorkersAiInvoke = async (request) => {
+      seen.push(request.model);
+      return { text: okReply };
+    };
+    const result = await new WorkersAiExecutor({ invoke }).execute({
+      worktreeDir: worktree,
+      workUnitId: "x",
+      objective: "add x",
+      paths: ["src/x.ts"],
+      baselineRef: "HEAD",
+    });
+    expect(seen).toEqual([DEFAULT_WORKERS_AI_MODEL]);
+    expect(result.cost.model).toBe(DEFAULT_WORKERS_AI_MODEL);
+  });
+
+  it("threads a per-attempt model id into the call and records it in cost.model", async () => {
+    // This is how the escalation ladder runs attempt 2 on a stronger model: it
+    // passes the escalation model id as context.model for that attempt. The
+    // executor runs that id and reports it back so the caller can show which
+    // model produced the attempt.
+    const escalationModel = "@cf/zai-org/glm-5.3";
+    const seen: string[] = [];
+    const invoke: WorkersAiInvoke = async (request) => {
+      seen.push(request.model);
+      return { text: okReply };
+    };
+    const result = await new WorkersAiExecutor({ invoke }).execute({
+      worktreeDir: worktree,
+      workUnitId: "x",
+      objective: "add x",
+      paths: ["src/x.ts"],
+      baselineRef: "HEAD",
+      model: escalationModel,
+    });
+    expect(seen).toEqual([escalationModel]);
+    expect(result.cost.model).toBe(escalationModel);
   });
 });

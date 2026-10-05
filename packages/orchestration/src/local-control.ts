@@ -149,6 +149,10 @@ export interface ChangeStateView {
   readonly failed: readonly FailureRecord[];
   /** The live deployment of the fixed app for this run (mirrors the Worker). */
   readonly deployment?: DeploymentRecord;
+  /** Mechanical verify attempts (mirrors the Worker); back the `verify` nodes. */
+  readonly verifyAttempts: readonly VerifyAttempt[];
+  /** Model-escalation retries (mirrors the Worker); back `retry` nodes/edges. */
+  readonly retryAttempts: readonly RetryAttempt[];
 }
 
 /** A recorded WorkUnit failure (mirrors the Worker's FailureRecord). */
@@ -186,6 +190,29 @@ export interface LeaseEdge {
   readonly path: string;
   readonly owner: string;
   readonly waiters: readonly string[];
+}
+
+/** The outcome of one mechanical verification attempt (mirrors the Worker). */
+export type VerifyOutcome = "pass" | "fail";
+
+/** One recorded mechanical VERIFY attempt for a WorkUnit (mirrors the Worker). */
+export interface VerifyAttempt {
+  readonly unitId: string;
+  readonly attempt: number;
+  readonly outcome: VerifyOutcome;
+  readonly model: string;
+  readonly evidence?: string;
+  readonly at: string;
+}
+
+/** One recorded model-escalation RETRY for a WorkUnit (mirrors the Worker). */
+export interface RetryAttempt {
+  readonly unitId: string;
+  readonly attempt: number;
+  readonly fromModel: string;
+  readonly toModel: string;
+  readonly reason: string;
+  readonly at: string;
 }
 
 /** The kind of a fork that must be escalated to a human (mirrors the Worker). */
@@ -287,6 +314,10 @@ class ChangeRecord {
   readonly stream = new Map<string, string>();
   /** The live deployment of the fixed app recorded for this run (mirrors DO). */
   deployment: DeploymentRecord | null = null;
+  /** Mechanical verify attempts recorded for this Change (mirrors the DO). */
+  readonly verifyAttempts: VerifyAttempt[] = [];
+  /** Model-escalation retries recorded for this Change (mirrors the DO). */
+  readonly retryAttempts: RetryAttempt[] = [];
   constructor(change: Change) {
     this.change = change;
   }
@@ -661,6 +692,86 @@ export class LocalChangeControl {
     return stored;
   }
 
+  /**
+   * Record one mechanical VERIFY attempt for a WorkUnit (mirrors the DO). This
+   * is the real backing for a `verify` graph node, so a verify node can only
+   * exist once this record does. The verifier is mechanical on every attempt, so
+   * this is the ground-truth verdict, never the model grading itself.
+   */
+  recordVerifyAttempt(changeId: string, input: Omit<VerifyAttempt, "at">): VerifyAttempt {
+    const record = this.require(changeId);
+    if (!record.change.work.some((u) => u.id === input.unitId)) {
+      throw new Error(`unknown WorkUnit: ${input.unitId}`);
+    }
+    const stored: VerifyAttempt = {
+      unitId: input.unitId,
+      attempt: Number.isFinite(input.attempt) && input.attempt > 0 ? Math.floor(input.attempt) : 1,
+      outcome: input.outcome === "pass" ? "pass" : "fail",
+      model: typeof input.model === "string" ? input.model.slice(0, 120) : "",
+      ...(typeof input.evidence === "string" && input.evidence !== ""
+        ? { evidence: sanitizeText(input.evidence, 20_000) }
+        : {}),
+      at: new Date().toISOString(),
+    };
+    record.verifyAttempts.push(stored);
+    return stored;
+  }
+
+  /**
+   * Record one model-escalation RETRY for a WorkUnit (mirrors the DO). This is
+   * the real backing for a `retry` graph node and the `model-escalation` edge,
+   * kept wholly separate from the human-escalation `escalated` flag.
+   */
+  recordRetryAttempt(changeId: string, input: Omit<RetryAttempt, "at">): RetryAttempt {
+    const record = this.require(changeId);
+    if (!record.change.work.some((u) => u.id === input.unitId)) {
+      throw new Error(`unknown WorkUnit: ${input.unitId}`);
+    }
+    const stored: RetryAttempt = {
+      unitId: input.unitId,
+      attempt: Number.isFinite(input.attempt) && input.attempt > 1 ? Math.floor(input.attempt) : 2,
+      fromModel: typeof input.fromModel === "string" ? input.fromModel.slice(0, 120) : "",
+      toModel: typeof input.toModel === "string" ? input.toModel.slice(0, 120) : "",
+      reason: sanitizeText(input.reason ?? "verify-fail escalation", 300) || "verify-fail escalation",
+      at: new Date().toISOString(),
+    };
+    record.retryAttempts.push(stored);
+    return stored;
+  }
+
+  /**
+   * Mark a WorkUnit FAILED on a verify-fail verdict (mirrors the DO's
+   * recordVerifyFailure): its candidate edit did not pass the mechanical per-app
+   * gate after the bounded ladder. This is the VERDICT on the pushed edit, so it
+   * overrides a prior pushed/completed marker (removes it from completed) and
+   * records a durable failure, making the unit a real RED node. Verification is
+   * the authority on green vs red, not the mere fact that an agent pushed.
+   */
+  recordVerifyFailure(changeId: string, unitId: string, reason?: string): FailureRecord {
+    const record = this.require(changeId);
+    if (!record.change.work.some((u) => u.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    record.completed.delete(unitId);
+    const existing = record.failed.get(unitId);
+    if (existing) {
+      return existing;
+    }
+    const stored: FailureRecord = {
+      unitId,
+      reason:
+        sanitizeText(reason ?? "verify failed after the bounded model-escalation ladder", 300) ||
+        "verify failed",
+      at: new Date().toISOString(),
+    };
+    record.failed.set(unitId, stored);
+    const lease = record.leases.get(unitId);
+    if (lease) {
+      void this.workspaces.revokeToken(lease.ref, lease.token.id).catch(() => {});
+    }
+    return stored;
+  }
+
   /** The completed WorkUnit ids for a Change. */
   completed(changeId: string): readonly string[] {
     return [...this.require(changeId).completed];
@@ -755,6 +866,8 @@ export class LocalChangeControl {
         a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0,
       ),
       ...(record.deployment ? { deployment: record.deployment } : {}),
+      verifyAttempts: record.verifyAttempts,
+      retryAttempts: record.retryAttempts,
     };
   }
 
@@ -820,6 +933,56 @@ export class LocalChangeControl {
         app: String(b.app ?? ""),
       });
       return json({ deployment: recorded }, 201);
+    }
+    const verifyAttemptRoute = url.pathname.match(
+      /^\/changes\/([^/]+)\/work\/([^/]+)\/verify-attempt$/,
+    );
+    if (method === "POST" && verifyAttemptRoute) {
+      const b = parseBody(init);
+      try {
+        const recorded = this.recordVerifyAttempt(dec(verifyAttemptRoute[1]), {
+          unitId: dec(verifyAttemptRoute[2]),
+          attempt: numberOr(b.attempt, 1),
+          outcome: b.outcome === "pass" ? "pass" : "fail",
+          model: String(b.model ?? ""),
+          ...(typeof b.evidence === "string" && b.evidence !== ""
+            ? { evidence: String(b.evidence) }
+            : {}),
+        });
+        return json({ verifyAttempt: recorded }, 201);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
+    const retryAttemptRoute = url.pathname.match(
+      /^\/changes\/([^/]+)\/work\/([^/]+)\/retry-attempt$/,
+    );
+    if (method === "POST" && retryAttemptRoute) {
+      const b = parseBody(init);
+      try {
+        const recorded = this.recordRetryAttempt(dec(retryAttemptRoute[1]), {
+          unitId: dec(retryAttemptRoute[2]),
+          attempt: numberOr(b.attempt, 2),
+          fromModel: String(b.fromModel ?? ""),
+          toModel: String(b.toModel ?? ""),
+          reason: String(b.reason ?? "verify-fail escalation"),
+        });
+        return json({ retryAttempt: recorded }, 201);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
+    const verifyFailRoute = url.pathname.match(
+      /^\/changes\/([^/]+)\/work\/([^/]+)\/verify-fail$/,
+    );
+    if (method === "POST" && verifyFailRoute) {
+      const b = parseBody(init);
+      try {
+        this.recordVerifyFailure(dec(verifyFailRoute[1]), dec(verifyFailRoute[2]), String(b.reason ?? ""));
+        return json(this.state(dec(verifyFailRoute[1])), 200);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
     }
     return json({ error: "not found" }, 404);
   };

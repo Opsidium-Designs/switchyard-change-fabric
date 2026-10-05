@@ -55,7 +55,13 @@ describe("VerificationProvider passing case", () => {
     const result = await provider.verify({ worktreeDir: checkout, baselineRef: "baseline", contract });
 
     expect(result.verdict).toBe("verified");
-    expect(result.checks.map((c) => c.kind)).toEqual(["clean-state", "path-scope", "test", "lint"]);
+    expect(result.checks.map((c) => c.kind)).toEqual([
+      "clean-state",
+      "path-scope",
+      "test",
+      "lint",
+      "app-gate",
+    ]);
     expect(result.checks.every((c) => c.passed)).toBe(true);
     const scope = result.checks.find((c) => c.kind === "path-scope");
     expect(scope?.summary).toMatch(/within declared scope/);
@@ -160,5 +166,82 @@ describe("VerificationProvider failing cases", () => {
     const lint = result.checks.find((c) => c.kind === "lint");
     expect(lint?.skipped).toBe(true);
     expect(lint?.passed).toBe(true);
+  });
+});
+
+describe("VerificationProvider app-gate (T3: absence is cannot-pass, never auto-pass)", () => {
+  it("passes verification when the per-app gate command exits zero", async () => {
+    const checkout = join(dir, "gate-pass");
+    await makeCheckout(checkout, BASELINE, [{ path: "src/alpha/alpha.done", content: "done\n" }]);
+    const runner = new FakeCommandRunner([
+      { match: "gate", outcome: { code: 0, stdout: "ok", stderr: "" } },
+    ]);
+    const provider = new VerificationProvider({ commandRunner: runner });
+    const contract: VerificationContract = {
+      unitId: "alpha",
+      paths: ["src/alpha/**"],
+      appGateCommand: ["node", "--test", "gate/gate.test.mjs"],
+      requiresAppGate: true,
+    };
+    const result = await provider.verify({ worktreeDir: checkout, baselineRef: "baseline", contract });
+    expect(result.verdict).toBe("verified");
+    const gate = result.checks.find((c) => c.kind === "app-gate");
+    expect(gate?.passed).toBe(true);
+    expect(gate?.skipped).toBe(false);
+  });
+
+  it("fails verification when the per-app gate command exits non-zero", async () => {
+    const checkout = join(dir, "gate-fail");
+    await makeCheckout(checkout, BASELINE, [{ path: "src/alpha/alpha.done", content: "done\n" }]);
+    const runner = new FakeCommandRunner([
+      { match: "gate", outcome: { code: 1, stdout: "", stderr: "assertion failed" } },
+    ]);
+    const provider = new VerificationProvider({ commandRunner: runner });
+    const contract: VerificationContract = {
+      unitId: "alpha",
+      paths: ["src/alpha/**"],
+      appGateCommand: ["node", "--test", "gate/gate.test.mjs"],
+      requiresAppGate: true,
+    };
+    const result = await provider.verify({ worktreeDir: checkout, baselineRef: "baseline", contract });
+    expect(result.verdict).toBe("failed");
+    const gate = result.checks.find((c) => c.kind === "app-gate");
+    expect(gate?.passed).toBe(false);
+    expect(gate?.skipped).toBe(false);
+    expect(gate?.summary).toMatch(/did not fix the planted bug/);
+  });
+
+  it("does NOT auto-pass a unit that requires a gate but has none (cannot-pass)", async () => {
+    const checkout = join(dir, "gate-absent");
+    await makeCheckout(checkout, BASELINE, [{ path: "src/alpha/alpha.done", content: "done\n" }]);
+    // No app-gate command supplied, but the unit requires one. The old vacuous
+    // "skipped counts as passed" behavior must NOT apply: this is a FAIL.
+    const provider = new VerificationProvider({ commandRunner: new FakeCommandRunner([]) });
+    const contract: VerificationContract = {
+      unitId: "alpha",
+      paths: ["src/alpha/**"],
+      requiresAppGate: true,
+    };
+    const result = await provider.verify({ worktreeDir: checkout, baselineRef: "baseline", contract });
+    expect(result.verdict).toBe("failed");
+    const gate = result.checks.find((c) => c.kind === "app-gate");
+    expect(gate?.passed).toBe(false);
+    expect(gate?.skipped).toBe(false);
+    expect(gate?.summary).toMatch(/cannot-pass/);
+  });
+
+  it("skips the app-gate (as not applicable) when the unit does not require one", async () => {
+    const checkout = join(dir, "gate-not-required");
+    await makeCheckout(checkout, BASELINE, [{ path: "src/alpha/alpha.done", content: "done\n" }]);
+    const provider = new VerificationProvider({ commandRunner: new FakeCommandRunner([]) });
+    const contract: VerificationContract = {
+      unitId: "alpha",
+      paths: ["src/alpha/**"],
+    };
+    const result = await provider.verify({ worktreeDir: checkout, baselineRef: "baseline", contract });
+    expect(result.verdict).toBe("verified");
+    const gate = result.checks.find((c) => c.kind === "app-gate");
+    expect(gate?.skipped).toBe(true);
+    expect(gate?.passed).toBe(true);
   });
 });

@@ -24,6 +24,7 @@ import type { WorkspaceProvider, WorkspaceRef } from "@switchyard-change/artifac
 import { Integrator, type VerifiedWorkspace } from "./integrator.ts";
 import type { GitIdentity } from "./git.ts";
 import { VerificationProvider } from "./verifier.ts";
+import type { CommandRunner } from "./command.ts";
 import { clone } from "./git.ts";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -51,6 +52,17 @@ export interface CompletedWorkUnit {
   readonly testCommand?: readonly string[];
   /** The per-unit lint command, as argv (optional). */
   readonly lintCommand?: readonly string[];
+  /**
+   * The per-app behavioral gate command, as argv (optional). When supplied, the
+   * verifier runs it as the real mechanical check that the planted bug is fixed.
+   */
+  readonly appGateCommand?: readonly string[];
+  /**
+   * True when this unit MUST satisfy a per-app behavioral gate. When true and no
+   * `appGateCommand` is supplied, the app-gate check FAILS (absence of a gate is
+   * cannot-pass, never auto-pass).
+   */
+  readonly requiresAppGate?: boolean;
 }
 
 /** Inputs for verifying and integrating a Change's completed WorkUnits. */
@@ -76,10 +88,24 @@ export class ChangeVerification {
     options: {
       readonly verifier?: VerificationProvider;
       readonly integrator?: Integrator;
+      /**
+       * An injectable command runner used by BOTH the per-unit verifier and the
+       * final-suite integrator when they are not supplied directly. The live run
+       * passes a real child-process runner; a test passes a deterministic fake so
+       * the per-app gate and the final suite stay offline. When a `verifier` or
+       * `integrator` is supplied directly it is used as-is.
+       */
+      readonly commandRunner?: CommandRunner;
     } = {},
   ) {
-    this.verifier = options.verifier ?? new VerificationProvider();
-    this.integrator = options.integrator ?? new Integrator(workspaces);
+    this.verifier =
+      options.verifier ??
+      new VerificationProvider(
+        options.commandRunner ? { commandRunner: options.commandRunner } : {},
+      );
+    this.integrator =
+      options.integrator ??
+      new Integrator(workspaces, options.commandRunner ? { commandRunner: options.commandRunner } : {});
   }
 
   /**
@@ -170,6 +196,8 @@ export class ChangeVerification {
       expectedFiles: done.expectedFiles,
       testCommand: done.testCommand,
       lintCommand: done.lintCommand,
+      appGateCommand: done.appGateCommand,
+      requiresAppGate: done.requiresAppGate,
       changedPaths: done.changedPaths,
     };
   }

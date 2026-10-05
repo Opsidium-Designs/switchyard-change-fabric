@@ -20,6 +20,17 @@ export interface ExecutorContext {
   /** The Git ref the workspace was seeded from (e.g. "HEAD" or a branch). */
   readonly baselineRef: string;
   /**
+   * Optional per-attempt model id. A caller that runs more than one attempt for
+   * the same unit (for example a verify-fail retry that escalates to a stronger
+   * model) sets this to the model id that attempt should use. An executor that
+   * supports it runs this model id for the call and records it in
+   * `ExecutionResult.cost.model`. When unset the executor falls back to its own
+   * configured base model, so every existing caller keeps its current behavior.
+   * This is a different axis from an executor's internal transport fallback: it
+   * selects WHICH model this attempt runs, not what happens when a call throws.
+   */
+  readonly model?: string;
+  /**
    * Optional, best-effort observability callbacks a caller (the live runner)
    * sets per WorkUnit so an inference executor can surface the real agent
    * activity as it happens: a readable summary of the prompt, each streamed
