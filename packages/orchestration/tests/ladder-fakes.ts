@@ -48,6 +48,18 @@ export interface ModelAwareExecutorOptions {
    * sequential loop would peak at 1 regardless of the delay).
    */
   readonly delayMs?: number;
+  /**
+   * Optional best-effort observer called with the exact objective text each
+   * execute received, tagged with whether it was an escalation (per-attempt
+   * model) call. A prompt-rotation test uses this to assert that the base round
+   * runs the plain objective while a retry round runs the rotated,
+   * evidence-bearing objective, without needing any network or real model.
+   */
+  readonly onObjective?: (record: {
+    readonly unitId: string;
+    readonly objective: string;
+    readonly isEscalation: boolean;
+  }) => void;
 }
 
 /**
@@ -80,6 +92,15 @@ export class ModelAwareExecutor implements ExecutorProvider {
     // runs with no model. Count re-fan concurrency only, so the kickoff wave's
     // own fan-out does not inflate the observed peak.
     const isEscalation = (context.model ?? "").trim() !== "";
+    try {
+      this.options.onObjective?.({
+        unitId: context.workUnitId,
+        objective: context.objective,
+        isEscalation,
+      });
+    } catch {
+      // Best-effort observer: never fail the fake run.
+    }
     if (isEscalation) {
       this.inFlight += 1;
       this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);

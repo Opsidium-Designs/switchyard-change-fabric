@@ -300,6 +300,12 @@ async function runLadder(options: {
   readonly maxConcurrency?: number;
   /** An artificial per-execute delay so a re-fan can overlap observably. */
   readonly executorDelayMs?: number;
+  /** Observe the per-attempt objective each execute received (prompt rotation). */
+  readonly onObjective?: (record: {
+    readonly unitId: string;
+    readonly objective: string;
+    readonly isEscalation: boolean;
+  }) => void;
 }) {
   const spec = options.spec ?? SPEC;
   const changeId = options.changeId ?? "change-ladder";
@@ -324,6 +330,7 @@ async function runLadder(options: {
   const executor = new ModelAwareExecutor({
     baseModel: BASE_MODEL,
     ...(options.executorDelayMs ? { delayMs: options.executorDelayMs } : {}),
+    ...(options.onObjective ? { onObjective: options.onObjective } : {}),
   });
 
   const result = await runFullLive({
@@ -773,5 +780,50 @@ work:
     expect(result.evidence.integration.verdict).toBe("verified");
     expect(result.evidence.integration.integratedUnits.length).toBeGreaterThan(0);
     expect(redeployed).toEqual(["switchyard-change-fabric-divergence-app"]);
+  });
+});
+
+describe("G3: the retry prompt rotates per round and feeds the real failing gate evidence", () => {
+  it("runs the plain objective at the base round, then a precise-fix prompt and a full-rewrite prompt on later rounds, each carrying the failing evidence", async () => {
+    const captured: Array<{ unitId: string; objective: string; isEscalation: boolean }> = [];
+    // No model ever passes the gate, so both bounded retry rounds fire and we can
+    // observe the round-2 (precise-fix) and round-3 (full-rewrite) prompts.
+    await runLadder({
+      passingModel: "no-model-ever-passes",
+      maxModelRetries: 2,
+      subdir: "rotation",
+      onObjective: (record) => captured.push(record),
+    });
+
+    // The base (kickoff) attempt ran the plain objective: no escalation, no
+    // injected failing evidence, no rotation strategy text.
+    const base = captured.find((c) => !c.isEscalation);
+    expect(base).toBeDefined();
+    expect(base?.objective).toBe("fix the planted bug in the app");
+    expect(base?.objective).not.toMatch(/failing gate evidence/i);
+
+    // The escalation attempts rotated the strategy per round and each fed the
+    // REAL failing gate output (which names the failing marker file). There are
+    // two retry rounds (round 2 and round 3).
+    const escalations = captured.filter((c) => c.isEscalation);
+    expect(escalations).toHaveLength(2);
+
+    // Round 2: a precise-fix prompt that steers the smallest change, with the
+    // real failing evidence folded in.
+    const round2 = escalations[0];
+    expect(round2?.objective).toMatch(/fix precisely what failed/i);
+    expect(round2?.objective).toMatch(/smallest change/i);
+    expect(round2?.objective).toMatch(/failing gate evidence/i);
+    expect(round2?.objective).toContain("src/fix.fix"); // the gate named this file
+
+    // Round 3: a different, escalated strategy (full corrected file honoring the
+    // frozen contract), still carrying the real failing evidence. The two retry
+    // prompts differ, so an identical-prompt gateway cache is naturally bypassed.
+    const round3 = escalations[1];
+    expect(round3?.objective).toMatch(/full corrected contents/i);
+    expect(round3?.objective).toMatch(/frozen contract/i);
+    expect(round3?.objective).toMatch(/failing gate evidence/i);
+    expect(round3?.objective).toContain("src/fix.fix");
+    expect(round3?.objective).not.toEqual(round2?.objective);
   });
 });

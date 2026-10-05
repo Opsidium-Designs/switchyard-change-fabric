@@ -20,6 +20,15 @@ export interface ExecutorContext {
   /** The Git ref the workspace was seeded from (e.g. "HEAD" or a branch). */
   readonly baselineRef: string;
   /**
+   * Optional frozen contract paths the Change's cohesion blueprint declared as
+   * read-only seams (the shared interfaces every module imports). An inference
+   * executor lists these in the prompt as read-only so the model IMPORTS and
+   * honors them rather than rewriting them, which is what keeps a module edit
+   * from silently diverging a shared seam. Optional and defaulting to empty, so
+   * a deterministic executor and every existing caller are unchanged.
+   */
+  readonly frozenContracts?: readonly string[];
+  /**
    * Optional per-attempt model id. A caller that runs more than one attempt for
    * the same unit (for example a verify-fail retry that escalates to a stronger
    * model) sets this to the model id that attempt should use. An executor that

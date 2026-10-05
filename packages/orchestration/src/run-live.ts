@@ -383,6 +383,15 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   const changeId = options.change.id;
   const emit = options.onEvent ?? (() => {});
 
+  // The frozen contract paths the Change's cohesion blueprint declared as
+  // read-only seams. Threaded into every executor call (the kickoff wave below
+  // and the ladder re-fan) so the base and retry prompts list them as read-only,
+  // steering the model to import and honor them rather than rewrite a shared
+  // interface. Empty when the Change carries no blueprint contracts.
+  const frozenContracts: readonly string[] = (options.change.blueprint?.contracts ?? []).map(
+    (c) => c.path,
+  );
+
   const workRoot = options.workRoot ?? (await mkdtemp(join(tmpdir(), "scf-full-")));
   await mkdir(workRoot, { recursive: true });
   const worktreeRoot = join(workRoot, "worktrees");
@@ -461,6 +470,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
         objective: agent.objective,
         paths: agent.paths,
         baselineRef: agent.baselineRef,
+        ...(frozenContracts.length > 0 ? { frozenContracts } : {}),
         // Per-unit observability callbacks: the executor surfaces the real agent
         // activity through these, and the runner relays it to the Worker so the
         // console renders it. A deterministic executor ignores them. There is no
@@ -771,6 +781,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       escalationModel,
       maxModelRetries,
       baseModel: options.baseModel ?? "",
+      frozenContracts,
       refanConcurrency: options.dial.maxConcurrency,
       defaultBranch: "main",
       worktreeRoot,
@@ -1001,6 +1012,13 @@ interface ChangeLevelLadderInput {
   /** The base model id, recorded on the round-1 verify attempt (informational). */
   readonly baseModel: string;
   /**
+   * The frozen contract paths from the Change's cohesion blueprint, passed to
+   * the executor on a re-fan so the escalation prompt lists them as read-only
+   * seams the model must import and honor rather than rewrite. Empty when the
+   * Change carries no blueprint contracts.
+   */
+  readonly frozenContracts: readonly string[];
+  /**
    * The bounded concurrency cap for re-fanning implicated units on a retry
    * round. Reuses the run's dial max so a retry round completes in roughly one
    * model-latency instead of N (each implicated unit has its own cloned
@@ -1184,10 +1202,13 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
           await executor.execute({
             worktreeDir,
             workUnitId: unit.unitId,
-            objective: escalationObjective(unit.objective, lastEvidence),
+            objective: escalationObjective(unit.objective, lastEvidence, nextRound),
             paths: unit.paths,
             baselineRef: input.baselineRef,
             model: escalationModel,
+            ...(input.frozenContracts.length > 0
+              ? { frozenContracts: input.frozenContracts }
+              : {}),
           });
         } catch {
           // Fall through: the re-verify fails the gate and, if the budget is
@@ -1490,13 +1511,46 @@ async function runBounded<T>(
   await Promise.all(workers);
 }
 
-/** Fold the failing gate evidence into the escalation attempt's objective. */
-function escalationObjective(objective: string, evidence: string): string {
+/**
+ * Fold the failing gate evidence into the escalation attempt's objective, and
+ * ROTATE the strategy per retry round so each retry both varies the instruction
+ * and feeds the REAL failing gate output. Varying the text per round also means
+ * the gateway cache is naturally bypassed on a retry (a different prompt is a
+ * different cache key), so a retry gets a fresh attempt rather than the cached
+ * failing reply.
+ *
+ *   - round <= 1 (the base attempt): the minimal-edit base prompt, no evidence.
+ *     The base round runs the executor's own buildMessages, so this returns the
+ *     objective unchanged.
+ *   - the first retry round: "the previous edit failed this check; fix precisely
+ *     what failed", with the real failing gate evidence, steering a focused fix
+ *     rather than a rewrite.
+ *   - a later retry round: escalate the strategy to "return the FULL corrected
+ *     file, honoring the frozen contract", still with the real failing evidence,
+ *     for the case a focused patch was not enough.
+ *
+ * The text is goal-agnostic (no per-app wording): it only references the
+ * objective and the mechanical gate evidence, so it works for any Change.
+ */
+function escalationObjective(objective: string, evidence: string, round: number): string {
   const trimmed = evidence.trim();
-  if (trimmed === "") {
+  if (round <= 1 || trimmed === "") {
     return objective;
   }
-  return `${objective}\n\nThe previous attempt failed the behavioral gate with this evidence; fix the cause:\n${trimmed.slice(0, 2000)}`;
+  const clippedEvidence = trimmed.slice(0, 2000);
+  const strategy =
+    round === 2
+      ? [
+          "The previous edit failed this behavioral gate check. Fix PRECISELY what failed:",
+          "make the smallest change that resolves the failure below, keep every other file as it is,",
+          "and import and honor the frozen contract files unchanged.",
+        ].join(" ")
+      : [
+          "The previous edits still fail this behavioral gate check. Return the FULL corrected contents",
+          "of only the file(s) you must change to resolve the failure below, honoring the frozen contract",
+          "files unchanged. Do not rewrite or edit any frozen contract.",
+        ].join(" ");
+  return `${objective}\n\n${strategy}\n\nFailing gate evidence:\n${clippedEvidence}`;
 }
 
 /**

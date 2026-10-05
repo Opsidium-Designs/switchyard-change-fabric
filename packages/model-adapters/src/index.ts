@@ -50,12 +50,23 @@ export type {
   WorkersAiUsage,
 } from "./workers-ai.ts";
 export {
+  coerceReplyText,
   createWorkersAiRestInvoke,
   DEFAULT_WORKERS_AI_FALLBACK_MODEL,
+  DEFAULT_WORKERS_AI_MAX_TOKENS,
   DEFAULT_WORKERS_AI_MODEL,
   DEFAULT_WORKERS_AI_TIMEOUT_MS,
+  extractReplyText,
   isTransientWorkersAiError,
   UnusableModelOutputError,
   WorkersAiExecutor,
   WorkersAiTimeoutError,
 } from "./workers-ai.ts";
+
+export type { AiGatewayRestOptions } from "./ai-gateway.ts";
+export {
+  createAiGatewayRestInvoke,
+  DEFAULT_AI_GATEWAY_ESCALATION_MODEL,
+  DEFAULT_AI_GATEWAY_MAX_MODEL_RETRIES,
+  DEFAULT_AI_GATEWAY_MODEL,
+} from "./ai-gateway.ts";

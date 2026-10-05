@@ -459,7 +459,8 @@ function buildMessages(
   const system = [
     "You are a careful software engineering agent working inside one isolated Git workspace.",
     "You are given one WorkUnit objective, the exact file paths you are allowed to change, and the current contents of the in-scope files.",
-    "Make the smallest concrete code edit that satisfies the objective.",
+    "Make the SMALLEST concrete code edit that satisfies the objective. Do not rewrite a whole file from scratch when a focused change is enough, and do not restyle or reformat code unrelated to the objective.",
+    "Some files are FROZEN CONTRACTS: shared read-only interfaces other modules import. You must IMPORT and honor a frozen contract as it is; never rewrite, re-export, or change its shape, and never list it as an edit.",
     "Reply with ONE JSON document and nothing else, in this exact shape:",
     '{"commitMessage": "<short message>", "edits": [{"path": "<repo-relative path within the declared scope>", "contents": "<full new file contents>"}]}',
     "Each edit must give the FULL new contents of the file, not a diff.",
@@ -468,6 +469,11 @@ function buildMessages(
   ].join("\n");
 
   const scopeLines = context.paths.length > 0 ? context.paths.join("\n") : "(no declared paths)";
+  const frozenContracts = context.frozenContracts ?? [];
+  const frozenLines =
+    frozenContracts.length > 0
+      ? frozenContracts.join("\n")
+      : "(none declared for this change)";
   const fileBlocks =
     contextFiles.length > 0
       ? contextFiles
@@ -482,6 +488,9 @@ function buildMessages(
     "",
     "Declared path scope (you may only write these paths):",
     scopeLines,
+    "",
+    "Frozen contract files (READ-ONLY; import and honor these, never rewrite or edit them):",
+    frozenLines,
     "",
     "Current in-scope file contents:",
     fileBlocks,
@@ -728,7 +737,7 @@ function guard(fn: () => void): void {
 }
 
 /** Coerce a reply value to the text the edit parser expects. */
-function coerceReplyText(value: unknown): string {
+export function coerceReplyText(value: unknown): string {
   // Workers AI usually returns a string, but some models return an
   // already-parsed JSON object when the reply itself is JSON. Coerce an object
   // back to its JSON text so the executor's parser always sees a string.
@@ -757,7 +766,7 @@ function coerceReplyText(value: unknown): string {
  * escalation) model from returning a silently empty reply that would otherwise
  * trip UnusableModelOutputError for a parsing reason rather than a real one.
  */
-function extractReplyText(body: {
+export function extractReplyText(body: {
   result?: {
     response?: unknown;
     choices?: ReadonlyArray<{ message?: { content?: unknown }; text?: unknown }>;

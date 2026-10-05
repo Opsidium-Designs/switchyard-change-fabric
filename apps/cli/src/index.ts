@@ -452,7 +452,13 @@ const commands: Command[] = [
       // runner is used, which runs `npm run gate` in each unit's cloned worktree
       // (a seeded copy of the app project, where package.json + gate/ live).
       const gateFlag = gateFlagFromArgs(args);
-      const maxModelRetries = maxModelRetriesFromArgs(args);
+      // The retry budget: an explicit --max-model-retries flag or
+      // WORKERS_AI_MAX_MODEL_RETRIES wins; otherwise fall back to the budget the
+      // selected executor carries (the ai-gateway path reads
+      // AI_GATEWAY_MAX_MODEL_RETRIES in selectExecutor), then to the built-in
+      // default. This lets AI_GATEWAY_MAX_MODEL_RETRIES take effect without the
+      // CLI having to re-read it.
+      const maxModelRetries = maxModelRetriesFromArgs(args, selected.maxModelRetries);
       const gateWiring = buildAppGateWiring({
         projectHasGate: await projectHasGateScript(projectDir),
         ...(gateFlag !== undefined ? { gateFlag } : {}),
@@ -752,17 +758,23 @@ function gateFlagFromArgs(args: readonly string[]): boolean | undefined {
  * non-finite, or negative value falls back to the default; the value is floored
  * to a whole number of retries.
  */
-function maxModelRetriesFromArgs(args: readonly string[]): number {
-  // The flag wins; otherwise read WORKERS_AI_MAX_MODEL_RETRIES from the env, and
-  // fall back to 3 bounded rounds. Workers AI is slow on the larger escalation
-  // model, so more rounds trade latency for a better chance the fix lands.
+function maxModelRetriesFromArgs(args: readonly string[], executorDefault?: number): number {
+  // The flag wins; otherwise read WORKERS_AI_MAX_MODEL_RETRIES from the env, then
+  // fall back to the budget the selected executor carries (e.g. the ai-gateway
+  // path's AI_GATEWAY_MAX_MODEL_RETRIES), and finally to 3 bounded rounds.
+  // Workers AI is slow on the larger escalation model, so more rounds trade
+  // latency for a better chance the fix lands.
+  const fallback =
+    executorDefault !== undefined && Number.isFinite(executorDefault) && executorDefault >= 0
+      ? Math.floor(executorDefault)
+      : 3;
   const raw = optionValue(args, "--max-model-retries") ?? process.env.WORKERS_AI_MAX_MODEL_RETRIES;
   if (raw === undefined) {
-    return 3;
+    return fallback;
   }
   const n = Number(raw);
   if (!Number.isFinite(n) || n < 0) {
-    return 3;
+    return fallback;
   }
   return Math.floor(n);
 }
