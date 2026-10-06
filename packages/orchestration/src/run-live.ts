@@ -1137,19 +1137,28 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
       ? Math.floor(input.refanConcurrency)
       : 3;
 
-  // The per-unit worktrees the ladder clones/re-runs, created lazily and torn
-  // down at the end. Each gated unit's repo is cloned once; a retry re-runs the
-  // executor in that same worktree and pushes, so the next round's integration
-  // worktree picks up the escalated edit from the pushed repo.
+  // The per-unit per-round worktrees the ladder clones/re-runs, created lazily
+  // and torn down at the end. Each retry round clones a FRESH worktree keyed by
+  // (unitId, round) rather than reusing one dir across rounds: reusing a single
+  // dir meant an identical-or-again-dropped rewrite left a clean `git status`,
+  // so the push was skipped and the retry changed nothing. A fresh clone per
+  // round compares the new edit against the unit repo HEAD, so a genuinely
+  // different edit is committed and pushed and the next round's integration
+  // worktree picks it up.
   const unitWorktrees = new Map<string, string>();
-  const ensureWorktree = async (unitId: string, authRemote: string): Promise<string> => {
-    const existing = unitWorktrees.get(unitId);
+  const ensureWorktree = async (
+    unitId: string,
+    round: number,
+    authRemote: string,
+  ): Promise<string> => {
+    const key = `${unitId}#${round}`;
+    const existing = unitWorktrees.get(key);
     if (existing) {
       return existing;
     }
-    const dir = await mkdtemp(join(worktreeRoot, `scf-ladder-${unitId}-`));
+    const dir = await mkdtemp(join(worktreeRoot, `scf-ladder-${unitId}-r${round}-`));
     await clone(authRemote, dir);
-    unitWorktrees.set(unitId, dir);
+    unitWorktrees.set(key, dir);
     return dir;
   };
 
@@ -1254,7 +1263,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
           "retrying",
           `retry round ${nextRound} on ${escalationModel}`,
         );
-        const worktreeDir = await ensureWorktree(unit.unitId, unit.authRemote);
+        const worktreeDir = await ensureWorktree(unit.unitId, nextRound, unit.authRemote);
         try {
           await executor.execute({
             worktreeDir,
@@ -1269,6 +1278,16 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             ...(unit.requiredExports.length > 0
               ? { requiredExports: unit.requiredExports }
               : {}),
+            // Thread the per-unit observability callbacks into the retry's
+            // executor call, exactly as the base wave does. Without them the
+            // escalation round posted no `model-call` / `applied-edit` activity
+            // step, so a watcher could not see the model being re-invoked and the
+            // retry looked like a no-op. Each round now records a real model-call
+            // step on the implicated unit, proving the escalation model ran.
+            onPromptSummary: (summary) =>
+              reportLadderStep(post, changeId, unit.unitId, "prompt", summary),
+            onStep: (step) =>
+              reportLadderStep(post, changeId, unit.unitId, step.phase, step.message),
           });
         } catch {
           // Fall through: the re-verify fails the gate and, if the budget is

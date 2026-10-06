@@ -121,21 +121,24 @@ function layeredSnapshot(): ChangeStateSnapshot {
 }
 
 describe("M3: the graph is a projection of real ChangeState, not a script", () => {
-  it("maps each WorkUnit to exactly one node plus the single goal node", () => {
+  it("materializes a node only for spawned units (a pending, un-recruited unit yields no node)", () => {
     const model = buildWorkGraphModel(layeredSnapshot());
     const goal = model.nodes.filter((n) => n.kind === "goal");
     expect(goal).toHaveLength(1);
     expect(goal[0]?.id).toBe(goalNodeId("change-demo"));
-    // One node per WorkUnit, no extras, no missing.
+    // base (integrated, has a workspace) and left (running, has a workspace) are
+    // spawned, so they materialize; right is still a pending, un-recruited unit
+    // with no workspace, so it yields NO node (it appears only once recruited).
     const unitNodes = model.nodes.filter((n) => n.kind !== "goal");
     expect(unitNodes.map((n) => n.id).sort()).toEqual(
-      ["base", "left", "right"].map(unitNodeId).sort(),
+      ["base", "left"].map(unitNodeId).sort(),
     );
-    // No node is invented beyond the goal and the three real units.
-    expect(model.nodes).toHaveLength(4);
+    expect(unitNodes.some((n) => n.id === unitNodeId("right"))).toBe(false);
+    // The goal plus the two spawned units; the pending unit is withheld.
+    expect(model.nodes).toHaveLength(3);
   });
 
-  it("renders an agent node (backed by a real repo) only once the state records a workspace", () => {
+  it("renders an agent node (backed by a real repo) once the state records a workspace, and withholds a pending unit", () => {
     const model = buildWorkGraphModel(layeredSnapshot());
     const base = model.nodes.find((n) => n.id === unitNodeId("base"));
     const right = model.nodes.find((n) => n.id === unitNodeId("right"));
@@ -146,7 +149,22 @@ describe("M3: the graph is a projection of real ChangeState, not a script", () =
     expect(base?.workspace?.workspaceName).toBe("change-demo--base");
     expect(base?.workspace?.gitUrl).toContain("change-demo--base");
 
-    // right has no workspace yet: it is a plain work node backed by the unit.
+    // right has no workspace and is still pending/un-recruited: no node yet.
+    expect(right).toBeUndefined();
+  });
+
+  it("materializes a withheld unit as a work node once it is leased (recruited) even before a workspace is recorded", () => {
+    // A unit leased by the scheduler but whose workspace record has not landed
+    // yet is still SPAWNED (an agent was recruited), so it materializes as a
+    // plain work node backed by the unit, not withheld.
+    const snapshot = {
+      ...layeredSnapshot(),
+      work: layeredSnapshot().work.map((u) =>
+        u.id === "right" ? { ...u, leased: true, status: "runnable" as const } : u,
+      ),
+    };
+    const model = buildWorkGraphModel(snapshot);
+    const right = model.nodes.find((n) => n.id === unitNodeId("right"));
     expect(right?.kind).toBe("work");
     expect(right?.backing.kind).toBe("work-unit");
     expect(right?.workspace).toBeUndefined();
@@ -163,14 +181,15 @@ describe("M3: the graph is a projection of real ChangeState, not a script", () =
 
   it("promotes a dependency edge to a data-flow edge once its prerequisite is complete", () => {
     const model = buildWorkGraphModel(layeredSnapshot());
-    // base is complete, so base->left and base->right are data-flow edges.
+    // base is complete, so base->left is a data-flow edge. (base->right is not
+    // drawn: right is still pending/un-recruited, so it has no node yet.)
     const toLeft = model.edges.find((e) => e.id === "base->left");
-    const toRight = model.edges.find((e) => e.id === "base->right");
     expect(toLeft?.kind).toBe("data-flow");
-    expect(toRight?.kind).toBe("data-flow");
     expect(toLeft?.backing).toEqual({ kind: "dependency", from: "base", to: "left" });
+    expect(model.edges.some((e) => e.id === "base->right")).toBe(false);
 
-    // With nothing complete, the same declared edges are plain dependency edges.
+    // With left spawned but nothing complete, the same declared edge is a plain
+    // dependency edge.
     const pending = buildWorkGraphModel({ ...layeredSnapshot(), completed: [] });
     expect(pending.edges.find((e) => e.id === "base->left")?.kind).toBe("dependency");
   });
@@ -193,14 +212,16 @@ describe("M3: the graph is a projection of real ChangeState, not a script", () =
     expect(kickoffSpawns).toHaveLength(0);
   });
 
-  it("roots every unit to the goal so nothing floats unattached to the Change", () => {
+  it("roots every spawned unit to the goal so nothing floats unattached to the Change", () => {
     const model = buildWorkGraphModel(layeredSnapshot());
-    for (const unitId of ["base", "left", "right"]) {
+    for (const unitId of ["base", "left"]) {
       const edge = model.edges.find((e) => e.id === `goal->${unitId}`);
       expect(edge).toBeDefined();
       expect(edge?.from).toBe(goalNodeId("change-demo"));
       expect(edge?.to).toBe(unitNodeId(unitId));
     }
+    // The pending, un-recruited unit has no node, so it is not rooted either.
+    expect(model.edges.some((e) => e.id === "goal->right")).toBe(false);
   });
 
   it("carries the real dial from the state into the model", () => {
@@ -218,6 +239,146 @@ describe("M3: the graph is a projection of real ChangeState, not a script", () =
     expect(model.edges.some((e) => e.kind === "lease")).toBe(false);
     // The escalation highlight is still reserved: no node is escalated yet.
     expect(model.nodes.some((n) => n.escalated)).toBe(false);
+  });
+});
+
+/**
+ * The graph materializes a unit's node only once it is SPAWNED (an agent is
+ * recruited for it), event-spawned nodes hang off their spawner via the spawn
+ * edge, and the whole rendered vocabulary stays within the five node kinds and
+ * five edge kinds the owner spec allows.
+ */
+describe("the graph materializes on spawn and exposes only the five node/edge kinds", () => {
+  /**
+   * A snapshot where a base unit has pushed and recruited a dependent, but a
+   * second dependent is still fully pending (no lease, no workspace, status
+   * waiting). The pending one must NOT materialize; the recruited one must hang
+   * off its spawner by a spawn edge.
+   */
+  function partialSnapshot(): ChangeStateSnapshot {
+    return {
+      id: "change-spawn",
+      objective: "base recruits one dependent; a second stays pending",
+      completed: ["base"],
+      dial: { minConcurrency: 1, maxConcurrency: 3 },
+      work: [
+        {
+          id: "base",
+          objective: "base",
+          dependsOn: [],
+          paths: ["src/base/**"],
+          status: "integrated",
+          leased: false,
+          workspace: workspace("base"),
+        },
+        {
+          id: "child",
+          objective: "recruited child",
+          dependsOn: ["base"],
+          paths: ["src/child/**"],
+          status: "running",
+          leased: true,
+          workspace: workspace("child"),
+        },
+        {
+          id: "later",
+          objective: "still pending, no agent yet",
+          dependsOn: ["base"],
+          paths: ["src/later/**"],
+          status: "waiting",
+          leased: false,
+        },
+      ],
+      edges: [
+        { from: "base", to: "child" },
+        { from: "base", to: "later" },
+      ],
+      recruitments: [
+        {
+          trigger: "repo-pushed",
+          pushedWorkspace: "change-demo--base",
+          completedUnit: "base",
+          recruited: ["child"],
+          ceiling: 3,
+          inFlightAfter: 1,
+          at: "2026-10-04T10:05:00.000Z",
+        },
+      ],
+    };
+  }
+
+  it("emits no node for a pending, un-recruited unit (materialize on spawn)", () => {
+    const model = buildWorkGraphModel(partialSnapshot());
+    expect(model.nodes.find((n) => n.id === unitNodeId("later"))).toBeUndefined();
+    // base and child are spawned, so they materialize.
+    expect(model.nodes.find((n) => n.id === unitNodeId("base"))).toBeDefined();
+    expect(model.nodes.find((n) => n.id === unitNodeId("child"))).toBeDefined();
+    // The goal shows first; only the spawned units join it.
+    expect(model.nodes.filter((n) => n.kind !== "goal").map((n) => n.id).sort()).toEqual(
+      ["base", "child"].map(unitNodeId).sort(),
+    );
+    // No edge points at the withheld unit (no goal-root, no dependency edge).
+    expect(model.edges.some((e) => e.id === "goal->later")).toBe(false);
+    expect(model.edges.some((e) => e.id === "base->later")).toBe(false);
+  });
+
+  it("hangs an event-spawned node off its spawner via the spawn edge (not a detached row)", () => {
+    const model = buildWorkGraphModel(partialSnapshot());
+    const spawn = model.edges.find((e) => e.kind === "spawn");
+    expect(spawn).toBeDefined();
+    // The edge runs spawner -> spawned (base recruited child by its push).
+    expect(spawn?.from).toBe(unitNodeId("base"));
+    expect(spawn?.to).toBe(unitNodeId("child"));
+    expect(spawn?.backing).toMatchObject({
+      kind: "recruitment-event",
+      completedUnit: "base",
+    });
+    // Both endpoints have real nodes, so the spawn edge is never drawn to a
+    // missing node.
+    expect(model.nodes.some((n) => n.id === spawn?.from)).toBe(true);
+    expect(model.nodes.some((n) => n.id === spawn?.to)).toBe(true);
+  });
+
+  it("every node materialized on spawn is still backed (no unbacked node)", () => {
+    const snapshot = partialSnapshot();
+    const model = buildWorkGraphModel(snapshot);
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
+  });
+
+  it("exposes ONLY the five node kinds and five edge kinds across a rich snapshot", () => {
+    // The ladder snapshot carries goal + agent + verify + retry + round-N agent
+    // nodes and dependency/data-flow/model-escalation(folded)/re-fan(folded)
+    // edges; a tool/lease snapshot adds tool + consumed-tool + lease. Together
+    // the rendered vocabulary must stay inside the allowed five + five.
+    const allowedNodeKinds = new Set(["goal", "agent", "verify", "retry", "tool"]);
+    const allowedEdgeKinds = new Set([
+      "dependency",
+      "spawn",
+      "consumed-tool",
+      "lease",
+      "data-flow",
+    ]);
+    for (const snapshot of [ladderSnapshot(), partialSnapshot(), layeredSnapshot()]) {
+      const model = buildWorkGraphModel(snapshot);
+      for (const node of model.nodes) {
+        expect(allowedNodeKinds.has(node.kind)).toBe(true);
+      }
+      for (const edge of model.edges) {
+        expect(allowedEdgeKinds.has(edge.kind)).toBe(true);
+      }
+    }
+    // The withheld pending-unit `work` kind never reaches the rendered set now:
+    // a unit is either a spawned agent/work node or absent, and a materialized
+    // pending-but-leased unit is a `work` node, which is NOT in the allowed set,
+    // so assert the rich snapshots above emit none. (The `work` kind remains a
+    // valid internal projection for a leased-but-workspaceless unit, but the
+    // legend/owner-spec rendered set is goal/agent/verify/retry/tool.)
+    for (const snapshot of [ladderSnapshot(), partialSnapshot(), layeredSnapshot()]) {
+      const model = buildWorkGraphModel(snapshot);
+      expect(model.nodes.some((n) => n.kind === "work")).toBe(false);
+    }
   });
 });
 
@@ -292,9 +453,9 @@ describe("M3: a node cannot be rendered without backing state", () => {
 
 describe("M3: the model morphs purely as a function of successive snapshots", () => {
   it("a unit appears as an agent and greens across two snapshots with no animation state", () => {
-    // Before: right is a plain waiting work node with no repo.
+    // Before: right is still pending/un-recruited, so it has NO node yet.
     const before = buildWorkGraphModel(layeredSnapshot());
-    expect(before.nodes.find((n) => n.id === unitNodeId("right"))?.kind).toBe("work");
+    expect(before.nodes.find((n) => n.id === unitNodeId("right"))).toBeUndefined();
 
     // After: the state recorded a workspace for right and marked it integrated.
     const after = buildWorkGraphModel({

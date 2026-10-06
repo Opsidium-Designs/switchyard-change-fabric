@@ -708,6 +708,33 @@ function isVerified(status: WorkUnitStatus): boolean {
   return status === "verified" || status === "integrated";
 }
 
+/**
+ * Whether a WorkUnit has actually been SPAWNED/recruited yet, so its node should
+ * be materialized. A unit's node appears only once an agent is genuinely working
+ * it: either a lease recorded a real workspace, or the unit has moved past the
+ * pending states into running/verified/integrated/failed. A still-pending unit
+ * (status `waiting`/`runnable` with no recorded workspace) has no agent yet, so
+ * it yields NO node: the goal shows first and agent nodes appear as they are
+ * recruited, rather than every declared unit sitting at t=0. Every node this
+ * admits is still backed (a workspace-backed node has its workspace; a
+ * work-backed node has its unit), so the no-unbacked-node rule is preserved.
+ */
+function isSpawned(unit: WorkUnitSnapshot): boolean {
+  if (unit.workspace !== undefined) {
+    return true;
+  }
+  if (unit.leased) {
+    return true;
+  }
+  // A unit that has recorded real run steps (or produced run detail) has an
+  // agent actively working it, so it is spawned even before a workspace record
+  // lands or its status advances.
+  if ((unit.activity?.length ?? 0) > 0 || unit.detail !== undefined) {
+    return true;
+  }
+  return unit.status === "running" || unit.status === "verified" || unit.status === "integrated" || unit.status === "failed";
+}
+
 /** The goal node's status + green flag, derived from the whole-change verdict. */
 interface GoalOutcome {
   readonly status: WorkUnitStatus;
@@ -798,6 +825,12 @@ function goalOutcome(snapshot: ChangeStateSnapshot): GoalOutcome {
 export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphModel {
   const completed = new Set(snapshot.completed);
   const unitIds = new Set(snapshot.work.map((u) => u.id));
+  // The units that have actually been spawned/recruited, so a node is emitted
+  // for them. A not-yet-spawned (still pending) unit is withheld: it has no agent
+  // working it, so it materializes only once a lease/workspace or a running+
+  // status appears. Every edge endpoint is checked against this set so an edge
+  // to a withheld unit is never drawn (which would be an edge to a missing node).
+  const spawnedIds = new Set(snapshot.work.filter((u) => isSpawned(u)).map((u) => u.id));
   const nodes: GraphNode[] = [];
 
   // Pending escalations light the reserved `escalated` flag. A unit-scoped
@@ -815,6 +848,14 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     } else {
       goalEscalated = true;
     }
+  }
+
+  // A unit with a PENDING escalation attached is actively the subject of a human
+  // decision the engine is waiting on, so it materializes (and lights its node)
+  // even if it had not otherwise reached a spawned status yet. Without this a
+  // unit-scoped escalation would have no node to light.
+  for (const unitId of escalatedUnits) {
+    spawnedIds.add(unitId);
   }
 
   // The goal node: the Change root the graph self-organizes toward. Its status
@@ -843,6 +884,13 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
   // a work node is backed by the WorkUnit itself. There is no third option, so
   // every unit node has concrete backing.
   for (const unit of snapshot.work) {
+    // Withhold a not-yet-spawned (still pending) unit: its node materializes only
+    // once an agent is recruited for it (a lease/workspace, or a status past
+    // pending). This keeps t=0 to the goal plus whatever is actually running,
+    // rather than every declared unit appearing before any agent exists.
+    if (!spawnedIds.has(unit.id)) {
+      continue;
+    }
     const hasWorkspace = unit.workspace !== undefined;
     const unitEscalated = escalatedUnits.has(unit.id);
     // Carry the real per-unit activity log and detail through additively, so the
@@ -879,10 +927,13 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
 
   const edges: GraphEdge[] = [];
 
-  // Root every unit to the goal, so the graph is a tree over the Change. These
-  // are backed by the Change-to-unit relationship the snapshot declares (the
-  // unit exists in this Change's work set).
+  // Root every SPAWNED unit to the goal, so the graph is a tree over the Change.
+  // A withheld (not-yet-spawned) unit has no node, so it is not rooted either.
+  // These are backed by the Change-to-unit relationship the snapshot declares.
   for (const unit of snapshot.work) {
+    if (!spawnedIds.has(unit.id)) {
+      continue;
+    }
     edges.push({
       id: `goal->${unit.id}`,
       kind: "dependency",
@@ -896,9 +947,9 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
   // data-flow edge (data has flowed from the finished prerequisite); otherwise
   // it is a plain dependency edge. Both are backed by the real edge in state.
   for (const edge of snapshot.edges) {
-    if (!unitIds.has(edge.from) || !unitIds.has(edge.to)) {
-      // Defensive: the state should never report an edge to a unit it does not
-      // also list, but if it does, skip it rather than draw an unbacked edge.
+    if (!spawnedIds.has(edge.from) || !spawnedIds.has(edge.to)) {
+      // Skip an edge whose endpoint has no node yet (unknown unit, or a unit not
+      // yet spawned/materialized), rather than drawing an edge to a missing node.
       continue;
     }
     const live = completed.has(edge.from);
@@ -919,11 +970,14 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
       continue;
     }
     const fromUnit = event.completedUnit;
-    if (!unitIds.has(fromUnit)) {
+    if (!spawnedIds.has(fromUnit)) {
       continue;
     }
     for (const recruitedId of event.recruited) {
-      if (!unitIds.has(recruitedId)) {
+      if (!spawnedIds.has(recruitedId)) {
+        // The recruited unit has not materialized a node yet (still pending): the
+        // spawn edge appears once it is actually spawned, so it hangs off its
+        // spawner rather than pointing at a missing node.
         continue;
       }
       edges.push({
@@ -970,7 +1024,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     // The builder-to-tool edge: the tool was published by its builder. Drawn as
     // a data-flow edge from the builder unit to the tool, backed by the tool
     // record (the builder unit is in the work set, which the record guarantees).
-    if (unitIds.has(tool.builderUnitId)) {
+    if (spawnedIds.has(tool.builderUnitId)) {
       edges.push({
         id: `built:${tool.builderUnitId}->${tool.capability}`,
         kind: "data-flow",
@@ -987,7 +1041,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
       if (consumption.capability !== tool.capability) {
         continue;
       }
-      if (!unitIds.has(consumption.consumerUnitId)) {
+      if (!spawnedIds.has(consumption.consumerUnitId)) {
         continue;
       }
       edges.push({
@@ -1009,11 +1063,11 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
   // waiter to the owner, surfacing the single-writer coordination (the waiter
   // waits for the owner before integrating). Backed by the real lease decision.
   for (const lease of snapshot.leaseEdges ?? []) {
-    if (!unitIds.has(lease.owner)) {
+    if (!spawnedIds.has(lease.owner)) {
       continue;
     }
     for (const waiter of lease.waiters) {
-      if (!unitIds.has(waiter)) {
+      if (!spawnedIds.has(waiter)) {
         continue;
       }
       edges.push({

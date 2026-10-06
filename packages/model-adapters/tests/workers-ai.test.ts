@@ -120,11 +120,22 @@ describe("WorkersAiExecutor", () => {
       requiredExports: ["handle"],
     });
 
-    // The system prompt steers the model to keep its exported interface intact.
+    // The system prompt steers the model to start from the current contents and
+    // make the minimal change, keeping its exported interface intact.
     expect(seenSystem).toMatch(/preserve the exported interface/i);
-    // The user prompt lists the real export name the service-api resource keeps.
+    expect(seenSystem).toMatch(/START FROM THE CURRENT CONTENTS/i);
+    expect(seenSystem).toMatch(/MINIMAL change/i);
+    // The system prompt names the real export and the concrete `export function`
+    // / `export { ... }` syntax the file MUST still contain, so the instruction
+    // is forceful and concrete rather than advisory.
+    expect(seenSystem).toContain("handle");
+    expect(seenSystem).toMatch(/export function handle/);
+    expect(seenSystem).toMatch(/export \{ handle \}/);
+    // The user prompt lists the real export name the service-api resource keeps,
+    // with the same concrete syntax.
     expect(seenUser).toMatch(/Required exports/);
     expect(seenUser).toContain("handle");
+    expect(seenUser).toMatch(/export function handle/);
   });
 
   it("omits the required-exports block when the module has no captured exports", async () => {

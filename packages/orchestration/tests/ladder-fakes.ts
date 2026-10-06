@@ -111,10 +111,27 @@ export class ModelAwareExecutor implements ExecutorProvider {
         await new Promise<void>((resolve) => setTimeout(resolve, delay));
       }
       const model = (context.model ?? "").trim() || this.options.baseModel;
+      // Emit a real `model-call` step, exactly as the live WorkersAiExecutor
+      // does, so a caller that threads onStep (the ladder's re-fan) records a
+      // model-call activity step for the round. This is what proves the retry
+      // genuinely re-invokes the model each round rather than being a no-op.
+      try {
+        context.onStep?.({ phase: "model-call", message: `calling model ${model}` });
+      } catch {
+        // Best-effort observability: never fail the fake run.
+      }
       const rel = markerPathFor(context.workUnitId);
       const abs = join(context.worktreeDir, rel);
       await mkdir(dirname(abs), { recursive: true });
       await writeFile(abs, `model: ${model}\n`, "utf8");
+      try {
+        context.onStep?.({
+          phase: "applied-edit",
+          message: `applied 1 model edit(s): ${rel}`,
+        });
+      } catch {
+        // Best-effort observability: never fail the fake run.
+      }
       return {
         status: "changed",
         changedPaths: [rel],

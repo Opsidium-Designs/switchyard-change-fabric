@@ -405,12 +405,13 @@ body {
 .sw-failed { background: #8b2c22; border-color: #f85149; }
 .sw-tool { background: #9e6a03; }
 .sw-escalated { background: #f85149; }
-/* The ladder's own node kinds, mirroring graph-view nodeFill exactly: a verify
-   pass is the healthy green, a verify fail is a vivid gate-fail red (distinct
-   from the muted dead-unit red), and a retry is the magenta smarter-model beat
-   (the same hue as the model-escalation edge that reaches it). */
-.sw-verify-pass { background: #238636; }
-.sw-verify-fail { background: #da3633; border-color: #f85149; }
+/* The ladder's own node kinds, mirroring graph-view nodeFill: a verify node is
+   drawn green on a pass and red on a fail in the graph, so its single legend
+   swatch uses the healthy green (the kind, not the status), and a retry is the
+   magenta smarter-model beat (the same hue as the model-escalation edge that
+   reaches it). The legend lists only the kind; node COLOR conveys status in the
+   graph itself. */
+.sw-verify { background: #238636; }
 .sw-retry { background: #a371f7; }
 
 /* The tool legend glyph is a YELLOW SQUARE, matching the yellow square tool

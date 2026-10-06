@@ -34,6 +34,12 @@ const GOAL_RADIUS = 32;
 const LABEL_GAP = 10;
 /** Minimum horizontal gap between adjacent node centers in a dense row. */
 const MIN_NODE_GAP = 150;
+/** Vertical stagger step applied by column so siblings are not on one flat row. */
+const STAGGER_STEP = 34;
+/** Deterministic per-node horizontal jitter amplitude (SVG units). */
+const X_JITTER = 22;
+/** Deterministic per-node vertical jitter amplitude (SVG units). */
+const Y_JITTER = 18;
 
 interface Placed {
   readonly node: GraphNode;
@@ -49,12 +55,14 @@ interface Placed {
 }
 
 /**
- * Build the per-node parent list from the dependency/data-flow edges (the same
- * edges computeLayers follows), so a node can be ordered within its layer by the
- * mean x of its parents (its barycenter). Goal-rooting and spawn edges are
- * ignored, exactly as in computeLayers. The ladder chain (escalation hop,
- * per-unit re-fan) rides the dependency/data-flow kinds, so following those two
- * kinds also follows the ladder.
+ * Build the per-node parent list from the dependency/data-flow AND spawn edges,
+ * so a node can be ordered within its layer by the mean x of its parents (its
+ * barycenter) and an event-spawned node hangs off its spawner rather than
+ * floating in a tidy row. Goal-rooting edges are ignored, exactly as in
+ * computeLayers. The ladder chain (escalation hop, per-unit re-fan) rides the
+ * dependency/data-flow kinds, so following those also follows the ladder; the
+ * spawn kind is now followed too so a recruited node branches beneath the unit
+ * whose push recruited it.
  */
 function buildParentLists(model: WorkGraphModel): Map<string, string[]> {
   const parents = new Map<string, string[]>();
@@ -67,7 +75,7 @@ function buildParentLists(model: WorkGraphModel): Map<string, string[]> {
     if (edge.from === goalNodeId(model.changeId)) {
       continue;
     }
-    if (edge.kind === "dependency" || edge.kind === "data-flow") {
+    if (edge.kind === "dependency" || edge.kind === "data-flow" || edge.kind === "spawn") {
       const list = parents.get(edge.to);
       if (list) {
         list.push(edge.from);
@@ -125,10 +133,17 @@ function placeNodes(model: WorkGraphModel): { placed: Placed[]; height: number; 
     const y = TOP_MARGIN + (l + 1) * LAYER_HEIGHT;
     const n = sorted.length;
     sorted.forEach((node, i) => {
-      const x = n === 1 ? width / 2 : ((i + 1) * width) / (n + 1);
-      // Alternate the label tier so adjacent labels in a dense row do not
-      // collide: even columns at tier 0, odd columns pushed down one tier.
-      placed.push({ node, x, y, labelTier: i % 2 });
+      const baseX = n === 1 ? width / 2 : ((i + 1) * width) / (n + 1);
+      // Positional variance so the graph reads organic, not a rigid lattice:
+      // stagger each node's y by column (alternating up/down tiers) and nudge x
+      // and y by a small, STABLE per-node jitter derived from the node id. The
+      // jitter is deterministic (the same id always yields the same offset), so
+      // the layout is reproducible for tests and a node never jumps between
+      // polls, yet siblings no longer sit on one dead-straight row/column.
+      const stagger = ((i % 3) - 1) * STAGGER_STEP;
+      const x = baseX + jitter(node.id, "x", X_JITTER);
+      const yv = y + stagger + jitter(node.id, "y", Y_JITTER);
+      placed.push({ node, x, y: yv, labelTier: i % 2 });
       xOf.set(node.id, x);
     });
   }
@@ -154,10 +169,29 @@ function barycenter(
   }
   return xs.reduce((sum, x) => sum + x, 0) / xs.length;
 }
+
+/**
+ * A small, STABLE pseudo-random offset in [-amp, amp] derived from a node id and
+ * an axis tag. It is a pure function of its inputs (a simple string hash folded
+ * into the range), so the same node always lands at the same offset: the layout
+ * is deterministic and reproducible for tests, while giving each node its own
+ * positional nudge so a row of siblings is no longer a dead-straight lattice.
+ */
+function jitter(id: string, axis: string, amp: number): number {
+  const seed = `${id}:${axis}`;
+  let hash = 2166136261;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash ^= seed.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  // Fold the unsigned hash into a fraction in [0, 1), then map to [-amp, amp].
+  const frac = (hash >>> 0) / 0xffffffff;
+  return (frac * 2 - 1) * amp;
+}
 function computeLayers(model: WorkGraphModel): Map<string, number> {
   const deps = new Map<string, string[]>();
   // Build the per-unit dependency list from the declared dependency/data-flow
-  // edges between unit nodes (ignore the goal-rooting edges and spawn edges).
+  // AND spawn edges between unit nodes (ignore only the goal-rooting edges).
   for (const node of model.nodes) {
     if (node.kind !== "goal") {
       deps.set(node.id, []);
@@ -170,10 +204,12 @@ function computeLayers(model: WorkGraphModel): Map<string, number> {
     // The ladder reads top to bottom: a verify node hangs below its unit (fed by
     // a data-flow edge), a retry node hangs below the failing verify it escalated
     // from (a dependency edge), and a round-N agent hangs below its retry (a
-    // data-flow re-fan edge). The escalation hop and the per-unit re-fan now ride
-    // the dependency/data-flow kinds, so following those two kinds lays the whole
-    // chain down the rows instead of letting the retry or round-N agent float up.
-    if (edge.kind === "dependency" || edge.kind === "data-flow") {
+    // data-flow re-fan edge). The escalation hop and the per-unit re-fan ride the
+    // dependency/data-flow kinds, so following those lays the whole chain down
+    // the rows. The spawn kind is followed too, so an event-spawned (recruited)
+    // node sits a layer BELOW the unit whose push recruited it, hanging off its
+    // spawner instead of floating in a flat, detached row.
+    if (edge.kind === "dependency" || edge.kind === "data-flow" || edge.kind === "spawn") {
       const list = deps.get(edge.to);
       if (list) {
         list.push(edge.from);

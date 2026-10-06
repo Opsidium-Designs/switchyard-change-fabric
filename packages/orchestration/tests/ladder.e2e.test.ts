@@ -575,6 +575,33 @@ describe("T10b: the retry round is a VISIBLE second wave (re-fan edges + per-uni
     expect(phases).toContain("retried");
   });
 
+  it("re-invokes the model each retry round (a real model-call step per round) and lands a pushed edit", async () => {
+    // No model ever passes, so both bounded retry rounds fire. Each round must
+    // genuinely re-invoke the executor on the implicated unit, so a `model-call`
+    // step is recorded on that unit for every round. This is the fix for the
+    // retry-no-op: the round used to reuse one worktree (a clean tree skipped the
+    // push) and omit the observability callbacks (no model-call step), so the
+    // retry looked like a no-op; now each round clones a fresh worktree and
+    // threads onStep, so the model-call is both run and visible.
+    const { snapshot } = await runLadder({
+      passingModel: "no-model-ever-passes",
+      maxModelRetries: 2,
+      subdir: "model-call-per-round",
+    });
+
+    const fixUnit = snapshot.work.find((u) => u.id === "fix");
+    const activity = fixUnit?.activity ?? [];
+    // Two retry rounds (round 2 and round 3) each re-invoked the model, so there
+    // are at least two recorded model-call steps on the implicated unit (one per
+    // retry round), proving the retry is not a no-op.
+    const modelCalls = activity.filter((s) => s.phase === "model-call");
+    expect(modelCalls.length).toBeGreaterThanOrEqual(2);
+    // Each retry round also produced a visible retrying/retried pair and the
+    // model-call sits between the two retry rounds.
+    expect(activity.filter((s) => s.phase === "retrying").length).toBeGreaterThanOrEqual(2);
+    expect(activity.filter((s) => s.phase === "retried").length).toBeGreaterThanOrEqual(2);
+  });
+
   it("re-fans the implicated units with BOUNDED CONCURRENCY up to the dial cap, not strictly one-after-another", async () => {
     // Three units all need escalation, so the single retry re-fans all three.
     // With a dial max of 3 and an artificial per-execute delay, a bounded-

@@ -629,34 +629,27 @@ function TemplateGallery({
 function Legend() {
   return (
     <ul className="legend" aria-label="Legend">
-      {/* The goal is a DIAMOND, matching the diamond goal node in the graph. */}
+      {/* Exactly five NODE kinds, matching the shapes graph-view draws. Node
+          COLOR still conveys status in the graph (a failed agent circle red, a
+          verify hexagon green/red), but the legend lists only the kinds, never a
+          status swatch. */}
+      {/* The goal is a DIAMOND. */}
       <li><span className="swatch-diamond sw-goal" aria-hidden="true" /> goal</li>
-      <li><span className="swatch sw-work" /> work unit</li>
-      <li><span className="swatch sw-agent" /> recruited agent (real repo)</li>
-      <li><span className="swatch sw-verified" /> verified / integrated</li>
-      <li><span className="swatch sw-failed" /> failed unit</li>
-      {/* The ladder's own node kinds are HEXAGONS, matching graph-view: a verify
-          node is a mechanical gate run (green pass / red fail), and a retry node
-          is the SAME hexagon shape in the smarter-model magenta, so verify and
-          retry share a shape and differ only by color. */}
-      <li><span className="swatch-hex sw-verify-pass" aria-hidden="true" /> verify passed (gate ran, green)</li>
-      <li><span className="swatch-hex sw-verify-fail" aria-hidden="true" /> verify failed (gate ran, red)</li>
-      <li><span className="swatch-hex sw-retry" aria-hidden="true" /> retry (escalated to a stronger model)</li>
-      {/* The tool entry uses a YELLOW SQUARE glyph so it matches the yellow
-          square tool node drawn in the graph. */}
-      <li><span className="swatch-square sw-tool" aria-hidden="true" /> agent-built tool (real repo)</li>
-      <li><span className="swatch sw-escalated" /> pending human escalation</li>
+      {/* An agent is a CIRCLE. */}
+      <li><span className="swatch sw-agent" /> agent</li>
+      {/* A verify node is a HEXAGON (a mechanical gate run). */}
+      <li><span className="swatch-hex sw-verify" aria-hidden="true" /> verify</li>
+      {/* A retry node is the SAME hexagon shape in a different color (the
+          smarter-model re-attempt). */}
+      <li><span className="swatch-hex sw-retry" aria-hidden="true" /> retry</li>
+      {/* A tool is a YELLOW SQUARE. */}
+      <li><span className="swatch-square sw-tool" aria-hidden="true" /> tool</li>
       {/* The rendered edge vocabulary is exactly these five kinds. */}
       <li><span className="line ln-dependency" /> dependency</li>
-      <li><span className="line ln-dataflow" /> data flow</li>
       <li><span className="line ln-spawn" /> event-driven spawn</li>
-      {/* A consumed-tool edge is a solid amber tool run; a write-lease is a
-          dotted teal owner-coordination edge, mirroring graph-view edgeStyle so
-          the legend reads the same as the graph and the two never confuse. A
-          consumed-tool edge only ever appears alongside a yellow square tool
-          node by construction. */}
-      <li><span className="line ln-tool" /> consumed tool (agent ran a built tool)</li>
-      <li><span className="line ln-lease" /> write-lease (waiter waits for owner)</li>
+      <li><span className="line ln-tool" /> consumed tool</li>
+      <li><span className="line ln-lease" /> write-lease</li>
+      <li><span className="line ln-dataflow" /> data flow</li>
     </ul>
   );
 }

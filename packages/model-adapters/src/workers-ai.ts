@@ -456,15 +456,34 @@ function buildMessages(
   context: ExecutorContext,
   contextFiles: readonly WorkersAiEdit[],
 ): readonly WorkersAiMessage[] {
+  const requiredExportsForSystem = context.requiredExports ?? [];
+  const exportRule =
+    requiredExportsForSystem.length > 0
+      ? [
+          "Your module MUST keep exporting these names EXACTLY, with the same signatures: " +
+            `${requiredExportsForSystem.join(", ")}.`,
+          "The updated file you return MUST still contain each one as a real export, for example " +
+            `${requiredExportsForSystem
+              .map((name) => `\`export function ${name}\``)
+              .join(" or ")}` +
+            " (or an equivalent `export { " +
+            requiredExportsForSystem.join(", ") +
+            " }`). Never remove, rename, or comment out any of these exports; dropping even one breaks the modules that import it.",
+        ]
+      : [
+          "Your module has a PUBLIC EXPORTED INTERFACE other modules import by name. Change the implementation, not the exported names or signatures, and keep every existing `export` present. Never remove or rename an export other modules import.",
+        ];
+
   const system = [
     "You are a careful software engineering agent working inside one isolated Git workspace.",
     "You are given one WorkUnit objective, the exact file paths you are allowed to change, and the current contents of the in-scope files.",
-    "Make the SMALLEST concrete code edit that satisfies the objective. Do not rewrite a whole file from scratch when a focused change is enough, and do not restyle or reformat code unrelated to the objective.",
+    "START FROM THE CURRENT CONTENTS of the in-scope file shown below and make the MINIMAL change needed to satisfy the objective. Do NOT regenerate the file from scratch and do NOT rewrite a whole file when a focused change is enough. Preserve the existing imports EXACTLY (keep importing the frozen contracts), keep every existing export, and do not restyle or reformat code unrelated to the objective.",
     "Some files are FROZEN CONTRACTS: shared read-only interfaces other modules import. You must IMPORT and honor a frozen contract as it is; never rewrite, re-export, or change its shape, and never list it as an edit.",
-    "Your own module has a PUBLIC EXPORTED INTERFACE other modules import by name. Preserve the exported interface your module already provides: change the implementation, not the exported names or signatures, and keep every listed export present and exported. Dropping or renaming an export other modules import breaks them.",
+    "Preserve the exported interface your module already provides.",
+    ...exportRule,
     "Reply with ONE JSON document and nothing else, in this exact shape:",
-    '{"commitMessage": "<short message>", "edits": [{"path": "<repo-relative path within the declared scope>", "contents": "<full new file contents>"}]}',
-    "Each edit must give the FULL new contents of the file, not a diff.",
+    '{"commitMessage": "<short message>", "edits": [{"path": "<repo-relative path within the declared scope>", "contents": "<full updated file contents>"}]}',
+    "Each edit must give the FULL updated contents of the file (the current contents with your minimal change applied), not a diff and not a from-scratch rewrite that drops anything.",
     "Only write files inside the declared path scope. Do not invent paths outside it.",
     "Do not wrap the JSON in markdown fences and do not add any prose before or after it.",
   ].join("\n");
@@ -499,8 +518,10 @@ function buildMessages(
     ...(requiredExports.length > 0
       ? [
           "",
-          "Required exports (your module MUST keep exporting these names; change the implementation, not the exported names/signatures):",
-          requiredExports.join("\n"),
+          "Required exports (your module MUST keep exporting these names EXACTLY; the updated file MUST still contain each one as a real export):",
+          requiredExports
+            .map((name) => `  ${name}  (must stay as \`export function ${name}\` / \`export { ${name} }\`)`)
+            .join("\n"),
         ]
       : []),
     "",

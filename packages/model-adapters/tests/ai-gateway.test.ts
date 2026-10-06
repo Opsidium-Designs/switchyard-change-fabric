@@ -180,10 +180,12 @@ describe("contract-aware base prompt (frozen contracts listed read-only)", () =>
       baselineRef: "HEAD",
       frozenContracts: ["src/contracts/auth.ts", "src/contracts/schema.ts"],
     });
-    // The system prompt instructs minimal edits and honoring frozen contracts.
-    expect(seenPrompt).toMatch(/smallest concrete code edit/i);
+    // The system prompt instructs a minimal edit started from the current
+    // contents, and honoring frozen contracts.
+    expect(seenPrompt).toMatch(/MINIMAL change/i);
+    expect(seenPrompt).toMatch(/START FROM THE CURRENT CONTENTS/i);
     expect(seenPrompt).toMatch(/frozen contract/i);
-    expect(seenPrompt).toMatch(/do not rewrite a whole file from scratch/i);
+    expect(seenPrompt).toMatch(/do NOT regenerate the file from scratch/i);
     // The user prompt lists the actual frozen contract paths as read-only.
     expect(seenPrompt).toContain("src/contracts/auth.ts");
     expect(seenPrompt).toContain("src/contracts/schema.ts");

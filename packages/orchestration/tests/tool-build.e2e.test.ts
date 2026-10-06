@@ -284,9 +284,9 @@ describe("M4: the graph projects the tool node, consumed-tool edges, and lease e
       objective: "Add organization-level audit logging",
       completed: [],
       work: [
-        { id: "model", objective: "model", dependsOn: [], paths: ["src/audit/**"], status: "runnable", leased: false },
-        { id: "api", objective: "api", dependsOn: ["model"], paths: ["src/api/audit/**", "src/audit/events.ts"], status: "waiting", leased: false },
-        { id: "tests", objective: "tests", dependsOn: [], paths: ["tests/audit/**", "src/audit/events.ts"], status: "runnable", leased: false },
+        { id: "model", objective: "model", dependsOn: [], paths: ["src/audit/**"], status: "running", leased: true },
+        { id: "api", objective: "api", dependsOn: ["model"], paths: ["src/api/audit/**", "src/audit/events.ts"], status: "running", leased: true },
+        { id: "tests", objective: "tests", dependsOn: [], paths: ["tests/audit/**", "src/audit/events.ts"], status: "running", leased: true },
       ],
       edges: [{ from: "model", to: "api" }],
       leaseEdges: [{ path: "src/audit/events.ts", owner: "api", waiters: ["tests"] }],
