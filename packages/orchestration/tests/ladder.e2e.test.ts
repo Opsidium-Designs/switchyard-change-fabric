@@ -23,12 +23,17 @@
 
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { parseChangeSpec } from "@switchyard-change/change-core";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
+import type {
+  ExecutionResult,
+  ExecutorContext,
+  ExecutorProvider,
+} from "@switchyard-change/model-adapters";
 
 import { LocalChangeControl } from "../src/local-control.ts";
 import {
@@ -995,5 +1000,191 @@ describe("G3: the retry prompt rotates per round and feeds the real failing gate
     expect(round3?.objective).toMatch(/failing gate evidence/i);
     expect(round3?.objective).toContain("src/fix.fix");
     expect(round3?.objective).not.toEqual(round2?.objective);
+  });
+});
+
+describe("the frozen contract file CONTENTS reach the agent prompt on both kickoff and the ladder re-fan", () => {
+  // A spec with a cohesion blueprint: two frozen contracts at the seam and one
+  // owner module. run-live derives frozenContracts from blueprint.contracts and
+  // reads their real contents from the project dir, threading both to the
+  // executor on the kickoff wave and on the ladder re-fan.
+  const BLUEPRINT_SPEC = `
+id: change-contract-contents
+objective: Fix the resource; honor the frozen contracts
+baseline: HEAD
+budget_usd: 10.00
+assurance: standard
+
+work:
+  - id: users
+    objective: require auth and validate input in the users resource
+    paths: [src/users.fix]
+
+blueprint:
+  contracts:
+    - path: src/contracts/auth.js
+      imported_by_count: 1
+    - path: src/contracts/response.js
+      imported_by_count: 1
+  modules:
+    - unit_id: users
+      paths: [src/users.fix]
+      exports: [handle]
+`;
+
+  // The real contract bodies seeded into the project dir, so run-live reads the
+  // genuine exported API (requireAuth + json/problem/readBody) and shows it to
+  // the model, not just the paths.
+  const AUTH_CONTRACT =
+    "import { problem } from './response.js';\n" +
+    "export const DEMO_TOKEN = 'demo-token';\n" +
+    "export function requireAuth(request) {\n" +
+    "  const header = request.headers.get('authorization') || '';\n" +
+    "  return header ? null : problem(401, 'authentication required');\n" +
+    "}\n";
+  const RESPONSE_CONTRACT =
+    "export function json(body, status = 200) {\n" +
+    "  return new Response(JSON.stringify(body), { status });\n" +
+    "}\n" +
+    "export function problem(status, detail) {\n" +
+    "  return new Response(JSON.stringify({ error: detail }), { status });\n" +
+    "}\n" +
+    "export async function readBody(request) {\n" +
+    "  try { return await request.json(); } catch { return {}; }\n" +
+    "}\n";
+
+  /**
+   * A capturing executor that records the frozenContractFiles each attempt
+   * received (kickoff vs escalation re-fan), while still writing the unit's
+   * marker so the MarkerGateRunner drives the ladder (base round fails, the
+   * escalation round passes). It is deterministic and offline: no model, no
+   * network.
+   */
+  class CapturingExecutor implements ExecutorProvider {
+    readonly name = "capturing-fake";
+    readonly attempts: Array<{
+      readonly isEscalation: boolean;
+      readonly frozenContracts: readonly string[];
+      readonly frozenContractFiles: readonly { readonly path: string; readonly contents: string }[];
+    }> = [];
+    async execute(context: ExecutorContext): Promise<ExecutionResult> {
+      const isEscalation = (context.model ?? "").trim() !== "";
+      this.attempts.push({
+        isEscalation,
+        frozenContracts: context.frozenContracts ?? [],
+        frozenContractFiles: context.frozenContractFiles ?? [],
+      });
+      const model = (context.model ?? "").trim() || BASE_MODEL;
+      const rel = `src/${context.workUnitId}.fix`;
+      const abs = join(context.worktreeDir, rel);
+      await mkdir(dirname(abs), { recursive: true });
+      await writeFile(abs, `model: ${model}\n`, "utf8");
+      return {
+        status: "changed",
+        changedPaths: [rel],
+        logs: [`capturing fake wrote ${rel} for ${model}`],
+        cost: { usd: 0, inputTokens: 0, outputTokens: 0, model },
+        commitMessage: `WorkUnit ${context.workUnitId}: edit by ${model}`,
+      };
+    }
+  }
+
+  it("reads the real contract bodies from the project dir and threads them to the kickoff AND re-fan executor calls", async () => {
+    const subdir = "contract-contents";
+    const changeId = "change-contract-contents";
+    const workspaces = new LocalFilesystemWorkspaceProvider({
+      rootDir: join(workRoot, subdir, "artifacts"),
+    });
+    const control = new LocalChangeControl(workspaces);
+    const { fetchFn } = fakeWorker(control, workspaces);
+    const change = parseChangeSpec(BLUEPRINT_SPEC);
+
+    // Seed the project dir with the real frozen contract files so run-live's
+    // reader finds and reads them.
+    const projectDir = join(workRoot, subdir, "project");
+    await seedProject(projectDir);
+    await mkdir(join(projectDir, "src", "contracts"), { recursive: true });
+    await writeFile(join(projectDir, "src/contracts/auth.js"), AUTH_CONTRACT, "utf8");
+    await writeFile(join(projectDir, "src/contracts/response.js"), RESPONSE_CONTRACT, "utf8");
+
+    const executor = new CapturingExecutor();
+    // The base round fails (base model), the escalation round passes, so the
+    // ladder re-fans the unit once: that exercises BOTH prompt paths.
+    await runFullLive({
+      change,
+      dial: { minConcurrency: 1, maxConcurrency: 2 },
+      workerUrl: "http://w",
+      specYaml: BLUEPRINT_SPEC,
+      projectDir,
+      workRoot: join(workRoot, subdir, "run"),
+      fetchFn,
+      executor,
+      appGateCommandFor: (unitId) => gateCommandFor(unitId),
+      verifyCommandRunner: new MarkerGateRunner({ passingModel: ESCALATION_MODEL }),
+      baseModel: BASE_MODEL,
+      escalationModel: ESCALATION_MODEL,
+      maxModelRetries: 1,
+    });
+
+    // The blueprint's contract paths reached the executor (not just empty).
+    const kickoff = executor.attempts.find((a) => !a.isEscalation);
+    const refan = executor.attempts.find((a) => a.isEscalation);
+    expect(kickoff).toBeDefined();
+    expect(refan).toBeDefined();
+
+    for (const attempt of [kickoff!, refan!]) {
+      // The paths are threaded as before.
+      expect([...attempt.frozenContracts].sort()).toEqual([
+        "src/contracts/auth.js",
+        "src/contracts/response.js",
+      ]);
+      // The CONTENTS carry the real exported API, not just the paths: the
+      // requireAuth signature from auth.js and json/problem/readBody from
+      // response.js. This is what stops the model inventing a function that does
+      // not exist.
+      const byPath = new Map(attempt.frozenContractFiles.map((f) => [f.path, f.contents]));
+      expect(byPath.get("src/contracts/auth.js")).toContain("export function requireAuth");
+      const response = byPath.get("src/contracts/response.js") ?? "";
+      expect(response).toContain("export function json");
+      expect(response).toContain("export function problem");
+      expect(response).toContain("export async function readBody");
+    }
+  });
+
+  it("is empty-safe: a Change with no blueprint contracts threads no contract files (unchanged prompt)", async () => {
+    const subdir = "contract-contents-empty";
+    const workspaces = new LocalFilesystemWorkspaceProvider({
+      rootDir: join(workRoot, subdir, "artifacts"),
+    });
+    const control = new LocalChangeControl(workspaces);
+    const { fetchFn } = fakeWorker(control, workspaces);
+    // The plain single-unit SPEC has no blueprint, so no contracts are derived.
+    const change = parseChangeSpec(SPEC);
+
+    const projectDir = join(workRoot, subdir, "project");
+    await seedProject(projectDir);
+
+    const executor = new CapturingExecutor();
+    await runFullLive({
+      change,
+      dial: { minConcurrency: 1, maxConcurrency: 2 },
+      workerUrl: "http://w",
+      specYaml: SPEC,
+      projectDir,
+      workRoot: join(workRoot, subdir, "run"),
+      fetchFn,
+      executor,
+      appGateCommandFor: (unitId) => gateCommandFor(unitId),
+      verifyCommandRunner: new MarkerGateRunner({ passingModel: BASE_MODEL }),
+      baseModel: BASE_MODEL,
+      escalationModel: ESCALATION_MODEL,
+      maxModelRetries: 1,
+    });
+
+    // No blueprint contracts means no contract files threaded on any attempt.
+    for (const attempt of executor.attempts) {
+      expect(attempt.frozenContracts).toEqual([]);
+      expect(attempt.frozenContractFiles).toEqual([]);
+    }
   });
 });

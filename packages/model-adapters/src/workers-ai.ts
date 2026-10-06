@@ -479,6 +479,7 @@ function buildMessages(
     "You are given one WorkUnit objective, the exact file paths you are allowed to change, and the current contents of the in-scope files.",
     "START FROM THE CURRENT CONTENTS of the in-scope file shown below and make the MINIMAL change needed to satisfy the objective. Do NOT regenerate the file from scratch and do NOT rewrite a whole file when a focused change is enough. Preserve the existing imports EXACTLY (keep importing the frozen contracts), keep every existing export, and do not restyle or reformat code unrelated to the objective.",
     "Some files are FROZEN CONTRACTS: shared read-only interfaces other modules import. You must IMPORT and honor a frozen contract as it is; never rewrite, re-export, or change its shape, and never list it as an edit.",
+    "Call ONLY functions these contracts actually export; do not invent helper names. The frozen contract contents are shown below as read-only reference, so import and call the real exported names with their real signatures rather than guessing.",
     "Preserve the exported interface your module already provides.",
     ...exportRule,
     "Reply with ONE JSON document and nothing else, in this exact shape:",
@@ -494,6 +495,26 @@ function buildMessages(
     frozenContracts.length > 0
       ? frozenContracts.join("\n")
       : "(none declared for this change)";
+  // The ACTUAL CONTENTS of the frozen contract files, rendered as read-only
+  // reference so the model writes against the real exported API (the genuine
+  // function names and signatures) rather than inventing helpers that do not
+  // exist. Each contract is bounded by the executor's per-file byte cap so the
+  // prompt stays small (contract files are tiny), and the block is empty-safe:
+  // a Change with no contract files produces the exact same prompt as before.
+  const frozenContractFiles = context.frozenContractFiles ?? [];
+  const maxFileBytes = DEFAULT_MAX_FILE_BYTES;
+  const frozenContractBlocks =
+    frozenContractFiles.length > 0
+      ? frozenContractFiles
+          .map((file) => {
+            const bounded =
+              file.contents.length > maxFileBytes
+                ? `${file.contents.slice(0, maxFileBytes)}\n... (contract truncated)`
+                : file.contents;
+            return `--- FROZEN CONTRACT: ${file.path} ---\n${bounded}`;
+          })
+          .join("\n\n")
+      : "";
   const requiredExports = context.requiredExports ?? [];
   const fileBlocks =
     contextFiles.length > 0
@@ -512,6 +533,18 @@ function buildMessages(
     "",
     "Frozen contract files (READ-ONLY; import and honor these, never rewrite or edit them):",
     frozenLines,
+    // The frozen contract CONTENTS block only appears when the caller threaded
+    // the real file bodies, so a Change with no contract files produces the
+    // exact same prompt as before. When present it shows the genuine exported
+    // API so the model imports and calls the real names rather than inventing
+    // helpers that do not exist.
+    ...(frozenContractBlocks !== ""
+      ? [
+          "",
+          "Frozen contract files (READ-ONLY REFERENCE - import and call these exactly; do NOT edit them, do NOT invent other names):",
+          frozenContractBlocks,
+        ]
+      : []),
     // The required-exports block only appears when this module has a captured
     // exported interface, so a module with no exports (or any existing caller
     // that passes none) produces the exact same prompt as before.

@@ -138,6 +138,101 @@ describe("WorkersAiExecutor", () => {
     expect(seenUser).toMatch(/export function handle/);
   });
 
+  it("renders the frozen contract file CONTENTS as read-only reference and tells the model to call only exported names", async () => {
+    await mkdir(join(worktree, "src", "resources"), { recursive: true });
+    await writeFile(
+      join(worktree, "src/resources/users.js"),
+      "export async function handle(request, parts) { return request; }\n",
+      "utf8",
+    );
+
+    let seenSystem = "";
+    let seenUser = "";
+    const invoke: WorkersAiInvoke = async (request) => {
+      seenSystem = request.messages.find((m) => m.role === "system")?.content ?? "";
+      seenUser = request.messages.find((m) => m.role === "user")?.content ?? "";
+      return {
+        text: JSON.stringify({
+          commitMessage: "require auth and validate",
+          edits: [
+            {
+              path: "src/resources/users.js",
+              contents: "export async function handle(request, parts) { return request; }\n",
+            },
+          ],
+        }),
+      };
+    };
+
+    await new WorkersAiExecutor({ invoke }).execute({
+      worktreeDir: worktree,
+      workUnitId: "add-src-resources-users",
+      objective: "require auth and validate input in users",
+      paths: ["src/resources/users.js"],
+      baselineRef: "HEAD",
+      frozenContracts: ["src/contracts/auth.js", "src/contracts/response.js"],
+      // The real contract bodies, exactly as run-live reads them from the repo.
+      frozenContractFiles: [
+        {
+          path: "src/contracts/auth.js",
+          contents:
+            "import { problem } from './response.js';\nexport const DEMO_TOKEN = 'demo-token';\nexport function requireAuth(request) { return null; }\n",
+        },
+        {
+          path: "src/contracts/response.js",
+          contents:
+            "export function json(body, status = 200) { return new Response(JSON.stringify(body), { status }); }\n" +
+            "export function problem(status, detail) { return new Response(JSON.stringify({ error: detail }), { status }); }\n" +
+            "export async function readBody(request) { return {}; }\n",
+        },
+      ],
+    });
+
+    // The system prompt now tells the model to call ONLY the real exports and
+    // not invent helper names, backed by the real contents shown below.
+    expect(seenSystem).toMatch(/Call ONLY functions these contracts actually export/i);
+    expect(seenSystem).toMatch(/do not invent helper names/i);
+
+    // The user prompt carries the real contract API, not just the paths: the
+    // requireAuth signature from auth.js and the json/problem/readBody exports
+    // from response.js. Before the fix only the paths were listed, so the model
+    // could not know these names existed.
+    expect(seenUser).toMatch(/Frozen contract files \(READ-ONLY REFERENCE/i);
+    expect(seenUser).toContain("--- FROZEN CONTRACT: src/contracts/auth.js ---");
+    expect(seenUser).toContain("export function requireAuth(request)");
+    expect(seenUser).toContain("--- FROZEN CONTRACT: src/contracts/response.js ---");
+    expect(seenUser).toContain("export function json");
+    expect(seenUser).toContain("export function problem");
+    expect(seenUser).toContain("export async function readBody");
+    // The paths are still listed too (the existing instruction is kept).
+    expect(seenUser).toContain("src/contracts/auth.js");
+  });
+
+  it("is empty-safe: with no frozen contract files the prompt carries no contents block", async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/leaf2.ts"), "const internal = 1;\n", "utf8");
+
+    let seenUser = "";
+    const invoke: WorkersAiInvoke = async (request) => {
+      seenUser = request.messages.find((m) => m.role === "user")?.content ?? "";
+      return {
+        text: JSON.stringify({ edits: [{ path: "src/leaf2.ts", contents: "const internal = 2;\n" }] }),
+      };
+    };
+
+    await new WorkersAiExecutor({ invoke }).execute({
+      worktreeDir: worktree,
+      workUnitId: "leaf2",
+      objective: "tweak leaf",
+      paths: ["src/leaf2.ts"],
+      baselineRef: "HEAD",
+      // No frozenContractFiles: the read-only REFERENCE block must not appear.
+    });
+
+    expect(seenUser).not.toMatch(/READ-ONLY REFERENCE/i);
+    expect(seenUser).not.toContain("--- FROZEN CONTRACT:");
+  });
+
   it("omits the required-exports block when the module has no captured exports", async () => {
     await mkdir(join(worktree, "src"), { recursive: true });
     await writeFile(join(worktree, "src/leaf.ts"), "const internal = 1;\n", "utf8");

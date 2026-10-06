@@ -401,6 +401,21 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     (c) => c.path,
   );
 
+  // The ACTUAL CONTENTS of those frozen contract files, read once from the
+  // project baseline so the executor prompt can show the model the real exported
+  // API (the genuine function names and signatures) rather than only the paths.
+  // A model shown only a path cannot know which functions a contract exports, so
+  // it invents helpers that do not exist and writes a wrong call signature; the
+  // real contents let it write against the genuine interface. The contracts are
+  // repo files present in the project dir (and in every unit's clone), so reading
+  // them from the project dir is robust and avoids a per-unit read. It is
+  // skip-safe: a contract file that cannot be read is omitted rather than failing
+  // the run, and an empty list leaves the prompt exactly as it was before.
+  const frozenContractFiles = await readFrozenContractFiles(
+    options.projectDir,
+    frozenContracts,
+  );
+
   // The per-unit exported interface the Change's cohesion blueprint captured for
   // each owner module: the names other modules import from that unit. Threaded
   // into THAT unit's executor call (the kickoff wave below and the ladder re-fan)
@@ -512,6 +527,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
         paths: agent.paths,
         baselineRef: agent.baselineRef,
         ...(frozenContracts.length > 0 ? { frozenContracts } : {}),
+        ...(frozenContractFiles.length > 0 ? { frozenContractFiles } : {}),
         ...((requiredExportsByUnit.get(agent.unitId) ?? []).length > 0
           ? { requiredExports: requiredExportsByUnit.get(agent.unitId)! }
           : {}),
@@ -832,6 +848,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       maxModelRetries,
       baseModel: options.baseModel ?? "",
       frozenContracts,
+      frozenContractFiles,
       refanConcurrency: options.dial.maxConcurrency,
       defaultBranch: "main",
       worktreeRoot,
@@ -1076,6 +1093,14 @@ interface ChangeLevelLadderInput {
    */
   readonly frozenContracts: readonly string[];
   /**
+   * The ACTUAL CONTENTS of the frozen contract files, passed to the executor on
+   * a re-fan so the escalation prompt shows the model the real exported API (the
+   * genuine function names and signatures) rather than only the paths. Empty when
+   * the Change carries no readable contract files, leaving the retry prompt
+   * exactly as it was before.
+   */
+  readonly frozenContractFiles: readonly { readonly path: string; readonly contents: string }[];
+  /**
    * The bounded concurrency cap for re-fanning implicated units on a retry
    * round. Reuses the run's dial max so a retry round completes in roughly one
    * model-latency instead of N (each implicated unit has its own cloned
@@ -1318,6 +1343,9 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             model: escalationModel,
             ...(input.frozenContracts.length > 0
               ? { frozenContracts: input.frozenContracts }
+              : {}),
+            ...(input.frozenContractFiles.length > 0
+              ? { frozenContractFiles: input.frozenContractFiles }
               : {}),
             ...(unit.requiredExports.length > 0
               ? { requiredExports: unit.requiredExports }
@@ -2282,6 +2310,67 @@ function safeJson(text: string): unknown {
   } catch {
     return {};
   }
+}
+
+/**
+ * The per-file byte cap applied to a frozen contract's contents before it is
+ * threaded to the executor prompt. It matches the executor's own default max
+ * file bytes, so a contract body is bounded the same way an in-scope file is.
+ * Contract files are tiny, so this effectively never truncates in practice; the
+ * cap is defensive so an unexpectedly large contract cannot bloat the prompt.
+ */
+const FROZEN_CONTRACT_MAX_BYTES = 8 * 1024;
+
+/**
+ * Read the ACTUAL CONTENTS of the frozen contract files from the project
+ * baseline, so the executor prompt can show the model the real exported API
+ * rather than only the paths. The contracts are repo files, so they are present
+ * in the project dir (and in every unit's clone); reading them from the project
+ * dir once is robust and avoids a per-unit read. It is skip-safe and
+ * contained: a path that escapes the project dir, is missing, is not a regular
+ * file, or cannot be read is simply omitted (never fails the run), and each
+ * body is bounded by FROZEN_CONTRACT_MAX_BYTES. An empty input yields an empty
+ * list, so a Change with no contracts leaves the prompt unchanged.
+ */
+async function readFrozenContractFiles(
+  projectDir: string,
+  contractPaths: readonly string[],
+): Promise<readonly { readonly path: string; readonly contents: string }[]> {
+  if (contractPaths.length === 0) {
+    return [];
+  }
+  const { readFile, stat } = await import("node:fs/promises");
+  const { resolve, sep } = await import("node:path");
+  const root = resolve(projectDir);
+  const out: { path: string; contents: string }[] = [];
+  for (const rel of contractPaths) {
+    // Reject a path that escapes the project dir rather than reading outside it.
+    if (rel.startsWith("/") || rel.includes("..")) {
+      continue;
+    }
+    const abs = resolve(root, rel);
+    if (abs !== root && !abs.startsWith(root + sep)) {
+      continue;
+    }
+    try {
+      const info = await stat(abs);
+      if (!info.isFile()) {
+        continue;
+      }
+      const contents = await readFile(abs, "utf8");
+      out.push({
+        path: rel,
+        contents:
+          contents.length > FROZEN_CONTRACT_MAX_BYTES
+            ? contents.slice(0, FROZEN_CONTRACT_MAX_BYTES)
+            : contents,
+      });
+    } catch {
+      // Skip-safe: a missing or unreadable contract file is omitted, never a
+      // run failure. The path is still listed via frozenContracts.
+    }
+  }
+  return out;
 }
 
 /**

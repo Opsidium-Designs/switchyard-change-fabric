@@ -29,6 +29,22 @@ export interface ExecutorContext {
    */
   readonly frozenContracts?: readonly string[];
   /**
+   * Optional ACTUAL CONTENTS of the frozen contract files, so an inference
+   * executor can show the model the real API it must import and call rather than
+   * only the paths. A model that is shown a path but never the file body cannot
+   * know which functions a contract exports, so it invents helper names that do
+   * not exist and writes a wrong call signature; including the real contents as
+   * read-only reference lets it write against the genuine interface. Each entry
+   * carries the contract's repo-relative path and its full file contents (bounded
+   * by the executor's per-file byte cap). Optional and defaulting to empty, so a
+   * deterministic executor and every existing caller are unchanged, and a Change
+   * with no contracts (or whose contract files could not be read) omits it.
+   */
+  readonly frozenContractFiles?: readonly {
+    readonly path: string;
+    readonly contents: string;
+  }[];
+  /**
    * Optional names of the symbols THIS unit's module must keep exporting: its
    * EXPORTED INTERFACE, which other modules (and the entry point) import by
    * name. An inference executor lists these in the prompt so the model changes
