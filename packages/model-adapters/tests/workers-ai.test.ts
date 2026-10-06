@@ -125,6 +125,19 @@ describe("WorkersAiExecutor", () => {
     expect(seenSystem).toMatch(/preserve the exported interface/i);
     expect(seenSystem).toMatch(/START FROM THE CURRENT CONTENTS/i);
     expect(seenSystem).toMatch(/MINIMAL change/i);
+    // The system prompt now carries the frozen auth-guard contract guidance: a
+    // guard returning a Response ONLY when it rejects (null-ish when it accepts)
+    // must be short-circuited ONLY on a truthy Response, and a valid authorized
+    // request MUST return a 2xx success rather than an error on the valid path.
+    // The guidance is goal-agnostic: it is phrased about honoring the contract,
+    // not about any service-api resource name.
+    expect(seenSystem).toMatch(/returns a Response ONLY when it rejects/i);
+    expect(seenSystem).toMatch(/MUST perform the real work and return a 2xx/i);
+    expect(seenSystem).toMatch(/never return an error helper .* on the authorized, valid path/i);
+    expect(seenSystem).toMatch(/exactly once and reuse/i);
+    // Goal-agnostic: it never hardcodes a resource name like users/orders.
+    expect(seenSystem).not.toMatch(/\busers\b/i);
+    expect(seenSystem).not.toMatch(/\brequireAuth\b/);
     // The system prompt names the real export and the concrete `export function`
     // / `export { ... }` syntax the file MUST still contain, so the instruction
     // is forceful and concrete rather than advisory.

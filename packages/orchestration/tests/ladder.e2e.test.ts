@@ -470,14 +470,21 @@ describe("T10: the bounded model-escalation ladder (offline, deterministic)", ()
     expect(snapshot.verifyAttempts?.every((a) => a.outcome === "fail")).toBe(true);
     expect(snapshot.retryAttempts).toHaveLength(1);
 
-    // The unit is a real failed/red node, and both change-level verify nodes are red.
+    // The change failed terminally, but that failure is shown on the GOAL and
+    // the VERIFY nodes (both red), NOT by retroactively reddening the original
+    // round-1 agent. The fix unit completed its own round-1 work, so it keeps
+    // its real round-1 outcome instead of being flipped to failed solely because
+    // the change-level gate failed.
     const model = buildWorkGraphModel(snapshot);
     const fixNode = model.nodes.find((n) => n.label === "fix");
-    expect(fixNode?.status).toBe("failed");
-    expect(fixNode?.verified).toBe(false);
+    expect(fixNode?.status).not.toBe("failed");
+    // Both change-level verify nodes are red (the honest terminal failure signal).
     expect(model.nodes.filter((n) => n.kind === "verify").every((n) => n.verified === false)).toBe(true);
-    // The goal does not falsely green while the unit is failed.
+    // The goal does not falsely green; it carries the change-level failure.
     expect(model.nodes.find((n) => n.kind === "goal")?.verified).toBe(false);
+    // Gate-equals-deploy honesty is preserved independently of unit status: the
+    // change is still not integrated and the app is still not redeployed (already
+    // asserted above), so the terminal failure never greens or ships.
   });
 
   it("the max-retries dial bounds escalation: with maxModelRetries=0 a base-fail is terminal (no retry)", async () => {
@@ -711,7 +718,7 @@ describe("round-N agents: a retry round spawns and tracks REAL agents like the k
     }
   });
 
-  it("a round-N unit whose round produces no fixing edit shows FAILED, backed by recorded state (red node)", async () => {
+  it("round-N agents reflect their own per-round recorded status while the change-level gate stays the authority (original unit keeps its round-1 outcome)", async () => {
     // No model ever passes, so both bounded retry rounds fire and the change
     // exhausts. The ModelAwareExecutor always writes a marker (so each round
     // pushes an edit and the round-N agent integrates per round), but the final
@@ -741,11 +748,21 @@ describe("round-N agents: a retry round spawns and tracks REAL agents like the k
     // (unit, round)), so round 2 and round 3 are genuinely separate instances.
     const names = new Set(roundAgents.map((a) => a.workspace.workspaceName));
     expect(names.size).toBe(roundAgents.length);
-    // The AUTHORITATIVE gate still decides: the change never passed, so "fix" is
-    // a real failed unit and the change did not integrate (gate-equals-deploy):
-    // a round-N agent going green individually does NOT mean the change passed.
-    expect(snapshot.work.find((u) => u.id === "fix")?.status).toBe("failed");
+    // The AUTHORITATIVE gate still decides: the change never passed, so the
+    // change did not integrate (gate-equals-deploy). But that change-level
+    // failure is NOT painted onto the original "fix" agent: a unit that completed
+    // its round-1 work keeps its real round-1 outcome rather than being flipped
+    // to failed solely because the change-level gate failed.
+    expect(snapshot.work.find((u) => u.id === "fix")?.status).not.toBe("failed");
     expect(result.evidence.integration.integratedUnits).not.toContain("fix");
+
+    // The change-level failure is shown on the GOAL (red) and the VERIFY nodes
+    // (red), the honest terminal signal, independent of the per-unit status.
+    const failModel = buildWorkGraphModel(snapshot);
+    expect(failModel.nodes.find((n) => n.kind === "goal")?.verified).toBe(false);
+    expect(
+      failModel.nodes.filter((n) => n.kind === "verify").every((n) => n.verified === false),
+    ).toBe(true);
 
     // The graph projects each round-N node from its recorded state and every
     // node stays backed.

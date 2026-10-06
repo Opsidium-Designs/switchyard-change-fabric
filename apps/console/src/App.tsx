@@ -644,12 +644,10 @@ function Legend() {
       <li><span className="swatch-hex sw-retry" aria-hidden="true" /> retry</li>
       {/* A tool is a YELLOW SQUARE. */}
       <li><span className="swatch-square sw-tool" aria-hidden="true" /> tool</li>
-      {/* The rendered edge vocabulary is exactly these five kinds. */}
+      {/* The rendered edge vocabulary is exactly these three kinds. */}
       <li><span className="line ln-dependency" /> dependency</li>
       <li><span className="line ln-spawn" /> event-driven spawn</li>
       <li><span className="line ln-tool" /> consumed tool</li>
-      <li><span className="line ln-lease" /> write-lease</li>
-      <li><span className="line ln-dataflow" /> data flow</li>
     </ul>
   );
 }

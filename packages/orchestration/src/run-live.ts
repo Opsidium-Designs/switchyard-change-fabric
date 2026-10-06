@@ -882,21 +882,14 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   }
 
   // When the change-level ladder never passed the gate (both rounds failed, or
-  // escalation was disabled), every gated unit is marked FAILED on the Worker,
-  // so they become real red nodes, are excluded from integration, and block any
-  // redeploy. This is the honest terminal of the change-level ladder: a
-  // non-fixing or broken change is never greened.
-  const ladderFailed = new Set<string>();
-  if (!changePassed) {
-    for (const unit of gatedUnits) {
-      ladderFailed.add(unit.id);
-      await post(
-        `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unit.id)}/verify-fail`,
-        { reason: "change-level model-escalation ladder exhausted: the change did not pass the per-app gate" },
-      ).catch(() => {});
-      reportStep(unit.id, "failed", "change-level verify failed after the bounded model-escalation ladder");
-    }
-  }
+  // escalation was disabled), the change is terminally FAILED, but that failure
+  // is surfaced on the GOAL node and the VERIFY round nodes (red), not by
+  // retroactively reddening every original round-1 agent. Each round-1 unit keeps
+  // its real round-1 outcome. Gate-equals-deploy honesty is preserved
+  // independently of unit status: integration/promotion/redeploy key off the
+  // mechanical verification verdict and integrated set below (a non-fixing or
+  // broken change still never greens or redeploys), so no per-unit status
+  // overwrite is needed to keep the change failed.
 
   // The integration workspace is a disposable local bare repo seeded from the
   // project baseline. Integration and promotion are Node-side Git work, so they
@@ -1478,15 +1471,74 @@ function selectImplicatedUnits(
   evidence: string,
 ): readonly GatedUnitInput[] {
   const failingFiles = extractFailingFiles(evidence);
-  if (failingFiles.length === 0) {
+  const failingNames = extractFailingNames(evidence);
+  if (failingFiles.length === 0 && failingNames.length === 0) {
     return gatedUnits; // nothing to attribute to: re-fan all
   }
-  const implicated = gatedUnits.filter((unit) =>
-    unit.paths.some((declared) => failingFiles.some((file) => pathCovers(declared, file))),
+  const implicated = gatedUnits.filter(
+    (unit) =>
+      unit.paths.some((declared) => failingFiles.some((file) => pathCovers(declared, file))) ||
+      failingNames.some((name) => unitCoversName(unit, name)),
   );
-  // Honest fallback: if the named files do not map to any unit's declared paths,
-  // re-fan all rather than silently skip (the change failed either way).
+  // Honest fallback: if neither the named files nor the named resources map to
+  // any unit, re-fan all rather than silently skip (the change failed either
+  // way). Attribution is best-effort narrowing, not a correctness claim.
   return implicated.length > 0 ? implicated : gatedUnits;
+}
+
+/**
+ * Extract the distinct failing RESOURCE NAMES from a failing gate output. The
+ * change-level gate is a node:test suite whose assertion names are keyed by the
+ * resource NAME, not a source path (e.g. `users: authenticated, valid request
+ * still succeeds` or `users must still succeed`). This pulls the leading
+ * `<name>` token off those failing-assertion lines so a name->unit map can be
+ * built even when the output names no source file. Returns a deduplicated list;
+ * an empty list means no resource name was attributable.
+ */
+function extractFailingNames(evidence: string): readonly string[] {
+  const found = new Set<string>();
+  const lines = evidence.split(/\r?\n/);
+  // Deterministic tokens emitted by node:test for a failing assertion: a
+  // `not ok` TAP line or a bare assertion-name line of the shape
+  // `<name>: <message>` or `<name> must <message>`. Capture the leading
+  // identifier token in either shape.
+  const colonShape = /^(?:not ok\s+\d+\s+-\s+|#\s+|\s*)?([A-Za-z0-9_-]+):\s+\S/;
+  const mustShape = /^(?:not ok\s+\d+\s+-\s+|#\s+|\s*)?([A-Za-z0-9_-]+)\s+must\s+\S/;
+  for (const line of lines) {
+    const colon = colonShape.exec(line);
+    if (colon && colon[1]) {
+      found.add(colon[1]);
+      continue;
+    }
+    const must = mustShape.exec(line);
+    if (must && must[1]) {
+      found.add(must[1]);
+    }
+  }
+  return [...found];
+}
+
+/**
+ * Whether a gated unit owns a failing resource name. The unit->resource
+ * relationship is carried by the unit's id and its declared paths: a resource
+ * `users` is owned by the unit whose id is (or ends with) `users` or whose
+ * declared paths contain a `.../<name>.js` (or `<name>.ts`) segment. Matching is
+ * on whole path segments so `users` never matches `users-admin.js`.
+ */
+function unitCoversName(unit: GatedUnitInput, name: string): boolean {
+  const n = name.toLowerCase();
+  const id = unit.unitId.toLowerCase();
+  if (id === n || id.endsWith(`-${n}`) || id.endsWith(`/${n}`) || id.endsWith(`:${n}`)) {
+    return true;
+  }
+  return unit.paths.some((declared) => {
+    const normalized = declared.replace(/^\.\//, "").replace(/[*]+/g, "");
+    const segments = normalized.split("/").filter((seg) => seg.length > 0);
+    return segments.some((seg) => {
+      const base = seg.replace(/\.[A-Za-z0-9]+$/, "").toLowerCase();
+      return base === n;
+    });
+  });
 }
 
 /**

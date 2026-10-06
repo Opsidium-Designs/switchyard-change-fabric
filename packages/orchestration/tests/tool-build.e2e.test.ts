@@ -278,7 +278,7 @@ describe("M4: the graph projects the tool node, consumed-tool edges, and lease e
     expect(consumed.map((e) => e.to)).toEqual(["unit:validate-a"]);
   });
 
-  it("surfaces the write lease as an edge from each waiter to the owner", () => {
+  it("records write-lease coordination without rendering it as a graph edge", () => {
     const snapshot: ChangeStateSnapshot = {
       id: "change-audit-logging",
       objective: "Add organization-level audit logging",
@@ -292,15 +292,12 @@ describe("M4: the graph projects the tool node, consumed-tool edges, and lease e
       leaseEdges: [{ path: "src/audit/events.ts", owner: "api", waiters: ["tests"] }],
     };
     const model = buildWorkGraphModel(snapshot);
-    const lease = model.edges.filter((e) => e.kind === "lease");
-    expect(lease).toHaveLength(1);
-    expect(lease[0]?.from).toBe("unit:tests"); // waiter
-    expect(lease[0]?.to).toBe("unit:api"); // owner
-    expect(lease[0]?.backing).toEqual({
-      kind: "lease",
-      path: "src/audit/events.ts",
-      owner: "api",
-      waiter: "tests",
-    });
+    // Write-lease coordination is still recorded in the snapshot and applied by
+    // the integrator, but it is no longer part of the rendered edge vocabulary:
+    // the graph draws exactly three kinds (dependency, spawn, consumed-tool), so
+    // no lease edge is rendered.
+    for (const edge of model.edges) {
+      expect(["dependency", "spawn", "consumed-tool"]).toContain(edge.kind);
+    }
   });
 });

@@ -40,6 +40,12 @@ const STAGGER_STEP = 34;
 const X_JITTER = 22;
 /** Deterministic per-node vertical jitter amplitude (SVG units). */
 const Y_JITTER = 18;
+/**
+ * Extra vertical gap pushed onto a retry node so it is not cramped against the
+ * verify node directly above it in the ladder tail. Applied only to a `retry`
+ * node's y, so the rest of the layout spacing is unchanged.
+ */
+const RETRY_EXTRA_GAP = 70;
 
 interface Placed {
   readonly node: GraphNode;
@@ -55,14 +61,13 @@ interface Placed {
 }
 
 /**
- * Build the per-node parent list from the dependency/data-flow AND spawn edges,
- * so a node can be ordered within its layer by the mean x of its parents (its
- * barycenter) and an event-spawned node hangs off its spawner rather than
- * floating in a tidy row. Goal-rooting edges are ignored, exactly as in
- * computeLayers. The ladder chain (escalation hop, per-unit re-fan) rides the
- * dependency/data-flow kinds, so following those also follows the ladder; the
- * spawn kind is now followed too so a recruited node branches beneath the unit
- * whose push recruited it.
+ * Build the per-node parent list from the dependency AND spawn edges, so a node
+ * can be ordered within its layer by the mean x of its parents (its barycenter)
+ * and an event-spawned node hangs off its spawner rather than floating in a tidy
+ * row. Goal-rooting edges are ignored, exactly as in computeLayers. The ladder
+ * chain (escalation hop, per-unit re-fan) rides the dependency kind, so
+ * following it also follows the ladder; the spawn kind is followed too so a
+ * recruited node branches beneath the unit whose push recruited it.
  */
 function buildParentLists(model: WorkGraphModel): Map<string, string[]> {
   const parents = new Map<string, string[]>();
@@ -75,7 +80,7 @@ function buildParentLists(model: WorkGraphModel): Map<string, string[]> {
     if (edge.from === goalNodeId(model.changeId)) {
       continue;
     }
-    if (edge.kind === "dependency" || edge.kind === "data-flow" || edge.kind === "spawn") {
+    if (edge.kind === "dependency" || edge.kind === "spawn") {
       const list = parents.get(edge.to);
       if (list) {
         list.push(edge.from);
@@ -141,8 +146,11 @@ function placeNodes(model: WorkGraphModel): { placed: Placed[]; height: number; 
       // the layout is reproducible for tests and a node never jumps between
       // polls, yet siblings no longer sit on one dead-straight row/column.
       const stagger = ((i % 3) - 1) * STAGGER_STEP;
+      // A retry node sits an extra gap below its layer row so it is not cramped
+      // against the verify node directly above it in the ladder tail.
+      const retryGap = node.kind === "retry" ? RETRY_EXTRA_GAP : 0;
       const x = baseX + jitter(node.id, "x", X_JITTER);
-      const yv = y + stagger + jitter(node.id, "y", Y_JITTER);
+      const yv = y + retryGap + stagger + jitter(node.id, "y", Y_JITTER);
       placed.push({ node, x, y: yv, labelTier: i % 2 });
       xOf.set(node.id, x);
     });
@@ -190,8 +198,8 @@ function jitter(id: string, axis: string, amp: number): number {
 }
 function computeLayers(model: WorkGraphModel): Map<string, number> {
   const deps = new Map<string, string[]>();
-  // Build the per-unit dependency list from the declared dependency/data-flow
-  // AND spawn edges between unit nodes (ignore only the goal-rooting edges).
+  // Build the per-unit dependency list from the declared dependency AND spawn
+  // edges between unit nodes (ignore only the goal-rooting edges).
   for (const node of model.nodes) {
     if (node.kind !== "goal") {
       deps.set(node.id, []);
@@ -202,14 +210,14 @@ function computeLayers(model: WorkGraphModel): Map<string, number> {
       continue;
     }
     // The ladder reads top to bottom: a verify node hangs below its unit (fed by
-    // a data-flow edge), a retry node hangs below the failing verify it escalated
-    // from (a dependency edge), and a round-N agent hangs below its retry (a
-    // data-flow re-fan edge). The escalation hop and the per-unit re-fan ride the
-    // dependency/data-flow kinds, so following those lays the whole chain down
+    // a dependency edge), a retry node hangs below the failing verify it
+    // escalated from (a dependency edge), and a round-N agent hangs below its
+    // retry (a dependency re-fan edge). The escalation hop and the per-unit
+    // re-fan ride the dependency kind, so following it lays the whole chain down
     // the rows. The spawn kind is followed too, so an event-spawned (recruited)
     // node sits a layer BELOW the unit whose push recruited it, hanging off its
     // spawner instead of floating in a flat, detached row.
-    if (edge.kind === "dependency" || edge.kind === "data-flow" || edge.kind === "spawn") {
+    if (edge.kind === "dependency" || edge.kind === "spawn") {
       const list = deps.get(edge.to);
       if (list) {
         list.push(edge.from);
@@ -239,23 +247,16 @@ function computeLayers(model: WorkGraphModel): Map<string, number> {
   return layer;
 }
 
-/** The stroke style per edge kind. The vocabulary is exactly five kinds. */
+/** The stroke style per edge kind. The vocabulary is exactly three kinds. */
 function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
   switch (kind) {
-    case "data-flow":
-      return { stroke: "#3fb950" }; // data has flowed from a completed prerequisite
     case "spawn":
       return { stroke: "#d2a8ff", dash: "2 5" }; // event-driven recruitment
     case "consumed-tool":
       // A real tool run: a bright AMBER edge, drawn solid (no dash), so it reads
-      // as a distinct tool-consumption and is never confused with the lease
-      // edge. A consumed-tool edge only ever appears next to a tool node.
+      // as a distinct tool-consumption. A consumed-tool edge only ever appears
+      // next to a tool node.
       return { stroke: "#f0883e" };
-    case "lease":
-      // Owner-coordination (a waiter waiting for the single write lease): a TEAL
-      // dotted edge, a clearly different hue and pattern from the amber tool
-      // edge, so the two are visually unmistakable even at render scale.
-      return { stroke: "#2dd4bf", dash: "1 5" };
     case "dependency":
     default:
       return { stroke: "#5a6472" };
@@ -579,7 +580,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                     x2={to.x}
                     y2={to.y}
                     stroke={style.stroke}
-                    strokeWidth={edge.kind === "data-flow" ? 2.5 : 1.5}
+                    strokeWidth={edge.backing.kind === "model-escalation" ? 2.5 : 1.5}
                     strokeDasharray={style.dash}
                     markerEnd="url(#arrow)"
                     className={`edge edge-${edge.kind}`}

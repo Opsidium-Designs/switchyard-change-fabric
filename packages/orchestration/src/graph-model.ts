@@ -377,18 +377,17 @@ export type GraphNodeKind =
 
 /**
  * The kind of an edge in the rendered graph. The vocabulary is exactly these
- * five: the ladder's escalation hop and per-unit re-fan reuse `dependency` and
- * `data-flow` rather than carrying their own bespoke kinds, so the rendered edge
- * set stays small and legible. The edge's `backing` still records the precise
- * provenance (including the model-escalation / re-fan state it came from), so no
- * honesty is lost by folding them onto the shared kinds.
+ * three: the ladder's escalation hop, the per-unit re-fan, a live push
+ * promotion, a verify flow, and goal/retry->agent connections all reuse
+ * `dependency` rather than carrying their own bespoke kinds, so the rendered
+ * edge set stays small and legible. The edge's `backing` still records the
+ * precise provenance (including the model-escalation / re-fan state it came
+ * from), so no honesty is lost by folding them onto the shared kinds.
  */
 export type GraphEdgeKind =
-  | "dependency" // a declared WorkGraph dependency (also the ladder escalation hop)
-  | "data-flow" // a dependency an agent push has made live (also a ladder re-fan)
+  | "dependency" // a declared WorkGraph dependency (also the ladder escalation hop, a live push promotion, a verify flow, and a ladder re-fan)
   | "spawn" // an event-driven recruitment: a push recruited the target
-  | "consumed-tool" // a downstream agent actually ran an agent-built tool
-  | "lease"; // a write-lease coordination: owner <- waiter on a contested path
+  | "consumed-tool"; // a downstream agent actually ran an agent-built tool
 
 /**
  * The real state element a node is backed by. Every node carries one. There is
@@ -793,6 +792,35 @@ function isSpawned(unit: WorkUnitSnapshot): boolean {
   return unit.status === "running" || unit.status === "verified" || unit.status === "integrated" || unit.status === "failed";
 }
 
+/**
+ * Whether a round-N retry agent has actually materialized, so its node is
+ * emitted only once it has leased/run rather than all at once when the retry
+ * record lands. This mirrors kickoff `isSpawned`: a round-N node appears when a
+ * real recorded round-agent instance for (unitId, round) carries a workspace,
+ * recorded run steps, run detail, or an advanced status. A retry record with no
+ * recorded round-agent instance yet yields NO round node, so round-N agents
+ * stagger in as each one leases/runs, exactly like the kickoff wave. Every node
+ * this admits is still fully backed by its recorded round-agent instance, so the
+ * no-unbacked-node rule is preserved.
+ */
+function isRoundAgentSpawned(agent: RoundAgentSnapshot | undefined): boolean {
+  if (!agent) {
+    return false;
+  }
+  if (agent.workspace !== undefined) {
+    return true;
+  }
+  if ((agent.activity?.length ?? 0) > 0 || agent.detail !== undefined) {
+    return true;
+  }
+  return (
+    agent.status === "running" ||
+    agent.status === "verified" ||
+    agent.status === "integrated" ||
+    agent.status === "failed"
+  );
+}
+
 /** The goal node's status + green flag, derived from the whole-change verdict. */
 interface GoalOutcome {
   readonly status: WorkUnitStatus;
@@ -881,7 +909,6 @@ function goalOutcome(snapshot: ChangeStateSnapshot): GoalOutcome {
  * them.
  */
 export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphModel {
-  const completed = new Set(snapshot.completed);
   const unitIds = new Set(snapshot.work.map((u) => u.id));
   // The units that have actually been spawned/recruited, so a node is emitted
   // for them. A not-yet-spawned (still pending) unit is withheld: it has no agent
@@ -1001,19 +1028,20 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     });
   }
 
-  // Declared dependency edges. An edge whose prerequisite is complete is a
-  // data-flow edge (data has flowed from the finished prerequisite); otherwise
-  // it is a plain dependency edge. Both are backed by the real edge in state.
+  // Declared dependency edges. Every declared WorkGraph dependency renders as a
+  // single `dependency` kind, backed by the real edge in state.
   for (const edge of snapshot.edges) {
     if (!spawnedIds.has(edge.from) || !spawnedIds.has(edge.to)) {
       // Skip an edge whose endpoint has no node yet (unknown unit, or a unit not
       // yet spawned/materialized), rather than drawing an edge to a missing node.
       continue;
     }
-    const live = completed.has(edge.from);
     edges.push({
       id: `${edge.from}->${edge.to}`,
-      kind: live ? "data-flow" : "dependency",
+      // A declared dependency, whether or not an agent push has made it live, is
+      // rendered as a single `dependency` kind. The declared dependency is the
+      // real backing.
+      kind: "dependency",
       from: unitNodeId(edge.from),
       to: unitNodeId(edge.to),
       backing: { kind: "dependency", from: edge.from, to: edge.to },
@@ -1085,7 +1113,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     if (spawnedIds.has(tool.builderUnitId)) {
       edges.push({
         id: `built:${tool.builderUnitId}->${tool.capability}`,
-        kind: "data-flow",
+        kind: "dependency",
         from: unitNodeId(tool.builderUnitId),
         to: toolNodeId(tool.capability),
         backing: { kind: "dependency", from: tool.builderUnitId, to: tool.capability },
@@ -1113,27 +1141,6 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
           consumerUnitId: consumption.consumerUnitId,
           at: consumption.at,
         },
-      });
-    }
-  }
-
-  // Write-lease coordination edges: for each contested path, one edge from each
-  // waiter to the owner, surfacing the single-writer coordination (the waiter
-  // waits for the owner before integrating). Backed by the real lease decision.
-  for (const lease of snapshot.leaseEdges ?? []) {
-    if (!spawnedIds.has(lease.owner)) {
-      continue;
-    }
-    for (const waiter of lease.waiters) {
-      if (!spawnedIds.has(waiter)) {
-        continue;
-      }
-      edges.push({
-        id: `lease:${lease.path}:${waiter}->${lease.owner}`,
-        kind: "lease",
-        from: unitNodeId(waiter),
-        to: unitNodeId(lease.owner),
-        backing: { kind: "lease", path: lease.path, owner: lease.owner, waiter },
       });
     }
   }
@@ -1184,7 +1191,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
         : retryNodeId(snapshot.id, attempt.round);
     edges.push({
       id: `verify-flow:${snapshot.id}#${attempt.round}`,
-      kind: "data-flow",
+      kind: "dependency",
       from: fromId,
       to: verifyNodeId(snapshot.id, attempt.round),
       backing: { kind: "dependency", from: snapshot.id, to: `verify#${attempt.round}` },
@@ -1265,13 +1272,21 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
       // recorded workspace and a real status lifecycle, exactly like a kickoff
       // agent. The node's status/verified/workspace/activity/detail come from
       // THIS record rather than a hardcoded literal, so the node moves blue
-      // (running) -> green (integrated) / red (failed) like a kickoff node. When
-      // no round-N agent is recorded yet (the retry record exists but the agent
-      // has not leased), fall back to "running" so the just-spawned instance
-      // reads as in flight until its lifecycle lands.
+      // (running) -> green (integrated) / red (failed) like a kickoff node. The
+      // node is only emitted once that record has materialized (gated below), so
+      // round-N agents stagger in like the kickoff wave.
       const roundAgent = (snapshot.roundAgents ?? []).find(
         (a) => a.unitId === unitId && a.round === retry.round,
       );
+      // Stagger round-N agents like the kickoff wave: withhold this round node
+      // (and its re-fan edge) until a real round-agent instance for (unitId,
+      // round) has materialized (leased/run), rather than emitting every
+      // implicated unit's node at once when the retry record lands. A retry with
+      // no recorded round-agent yet draws its retry node but no round agents, so
+      // the second wave pops in one by one as each round agent leases.
+      if (!isRoundAgentSpawned(roundAgent)) {
+        continue;
+      }
       const roundStatus: WorkUnitStatus = roundAgent?.status ?? "running";
       const roundExtras = {
         ...(roundAgent?.workspace ? { workspace: roundAgent.workspace } : {}),
@@ -1302,10 +1317,11 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
 
       edges.push({
         id: `re-fan:${snapshot.id}#${retry.round}->${unitId}`,
-        // The per-unit re-fan reuses the `data-flow` kind (the retry fed this
-        // round-N agent its escalation edit). Its backing still records the full
+        // The per-unit re-fan reuses the `dependency` kind (the round-N agent
+        // depends on the retry that fed it its escalation edit), so goal->agent
+        // and retry->agent share one kind. Its backing still records the full
         // re-fan provenance, so the shared kind loses no honesty.
-        kind: "data-flow",
+        kind: "dependency",
         from: retryNodeId(snapshot.id, retry.round),
         to: roundAgentNodeId(snapshot.id, retry.round, unitId),
         backing: {

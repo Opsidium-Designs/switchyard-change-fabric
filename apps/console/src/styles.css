@@ -330,6 +330,18 @@ body {
   stroke-width: 3;
 }
 
+/* The white selection ring must draw on EVERY node kind and state when selected,
+   including a red/failed or escalated circle. A stylesheet rule beats the inline
+   stroke presentation attribute set in graph-view, so without this the is-failed
+   and is-escalated outlines above would always win and the selection ring would
+   never show on those nodes. Listing circle and polygon (goal diamond, verify and
+   retry hexagons, tool square) covers all node shapes. */
+.node.is-selected circle,
+.node.is-selected polygon {
+  stroke: #e6edf3;
+  stroke-width: 3;
+}
+
 .node-label {
   fill: #e6edf3;
   font-size: 0.8rem;
@@ -462,13 +474,10 @@ body {
 }
 
 .ln-dependency { border-top-color: #5a6472; }
-.ln-dataflow { border-top-color: #3fb950; }
 .ln-spawn { border-top-color: #d2a8ff; border-top-style: dashed; }
-/* A consumed-tool edge is a SOLID amber line; a write-lease is a DOTTED teal
-   line. They mirror the graph-view edge styling exactly, so the legend reads
-   the same as the graph and the two are never confusable. */
+/* A consumed-tool edge is a SOLID amber line, mirroring the graph-view edge
+   styling exactly, so the legend reads the same as the graph. */
 .ln-tool { border-top-color: #f0883e; border-top-style: solid; }
-.ln-lease { border-top-color: #2dd4bf; border-top-style: dotted; }
 
 /* --- Dial control --- */
 
