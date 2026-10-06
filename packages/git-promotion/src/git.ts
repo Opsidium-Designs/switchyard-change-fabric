@@ -100,3 +100,13 @@ export async function listTrackedFiles(repoDir: string): Promise<readonly string
     .map((line) => line.trim())
     .filter((line) => line !== "");
 }
+
+/**
+ * The tree object hash a ref points at. Two refs that resolve to the same tree
+ * hash have byte-identical content (ignoring commit metadata and history), so
+ * comparing tree hashes is how promotion decides whether the integrated tree
+ * actually differs from the baseline it was seeded from.
+ */
+export async function treeHash(repoDir: string, ref: string): Promise<string> {
+  return (await git(repoDir, ["rev-parse", `${ref}^{tree}`])).trim();
+}

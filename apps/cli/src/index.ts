@@ -470,6 +470,7 @@ const commands: Command[] = [
         ...(gateFlag !== undefined ? { gateFlag } : {}),
         executorLive: selected.live,
         escalationModel: selected.escalationModel,
+        escalationModels: selected.escalationModels,
         baseModel: selected.baseModel,
         maxModelRetries,
       });
@@ -501,6 +502,9 @@ const commands: Command[] = [
           ? { verifyCommandRunner: gateWiring.verifyCommandRunner }
           : {}),
         ...(gateWiring.escalationModel ? { escalationModel: gateWiring.escalationModel } : {}),
+        ...(gateWiring.escalationModels && gateWiring.escalationModels.length > 0
+          ? { escalationModels: gateWiring.escalationModels }
+          : {}),
         ...(gateWiring.baseModel ? { baseModel: gateWiring.baseModel } : {}),
         ...(gateWiring.maxModelRetries !== undefined
           ? { maxModelRetries: gateWiring.maxModelRetries }

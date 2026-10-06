@@ -28,6 +28,20 @@ export interface PromotionInput {
    * Defaults to the workspace default branch when omitted.
    */
   readonly integrationBranch?: string;
+  /**
+   * The number of verified WorkUnits the integration landed in the promoted
+   * tree. When this is greater than zero a fix was expected to be present, so
+   * the integrated tree MUST differ from the delivery branch start point. If it
+   * does not (the integration never advanced past the baseline seed, so the gate
+   * passed on a baseline-identical tree and promotion would silently ship the
+   * unfixed baseline), promotion fails loudly instead of committing the baseline.
+   * This keeps the gated tree and the promoted tree the same: a run that greened
+   * because its edits were detected is the only run that promotes content, and a
+   * run whose edits vanished before integration cannot masquerade as a landed
+   * fix. Omitted or zero means no fix was expected (an empty or additive-only
+   * change), so an unchanged promotion is a normal no-op.
+   */
+  readonly expectedIntegratedUnits?: number;
 }
 
 /** Where and how to promote the result into the local source repository. */
@@ -60,6 +74,14 @@ export interface PromotionResult {
   readonly commit: string;
   /** The repository-relative paths delivered by the promotion. */
   readonly deliveredPaths: readonly string[];
+  /**
+   * The repository-relative paths removed from the delivery branch because the
+   * integrated tree no longer tracks them (a verified fix that deleted or
+   * renamed a file). Reconciling these keeps the promoted tree byte-identical to
+   * the integrated tree the gate ran on. Empty when the fix only added or
+   * modified files.
+   */
+  readonly removedPaths: readonly string[];
   /** True when the promotion created a commit; false when there was nothing to do. */
   readonly committed: boolean;
 }

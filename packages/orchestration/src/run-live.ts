@@ -968,6 +968,10 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       objective: options.change.objective,
       integrationGitUrl: integrationRef.gitUrl,
       integrationBranch: integrationRef.defaultBranch,
+      // Guard gate-equals-deploy at the promote step: when the integration
+      // reported it landed fixes, the integrated tree the gate ran on must
+      // differ from the baseline, or promotion refuses to ship the baseline.
+      expectedIntegratedUnits: evidence.integration.integratedUnits.length,
     },
     { repoDir: sourceRepoDir, startPoint, identity },
   );

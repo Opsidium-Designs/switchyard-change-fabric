@@ -27,6 +27,7 @@ import {
   git,
   hasChanges,
   listTrackedFiles,
+  treeHash,
   type GitIdentity,
 } from "./git.ts";
 import type {
@@ -70,12 +71,42 @@ export class LocalGitDeliveryProvider implements DeliveryProvider {
 
       // 2. Create or reset the delivery branch in the source repository.
       const startPoint = target.startPoint ?? (await currentBranch(target.repoDir));
+
+      // Gate-equals-deploy guard: when the integration reported it landed fixes,
+      // the integrated tree the gate ran on MUST differ from the delivery branch
+      // start point (the baseline the integration workspace was seeded from). If
+      // the two trees are identical the integration never advanced past the
+      // baseline seed, which means the authoritative gate passed on a
+      // baseline-identical tree and promoting it would silently ship the unfixed
+      // baseline while claiming a fix landed. Fail loudly instead, so a silent
+      // baseline-ship becomes a hard error rather than a passing-but-unfixed
+      // deploy. A change that expected no fix (expectedIntegratedUnits omitted or
+      // zero) is exempt: an unchanged promotion there is a legitimate no-op.
+      if ((input.expectedIntegratedUnits ?? 0) > 0) {
+        const integratedTree = await treeHash(integrationDir, "HEAD");
+        const baselineTree = await treeHash(target.repoDir, startPoint);
+        if (integratedTree === baselineTree) {
+          throw new Error(
+            `promotion refused: integration reported ${input.expectedIntegratedUnits} landed fix(es) ` +
+              "but the integrated tree is identical to the baseline, so the gate passed on an unfixed " +
+              "tree and promotion would ship the baseline. The gated tree and the promoted tree must " +
+              "be the same tree.",
+          );
+        }
+      }
+
       if (await branchExists(target.repoDir, branch)) {
         await checkout(target.repoDir, branch);
         await git(target.repoDir, ["reset", "--hard", startPoint]);
       } else {
         await createBranch(target.repoDir, branch, startPoint);
       }
+
+      // The files already present on the delivery branch (the baseline start
+      // point), used to reconcile deletions below so the promoted tree matches
+      // the integrated tree the gate ran on exactly.
+      const baselineFiles = await listTrackedFiles(target.repoDir);
+      const integratedSet = new Set(integratedFiles);
 
       // 3. Copy every tracked file from the integrated result on top of the
       //    delivery branch. ".git" is never tracked, so it is never copied.
@@ -86,6 +117,21 @@ export class LocalGitDeliveryProvider implements DeliveryProvider {
         await mkdir(dirname(to), { recursive: true });
         await cp(from, to, { recursive: true });
         deliveredPaths.push(rel);
+      }
+
+      // 3b. Reconcile deletions. The copy above only adds or overwrites files, so
+      //     a baseline file the integrated tree no longer tracks (a verified fix
+      //     that DELETED or RENAMED a file) would otherwise survive on the
+      //     delivery branch, leaving the promoted tree different from the
+      //     integrated tree the gate ran on. Remove any baseline path absent from
+      //     the integrated tree so the promoted tree is byte-identical to the
+      //     gated/integrated composition: gated == promoted, deletions included.
+      const removedPaths: string[] = [];
+      for (const rel of baselineFiles) {
+        if (!integratedSet.has(rel)) {
+          await git(target.repoDir, ["rm", "-f", "--", rel]);
+          removedPaths.push(rel);
+        }
       }
 
       // 4. Commit the promotion when the branch actually changed.
@@ -101,6 +147,7 @@ export class LocalGitDeliveryProvider implements DeliveryProvider {
         branch,
         commit,
         deliveredPaths: deliveredPaths.sort(),
+        removedPaths: removedPaths.sort(),
         committed,
       };
     } finally {
