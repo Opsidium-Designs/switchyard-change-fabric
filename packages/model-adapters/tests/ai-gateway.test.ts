@@ -36,7 +36,7 @@ afterEach(async () => {
 });
 
 const editDoc = JSON.stringify({
-  edits: [{ path: "src/x.ts", contents: "export const x = 1;\n" }],
+  edits: [{ path: "src/x.ts", search: "export const x = 0;", replace: "export const x = 1;" }],
 });
 
 describe("createAiGatewayRestInvoke (BYOK, offline fake fetch)", () => {
@@ -78,11 +78,14 @@ describe("createAiGatewayRestInvoke (BYOK, offline fake fetch)", () => {
     expect(seenHeaders.authorization).toBeUndefined();
     expect(seenHeaders["content-type"]).toBe("application/json");
     // The body is the OpenAI shape with model, messages, and an explicit
-    // max_tokens generous enough for a full-file edit.
+    // max_completion_tokens generous enough for a full edit. It uses
+    // max_completion_tokens (NOT the legacy max_tokens) so gpt-5 / o-series,
+    // which reject max_tokens, work through the same transport.
     const parsedBody = JSON.parse(seenBody);
     expect(parsedBody.model).toBe("gpt-4o-mini");
     expect(Array.isArray(parsedBody.messages)).toBe(true);
-    expect(parsedBody.max_tokens).toBeGreaterThanOrEqual(2048);
+    expect(parsedBody.max_completion_tokens).toBeGreaterThanOrEqual(2048);
+    expect(parsedBody.max_tokens).toBeUndefined();
     // The reply is parsed from choices[0].message.content.
     expect(result.text).toBe(editDoc);
     expect(result.usage?.inputTokens).toBe(9);
@@ -166,6 +169,12 @@ describe("WorkersAiExecutor over the AI Gateway transport (offline fake fetch)",
 });
 
 describe("contract-aware base prompt (frozen contracts listed read-only)", () => {
+  beforeEach(async () => {
+    // The editDoc anchors on src/x.ts, so seed it verbatim for the apply.
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/x.ts"), "export const x = 0;\n", "utf8");
+  });
+
   it("lists the frozen contract paths as read-only in the prompt the model sees", async () => {
     let seenPrompt = "";
     const invoke: WorkersAiInvoke = async (request) => {

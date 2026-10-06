@@ -117,11 +117,35 @@ export type WorkersAiInvoke = (
   callbacks?: WorkersAiStreamCallbacks,
 ) => Promise<WorkersAiInvokeResult>;
 
-/** A single file edit the model proposed, applied by this executor. */
+/**
+ * A single ANCHORED file edit the model proposed, applied by this executor as an
+ * exact string replacement in the current file. `search` MUST be an exact,
+ * verbatim substring of the file's current contents and `replace` is the new
+ * text that takes its place. Anchoring the edit this way structurally forces the
+ * model to quote the real code it is changing (the genuine function signature
+ * and the real field names), so it cannot change a signature or invent fields by
+ * rewriting the file from scratch: an edit whose `search` is not found verbatim
+ * is an honest failure, not a silent whole-file rewrite.
+ */
 export interface WorkersAiEdit {
-  /** Repository-relative path to write. */
+  /** Repository-relative path to edit. */
   readonly path: string;
-  /** Full file contents to write. */
+  /** The exact current substring to replace (must match the file verbatim). */
+  readonly search: string;
+  /** The new text that replaces `search`. */
+  readonly replace: string;
+}
+
+/**
+ * One in-scope file the executor read from the worktree and sends to the model
+ * as context: its repo-relative path and its current full contents. This is the
+ * read side (what the model sees), distinct from the anchored edit the model
+ * returns (`WorkersAiEdit`).
+ */
+export interface WorkersAiContextFile {
+  /** Repository-relative path of the file. */
+  readonly path: string;
+  /** The file's current full contents. */
   readonly contents: string;
 }
 
@@ -176,7 +200,7 @@ export interface WorkersAiExecutorOptions {
     worktreeDir: string,
     paths: readonly string[],
     limits: { readonly maxFiles: number; readonly maxBytes: number },
-  ) => Promise<readonly WorkersAiEdit[]>;
+  ) => Promise<readonly WorkersAiContextFile[]>;
   /** Injectable writer, for tests. Defaults to writing the real worktree. */
   readonly writeFile?: (absPath: string, contents: string) => Promise<void>;
   /**
@@ -289,7 +313,15 @@ export class WorkersAiExecutor implements ExecutorProvider {
     // the SAME model rather than switching to another one.
     const baseModel = (context.model ?? "").trim() || this.model;
 
-    const contextFiles = await readScoped(context.worktreeDir, context.paths, {
+    // Read the current in-scope file contents the model anchors its edit on. A
+    // kickoff worktree is a clone of a freshly leased (empty) repo, so the real
+    // current file lives in the project baseline; when the caller provides a
+    // baselineDir we read the scope from there so the model sees the genuine
+    // current file. The edit is still WRITTEN into the worktree below. When no
+    // baselineDir is given (or a scoped file is absent from it) we read the
+    // worktree, so every existing caller and a genuine create are unchanged.
+    const readDir = (context.baselineDir ?? "").trim() || context.worktreeDir;
+    const contextFiles = await readScoped(readDir, context.paths, {
       maxFiles,
       maxBytes,
     });
@@ -377,16 +409,60 @@ export class WorkersAiExecutor implements ExecutorProvider {
       );
     }
 
+    // Apply each anchored edit by exact string replacement against the file's
+    // CURRENT contents. The working set is seeded from the in-scope files the
+    // executor already read (so no second disk read is needed for a file the
+    // model saw), and a file an edit names that was not in context is read once
+    // and cached. Multiple edits to the same file chain in order: each edit's
+    // `search` is matched against the running contents, so a later edit can
+    // anchor on text an earlier edit introduced. An edit whose `search` is not
+    // found verbatim is an honest, unusable failure (never a silent whole-file
+    // rewrite), which the ladder/gate handles.
+    const working = new Map<string, string>();
+    for (const file of contextFiles) {
+      working.set(file.path, file.contents);
+    }
+    const readCurrent = async (relPath: string): Promise<string | null> => {
+      if (working.has(relPath)) {
+        return working.get(relPath)!;
+      }
+      const abs = containedWorktreePath(context.worktreeDir, relPath);
+      try {
+        const current = await readFile(abs, "utf8");
+        working.set(relPath, current);
+        return current;
+      } catch {
+        return null;
+      }
+    };
+
     const changedPaths: string[] = [];
     for (const edit of parsed.edits) {
-      const abs = containedWorktreePath(context.worktreeDir, edit.path);
-      await write(abs, edit.contents);
-      changedPaths.push(edit.path);
+      // Resolve (and containment-check) the path up front so an escaping path
+      // fails exactly as before.
+      containedWorktreePath(context.worktreeDir, edit.path);
+      const current = await readCurrent(edit.path);
+      if (current === null) {
+        throw new UnusableModelOutputError(
+          `Workers AI model ${usedModel} edit for WorkUnit ${context.workUnitId} targets a file ` +
+            `that does not exist and cannot be anchored: ${edit.path}`,
+        );
+      }
+      const applied = applyAnchoredEdit(current, edit, usedModel, context.workUnitId);
+      working.set(edit.path, applied);
+      if (!changedPaths.includes(edit.path)) {
+        changedPaths.push(edit.path);
+      }
+    }
+
+    for (const relPath of changedPaths) {
+      const abs = containedWorktreePath(context.worktreeDir, relPath);
+      await write(abs, working.get(relPath)!);
     }
     guard(() => {
       onStep({
         phase: "applied-edit",
-        message: `applied ${changedPaths.length} model edit(s): ${changedPaths.join(", ")}`,
+        message: `applied ${parsed.edits.length} anchored model edit(s): ${changedPaths.join(", ")}`,
       });
     });
 
@@ -399,7 +475,7 @@ export class WorkersAiExecutor implements ExecutorProvider {
       logs: [
         `workers-ai executor used model ${usedModel}`,
         `read ${contextFiles.length} in-scope file(s) as context`,
-        `applied ${changedPaths.length} model-proposed edit(s): ${changedPaths.join(", ")}`,
+        `applied ${parsed.edits.length} anchored model-proposed edit(s): ${changedPaths.join(", ")}`,
       ],
       cost: {
         // Workers AI usage-based billing is account-plan dependent; we do not
@@ -426,7 +502,7 @@ export class WorkersAiExecutor implements ExecutorProvider {
  */
 function summarizePrompt(
   context: ExecutorContext,
-  contextFiles: readonly WorkersAiEdit[],
+  contextFiles: readonly WorkersAiContextFile[],
 ): string {
   const scope = context.paths.length > 0 ? context.paths.join(", ") : "(no declared paths)";
   const files =
@@ -437,24 +513,29 @@ function summarizePrompt(
     `Objective: ${context.objective}`,
     `Allowed paths: ${scope}`,
     `Context files sent: ${files}`,
-    `Instruction: make the smallest concrete edit satisfying the objective, returned as one JSON edit document.`,
+    `Instruction: make the smallest anchored search/replace edit satisfying the objective, returned as one JSON edit document.`,
   ].join("\n");
 }
 
 /** The strict JSON contract the model is asked to return. */
 interface ModelEditDocument {
   readonly commitMessage?: string;
-  readonly edits?: readonly { readonly path?: string; readonly contents?: string }[];
+  readonly edits?: readonly {
+    readonly path?: string;
+    readonly search?: string;
+    readonly replace?: string;
+  }[];
 }
 
 /**
  * Build the chat messages. The system prompt pins the output contract (a single
- * JSON document of edits), and the user message carries the objective, the
- * declared path scope, and the real current contents of the in-scope files.
+ * JSON document of ANCHORED search/replace edits), and the user message carries
+ * the objective, the declared path scope, and the real current contents of the
+ * in-scope files so the model can quote an exact snippet to anchor its edit.
  */
 function buildMessages(
   context: ExecutorContext,
-  contextFiles: readonly WorkersAiEdit[],
+  contextFiles: readonly WorkersAiContextFile[],
 ): readonly WorkersAiMessage[] {
   const requiredExportsForSystem = context.requiredExports ?? [];
   const exportRule =
@@ -484,10 +565,11 @@ function buildMessages(
     "A valid, authorized, well-formed request MUST perform the real work and return a 2xx success (for example a success helper like `json(entity, 201)` or `json(result)`); never return an error helper like `problem(400, ...)` on the authorized, valid path. Reject with an error helper ONLY when the input is genuinely missing or invalid, and validate only the fields named in the objective. Read the request body with a tolerant body reader exactly once and reuse that value; do not read it twice.",
     "Preserve the exported interface your module already provides.",
     ...exportRule,
-    "Reply with ONE JSON document and nothing else, in this exact shape:",
-    '{"commitMessage": "<short message>", "edits": [{"path": "<repo-relative path within the declared scope>", "contents": "<full updated file contents>"}]}',
-    "Each edit must give the FULL updated contents of the file (the current contents with your minimal change applied), not a diff and not a from-scratch rewrite that drops anything.",
-    "Only write files inside the declared path scope. Do not invent paths outside it.",
+    "Return your change as ANCHORED SEARCH/REPLACE edits, NOT whole-file contents. Reply with ONE JSON document and nothing else, in this exact shape:",
+    '{"commitMessage": "<short message>", "edits": [{"path": "<repo-relative path within the declared scope>", "search": "<an EXACT snippet copied verbatim from the current file>", "replace": "<the minimal new version of that snippet>"}]}',
+    "`search` MUST be an exact, verbatim substring of the current file contents shown below (copy it character for character, including whitespace and the real function signature); the executor applies the edit by exact string replacement and FAILS the edit if `search` is not found, so you cannot change a function signature or invent field names by rewriting from scratch. Quote the real signature and the real field names in `search` to anchor your edit WITHIN the current file.",
+    "Make the SMALLEST change that satisfies the objective: `search` should be the smallest unique snippet around what you change, and `replace` is that same snippet with your minimal change applied. Keep the function signature and all exports EXACTLY. Do NOT return whole-file contents and do NOT regenerate the file from scratch. You may return several edits for one file; each `search` must match the file verbatim.",
+    "Only edit files inside the declared path scope. Do not invent paths outside it.",
     "Do not wrap the JSON in markdown fences and do not add any prose before or after it.",
   ].join("\n");
 
@@ -560,7 +642,7 @@ function buildMessages(
         ]
       : []),
     "",
-    "Current in-scope file contents:",
+    "Current in-scope file contents (copy an EXACT snippet from here into each edit's `search`):",
     fileBlocks,
   ].join("\n");
 
@@ -571,11 +653,13 @@ function buildMessages(
 }
 
 /**
- * Parse the model reply into edits. It is lenient about surrounding whitespace
- * and a single markdown code fence (models sometimes add one despite the
- * instruction), but strict about the resulting shape: a valid document has an
- * `edits` array of `{ path, contents }`. Anything else yields zero edits, which
- * the caller turns into an honest failure.
+ * Parse the model reply into ANCHORED edits. It is lenient about surrounding
+ * whitespace and a single markdown code fence (models sometimes add one despite
+ * the instruction), but strict about the resulting shape: a valid document has
+ * an `edits` array of `{ path, search, replace }`. Anything else yields zero
+ * edits, which the caller turns into an honest failure. An empty `search` is
+ * rejected too: an edit must anchor on real current text, so a blank anchor
+ * (which would match anywhere) is not a usable edit.
  */
 function parseEdits(text: string): { edits: WorkersAiEdit[]; commitMessage?: string } {
   const candidate = extractJson(text);
@@ -597,18 +681,51 @@ function parseEdits(text: string): { edits: WorkersAiEdit[]; commitMessage?: str
       !raw ||
       typeof raw.path !== "string" ||
       raw.path.trim() === "" ||
-      typeof raw.contents !== "string"
+      typeof raw.search !== "string" ||
+      raw.search === "" ||
+      typeof raw.replace !== "string"
     ) {
       // A malformed edit entry invalidates the whole reply: we refuse to apply a
       // partial, half-understood change rather than guess.
       return { edits: [] };
     }
-    edits.push({ path: raw.path.trim(), contents: raw.contents });
+    edits.push({ path: raw.path.trim(), search: raw.search, replace: raw.replace });
   }
   return {
     edits,
     ...(typeof doc.commitMessage === "string" ? { commitMessage: doc.commitMessage } : {}),
   };
+}
+
+/**
+ * Apply one anchored edit to the current contents by EXACT string replacement.
+ * The `search` must be present verbatim: if it is absent the edit is an honest,
+ * unusable failure (never a silent whole-file rewrite). When `search` occurs
+ * more than once we refuse rather than guess which occurrence was meant, so the
+ * model must quote a snippet unique enough to anchor unambiguously. The first
+ * (and only) occurrence of `search` is replaced with `replace`.
+ */
+function applyAnchoredEdit(
+  current: string,
+  edit: WorkersAiEdit,
+  usedModel: string,
+  workUnitId: string,
+): string {
+  const first = current.indexOf(edit.search);
+  if (first === -1) {
+    throw new UnusableModelOutputError(
+      `Workers AI model ${usedModel} edit for WorkUnit ${workUnitId} did not match: its \`search\` ` +
+        `snippet was not found verbatim in ${edit.path}`,
+    );
+  }
+  const second = current.indexOf(edit.search, first + edit.search.length);
+  if (second !== -1) {
+    throw new UnusableModelOutputError(
+      `Workers AI model ${usedModel} edit for WorkUnit ${workUnitId} is ambiguous: its \`search\` ` +
+        `snippet occurs more than once in ${edit.path}; quote a longer unique snippet`,
+    );
+  }
+  return current.slice(0, first) + edit.replace + current.slice(first + edit.search.length);
 }
 
 /**
@@ -644,7 +761,7 @@ async function defaultReadScopedFiles(
   worktreeDir: string,
   paths: readonly string[],
   limits: { readonly maxFiles: number; readonly maxBytes: number },
-): Promise<readonly WorkersAiEdit[]> {
+): Promise<readonly WorkersAiContextFile[]> {
   const collected = new Map<string, string>();
   for (const glob of paths) {
     if (collected.size >= limits.maxFiles) {

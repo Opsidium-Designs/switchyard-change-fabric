@@ -13,7 +13,11 @@
  *     key is stored in the Cloudflare account (BYOK) and injected by the gateway
  *     on the way out; it never lives in this repo;
  *   - body: it sends the OpenAI chat-completions shape
- *     `{ model, messages, max_tokens }`.
+ *     `{ model, messages, max_completion_tokens }`. It uses
+ *     `max_completion_tokens` (not the legacy `max_tokens`) for ALL calls
+ *     because gpt-5 / o-series reject `max_tokens`, while gpt-4o / gpt-4.1
+ *     accept `max_completion_tokens`, so one body shape works for every model
+ *     the ladder escalates through.
  *
  * The response is the OpenAI top-level `choices[0].message.content`, which the
  * reused `extractReplyText` already handles, so there is no new parser here.
@@ -112,7 +116,12 @@ export function createAiGatewayRestInvoke(options: AiGatewayRestOptions): Worker
         body: JSON.stringify({
           model: request.model,
           messages: request.messages,
-          max_tokens: maxTokens,
+          // gpt-5 / o-series REJECT `max_tokens` and require
+          // `max_completion_tokens`; gpt-4o / gpt-4.1 accept
+          // `max_completion_tokens` too, so we send it for ALL gateway calls so
+          // every model on the ladder works. The value is generous (gpt-5 spends
+          // some of this budget on hidden reasoning tokens before the reply).
+          max_completion_tokens: maxTokens,
         }),
         ...(controller ? { signal: controller.signal } : {}),
       });

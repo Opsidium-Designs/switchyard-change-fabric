@@ -65,6 +65,13 @@ export interface AppGateWiringInput {
   readonly executorLive: boolean;
   /** The verify-fail escalation model id (from the environment). */
   readonly escalationModel: string;
+  /**
+   * The ORDERED escalation model ladder (from the environment): each retry round
+   * uses the next entry. Optional; when omitted the wiring falls back to a
+   * one-element list built from `escalationModel`, so existing callers are
+   * unchanged.
+   */
+  readonly escalationModels?: readonly string[];
   /** The base model id (informational, recorded on the base verify attempt). */
   readonly baseModel: string;
   /** The bounded max RETRY attempts past the base attempt (default 1). */
@@ -92,6 +99,11 @@ export interface AppGateWiring {
   readonly verifyCommandRunner?: CommandRunner;
   /** The model a verify-fail retry escalates to (only on a live executor). */
   readonly escalationModel?: string;
+  /**
+   * The ORDERED escalation model ladder (only on a live executor): each retry
+   * round steps to the next entry. Empty off the live path.
+   */
+  readonly escalationModels?: readonly string[];
   /** The base model recorded on the base verify attempt (only on a live executor). */
   readonly baseModel?: string;
   /** The bounded max retries dial for the ladder. */
@@ -120,12 +132,23 @@ export function buildAppGateWiring(input: AppGateWiringInput): AppGateWiring {
   // `npm run gate` resolves exactly as it does in the app directory.
   const appGateCommandFor = (_unitId: string): readonly string[] | undefined => APP_GATE_COMMAND;
   const escalationModel = input.executorLive ? input.escalationModel : "";
+  // The ordered ladder travels alongside the single escalation model: prefer the
+  // explicit list, else fall back to a one-element list built from the single
+  // model so existing callers are unchanged. Empty off the live path.
+  const escalationModels = input.executorLive
+    ? input.escalationModels && input.escalationModels.length > 0
+      ? input.escalationModels
+      : escalationModel !== ""
+        ? [escalationModel]
+        : []
+    : [];
   const baseModel = input.executorLive ? input.baseModel : "";
   return {
     enabled: true,
     appGateCommandFor,
     verifyCommandRunner: runner,
     escalationModel,
+    escalationModels,
     baseModel,
     maxModelRetries: input.maxModelRetries,
   };

@@ -20,9 +20,11 @@
  *      UI; the graph node carries them unchanged.
  */
 
+import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -62,14 +64,71 @@ function fakeInvoke(reply: string): WorkersAiInvoke {
   };
 }
 
+const run = promisify(execFile);
+
+/**
+ * Seed a freshly-created (empty) local Artifact repo with a baseline tree, so an
+ * agent that clones it starts from the real current file contents. A real run
+ * seeds a unit repo from the Change baseline before the agent clones; the
+ * anchored search/replace edit the executor applies must find its `search`
+ * snippet verbatim in that current file, so the agent's worktree has to contain
+ * the baseline rather than be empty. This mirrors that seeding offline: it
+ * writes the given files into a scratch clone, commits them on the repo's
+ * default branch, and pushes to the bare repo's `file://` URL. Deterministic and
+ * offline (local git only), so `make check` stays green without a network.
+ */
+async function seedBaseline(
+  gitUrl: string,
+  defaultBranch: string,
+  files: Readonly<Record<string, string>>,
+  scratchRoot: string,
+): Promise<void> {
+  const work = await mkdtemp(join(scratchRoot, "seed-"));
+  try {
+    await run("git", ["clone", gitUrl, work]);
+    for (const [rel, contents] of Object.entries(files)) {
+      const abs = join(work, rel);
+      await mkdir(join(abs, ".."), { recursive: true });
+      await writeFile(abs, contents, "utf8");
+    }
+    await run("git", ["-C", work, "add", "-A"]);
+    await run("git", [
+      "-C",
+      work,
+      "-c",
+      "user.name=Switchyard Baseline",
+      "-c",
+      "user.email=baseline@switchyard.local",
+      "commit",
+      "--no-verify",
+      "-m",
+      "baseline",
+    ]);
+    await run("git", ["-C", work, "push", "origin", `HEAD:${defaultBranch}`]);
+  } finally {
+    await rm(work, { recursive: true, force: true });
+  }
+}
+
 /**
  * An in-process fake Worker fetch backed by LocalChangeControl, covering the
  * endpoints runFullLive touches INCLUDING the M8.2 per-node feedback routes
  * (step, detail, stream). It reuses the control's own fetch for those so the
  * recorded steps/detail/stream are real state, exactly as the live Worker's DO
  * records them.
+ *
+ * `baselineFiles` seeds each newly-leased unit repo so the agent clones a repo
+ * that already contains the current file (as a real run would), which is what
+ * lets the executor's anchored search/replace edit find its `search` snippet.
  */
-function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWorkspaceProvider) {
+function fakeWorker(
+  control: LocalChangeControl,
+  workspaces: LocalFilesystemWorkspaceProvider,
+  options: {
+    readonly baselineFiles?: Readonly<Record<string, string>>;
+    readonly seedRoot?: string;
+  } = {},
+) {
   const provisionAndRecord = async (changeId: string, unitIds: readonly string[]) => {
     const recruited: unknown[] = [];
     for (const unitId of unitIds) {
@@ -81,6 +140,23 @@ function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWork
         continue;
       }
       const lease = (await res.json()) as Record<string, unknown>;
+      // Seed the freshly-created unit repo with the baseline tree so the agent's
+      // clone contains the current file the anchored edit must anchor on. A real
+      // run seeds the baseline into the unit repo the same way before the agent
+      // clones; without it the clone is empty and no verbatim `search` can match.
+      if (
+        options.baselineFiles &&
+        Object.keys(options.baselineFiles).length > 0 &&
+        typeof lease.gitUrl === "string" &&
+        options.seedRoot
+      ) {
+        await seedBaseline(
+          lease.gitUrl,
+          typeof lease.defaultBranch === "string" ? lease.defaultBranch : "main",
+          options.baselineFiles,
+          options.seedRoot,
+        );
+      }
       recruited.push({
         unitId: lease.unitId,
         objective: lease.objective,
@@ -210,20 +286,35 @@ describe("rich per-node feedback, all backed by real state", () => {
   it("records a real activity log and a real model transcript for a run", async () => {
     const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, "artifacts") });
     const control = new LocalChangeControl(workspaces);
-    const { fetchFn } = fakeWorker(control, workspaces);
+    // The current baseline contents of the in-scope file. The unit repo is
+    // seeded with this before the agent clones (as a real run seeds the baseline
+    // into the unit repo), so the agent's worktree contains the real current
+    // file and the executor's anchored search/replace edit can find its `search`
+    // snippet verbatim.
+    const baselineAdd = "export const add = (a, b) => a + b;\n";
+    const { fetchFn } = fakeWorker(control, workspaces, {
+      baselineFiles: { "src/add.ts": baselineAdd },
+      seedRoot: workRoot,
+    });
     const change = parseChangeSpec(SPEC);
 
     const projectDir = join(workRoot, "project");
     await mkdir(join(projectDir, "src"), { recursive: true });
-    // Seed the in-scope file so the executor reads real current contents and the
-    // diff reflects a real change against the baseline.
-    await writeFile(join(projectDir, "src", "add.ts"), "export const add = (a, b) => a + b;\n", "utf8");
+    // Seed the in-scope file in the project baseline too, so the executor reads
+    // real current contents and the diff reflects a real change against it.
+    await writeFile(join(projectDir, "src", "add.ts"), baselineAdd, "utf8");
 
     // The model's reply: a real JSON edit document, returned non-streaming by
     // the fake transport.
     const edit = JSON.stringify({
       commitMessage: "type the add inputs",
-      edits: [{ path: "src/add.ts", contents: "export const add = (a: number, b: number) => a + b;\n" }],
+      edits: [
+        {
+          path: "src/add.ts",
+          search: "export const add = (a, b) => a + b;",
+          replace: "export const add = (a: number, b: number) => a + b;",
+        },
+      ],
     });
     const executor = new WorkersAiExecutor({
       invoke: fakeInvoke(edit),

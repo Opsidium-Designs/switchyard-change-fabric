@@ -51,7 +51,9 @@ describe("WorkersAiExecutor", () => {
           edits: [
             {
               path: "src/add.ts",
-              contents: "export const add = (a: number, b: number) => a + b;\n",
+              // Anchored on the real current signature, quoting it verbatim.
+              search: "export const add = (a, b) => a + b;",
+              replace: "export const add = (a: number, b: number) => a + b;",
             },
           ],
         }),
@@ -104,7 +106,9 @@ describe("WorkersAiExecutor", () => {
           edits: [
             {
               path: "src/resources/users.js",
-              contents: "export async function handle(request, parts) { return request; }\n",
+              // Anchor on the real exported signature, quoting it verbatim.
+              search: "export async function handle(request, parts) { return request; }",
+              replace: "export async function handle(request, parts) { return request; }",
             },
           ],
         }),
@@ -170,7 +174,8 @@ describe("WorkersAiExecutor", () => {
           edits: [
             {
               path: "src/resources/users.js",
-              contents: "export async function handle(request, parts) { return request; }\n",
+              search: "export async function handle(request, parts) { return request; }",
+              replace: "export async function handle(request, parts) { return request; }",
             },
           ],
         }),
@@ -229,7 +234,9 @@ describe("WorkersAiExecutor", () => {
     const invoke: WorkersAiInvoke = async (request) => {
       seenUser = request.messages.find((m) => m.role === "user")?.content ?? "";
       return {
-        text: JSON.stringify({ edits: [{ path: "src/leaf2.ts", contents: "const internal = 2;\n" }] }),
+        text: JSON.stringify({
+          edits: [{ path: "src/leaf2.ts", search: "const internal = 1;", replace: "const internal = 2;" }],
+        }),
       };
     };
 
@@ -255,7 +262,7 @@ describe("WorkersAiExecutor", () => {
       seenUser = request.messages.find((m) => m.role === "user")?.content ?? "";
       return {
         text: JSON.stringify({
-          edits: [{ path: "src/leaf.ts", contents: "const internal = 2;\n" }],
+          edits: [{ path: "src/leaf.ts", search: "const internal = 1;", replace: "const internal = 2;" }],
         }),
       };
     };
@@ -273,8 +280,11 @@ describe("WorkersAiExecutor", () => {
     expect(seenUser).not.toMatch(/Required exports/);
   });
 
-  it("tolerates a markdown-fenced JSON reply", async () => {    const invoke: WorkersAiInvoke = async () => ({
-      text: "```json\n{\"edits\":[{\"path\":\"src/x.ts\",\"contents\":\"export const x = 1;\\n\"}]}\n```",
+  it("tolerates a markdown-fenced JSON reply", async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/x.ts"), "export const x = 0;\n", "utf8");
+    const invoke: WorkersAiInvoke = async () => ({
+      text: "```json\n{\"edits\":[{\"path\":\"src/x.ts\",\"search\":\"export const x = 0;\",\"replace\":\"export const x = 1;\"}]}\n```",
     });
     const result = await new WorkersAiExecutor({ invoke }).execute({
       worktreeDir: worktree,
@@ -316,7 +326,7 @@ describe("WorkersAiExecutor", () => {
 
   it("rejects an edit path that escapes the worktree", async () => {
     const invoke: WorkersAiInvoke = async () => ({
-      text: JSON.stringify({ edits: [{ path: "../escape.ts", contents: "nope" }] }),
+      text: JSON.stringify({ edits: [{ path: "../escape.ts", search: "nope", replace: "still nope" }] }),
     });
     await expect(
       new WorkersAiExecutor({ invoke }).execute({
@@ -330,6 +340,8 @@ describe("WorkersAiExecutor", () => {
   });
 
   it("retries the SAME base model on a transient throw (never switches to a different model)", async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/x.ts"), "export const x = 0;\n", "utf8");
     const calls: string[] = [];
     const invoke: WorkersAiInvoke = async (request) => {
       calls.push(request.model);
@@ -339,7 +351,9 @@ describe("WorkersAiExecutor", () => {
       }
       // The retry must be the SAME base model, not a different one.
       return {
-        text: JSON.stringify({ edits: [{ path: "src/x.ts", contents: "export const x = 2;\n" }] }),
+        text: JSON.stringify({
+          edits: [{ path: "src/x.ts", search: "export const x = 0;", replace: "export const x = 2;" }],
+        }),
       };
     };
     // A deprecated fallbackModel is set but must be ignored: no model swap.
@@ -364,9 +378,190 @@ describe("WorkersAiExecutor", () => {
   });
 });
 
+describe("WorkersAiExecutor anchored search/replace edits (offline)", () => {
+  it("asks for anchored search/replace edits, not whole-file contents", async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/add.ts"), "export const add = (a, b) => a + b;\n", "utf8");
+    let seenSystem = "";
+    let seenUser = "";
+    const invoke: WorkersAiInvoke = async (request) => {
+      seenSystem = request.messages.find((m) => m.role === "system")?.content ?? "";
+      seenUser = request.messages.find((m) => m.role === "user")?.content ?? "";
+      return {
+        text: JSON.stringify({
+          edits: [
+            {
+              path: "src/add.ts",
+              search: "export const add = (a, b) => a + b;",
+              replace: "export const add = (a: number, b: number) => a + b;",
+            },
+          ],
+        }),
+      };
+    };
+    await new WorkersAiExecutor({ invoke }).execute({
+      worktreeDir: worktree,
+      workUnitId: "add",
+      objective: "type the add() args",
+      paths: ["src/add.ts"],
+      baselineRef: "HEAD",
+    });
+    // The system prompt pins the anchored search/replace contract and forbids
+    // whole-file rewrites, so the model cannot rewrite from scratch.
+    expect(seenSystem).toMatch(/ANCHORED SEARCH\/REPLACE edits, NOT whole-file contents/i);
+    expect(seenSystem).toMatch(/"search":/);
+    expect(seenSystem).toMatch(/"replace":/);
+    expect(seenSystem).toMatch(/EXACT snippet copied verbatim from the current file/i);
+    expect(seenSystem).toMatch(/FAILS the edit if `search` is not found/i);
+    expect(seenSystem).toMatch(/Do NOT return whole-file contents/i);
+    // The old whole-file contract wording is gone.
+    expect(seenSystem).not.toMatch(/full updated file contents/i);
+    expect(seenSystem).not.toMatch(/"contents": "<full updated file contents>"/);
+    // The user prompt tells the model to copy an exact snippet from the current
+    // file into each edit's search.
+    expect(seenUser).toMatch(/copy an EXACT snippet from here into each edit's `search`/i);
+  });
+
+  it("applies an edit whose search matches the current file verbatim, preserving the signature and exports", async () => {
+    await mkdir(join(worktree, "src", "resources"), { recursive: true });
+    const original =
+      "import { requireAuth } from '../contracts/auth.js';\n" +
+      "export async function handle(request, parts) {\n" +
+      "  return request;\n" +
+      "}\n";
+    await writeFile(join(worktree, "src/resources/users.js"), original, "utf8");
+    // The model quotes the real body line and inserts an auth guard, anchoring
+    // on the verbatim signature line so it cannot change the signature.
+    const invoke: WorkersAiInvoke = async () => ({
+      text: JSON.stringify({
+        commitMessage: "require auth",
+        edits: [
+          {
+            path: "src/resources/users.js",
+            search: "  return request;",
+            replace: "  const denied = requireAuth(request);\n  if (denied) return denied;\n  return request;",
+          },
+        ],
+      }),
+    });
+    const result = await new WorkersAiExecutor({ invoke }).execute({
+      worktreeDir: worktree,
+      workUnitId: "users",
+      objective: "require auth in users",
+      paths: ["src/resources/users.js"],
+      baselineRef: "HEAD",
+      requiredExports: ["handle"],
+    });
+    expect(result.changedPaths).toEqual(["src/resources/users.js"]);
+    const written = await readFile(join(worktree, "src/resources/users.js"), "utf8");
+    // The exact signature and the export are preserved because the model had to
+    // quote the surrounding real text to anchor; only the body changed.
+    expect(written).toContain("export async function handle(request, parts) {");
+    expect(written).toContain("const denied = requireAuth(request);");
+    expect(written).toContain("if (denied) return denied;");
+    expect(written).toContain("return request;");
+    // The import line is untouched.
+    expect(written).toContain("import { requireAuth } from '../contracts/auth.js';");
+  });
+
+  it("fails honestly (unusable) when the search snippet is not found verbatim (no silent rewrite)", async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/add.ts"), "export const add = (a, b) => a + b;\n", "utf8");
+    // The model quotes a signature that does NOT exist in the file (it invented
+    // a different signature). The exact-match anchor rejects it rather than
+    // letting a from-scratch rewrite land.
+    const invoke: WorkersAiInvoke = async () => ({
+      text: JSON.stringify({
+        edits: [
+          {
+            path: "src/add.ts",
+            search: "export function add(a, b) { return a + b; }",
+            replace: "export function add(a, b) { return a + b + 1; }",
+          },
+        ],
+      }),
+    });
+    await expect(
+      new WorkersAiExecutor({ invoke }).execute({
+        worktreeDir: worktree,
+        workUnitId: "add",
+        objective: "tweak add",
+        paths: ["src/add.ts"],
+        baselineRef: "HEAD",
+      }),
+    ).rejects.toThrow(/did not match|not found verbatim/i);
+    // The file is untouched: no silent whole-file rewrite happened.
+    const after = await readFile(join(worktree, "src/add.ts"), "utf8");
+    expect(after).toBe("export const add = (a, b) => a + b;\n");
+  });
+
+  it("applies multiple anchored edits to one file in order (a later edit can anchor on earlier text)", async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/x.ts"), "const a = 1;\nconst b = 2;\n", "utf8");
+    const invoke: WorkersAiInvoke = async () => ({
+      text: JSON.stringify({
+        edits: [
+          { path: "src/x.ts", search: "const a = 1;", replace: "const a = 10;" },
+          { path: "src/x.ts", search: "const b = 2;", replace: "const b = 20;" },
+        ],
+      }),
+    });
+    const result = await new WorkersAiExecutor({ invoke }).execute({
+      worktreeDir: worktree,
+      workUnitId: "x",
+      objective: "bump both",
+      paths: ["src/x.ts"],
+      baselineRef: "HEAD",
+    });
+    expect(result.changedPaths).toEqual(["src/x.ts"]);
+    const written = await readFile(join(worktree, "src/x.ts"), "utf8");
+    expect(written).toBe("const a = 10;\nconst b = 20;\n");
+  });
+
+  it("fails honestly when the search snippet is ambiguous (occurs more than once)", async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/x.ts"), "x();\nx();\n", "utf8");
+    const invoke: WorkersAiInvoke = async () => ({
+      text: JSON.stringify({ edits: [{ path: "src/x.ts", search: "x();", replace: "y();" }] }),
+    });
+    await expect(
+      new WorkersAiExecutor({ invoke }).execute({
+        worktreeDir: worktree,
+        workUnitId: "x",
+        objective: "swap",
+        paths: ["src/x.ts"],
+        baselineRef: "HEAD",
+      }),
+    ).rejects.toThrow(/ambiguous|more than once/i);
+  });
+
+  it("rejects an edit with an empty search anchor (cannot anchor on nothing)", async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/x.ts"), "const x = 1;\n", "utf8");
+    const invoke: WorkersAiInvoke = async () => ({
+      text: JSON.stringify({ edits: [{ path: "src/x.ts", search: "", replace: "const x = 2;" }] }),
+    });
+    await expect(
+      new WorkersAiExecutor({ invoke }).execute({
+        worktreeDir: worktree,
+        workUnitId: "x",
+        objective: "x",
+        paths: ["src/x.ts"],
+        baselineRef: "HEAD",
+      }),
+    ).rejects.toThrow(/no usable edit/i);
+  });
+});
+
 describe("WorkersAiExecutor step and prompt callbacks (fake transport, deterministic/offline)", () => {
   const okReply = JSON.stringify({
-    edits: [{ path: "src/x.ts", contents: "export const x = 1;\n" }],
+    edits: [{ path: "src/x.ts", search: "export const x = 0;", replace: "export const x = 1;" }],
+  });
+
+  // Seed the file the anchored okReply edit targets so `search` matches verbatim.
+  beforeEach(async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/x.ts"), "export const x = 0;\n", "utf8");
   });
 
   /**
@@ -543,10 +738,12 @@ describe("createWorkersAiRestInvoke", () => {
 
 describe("WorkersAiExecutor bounded retry (tolerating transient model errors)", () => {
   const okReply = JSON.stringify({
-    edits: [{ path: "src/x.ts", contents: "export const x = 1;\n" }],
+    edits: [{ path: "src/x.ts", search: "export const x = 0;", replace: "export const x = 1;" }],
   });
 
   it("retries a transient provider error a bounded number of times, then succeeds", async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/x.ts"), "export const x = 0;\n", "utf8");
     let calls = 0;
     const sleeps: number[] = [];
     const invoke: WorkersAiInvoke = async () => {
@@ -728,7 +925,12 @@ describe("createWorkersAiRestInvoke response parsing (OpenAI shape and legacy sh
 
 describe("WorkersAiExecutor per-attempt model id (so a retry can escalate, offline)", () => {
   const okReply = JSON.stringify({
-    edits: [{ path: "src/x.ts", contents: "export const x = 1;\n" }],
+    edits: [{ path: "src/x.ts", search: "export const x = 0;", replace: "export const x = 1;" }],
+  });
+
+  beforeEach(async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/x.ts"), "export const x = 0;\n", "utf8");
   });
 
   it("defaults to the configured base model when no per-attempt model is given", async () => {

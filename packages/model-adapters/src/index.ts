@@ -38,6 +38,7 @@ export type {
 export { OpenAiCompatibleExecutor } from "./openai-compatible.ts";
 
 export type {
+  WorkersAiContextFile,
   WorkersAiEdit,
   WorkersAiExecutorOptions,
   WorkersAiInvoke,

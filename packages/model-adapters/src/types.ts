@@ -20,6 +20,19 @@ export interface ExecutorContext {
   /** The Git ref the workspace was seeded from (e.g. "HEAD" or a branch). */
   readonly baselineRef: string;
   /**
+   * Optional absolute path to the project BASELINE the model should read the
+   * current in-scope file contents from. A kickoff worktree is a clone of a
+   * freshly leased (empty) repo, so the real current file lives in the project
+   * baseline, not the worktree. When set, an inference executor reads the
+   * declared scope files from here so the model sees the genuine current file to
+   * anchor an edit on, while it still WRITES its edit into `worktreeDir`. When
+   * unset (or a file is absent from the baseline) the executor falls back to the
+   * worktree, so a deterministic executor and every existing caller are
+   * unchanged, and a genuinely new file (absent from the baseline) is still a
+   * create.
+   */
+  readonly baselineDir?: string;
+  /**
    * Optional frozen contract paths the Change's cohesion blueprint declared as
    * read-only seams (the shared interfaces every module imports). An inference
    * executor lists these in the prompt as read-only so the model IMPORTS and

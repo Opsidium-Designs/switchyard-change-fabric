@@ -9,8 +9,10 @@
  * `WORKERS_AI_ESCALATION_MODEL` (defaulting to qwen2.5-coder-32b), and the credential from
  * `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_API_TOKEN`. For `ai-gateway`, this builds
  * the same executor shape over the AI Gateway (BYOK) transport, reading the base
- * model from `AI_GATEWAY_MODEL` (default gpt-4o-mini), the escalation model from
- * `AI_GATEWAY_ESCALATION_MODEL` (default gpt-4o), the bounded retry budget from
+ * model from `AI_GATEWAY_MODEL` (default gpt-4o-mini), the ORDERED escalation
+ * ladder from `AI_GATEWAY_ESCALATION_MODELS` (a comma-separated list, e.g.
+ * `gpt-4.1,gpt-5`, falling back to the singular `AI_GATEWAY_ESCALATION_MODEL`
+ * for backward compatibility, then to gpt-4o), the bounded retry budget from
  * `AI_GATEWAY_MAX_MODEL_RETRIES` (default 3), and the gateway endpoint/credential
  * from `CLOUDFLARE_AI_GATEWAY_URL` / `CLOUDFLARE_AI_GATEWAY_TOKEN`. Every token is
  * read from the environment and passed into the transport closure only; it is
@@ -52,6 +54,7 @@ export interface ExecutorEnv {
   readonly CLOUDFLARE_API_TOKEN?: string;
   readonly AI_GATEWAY_MODEL?: string;
   readonly AI_GATEWAY_ESCALATION_MODEL?: string;
+  readonly AI_GATEWAY_ESCALATION_MODELS?: string;
   readonly AI_GATEWAY_MAX_MODEL_RETRIES?: string;
   readonly CLOUDFLARE_AI_GATEWAY_URL?: string;
   readonly CLOUDFLARE_AI_GATEWAY_TOKEN?: string;
@@ -69,9 +72,21 @@ export interface SelectedExecutor {
   /**
    * The model id a verify-fail retry escalates to, so the ladder can run
    * attempt 2 on a stronger model by passing it as the per-attempt model id.
-   * Empty for the deterministic noop path (no inference, no escalation).
+   * Empty for the deterministic noop path (no inference, no escalation). This
+   * is the FIRST escalation model (escalationModels[0]); it is kept for
+   * backward compatibility with callers that escalate to a single model.
    */
   readonly escalationModel: string;
+  /**
+   * The ORDERED escalation model ladder: each retry ROUND uses the next better
+   * model, so retry round 1 uses escalationModels[0], retry round 2 uses
+   * escalationModels[1], and so on (clamped to the last entry past the end).
+   * The AI Gateway path reads it from AI_GATEWAY_ESCALATION_MODELS (a
+   * comma-separated ordered list), falling back to the singular
+   * AI_GATEWAY_ESCALATION_MODEL as a one-element list for backward
+   * compatibility. Empty for the deterministic noop path.
+   */
+  readonly escalationModels: readonly string[];
   /**
    * The bounded max RETRY rounds the chosen executor's ladder should run past
    * the base round. The AI Gateway path reads it from AI_GATEWAY_MAX_MODEL_RETRIES
@@ -115,6 +130,7 @@ export function selectExecutor(env: ExecutorEnv = process.env): SelectedExecutor
       live: true,
       baseModel: model,
       escalationModel,
+      escalationModels: [escalationModel],
     };
   }
   if (choice === "ai-gateway") {
@@ -130,8 +146,17 @@ export function selectExecutor(env: ExecutorEnv = process.env): SelectedExecutor
       );
     }
     const model = (env.AI_GATEWAY_MODEL ?? "").trim() || DEFAULT_AI_GATEWAY_MODEL;
-    const escalationModel =
-      (env.AI_GATEWAY_ESCALATION_MODEL ?? "").trim() || DEFAULT_AI_GATEWAY_ESCALATION_MODEL;
+    // The ORDERED escalation ladder: prefer the plural
+    // AI_GATEWAY_ESCALATION_MODELS (a comma-separated ordered list, e.g.
+    // "gpt-4.1,gpt-5") so each retry round steps to the next better model. For
+    // backward compatibility, when the list is unset fall back to the singular
+    // AI_GATEWAY_ESCALATION_MODEL as a one-element list, then to the default.
+    const escalationModels = parseEscalationModels(
+      env.AI_GATEWAY_ESCALATION_MODELS,
+      env.AI_GATEWAY_ESCALATION_MODEL,
+      DEFAULT_AI_GATEWAY_ESCALATION_MODEL,
+    );
+    const escalationModel = escalationModels[0] ?? DEFAULT_AI_GATEWAY_ESCALATION_MODEL;
     const maxModelRetries = parseMaxModelRetries(
       env.AI_GATEWAY_MAX_MODEL_RETRIES,
       DEFAULT_AI_GATEWAY_MAX_MODEL_RETRIES,
@@ -144,10 +169,11 @@ export function selectExecutor(env: ExecutorEnv = process.env): SelectedExecutor
     const executor = new WorkersAiExecutor({ model, invoke });
     return {
       executor,
-      description: `ai-gateway (base ${model}, escalation ${escalationModel})`,
+      description: `ai-gateway (base ${model}, escalation ${escalationModels.join(" -> ")})`,
       live: true,
       baseModel: model,
       escalationModel,
+      escalationModels,
       maxModelRetries,
     };
   }
@@ -157,7 +183,35 @@ export function selectExecutor(env: ExecutorEnv = process.env): SelectedExecutor
     live: false,
     baseModel: "",
     escalationModel: "",
+    escalationModels: [],
   };
+}
+
+/**
+ * Parse the ordered escalation model ladder from the environment. The plural
+ * AI_GATEWAY_ESCALATION_MODELS is a comma-separated ORDERED list (each retry
+ * round uses the next entry). When it is unset or empty, fall back to the
+ * singular AI_GATEWAY_ESCALATION_MODEL as a one-element list for backward
+ * compatibility, then to the provided default. Blank entries are dropped and
+ * each entry is trimmed; the result always has at least one element.
+ */
+function parseEscalationModels(
+  plural: string | undefined,
+  singular: string | undefined,
+  fallback: string,
+): readonly string[] {
+  const fromList = (plural ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
+  if (fromList.length > 0) {
+    return fromList;
+  }
+  const single = (singular ?? "").trim();
+  if (single !== "") {
+    return [single];
+  }
+  return [fallback];
 }
 
 /**

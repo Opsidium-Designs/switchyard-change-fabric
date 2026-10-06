@@ -319,6 +319,13 @@ async function runLadder(options: {
     readonly objective: string;
     readonly isEscalation: boolean;
   }) => void;
+  /**
+   * An ORDERED escalation model ladder. When set, each retry round steps to the
+   * next entry (retry round 1 uses escalationModels[0], retry round 2 uses
+   * escalationModels[1], clamped to the last). When unset the single
+   * ESCALATION_MODEL is used for every retry round (the pre-list behavior).
+   */
+  readonly escalationModels?: readonly string[];
 }) {
   const spec = options.spec ?? SPEC;
   const changeId = options.changeId ?? "change-ladder";
@@ -363,6 +370,7 @@ async function runLadder(options: {
     }),
     baseModel: BASE_MODEL,
     escalationModel: ESCALATION_MODEL,
+    ...(options.escalationModels ? { escalationModels: options.escalationModels } : {}),
     maxModelRetries: options.maxModelRetries ?? 1,
     // Redeploy-in-place wiring (M8.4): the app was already deployed, so a
     // verified fix refreshes it; a red run must not redeploy.
@@ -502,6 +510,69 @@ describe("T10: the bounded model-escalation ladder (offline, deterministic)", ()
     expect(snapshot.retryAttempts).toHaveLength(0);
     expect(result.evidence.integration.integratedUnits).not.toContain("fix");
     expect(redeployed).toEqual([]);
+  });
+
+  it("steps the escalation ladder per retry round: round 1 base, retry 1 list[0], retry 2 list[1]", async () => {
+    // An ORDERED escalation ladder of two models. The gate PASSES only when the
+    // marker records the SECOND escalation model, so the change must climb:
+    //   round 1 (base-model)   -> FAIL
+    //   retry round 2 (step-1) -> FAIL (not yet the passing model)
+    //   retry round 3 (step-2) -> PASS
+    // This proves each retry round uses the NEXT better model, not one escalation
+    // model repeated. Deterministic and offline (marker executor + marker gate).
+    const STEP_1 = "escalation-step-1";
+    const STEP_2 = "escalation-step-2";
+    const { snapshot, result, redeployed } = await runLadder({
+      passingModel: STEP_2, // only the SECOND escalation model's edit passes
+      escalationModels: [STEP_1, STEP_2],
+      maxModelRetries: 2,
+      subdir: "ladder-steps",
+    });
+
+    // Three change-level verify rounds, recording a DIFFERENT model each round:
+    // base, then the first escalation model, then the second (which passes).
+    expect(snapshot.verifyAttempts).toHaveLength(3);
+    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ round: 1, outcome: "fail", model: BASE_MODEL });
+    expect(snapshot.verifyAttempts?.[1]).toMatchObject({ round: 2, outcome: "fail", model: STEP_1 });
+    expect(snapshot.verifyAttempts?.[2]).toMatchObject({ round: 3, outcome: "pass", model: STEP_2 });
+
+    // Two retries recorded, each escalating to the NEXT model in order (never the
+    // same escalation model twice): base -> step 1, then step 1 -> step 2.
+    expect(snapshot.retryAttempts).toHaveLength(2);
+    expect(snapshot.retryAttempts?.[0]).toMatchObject({
+      round: 2,
+      fromModel: BASE_MODEL,
+      toModel: STEP_1,
+    });
+    expect(snapshot.retryAttempts?.[1]).toMatchObject({
+      round: 3,
+      fromModel: STEP_1,
+      toModel: STEP_2,
+    });
+
+    // The change ultimately passed on the second escalation model: it integrated
+    // and redeployed, proving the climb reached the model that fixes the bug.
+    expect(result.evidence.integration.integratedUnits).toContain("fix");
+    expect(redeployed).toEqual(["switchyard-change-fabric-ladder-app"]);
+  });
+
+  it("clamps the ladder to the LAST model when retries run past the list", async () => {
+    // A one-element ladder with two retries: both retry rounds must reuse that
+    // single model (clamped), never run off the end into an empty model id.
+    const ONLY = "only-escalation";
+    const { snapshot } = await runLadder({
+      passingModel: "never-passes", // force exhaustion so both retry rounds run
+      escalationModels: [ONLY],
+      maxModelRetries: 2,
+      subdir: "ladder-clamp",
+    });
+    // Three verify rounds: base, then the single escalation model twice (clamped).
+    expect(snapshot.verifyAttempts).toHaveLength(3);
+    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ round: 1, model: BASE_MODEL });
+    expect(snapshot.verifyAttempts?.[1]).toMatchObject({ round: 2, model: ONLY });
+    expect(snapshot.verifyAttempts?.[2]).toMatchObject({ round: 3, model: ONLY });
+    // Both retries escalated TO the same clamped model (from base, then from it).
+    expect(snapshot.retryAttempts?.map((r) => r.toModel)).toEqual([ONLY, ONLY]);
   });
 
   it("implicated-unit attribution re-fans only the unit the failing gate output names, not all units", async () => {

@@ -333,6 +333,17 @@ export interface RunFullLiveOptions {
    */
   readonly escalationModel?: string;
   /**
+   * The ORDERED escalation model ladder: each retry ROUND uses the next better
+   * model (retry round 1 uses escalationModels[0], retry round 2 uses
+   * escalationModels[1], clamped to the last entry past the end), so a change
+   * that fails round after round climbs to a stronger model each time rather
+   * than re-running one escalation model forever. When omitted, the ladder
+   * falls back to a one-element list built from `escalationModel`, so every
+   * existing caller is unchanged. When both are omitted the ladder cannot
+   * escalate (a base verify-fail is terminal).
+   */
+  readonly escalationModels?: readonly string[];
+  /**
    * The base model id for the first ladder attempt, recorded on the base
    * verify attempt so the console shows which model produced the graded edit.
    * Informational only (the base edit was already produced by the executor);
@@ -526,6 +537,12 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
         objective: agent.objective,
         paths: agent.paths,
         baselineRef: agent.baselineRef,
+        // The kickoff worktree is a clone of a freshly leased (empty) repo, so
+        // the real current file the model should anchor its edit on lives in the
+        // project baseline. Point the executor at it so the model sees the
+        // genuine current file (not an empty workspace that invites a from-scratch
+        // rewrite); the edit is still written into the worktree.
+        baselineDir: options.projectDir,
         ...(frozenContracts.length > 0 ? { frozenContracts } : {}),
         ...(frozenContractFiles.length > 0 ? { frozenContractFiles } : {}),
         ...((requiredExportsByUnit.get(agent.unitId) ?? []).length > 0
@@ -814,6 +831,19 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   const gateCommandRunner = options.verifyCommandRunner;
   const maxModelRetries = Math.max(0, Math.floor(options.maxModelRetries ?? 1));
   const escalationModel = (options.escalationModel ?? "").trim();
+  // The ORDERED escalation ladder: prefer the explicit list; otherwise fall back
+  // to a one-element list built from the single escalationModel (so every
+  // existing caller is unchanged). Blank entries are dropped so a stray comma or
+  // an empty single model does not inject an empty round model.
+  const escalationModels = (
+    options.escalationModels && options.escalationModels.length > 0
+      ? options.escalationModels
+      : escalationModel !== ""
+        ? [escalationModel]
+        : []
+  )
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
   // The gated units: completed units that both declare a gate and pushed a repo
   // the ladder can clone. The gate is per-app, so the same command applies to
   // every unit; a unit that never pushed (e.g. already failed) is not gated.
@@ -845,6 +875,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       gateCommandRunner,
       executor,
       escalationModel,
+      escalationModels,
       maxModelRetries,
       baseModel: options.baseModel ?? "",
       frozenContracts,
@@ -1074,6 +1105,13 @@ interface ChangeLevelLadderInput {
   readonly executor: ExecutorProvider;
   /** The stronger model id a verify-fail retry escalates to (empty disables it). */
   readonly escalationModel: string;
+  /**
+   * The ORDERED escalation ladder: retry round k uses escalationModels[k-1],
+   * clamped to the LAST entry once the rounds run past the list, so each retry
+   * round steps to the next better model. When empty, the ladder falls back to
+   * the single escalationModel; when both are empty, escalation is disabled.
+   */
+  readonly escalationModels: readonly string[];
   /** The bounded max RETRY rounds past the base round (default 1). */
   readonly maxModelRetries: number;
   /** The base model id, recorded on the round-1 verify attempt (informational). */
@@ -1145,6 +1183,23 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
     post,
     emit,
   } = input;
+
+  // The ORDERED escalation ladder the retry rounds climb: prefer the explicit
+  // list; otherwise fall back to a one-element list built from the single
+  // escalationModel so every existing caller is unchanged. Retry round k uses
+  // ladderModels[k-1], clamped to the last entry once the rounds run past the
+  // list, so a change that keeps failing climbs to the next better model each
+  // round instead of re-running one escalation model forever. When the ladder
+  // is empty there is no stronger model, so a base verify-fail is terminal.
+  const ladderModels = (
+    input.escalationModels && input.escalationModels.length > 0
+      ? input.escalationModels
+      : escalationModel !== ""
+        ? [escalationModel]
+        : []
+  )
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
 
   // The bounded concurrency cap for re-fanning implicated units. Reuse the run's
   // dial max when it is a positive number; otherwise fall back to a small cap so
@@ -1226,9 +1281,14 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
     // change mechanically. Bounded by maxModelRetries, only when an escalation
     // model is configured.
     for (let retry = 0; retry < maxModelRetries; retry += 1) {
-      if (escalationModel === "") {
+      if (ladderModels.length === 0) {
         break; // no stronger model to escalate to; the base change-fail is terminal
       }
+      // Each retry ROUND steps to the next better model in the ordered ladder,
+      // clamped to the last entry once the rounds run past the list, so round
+      // after round the change climbs the ladder rather than re-running one
+      // escalation model forever.
+      const roundModel = ladderModels[Math.min(retry, ladderModels.length - 1)]!;
       const fromModel = currentModel;
       const nextRound = round + 1;
 
@@ -1244,7 +1304,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
       await post(`/changes/${encodeURIComponent(changeId)}/retry-attempt`, {
         round: nextRound,
         fromModel,
-        toModel: escalationModel,
+        toModel: roundModel,
         implicatedUnits: implicated.map((u) => u.unitId),
         reason: `verify round ${round} failed; re-fanning ${implicated.length} implicated unit(s) on a stronger model fed the failing evidence`,
       }).catch(() => {});
@@ -1252,7 +1312,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
         kind: "model-escalation",
         round: nextRound,
         fromModel,
-        toModel: escalationModel,
+        toModel: roundModel,
         implicatedUnits: implicated.map((u) => u.unitId),
       });
 
@@ -1279,7 +1339,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
           changeId,
           unit.unitId,
           "retrying",
-          `retry round ${nextRound} on ${escalationModel}`,
+          `retry round ${nextRound} on ${roundModel}`,
         );
         // Spawn a BRAND NEW round-N agent for this (unit, round): lease it its
         // OWN real Artifact repo and record the lease on the control plane,
@@ -1325,7 +1385,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
           roundReportStep("cloning", `cloning the round ${nextRound} workspace`);
         }
         let executed = false;
-        let modelId = escalationModel;
+        let modelId = roundModel;
         try {
           const result = await executor.execute({
             worktreeDir,
@@ -1333,7 +1393,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             objective: escalationObjective(unit.objective, lastEvidence, nextRound),
             paths: unit.paths,
             baselineRef: input.baselineRef,
-            model: escalationModel,
+            model: roundModel,
             ...(input.frozenContracts.length > 0
               ? { frozenContracts: input.frozenContracts }
               : {}),
@@ -1359,7 +1419,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             },
           });
           executed = true;
-          modelId = result.cost.model ?? escalationModel;
+          modelId = result.cost.model ?? roundModel;
           // Record the round-N agent's rich model detail (the model id, edited
           // paths, a readable diff, the commit message, and token usage/cost),
           // exactly as the kickoff agent records its detail, so the round-N node
@@ -1398,7 +1458,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             changeId,
             unit.unitId,
             "retried",
-            `retry round ${nextRound} on ${escalationModel}: pushed re-fanned edit`,
+            `retry round ${nextRound} on ${roundModel}: pushed re-fanned edit`,
           );
           // The round-N agent completed its work (it pushed an edit), so walk
           // its instance to the terminal "integrated" status, exactly as a
@@ -1412,7 +1472,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             changeId,
             unit.unitId,
             "retried",
-            `retry round ${nextRound} on ${escalationModel}: no change produced`,
+            `retry round ${nextRound} on ${roundModel}: no change produced`,
           );
           // The round-N agent produced no usable edit (its executor errored or
           // dropped the rewrite), so walk its instance to the terminal "failed"
@@ -1430,7 +1490,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
       };
       await runBounded(implicated, refanConcurrency, refanOne);
 
-      currentModel = escalationModel;
+      currentModel = roundModel;
       round = nextRound;
       outcome = await runChangeGate();
       await recordVerifyAttempt(

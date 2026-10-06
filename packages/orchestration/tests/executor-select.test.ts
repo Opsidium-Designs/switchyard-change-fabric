@@ -65,12 +65,61 @@ describe("selectExecutor ai-gateway branch", () => {
     ).toThrow(/CLOUDFLARE_AI_GATEWAY_URL and CLOUDFLARE_AI_GATEWAY_TOKEN/);
   });
 
+  it("parses an ordered AI_GATEWAY_ESCALATION_MODELS list (each retry round steps to the next model)", () => {
+    const selected = selectExecutor({
+      EXECUTOR: "ai-gateway",
+      CLOUDFLARE_AI_GATEWAY_URL: "https://gw/base",
+      CLOUDFLARE_AI_GATEWAY_TOKEN: "gateway-token-value",
+      AI_GATEWAY_MODEL: "gpt-4o",
+      AI_GATEWAY_ESCALATION_MODELS: "gpt-4.1,gpt-5",
+    });
+    expect(selected.baseModel).toBe("gpt-4o");
+    // The ordered ladder is parsed in order; escalationModel is the first entry
+    // (kept for backward compatibility).
+    expect(selected.escalationModels).toEqual(["gpt-4.1", "gpt-5"]);
+    expect(selected.escalationModel).toBe("gpt-4.1");
+    // The description shows the ladder order, never the token.
+    expect(selected.description).toContain("gpt-4.1 -> gpt-5");
+    expect(selected.description).not.toContain("gateway-token-value");
+  });
+
+  it("trims blank entries and tolerates surrounding whitespace in the ordered list", () => {
+    const selected = selectExecutor({
+      EXECUTOR: "ai-gateway",
+      CLOUDFLARE_AI_GATEWAY_URL: "https://gw/base",
+      CLOUDFLARE_AI_GATEWAY_TOKEN: "t",
+      AI_GATEWAY_ESCALATION_MODELS: " gpt-4.1 , , gpt-5 ,",
+    });
+    expect(selected.escalationModels).toEqual(["gpt-4.1", "gpt-5"]);
+  });
+
+  it("falls back to the singular AI_GATEWAY_ESCALATION_MODEL as a one-element list (backward compatible)", () => {
+    const selected = selectExecutor({
+      EXECUTOR: "ai-gateway",
+      CLOUDFLARE_AI_GATEWAY_URL: "https://gw/base",
+      CLOUDFLARE_AI_GATEWAY_TOKEN: "t",
+      AI_GATEWAY_ESCALATION_MODEL: "gpt-4o",
+    });
+    expect(selected.escalationModels).toEqual(["gpt-4o"]);
+    expect(selected.escalationModel).toBe("gpt-4o");
+  });
+
+  it("defaults the escalation ladder when neither the list nor the single model is set", () => {
+    const selected = selectExecutor({
+      EXECUTOR: "ai-gateway",
+      CLOUDFLARE_AI_GATEWAY_URL: "https://gw/base",
+      CLOUDFLARE_AI_GATEWAY_TOKEN: "t",
+    });
+    expect(selected.escalationModels).toEqual(["gpt-4o"]);
+  });
+
   it("keeps the deterministic noop path when EXECUTOR is unset (offline make check)", () => {
     const selected = selectExecutor({});
     expect(selected.live).toBe(false);
     expect(selected.executor.name).toBe("noop");
     expect(selected.baseModel).toBe("");
     expect(selected.escalationModel).toBe("");
+    expect(selected.escalationModels).toEqual([]);
     expect(selected.maxModelRetries).toBeUndefined();
   });
 });
