@@ -147,6 +147,27 @@ export class Integrator {
         ]);
       }
 
+      // HARD ERROR on a silent baseline, enforced on the LIVE path (not only in a
+      // unit test). When a fix was EXPECTED (the integrated tree requires the
+      // per-app gate AND at least one verified unit was handed in to apply) but
+      // applying every verified unit produced NO change (nothing committed, so
+      // the composed tree is byte-identical to the baseline seed), the "apply"
+      // vanished the fixes. Running the gate on that baseline tree and reporting
+      // a verdict would let the unfixed baseline ship green (the exact false-green
+      // this guard closes). Fail loudly instead, so a silent baseline-ship is a
+      // hard error rather than a passing-but-unfixed deploy. A change that
+      // expected no fix (no gate required, or no verified unit to apply) is
+      // exempt: an unchanged integration there is a legitimate no-op.
+      const fixesExpected = (requiresIntegrationGate ?? false) && verified.length > 0;
+      if (fixesExpected && !committed) {
+        throw new Error(
+          `integration refused: ${verified.length} verified unit(s) were expected to land a fix ` +
+            "but applying them produced no change, so the integrated tree is identical to the " +
+            "baseline. A pass here would ship the unfixed baseline. The verified units' real edits " +
+            "must reach the integration tree (gated tree == integrated tree == promoted tree).",
+        );
+      }
+
       // The AUTHORITATIVE gate. It runs the per-app behavioral gate on THIS exact
       // integrationDir, which is the tree we just committed and pushed to the
       // integration workspace and which promotion then clones and deploys. So the

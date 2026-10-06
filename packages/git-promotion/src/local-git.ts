@@ -72,7 +72,8 @@ export class LocalGitDeliveryProvider implements DeliveryProvider {
       // 2. Create or reset the delivery branch in the source repository.
       const startPoint = target.startPoint ?? (await currentBranch(target.repoDir));
 
-      // Gate-equals-deploy guard: when the integration reported it landed fixes,
+      // Gate-equals-deploy guard: when the integration reported it landed fixes
+      // (or the change required an app gate, so a fix was expected either way),
       // the integrated tree the gate ran on MUST differ from the delivery branch
       // start point (the baseline the integration workspace was seeded from). If
       // the two trees are identical the integration never advanced past the
@@ -81,13 +82,18 @@ export class LocalGitDeliveryProvider implements DeliveryProvider {
       // baseline while claiming a fix landed. Fail loudly instead, so a silent
       // baseline-ship becomes a hard error rather than a passing-but-unfixed
       // deploy. A change that expected no fix (expectedIntegratedUnits omitted or
-      // zero) is exempt: an unchanged promotion there is a legitimate no-op.
-      if ((input.expectedIntegratedUnits ?? 0) > 0) {
+      // zero AND expectedFixes not set) is exempt: an unchanged promotion there
+      // is a legitimate no-op.
+      const fixExpected = (input.expectedIntegratedUnits ?? 0) > 0 || input.expectedFixes === true;
+      if (fixExpected) {
         const integratedTree = await treeHash(integrationDir, "HEAD");
         const baselineTree = await treeHash(target.repoDir, startPoint);
         if (integratedTree === baselineTree) {
           throw new Error(
-            `promotion refused: integration reported ${input.expectedIntegratedUnits} landed fix(es) ` +
+            "promotion refused: a fix was expected " +
+              (input.expectedIntegratedUnits
+                ? `(${input.expectedIntegratedUnits} landed fix(es)) `
+                : "(the change required a behavioral app gate) ") +
               "but the integrated tree is identical to the baseline, so the gate passed on an unfixed " +
               "tree and promotion would ship the baseline. The gated tree and the promoted tree must " +
               "be the same tree.",

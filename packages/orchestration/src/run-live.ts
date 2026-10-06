@@ -898,19 +898,44 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     // Use the authenticated remote so verification can clone the real Artifacts
     // repo over HTTPS with the scoped token (a file:// fallback ignores it).
     const authRemote = unitAuthRemotes.get(unit.id) ?? gitUrl;
-    // When the unit has a per-app gate, thread it into the final verify so the
-    // integration gate runs the SAME mechanical check against the final edit the
-    // ladder left on the repo HEAD. A unit that requires a gate but has no
-    // command cannot auto-pass (the verifier fails the absent gate).
-    const gateCommand = options.appGateCommandFor?.(unit.id);
-    const requiresAppGate = Boolean(gateCommand && gateCommand.length > 0);
+    // The per-app gate is WHOLE-APP (it imports the app's handler and asserts on
+    // the composed Response, with a typecheck step over every app file), so it
+    // can only be satisfied by the full app tree with every unit's fix present.
+    // A single unit's bare repo holds just that unit's one edited file, so the
+    // whole-app gate run against a per-unit checkout always fails (a missing
+    // file / a resource not yet fixed) BEFORE any assertion. Running it as a
+    // per-unit admission test therefore excluded every unit, emptied the
+    // verified set, and left integration baseline-only (the false green). So the
+    // per-unit verify no longer runs the whole-app gate: each unit keeps its
+    // legitimate per-unit checks (clean-state, path-scope, and any per-unit
+    // test/lint) and is admitted to integration on those. The WHOLE-APP gate is
+    // the single authoritative verdict run once on the COMPOSED integrated tree
+    // below (verifyAndIntegrate's integrationGateCommand), which is exactly the
+    // tree that is committed, pushed, promoted, and redeployed. That makes the
+    // gated tree == the integrated tree == the promoted tree.
     completedInputs.push({
       unitId: unit.id,
       gitUrl: authRemote,
       baselineRef: effectiveChange.baseline,
-      ...(requiresAppGate ? { appGateCommand: gateCommand, requiresAppGate: true } : {}),
     });
   }
+
+  // The single authoritative WHOLE-APP gate command for this change, if any. The
+  // gate is per-app, so the same command applies to every unit; use the first
+  // unit that resolves one. When the change has an app gate, it is the AUTHORITATIVE
+  // verdict run on the composed integrated tree (not a per-unit checkout, not the
+  // ladder's advisory overlay), and the integrated tree is REQUIRED to satisfy
+  // it: a tree that cannot be gated can never green, and an apply that produced
+  // no change when a fix was expected is a hard integration failure (see the
+  // Integrator's silent-baseline guard). This is the final pass/verdict the run
+  // reports and promotes on; the ladder's per-round overlay only decided whether
+  // to retry.
+  const integrationGateCommand = effectiveChange.work
+    .map((unit) => options.appGateCommandFor?.(unit.id))
+    .find((cmd) => cmd !== undefined && cmd.length > 0);
+  const requiresIntegrationGate = Boolean(
+    integrationGateCommand && integrationGateCommand.length > 0,
+  );
 
   // When the change-level ladder never passed the gate (both rounds failed, or
   // escalation was disabled), the change is terminally FAILED, but that failure
@@ -937,6 +962,14 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     completed: completedInputs,
     integrationRef,
     integrationToken,
+    // The WHOLE-APP gate runs ONCE here, on the exact composed integrated tree
+    // (baseline + the per-unit-verified units' real edits, with write-lease
+    // yields and exclusions applied), which is the same tree that is committed,
+    // pushed, promoted, and redeployed. This is the authoritative verdict a pass
+    // is recorded on, so a pass means the SHIPPED tree is fixed. Requiring the
+    // gate means a tree that cannot be gated can never green, and the Integrator
+    // hard-fails a silent baseline (fixes expected but apply produced nothing).
+    ...(requiresIntegrationGate ? { integrationGateCommand, requiresIntegrationGate } : {}),
     workRoot: worktreeRoot,
     identity,
   });
@@ -968,10 +1001,16 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       objective: options.change.objective,
       integrationGitUrl: integrationRef.gitUrl,
       integrationBranch: integrationRef.defaultBranch,
-      // Guard gate-equals-deploy at the promote step: when the integration
-      // reported it landed fixes, the integrated tree the gate ran on must
+      // Guard gate-equals-deploy at the promote step: when a fix was expected
+      // (the change required a behavioral app gate, OR the integration reported
+      // landed fixes), the integrated tree the authoritative gate ran on must
       // differ from the baseline, or promotion refuses to ship the baseline.
+      // Passing BOTH signals makes the guard effective on the LIVE path even
+      // when a failed/empty integration left integratedUnits at zero: a run that
+      // required an app gate always carries expectedFixes, so a baseline-identical
+      // integrated tree is a hard error rather than a silent baseline ship.
       expectedIntegratedUnits: evidence.integration.integratedUnits.length,
+      ...(requiresIntegrationGate ? { expectedFixes: true } : {}),
     },
     { repoDir: sourceRepoDir, startPoint, identity },
   );

@@ -42,6 +42,18 @@ export interface PromotionInput {
    * change), so an unchanged promotion is a normal no-op.
    */
   readonly expectedIntegratedUnits?: number;
+  /**
+   * True when this run EXPECTED a fix because the change required a behavioral
+   * app gate (fixes were expected regardless of how many units ultimately
+   * integrated). The gate-equals-deploy guard treats this the same as
+   * `expectedIntegratedUnits > 0`: the integrated tree MUST differ from the
+   * baseline start point, or promotion refuses to ship the unfixed baseline.
+   * This closes the live false-green path where a failed/empty integration left
+   * `expectedIntegratedUnits` at zero and silently exempted the baseline ship.
+   * Omitted or false means no fix was expected, so an unchanged promotion is a
+   * normal no-op.
+   */
+  readonly expectedFixes?: boolean;
 }
 
 /** Where and how to promote the result into the local source repository. */
