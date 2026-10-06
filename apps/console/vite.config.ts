@@ -11,6 +11,11 @@ import { launcherPlugin } from "./launcher";
 export default defineConfig({
   plugins: [react(), launcherPlugin()],
   server: {
+    // host: true binds 0.0.0.0 so the console is reachable from other machines
+    // on the LAN (not only localhost). Harmless locally. Pair it with
+    // VITE_WORKER_URL pointing at this host's LAN IP so the browser (and the
+    // spawned run) reach the Worker by its LAN address rather than 127.0.0.1.
+    host: true,
     port: 5173,
     strictPort: false,
   },

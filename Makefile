@@ -27,7 +27,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install dev console dev-all cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: install dev console dev-all dev-all-lan cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -53,6 +53,24 @@ dev-all:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/worker run dev & \
 	npm -w apps/console run dev & \
+	wait
+
+# Same as dev-all but reachable from OTHER machines on the LAN. The Worker binds
+# 0.0.0.0 (WRANGLER_DEV_IP), the console (Vite) already binds 0.0.0.0 via
+# host:true, and VITE_WORKER_URL is set to this host's LAN IP so the remote
+# browser AND the spawned runs reach the Worker by its LAN address, not
+# 127.0.0.1. Override LAN_IP=... to pick a specific interface. NOTE: this exposes
+# an UNAUTHENTICATED dev control plane (it can launch runs, spend AI/Artifacts,
+# and deploy) to everyone on the LAN; only use it on a trusted network.
+LAN_IP ?= $(shell hostname -I 2>/dev/null | awk '{print $$1}')
+dev-all-lan:
+	@echo "LAN console: http://$(LAN_IP):5173  (Worker: http://$(LAN_IP):8787)"
+	@echo "WARNING: this exposes an unauthenticated dev control plane to the LAN."
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	export WRANGLER_DEV_IP=0.0.0.0; \
+	export VITE_WORKER_URL=http://$(LAN_IP):8787; \
+	npm -w apps/worker run dev & \
+	VITE_WORKER_URL=http://$(LAN_IP):8787 npm -w apps/console run dev & \
 	wait
 
 # Run the switchyard-change CLI, e.g. `make cli ARGS="doctor"`.

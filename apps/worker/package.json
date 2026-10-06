@@ -7,7 +7,7 @@
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --ip ${WRANGLER_DEV_IP:-127.0.0.1} --port ${WRANGLER_DEV_PORT:-8787}",
     "deploy": "wrangler deploy",
     "cf-typegen": "wrangler types",
     "typecheck": "wrangler types && tsc --noEmit",
