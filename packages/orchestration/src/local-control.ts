@@ -153,6 +153,11 @@ export interface ChangeStateView {
   readonly verifyAttempts: readonly VerifyAttempt[];
   /** Model-escalation retries (mirrors the Worker); back `retry` nodes/edges. */
   readonly retryAttempts: readonly RetryAttempt[];
+  /**
+   * Round-N agent instances (mirrors the Worker); back the graph's round-N
+   * `agent` nodes with recorded status/workspace/activity/detail.
+   */
+  readonly roundAgents: readonly RoundAgentView[];
 }
 
 /** A recorded WorkUnit failure (mirrors the Worker's FailureRecord). */
@@ -213,6 +218,22 @@ export interface RetryAttempt {
   readonly implicatedUnits: readonly string[];
   readonly reason: string;
   readonly at: string;
+}
+
+/**
+ * A recorded round-N agent instance for a retry round (mirrors the Worker's
+ * RoundAgentView): a retry round's re-fanned unit running as a BRAND NEW agent
+ * keyed by (unitId, round), with its OWN recorded Artifact repo and a real
+ * status lifecycle (running -> integrated | failed). Backs the graph's round-N
+ * `agent` nodes offline exactly like the live Worker.
+ */
+export interface RoundAgentView {
+  readonly unitId: string;
+  readonly round: number;
+  readonly workspace: WorkspaceIdentity;
+  readonly status: WorkUnitStatus;
+  readonly activity?: readonly ActivityStep[];
+  readonly detail?: UnitDetail;
 }
 
 /** The kind of a fork that must be escalated to a human (mirrors the Worker). */
@@ -316,6 +337,12 @@ class ChangeRecord {
   readonly verifyAttempts: VerifyAttempt[] = [];
   /** Model-escalation retries recorded for this Change (mirrors the DO). */
   readonly retryAttempts: RetryAttempt[] = [];
+  /**
+   * Round-N agent instances keyed by `${unitId}#${round}` (mirrors the DO): a
+   * retry round's re-fanned unit tracked as a BRAND NEW agent with its own
+   * recorded workspace and a real status lifecycle.
+   */
+  readonly roundAgents = new Map<string, RoundAgentView>();
   constructor(change: Change) {
     this.change = change;
   }
@@ -720,6 +747,153 @@ export class LocalChangeControl {
   }
 
   /**
+   * Record (or re-lease) a round-N agent instance keyed by (unitId, round),
+   * against an already-provisioned round-N workspace (mirrors the DO's
+   * recordRoundLease). A retry round's re-fanned unit is a BRAND NEW agent that
+   * spawns and tracks state exactly like a kickoff agent, so leasing it records
+   * its OWN real Artifact repo and sets status to running (the lifecycle start).
+   */
+  recordRoundLease(
+    changeId: string,
+    unitId: string,
+    round: number,
+    workspace: WorkspaceIdentity,
+  ): RoundAgentView {
+    const record = this.require(changeId);
+    if (!record.change.work.some((u) => u.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    const key = roundAgentKey(unitId, round);
+    const previous = record.roundAgents.get(key);
+    const stored: RoundAgentView = {
+      unitId,
+      round: normalizeRound(round),
+      workspace,
+      status: "running",
+      ...(previous?.activity ? { activity: previous.activity } : {}),
+      ...(previous?.detail ? { detail: previous.detail } : {}),
+    };
+    record.roundAgents.set(key, stored);
+    return stored;
+  }
+
+  /**
+   * Record one ordered real run step for a round-N agent keyed by (unitId,
+   * round) (mirrors the DO's recordRoundStep). The round-N agent must have been
+   * leased; the message is bounded and secret-stripped.
+   */
+  recordRoundStep(
+    changeId: string,
+    unitId: string,
+    round: number,
+    phase: string,
+    message: string,
+  ): ActivityStep {
+    const record = this.require(changeId);
+    const key = roundAgentKey(unitId, round);
+    const agent = record.roundAgents.get(key);
+    if (!agent) {
+      throw new Error(`unknown round-N agent: ${unitId} round ${round}`);
+    }
+    const step: ActivityStep = {
+      phase: boundedPhase(phase),
+      message: sanitizeText(message, 300) || "step",
+      at: new Date().toISOString(),
+    };
+    const list = [...(agent.activity ?? []), step];
+    record.roundAgents.set(key, {
+      ...agent,
+      activity: list.length > 200 ? list.slice(-200) : list,
+    });
+    return step;
+  }
+
+  /**
+   * Record (merge) the rich per-unit detail for a round-N agent keyed by
+   * (unitId, round) (mirrors the DO's recordRoundDetail). The round-N agent must
+   * have been leased; the free-text fields are bounded and secret-stripped.
+   */
+  recordRoundDetail(
+    changeId: string,
+    unitId: string,
+    round: number,
+    detail: UnitDetail,
+  ): UnitDetail {
+    const record = this.require(changeId);
+    const key = roundAgentKey(unitId, round);
+    const agent = record.roundAgents.get(key);
+    if (!agent) {
+      throw new Error(`unknown round-N agent: ${unitId} round ${round}`);
+    }
+    const merged: UnitDetail = {
+      ...(agent.detail ?? {}),
+      ...sanitizeDetail(detail),
+      at: new Date().toISOString(),
+    };
+    record.roundAgents.set(key, { ...agent, detail: merged });
+    return merged;
+  }
+
+  /**
+   * Mark a round-N agent COMPLETE keyed by (unitId, round) (mirrors the DO's
+   * completeRoundAgent): its round pushed an edit, so the round-N instance walks
+   * to "integrated". The change-level gate remains the authority on the whole
+   * change's pass/fail. Completing an already-terminal one is a safe no-op.
+   */
+  completeRoundAgent(changeId: string, unitId: string, round: number): RoundAgentView {
+    const record = this.require(changeId);
+    const key = roundAgentKey(unitId, round);
+    const agent = record.roundAgents.get(key);
+    if (!agent) {
+      throw new Error(`unknown round-N agent: ${unitId} round ${round}`);
+    }
+    if (agent.status === "integrated" || agent.status === "failed") {
+      return agent;
+    }
+    const stored: RoundAgentView = { ...agent, status: "integrated" };
+    record.roundAgents.set(key, stored);
+    return stored;
+  }
+
+  /**
+   * Mark a round-N agent FAILED keyed by (unitId, round) (mirrors the DO's
+   * failRoundAgent): its round's executor errored or produced no usable edit, so
+   * the round-N instance walks to "failed". Failing an already-terminal one is a
+   * safe no-op.
+   */
+  failRoundAgent(changeId: string, unitId: string, round: number, reason?: string): RoundAgentView {
+    const record = this.require(changeId);
+    const key = roundAgentKey(unitId, round);
+    const agent = record.roundAgents.get(key);
+    if (!agent) {
+      throw new Error(`unknown round-N agent: ${unitId} round ${round}`);
+    }
+    if (agent.status === "integrated" || agent.status === "failed") {
+      return agent;
+    }
+    const list = [
+      ...(agent.activity ?? []),
+      {
+        phase: "failed",
+        message: sanitizeText(reason ?? "agent failed", 300) || "agent failed",
+        at: new Date().toISOString(),
+      },
+    ];
+    const stored: RoundAgentView = {
+      ...agent,
+      status: "failed",
+      activity: list.length > 200 ? list.slice(-200) : list,
+    };
+    record.roundAgents.set(key, stored);
+    return stored;
+  }
+
+  /** The round-N agent instances recorded for a Change (mirrors the DO). */
+  roundAgents(changeId: string): readonly RoundAgentView[] {
+    return [...this.require(changeId).roundAgents.values()];
+  }
+
+  /**
    * Mark a WorkUnit FAILED on a verify-fail verdict (mirrors the DO's
    * recordVerifyFailure): its candidate edit did not pass the mechanical per-app
    * gate after the bounded ladder. This is the VERDICT on the pushed edit, so it
@@ -848,6 +1022,9 @@ export class LocalChangeControl {
       ...(record.deployment ? { deployment: record.deployment } : {}),
       verifyAttempts: record.verifyAttempts,
       retryAttempts: record.retryAttempts,
+      roundAgents: [...record.roundAgents.values()].sort((a, b) =>
+        a.round !== b.round ? a.round - b.round : a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0,
+      ),
     };
   }
 
@@ -958,6 +1135,83 @@ export class LocalChangeControl {
         return json({ error: error instanceof Error ? error.message : String(error) }, 400);
       }
     }
+    // The round-N agent lifecycle routes (lease/step/detail/complete/fail),
+    // keyed by (unit, round). These are the offline mirror of the Worker's
+    // round-scoped routes: a retry round's re-fanned unit spawns and tracks
+    // state through the SAME lease/record/complete-or-fail path as a kickoff
+    // agent, scoped to (unit, round).
+    const roundLease = url.pathname.match(
+      /^\/changes\/([^/]+)\/work\/([^/]+)\/round\/([^/]+)\/lease$/,
+    );
+    if (method === "POST" && roundLease) {
+      return this.handleRoundLease(dec(roundLease[1]), dec(roundLease[2]), Number(dec(roundLease[3])));
+    }
+    const roundStep = url.pathname.match(
+      /^\/changes\/([^/]+)\/work\/([^/]+)\/round\/([^/]+)\/step$/,
+    );
+    if (method === "POST" && roundStep) {
+      const b = parseBody(init);
+      try {
+        const recorded = this.recordRoundStep(
+          dec(roundStep[1]),
+          dec(roundStep[2]),
+          Number(dec(roundStep[3])),
+          String(b.phase ?? "step"),
+          String(b.message ?? ""),
+        );
+        return json({ step: recorded }, 201);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
+    const roundDetail = url.pathname.match(
+      /^\/changes\/([^/]+)\/work\/([^/]+)\/round\/([^/]+)\/detail$/,
+    );
+    if (method === "POST" && roundDetail) {
+      try {
+        const recorded = this.recordRoundDetail(
+          dec(roundDetail[1]),
+          dec(roundDetail[2]),
+          Number(dec(roundDetail[3])),
+          parseBody(init) as UnitDetail,
+        );
+        return json({ detail: recorded }, 201);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
+    const roundComplete = url.pathname.match(
+      /^\/changes\/([^/]+)\/work\/([^/]+)\/round\/([^/]+)\/complete$/,
+    );
+    if (method === "POST" && roundComplete) {
+      try {
+        const agent = this.completeRoundAgent(
+          dec(roundComplete[1]),
+          dec(roundComplete[2]),
+          Number(dec(roundComplete[3])),
+        );
+        return json({ roundAgent: agent }, 200);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
+    const roundFail = url.pathname.match(
+      /^\/changes\/([^/]+)\/work\/([^/]+)\/round\/([^/]+)\/fail$/,
+    );
+    if (method === "POST" && roundFail) {
+      const b = parseBody(init);
+      try {
+        const agent = this.failRoundAgent(
+          dec(roundFail[1]),
+          dec(roundFail[2]),
+          Number(dec(roundFail[3])),
+          String(b.reason ?? ""),
+        );
+        return json({ roundAgent: agent }, 200);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
     return json({ error: "not found" }, 404);
   };
 
@@ -996,6 +1250,58 @@ export class LocalChangeControl {
     return json(
       {
         unitId,
+        objective: unit.objective,
+        paths: unit.paths,
+        baselineRef: record.change.baseline,
+        workspaceId: ref.id,
+        workspaceName: ref.name,
+        gitUrl: ref.gitUrl,
+        defaultBranch: ref.defaultBranch,
+        backend: ref.backend,
+        fallback: ref.fallback,
+        tokenId: token.id,
+        tokenExpiresAt: token.expiresAt,
+        token: token.token,
+      },
+      201,
+    );
+  }
+
+  /**
+   * Lease a round-N agent instance keyed by (unitId, round): provision its OWN
+   * Artifact repo (keyed with an `r<round>` suffix so it is distinct from the
+   * kickoff repo and every other round) through the honest local fallback
+   * provider, then record it like a kickoff lease and set its status to running.
+   * The offline mirror of the Worker's round lease route; the plaintext token is
+   * returned once so the runner can clone and push the round-N repo.
+   */
+  private async handleRoundLease(changeId: string, unitId: string, round: number): Promise<Response> {
+    const record = this.records.get(changeId);
+    if (!record) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    const unit = record.change.work.find((u) => u.id === unitId);
+    if (!unit) {
+      return json({ error: `unknown WorkUnit: ${unitId}` }, 404);
+    }
+    const workspaceName = workspaceNameFor(changeId, unitId, round);
+    const ref = await this.workspaces.create(workspaceName, { defaultBranch: "main" });
+    const token = await this.workspaces.issueWriteToken(ref);
+    const identity: WorkspaceIdentity = {
+      workspaceId: ref.id,
+      workspaceName: ref.name,
+      gitUrl: ref.gitUrl,
+      defaultBranch: ref.defaultBranch,
+      backend: ref.backend,
+      fallback: ref.fallback,
+      tokenId: token.id,
+      leasedAt: new Date().toISOString(),
+    };
+    const agent = this.recordRoundLease(changeId, unitId, round, identity);
+    return json(
+      {
+        unitId: agent.unitId,
+        round: agent.round,
         objective: unit.objective,
         paths: unit.paths,
         baselineRef: record.change.baseline,
@@ -1099,8 +1405,22 @@ export class LocalChangeControl {
 }
 
 /** A stable, filesystem-safe workspace name for a Change's WorkUnit. */
-export function workspaceNameFor(changeId: string, unitId: string): string {
-  return `${changeId}--${unitId}`.replace(/[^A-Za-z0-9._-]+/g, "-");
+export function workspaceNameFor(changeId: string, unitId: string, round?: number): string {
+  const base =
+    round !== undefined && Number.isFinite(round) && round > 0
+      ? `${changeId}--${unitId}--r${Math.floor(round)}`
+      : `${changeId}--${unitId}`;
+  return base.replace(/[^A-Za-z0-9._-]+/g, "-");
+}
+
+/** The map key for a round-N agent instance, keyed by (unitId, round). */
+function roundAgentKey(unitId: string, round: number): string {
+  return `${unitId}#${normalizeRound(round)}`;
+}
+
+/** Normalize a retry round to a positive integer (round 2 is the first retry). */
+function normalizeRound(round: number): number {
+  return Number.isFinite(round) && round > 0 ? Math.floor(round) : 2;
 }
 
 function json(body: unknown, status: number): Response {

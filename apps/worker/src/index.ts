@@ -48,9 +48,19 @@ function changeStateStub(env: EnvWithProvisioner, changeId: string) {
   return env.CHANGE_STATE.get(id);
 }
 
-/** A stable, filesystem-safe workspace name for a Change's WorkUnit. */
-export function workspaceNameFor(changeId: string, unitId: string): string {
-  return `${changeId}--${unitId}`.replace(/[^A-Za-z0-9._-]+/g, "-");
+/**
+ * A stable, filesystem-safe workspace name for a Change's WorkUnit. When a
+ * `round` is given, the name carries an `r<round>` suffix so a retry round's
+ * re-fanned agent gets its OWN Artifact repo distinct from the kickoff repo (and
+ * distinct from any other round), exactly as the kickoff wave gives each unit its
+ * own repo. The kickoff wave omits `round`, so its names are unchanged.
+ */
+export function workspaceNameFor(changeId: string, unitId: string, round?: number): string {
+  const base =
+    round !== undefined && Number.isFinite(round) && round > 0
+      ? `${changeId}--${unitId}--r${Math.floor(round)}`
+      : `${changeId}--${unitId}`;
+  return base.replace(/[^A-Za-z0-9._-]+/g, "-");
 }
 
 /**
@@ -437,6 +447,174 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         reason: body.reason ?? "verify-fail escalation",
       });
       return json({ retryAttempt: attempt }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Lease a ROUND-N agent instance: provision its OWN Artifact repo (keyed by
+  // (changeId, unitId, round) so it is distinct from the kickoff repo) and
+  // record it on the DO like a kickoff lease, setting the round-N instance's
+  // status to running. This is the round-N parallel of the kickoff lease route:
+  // a retry round's re-fanned unit is a BRAND NEW agent that spawns with its own
+  // repo and tracks a real status lifecycle, so the graph reads its state rather
+  // than a hardcoded literal. The plaintext token is returned once so the runner
+  // can clone and push the round-N repo.
+  const roundLeaseMatch = url.pathname.match(
+    /^\/changes\/([^/]+)\/work\/([^/]+)\/round\/([^/]+)\/lease$/,
+  );
+  if (request.method === "POST" && roundLeaseMatch) {
+    const changeId = decodeURIComponent(roundLeaseMatch[1] ?? "");
+    const unitId = decodeURIComponent(roundLeaseMatch[2] ?? "");
+    const round = Number(decodeURIComponent(roundLeaseMatch[3] ?? ""));
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    const provisioner = selectProvisioner(env);
+    let provisioned;
+    try {
+      provisioned = await provisioner.provision(workspaceNameFor(changeId, unitId, round));
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 502);
+    }
+    const workspace: LeaseWorkspace = {
+      workspaceId: provisioned.workspaceId,
+      workspaceName: provisioned.workspaceName,
+      gitUrl: provisioned.gitUrl,
+      defaultBranch: provisioned.defaultBranch,
+      backend: provisioned.backend,
+      fallback: provisioned.fallback,
+      tokenId: provisioned.tokenId,
+      tokenExpiresAt: provisioned.tokenExpiresAt,
+    };
+    try {
+      const record = await stub.recordRoundLease(unitId, round, workspace);
+      // The plaintext token is returned once to the runner and never persisted.
+      return json({ ...record, token: provisioned.token }, 201);
+    } catch (error) {
+      // Could not record: revoke the just-issued token to avoid a leak.
+      await provisioner.revoke(provisioned.workspaceName, provisioned.tokenId).catch(() => {});
+      return json({ error: errorMessage(error) }, 409);
+    }
+  }
+
+  // Record one ordered activity step a round-N agent reported, keyed by
+  // (unit, round). The round-N parallel of the kickoff /step route.
+  const roundStepMatch = url.pathname.match(
+    /^\/changes\/([^/]+)\/work\/([^/]+)\/round\/([^/]+)\/step$/,
+  );
+  if (request.method === "POST" && roundStepMatch) {
+    const changeId = decodeURIComponent(roundStepMatch[1] ?? "");
+    const unitId = decodeURIComponent(roundStepMatch[2] ?? "");
+    const round = Number(decodeURIComponent(roundStepMatch[3] ?? ""));
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: StepBody;
+    try {
+      body = (await request.json()) as StepBody;
+    } catch {
+      return json({ error: "invalid step body" }, 400);
+    }
+    if (!body.phase && !body.message) {
+      return json({ error: "a step requires a phase or a message" }, 400);
+    }
+    try {
+      const step = await stub.recordRoundStep(unitId, round, body.phase ?? "step", body.message ?? "");
+      return json({ step }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Record (merge) the rich per-unit detail a round-N agent reported, keyed by
+  // (unit, round). The round-N parallel of the kickoff /detail route.
+  const roundDetailMatch = url.pathname.match(
+    /^\/changes\/([^/]+)\/work\/([^/]+)\/round\/([^/]+)\/detail$/,
+  );
+  if (request.method === "POST" && roundDetailMatch) {
+    const changeId = decodeURIComponent(roundDetailMatch[1] ?? "");
+    const unitId = decodeURIComponent(roundDetailMatch[2] ?? "");
+    const round = Number(decodeURIComponent(roundDetailMatch[3] ?? ""));
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: DetailBody;
+    try {
+      body = (await request.json()) as DetailBody;
+    } catch {
+      return json({ error: "invalid detail body" }, 400);
+    }
+    try {
+      const detail = await stub.recordRoundDetail(unitId, round, body);
+      return json({ detail }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Mark a round-N agent COMPLETE, keyed by (unit, round): the round pushed its
+  // edit, so the round-N instance greens. Revokes its lease token (its workspace
+  // is kept so the node still reveals the real repo). The round-N parallel of
+  // the kickoff /complete route. The change-level gate remains the authority on
+  // whether the whole change passed.
+  const roundCompleteMatch = url.pathname.match(
+    /^\/changes\/([^/]+)\/work\/([^/]+)\/round\/([^/]+)\/complete$/,
+  );
+  if (request.method === "POST" && roundCompleteMatch) {
+    const changeId = decodeURIComponent(roundCompleteMatch[1] ?? "");
+    const unitId = decodeURIComponent(roundCompleteMatch[2] ?? "");
+    const round = Number(decodeURIComponent(roundCompleteMatch[3] ?? ""));
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    try {
+      const agent = await stub.completeRoundAgent(unitId, round);
+      const provisioner = selectProvisioner(env);
+      await provisioner
+        .revoke(agent.workspace.workspaceName, agent.workspace.tokenId)
+        .catch(() => {});
+      return json({ roundAgent: agent }, 200);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Mark a round-N agent FAILED, keyed by (unit, round): the round's executor
+  // errored or produced no usable edit, so the round-N instance reds. Revokes
+  // its lease token. The round-N parallel of the kickoff /fail route. The
+  // change-level gate remains the authority on the whole change's pass/fail.
+  const roundFailMatch = url.pathname.match(
+    /^\/changes\/([^/]+)\/work\/([^/]+)\/round\/([^/]+)\/fail$/,
+  );
+  if (request.method === "POST" && roundFailMatch) {
+    const changeId = decodeURIComponent(roundFailMatch[1] ?? "");
+    const unitId = decodeURIComponent(roundFailMatch[2] ?? "");
+    const round = Number(decodeURIComponent(roundFailMatch[3] ?? ""));
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: FailBody = {};
+    const raw = await request.text();
+    if (raw.trim() !== "") {
+      try {
+        body = JSON.parse(raw) as FailBody;
+      } catch {
+        return json({ error: "invalid failure body" }, 400);
+      }
+    }
+    try {
+      const agent = await stub.failRoundAgent(unitId, round, body.reason);
+      const provisioner = selectProvisioner(env);
+      await provisioner
+        .revoke(agent.workspace.workspaceName, agent.workspace.tokenId)
+        .catch(() => {});
+      return json({ roundAgent: agent }, 200);
     } catch (error) {
       return json({ error: errorMessage(error) }, 400);
     }

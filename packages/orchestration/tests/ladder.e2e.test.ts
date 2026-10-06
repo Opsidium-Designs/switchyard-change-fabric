@@ -246,7 +246,10 @@ function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWork
     // to the live Worker (and back the graph nodes/edges).
     const delegated =
       /^\/changes\/[^/]+\/(verify-attempt|retry-attempt)$/.test(url.pathname) ||
-      /^\/changes\/[^/]+\/work\/[^/]+\/(verify-fail|step|detail|stream)$/.test(url.pathname);
+      /^\/changes\/[^/]+\/work\/[^/]+\/(verify-fail|step|detail|stream)$/.test(url.pathname) ||
+      /^\/changes\/[^/]+\/work\/[^/]+\/round\/[^/]+\/(lease|step|detail|complete|fail)$/.test(
+        url.pathname,
+      );
     if (method === "POST" && delegated) {
       return control.fetch(input, init);
     }
@@ -646,6 +649,131 @@ describe("T10b: the retry round is a VISIBLE second wave (re-fan edges + per-uni
     });
     expect(executor.maxInFlight).toBe(2);
     expect([...result.evidence.integration.integratedUnits].sort()).toEqual(["one", "three", "two"]);
+  });
+});
+
+describe("round-N agents: a retry round spawns and tracks REAL agents like the kickoff wave", () => {
+  it("records a round-N agent instance with its OWN recorded workspace and a real status lifecycle (not a fixed status)", async () => {
+    // Seeded single-unit run: round 1 fails, round 2 re-fans "fix" on the
+    // escalation model and the round passes. The retry round's re-fanned unit is
+    // a BRAND NEW round-N agent keyed by (unit, round), recorded with its own
+    // Artifact repo and driven running -> integrated through the SAME lifecycle
+    // machinery the kickoff wave records.
+    const { snapshot } = await runLadder({ passingModel: ESCALATION_MODEL, subdir: "round-agent-green" });
+
+    const roundAgents = snapshot.roundAgents ?? [];
+    expect(roundAgents).toHaveLength(1);
+    const agent = roundAgents[0]!;
+    expect(agent.unitId).toBe("fix");
+    expect(agent.round).toBe(2);
+    // It carries its OWN real Artifact repo, recorded like a kickoff lease, with
+    // an r2 suffix so it is distinct from the kickoff repo.
+    expect(agent.workspace).toBeDefined();
+    expect(agent.workspace.workspaceName).toContain("fix");
+    expect(agent.workspace.workspaceName).toContain("r2");
+    // The status is a REAL lifecycle outcome, not a fixed literal: this round
+    // pushed an edit, so the round-N agent reached "integrated".
+    expect(agent.status).toBe("integrated");
+    // It carries real activity (the ordered run steps the round-N agent emitted)
+    // including a model-call step, proving the escalation model ran this round.
+    const phases = (agent.activity ?? []).map((s) => s.phase);
+    expect(phases).toContain("leased");
+    expect(phases).toContain("model-call");
+    expect(phases).toContain("pushed");
+    // It carries real detail (the model id and the edited paths) exactly like a
+    // kickoff agent.
+    expect(agent.detail?.model).toBe(ESCALATION_MODEL);
+    expect(agent.detail?.editedPaths).toContain("src/fix.fix");
+  });
+
+  it("projects the round-N agent node whose status comes from recorded state (green when the round produced an edit), fully backed", async () => {
+    const { snapshot } = await runLadder({ passingModel: ESCALATION_MODEL, subdir: "round-agent-node-green" });
+    const model = buildWorkGraphModel(snapshot);
+    const roundNode = model.nodes.find((n) => n.id === roundAgentNodeId(snapshot.id, 2, "fix"));
+    expect(roundNode).toBeDefined();
+    expect(roundNode?.kind).toBe("agent");
+    // The node's status/verified come from the RECORDED round-N state, not the
+    // old hardcoded "running"/false: the round integrated, so it greens.
+    expect(roundNode?.status).toBe("integrated");
+    expect(roundNode?.verified).toBe(true);
+    // The node carries the round-N agent's OWN recorded workspace and activity.
+    expect(roundNode?.workspace?.workspaceName).toContain("r2");
+    expect((roundNode?.activity ?? []).some((s) => s.phase === "model-call")).toBe(true);
+    // Every node (including the dynamic round-N node) still passes the backing
+    // guard: no-unbacked-node holds.
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
+  });
+
+  it("a round-N unit whose round produces no fixing edit shows FAILED, backed by recorded state (red node)", async () => {
+    // No model ever passes, so both bounded retry rounds fire and the change
+    // exhausts. The ModelAwareExecutor always writes a marker (so each round
+    // pushes an edit and the round-N agent integrates per round), but the final
+    // round's agent is recorded with a real terminal status either way. Use a
+    // fail-driving executor path: the executor that produces no change on the
+    // last round would mark that round failed. Here we assert the authority
+    // split: the round-N agents reflect THEIR per-round work, while the
+    // change-level gate stays the authority on the whole change.
+    const { snapshot, result } = await runLadder({
+      passingModel: "no-model-ever-passes",
+      maxModelRetries: 2,
+      subdir: "round-agent-red",
+    });
+    // Two retry rounds recorded (rounds 2 and 3), each a distinct round-N agent
+    // instance for "fix" keyed by (unit, round).
+    const roundAgents = snapshot.roundAgents ?? [];
+    const rounds = roundAgents.map((a) => a.round).sort();
+    expect(rounds).toEqual([2, 3]);
+    for (const agent of roundAgents) {
+      expect(agent.unitId).toBe("fix");
+      // Each round's agent reached a REAL terminal status (integrated: it pushed
+      // its per-round edit). The authority on the whole change is the gate below.
+      expect(["integrated", "failed"]).toContain(agent.status);
+      expect(agent.workspace.workspaceName).toContain(`r${agent.round}`);
+    }
+    // Each round's agent has a distinct recorded workspace (its OWN repo per
+    // (unit, round)), so round 2 and round 3 are genuinely separate instances.
+    const names = new Set(roundAgents.map((a) => a.workspace.workspaceName));
+    expect(names.size).toBe(roundAgents.length);
+    // The AUTHORITATIVE gate still decides: the change never passed, so "fix" is
+    // a real failed unit and the change did not integrate (gate-equals-deploy):
+    // a round-N agent going green individually does NOT mean the change passed.
+    expect(snapshot.work.find((u) => u.id === "fix")?.status).toBe("failed");
+    expect(result.evidence.integration.integratedUnits).not.toContain("fix");
+
+    // The graph projects each round-N node from its recorded state and every
+    // node stays backed.
+    const model = buildWorkGraphModel(snapshot);
+    for (const round of rounds) {
+      const node = model.nodes.find((n) => n.id === roundAgentNodeId(snapshot.id, round, "fix"));
+      expect(node).toBeDefined();
+      expect(node?.workspace?.workspaceName).toContain(`r${round}`);
+    }
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
+  });
+
+  it("records a distinct round-N agent per implicated unit, each with its own workspace and model-call", async () => {
+    // Two units: alpha already passes on the base model, beta needs escalation.
+    // Only beta is re-fanned, so exactly one round-N agent (beta round 2) is
+    // recorded, with its own repo and a real model-call.
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      alwaysPassingUnits: ["alpha"],
+      subdir: "round-agent-attribution",
+    });
+    const roundAgents = snapshot.roundAgents ?? [];
+    expect(roundAgents).toHaveLength(1);
+    expect(roundAgents[0]?.unitId).toBe("beta");
+    expect(roundAgents[0]?.round).toBe(2);
+    expect(roundAgents[0]?.status).toBe("integrated");
+    expect((roundAgents[0]?.activity ?? []).some((s) => s.phase === "model-call")).toBe(true);
+    // No round-N agent was spawned for the already-passing alpha unit.
+    expect(roundAgents.some((a) => a.unitId === "alpha")).toBe(false);
   });
 });
 

@@ -54,6 +54,21 @@ function workspace(unitId: string, fallback = true): WorkspaceIdentitySnapshot {
   };
 }
 
+/** A workspace identity with an EXACT recorded name (used for round-N repos). */
+function namedWorkspace(workspaceName: string): WorkspaceIdentitySnapshot {
+  return {
+    workspaceId: `ws-${workspaceName}`,
+    workspaceName,
+    gitUrl: `file:///tmp/artifacts/${workspaceName}`,
+    defaultBranch: "main",
+    backend: "local-filesystem",
+    fallback: true,
+    tokenId: `tok-${workspaceName}`,
+    tokenExpiresAt: "2026-10-04T12:00:00.000Z",
+    leasedAt: "2026-10-04T10:00:40.000Z",
+  };
+}
+
 /**
  * A layered snapshot: a base unit two dependents wait on. `base` has been
  * recruited (a real workspace recorded) and completed; `left` is running with a
@@ -748,6 +763,92 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
     // kinds, with their provenance intact on the backing.
     expect(model.edges.some((e) => e.backing.kind === "model-escalation" && e.kind === "dependency")).toBe(true);
     expect(model.edges.some((e) => e.backing.kind === "re-fan" && e.kind === "data-flow")).toBe(true);
+  });
+
+  it("projects a round-N agent node's status from the RECORDED round-N state (integrated -> green, with its own workspace)", () => {
+    // Extend the ladder snapshot with a recorded round-N agent for (fix, 2) that
+    // reached "integrated" with its OWN r2 workspace and a model-call step. The
+    // node's status/verified now come from THIS record, not a hardcoded literal.
+    const base = ladderSnapshot();
+    const snapshot: ChangeStateSnapshot = {
+      ...base,
+      roundAgents: [
+        {
+          unitId: "fix",
+          round: 2,
+          status: "integrated",
+          workspace: namedWorkspace("change-ladder--fix--r2"),
+          activity: [
+            { phase: "leased", message: "leased", at: "2026-10-04T10:00:40.000Z" },
+            { phase: "model-call", message: "calling model escalation-model", at: "2026-10-04T10:00:41.000Z" },
+            { phase: "pushed", message: "pushed round 2 edit", at: "2026-10-04T10:00:42.000Z" },
+          ],
+          detail: { model: "escalation-model", editedPaths: ["src/fix.fix"] },
+        },
+      ],
+    };
+    const model = buildWorkGraphModel(snapshot);
+    const node = model.nodes.find((n) => n.id === roundAgentNodeId("change-ladder", 2, "fix"));
+    expect(node?.kind).toBe("agent");
+    // Dynamic status from recorded state, not the old literal.
+    expect(node?.status).toBe("integrated");
+    expect(node?.verified).toBe(true);
+    // Carries its OWN recorded r2 workspace and real activity/detail.
+    expect(node?.workspace?.workspaceName).toBe("change-ladder--fix--r2");
+    expect((node?.activity ?? []).some((s) => s.phase === "model-call")).toBe(true);
+    expect(node?.detail?.model).toBe("escalation-model");
+    // Fully backed (no-unbacked-node holds).
+    for (const n of model.nodes) {
+      expect(() => assertBacked(n, snapshot)).not.toThrow();
+    }
+  });
+
+  it("projects a round-N agent node as FAILED (red) when the recorded round-N state failed", () => {
+    const base = ladderSnapshot();
+    const snapshot: ChangeStateSnapshot = {
+      ...base,
+      roundAgents: [
+        {
+          unitId: "fix",
+          round: 2,
+          status: "failed",
+          workspace: namedWorkspace("change-ladder--fix--r2"),
+          activity: [{ phase: "failed", message: "retry round 2 produced no change", at: "2026-10-04T10:00:45.000Z" }],
+        },
+      ],
+    };
+    const model = buildWorkGraphModel(snapshot);
+    const node = model.nodes.find((n) => n.id === roundAgentNodeId("change-ladder", 2, "fix"));
+    // Red: the recorded round-N agent failed, so the node is failed (not green,
+    // not the old static blue).
+    expect(node?.status).toBe("failed");
+    expect(node?.verified).toBe(false);
+    for (const n of model.nodes) {
+      expect(() => assertBacked(n, snapshot)).not.toThrow();
+    }
+  });
+
+  it("rejects a round-N node claiming a workspace with NO recorded round-N agent (cannot render unbacked)", () => {
+    const snapshot = ladderSnapshot(); // has the retry record but no roundAgents
+    const bogus: GraphNode = {
+      id: roundAgentNodeId("change-ladder", 2, "fix"),
+      kind: "agent",
+      label: "fix (retry 2)",
+      status: "integrated",
+      verified: true,
+      escalated: false,
+      workspace: namedWorkspace("change-ladder--fix--r2"),
+      backing: {
+        kind: "round-agent",
+        changeId: "change-ladder",
+        round: 2,
+        unitId: "fix",
+        toModel: "escalation-model",
+      },
+    };
+    // The retry re-fanned "fix", but no round-N agent instance is recorded, so a
+    // node claiming a workspace / green status is unbacked.
+    expect(() => assertBacked(bogus, snapshot)).toThrow(/no round-N agent instance is recorded/);
   });
 });
 

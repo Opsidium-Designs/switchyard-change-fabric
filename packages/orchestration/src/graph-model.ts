@@ -276,6 +276,30 @@ export interface RetryAttemptSnapshot {
 }
 
 /**
+ * A recorded round-N agent instance, as reported by the state. This is the real
+ * backing for a round-N `agent` node: a retry round's re-fanned unit running as
+ * a BRAND NEW agent keyed by (unitId, round), with its OWN recorded Artifact
+ * repo and a real status lifecycle (running -> integrated | failed). The graph
+ * reads the round-N node's status/verified/workspace/activity/detail from THIS
+ * record rather than a hardcoded literal, so the node moves exactly like a
+ * kickoff agent node. A round-N node is only emitted when both this record and
+ * the backing retry (which names the unit among its implicated units) exist, so
+ * it is backed like every other node.
+ */
+export interface RoundAgentSnapshot {
+  readonly unitId: string;
+  readonly round: number;
+  /** The real Artifact repo this round-N agent ran in (no plaintext token). */
+  readonly workspace: WorkspaceIdentitySnapshot;
+  /** The round-N agent's recorded lifecycle status. */
+  readonly status: WorkUnitStatus;
+  /** The ordered real run steps this round-N agent emitted, when present. */
+  readonly activity?: readonly ActivityStepSnapshot[];
+  /** The rich per-unit detail this round-N agent produced, when present. */
+  readonly detail?: UnitDetailSnapshot;
+}
+
+/**
  * The subset of the live ChangeState projection the graph model reads. Both the
  * Worker's `ChangeStateView` and the offline control surface's view are
  * structurally assignable to this, so the model projects either without a
@@ -332,6 +356,14 @@ export interface ChangeStateSnapshot {
    * verify round to the retry. Optional/absent until a verify-fail triggers one.
    */
   readonly retryAttempts?: readonly RetryAttemptSnapshot[];
+  /**
+   * The round-N agent instances recorded for this Change. Each is a retry
+   * round's re-fanned unit tracked as a BRAND NEW agent keyed by (unitId,
+   * round), and becomes one round-N `agent` node beneath its retry whose
+   * status/workspace/activity/detail come from this record. Optional/absent
+   * until the ladder re-fans a unit on a retry round.
+   */
+  readonly roundAgents?: readonly RoundAgentSnapshot[];
 }
 
 /** The kind of a node in the rendered graph. */
@@ -691,6 +723,32 @@ export function assertBacked(node: GraphNode, snapshot: ChangeStateSnapshot): Gr
       if (!unit) {
         throw new Error(
           `unbacked node ${node.id}: round-agent unit ${backing.unitId} is not a WorkUnit in the state`,
+        );
+      }
+      // When the round-N node carries a workspace (its OWN recorded Artifact
+      // repo) or a non-running status, that richer backing must be a REAL
+      // recorded round-N agent instance keyed by (unitId, round): a round node
+      // cannot claim a repo it was never leased or a green/red status it never
+      // reached. This mirrors the kickoff `workspace`-backed node requiring its
+      // recorded workspace, so the dynamic round-N node is still fully backed.
+      const recorded = (snapshot.roundAgents ?? []).find(
+        (a) => a.unitId === backing.unitId && a.round === backing.round,
+      );
+      if (node.workspace !== undefined) {
+        if (!recorded) {
+          throw new Error(
+            `unbacked node ${node.id}: round-agent claims a workspace but no round-N agent instance is recorded for unit ${backing.unitId} round ${backing.round}`,
+          );
+        }
+        if (recorded.workspace.workspaceName !== node.workspace.workspaceName) {
+          throw new Error(
+            `unbacked node ${node.id}: round-agent workspace ${node.workspace.workspaceName} does not match the recorded round-N agent workspace ${recorded.workspace.workspaceName}`,
+          );
+        }
+      }
+      if (node.status !== "running" && !recorded) {
+        throw new Error(
+          `unbacked node ${node.id}: round-agent claims status ${node.status} but no round-N agent instance is recorded for unit ${backing.unitId} round ${backing.round}`,
         );
       }
       return node;
@@ -1202,15 +1260,36 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
       if (!unit) {
         continue;
       }
+      // Read the recorded round-N agent instance for (unitId, round): a retry
+      // round's re-fanned unit is tracked as a BRAND NEW agent with its OWN
+      // recorded workspace and a real status lifecycle, exactly like a kickoff
+      // agent. The node's status/verified/workspace/activity/detail come from
+      // THIS record rather than a hardcoded literal, so the node moves blue
+      // (running) -> green (integrated) / red (failed) like a kickoff node. When
+      // no round-N agent is recorded yet (the retry record exists but the agent
+      // has not leased), fall back to "running" so the just-spawned instance
+      // reads as in flight until its lifecycle lands.
+      const roundAgent = (snapshot.roundAgents ?? []).find(
+        (a) => a.unitId === unitId && a.round === retry.round,
+      );
+      const roundStatus: WorkUnitStatus = roundAgent?.status ?? "running";
+      const roundExtras = {
+        ...(roundAgent?.workspace ? { workspace: roundAgent.workspace } : {}),
+        ...(roundAgent?.activity && roundAgent.activity.length > 0
+          ? { activity: roundAgent.activity }
+          : {}),
+        ...(roundAgent?.detail ? { detail: roundAgent.detail } : {}),
+      };
       const roundNode: GraphNode = {
         id: roundAgentNodeId(snapshot.id, retry.round, unitId),
         kind: "agent",
         // A readable label, e.g. "users (retry 2)", so the console shows which
         // unit this round-N instance re-ran.
         label: `${unitId} (retry ${retry.round})`,
-        status: "running",
-        verified: false,
+        status: roundStatus,
+        verified: isVerified(roundStatus),
         escalated: false,
+        ...roundExtras,
         backing: {
           kind: "round-agent",
           changeId: snapshot.id,

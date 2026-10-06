@@ -1263,9 +1263,53 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
           "retrying",
           `retry round ${nextRound} on ${escalationModel}`,
         );
-        const worktreeDir = await ensureWorktree(unit.unitId, nextRound, unit.authRemote);
+        // Spawn a BRAND NEW round-N agent for this (unit, round): lease it its
+        // OWN real Artifact repo and record the lease on the control plane,
+        // exactly as the kickoff wave leases a unit its own repo. The round-N
+        // agent then tracks a real status lifecycle (running -> integrated |
+        // failed) and reports its real run steps and model detail through the
+        // round-scoped routes, so the graph reads the round-N node's state from
+        // recorded state rather than a hardcoded literal. If the lease fails we
+        // fall back to the unit's kickoff repo so the ladder still makes progress.
+        const roundReportStep = (phase: string, message: string): void =>
+          reportRoundStep(post, changeId, unit.unitId, nextRound, phase, message);
+        const roundReportDetail = (detail: Record<string, unknown>): void =>
+          reportRoundDetail(post, changeId, unit.unitId, nextRound, detail);
+        let roundRemote: string | undefined;
+        let roundLeased = false;
         try {
-          await executor.execute({
+          const leaseOut = await post(
+            `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unit.unitId)}/round/${nextRound}/lease`,
+          );
+          const gitUrl = typeof leaseOut.gitUrl === "string" ? leaseOut.gitUrl : "";
+          const token = typeof leaseOut.token === "string" ? leaseOut.token : "";
+          const workspaceName =
+            typeof leaseOut.workspaceName === "string" ? leaseOut.workspaceName : "";
+          const backend = typeof leaseOut.backend === "string" ? leaseOut.backend : "";
+          if (gitUrl !== "") {
+            roundRemote = authenticatedRemote(gitUrl, token);
+            roundLeased = true;
+            roundReportStep("leased", `leased ${workspaceName} (${backend})`);
+          }
+        } catch {
+          // Could not lease a round-N workspace: fall through to the unit's own
+          // repo so the ladder still re-fans the implicated unit.
+        }
+        // Clone the UNIT's kickoff repo into the round worktree: it shares the
+        // unit repo history, so the committed round edit pushes fast-forward back
+        // to the unit repo (which the authoritative change-level gate and the
+        // integration overlay read, preserving gate-equals-deploy). The round-N
+        // agent's OWN repo was freshly provisioned (an empty bare repo), so the
+        // same commit is also pushed there to make it a real repo the round-N
+        // agent populated, recorded as that agent's workspace.
+        const worktreeDir = await ensureWorktree(unit.unitId, nextRound, unit.authRemote);
+        if (roundLeased) {
+          roundReportStep("cloning", `cloning the round ${nextRound} workspace`);
+        }
+        let executed = false;
+        let modelId = escalationModel;
+        try {
+          const result = await executor.execute({
             worktreeDir,
             workUnitId: unit.unitId,
             objective: escalationObjective(unit.objective, lastEvidence, nextRound),
@@ -1279,27 +1323,55 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
               ? { requiredExports: unit.requiredExports }
               : {}),
             // Thread the per-unit observability callbacks into the retry's
-            // executor call, exactly as the base wave does. Without them the
-            // escalation round posted no `model-call` / `applied-edit` activity
-            // step, so a watcher could not see the model being re-invoked and the
-            // retry looked like a no-op. Each round now records a real model-call
-            // step on the implicated unit, proving the escalation model ran.
-            onPromptSummary: (summary) =>
-              reportLadderStep(post, changeId, unit.unitId, "prompt", summary),
-            onStep: (step) =>
-              reportLadderStep(post, changeId, unit.unitId, step.phase, step.message),
+            // executor call, exactly as the base wave does. Each real step and
+            // prompt summary is relayed to BOTH the kickoff unit's activity log
+            // (so the original unit shows the second wave) AND the round-N
+            // agent's own activity log (so the round-N node carries real steps),
+            // proving the escalation model ran this round.
+            onPromptSummary: (summary) => {
+              reportLadderStep(post, changeId, unit.unitId, "prompt", summary);
+              roundReportDetail({ promptSummary: summary });
+            },
+            onStep: (step) => {
+              reportLadderStep(post, changeId, unit.unitId, step.phase, step.message);
+              roundReportStep(step.phase, step.message);
+            },
+          });
+          executed = true;
+          modelId = result.cost.model ?? escalationModel;
+          // Record the round-N agent's rich model detail (the model id, edited
+          // paths, a readable diff, the commit message, and token usage/cost),
+          // exactly as the kickoff agent records its detail, so the round-N node
+          // carries real activity/detail (model, edited paths, diff).
+          const diff = await buildEditDiff(worktreeDir, result.changedPaths);
+          roundReportDetail({
+            ...(result.cost.model ? { model: result.cost.model } : {}),
+            editedPaths: result.changedPaths,
+            ...(diff ? { diff } : {}),
+            commitMessage: result.commitMessage,
+            ...(result.cost.inputTokens !== undefined ? { inputTokens: result.cost.inputTokens } : {}),
+            ...(result.cost.outputTokens !== undefined ? { outputTokens: result.cost.outputTokens } : {}),
+            ...(result.cost.usd !== undefined ? { usd: result.cost.usd } : {}),
           });
         } catch {
           // Fall through: the re-verify fails the gate and, if the budget is
           // exhausted, the gated units are marked red.
         }
         if (await hasChanges(worktreeDir)) {
-          await commitAll(
-            worktreeDir,
-            `WorkUnit ${unit.unitId}: change-level model-escalation retry round ${nextRound}`,
-            identity,
-          );
+          const commitMessage = `WorkUnit ${unit.unitId}: change-level model-escalation retry round ${nextRound}`;
+          roundReportStep("commit", `committing: ${commitMessage}`);
+          await commitAll(worktreeDir, commitMessage, identity);
+          // Push to the unit's kickoff repo first (fast-forward, since the round
+          // worktree was cloned from it) so the authoritative change-level gate
+          // and the integration overlay read the edit (gate-equals-deploy). Then
+          // push the SAME commit to the round-N agent's OWN repo (its recorded
+          // workspace, a fresh bare repo) so that node is a real pushed agent.
           await push(worktreeDir, unit.authRemote, input.defaultBranch);
+          if (roundRemote) {
+            roundReportStep("push", `pushing to the round ${nextRound} workspace`);
+            await push(worktreeDir, roundRemote, input.defaultBranch).catch(() => {});
+          }
+          roundReportStep("pushed", `pushed round ${nextRound} edit by ${modelId}`);
           reportLadderStep(
             post,
             changeId,
@@ -1307,6 +1379,12 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             "retried",
             `retry round ${nextRound} on ${escalationModel}: pushed re-fanned edit`,
           );
+          // The round-N agent completed its work (it pushed an edit), so walk
+          // its instance to the terminal "integrated" status, exactly as a
+          // kickoff agent that pushed does. The authoritative change-level gate
+          // still decides whether the whole change passed: a round-N agent going
+          // green individually does NOT mean the change passed.
+          await reportRoundComplete(post, changeId, unit.unitId, nextRound);
         } else {
           reportLadderStep(
             post,
@@ -1314,6 +1392,18 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             unit.unitId,
             "retried",
             `retry round ${nextRound} on ${escalationModel}: no change produced`,
+          );
+          // The round-N agent produced no usable edit (its executor errored or
+          // dropped the rewrite), so walk its instance to the terminal "failed"
+          // status, exactly as a kickoff agent that failed does.
+          await reportRoundFail(
+            post,
+            changeId,
+            unit.unitId,
+            nextRound,
+            executed
+              ? `retry round ${nextRound} produced no change`
+              : `retry round ${nextRound} executor call failed`,
           );
         }
       };
@@ -1555,6 +1645,83 @@ function reportLadderStep(
   void post(
     `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/step`,
     { phase, message },
+  ).catch(() => {});
+}
+
+/**
+ * Report one real run step for a ROUND-N agent instance (best-effort, never
+ * throws into the run). This is the round-scoped parallel of the kickoff wave's
+ * reportStep: a retry round's re-fanned agent reports its own real steps
+ * (leased, cloning, model-call, applied-edit, commit, push, pushed) to its own
+ * (unit, round) activity log, so the round-N graph node carries real steps
+ * exactly like a kickoff agent node.
+ */
+function reportRoundStep(
+  post: (path: string, body?: unknown, contentType?: string) => Promise<Record<string, unknown>>,
+  changeId: string,
+  unitId: string,
+  round: number,
+  phase: string,
+  message: string,
+): void {
+  void post(
+    `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/round/${round}/step`,
+    { phase, message },
+  ).catch(() => {});
+}
+
+/**
+ * Report the rich model detail for a ROUND-N agent instance (best-effort). The
+ * round-scoped parallel of the kickoff wave's reportDetail: the round-N agent
+ * reports its model id, edited paths, diff, commit message, and token usage to
+ * its own (unit, round) detail, so the round-N node carries real detail.
+ */
+function reportRoundDetail(
+  post: (path: string, body?: unknown, contentType?: string) => Promise<Record<string, unknown>>,
+  changeId: string,
+  unitId: string,
+  round: number,
+  detail: Record<string, unknown>,
+): void {
+  void post(
+    `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/round/${round}/detail`,
+    detail,
+  ).catch(() => {});
+}
+
+/**
+ * Mark a ROUND-N agent instance COMPLETE (best-effort): its round pushed an
+ * edit, so the round-N instance walks to the terminal "integrated" status and
+ * the graph greens that node. Awaited so the terminal status is recorded before
+ * the next change-level verify reads state, but a failure to record it never
+ * fails the run (the authoritative gate still decides the change outcome).
+ */
+async function reportRoundComplete(
+  post: (path: string, body?: unknown, contentType?: string) => Promise<Record<string, unknown>>,
+  changeId: string,
+  unitId: string,
+  round: number,
+): Promise<void> {
+  await post(
+    `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/round/${round}/complete`,
+  ).catch(() => {});
+}
+
+/**
+ * Mark a ROUND-N agent instance FAILED (best-effort): its round's executor
+ * errored or produced no usable edit, so the round-N instance walks to the
+ * terminal "failed" status and the graph reds that node.
+ */
+async function reportRoundFail(
+  post: (path: string, body?: unknown, contentType?: string) => Promise<Record<string, unknown>>,
+  changeId: string,
+  unitId: string,
+  round: number,
+  reason: string,
+): Promise<void> {
+  await post(
+    `/changes/${encodeURIComponent(changeId)}/work/${encodeURIComponent(unitId)}/round/${round}/fail`,
+    { reason },
   ).catch(() => {});
 }
 

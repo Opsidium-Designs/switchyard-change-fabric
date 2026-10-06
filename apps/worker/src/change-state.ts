@@ -230,6 +230,52 @@ export interface RetryAttempt {
   readonly at: string;
 }
 
+/**
+ * A recorded round-N agent instance for a retry round, keyed by (unitId, round).
+ * It is the real backing for a round-N `agent` graph node: a retry round's
+ * re-fanned unit is a BRAND NEW agent instance that spawns and tracks state
+ * exactly like a kickoff-wave agent, scoped to (unit, round). It carries its OWN
+ * real Artifact repo (recorded like a kickoff lease), a real status lifecycle
+ * (running -> integrated | failed), and the real ordered run steps and rich
+ * detail the retry's executor emitted, so the graph reads the round-N node's
+ * status, workspace, activity, and detail from recorded state rather than a
+ * hardcoded literal. The kickoff agent derives these same fields from the
+ * per-unit lease/activity/detail machinery; a round-N agent mirrors it exactly,
+ * keyed by (unitId, round) so round N and round N+1 are distinct instances for
+ * the same unit.
+ */
+export interface RoundAgentView {
+  readonly unitId: string;
+  readonly round: number;
+  /**
+   * The real Artifact repo this round-N agent ran in, recorded at lease time
+   * exactly like a kickoff lease records a unit's workspace. The plaintext token
+   * is never included (only the token id).
+   */
+  readonly workspace: WorkspaceIdentity;
+  /**
+   * The round-N agent's live status, driven through the SAME lifecycle a kickoff
+   * agent walks: "running" when leased and in flight, "integrated" when the round
+   * completed, "failed" when the round's work failed. The graph projects the
+   * round-N node's color from this, so it moves blue -> green/red like a kickoff
+   * node rather than sitting at a fixed status.
+   */
+  readonly status: WorkUnitStatus;
+  /**
+   * The ordered real run steps this round-N agent emitted (leased, cloning,
+   * model-call, applied-edit, commit, push, pushed, or failed), reported exactly
+   * like a kickoff agent reports its steps, so the console's per-node activity
+   * log for a round-N instance is backed by real steps.
+   */
+  readonly activity?: readonly ActivityStep[];
+  /**
+   * The rich per-unit detail (prompt summary, model id, edited paths, diff,
+   * commit message, tokens, cost) this round-N agent produced, reported exactly
+   * like a kickoff agent reports its detail.
+   */
+  readonly detail?: UnitDetail;
+}
+
 /** The live, serializable projection of a Change's orchestration state. */
 export interface ChangeStateView {
   readonly id: string;
@@ -297,6 +343,15 @@ export interface ChangeStateView {
    * human-escalation `escalated` flag.
    */
   readonly retryAttempts: readonly RetryAttempt[];
+  /**
+   * The round-N agent instances recorded for this Change: each is a retry
+   * round's re-fanned unit running as a BRAND NEW agent keyed by (unitId, round),
+   * with its OWN recorded Artifact repo and a real status lifecycle. They back
+   * the graph's round-N `agent` nodes, so a round-N node's status/workspace/
+   * activity/detail come from recorded state and move exactly like a kickoff
+   * agent (blue running -> green integrated / red failed).
+   */
+  readonly roundAgents: readonly RoundAgentView[];
 }
 
 /**
@@ -497,6 +552,11 @@ export class ChangeState extends DurableObject<Env> {
     // The live deployment of the fixed app (recorded at the end of a real-app
     // run after verification passed). Null until the run deploys one.
     await this.ctx.storage.put("deployment", null);
+    // Round-N agent instances, keyed by `${unitId}#${round}`: a retry round's
+    // re-fanned unit running as a BRAND NEW agent with its OWN recorded Artifact
+    // repo and a real status lifecycle, exactly like a kickoff lease. Empty until
+    // the change-level ladder re-fans a unit on a retry round.
+    await this.ctx.storage.put("roundAgents", {} as Record<string, RoundAgentView>);
     return this.view();
   }
 
@@ -878,6 +938,170 @@ export class ChangeState extends DurableObject<Env> {
   }
 
   /**
+   * Record (or re-lease) a round-N agent instance for a retry round, keyed by
+   * (unitId, round), against an already-provisioned round-N workspace. This is
+   * the round-N parallel of recordLease: a retry round's re-fanned unit is a
+   * BRAND NEW agent that spawns and tracks state exactly like a kickoff agent,
+   * so leasing it records its OWN real Artifact repo and sets its status to
+   * "running" (the lifecycle start). The unit must exist in the Change; the
+   * plaintext token is never stored (only the token id). Re-leasing the same
+   * (unitId, round) overwrites the workspace and resets the status to running so
+   * a re-driven round is idempotent.
+   */
+  async recordRoundLease(
+    unitId: string,
+    round: number,
+    workspace: LeaseWorkspace,
+  ): Promise<RoundAgentView> {
+    const change = await this.loadChange();
+    if (!change.work.some((unit) => unit.id === unitId)) {
+      throw new Error(`unknown WorkUnit: ${unitId}`);
+    }
+    const roundAgents = await this.loadRoundAgents();
+    const key = roundAgentKey(unitId, round);
+    const identity: WorkspaceIdentity = {
+      workspaceId: workspace.workspaceId,
+      workspaceName: workspace.workspaceName,
+      gitUrl: workspace.gitUrl,
+      defaultBranch: workspace.defaultBranch,
+      backend: workspace.backend,
+      fallback: workspace.fallback,
+      tokenId: workspace.tokenId,
+      tokenExpiresAt: workspace.tokenExpiresAt,
+      leasedAt: new Date().toISOString(),
+    };
+    const previous = roundAgents[key];
+    const stored: RoundAgentView = {
+      unitId,
+      round: normalizeRound(round),
+      workspace: identity,
+      status: "running",
+      ...(previous?.activity ? { activity: previous.activity } : {}),
+      ...(previous?.detail ? { detail: previous.detail } : {}),
+    };
+    roundAgents[key] = stored;
+    await this.ctx.storage.put("roundAgents", roundAgents);
+    return stored;
+  }
+
+  /**
+   * Record one ordered real run step for a round-N agent instance, keyed by
+   * (unitId, round). The round-N parallel of recordStep: a retry round's agent
+   * reports its real steps (leased, cloning, model-call, applied-edit, commit,
+   * push, pushed, failed) exactly like a kickoff agent, so the console's per-node
+   * activity log for the round-N instance is backed by real steps. The round-N
+   * agent must have been leased first; the message is bounded and secret-stripped.
+   */
+  async recordRoundStep(
+    unitId: string,
+    round: number,
+    phase: string,
+    message: string,
+  ): Promise<ActivityStep> {
+    const roundAgents = await this.loadRoundAgents();
+    const key = roundAgentKey(unitId, round);
+    const agent = roundAgents[key];
+    if (!agent) {
+      throw new Error(`unknown round-N agent: ${unitId} round ${round}`);
+    }
+    const step: ActivityStep = {
+      phase: boundedPhase(phase),
+      message: sanitizeReason(message),
+      at: new Date().toISOString(),
+    };
+    const list = [...(agent.activity ?? []), step];
+    const bounded = list.length > MAX_ACTIVITY_STEPS ? list.slice(-MAX_ACTIVITY_STEPS) : list;
+    roundAgents[key] = { ...agent, activity: bounded };
+    await this.ctx.storage.put("roundAgents", roundAgents);
+    return step;
+  }
+
+  /**
+   * Record (merge) the rich per-unit detail for a round-N agent instance, keyed
+   * by (unitId, round). The round-N parallel of recordDetail: a retry round's
+   * agent reports its model id, edited paths, diff, commit message, prompt
+   * summary, and token usage exactly like a kickoff agent, so the console's
+   * click-detail for the round-N instance reads real recorded detail. The round-N
+   * agent must have been leased first; every field is bounded and secret-stripped.
+   */
+  async recordRoundDetail(
+    unitId: string,
+    round: number,
+    detail: UnitDetail,
+  ): Promise<UnitDetail> {
+    const roundAgents = await this.loadRoundAgents();
+    const key = roundAgentKey(unitId, round);
+    const agent = roundAgents[key];
+    if (!agent) {
+      throw new Error(`unknown round-N agent: ${unitId} round ${round}`);
+    }
+    const merged: UnitDetail = {
+      ...(agent.detail ?? {}),
+      ...sanitizeDetail(detail),
+      at: new Date().toISOString(),
+    };
+    roundAgents[key] = { ...agent, detail: merged };
+    await this.ctx.storage.put("roundAgents", roundAgents);
+    return merged;
+  }
+
+  /**
+   * Mark a round-N agent instance COMPLETE, keyed by (unitId, round): its retry
+   * round produced and pushed an edit. The round-N parallel of markComplete: it
+   * walks the round-N instance to the terminal "integrated" status, so the graph
+   * greens that node exactly like a kickoff agent that integrated. The authority
+   * on whether the CHANGE passed is still the change-level gate, so a round-N
+   * agent going green individually does NOT mean the change passed. The round-N
+   * agent must have been leased first; completing an already-terminal one is a
+   * safe no-op.
+   */
+  async completeRoundAgent(unitId: string, round: number): Promise<RoundAgentView> {
+    const roundAgents = await this.loadRoundAgents();
+    const key = roundAgentKey(unitId, round);
+    const agent = roundAgents[key];
+    if (!agent) {
+      throw new Error(`unknown round-N agent: ${unitId} round ${round}`);
+    }
+    if (agent.status === "integrated" || agent.status === "failed") {
+      return agent;
+    }
+    const stored: RoundAgentView = { ...agent, status: "integrated" };
+    roundAgents[key] = stored;
+    await this.ctx.storage.put("roundAgents", roundAgents);
+    return stored;
+  }
+
+  /**
+   * Mark a round-N agent instance FAILED, keyed by (unitId, round): its retry
+   * round's executor errored or produced no usable edit. The round-N parallel of
+   * failUnit: it walks the round-N instance to the terminal "failed" status, so
+   * the graph reds that node exactly like a kickoff agent that failed. The
+   * change-level gate remains the authority on the whole change's pass/fail. The
+   * round-N agent must have been leased first; failing an already-terminal one is
+   * a safe no-op.
+   */
+  async failRoundAgent(unitId: string, round: number, reason?: string): Promise<RoundAgentView> {
+    const roundAgents = await this.loadRoundAgents();
+    const key = roundAgentKey(unitId, round);
+    const agent = roundAgents[key];
+    if (!agent) {
+      throw new Error(`unknown round-N agent: ${unitId} round ${round}`);
+    }
+    if (agent.status === "integrated" || agent.status === "failed") {
+      return agent;
+    }
+    const list = [
+      ...(agent.activity ?? []),
+      { phase: "failed", message: sanitizeReason(reason), at: new Date().toISOString() },
+    ];
+    const bounded = list.length > MAX_ACTIVITY_STEPS ? list.slice(-MAX_ACTIVITY_STEPS) : list;
+    const stored: RoundAgentView = { ...agent, status: "failed", activity: bounded };
+    roundAgents[key] = stored;
+    await this.ctx.storage.put("roundAgents", roundAgents);
+    return stored;
+  }
+
+  /**
    * Mark a WorkUnit FAILED because its candidate edit did not pass the mechanical
    * per-app gate after the bounded model-escalation ladder. This is the honesty
    * terminal of the ladder: a unit that pushed an edit but whose edit does NOT
@@ -1181,6 +1405,7 @@ export class ChangeState extends DurableObject<Env> {
     const deployment = await this.loadDeployment();
     const verifyAttempts = await this.loadVerifyAttempts();
     const retryAttempts = await this.loadRetryAttempts();
+    const roundAgents = await this.loadRoundAgents();
     const statuses = workUnitStatuses(change, completed);
     const graph = buildWorkGraph(change);
     const collisions = detectPathCollisions(change);
@@ -1246,6 +1471,12 @@ export class ChangeState extends DurableObject<Env> {
       ...(deployment ? { deployment } : {}),
       verifyAttempts,
       retryAttempts,
+      // The round-N agent instances, ordered by (round, unitId) for a stable
+      // projection. Each is a retry round's re-fanned unit tracked as a real
+      // agent with its own recorded workspace and status lifecycle.
+      roundAgents: Object.values(roundAgents).sort((a, b) =>
+        a.round !== b.round ? a.round - b.round : a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0,
+      ),
     };
   }
 
@@ -1334,6 +1565,10 @@ export class ChangeState extends DurableObject<Env> {
   private async loadRetryAttempts(): Promise<RetryAttempt[]> {
     return (await this.ctx.storage.get<RetryAttempt[]>("retryAttempts")) ?? [];
   }
+
+  private async loadRoundAgents(): Promise<Record<string, RoundAgentView>> {
+    return (await this.ctx.storage.get<Record<string, RoundAgentView>>("roundAgents")) ?? {};
+  }
 }
 
 /**
@@ -1377,6 +1612,16 @@ function boundedPhase(phase: string | undefined): string {
   const text = (phase ?? "step").toString().replace(/\s+/g, "-").trim().toLowerCase();
   const bounded = text.length > 40 ? text.slice(0, 40) : text;
   return bounded === "" ? "step" : bounded;
+}
+
+/** The storage key for a round-N agent instance, keyed by (unitId, round). */
+function roundAgentKey(unitId: string, round: number): string {
+  return `${unitId}#${normalizeRound(round)}`;
+}
+
+/** Normalize a retry round to a positive integer (round 2 is the first retry). */
+function normalizeRound(round: number): number {
+  return Number.isFinite(round) && round > 0 ? Math.floor(round) : 2;
 }
 
 /**
