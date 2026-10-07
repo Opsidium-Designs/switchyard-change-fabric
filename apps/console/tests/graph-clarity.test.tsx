@@ -211,6 +211,96 @@ describe("item 4: spacing: no two placed nodes overlap in a dense planner+verify
   });
 });
 
+describe("item 4b: tighter agent spacing (seam 5): a wide agent fan is closer together, still non-overlapping and non-collinear", () => {
+  /** A goal with a single wide row of six agent nodes (the service-api fan). */
+  function wideFanModel(): WorkGraphModel {
+    const node = (id: string, kind: GraphNode["kind"], label: string): GraphNode =>
+      ({
+        id,
+        kind,
+        label,
+        status: "integrated",
+        verified: true,
+        escalated: false,
+        backing: { kind: "change", changeId: "c" },
+      }) as GraphNode;
+    const names = ["users", "orders", "products", "auth", "search", "notifications"];
+    const nodes: GraphNode[] = [node("goal:c", "goal", "the change")];
+    for (const n of names) {
+      nodes.push(node(`unit:${n}`, "agent", n));
+    }
+    const edges = names.map(
+      (n) =>
+        ({
+          id: `goal:c->unit:${n}`,
+          kind: "dependency",
+          from: "goal:c",
+          to: `unit:${n}`,
+          backing: { kind: "dependency", from: "goal:c", to: `unit:${n}` },
+        }) as WorkGraphModel["edges"][number],
+    );
+    return { nodes, edges, dial: { minConcurrency: 1, maxConcurrency: 6 } } as unknown as WorkGraphModel;
+  }
+
+  function coordsOf(markup: string): { x: number; y: number }[] {
+    const coords: { x: number; y: number }[] = [];
+    const re = /translate\(([-\d.]+), ([-\d.]+)\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(markup)) !== null) {
+      coords.push({ x: Number(m[1]), y: Number(m[2]) });
+    }
+    return coords;
+  }
+
+  it("packs a 6-agent row tighter than the pre-tightening baseline (old MIN_NODE_GAP=200)", () => {
+    const markup = renderToStaticMarkup(
+      createElement(GraphView, { model: wideFanModel(), selectedId: null, onSelect: () => {} }),
+    );
+    const vb = /viewBox="0 0 ([\d.]+) ([\d.]+)"/.exec(markup);
+    expect(vb).not.toBeNull();
+    const width = Number(vb?.[1]);
+    // The OLD layout gave width = max(1100, (6+1)*200) = 1400 for this fan. The
+    // tightened layout gives max(760, (6+1)*130) = 910, so the row is visibly
+    // closer together. Assert it is well under the old 1400 baseline.
+    expect(width).toBeLessThan(1200);
+    // The agent centers are also closer than the old per-node gap of ~200: the
+    // mean gap between adjacent agent x's is around the new MIN_NODE_GAP (130).
+    const coords = coordsOf(markup).sort((a, b) => a.x - b.x);
+    // Drop the goal (centered); compare the six agent x's.
+    const xs = coords.map((c) => c.x);
+    const gaps: number[] = [];
+    for (let i = 1; i < xs.length; i += 1) {
+      gaps.push(xs[i]! - xs[i - 1]!);
+    }
+    const meanGap = gaps.reduce((s, g) => s + g, 0) / gaps.length;
+    expect(meanGap).toBeLessThan(200);
+  });
+
+  it("keeps the tightened row non-overlapping (>= a node diameter apart) and non-collinear (jitter preserved)", () => {
+    const markup = renderToStaticMarkup(
+      createElement(GraphView, { model: wideFanModel(), selectedId: null, onSelect: () => {} }),
+    );
+    const coords = coordsOf(markup);
+    expect(coords.length).toBeGreaterThanOrEqual(7);
+    // No two centers closer than a node diameter (2 * NODE_RADIUS = 48).
+    for (let i = 0; i < coords.length; i += 1) {
+      for (let j = i + 1; j < coords.length; j += 1) {
+        const dx = coords[i]!.x - coords[j]!.x;
+        const dy = coords[i]!.y - coords[j]!.y;
+        expect(Math.hypot(dx, dy)).toBeGreaterThanOrEqual(48);
+      }
+    }
+    // The agent row is NOT collinear: the deterministic stagger/jitter is kept,
+    // so the six agents (all in one layer) do not share a single y. Prove at
+    // least two distinct y values among the agents.
+    const agentYs = coords
+      .filter((c) => c.y > 200) // below the goal row
+      .map((c) => Math.round(c.y));
+    const distinct = new Set(agentYs);
+    expect(distinct.size).toBeGreaterThan(1);
+  });
+});
+
 describe("item 5: shorter labels (module tail), full id preserved", () => {
   it("derives the module tail from a full unit id, keeping any (retry N) suffix", () => {
     expect(shortNodeLabel("validate-src-resources-notifications")).toBe("notifications");
@@ -267,5 +357,65 @@ describe("item 6: a failed round-N agent in a passing change does not imply the 
       }),
     );
     expect(markup).toContain("per-attempt retry failure that did not block");
+  });
+});
+
+describe("verify/retry detail panel surfaces the gate output, implicated units, and re-fan source", () => {
+  it("a FAILING verify node shows its gate output, the units it re-fanned, and the re-fan source", () => {
+    const verifyFail: GraphNode = {
+      id: "verify:c#1",
+      kind: "verify",
+      label: "verify round 1 (app gate) fail",
+      status: "failed",
+      verified: false,
+      escalated: false,
+      backing: {
+        kind: "verify-attempt",
+        changeId: "c",
+        round: 1,
+        outcome: "fail",
+        gateCommand: "node gate/run.mjs",
+        failingOutput: "✖ auth: unauthenticated request is rejected (401/403)",
+        implicatedUnits: ["auth"],
+        refanSource: "parse",
+      },
+    } as GraphNode;
+    const markup = renderToStaticMarkup(
+      createElement(NodeDetail, { node: verifyFail, changePassed: false, onClose: () => {} }),
+    );
+    // The failing gate output is shown.
+    expect(markup).toContain("Failing gate output");
+    expect(markup).toContain("✖ auth:");
+    // The re-fanned units and the re-fan source are both surfaced.
+    expect(markup).toContain("Re-fanned units (1)");
+    expect(markup).toContain(">auth<");
+    expect(markup).toContain("gate-output parse");
+  });
+
+  it("a RETRY node shows the re-fan source (how the implicated units were chosen)", () => {
+    const retry: GraphNode = {
+      id: "retry:c#2",
+      kind: "retry",
+      label: "retry round 2: m2 (1 unit)",
+      status: "running",
+      verified: false,
+      escalated: false,
+      backing: {
+        kind: "retry-attempt",
+        changeId: "c",
+        round: 2,
+        fromModel: "m",
+        toModel: "m2",
+        implicatedUnits: ["auth"],
+        reason: "re-planned to 1 unit(s)",
+        refanSource: "re-plan",
+      },
+    } as GraphNode;
+    const markup = renderToStaticMarkup(
+      createElement(NodeDetail, { node: retry, changePassed: false, onClose: () => {} }),
+    );
+    expect(markup).toContain("Re-fan source");
+    expect(markup).toContain("re-plan");
+    expect(markup).toContain(">auth<");
   });
 });

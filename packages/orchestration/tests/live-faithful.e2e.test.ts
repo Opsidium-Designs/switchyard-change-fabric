@@ -210,6 +210,7 @@ function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWork
     // delegated so a run with an app gate records its attempts exactly as live.
     const delegated =
       /^\/changes\/[^/]+\/(verify-attempt|retry-attempt|jev-decision)$/.test(url.pathname) ||
+      /^\/changes\/[^/]+\/verify-attempt\/refan$/.test(url.pathname) ||
       /^\/changes\/[^/]+\/work\/[^/]+\/(verify-fail|step|detail|stream)$/.test(url.pathname) ||
       /^\/changes\/[^/]+\/work\/[^/]+\/round\/[^/]+\/(lease|step|detail|complete|fail)$/.test(
         url.pathname,

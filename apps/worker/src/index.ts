@@ -1,7 +1,7 @@
 import { parseChangeSpec } from "@switchyard-change/change-core";
 import type { DiscoveredWorkUnit } from "@switchyard-change/change-core";
 
-import type { EscalationKind, JevDecisionView, JevJuncture, LeaseWorkspace, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
+import type { EscalationKind, JevDecisionView, JevJuncture, LeaseWorkspace, RefanSource, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
 import type { ChangeState } from "./change-state.ts";
 import type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 import { selectProvisioner } from "./workspace-provisioner.ts";
@@ -413,8 +413,40 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         model: body.model ?? "",
         ...(body.gateCommand ? { gateCommand: body.gateCommand } : {}),
         ...(body.failingOutput ? { failingOutput: body.failingOutput } : {}),
+        ...(Array.isArray(body.implicatedUnits) ? { implicatedUnits: body.implicatedUnits } : {}),
+        ...(body.refanSource ? { refanSource: body.refanSource } : {}),
       });
       return json({ verifyAttempt: attempt }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Patch the implicated units and the re-fan source onto the LAST verify
+  // attempt for a round (the failing verify that produced a re-fan). The ladder
+  // records the failing verify before it computes attribution, then calls this
+  // once the resulting re-fan is chosen, so the console detail panel can show
+  // WHY that round failed and which units it re-fanned.
+  const verifyRefanMatch = url.pathname.match(/^\/changes\/([^/]+)\/verify-attempt\/refan$/);
+  if (request.method === "POST" && verifyRefanMatch) {
+    const changeId = decodeURIComponent(verifyRefanMatch[1] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: VerifyAttemptBody;
+    try {
+      body = (await request.json()) as VerifyAttemptBody;
+    } catch {
+      return json({ error: "invalid verify-attempt refan body" }, 400);
+    }
+    try {
+      await stub.updateVerifyAttempt({
+        round: numberOr(body.round, 1),
+        ...(Array.isArray(body.implicatedUnits) ? { implicatedUnits: body.implicatedUnits } : {}),
+        ...(body.refanSource ? { refanSource: body.refanSource } : {}),
+      });
+      return json({ ok: true });
     } catch (error) {
       return json({ error: errorMessage(error) }, 400);
     }
@@ -444,6 +476,7 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         fromModel: body.fromModel ?? "",
         toModel: body.toModel ?? "",
         implicatedUnits: Array.isArray(body.implicatedUnits) ? body.implicatedUnits : [],
+        ...(body.refanSource ? { refanSource: body.refanSource } : {}),
         reason: body.reason ?? "verify-fail escalation",
       });
       return json({ retryAttempt: attempt }, 201);
@@ -1027,6 +1060,8 @@ interface VerifyAttemptBody {
   readonly model?: string;
   readonly gateCommand?: string;
   readonly failingOutput?: string;
+  readonly implicatedUnits?: readonly string[];
+  readonly refanSource?: RefanSource;
 }
 
 /** Body of POST /changes/:id/retry-attempt: one change-level model-escalation retry. */
@@ -1035,6 +1070,7 @@ interface RetryAttemptBody {
   readonly fromModel?: string;
   readonly toModel?: string;
   readonly implicatedUnits?: readonly string[];
+  readonly refanSource?: RefanSource;
   readonly reason?: string;
 }
 

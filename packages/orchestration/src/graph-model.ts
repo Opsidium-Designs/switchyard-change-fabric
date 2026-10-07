@@ -228,6 +228,16 @@ export interface EscalationSnapshot {
 }
 
 /**
+ * How the implicated units for a re-fan were chosen after a change-level
+ * verify-fail (mirrors the DO): "parse" (string-parse of the failing gate
+ * output), "jev" (a confident Jev attribution choice), "re-plan" (a configured
+ * re-plan transport returned a revised unit set), or "all" (nothing could be
+ * attributed, so the honest fallback re-fanned every gated unit). A "re-plan"
+ * source is what backs a `replan` graph node and makes a live re-plan countable.
+ */
+export type RefanSource = "parse" | "jev" | "re-plan" | "all";
+
+/**
  * A recorded mechanical VERIFY attempt for the whole CHANGE, as reported by the
  * state. This is the real backing for a `verify` node: a single run of the
  * per-app behavioral gate against the integrated change after a wave completed.
@@ -248,6 +258,10 @@ export interface VerifyAttemptSnapshot {
   readonly gateCommand?: string;
   /** Bounded real gate failing output (stderr/stdout) when the round failed. */
   readonly failingOutput?: string;
+  /** The units the resulting re-fan selected (present only on a fail that re-fanned). */
+  readonly implicatedUnits?: readonly string[];
+  /** How those units were chosen (parse | jev | re-plan | all). */
+  readonly refanSource?: RefanSource;
   readonly at: string;
 }
 
@@ -270,6 +284,8 @@ export interface RetryAttemptSnapshot {
   readonly toModel: string;
   /** The unit ids re-fanned on the escalation model (the implicated units). */
   readonly implicatedUnits: readonly string[];
+  /** How the implicated units were chosen (parse | jev | re-plan | all). */
+  readonly refanSource?: RefanSource;
   /** A short, human-readable reason the ladder escalated. */
   readonly reason: string;
   readonly at: string;
@@ -477,6 +493,12 @@ export interface ChangeStateSnapshot {
    */
   readonly retryAttempts?: readonly RetryAttemptSnapshot[];
   /**
+   * How many retry rounds were driven by a LIVE re-plan (refanSource "re-plan").
+   * Optional/absent on the offline path; present and positive only when a
+   * configured re-plan transport revised the unit set on a verify-fail.
+   */
+  readonly rePlans?: number;
+  /**
    * The round-N agent instances recorded for this Change. Each is a retry
    * round's re-fanned unit tracked as a BRAND NEW agent keyed by (unitId,
    * round), and becomes one round-N `agent` node beneath its retry whose
@@ -513,6 +535,7 @@ export type GraphNodeKind =
   | "tool" // an agent-built tool published to its own repo, consumed downstream
   | "verify" // one mechanical gate run against a unit's candidate edit (pass/fail)
   | "retry" // one bounded model-escalation retry on a stronger model after a verify-fail
+  | "replan" // one re-plan of the unit set to re-fan, between a failing verify and the retry agents
   | "jev"; // one Jev typed decision at a juncture (plan-review, attribution, or fix-confidence)
 
 /**
@@ -573,6 +596,10 @@ export type NodeBacking =
       readonly gateCommand?: string;
       /** The real failing gate output on a fail (for the console detail). */
       readonly failingOutput?: string;
+      /** The units this round's failure re-fanned (for the console detail). */
+      readonly implicatedUnits?: readonly string[];
+      /** How those units were chosen (parse | jev | re-plan | all). */
+      readonly refanSource?: RefanSource;
     }
   | {
       // A retry node is backed by a real recorded CHANGE-LEVEL model-escalation
@@ -585,6 +612,20 @@ export type NodeBacking =
       readonly toModel: string;
       readonly implicatedUnits: readonly string[];
       readonly reason: string;
+      /** How the implicated units were chosen (parse | jev | re-plan | all). */
+      readonly refanSource?: RefanSource;
+    }
+  | {
+      // A replan node is backed by a real recorded CHANGE-LEVEL retry whose
+      // refanSource is "re-plan": a configured re-plan transport revised the
+      // unit set to re-fan on a verify-fail. It can never be drawn without that
+      // recorded re-plan decision (a retry attempt with refanSource "re-plan"
+      // for the same round), so a replan node always maps to a genuine re-plan.
+      // It carries the revised units the re-plan chose for the round.
+      readonly kind: "replan";
+      readonly changeId: string;
+      readonly round: number;
+      readonly implicatedUnits: readonly string[];
     }
   | {
       // A round-N agent-instance node is backed by a real recorded CHANGE-LEVEL
@@ -757,6 +798,16 @@ export function retryNodeId(changeId: string, round: number): string {
 }
 
 /**
+ * The id used for the change-level REPLAN node for a given round: a re-plan of
+ * the unit set to re-fan, sitting BETWEEN the failing verify of the previous
+ * round and that round's retry agents. One per retry round that a live re-plan
+ * drove (refanSource "re-plan"); absent on the offline/attribution path.
+ */
+export function replanNodeId(changeId: string, round: number): string {
+  return `replan:${changeId}#${round}`;
+}
+
+/**
  * The id used for a round-N agent-instance node: a FRESH agent node materialized
  * beneath a retry node for one implicated unit re-fanned in that round. It is
  * keyed by (changeId, round, unitId) so round N and round N+1 each get their own
@@ -900,6 +951,29 @@ export function assertBacked(node: GraphNode, snapshot: ChangeStateSnapshot): Gr
       if (!retry) {
         throw new Error(
           `unbacked node ${node.id}: no recorded model-escalation retry round ${backing.round} to ${backing.toModel} for change ${backing.changeId}`,
+        );
+      }
+      return node;
+    }
+    case "replan": {
+      // A replan node must map to a real recorded CHANGE-LEVEL retry whose
+      // refanSource is "re-plan": a configured re-plan transport revised the
+      // unit set to re-fan on a verify-fail. Its change must match AND a retry
+      // attempt for the same round with refanSource "re-plan" must be present. A
+      // replan node with no such re-plan record is exactly the decorative node
+      // the no-unbacked-node rule forbids, so an offline/attribution round (no
+      // re-plan) can never draw one.
+      if (backing.changeId !== snapshot.id) {
+        throw new Error(
+          `unbacked node ${node.id}: replan names change ${backing.changeId}, not ${snapshot.id}`,
+        );
+      }
+      const replanRetry = (snapshot.retryAttempts ?? []).find(
+        (a) => a.round === backing.round && a.refanSource === "re-plan",
+      );
+      if (!replanRetry) {
+        throw new Error(
+          `unbacked node ${node.id}: no recorded re-plan (retry round ${backing.round} with refanSource re-plan) for change ${backing.changeId}`,
         );
       }
       return node;
@@ -1505,6 +1579,10 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
         outcome: attempt.outcome,
         ...(attempt.gateCommand ? { gateCommand: attempt.gateCommand } : {}),
         ...(attempt.failingOutput ? { failingOutput: attempt.failingOutput } : {}),
+        ...(attempt.implicatedUnits && attempt.implicatedUnits.length > 0
+          ? { implicatedUnits: attempt.implicatedUnits }
+          : {}),
+        ...(attempt.refanSource ? { refanSource: attempt.refanSource } : {}),
       },
     };
     nodes.push(assertBacked(verifyNode, snapshot));
@@ -1547,6 +1625,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
         toModel: retry.toModel,
         implicatedUnits: retry.implicatedUnits,
         reason: retry.reason,
+        ...(retry.refanSource ? { refanSource: retry.refanSource } : {}),
       },
     };
     nodes.push(assertBacked(retryNode, snapshot));
@@ -1578,6 +1657,58 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
           toModel: retry.toModel,
         },
       });
+    }
+
+    // The REPLAN node: when this retry round was driven by a LIVE re-plan
+    // (refanSource "re-plan"), a configured re-plan transport revised the unit
+    // set to re-fan. Draw a replan node BETWEEN the failing verify of the
+    // previous round and this round's retry agents, with SPAWN-kind edges
+    // verify(failed) -> replan -> retry-agents, so the graph shows WHAT
+    // triggered the retry. The node is backed by this retry's re-plan decision
+    // (assertBacked rejects an unbacked replan node), so an offline/attribution
+    // round (no re-plan) draws no replan node and the parse/attribution path is
+    // unchanged. It is emitted BEFORE its edges so every edge endpoint is in the
+    // node set.
+    const replanned = retry.refanSource === "re-plan";
+    if (replanned) {
+      const replanCount = retry.implicatedUnits.length;
+      const replanNode: GraphNode = {
+        id: replanNodeId(snapshot.id, retry.round),
+        kind: "replan",
+        // A readable label naming the round and the revised unit count, e.g.
+        // "re-plan round 2 (1 unit)".
+        label: `re-plan round ${retry.round} (${replanCount} unit${replanCount === 1 ? "" : "s"})`,
+        status: "integrated",
+        verified: false,
+        escalated: false,
+        backing: {
+          kind: "replan",
+          changeId: snapshot.id,
+          round: retry.round,
+          implicatedUnits: retry.implicatedUnits,
+        },
+      };
+      nodes.push(assertBacked(replanNode, snapshot));
+
+      // The SPAWN trigger edge verify(failed) -> replan: the failing verify of
+      // the previous round spawned the re-plan. Only drawn when that previous
+      // verify is a real recorded failing round, so the hop is backed by both
+      // the re-plan record and the failing verify it followed.
+      if (prevVerifyFailed) {
+        edges.push({
+          id: `replan-trigger:${snapshot.id}#${prevRound}->${retry.round}`,
+          kind: "spawn",
+          from: verifyNodeId(snapshot.id, prevRound),
+          to: replanNodeId(snapshot.id, retry.round),
+          backing: {
+            kind: "model-escalation",
+            changeId: snapshot.id,
+            round: retry.round,
+            fromModel: retry.fromModel,
+            toModel: retry.toModel,
+          },
+        });
+      }
     }
 
     // The round-N agent instances: one FRESH agent node per implicated unit the
@@ -1660,6 +1791,28 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
           toModel: retry.toModel,
         },
       });
+
+      // When this round was driven by a live re-plan, also draw the SPAWN edge
+      // replan -> round-N agent, so the trigger chain reads
+      // verify(failed) -> replan -> retry-agents. It is backed by the same
+      // re-fan provenance as the retry -> agent edge; the replan node it points
+      // from is itself backed by the recorded re-plan (gated above), so the edge
+      // never references a node the graph did not emit.
+      if (replanned) {
+        edges.push({
+          id: `replan-refan:${snapshot.id}#${retry.round}->${unitId}`,
+          kind: "spawn",
+          from: replanNodeId(snapshot.id, retry.round),
+          to: roundAgentNodeId(snapshot.id, retry.round, unitId),
+          backing: {
+            kind: "re-fan",
+            changeId: snapshot.id,
+            round: retry.round,
+            unitId,
+            toModel: retry.toModel,
+          },
+        });
+      }
     }
   }
 

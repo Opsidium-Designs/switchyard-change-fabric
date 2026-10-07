@@ -226,6 +226,144 @@ export class MarkerGateRunner implements CommandRunner {
 }
 
 /**
+ * A deterministic CommandRunner the ladder runs as the CHANGE-LEVEL per-app gate
+ * that, UNLIKE MarkerGateRunner, names failing units by RESOURCE NAME in the
+ * real `node --test` SPEC-reporter forms rather than by source-file path:
+ *   - a top-level `✖ <name>: unauthenticated request is rejected (401/403)` line, and
+ *   - an assertion detail `AssertionError [ERR_ASSERTION]: <name> must reject ..., got 201`.
+ * It scans the same `*.fix` markers (each records the model that produced the
+ * edit) and FAILS a unit whose marker does not record the passing model, naming
+ * that unit by its id so the ladder's resource-name attribution (unitCoversName)
+ * maps it back to the owning unit WITHOUT any file-path hint. This is what
+ * proves the FIRST retry narrows to the failing resource (e.g. auth) from the
+ * real assertion-line format, not just from a named file. Mechanical and
+ * offline: it grades the real marker artifacts the model never sees.
+ */
+export class ResourceNameGateRunner implements CommandRunner {
+  readonly calls: { argv: readonly string[]; cwd: string }[] = [];
+  constructor(private readonly options: MarkerGateRunnerOptions) {}
+
+  async run(argv: readonly string[], cwd: string): Promise<CommandOutcome> {
+    this.calls.push({ argv, cwd });
+    const srcDir = join(cwd, "src");
+    let entries: string[] = [];
+    try {
+      entries = (await readdir(srcDir)).filter((name) => name.endsWith(".fix"));
+    } catch {
+      entries = [];
+    }
+    if (entries.length === 0) {
+      return { code: 1, stdout: "", stderr: "gate failed: no edit markers found under src/" };
+    }
+    const alwaysPass = new Set(this.options.alwaysPassingUnits ?? []);
+    const failing: string[] = [];
+    const passing: string[] = [];
+    for (const name of entries.sort()) {
+      const unitId = name.replace(/\.fix$/, "");
+      if (alwaysPass.has(unitId)) {
+        passing.push(unitId);
+        continue;
+      }
+      let content = "";
+      try {
+        content = await readFile(join(srcDir, name), "utf8");
+      } catch {
+        failing.push(unitId);
+        continue;
+      }
+      const match = content.match(/^model:\s*(.+)\s*$/m);
+      const recorded = (match?.[1] ?? "").trim();
+      (recorded === this.options.passingModel ? passing : failing).push(unitId);
+    }
+    if (failing.length === 0) {
+      return { code: 0, stdout: `gate passed for ${entries.length} marker(s)`, stderr: "" };
+    }
+    // Emit the real SPEC-reporter shapes keyed by resource NAME (no file path),
+    // a ✔ line for each passing resource and a ✖ line + AssertionError for each
+    // failing one, so the ladder attributes by resource name alone.
+    const lines: string[] = [];
+    for (const unitId of passing) {
+      lines.push(`✔ ${unitId}: unauthenticated request is rejected (401/403) (1ms)`);
+    }
+    for (const unitId of failing) {
+      lines.push(`✖ ${unitId}: unauthenticated request is rejected (401/403) (1.78ms)`);
+    }
+    lines.push("", "✖ failing tests:", "");
+    for (const unitId of failing) {
+      lines.push(
+        `  AssertionError [ERR_ASSERTION]: ${unitId} must reject an unauthenticated request via requireAuth, got 201`,
+      );
+    }
+    return { code: 1, stdout: lines.join("\n"), stderr: "" };
+  }
+}
+
+/**
+ * A deterministic CommandRunner that FAILS the change-level gate with an
+ * UNATTRIBUTABLE crash output (a module-load crash naming only the gate file,
+ * like a round-1 whole-app import crash) whenever any present marker does not
+ * record the passing model, and PASSES only when every marker records it. Unlike
+ * the resource-name/marker gates, it NEVER names a failing unit or an owned
+ * source file, so the string-parse attribution cannot narrow and falls back to
+ * re-fanning ALL units. This is exactly the round-1 crash the debugger pinned,
+ * and it lets a test prove a CONFIDENT Jev choice is the PRIMARY selector that
+ * narrows the re-fan even when the parse is unattributable. Mechanical and
+ * offline: it grades the real markers; it just reports the failure opaquely.
+ */
+export class CrashGateRunner implements CommandRunner {
+  readonly calls: { argv: readonly string[]; cwd: string }[] = [];
+  constructor(private readonly options: MarkerGateRunnerOptions) {}
+
+  async run(argv: readonly string[], cwd: string): Promise<CommandOutcome> {
+    this.calls.push({ argv, cwd });
+    const srcDir = join(cwd, "src");
+    let entries: string[] = [];
+    try {
+      entries = (await readdir(srcDir)).filter((name) => name.endsWith(".fix"));
+    } catch {
+      entries = [];
+    }
+    if (entries.length === 0) {
+      return { code: 1, stdout: "", stderr: "gate failed: no edit markers found under src/" };
+    }
+    const alwaysPass = new Set(this.options.alwaysPassingUnits ?? []);
+    let allPass = true;
+    for (const name of entries) {
+      const unitId = name.replace(/\.fix$/, "");
+      if (alwaysPass.has(unitId)) {
+        continue;
+      }
+      let content = "";
+      try {
+        content = await readFile(join(srcDir, name), "utf8");
+      } catch {
+        allPass = false;
+        continue;
+      }
+      const match = content.match(/^model:\s*(.+)\s*$/m);
+      if ((match?.[1] ?? "").trim() !== this.options.passingModel) {
+        allPass = false;
+      }
+    }
+    if (allPass) {
+      return { code: 0, stdout: `gate passed for ${entries.length} marker(s)`, stderr: "" };
+    }
+    // An UNATTRIBUTABLE crash: a module-load failure that names only the gate
+    // runner file (which no unit owns), so neither a resource name nor an owned
+    // source path can be extracted. This is the round-1 whole-app import crash.
+    return {
+      code: 1,
+      stdout: "",
+      stderr: [
+        "✖ gate/run.mjs (8.42ms)",
+        "  Error [ERR_MODULE_NOT_FOUND]: Cannot find package imported from the composed app",
+        "    code: 'ERR_MODULE_NOT_FOUND'",
+      ].join("\n"),
+    };
+  }
+}
+
+/**
  * The CHANGE-LEVEL gate argv. The gate is per-app (it verifies the whole app),
  * so the SAME command applies to every unit; the MarkerGateRunner scans all
  * markers rather than reading one unit's path. Kept as a function taking a unit

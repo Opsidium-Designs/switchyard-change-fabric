@@ -205,6 +205,17 @@ export type TeardownApp = (input: {
 }) => Promise<void>;
 
 /**
+ * How the implicated units for a change-level re-fan were chosen: "parse" (the
+ * string-parse of the failing gate output narrowed them), "jev" (a confident Jev
+ * attribution choice drove the selection), "re-plan" (a configured re-plan
+ * transport returned a revised set), or "all" (nothing was attributable, so the
+ * honest fallback re-fanned every gated unit). Recorded on the verify attempt
+ * that failed and the retry it produced so the console can show WHY a round
+ * re-fanned the units it did.
+ */
+export type RefanSource = "parse" | "jev" | "re-plan" | "all";
+
+/**
  * The injected re-plan transport the change-level ladder calls on a verify-fail
  * to produce a REVISED set of units to re-fan for the next retry round. It is
  * handed the failing gate evidence, the candidate unit ids (every gated unit),
@@ -1475,15 +1486,24 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
       // Attribution: pick the units whose declared paths cover the file(s) the
       // failing gate output named. When the failure cannot be attributed to any
       // specific unit, FALL BACK to re-fanning ALL gated units (never silently
-      // skip). This narrowing is best-effort; the fallback keeps it honest.
-      const parsed = selectImplicatedUnits(gatedUnits, lastEvidence);
+      // skip). This narrowing is best-effort; the fallback keeps it honest. The
+      // attributability flag distinguishes a genuine narrow ("parse") from the
+      // re-fan-all fallback ("all"), recorded as the re-fan source.
+      const attribution = attributeImplicatedUnits(gatedUnits, lastEvidence);
+      const parsed = attribution.units;
+      // The honest re-fan source for this round: "parse" when the string-parse
+      // narrowed to specific units, "all" when nothing was attributable (the
+      // fallback). Jev or a re-plan may upgrade it to "jev"/"re-plan" below.
+      let refanSource: RefanSource = attribution.attributed ? "parse" : "all";
       // JUNCTURE (b) FAILURE ATTRIBUTION: when Jev is live, ask which module the
-      // failure implicates (a choice over the gated unit ids) and UNION a
-      // confident choice with the string-parse result, so Jev is a SMARTER
-      // COMPLEMENT, never a replacement. A low-confidence or unrecognized choice
-      // leaves the parse+fallback result exactly as it was (the fallback is never
-      // silently dropped). The decision is recorded on the Change (backing a jev
-      // node). Offline (no Jev) this is a no-op and the parse+fallback stands.
+      // failure implicates (a choice over the gated unit ids). A CONFIDENT Jev
+      // choice is the PRIMARY selector: it drives the implicated set (preferred
+      // over the string-parse), which helps narrow to the failing module even
+      // when the parse is weak or fell back to all. A low-confidence or
+      // unrecognized choice leaves the parse+fallback result exactly as it was
+      // (the fallback is never silently dropped). The decision is recorded on the
+      // Change (backing a jev node). Offline (no Jev) this is a no-op and the
+      // parse+fallback stands.
       let implicated = parsed;
       // The confident Jev attribution choice this round, when one was recorded,
       // so the re-plan transport can be fed it as a hint. Undefined otherwise.
@@ -1521,14 +1541,30 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             });
           }
           if (confident && answer) {
-            // Union the confident Jev choice with the string-parse result, so a
-            // unit either the parse OR Jev implicates is re-fanned. The fallback
-            // (re-fan all when the parse found nothing) is preserved because
-            // `parsed` already carries it.
+            // A confident Jev choice is the PRIMARY implicated-unit selector:
+            // the Jev-chosen unit drives the re-fan. Union it with any
+            // string-parse hits so a unit either the parse OR Jev implicates is
+            // re-fanned, but when the parse found nothing (the "all" fallback),
+            // the confident Jev choice NARROWS to that unit rather than leaving
+            // the whole re-fan-all set. This is what lets round 2 narrow to the
+            // failing module even when the parse is weak. The honest fallback is
+            // preserved: an absent/low-confidence Jev leaves `parsed` (and its
+            // re-fan-all case) untouched.
             attributionChoice = answer.choice;
             const chosen = gatedUnits.find((u) => u.unitId === answer.choice);
-            if (chosen && !parsed.some((u) => u.unitId === chosen.unitId)) {
-              implicated = [...parsed, chosen];
+            if (chosen) {
+              if (attribution.attributed) {
+                // Union the Jev choice with the genuine parse hits.
+                implicated = parsed.some((u) => u.unitId === chosen.unitId)
+                  ? parsed
+                  : [...parsed, chosen];
+              } else {
+                // The parse could not attribute (fallback to all): let the
+                // confident Jev choice narrow to its unit rather than re-fanning
+                // everything.
+                implicated = [chosen];
+              }
+              refanSource = "jev";
             }
           }
         } catch {
@@ -1547,9 +1583,8 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
       // the implicated set exactly as before, so the attribution + re-fan-all
       // fallback is never silently lost. The mechanical gate stays authoritative:
       // the re-plan only chooses WHICH units re-run, never the verdict. Recorded
-      // per round via implicatedUnits + the reason, so the revised plan is
-      // visible and a dropped unit is not re-fanned.
-      let refanSource: "re-plan" | "attribution" = "attribution";
+      // per round via implicatedUnits + the reason + the "re-plan" refan source,
+      // so the revised plan is visible and a dropped unit is not re-fanned.
       if (input.rePlan) {
         const candidateUnitIds = gatedUnits.map((u) => u.unitId);
         try {
@@ -1575,24 +1610,41 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
       }
 
       // Record the change-level model-escalation beat (a retry node + a
-      // model-escalation edge, carrying the implicated units) BEFORE running it,
-      // so the console shows the hop.
+      // model-escalation edge, carrying the implicated units + the re-fan source)
+      // BEFORE running it, so the console shows the hop and WHY these units.
+      const refanReason =
+        refanSource === "re-plan"
+          ? `verify round ${round} failed; re-planned to ${implicated.length} unit(s) and re-fanning them on a stronger model fed the failing evidence`
+          : refanSource === "jev"
+            ? `verify round ${round} failed; Jev attribution implicated ${implicated.length} unit(s), re-fanning them on a stronger model fed the failing evidence`
+            : refanSource === "parse"
+              ? `verify round ${round} failed; re-fanning ${implicated.length} implicated unit(s) on a stronger model fed the failing evidence`
+              : `verify round ${round} failed; could not attribute the failure, re-fanning all ${implicated.length} unit(s) on a stronger model fed the failing evidence`;
+      const implicatedIds = implicated.map((u) => u.unitId);
       await post(`/changes/${encodeURIComponent(changeId)}/retry-attempt`, {
         round: nextRound,
         fromModel,
         toModel: roundModel,
-        implicatedUnits: implicated.map((u) => u.unitId),
-        reason:
-          refanSource === "re-plan"
-            ? `verify round ${round} failed; re-planned to ${implicated.length} unit(s) and re-fanning them on a stronger model fed the failing evidence`
-            : `verify round ${round} failed; re-fanning ${implicated.length} implicated unit(s) on a stronger model fed the failing evidence`,
+        implicatedUnits: implicatedIds,
+        refanSource,
+        reason: refanReason,
+      }).catch(() => {});
+      // Patch the failing verify of the PREVIOUS round with the implicated units
+      // and the re-fan source it produced, so the console detail panel for that
+      // verify node shows which units its failure re-fanned and how they were
+      // chosen (parse | jev | re-plan | all). Best-effort; a patch for a round
+      // with no recorded verify is a no-op.
+      await post(`/changes/${encodeURIComponent(changeId)}/verify-attempt/refan`, {
+        round,
+        implicatedUnits: implicatedIds,
+        refanSource,
       }).catch(() => {});
       emit({
         kind: "model-escalation",
         round: nextRound,
         fromModel,
         toModel: roundModel,
-        implicatedUnits: implicated.map((u) => u.unitId),
+        implicatedUnits: implicatedIds,
       });
 
       // Re-fan the implicated units on the escalation model, fed the failing
@@ -1809,10 +1861,27 @@ export function selectImplicatedUnits(
   gatedUnits: readonly GatedUnitInput[],
   evidence: string,
 ): readonly GatedUnitInput[] {
+  return attributeImplicatedUnits(gatedUnits, evidence).units;
+}
+
+/**
+ * The attribution result for a change-level gate failure: the implicated units
+ * AND whether the failure could genuinely be attributed to specific units
+ * (`attributed: true` when the parse mapped at least one named file/resource to
+ * a declared unit) or fell back to re-fanning ALL gated units (`attributed:
+ * false`, the honest "cannot attribute" case). The boolean is what lets the
+ * ladder record an honest re-fan source: a narrowed parse ("parse") versus the
+ * re-fan-all fallback ("all"). `selectImplicatedUnits` is the units-only view
+ * for the existing callers; this is the richer view the ladder uses.
+ */
+export function attributeImplicatedUnits(
+  gatedUnits: readonly GatedUnitInput[],
+  evidence: string,
+): { readonly units: readonly GatedUnitInput[]; readonly attributed: boolean } {
   const failingFiles = extractFailingFiles(evidence);
   const failingNames = extractFailingNames(evidence);
   if (failingFiles.length === 0 && failingNames.length === 0) {
-    return gatedUnits; // nothing to attribute to: re-fan all
+    return { units: gatedUnits, attributed: false }; // nothing to attribute to: re-fan all
   }
   const implicated = gatedUnits.filter(
     (unit) =>
@@ -1822,7 +1891,9 @@ export function selectImplicatedUnits(
   // Honest fallback: if neither the named files nor the named resources map to
   // any unit, re-fan all rather than silently skip (the change failed either
   // way). Attribution is best-effort narrowing, not a correctness claim.
-  return implicated.length > 0 ? implicated : gatedUnits;
+  return implicated.length > 0
+    ? { units: implicated, attributed: true }
+    : { units: gatedUnits, attributed: false };
 }
 
 /**

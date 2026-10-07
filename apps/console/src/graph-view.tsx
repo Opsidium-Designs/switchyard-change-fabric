@@ -32,15 +32,23 @@ import { goalNodeId } from "@switchyard-change/orchestration/graph-model";
  * fades in where its layer puts it.
  */
 
-const WIDTH = 1100;
+const WIDTH = 760;
 const LAYER_HEIGHT = 280;
 const TOP_MARGIN = 80;
 const NODE_RADIUS = 24;
 const GOAL_RADIUS = 32;
 /** Vertical gap between a node's circle edge and its label row (outside it). */
 const LABEL_GAP = 10;
-/** Minimum horizontal gap between adjacent node centers in a dense row. */
-const MIN_NODE_GAP = 200;
+/**
+ * Minimum horizontal gap between adjacent node centers in a dense row. Tightened
+ * from the earlier 200 so a wide agent fan reads as a cohesive wave rather than
+ * a sparse spread, while staying comfortably above the no-overlap floor: with
+ * the per-node X jitter (X_JITTER below) the closest two centers can get is
+ * MIN_NODE_GAP - 2*X_JITTER, which must stay >= 2*NODE_RADIUS (a node diameter),
+ * so 130 - 44 = 86 >= 48 holds. The positional variance (jitter/stagger) is
+ * deliberately kept unchanged, so the row stays organic, not collinear.
+ */
+const MIN_NODE_GAP = 130;
 /** Vertical stagger step applied by column so siblings are not on one flat row. */
 const STAGGER_STEP = 34;
 /** Deterministic per-node horizontal jitter amplitude (SVG units). */
@@ -435,6 +443,13 @@ function nodeFill(node: GraphNode, changePassed = false): string {
   if (node.kind === "jev") {
     return node.verified ? "#e3883e" : "#9a5a1f";
   }
+  // A replan node is the re-plan-of-the-unit-set beat between a failing verify
+  // and the retry agents it triggered: a distinct TEAL-VIOLET, associated with
+  // the planner (it is a re-plan) yet clearly its own node, so the trigger chain
+  // verify(failed) -> replan -> retry-agents reads as one beat.
+  if (node.kind === "replan") {
+    return "#6f7bd6";
+  }
   if (node.status === "failed") {
     // A failed unit is a distinct terminal state: a dark, muted red, clearly not
     // the healthy green of a verified node and not the blue of a running one, so
@@ -776,7 +791,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                       stroke={selected ? "#e6edf3" : "#0d1117"}
                       strokeWidth={selected ? 3 : 1.5}
                     />
-                  ) : node.kind === "planner" ? (
+                  ) : node.kind === "planner" || node.kind === "replan" ? (
                     <polygon
                       points={trianglePoints(r)}
                       fill={nodeFill(node, changePassed)}

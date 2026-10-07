@@ -132,4 +132,38 @@ describe("retry attribution against the real node --test SPEC reporter output", 
     const implicated = selectImplicatedUnits(UNITS, allPass);
     expect(implicated.map((u) => u.unitId)).toEqual(UNITS.map((u) => u.unitId));
   });
+
+  it("narrows a round-1 fail implicating ONLY auth to the auth unit (both real assertion-line forms)", () => {
+    // The exact two forms the service-api gate emits for a failing resource:
+    //   `<name>: <desc> (401/403)` (the top-level ✖ line) and
+    //   `<name> must <...>, got <...>` (the assertion detail).
+    // When ONLY auth fails, attribution must narrow the FIRST retry to the auth
+    // unit alone, never the other five resources.
+    const evidence = [
+      "✖ auth: unauthenticated request is rejected (401/403) (1.78ms)",
+      "✔ users: unauthenticated request is rejected (401/403) (1.1ms)",
+      "✔ orders: unauthenticated request is rejected (401/403) (0.9ms)",
+      "✔ products: authenticated, valid request still succeeds (0.7ms)",
+      "✔ search: authenticated, valid request still succeeds (0.6ms)",
+      "✔ notifications: authenticated, valid request still succeeds (0.6ms)",
+      "",
+      "✖ failing tests:",
+      "  AssertionError [ERR_ASSERTION]: auth must reject an unauthenticated request via requireAuth, got 201",
+    ].join("\n");
+    const implicated = selectImplicatedUnits(UNITS, evidence);
+    expect(implicated.map((u) => u.unitId)).toEqual(["auth"]);
+    for (const other of ["users", "orders", "products", "search", "notifications"]) {
+      expect(implicated.some((u) => u.unitId === other)).toBe(false);
+    }
+  });
+
+  it("narrows on the bare `<name> must ..., got <status>` assertion line alone (no top-level glyph line)", () => {
+    // A gate whose captured output carries only the assertion detail (the
+    // top-level ✖ line was truncated away) must still attribute to the unit.
+    const evidence = [
+      "auth must reject invalid input with 400, got 201",
+    ].join("\n");
+    const implicated = selectImplicatedUnits(UNITS, evidence);
+    expect(implicated.map((u) => u.unitId)).toEqual(["auth"]);
+  });
 });

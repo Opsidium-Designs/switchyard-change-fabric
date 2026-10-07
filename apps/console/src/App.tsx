@@ -1133,6 +1133,28 @@ function JevDetail({ detail }: { detail: JevDetailSnapshot }) {
  * Both come from the backing variant the graph model attached, so this panel can
  * only show a ladder beat that genuinely happened.
  */
+/**
+ * A readable label for a re-fan source (how the implicated units were chosen):
+ * the string-parse of the failing gate output, a confident Jev attribution
+ * choice, a configured re-plan, or the honest re-fan-all fallback.
+ */
+function refanSourceLabel(source: "parse" | "jev" | "re-plan" | "all"): string {
+  switch (source) {
+    case "parse":
+      return "gate-output parse";
+    case "jev":
+      return "Jev attribution";
+    case "re-plan":
+      return "re-plan";
+    case "all":
+      return "re-fan all (unattributable)";
+  }
+}
+
+/** A short explainer of what the re-fan source values mean. */
+const refanSourceExplainer =
+  "a parse of the failing gate output, a confident Jev attribution choice, a configured re-plan, or the honest re-fan-all fallback when the failure could not be attributed";
+
 function LadderDetail({
   backing,
 }: {
@@ -1172,6 +1194,27 @@ function LadderDetail({
             <pre className="detail-pre">{backing.failingOutput}</pre>
           </>
         ) : null}
+        {backing.outcome === "fail" &&
+        backing.implicatedUnits &&
+        backing.implicatedUnits.length > 0 ? (
+          <>
+            <h4>
+              Re-fanned units ({backing.implicatedUnits.length})
+              {backing.refanSource ? ` via ${refanSourceLabel(backing.refanSource)}` : ""}
+            </h4>
+            <ul className="paths">
+              {backing.implicatedUnits.map((u) => (
+                <li key={u}>
+                  <code>{u}</code>
+                </li>
+              ))}
+            </ul>
+            <p className="muted">
+              This round's failure re-fanned these units on the next round. The
+              re-fan source shows how they were chosen: {refanSourceExplainer}.
+            </p>
+          </>
+        ) : null}
       </div>
     );
   }
@@ -1192,6 +1235,11 @@ function LadderDetail({
         </div>
       </dl>
       {backing.reason ? <p className="muted">{backing.reason}</p> : null}
+      {backing.refanSource ? (
+        <p className="muted">
+          Re-fan source: <strong>{refanSourceLabel(backing.refanSource)}</strong>.
+        </p>
+      ) : null}
       <h4>Implicated units ({backing.implicatedUnits.length})</h4>
       {backing.implicatedUnits.length === 0 ? (
         <p className="muted">No specific unit was recorded for this retry.</p>

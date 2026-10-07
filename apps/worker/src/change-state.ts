@@ -193,6 +193,17 @@ export type VerifyOutcome = "pass" | "fail";
  * prompt and the console can show WHY the round failed, and the gate command is
  * kept so the console can show exactly what ran.
  */
+/**
+ * How the implicated units for a re-fan were chosen after a change-level
+ * verify-fail: "parse" (the string-parse of the failing gate output narrowed
+ * them), "jev" (a confident Jev attribution choice drove the selection),
+ * "re-plan" (a configured re-plan transport returned a revised unit set), or
+ * "all" (nothing could be attributed, so the honest fallback re-fanned every
+ * gated unit). It makes WHY a round re-fanned the units it did visible on both
+ * the verify attempt that failed and the retry it produced.
+ */
+export type RefanSource = "parse" | "jev" | "re-plan" | "all";
+
 export interface VerifyAttempt {
   /** 1 for the first verify after the kickoff wave, 2 after the retry wave. */
   readonly round: number;
@@ -203,6 +214,17 @@ export interface VerifyAttempt {
   readonly gateCommand?: string;
   /** Bounded real gate failing output (stderr/stdout) when the round failed. */
   readonly failingOutput?: string;
+  /**
+   * The unit ids the resulting re-fan selected for the NEXT round, recorded on
+   * the failing verify so the console can show which units this round's failure
+   * re-fanned. Present only on a fail that produced a re-fan (a retry round).
+   */
+  readonly implicatedUnits?: readonly string[];
+  /**
+   * How those implicated units were chosen (parse | jev | re-plan | all).
+   * Present only on a fail that produced a re-fan.
+   */
+  readonly refanSource?: RefanSource;
   readonly at: string;
 }
 
@@ -226,6 +248,13 @@ export interface RetryAttempt {
   readonly toModel: string;
   /** The unit ids re-fanned on the escalation model (the implicated units). */
   readonly implicatedUnits: readonly string[];
+  /**
+   * How the implicated units were chosen (parse | jev | re-plan | all), so the
+   * console can show whether this round narrowed by the string-parse, a Jev
+   * choice, a configured re-plan, or the honest re-fan-all fallback. A re-plan
+   * refanSource is what makes a live re-plan countable (rePlans > 0).
+   */
+  readonly refanSource?: RefanSource;
   /** A short, human-readable reason the ladder escalated (never a secret). */
   readonly reason: string;
   readonly at: string;
@@ -423,6 +452,14 @@ export interface ChangeStateView {
    * human-escalation `escalated` flag.
    */
   readonly retryAttempts: readonly RetryAttempt[];
+  /**
+   * How many retry rounds were driven by a LIVE re-plan (a configured re-plan
+   * transport returning a revised unit set), derived from the retry attempts
+   * whose refanSource is "re-plan". Zero on the offline/attribution path, so a
+   * caller can tell a run that genuinely re-planned (rePlans > 0) from one that
+   * only used the deterministic string-parse/Jev attribution path.
+   */
+  readonly rePlans: number;
   /**
    * The round-N agent instances recorded for this Change: each is a retry
    * round's re-fanned unit running as a BRAND NEW agent keyed by (unitId, round),
@@ -991,11 +1028,51 @@ export class ChangeState extends DurableObject<Env> {
       ...(typeof input.failingOutput === "string" && input.failingOutput !== ""
         ? { failingOutput: sanitizeText(input.failingOutput, MAX_DETAIL_TEXT) }
         : {}),
+      ...(Array.isArray(input.implicatedUnits) && input.implicatedUnits.length > 0
+        ? { implicatedUnits: input.implicatedUnits.map((u) => String(u)) }
+        : {}),
+      ...(normalizeRefanSource(input.refanSource)
+        ? { refanSource: normalizeRefanSource(input.refanSource)! }
+        : {}),
       at: new Date().toISOString(),
     };
     attempts.push(stored);
     await this.ctx.storage.put("verifyAttempts", attempts);
     return stored;
+  }
+
+  /**
+   * Patch the implicated units and the re-fan source onto the LAST recorded
+   * verify attempt for a round (the failing verify that produced a re-fan). The
+   * ladder records the failing verify before it computes attribution, then calls
+   * this once the resulting re-fan is chosen, so the console detail panel can
+   * show WHY that round failed and which units it re-fanned. A patch for a round
+   * with no recorded verify attempt is a best-effort no-op.
+   */
+  async updateVerifyAttempt(input: {
+    readonly round: number;
+    readonly implicatedUnits?: readonly string[];
+    readonly refanSource?: RefanSource;
+  }): Promise<void> {
+    const attempts = await this.loadVerifyAttempts();
+    const round = Number.isFinite(input.round) && input.round > 0 ? Math.floor(input.round) : 1;
+    // Patch the LAST attempt for the round (the one that just failed), so a
+    // re-run of the same round does not clobber an earlier attempt's record.
+    for (let i = attempts.length - 1; i >= 0; i -= 1) {
+      if (attempts[i]!.round === round) {
+        attempts[i] = {
+          ...attempts[i]!,
+          ...(Array.isArray(input.implicatedUnits) && input.implicatedUnits.length > 0
+            ? { implicatedUnits: input.implicatedUnits.map((u) => String(u)) }
+            : {}),
+          ...(normalizeRefanSource(input.refanSource)
+            ? { refanSource: normalizeRefanSource(input.refanSource)! }
+            : {}),
+        };
+        await this.ctx.storage.put("verifyAttempts", attempts);
+        return;
+      }
+    }
   }
 
   /**
@@ -1021,6 +1098,9 @@ export class ChangeState extends DurableObject<Env> {
       fromModel: typeof input.fromModel === "string" ? input.fromModel.slice(0, 120) : "",
       toModel: typeof input.toModel === "string" ? input.toModel.slice(0, 120) : "",
       implicatedUnits: implicated.map((u) => String(u)),
+      ...(normalizeRefanSource(input.refanSource)
+        ? { refanSource: normalizeRefanSource(input.refanSource)! }
+        : {}),
       reason: sanitizeReason(input.reason),
       at: new Date().toISOString(),
     };
@@ -1601,6 +1681,7 @@ export class ChangeState extends DurableObject<Env> {
       ...(deployment ? { deployment } : {}),
       verifyAttempts,
       retryAttempts,
+      rePlans: retryAttempts.filter((a) => a.refanSource === "re-plan").length,
       // The round-N agent instances, ordered by (round, unitId) for a stable
       // projection. Each is a retry round's re-fanned unit tracked as a real
       // agent with its own recorded workspace and status lifecycle.
@@ -1728,6 +1809,16 @@ function leaseEdgesFromPlan(plan: LeasePlan): LeaseEdge[] {
  * built to not leak one), but the reason is stored and shown, so bound its
  * length and strip obvious credential-looking fragments defensively.
  */
+/**
+ * Normalize a re-fan source to one of the known values, or undefined when it is
+ * absent or unrecognized (so an unknown value never persists).
+ */
+function normalizeRefanSource(value: unknown): RefanSource | undefined {
+  return value === "parse" || value === "jev" || value === "re-plan" || value === "all"
+    ? value
+    : undefined;
+}
+
 function sanitizeReason(reason: string | undefined): string {
   const text = (reason ?? "agent failed").toString().replace(/\s+/g, " ").trim();
   const redacted = text

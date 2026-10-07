@@ -36,6 +36,7 @@ export type {
   ToolRecord,
   VerifyAttempt,
   VerifyOutcome,
+  RefanSource,
   RetryAttempt,
   WorkspaceIdentity,
   WorkUnitView,
@@ -148,7 +149,7 @@ export type {
   WorkUnitSnapshot,
   WorkUnitStatus,
 } from "./graph-model.ts";
-export { assertBacked, buildWorkGraphModel, goalNodeId, plannerNodeId, retryNodeId, roundAgentNodeId, toolNodeId, unitNodeId, verifyNodeId } from "./graph-model.ts";
+export { assertBacked, buildWorkGraphModel, goalNodeId, plannerNodeId, replanNodeId, retryNodeId, roundAgentNodeId, toolNodeId, unitNodeId, verifyNodeId } from "./graph-model.ts";
 
 export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor.ts";
 export { formatDoctorReport, runDoctor } from "./doctor.ts";

@@ -200,6 +200,8 @@ export interface ChangeStateView {
   readonly verifyAttempts: readonly VerifyAttempt[];
   /** Model-escalation retries (mirrors the Worker); back `retry` nodes/edges. */
   readonly retryAttempts: readonly RetryAttempt[];
+  /** Count of retry rounds driven by a LIVE re-plan (refanSource "re-plan"). */
+  readonly rePlans: number;
   /**
    * Round-N agent instances (mirrors the Worker); back the graph's round-N
    * `agent` nodes with recorded status/workspace/activity/detail.
@@ -253,6 +255,9 @@ export interface LeaseEdge {
 /** The outcome of one mechanical verification attempt (mirrors the Worker). */
 export type VerifyOutcome = "pass" | "fail";
 
+/** How the implicated units for a re-fan were chosen (mirrors the Worker). */
+export type RefanSource = "parse" | "jev" | "re-plan" | "all";
+
 /** One recorded CHANGE-LEVEL mechanical VERIFY attempt (mirrors the Worker). */
 export interface VerifyAttempt {
   readonly round: number;
@@ -260,6 +265,8 @@ export interface VerifyAttempt {
   readonly model: string;
   readonly gateCommand?: string;
   readonly failingOutput?: string;
+  readonly implicatedUnits?: readonly string[];
+  readonly refanSource?: RefanSource;
   readonly at: string;
 }
 
@@ -269,6 +276,7 @@ export interface RetryAttempt {
   readonly fromModel: string;
   readonly toModel: string;
   readonly implicatedUnits: readonly string[];
+  readonly refanSource?: RefanSource;
   readonly reason: string;
   readonly at: string;
 }
@@ -792,10 +800,43 @@ export class LocalChangeControl {
       ...(typeof input.failingOutput === "string" && input.failingOutput !== ""
         ? { failingOutput: sanitizeText(input.failingOutput, 20_000) }
         : {}),
+      ...(Array.isArray(input.implicatedUnits) && input.implicatedUnits.length > 0
+        ? { implicatedUnits: input.implicatedUnits.map((u) => String(u)) }
+        : {}),
+      ...(normalizeRefanSource(input.refanSource)
+        ? { refanSource: normalizeRefanSource(input.refanSource)! }
+        : {}),
       at: new Date().toISOString(),
     };
     record.verifyAttempts.push(stored);
     return stored;
+  }
+
+  /**
+   * Patch implicated units and the re-fan source onto the LAST verify attempt
+   * for a round (mirrors the DO): the failing verify is recorded before
+   * attribution is computed, so the ladder patches it once the re-fan is chosen.
+   */
+  updateVerifyAttempt(
+    changeId: string,
+    input: { readonly round: number; readonly implicatedUnits?: readonly string[]; readonly refanSource?: RefanSource },
+  ): void {
+    const record = this.require(changeId);
+    const round = Number.isFinite(input.round) && input.round > 0 ? Math.floor(input.round) : 1;
+    for (let i = record.verifyAttempts.length - 1; i >= 0; i -= 1) {
+      if (record.verifyAttempts[i]!.round === round) {
+        record.verifyAttempts[i] = {
+          ...record.verifyAttempts[i]!,
+          ...(Array.isArray(input.implicatedUnits) && input.implicatedUnits.length > 0
+            ? { implicatedUnits: input.implicatedUnits.map((u) => String(u)) }
+            : {}),
+          ...(normalizeRefanSource(input.refanSource)
+            ? { refanSource: normalizeRefanSource(input.refanSource)! }
+            : {}),
+        };
+        return;
+      }
+    }
   }
 
   /**
@@ -817,6 +858,9 @@ export class LocalChangeControl {
       fromModel: typeof input.fromModel === "string" ? input.fromModel.slice(0, 120) : "",
       toModel: typeof input.toModel === "string" ? input.toModel.slice(0, 120) : "",
       implicatedUnits: implicated.map((u) => String(u)),
+      ...(normalizeRefanSource(input.refanSource)
+        ? { refanSource: normalizeRefanSource(input.refanSource)! }
+        : {}),
       reason: sanitizeText(input.reason ?? "verify-fail escalation", 300) || "verify-fail escalation",
       at: new Date().toISOString(),
     };
@@ -1140,6 +1184,7 @@ export class LocalChangeControl {
       ...(record.deployment ? { deployment: record.deployment } : {}),
       verifyAttempts: record.verifyAttempts,
       retryAttempts: record.retryAttempts,
+      rePlans: record.retryAttempts.filter((a) => a.refanSource === "re-plan").length,
       roundAgents: [...record.roundAgents.values()].sort((a, b) =>
         a.round !== b.round ? a.round - b.round : a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0,
       ),
@@ -1218,8 +1263,32 @@ export class LocalChangeControl {
           ...(typeof b.failingOutput === "string" && b.failingOutput !== ""
             ? { failingOutput: String(b.failingOutput) }
             : {}),
+          ...(Array.isArray(b.implicatedUnits)
+            ? { implicatedUnits: (b.implicatedUnits as unknown[]).map((u) => String(u)) }
+            : {}),
+          ...(normalizeRefanSource(b.refanSource)
+            ? { refanSource: normalizeRefanSource(b.refanSource)! }
+            : {}),
         });
         return json({ verifyAttempt: recorded }, 201);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
+    const verifyRefanRoute = url.pathname.match(/^\/changes\/([^/]+)\/verify-attempt\/refan$/);
+    if (method === "POST" && verifyRefanRoute) {
+      const b = parseBody(init);
+      try {
+        this.updateVerifyAttempt(dec(verifyRefanRoute[1]), {
+          round: numberOr(b.round, 1),
+          ...(Array.isArray(b.implicatedUnits)
+            ? { implicatedUnits: (b.implicatedUnits as unknown[]).map((u) => String(u)) }
+            : {}),
+          ...(normalizeRefanSource(b.refanSource)
+            ? { refanSource: normalizeRefanSource(b.refanSource)! }
+            : {}),
+        });
+        return json({ ok: true }, 200);
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 400);
       }
@@ -1235,6 +1304,9 @@ export class LocalChangeControl {
           implicatedUnits: Array.isArray(b.implicatedUnits)
             ? (b.implicatedUnits as unknown[]).map((u) => String(u))
             : [],
+          ...(normalizeRefanSource(b.refanSource)
+            ? { refanSource: normalizeRefanSource(b.refanSource)! }
+            : {}),
           reason: String(b.reason ?? "verify-fail escalation"),
         });
         return json({ retryAttempt: recorded }, 201);
@@ -1570,6 +1642,13 @@ function normalizeJuncture(juncture: unknown): JevJuncture {
   return juncture === "plan-review" || juncture === "attribution" || juncture === "fix-confidence"
     ? juncture
     : "plan-review";
+}
+
+/** Normalize a re-fan source to a known value, or undefined (mirrors the DO). */
+function normalizeRefanSource(value: unknown): RefanSource | undefined {
+  return value === "parse" || value === "jev" || value === "re-plan" || value === "all"
+    ? value
+    : undefined;
 }
 
 /** Clamp a confidence/probability to [0, 1]; a non-finite value becomes 0. */

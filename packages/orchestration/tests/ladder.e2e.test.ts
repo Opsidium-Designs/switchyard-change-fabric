@@ -41,12 +41,15 @@ import {
   buildWorkGraphModel,
   jevNodeId,
   roundAgentNodeId,
+  verifyNodeId,
   type ChangeStateSnapshot,
 } from "../src/graph-model.ts";
 import { runFullLive, type DeployApp, type FullLiveEvent } from "../src/run-live.ts";
 import {
   MarkerGateRunner,
   ModelAwareExecutor,
+  ResourceNameGateRunner,
+  CrashGateRunner,
   SharedPathExecutor,
   SharedPathGateRunner,
   gateCommandFor,
@@ -118,6 +121,43 @@ work:
   - id: three
     objective: fix part three
     paths: [src/three.fix]
+`;
+
+/**
+ * A SIX-resource change mirroring the service-api shape (users, orders,
+ * products, auth, search, notifications). Only `auth` needs the escalation
+ * model; every other resource already passes on the base model (always-passing
+ * markers). The round-1 change-level fail names ONLY auth (by resource name, via
+ * the ResourceNameGateRunner), so the FIRST retry (round 2) must re-fan ONLY
+ * auth, not all six. Each unit id IS its resource name so unitCoversName maps the
+ * named resource to its unit with no file-path hint.
+ */
+const SPEC_SIX_RESOURCES = `
+id: change-ladder-six
+objective: Require auth across six resources; only auth needs escalation
+baseline: HEAD
+budget_usd: 10.00
+assurance: standard
+
+work:
+  - id: users
+    objective: fix users
+    paths: [src/users.fix]
+  - id: orders
+    objective: fix orders
+    paths: [src/orders.fix]
+  - id: products
+    objective: fix products
+    paths: [src/products.fix]
+  - id: auth
+    objective: fix auth
+    paths: [src/auth.fix]
+  - id: search
+    objective: fix search
+    paths: [src/search.fix]
+  - id: notifications
+    objective: fix notifications
+    paths: [src/notifications.fix]
 `;
 
 /**
@@ -252,6 +292,7 @@ function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWork
     // to the live Worker (and back the graph nodes/edges).
     const delegated =
       /^\/changes\/[^/]+\/(verify-attempt|retry-attempt|jev-decision)$/.test(url.pathname) ||
+      /^\/changes\/[^/]+\/verify-attempt\/refan$/.test(url.pathname) ||
       /^\/changes\/[^/]+\/work\/[^/]+\/(verify-fail|step|detail|stream)$/.test(url.pathname) ||
       /^\/changes\/[^/]+\/work\/[^/]+\/round\/[^/]+\/(lease|step|detail|complete|fail)$/.test(
         url.pathname,
@@ -367,6 +408,20 @@ async function runLadder(options: {
     readonly attributionChoice?: string;
     readonly round: number;
   }) => Promise<readonly string[]>;
+  /**
+   * Use the ResourceNameGateRunner (names failing units by RESOURCE NAME in the
+   * real assertion-line forms) instead of the file-path MarkerGateRunner, so a
+   * test proves attribution narrows from the real `<name>: ...(401/403)` +
+   * `<name> must ..., got 201` evidence rather than a named file.
+   */
+  readonly useResourceNameGate?: boolean;
+  /**
+   * Use the CrashGateRunner (fails with an UNATTRIBUTABLE crash output naming no
+   * unit/file) so the string-parse attribution falls back to re-fanning ALL
+   * units. A test uses this to prove a CONFIDENT Jev choice is the PRIMARY
+   * selector that narrows the re-fan even when the parse cannot.
+   */
+  readonly useCrashGate?: boolean;
 }) {
   const spec = options.spec ?? SPEC;
   const changeId = options.changeId ?? "change-ladder";
@@ -405,10 +460,20 @@ async function runLadder(options: {
     executor,
     // The ladder gate + escalation wiring (T6):
     appGateCommandFor: (unitId) => gateCommandFor(unitId),
-    verifyCommandRunner: new MarkerGateRunner({
-      passingModel: options.passingModel,
-      ...(options.alwaysPassingUnits ? { alwaysPassingUnits: options.alwaysPassingUnits } : {}),
-    }),
+    verifyCommandRunner: options.useCrashGate
+      ? new CrashGateRunner({
+          passingModel: options.passingModel,
+          ...(options.alwaysPassingUnits ? { alwaysPassingUnits: options.alwaysPassingUnits } : {}),
+        })
+      : options.useResourceNameGate
+        ? new ResourceNameGateRunner({
+            passingModel: options.passingModel,
+            ...(options.alwaysPassingUnits ? { alwaysPassingUnits: options.alwaysPassingUnits } : {}),
+          })
+        : new MarkerGateRunner({
+            passingModel: options.passingModel,
+            ...(options.alwaysPassingUnits ? { alwaysPassingUnits: options.alwaysPassingUnits } : {}),
+          }),
     baseModel: BASE_MODEL,
     escalationModel: ESCALATION_MODEL,
     ...(options.escalationModels ? { escalationModels: options.escalationModels } : {}),
@@ -660,6 +725,68 @@ describe("T10: the bounded model-escalation ladder (offline, deterministic)", ()
     expect(snapshot.retryAttempts).toHaveLength(1);
     expect(snapshot.retryAttempts?.[0]?.implicatedUnits).toEqual(["fix"]);
     expect(result.evidence.integration.integratedUnits).toContain("fix");
+  });
+
+  it("attributes a round-1 fail implicating ONLY auth to auth on the FIRST retry (real assertion-line format, 6 resources)", async () => {
+    // Six resources, only auth fails round 1; the gate names failing resources
+    // by RESOURCE NAME in the real `✖ auth: ...(401/403)` + `auth must ..., got
+    // 201` forms (no source-file path). The FIRST retry (round 2) must re-fan
+    // ONLY auth, proving the narrowing happens on the first retry from the real
+    // assertion-line evidence, not after a crash round. The refan source is the
+    // string-parse ("parse"), and the failing verify records it.
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_SIX_RESOURCES,
+      changeId: "change-ladder-six",
+      alwaysPassingUnits: ["users", "orders", "products", "search", "notifications"],
+      useResourceNameGate: true,
+      subdir: "six-auth",
+    });
+
+    // Exactly ONE retry (the first), re-fanning ONLY auth.
+    expect(snapshot.retryAttempts).toHaveLength(1);
+    expect(snapshot.retryAttempts?.[0]?.round).toBe(2);
+    expect(snapshot.retryAttempts?.[0]?.implicatedUnits).toEqual(["auth"]);
+    for (const other of ["users", "orders", "products", "search", "notifications"]) {
+      expect(snapshot.retryAttempts?.[0]?.implicatedUnits).not.toContain(other);
+    }
+    // The re-fan source is the deterministic string-parse (no Jev, no re-plan).
+    expect(snapshot.retryAttempts?.[0]?.refanSource).toBe("parse");
+
+    // Two change-level verify rounds: round 1 FAIL (base), round 2 PASS once auth
+    // is re-fanned on the escalation model.
+    expect(snapshot.verifyAttempts).toHaveLength(2);
+    expect(snapshot.verifyAttempts?.[0]).toMatchObject({ round: 1, outcome: "fail" });
+    expect(snapshot.verifyAttempts?.[1]).toMatchObject({ round: 2, outcome: "pass" });
+    // The failing round-1 verify records the implicated units + refan source it
+    // produced (persisted on the verify attempt), so the console can show WHY.
+    expect(snapshot.verifyAttempts?.[0]?.implicatedUnits).toEqual(["auth"]);
+    expect(snapshot.verifyAttempts?.[0]?.refanSource).toBe("parse");
+  });
+
+  it("still FALLS BACK to re-fanning all when a round-1 crash output is unattributable (fallback not weakened)", async () => {
+    // Prove the honest fallback directly on the attribution function: a crash
+    // output that names no resource and no owned file re-fans ALL units, so a
+    // genuinely unattributable failure is never narrowed away.
+    const sixUnits = ["users", "orders", "products", "auth", "search", "notifications"].map(
+      (id) => ({
+        unitId: id,
+        objective: `fix ${id}`,
+        paths: [`src/${id}.fix`],
+        authRemote: `https://example.invalid/${id}.git`,
+        gateCommand: ["npm", "run", "gate"],
+        requiredExports: [],
+      }),
+    );
+    const crash = [
+      "✖ gate/run.mjs (12ms)",
+      "  Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/abs/src/resources/auth.js'",
+      "    code: 'ERR_MODULE_NOT_FOUND'",
+    ].join("\n");
+    const { attributeImplicatedUnits } = await import("../src/run-live.ts");
+    const result = attributeImplicatedUnits(sixUnits, crash);
+    expect(result.attributed).toBe(false);
+    expect(result.units.map((u) => u.unitId)).toEqual(sixUnits.map((u) => u.unitId));
   });
 });
 
@@ -1428,6 +1555,44 @@ describe("H2: the Jev typed-decision junctures (offline, faked Jev, no network)"
     expect(result.evidence.integration.integratedUnits).toContain("beta");
   });
 
+  it("JUNCTURE (b) attribution: a confident Jev choice is the PRIMARY selector (narrows an UNATTRIBUTABLE parse to auth)", async () => {
+    // The round-1 gate CRASHES with an unattributable output (names no unit/file),
+    // so the string-parse falls back to re-fanning ALL six resources. A CONFIDENT
+    // Jev choice of `auth` is the PRIMARY selector: it narrows the FIRST retry to
+    // ONLY auth, which is exactly the help round 2 needs when the parse is weak.
+    // The retry records refanSource "jev". The honest fallback is still available
+    // (proven by the low-confidence test above), it is just preferred here.
+    const { jev, calls } = makeFakeJev({
+      attribution: { type: "choice", choice: "auth", confidence: 0.92 },
+    });
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_SIX_RESOURCES,
+      changeId: "change-ladder-six",
+      alwaysPassingUnits: ["users", "orders", "products", "search", "notifications"],
+      useCrashGate: true,
+      subdir: "jev-primary-auth",
+      jev,
+      jevThreshold: 0.75,
+    });
+
+    // Jev was asked the attribution question on the round-1 fail.
+    expect(calls.some((c) => c.keys.includes("attribution"))).toBe(true);
+    // The confident Jev choice narrowed the FIRST retry to ONLY auth, even though
+    // the parse was unattributable (would have re-fanned all six).
+    expect(snapshot.retryAttempts).toHaveLength(1);
+    expect(snapshot.retryAttempts?.[0]?.implicatedUnits).toEqual(["auth"]);
+    expect(snapshot.retryAttempts?.[0]?.refanSource).toBe("jev");
+    // The decision is recorded ACCEPTED and backs a jev node.
+    const attribution = (snapshot.jevDecisions ?? []).find((d) => d.juncture === "attribution");
+    expect(attribution?.accepted).toBe(true);
+    expect(attribution?.choice).toBe("auth");
+    const model = buildWorkGraphModel(snapshot);
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
+  });
+
   it("JUNCTURE (c) fix-confidence is ADVISORY: a confident 'unacceptable' with a PASSING gate still ships", async () => {
     // The gate passes on the escalation model, so the fix integrates and
     // redeploys. Jev confidently says the fix is NOT acceptable, but that is
@@ -1587,12 +1752,37 @@ describe("re-plan on retry (offline, faked planner): choose a revised unit set t
     // The recorded reason names the re-plan provenance so the revised plan is
     // visible per round (not the default implicated-unit re-fan reason).
     expect(snapshot.retryAttempts?.[0]?.reason).toContain("re-planned");
+    // The retry records refanSource "re-plan", and the change counts the live
+    // re-plan (rePlans > 0), so a run that genuinely re-planned is distinguishable
+    // from one that only used the deterministic attribution path.
+    expect(snapshot.retryAttempts?.[0]?.refanSource).toBe("re-plan");
+    expect(snapshot.rePlans).toBeGreaterThan(0);
+    // The failing round-1 verify records the re-plan source too.
+    expect(snapshot.verifyAttempts?.[0]?.refanSource).toBe("re-plan");
     // Only the re-planned unit got a round-N agent; the dropped units did not.
     const model = buildWorkGraphModel(snapshot);
     const roundAgents = model.nodes.filter(
       (n) => n.kind === "agent" && n.backing.kind === "round-agent",
     );
     expect(roundAgents.map((n) => (n.backing as { unitId: string }).unitId)).toEqual(["two"]);
+    // A backed REPLAN node is emitted for the re-planned round, positioned
+    // between the failing verify and the retry agents.
+    const replanNodes = model.nodes.filter((n) => n.kind === "replan");
+    expect(replanNodes).toHaveLength(1);
+    expect(replanNodes[0]?.backing.kind).toBe("replan");
+    // The trigger chain verify(failed) -> replan -> retry-agents is drawn with
+    // SPAWN-kind edges: a spawn edge from the failing verify into the replan, and
+    // a spawn edge from the replan into the re-fanned round-N agent.
+    const replanId = replanNodes[0]!.id;
+    const verifyToReplan = model.edges.find(
+      (e) => e.kind === "spawn" && e.to === replanId && e.from === verifyNodeId(snapshot.id, 1),
+    );
+    expect(verifyToReplan).toBeDefined();
+    const replanToAgent = model.edges.find(
+      (e) => e.kind === "spawn" && e.from === replanId,
+    );
+    expect(replanToAgent).toBeDefined();
+    expect(replanToAgent?.to).toBe(roundAgentNodeId(snapshot.id, 2, "two"));
     for (const node of model.nodes) {
       expect(() => assertBacked(node, snapshot)).not.toThrow();
     }
@@ -1619,5 +1809,24 @@ describe("re-plan on retry (offline, faked planner): choose a revised unit set t
     expect(implicated).toEqual(["one", "three", "two"]);
     // The reason is the default implicated-unit re-fan reason, not re-planned.
     expect(snapshot.retryAttempts?.[0]?.reason).not.toContain("re-planned");
+  });
+
+  it("no re-plan configured (offline): no replan node, rePlans stays 0, parse path stands", async () => {
+    // The seeded single-unit run with NO re-plan transport injected: the ladder
+    // uses the deterministic string-parse attribution path, records no re-plan,
+    // and emits NO replan node. rePlans is 0 and the retry's refanSource is the
+    // string-parse ("parse"), so the offline path is unchanged.
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      subdir: "replan-unconfigured",
+    });
+    expect(snapshot.rePlans).toBe(0);
+    expect(snapshot.retryAttempts?.[0]?.refanSource).toBe("parse");
+    const model = buildWorkGraphModel(snapshot);
+    expect(model.nodes.some((n) => n.kind === "replan")).toBe(false);
+    // No spawn-kind trigger edge is drawn either (the parse/attribution path
+    // keeps the model-escalation dependency edge, not a replan spawn edge).
+    expect(model.edges.some((e) => e.id.startsWith("replan-trigger:"))).toBe(false);
+    expect(model.edges.some((e) => e.id.startsWith("replan-refan:"))).toBe(false);
   });
 });
