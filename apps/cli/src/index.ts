@@ -41,11 +41,13 @@ import {
   runRecruitment,
   runRecruitmentLive,
   selectExecutor,
+  selectPlanner,
   stableAppWorkerName,
   type Change,
   type ConcurrencyDial,
   type DeployApp,
   type Escalation,
+  type PlannerInjection,
   type TeardownApp,
 } from "@switchyard-change/orchestration";
 import { DiscoveringExecutor } from "@switchyard-change/model-adapters";
@@ -197,7 +199,12 @@ const commands: Command[] = [
         console.error("A target project is required: pass --project <dir>.");
         return 1;
       }
-      const result = await decomposeGoal({ goal, projectDir });
+      const plannerForDecompose = plannerInjectionFromEnv();
+      const result = await decomposeGoal({
+        goal,
+        projectDir,
+        ...(plannerForDecompose ? { planner: plannerForDecompose } : {}),
+      });
       console.log(formatDecomposition(result));
       return 0;
     },
@@ -220,7 +227,12 @@ const commands: Command[] = [
         console.error("A target project is required: pass --project <dir>.");
         return 1;
       }
-      const decomposition = await decomposeGoal({ goal, projectDir });
+      const plannerForRunGoal = plannerInjectionFromEnv();
+      const decomposition = await decomposeGoal({
+        goal,
+        projectDir,
+        ...(plannerForRunGoal ? { planner: plannerForRunGoal } : {}),
+      });
       console.log(formatDecomposition(decomposition));
       console.log("");
       console.log("Running the decomposed WorkGraph to completion offline...");
@@ -810,6 +822,29 @@ async function resolveGoal(args: readonly string[]): Promise<string | undefined>
 function requireProjectDir(args: readonly string[]): string | undefined {
   const explicit = optionValue(args, "--project");
   return explicit ? resolve(explicit) : undefined;
+}
+
+/**
+ * Build the opt-in schema-constrained planner injection from the environment.
+ * Returns the injection ONLY when a live inference planner is configured
+ * (EXECUTOR=ai-gateway with gateway credentials); otherwise returns undefined so
+ * decomposeGoal keeps the deterministic heuristic decomposition. The gateway
+ * credential is read inside selectPlanner and never printed here. A caller that
+ * passed undefined to decomposeGoal is on the offline path, so `make check` and
+ * the demo stay deterministic and offline.
+ */
+function plannerInjectionFromEnv(): PlannerInjection | undefined {
+  const selected = selectPlanner();
+  if (!selected.live || !selected.plan) {
+    return undefined;
+  }
+  return {
+    plan: selected.plan,
+    baseModel: selected.baseModel,
+    ...(selected.escalationModels.length > 0
+      ? { escalationModels: selected.escalationModels }
+      : {}),
+  };
 }
 
 /**

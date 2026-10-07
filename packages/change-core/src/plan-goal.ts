@@ -1,0 +1,465 @@
+/**
+ * plan-goal: the inference-backed, schema-constrained planner pass that makes
+ * decomposition goal-driven over the deterministic structural backbone, while
+ * keeping the offline heuristic as the default everywhere it is not configured.
+ *
+ * Where this sits
+ * ---------------
+ * The pure `decompose` path (goal.ts + decompose.ts + blueprint.ts) stays the
+ * offline default: it reduces a goal to generic features and shapes the work
+ * from how those features meet the repo's structure, with no inference. That is
+ * what `make check`, the demo, and the anti-puppet substrate all run, so none of
+ * it is touched here.
+ *
+ * This module adds an OPT-IN pass that a caller selects only when inference is
+ * configured. It asks a schema-constrained planner (a plan transport that
+ * returns a strict plan object) to decide, WITHIN the real structural backbone:
+ * which modules are in scope, each unit's objective, how many agents (= unit
+ * count), and the dependency order. The planner is handed the goal text plus the
+ * structural module map derived from `deriveCohesionBlueprint` (the modules,
+ * their files and exports, the shared frozen contracts, and the import-graph
+ * dependency edges), so it reasons over the real structure and may not invent a
+ * path outside the snapshot.
+ *
+ * Honesty and the fall-back
+ * -------------------------
+ * A planner reply is validated against the json_schema SHAPE by the transport,
+ * then against REALITY here: every unit path must exist in the snapshot, every
+ * contract must be a real frozen seam, and no unit may own a contract (the
+ * single-writer + frozen-contract backbone that preserves the cohesion
+ * guarantee). On an invalid or unusable plan the pass escalates through the
+ * bounded, ORDERED model ladder (the same ladder the executor uses), and if the
+ * ladder is exhausted and still invalid it FALLS BACK to the deterministic
+ * heuristic `decompose`, so a run never ships a broken plan. The recorded plan
+ * (how the Change was decomposed) is returned so a later stage can back a
+ * planner graph node with it.
+ */
+
+import { decompose, type DecomposeOptions, type DecomposeResult } from "./decompose.ts";
+import { buildRepoSnapshot, type RepoFile, type RepoSnapshot } from "./repo-snapshot.ts";
+import { deriveCohesionBlueprint, type CohesionBlueprint } from "./blueprint.ts";
+import { normalizeChange } from "./loader.ts";
+import type { AssuranceLevel, Change, ChangeBlueprint } from "./types.ts";
+
+/** A single unit the planner proposed (the minimal plan shape). */
+export interface PlannedUnit {
+  readonly id: string;
+  readonly objective: string;
+  readonly paths: readonly string[];
+  readonly dependsOn: readonly string[];
+}
+
+/** The whole plan the planner proposed, before it is projected onto a Change. */
+export interface PlannedShape {
+  readonly units: readonly PlannedUnit[];
+  readonly contracts: readonly string[];
+}
+
+/**
+ * The plan transport the planner pass calls. It is the exact shape of the
+ * model-adapters `PlannerInvoke`, declared here so change-core carries no
+ * dependency on the adapter package: a caller injects a concrete transport
+ * (the live AI Gateway plan transport, or a deterministic fake in tests).
+ */
+export type PlanTransport = (request: {
+  readonly model: string;
+  readonly messages: readonly { readonly role: "system" | "user" | "assistant"; readonly content: string }[];
+}) => Promise<PlannedShape>;
+
+/** How the recorded plan was produced, so a later stage can back a planner node. */
+export type PlanSource = "planner" | "heuristic-fallback";
+
+/** The recorded plan: the shape that drove the Change, plus its provenance. */
+export interface RecordedPlan {
+  /** Whether the inference planner produced this plan, or the heuristic fallback did. */
+  readonly source: PlanSource;
+  /** The model that produced an accepted plan (empty on the heuristic fallback). */
+  readonly model: string;
+  /** The planned units projected onto the Change's own unit ids. */
+  readonly units: readonly PlannedUnit[];
+  /** The frozen read-only contract paths the plan froze (owned by no unit). */
+  readonly contracts: readonly string[];
+}
+
+/** Options for an inference-backed, schema-constrained plan pass. */
+export interface PlanGoalOptions {
+  /** The human-stated goal (plain text intent). */
+  readonly goal: string;
+  /** The target repository, either a flat file list or a prebuilt snapshot. */
+  readonly repo: readonly RepoFile[] | RepoSnapshot;
+  /** The injected plan transport (the live gateway plan call, or a fake). */
+  readonly plan: PlanTransport;
+  /**
+   * The ORDERED model ladder the pass escalates through on an invalid plan: the
+   * base model is tried first, then each escalation model in order. The pass
+   * tries at most `1 + escalationModels.length` plan calls, then falls back to
+   * the heuristic. The base model is required; the escalation ladder is optional.
+   */
+  readonly baseModel: string;
+  readonly escalationModels?: readonly string[];
+  /** A stable Change id. Defaults to the heuristic decomposer's slug. */
+  readonly changeId?: string;
+  /** Budget to record on the Change. Defaults to 5. */
+  readonly budgetUsd?: number;
+  /** Assurance level to record. Defaults to "standard". */
+  readonly assurance?: AssuranceLevel;
+}
+
+/** The result of a plan pass: a decomposition plus the recorded plan. */
+export interface PlanGoalResult extends DecomposeResult {
+  /** The recorded plan that drove the Change (planner or heuristic fallback). */
+  readonly plan: RecordedPlan;
+}
+
+/**
+ * Run the inference-backed, schema-constrained plan pass. It builds the
+ * structural module map from the snapshot, asks the planner for a plan (trying
+ * the base model then the ordered escalation ladder on an invalid plan), and
+ * projects the first valid plan onto a Change. If no model returns a usable
+ * plan, it FALLS BACK to the deterministic heuristic `decompose` so a run never
+ * ships a broken plan. The returned result always carries a RecordedPlan naming
+ * how it was produced.
+ */
+export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult> {
+  const snapshot = isSnapshot(options.repo)
+    ? options.repo
+    : buildRepoSnapshot(options.repo);
+  const blueprint = deriveCohesionBlueprint(snapshot);
+
+  const ladder = [options.baseModel, ...(options.escalationModels ?? [])].filter(
+    (model) => model.trim() !== "",
+  );
+  const messages = buildPlannerMessages(options.goal, snapshot, blueprint);
+
+  for (const model of ladder) {
+    let proposed: PlannedShape;
+    try {
+      proposed = await options.plan({ model, messages });
+    } catch {
+      // A transport/schema error on this model: try the next model in the
+      // ordered ladder rather than failing the whole pass.
+      continue;
+    }
+    const validation = validatePlan(proposed, snapshot, blueprint);
+    if (!validation.ok) {
+      // A schema-conforming but unreal plan (invented path, a unit owning a
+      // contract, a bad dependency): escalate to the next model.
+      continue;
+    }
+    const projected = projectPlanToChange({
+      plan: validation.plan,
+      snapshot,
+      model,
+      changeId: options.changeId,
+      goal: options.goal,
+      budgetUsd: options.budgetUsd,
+      assurance: options.assurance,
+    });
+    return projected;
+  }
+
+  // The ladder is exhausted with no usable plan: fall back to the deterministic
+  // heuristic decomposition so the run proceeds with an honest, backbone-true
+  // Change rather than a broken plan.
+  return heuristicFallback(options, snapshot);
+}
+
+/** Whether a validated plan is usable, or why it is not. */
+type PlanValidation =
+  | { readonly ok: true; readonly plan: PlannedShape }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Validate a schema-conforming plan against REALITY: the backbone the heuristic
+ * also honors. Every unit path must be a real source file in the snapshot; every
+ * contract must be a real frozen seam (a derived contract when a blueprint
+ * exists); no unit may own a contract path (contracts are read-only, owned by no
+ * unit); unit ids are unique and non-empty; and every dependency names another
+ * unit in the plan (not itself). A plan that fails any check is rejected so the
+ * caller escalates or falls back rather than shipping it.
+ */
+export function validatePlan(
+  plan: PlannedShape,
+  snapshot: RepoSnapshot,
+  blueprint: CohesionBlueprint | undefined,
+): PlanValidation {
+  if (plan.units.length === 0) {
+    return { ok: false, reason: "plan has no units" };
+  }
+
+  const knownPaths = new Set(snapshot.sourceFiles.map((f) => f.path));
+  // The real frozen seams: the blueprint's contracts when it exists. The plan may
+  // only freeze a seam the structural backbone actually identified, so it cannot
+  // invent a contract or freeze an owner module.
+  const realContracts = new Set((blueprint?.contracts ?? []).map((c) => c.path));
+
+  // Every declared contract must be a real frozen seam.
+  for (const contract of plan.contracts) {
+    if (!realContracts.has(contract)) {
+      return { ok: false, reason: `contract ${contract} is not a real frozen seam` };
+    }
+  }
+  const frozen = new Set(plan.contracts);
+
+  const seenIds = new Set<string>();
+  const ownedPaths = new Set<string>();
+  for (const unit of plan.units) {
+    if (seenIds.has(unit.id)) {
+      return { ok: false, reason: `duplicate unit id ${unit.id}` };
+    }
+    seenIds.add(unit.id);
+    if (unit.paths.length === 0) {
+      return { ok: false, reason: `unit ${unit.id} owns no paths` };
+    }
+    for (const path of unit.paths) {
+      if (!knownPaths.has(path)) {
+        return { ok: false, reason: `unit ${unit.id} owns unknown path ${path}` };
+      }
+      if (frozen.has(path)) {
+        return { ok: false, reason: `unit ${unit.id} owns frozen contract ${path}` };
+      }
+      if (ownedPaths.has(path)) {
+        return { ok: false, reason: `path ${path} is owned by more than one unit` };
+      }
+      ownedPaths.add(path);
+    }
+  }
+
+  // Dependencies must name another unit in the plan, never themselves.
+  for (const unit of plan.units) {
+    for (const dep of unit.dependsOn) {
+      if (dep === unit.id) {
+        return { ok: false, reason: `unit ${unit.id} depends on itself` };
+      }
+      if (!seenIds.has(dep)) {
+        return { ok: false, reason: `unit ${unit.id} depends on unknown unit ${dep}` };
+      }
+    }
+  }
+
+  return { ok: true, plan };
+}
+
+/**
+ * Project a validated plan onto a Change, carrying the frozen contracts and each
+ * owner's exported interface the SAME way the heuristic decomposer does, so the
+ * planned Change reaches the Worker/run exactly like a heuristic Change: the
+ * blueprint rides the spec round-trip, so frozenContracts and requiredExports
+ * still reach the agent prompts. The projection also builds the recorded plan so
+ * a later stage can back a planner graph node with it.
+ */
+function projectPlanToChange(input: {
+  readonly plan: PlannedShape;
+  readonly snapshot: RepoSnapshot;
+  readonly model: string;
+  readonly changeId?: string;
+  readonly goal: string;
+  readonly budgetUsd?: number;
+  readonly assurance?: AssuranceLevel;
+}): PlanGoalResult {
+  const { plan, snapshot, model } = input;
+  const byPath = new Map(snapshot.sourceFiles.map((f) => [f.path, f] as const));
+
+  const change: Change = normalizeChange({
+    id: input.changeId ?? slug(input.goal),
+    objective: input.goal,
+    baseline: "HEAD",
+    budget_usd: input.budgetUsd ?? 5,
+    assurance: input.assurance ?? "standard",
+    work: plan.units.map((unit) => ({
+      id: unit.id,
+      objective: unit.objective,
+      depends_on: [...unit.dependsOn],
+      paths: [...unit.paths],
+    })),
+  });
+
+  // Carry the blueprint from the plan's own ownership: one carried module per
+  // planned unit (its owned paths, its dependency order, and the union of its
+  // files' exported symbols), plus the frozen contracts with their real import
+  // in-degree. This is the same blueprint carry the heuristic decomposer uses,
+  // built from the plan rather than the heuristic's structural pass, so the
+  // planned Change round-trips with frozen contracts and required exports intact.
+  const modules = plan.units.map((unit) => ({
+    unitId: unit.id,
+    paths: [...unit.paths],
+    dependsOn: [...unit.dependsOn],
+    exports: moduleExports(unit.paths, byPath),
+  }));
+  const contracts = plan.contracts.map((path) => ({
+    path,
+    importedByCount: byPath.get(path)?.importedByCount ?? 0,
+  }));
+  const changeBlueprint: ChangeBlueprint = { modules, contracts };
+  const planned: Change = { ...change, blueprint: changeBlueprint };
+
+  const recordedPlan: RecordedPlan = {
+    source: "planner",
+    model,
+    units: change.work.map((unit) => ({
+      id: unit.id,
+      objective: unit.objective,
+      paths: [...unit.paths],
+      dependsOn: [...unit.dependsOn],
+    })),
+    contracts: [...plan.contracts],
+  };
+
+  // Produce the same shape DecomposeResult carries so a caller can treat a
+  // planned decomposition identically to a heuristic one. The intent is derived
+  // from the goal text for the readable report; the structural decisions came
+  // from the planner, not the intent.
+  const heuristic = decompose({
+    goal: input.goal,
+    repo: snapshot,
+    ...(input.changeId ? { changeId: input.changeId } : {}),
+  });
+
+  const blueprint = deriveCohesionBlueprint(snapshot);
+  return {
+    change: planned,
+    intent: heuristic.intent,
+    snapshot,
+    ...(blueprint ? { blueprint } : {}),
+    plan: recordedPlan,
+  };
+}
+
+/**
+ * The heuristic fall-back: run the deterministic `decompose` and record the plan
+ * as a heuristic fallback, so a planner node backed by this plan is honest about
+ * how the Change was produced. The Change is exactly the heuristic Change, so the
+ * run is unchanged from the offline path.
+ */
+function heuristicFallback(
+  options: PlanGoalOptions,
+  snapshot: RepoSnapshot,
+): PlanGoalResult {
+  const decomposeOptions: DecomposeOptions = {
+    goal: options.goal,
+    repo: snapshot,
+    ...(options.changeId ? { changeId: options.changeId } : {}),
+    ...(options.budgetUsd !== undefined ? { budgetUsd: options.budgetUsd } : {}),
+    ...(options.assurance ? { assurance: options.assurance } : {}),
+  };
+  const result = decompose(decomposeOptions);
+  const recordedPlan: RecordedPlan = {
+    source: "heuristic-fallback",
+    model: "",
+    units: result.change.work.map((unit) => ({
+      id: unit.id,
+      objective: unit.objective,
+      paths: [...unit.paths],
+      dependsOn: [...unit.dependsOn],
+    })),
+    contracts: (result.change.blueprint?.contracts ?? []).map((c) => c.path),
+  };
+  return { ...result, plan: recordedPlan };
+}
+
+/**
+ * Build the planner prompt: a system message stating the hard rules (reason over
+ * the real structure only, never invent a path, never let a unit own a frozen
+ * contract) and a user message carrying the goal plus the structural module map
+ * the planner reasons over. The map is derived from the blueprint when the repo
+ * is modular, else from the snapshot's source files, so a non-modular repo still
+ * gets a sensible plan surface. Pure and deterministic given its inputs.
+ */
+export function buildPlannerMessages(
+  goal: string,
+  snapshot: RepoSnapshot,
+  blueprint: CohesionBlueprint | undefined,
+): readonly { readonly role: "system" | "user"; readonly content: string }[] {
+  const structure = structuralMap(snapshot, blueprint);
+  const system = [
+    "You are a planner that decomposes a software goal into a work plan over a REAL repository.",
+    "You are given the goal and a structural map of the repository: its modules, each module's files and exported symbols, the shared frozen contracts, and the import-graph dependency edges.",
+    "Decide which modules are in scope, one objective per unit, how many units, and the dependency order WITHIN the real structure.",
+    "Hard rules you must obey:",
+    "- Every path you put on a unit MUST be a real source file path from the structural map. Never invent a path.",
+    "- The frozen contracts are read-only. No unit may own a contract path. List the frozen contract paths under contracts.",
+    "- Each real source file is owned by at most one unit (single writer).",
+    "- A unit's dependsOn must reference other unit ids in your plan, following the import order in the structural map.",
+    "Return only the plan object the schema describes.",
+  ].join("\n");
+  const user = [
+    `Goal: ${goal}`,
+    "",
+    "Structural map of the repository:",
+    structure,
+  ].join("\n");
+  return [
+    { role: "system", content: system },
+    { role: "user", content: user },
+  ];
+}
+
+/** Render the structural map the planner reasons over as a compact text block. */
+function structuralMap(
+  snapshot: RepoSnapshot,
+  blueprint: CohesionBlueprint | undefined,
+): string {
+  const lines: string[] = [];
+  if (blueprint && blueprint.modules.length > 0) {
+    lines.push("modules:");
+    for (const module of blueprint.modules) {
+      const deps = module.dependsOn.length > 0 ? ` depends_on: ${module.dependsOn.join(", ")}` : "";
+      const exports = module.exports.length > 0 ? ` exports: ${module.exports.join(", ")}` : "";
+      lines.push(`  - ${module.label}: paths ${module.paths.join(", ")}${deps}${exports}`);
+    }
+    lines.push("frozen_contracts:");
+    for (const contract of blueprint.contracts) {
+      lines.push(`  - ${contract.path} (imported_by_count ${contract.importedByCount})`);
+    }
+  } else {
+    lines.push("source_files:");
+    for (const file of snapshot.sourceFiles) {
+      const exports = file.exports.length > 0
+        ? ` exports: ${file.exports.map((e) => e.name).join(", ")}`
+        : "";
+      lines.push(`  - ${file.path}${exports}`);
+    }
+    lines.push("frozen_contracts: (none)");
+  }
+  return lines.join("\n");
+}
+
+/**
+ * The exported interface of a planned unit: the union of its files' exported
+ * symbol names from the snapshot, sorted and de-duplicated. Mirrors the
+ * blueprint's structural read so the planned Change carries the same exports a
+ * heuristic Change does. A unit whose files export nothing carries an empty list.
+ */
+function moduleExports(
+  paths: readonly string[],
+  byPath: ReadonlyMap<string, { readonly exports: readonly { readonly name: string }[] }>,
+): readonly string[] {
+  const names = new Set<string>();
+  for (const path of paths) {
+    const file = byPath.get(path);
+    if (!file) {
+      continue;
+    }
+    for (const symbol of file.exports) {
+      if (symbol.name !== "") {
+        names.add(symbol.name);
+      }
+    }
+  }
+  return [...names].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+/** A slug for a Change id derived from the goal text (mirrors the decomposer). */
+function slug(text: string): string {
+  const base = text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48)
+    .replace(/-+$/g, "");
+  return `change-${base || "goal"}`;
+}
+
+function isSnapshot(repo: readonly RepoFile[] | RepoSnapshot): repo is RepoSnapshot {
+  return !Array.isArray(repo) && "sourceFiles" in (repo as RepoSnapshot);
+}

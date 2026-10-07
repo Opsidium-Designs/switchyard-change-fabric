@@ -109,8 +109,9 @@ export type { ConcurrencyDial } from "@switchyard-change/change-core";
 export { DEFAULT_DIAL } from "@switchyard-change/change-core";
 
 export type { Change, WorkUnit } from "@switchyard-change/change-core";
+export type { PlanSource, RecordedPlan } from "@switchyard-change/change-core";
 
-export type { DecomposeGoalOptions, DecomposeGoalResult } from "./decompose-goal.ts";
+export type { DecomposeGoalOptions, DecomposeGoalResult, PlannerInjection } from "./decompose-goal.ts";
 export {
   decomposeGoal,
   formatDecomposition,
@@ -133,6 +134,7 @@ export type {
   GraphNodeKind,
   LeaseEdgeSnapshot,
   NodeBacking,
+  PlanSnapshot,
   RecruitmentEventSnapshot,
   ToolConsumptionSnapshot,
   ToolSnapshot,
@@ -143,13 +145,13 @@ export type {
   WorkUnitSnapshot,
   WorkUnitStatus,
 } from "./graph-model.ts";
-export { assertBacked, buildWorkGraphModel, goalNodeId, retryNodeId, roundAgentNodeId, toolNodeId, unitNodeId, verifyNodeId } from "./graph-model.ts";
+export { assertBacked, buildWorkGraphModel, goalNodeId, plannerNodeId, retryNodeId, roundAgentNodeId, toolNodeId, unitNodeId, verifyNodeId } from "./graph-model.ts";
 
 export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor.ts";
 export { formatDoctorReport, runDoctor } from "./doctor.ts";
 
-export type { ExecutorEnv, SelectedExecutor } from "./executor-select.ts";
-export { DEFAULT_WORKERS_AI_ESCALATION_MODEL, selectExecutor } from "./executor-select.ts";
+export type { ExecutorEnv, SelectedExecutor, SelectedPlanner, PlanTransport } from "./executor-select.ts";
+export { DEFAULT_WORKERS_AI_ESCALATION_MODEL, selectExecutor, selectPlanner } from "./executor-select.ts";
 
 export type { AppGateWiring, AppGateWiringInput } from "./app-gate-wiring.ts";
 export {

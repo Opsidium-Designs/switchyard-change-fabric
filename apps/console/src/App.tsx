@@ -629,12 +629,14 @@ function TemplateGallery({
 function Legend() {
   return (
     <ul className="legend" aria-label="Legend">
-      {/* Exactly five NODE kinds, matching the shapes graph-view draws. Node
-          COLOR still conveys status in the graph (a failed agent circle red, a
-          verify hexagon green/red), but the legend lists only the kinds, never a
-          status swatch. */}
+      {/* The node kinds, matching the shapes graph-view draws. Node COLOR still
+          conveys status in the graph (a failed agent circle red, a verify
+          hexagon green/red), but the legend lists only the kinds, never a status
+          swatch. */}
       {/* The goal is a DIAMOND. */}
       <li><span className="swatch-diamond sw-goal" aria-hidden="true" /> goal</li>
+      {/* The planner is a TRIANGLE (the schema-constrained decomposer). */}
+      <li><span className="swatch-triangle sw-planner" aria-hidden="true" /> planner</li>
       {/* An agent is a CIRCLE. */}
       <li><span className="swatch sw-agent" /> agent</li>
       {/* A verify node is a HEXAGON (a mechanical gate run). */}

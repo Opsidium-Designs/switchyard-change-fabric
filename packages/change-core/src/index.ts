@@ -61,6 +61,17 @@ export type { DecomposeOptions, DecomposeResult } from "./decompose.ts";
 export { decompose, decomposeToChange } from "./decompose.ts";
 
 export type {
+  PlannedShape,
+  PlannedUnit,
+  PlanGoalOptions,
+  PlanGoalResult,
+  PlanSource,
+  PlanTransport,
+  RecordedPlan,
+} from "./plan-goal.ts";
+export { buildPlannerMessages, planGoal, validatePlan } from "./plan-goal.ts";
+
+export type {
   BlueprintContract,
   BlueprintModule,
   CohesionBlueprint,

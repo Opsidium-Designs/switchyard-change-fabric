@@ -300,6 +300,28 @@ export interface RoundAgentSnapshot {
 }
 
 /**
+ * A recorded schema-constrained plan for this Change, as reported by the state.
+ * This is the real backing for the `planner` node: the planner pass decided the
+ * in-scope modules, each unit objective, the agent count, and the dependency
+ * order within the real structural backbone, and recorded how it did so. A
+ * planner node is only emitted when this record is present, so the node always
+ * maps to a real recorded decomposition (the no-unbacked-node rule for the new
+ * kind). The `source` tells apart a plan the inference planner produced from the
+ * deterministic heuristic fallback the pass used when no model returned a usable
+ * plan, so the node is honest about how the Change was decomposed.
+ */
+export interface PlanSnapshot {
+  /** Whether the inference planner produced the plan, or the heuristic fallback. */
+  readonly source: "planner" | "heuristic-fallback";
+  /** The model that produced an accepted plan (empty on the heuristic fallback). */
+  readonly model: string;
+  /** The ids of the units the plan produced (match the Change's own unit ids). */
+  readonly units: readonly string[];
+  /** The frozen read-only contract paths the plan froze (owned by no unit). */
+  readonly contracts: readonly string[];
+}
+
+/**
  * The subset of the live ChangeState projection the graph model reads. Both the
  * Worker's `ChangeStateView` and the offline control surface's view are
  * structurally assignable to this, so the model projects either without a
@@ -364,11 +386,21 @@ export interface ChangeStateSnapshot {
    * until the ladder re-fans a unit on a retry round.
    */
   readonly roundAgents?: readonly RoundAgentSnapshot[];
+  /**
+   * The schema-constrained plan recorded for this Change, when the goal was
+   * decomposed through the inference-backed planner pass (or its heuristic
+   * fallback). It becomes one `planner` node between the goal and the first
+   * agent wave, backed by this record. Optional/absent on the plain heuristic
+   * decomposition path (no planner pass), where there is no separate plan record
+   * and the graph has no planner node, exactly as before.
+   */
+  readonly plan?: PlanSnapshot;
 }
 
 /** The kind of a node in the rendered graph. */
 export type GraphNodeKind =
   | "goal" // the Change itself: the root the graph self-organizes toward
+  | "planner" // the schema-constrained decomposer that produced the plan, between the goal and the first agent wave
   | "work" // a declared WorkUnit before an agent is recruited for it
   | "agent" // a WorkUnit an agent has been recruited for (a real repo exists)
   | "tool" // an agent-built tool published to its own repo, consumed downstream
@@ -396,6 +428,14 @@ export type GraphEdgeKind =
  */
 export type NodeBacking =
   | { readonly kind: "change"; readonly changeId: string }
+  | {
+      // A planner node is backed by the real recorded plan the planner pass
+      // produced for this Change, so it can never be a decorative "it planned"
+      // node: a plan record with the same change must be present in the state.
+      readonly kind: "planner";
+      readonly changeId: string;
+      readonly source: "planner" | "heuristic-fallback";
+    }
   | {
       readonly kind: "work-unit";
       readonly unitId: string;
@@ -557,6 +597,11 @@ export function goalNodeId(changeId: string): string {
   return `goal:${changeId}`;
 }
 
+/** The id used for the single planner node (the Change's decomposer). */
+export function plannerNodeId(changeId: string): string {
+  return `planner:${changeId}`;
+}
+
 /** The id used for a WorkUnit's node. */
 export function unitNodeId(unitId: string): string {
   return `unit:${unitId}`;
@@ -605,6 +650,28 @@ export function assertBacked(node: GraphNode, snapshot: ChangeStateSnapshot): Gr
         );
       }
       return node;
+    case "planner": {
+      // A planner node must map to the real recorded plan the state reports: its
+      // change must match AND a plan record whose source matches must be present.
+      // A planner node with no backing plan record is exactly the decorative
+      // "it planned" node the no-unbacked-node rule forbids.
+      if (backing.changeId !== snapshot.id) {
+        throw new Error(
+          `unbacked node ${node.id}: planner backing ${backing.changeId} is not the Change ${snapshot.id}`,
+        );
+      }
+      if (!snapshot.plan) {
+        throw new Error(
+          `unbacked node ${node.id}: no plan recorded in the state for change ${backing.changeId}`,
+        );
+      }
+      if (snapshot.plan.source !== backing.source) {
+        throw new Error(
+          `unbacked node ${node.id}: planner source ${backing.source} does not match the recorded plan source ${snapshot.plan.source}`,
+        );
+      }
+      return node;
+    }
     case "work-unit": {
       const unit = snapshot.work.find((u) => u.id === backing.unitId);
       if (!unit) {
@@ -965,6 +1032,34 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     ),
   );
 
+  // The planner node: the schema-constrained decomposer that produced the plan,
+  // placed between the goal and the first agent wave. It is emitted ONLY when
+  // the state records a plan (the inference planner pass ran), so the plain
+  // heuristic path has no planner node and is unchanged. It is backed by the
+  // real recorded plan, so it is never a decorative node, and it roots the agent
+  // wave below it (goal -> planner -> agents) so the planner is visibly the
+  // decomposer. It greens once a plan is recorded (the decomposition is done).
+  const plan = snapshot.plan;
+  if (plan) {
+    nodes.push(
+      assertBacked(
+        {
+          id: plannerNodeId(snapshot.id),
+          kind: "planner",
+          label:
+            plan.source === "planner"
+              ? `planner: ${plan.model || "schema-constrained"}`
+              : "planner: heuristic fallback",
+          status: "integrated",
+          verified: true,
+          escalated: false,
+          backing: { kind: "planner", changeId: snapshot.id, source: plan.source },
+        },
+        snapshot,
+      ),
+    );
+  }
+
   // One node per WorkUnit. An agent node is backed by a real recorded workspace;
   // a work node is backed by the WorkUnit itself. There is no third option, so
   // every unit node has concrete backing.
@@ -1012,17 +1107,36 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
 
   const edges: GraphEdge[] = [];
 
-  // Root every SPAWNED unit to the goal, so the graph is a tree over the Change.
-  // A withheld (not-yet-spawned) unit has no node, so it is not rooted either.
-  // These are backed by the Change-to-unit relationship the snapshot declares.
+  // When a plan is recorded, the planner node sits between the goal and the
+  // agents: the goal flows into the planner (the Change handed to the decomposer)
+  // and the agents root off the planner, so the planner is visibly the
+  // decomposer. The goal->planner edge is drawn once; the per-unit rooting below
+  // runs from the planner instead of the goal. On the plain heuristic path (no
+  // plan) the planner node is absent, so units root directly off the goal exactly
+  // as before, and nothing changes.
+  const rootId = plan ? plannerNodeId(snapshot.id) : goalNodeId(snapshot.id);
+  if (plan) {
+    edges.push({
+      id: `goal->planner:${snapshot.id}`,
+      kind: "dependency",
+      from: goalNodeId(snapshot.id),
+      to: plannerNodeId(snapshot.id),
+      backing: { kind: "dependency", from: snapshot.id, to: `planner:${snapshot.id}` },
+    });
+  }
+
+  // Root every SPAWNED unit to the planner (when present) or the goal, so the
+  // graph is a tree over the Change. A withheld (not-yet-spawned) unit has no
+  // node, so it is not rooted either. These are backed by the Change-to-unit
+  // relationship the snapshot declares.
   for (const unit of snapshot.work) {
     if (!spawnedIds.has(unit.id)) {
       continue;
     }
     edges.push({
-      id: `goal->${unit.id}`,
+      id: `${plan ? "planner" : "goal"}->${unit.id}`,
       kind: "dependency",
-      from: goalNodeId(snapshot.id),
+      from: rootId,
       to: unitNodeId(unit.id),
       backing: { kind: "dependency", from: snapshot.id, to: unit.id },
     });

@@ -23,8 +23,9 @@
  * executor, so an offline run and `make check` never call the network.
  */
 
-import type { ExecutorProvider } from "@switchyard-change/model-adapters";
+import type { ExecutorProvider, PlannerPlan } from "@switchyard-change/model-adapters";
 import {
+  createAiGatewayPlannerInvoke,
   createAiGatewayRestInvoke,
   createWorkersAiRestInvoke,
   DEFAULT_AI_GATEWAY_ESCALATION_MODEL,
@@ -53,6 +54,7 @@ export interface ExecutorEnv {
   readonly CLOUDFLARE_ACCOUNT_ID?: string;
   readonly CLOUDFLARE_API_TOKEN?: string;
   readonly AI_GATEWAY_MODEL?: string;
+  readonly AI_GATEWAY_PLANNER_MODEL?: string;
   readonly AI_GATEWAY_ESCALATION_MODEL?: string;
   readonly AI_GATEWAY_ESCALATION_MODELS?: string;
   readonly AI_GATEWAY_MAX_MODEL_RETRIES?: string;
@@ -228,4 +230,101 @@ function parseMaxModelRetries(raw: string | undefined, fallback: number): number
     return fallback;
   }
   return Math.floor(n);
+}
+
+/**
+ * The plan transport the planner pass calls: a goal plus the structural map in,
+ * a plan object out. It is structurally the model-adapters PlannerInvoke, named
+ * here so the orchestration layer can hand it to change-core's planGoal without
+ * change-core depending on the adapter package.
+ */
+export type PlanTransport = (request: {
+  readonly model: string;
+  readonly messages: readonly {
+    readonly role: "system" | "user" | "assistant";
+    readonly content: string;
+  }[];
+}) => Promise<PlannerPlan>;
+
+/**
+ * The outcome of selecting a planner: whether the inference planner is live, the
+ * injectable plan transport when it is, and the ORDERED model ladder (base plus
+ * escalation models) the plan pass escalates through on an invalid plan.
+ */
+export interface SelectedPlanner {
+  /**
+   * True when a schema-constrained inference planner is configured
+   * (EXECUTOR=ai-gateway with gateway credentials). When false the caller keeps
+   * the deterministic heuristic decomposition, so offline runs, `make check`,
+   * and the demo stay deterministic and anti-puppet holds on the heuristic path.
+   */
+  readonly live: boolean;
+  /** A human-readable description of what was selected (no secrets). */
+  readonly description: string;
+  /** The injected plan transport, present only when `live` is true. */
+  readonly plan?: PlanTransport;
+  /** The base plan model (empty when not live). */
+  readonly baseModel: string;
+  /** The ORDERED escalation ladder the plan pass walks on an invalid plan. */
+  readonly escalationModels: readonly string[];
+}
+
+/**
+ * Select the schema-constrained planner from the environment, independently of
+ * the executor. The inference planner is live ONLY for EXECUTOR=ai-gateway with
+ * gateway credentials present: it builds the AI Gateway plan transport (the
+ * json_schema plan call) over the same gateway URL and token the executor uses,
+ * reads the plan model from AI_GATEWAY_PLANNER_MODEL (falling back to
+ * AI_GATEWAY_MODEL, then the default), and reuses the ordered escalation ladder
+ * from AI_GATEWAY_ESCALATION_MODELS (or the singular, then the default) so an
+ * invalid plan escalates through the same models the executor does.
+ *
+ * For any other EXECUTOR (or an unset one, the noop/offline path), the planner
+ * is NOT live: the caller keeps the deterministic heuristic decomposition, so
+ * `make check`, the demo, and the anti-puppet substrate stay offline and
+ * deterministic. Missing gateway credentials under EXECUTOR=ai-gateway also
+ * yield a non-live planner here (the executor selection is where that misconfig
+ * is surfaced as an error), so the planner never falls back to a network call it
+ * cannot authenticate.
+ */
+export function selectPlanner(env: ExecutorEnv = process.env): SelectedPlanner {
+  const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
+  if (choice !== "ai-gateway") {
+    return {
+      live: false,
+      description: "heuristic (deterministic, offline decomposition)",
+      baseModel: "",
+      escalationModels: [],
+    };
+  }
+  const gatewayUrl = (env.CLOUDFLARE_AI_GATEWAY_URL ?? "").trim();
+  const gatewayToken = (env.CLOUDFLARE_AI_GATEWAY_TOKEN ?? "").trim();
+  if (gatewayUrl === "" || gatewayToken === "") {
+    // The gateway is not configured; keep the heuristic rather than attempting an
+    // unauthenticated network call.
+    return {
+      live: false,
+      description: "heuristic (gateway credentials absent)",
+      baseModel: "",
+      escalationModels: [],
+    };
+  }
+  const baseModel =
+    (env.AI_GATEWAY_PLANNER_MODEL ?? "").trim() ||
+    (env.AI_GATEWAY_MODEL ?? "").trim() ||
+    DEFAULT_AI_GATEWAY_MODEL;
+  const escalationModels = parseEscalationModels(
+    env.AI_GATEWAY_ESCALATION_MODELS,
+    env.AI_GATEWAY_ESCALATION_MODEL,
+    DEFAULT_AI_GATEWAY_ESCALATION_MODEL,
+  );
+  const invoke = createAiGatewayPlannerInvoke({ gatewayUrl, gatewayToken });
+  const plan: PlanTransport = (request) => invoke(request);
+  return {
+    live: true,
+    description: `ai-gateway planner (base ${baseModel}, escalation ${escalationModels.join(" -> ")})`,
+    plan,
+    baseModel,
+    escalationModels,
+  };
 }

@@ -300,6 +300,24 @@ function squarePoints(r: number): string {
   return `${-r},${-r} ${r},${-r} ${r},${r} ${-r},${r}`;
 }
 
+/**
+ * The three points of an upward equilateral triangle with circumradius `r`,
+ * centered at the node origin. Used for the PLANNER node so the decomposer reads
+ * as a distinct triangle, set apart from the goal diamond, the agent circles,
+ * the tool square, and the verify/retry hexagons, while keeping the same visual
+ * footprint as a circle of radius `r`.
+ */
+function trianglePoints(r: number): string {
+  const pts: string[] = [];
+  for (let i = 0; i < 3; i += 1) {
+    const angle = (2 * Math.PI / 3) * i - Math.PI / 2; // start at the top
+    const x = r * Math.cos(angle);
+    const y = r * Math.sin(angle);
+    pts.push(`${x.toFixed(2)},${y.toFixed(2)}`);
+  }
+  return pts.join(" ");
+}
+
 /** The fill color for a node from its kind and verified/escalated/failed state. */
 function nodeFill(node: GraphNode): string {
   if (node.escalated) {
@@ -336,6 +354,12 @@ function nodeFill(node: GraphNode): string {
   switch (node.kind) {
     case "goal":
       return "#1f6feb";
+    case "planner":
+      // The schema-constrained decomposer: a distinct TEAL, set apart from the
+      // goal diamond (blue), the agent circles (blue), the tool square (yellow),
+      // and the verify/retry hexagons (green/red/magenta), so the planner reads
+      // as its own beat between the goal and the first agent wave.
+      return "#2bb3a3";
     case "agent":
       return node.status === "running" ? "#388bfd" : "#30497a";
     case "work":
@@ -650,6 +674,13 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                   {node.kind === "goal" ? (
                     <polygon
                       points={diamondPoints(r)}
+                      fill={nodeFill(node)}
+                      stroke={selected ? "#e6edf3" : "#0d1117"}
+                      strokeWidth={selected ? 3 : 1.5}
+                    />
+                  ) : node.kind === "planner" ? (
+                    <polygon
+                      points={trianglePoints(r)}
                       fill={nodeFill(node)}
                       stroke={selected ? "#e6edf3" : "#0d1117"}
                       strokeWidth={selected ? 3 : 1.5}

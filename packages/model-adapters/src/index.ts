@@ -71,3 +71,20 @@ export {
   DEFAULT_AI_GATEWAY_MAX_MODEL_RETRIES,
   DEFAULT_AI_GATEWAY_MODEL,
 } from "./ai-gateway.ts";
+
+export type {
+  AiGatewayPlannerOptions,
+  PlannerInvoke,
+  PlannerPlan,
+  PlannerPlanUnit,
+  PlannerRequest,
+} from "./planner.ts";
+export {
+  createAiGatewayPlannerInvoke,
+  DEFAULT_AI_GATEWAY_PLANNER_MAX_TOKENS,
+  DEFAULT_AI_GATEWAY_PLANNER_MODEL,
+  parsePlannerPlan,
+  PLANNER_PLAN_JSON_SCHEMA,
+  PLANNER_PLAN_SCHEMA_NAME,
+  PlannerResponseError,
+} from "./planner.ts";

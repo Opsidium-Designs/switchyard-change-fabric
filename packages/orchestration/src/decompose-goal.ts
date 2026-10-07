@@ -14,9 +14,12 @@
 import {
   buildWorkGraph,
   decompose,
+  planGoal,
   type Change,
   type DecomposeResult,
   type GoalAnalyzer,
+  type PlanTransport,
+  type RecordedPlan,
   type WorkGraph,
 } from "@switchyard-change/change-core";
 
@@ -34,20 +37,67 @@ export interface DecomposeGoalOptions {
   readonly analyzer?: GoalAnalyzer;
   /** An optional stable Change id override. */
   readonly changeId?: string;
+  /**
+   * An optional inference-backed, schema-constrained planner. When present AND
+   * live (an injected plan transport plus a base model), decomposition is
+   * goal-driven: the planner decides the in-scope modules, each unit objective,
+   * the agent count, and the dependency order within the real structural
+   * backbone, with a bounded escalation ladder and a fall-back to the heuristic
+   * on an invalid/unusable plan. When absent (the default, offline/noop path),
+   * the deterministic heuristic `decompose` is used, so `make check`, the demo,
+   * and the anti-puppet substrate stay deterministic and offline.
+   */
+  readonly planner?: PlannerInjection;
+}
+
+/**
+ * The injected planner: the plan transport plus the ordered model ladder it
+ * escalates through. The caller (the CLI) builds this from `selectPlanner` only
+ * when inference is configured, so a bare `decomposeGoal` call stays on the
+ * deterministic heuristic path.
+ */
+export interface PlannerInjection {
+  readonly plan: PlanTransport;
+  readonly baseModel: string;
+  readonly escalationModels?: readonly string[];
 }
 
 /** The outcome of decomposing a goal: the Change, its graph, and the intent. */
 export interface DecomposeGoalResult extends DecomposeResult {
   readonly graph: WorkGraph;
+  /**
+   * The recorded plan that drove the Change, present when the inference planner
+   * ran (planner or heuristic-fallback). Absent on the plain heuristic path (no
+   * planner injected), where the Change is the deterministic decomposition and
+   * there is no separate plan record. A caller that wants a planner graph node
+   * backs it with this record.
+   */
+  readonly plan?: RecordedPlan;
 }
 
 /**
  * Decompose a goal against a project directory on disk. Scans the project into a
- * file list, then calls the pure decomposer. Deterministic given the default
- * analyzer.
+ * file list, then either runs the inference-backed schema-constrained planner
+ * (when a live planner is injected) or the pure deterministic decomposer (the
+ * default). The planner honors the structural backbone, so single-writer
+ * ownership and the frozen contracts are preserved either way; the planned
+ * Change round-trips through the spec YAML exactly like the heuristic Change.
  */
 export async function decomposeGoal(options: DecomposeGoalOptions): Promise<DecomposeGoalResult> {
   const files = await scanRepoFiles(options.projectDir);
+  if (options.planner) {
+    const planned = await planGoal({
+      goal: options.goal,
+      repo: files,
+      plan: options.planner.plan,
+      baseModel: options.planner.baseModel,
+      ...(options.planner.escalationModels
+        ? { escalationModels: options.planner.escalationModels }
+        : {}),
+      ...(options.changeId ? { changeId: options.changeId } : {}),
+    });
+    return { ...planned, graph: buildWorkGraph(planned.change) };
+  }
   const result = decompose({
     goal: options.goal,
     repo: files,

@@ -411,6 +411,7 @@ body {
 }
 
 .sw-goal { background: #1f6feb; }
+.sw-planner { background: #2bb3a3; }
 .sw-work { background: #21262d; border-color: var(--border); }
 .sw-agent { background: #30497a; }
 .sw-verified { background: #238636; }
@@ -438,6 +439,22 @@ body {
 
 .swatch-square.sw-tool {
   background: #e3b341;
+}
+
+/* The planner legend glyph is a TRIANGLE (a CSS triangle via borders), matching
+   the triangle planner node drawn in the graph. It keeps roughly the same
+   footprint as the circular swatches. */
+.swatch-triangle {
+  width: 0;
+  height: 0;
+  display: inline-block;
+  border-left: 0.45rem solid transparent;
+  border-right: 0.45rem solid transparent;
+  border-bottom: 0.8rem solid #2bb3a3;
+}
+
+.swatch-triangle.sw-planner {
+  border-bottom-color: #2bb3a3;
 }
 
 /* The goal legend glyph is a DIAMOND (a CSS-rotated square), matching the
