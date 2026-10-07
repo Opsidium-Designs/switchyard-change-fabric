@@ -218,6 +218,17 @@ export function changeToSpecYaml(change: Change): string {
     lines.push("plan:");
     lines.push(`  source: ${quote(source)}`);
     lines.push(`  model: ${quote(model)}`);
+    // The prompt summary and rationale ride the round-trip so the Worker-side
+    // Change carries them and the console's planner detail panel can show what
+    // the planner was asked and why it decomposed as it did. Both are optional
+    // and empty-safe: omitted when the plan has none, so a plan without them
+    // still round-trips and validates.
+    if (change.plan.promptSummary) {
+      lines.push(`  prompt_summary: ${quote(change.plan.promptSummary)}`);
+    }
+    if (change.plan.rationale) {
+      lines.push(`  rationale: ${quote(change.plan.rationale)}`);
+    }
     if (units.length > 0) {
       lines.push("  units:");
       for (const unit of units) {
@@ -247,7 +258,19 @@ export function changeToSpecYaml(change: Change): string {
   return lines.join("\n");
 }
 
-/** Double-quote a YAML scalar, escaping embedded quotes and backslashes. */
+/**
+ * Double-quote a YAML scalar, escaping embedded quotes and backslashes, plus the
+ * control characters (newline, carriage return, tab) that would otherwise fold
+ * or corrupt a multi-line value in a double-quoted YAML scalar. Single-line
+ * values are unaffected; a multi-line value (the plan's prompt summary) survives
+ * the round-trip because the parser decodes `\n` back to a real newline.
+ */
 function quote(value: string): string {
-  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  const escaped = value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, "\\r")
+    .replace(/\n/g, "\\n")
+    .replace(/\t/g, "\\t");
+  return `"${escaped}"`;
 }

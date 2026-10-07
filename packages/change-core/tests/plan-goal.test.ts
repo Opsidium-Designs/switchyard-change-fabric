@@ -138,6 +138,69 @@ describe("planGoal: schema-constrained planner over the structural backbone", ()
     }
   });
 
+  it("records a readable prompt summary and the model's rationale on the recorded plan", async () => {
+    // A plan the model returns WITH a rationale: the recorded plan carries both a
+    // deterministic prompt summary (what the planner was asked) and the model's
+    // rationale (why this decomposition), empty-safe either way.
+    const planWithRationale: PlannedShape = {
+      ...GOOD_PLAN,
+      rationale: "one owner per resource keeps the two shared seams frozen",
+    };
+    const result = await planGoal({
+      goal: GOAL,
+      repo: SERVICE_REPO,
+      plan: fixedPlan(planWithRationale),
+      baseModel: "gpt-4o-mini",
+    });
+
+    // The prompt summary names the goal and the real structural map (modules and
+    // frozen contracts), and never leaks a credential (only paths/symbol names).
+    expect(result.plan.promptSummary).toBeDefined();
+    expect(result.plan.promptSummary).toContain(GOAL);
+    expect(result.plan.promptSummary).toContain("frozen");
+    expect(result.plan.promptSummary).toContain("src/resources/users.js");
+    expect(result.plan.promptSummary).not.toMatch(/Bearer\s/);
+
+    // The model's rationale is carried through verbatim.
+    expect(result.plan.rationale).toBe(
+      "one owner per resource keeps the two shared seams frozen",
+    );
+  });
+
+  it("records a prompt summary but no rationale when the model omits one", async () => {
+    // GOOD_PLAN has no rationale: the recorded plan still carries the prompt
+    // summary (deterministic), but rationale is simply absent (empty-safe).
+    const result = await planGoal({
+      goal: GOAL,
+      repo: SERVICE_REPO,
+      plan: fixedPlan(GOOD_PLAN),
+      baseModel: "gpt-4o-mini",
+    });
+    expect(result.plan.promptSummary).toBeDefined();
+    expect(result.plan.promptSummary).toContain(GOAL);
+    expect(result.plan.rationale).toBeUndefined();
+  });
+
+  it("the heuristic fallback carries no prompt summary and no rationale", async () => {
+    // The fallback ran the heuristic rather than the planner, so neither the
+    // prompt summary nor the rationale is recorded (empty-safe).
+    const badPath: PlannedShape = {
+      units: [
+        { id: "ghost", objective: "bad", paths: ["src/resources/ghost.js"], dependsOn: [] },
+      ],
+      contracts: [],
+    };
+    const result = await planGoal({
+      goal: GOAL,
+      repo: SERVICE_REPO,
+      plan: fixedPlan(badPath),
+      baseModel: "gpt-4o-mini",
+    });
+    expect(result.plan.source).toBe("heuristic-fallback");
+    expect(result.plan.promptSummary).toBeUndefined();
+    expect(result.plan.rationale).toBeUndefined();
+  });
+
   it("holds single-writer ownership: no two planned units declare the same path", async () => {
     const result = await planGoal({
       goal: GOAL,

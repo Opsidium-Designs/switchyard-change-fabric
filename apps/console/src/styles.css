@@ -636,6 +636,34 @@ body {
   font-weight: 600;
 }
 
+/* The planner node's plan detail, in the same styling family as the agent
+   model detail: the planned units with their objectives read as a compact
+   list under the plan source/model/agent-count meta. */
+.planner-detail {
+  margin-top: 1rem;
+}
+
+.planner-units {
+  list-style: none;
+  margin: 0.25rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.planner-units li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: baseline;
+  font-size: 0.82rem;
+}
+
+.planner-objective {
+  color: var(--muted, #8b949e);
+}
+
 /* --- Rich click-detail: prompt, proposed edit, tokens/cost --- */
 
 .detail-panel h4 {

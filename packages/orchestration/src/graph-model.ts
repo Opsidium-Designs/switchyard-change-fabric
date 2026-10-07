@@ -319,6 +319,51 @@ export interface PlanSnapshot {
   readonly units: readonly string[];
   /** The frozen read-only contract paths the plan froze (owned by no unit). */
   readonly contracts: readonly string[];
+  /**
+   * A readable, secret-free summary of what the planner was asked (the goal plus
+   * the structural module map it was handed). Surfaced in the console's planner
+   * detail panel. Optional/empty-safe: absent when the plan carries none.
+   */
+  readonly promptSummary?: string;
+  /** The model's optional explanation of why this decomposition, when present. */
+  readonly rationale?: string;
+}
+
+/**
+ * One planned unit as the planner detail exposes it: the unit id and its
+ * objective. The objective is resolved from the Change's WorkUnit of the same
+ * id, so the planner detail shows the real objective the plan assigned each unit
+ * (the agent count equals the number of these entries).
+ */
+export interface PlannerUnitDetail {
+  readonly id: string;
+  readonly objective: string;
+}
+
+/**
+ * The inspectable detail carried on the planner graph node, so the console can
+ * render a planner detail panel at parity with the agent node's detail. Every
+ * field is derived from the real recorded plan (and the Change's own WorkUnits
+ * for the objectives), so it is backed by the recorded plan exactly like the
+ * node itself. The `agentCount` is the number of planned units (the fan-out the
+ * plan chose). Optional explanatory fields (promptSummary, rationale) are present
+ * only when the plan carried them.
+ */
+export interface PlannerDetailSnapshot {
+  /** Whether the inference planner produced the plan, or the heuristic fallback. */
+  readonly source: "planner" | "heuristic-fallback";
+  /** The model that produced an accepted plan (empty on the heuristic fallback). */
+  readonly model: string;
+  /** A readable, secret-free summary of what the planner was asked, when present. */
+  readonly promptSummary?: string;
+  /** The model's optional explanation of why this decomposition, when present. */
+  readonly rationale?: string;
+  /** The planned units with their objectives (one per recruited agent). */
+  readonly units: readonly PlannerUnitDetail[];
+  /** The agent count the plan chose (equals the number of planned units). */
+  readonly agentCount: number;
+  /** The frozen read-only contract paths the plan froze (owned by no unit). */
+  readonly contracts: readonly string[];
 }
 
 /**
@@ -570,6 +615,14 @@ export interface GraphNode {
    * it straight from real state. Absent until the agent has produced it.
    */
   readonly detail?: UnitDetailSnapshot;
+  /**
+   * The inspectable plan detail carried on the PLANNER node, so the console can
+   * render a planner detail panel (source, model, prompt summary, rationale, the
+   * planned units with objectives, the agent count, and the frozen contracts) at
+   * parity with the agent node's model detail. Present only on the planner node,
+   * derived from the real recorded plan, so it is backed exactly like the node.
+   */
+  readonly plannerDetail?: PlannerDetailSnapshot;
   /** The concrete state element this node was derived from. */
   readonly backing: NodeBacking;
 }
@@ -1066,6 +1119,25 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
   // decomposer. It greens once a plan is recorded (the decomposition is done).
   const plan = snapshot.plan;
   if (plan) {
+    // Build the inspectable planner detail from the real recorded plan: resolve
+    // each planned unit id to its objective from the Change's WorkUnits so the
+    // detail shows the objective the plan assigned each unit, and carry the agent
+    // count (= number of planned units), the frozen contracts, and the optional
+    // prompt summary / rationale. This is derived wholly from the recorded plan
+    // (and the Change's own units), so it is backed exactly like the node.
+    const plannerUnits: PlannerUnitDetail[] = plan.units.map((unitId) => {
+      const unit = snapshot.work.find((u) => u.id === unitId);
+      return { id: unitId, objective: unit?.objective ?? "" };
+    });
+    const plannerDetail: PlannerDetailSnapshot = {
+      source: plan.source,
+      model: plan.model,
+      ...(plan.promptSummary !== undefined ? { promptSummary: plan.promptSummary } : {}),
+      ...(plan.rationale !== undefined ? { rationale: plan.rationale } : {}),
+      units: plannerUnits,
+      agentCount: plannerUnits.length,
+      contracts: [...plan.contracts],
+    };
     nodes.push(
       assertBacked(
         {
@@ -1078,6 +1150,7 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
           status: "integrated",
           verified: true,
           escalated: false,
+          plannerDetail,
           backing: { kind: "planner", changeId: snapshot.id, source: plan.source },
         },
         snapshot,

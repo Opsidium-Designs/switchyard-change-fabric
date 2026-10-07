@@ -53,6 +53,13 @@ export interface PlannedUnit {
 export interface PlannedShape {
   readonly units: readonly PlannedUnit[];
   readonly contracts: readonly string[];
+  /**
+   * A short, optional explanation the model may return of WHY it decomposed the
+   * goal this way. Optional and empty-safe: a plan without it still projects. It
+   * is purely explanatory (never a credential, never drives a decision) and is
+   * surfaced in the console's planner detail panel when present.
+   */
+  readonly rationale?: string;
 }
 
 /**
@@ -79,6 +86,24 @@ export interface RecordedPlan {
   readonly units: readonly PlannedUnit[];
   /** The frozen read-only contract paths the plan froze (owned by no unit). */
   readonly contracts: readonly string[];
+  /**
+   * A readable, secret-free summary of what the planner was ASKED: the goal plus
+   * the structural module map it was handed (modules/files/exports and the frozen
+   * seams), summarized. It is derived deterministically from the goal and the
+   * snapshot, so it is present for a planner plan and empty-safe for the fallback
+   * (where the heuristic ran rather than the planner). The console surfaces it in
+   * the planner detail panel so a reader can see the real question the planner
+   * answered. It never contains a credential (the structural map carries only
+   * paths and symbol names).
+   */
+  readonly promptSummary?: string;
+  /**
+   * A short, optional explanation the model returned of WHY this decomposition.
+   * Present only when the planner model supplied one; absent otherwise (including
+   * the heuristic fallback). Purely explanatory and surfaced in the console's
+   * planner detail panel.
+   */
+  readonly rationale?: string;
 }
 
 /** Options for an inference-backed, schema-constrained plan pass. */
@@ -130,6 +155,11 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
     (model) => model.trim() !== "",
   );
   const messages = buildPlannerMessages(options.goal, snapshot, blueprint);
+  // A readable, secret-free summary of what the planner was asked: the goal plus
+  // the structural module map it was handed. Derived deterministically from the
+  // goal and the snapshot (the same inputs the prompt was built from), so a
+  // planner plan always carries it and no credential can leak into it.
+  const promptSummary = summarizePlannerPrompt(options.goal, snapshot, blueprint);
 
   for (const model of ladder) {
     let proposed: PlannedShape;
@@ -154,6 +184,8 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
       goal: options.goal,
       budgetUsd: options.budgetUsd,
       assurance: options.assurance,
+      promptSummary,
+      ...(proposed.rationale !== undefined ? { rationale: proposed.rationale } : {}),
     });
     return projected;
   }
@@ -256,6 +288,10 @@ function projectPlanToChange(input: {
   readonly goal: string;
   readonly budgetUsd?: number;
   readonly assurance?: AssuranceLevel;
+  /** The readable summary of what the planner was asked (goal + structural map). */
+  readonly promptSummary?: string;
+  /** The model's optional explanation of why this decomposition. */
+  readonly rationale?: string;
 }): PlanGoalResult {
   const { plan, snapshot, model } = input;
   const byPath = new Map(snapshot.sourceFiles.map((f) => [f.path, f] as const));
@@ -302,6 +338,8 @@ function projectPlanToChange(input: {
       dependsOn: [...unit.dependsOn],
     })),
     contracts: [...plan.contracts],
+    ...(input.promptSummary !== undefined ? { promptSummary: input.promptSummary } : {}),
+    ...(input.rationale !== undefined ? { rationale: input.rationale } : {}),
   };
 
   // Carry the recorded plan ON the Change so it survives the spec YAML
@@ -408,6 +446,65 @@ export function buildPlannerMessages(
     { role: "user", content: user },
   ];
 }
+
+/**
+ * Build a readable, secret-free summary of what the planner was ASKED: the goal
+ * plus a compact description of the structural module map it was handed (how
+ * many modules/files it could place, each module's owned files, and the frozen
+ * read-only seams). It is derived deterministically from the goal and the
+ * snapshot (the same inputs the prompt was built from), so it is reproducible
+ * and carries only paths and symbol names, never a credential. Bounded so a very
+ * large repo's map does not produce an unbounded summary. Surfaced in the
+ * console's planner detail panel so a reader sees the real question the planner
+ * answered.
+ */
+export function summarizePlannerPrompt(
+  goal: string,
+  snapshot: RepoSnapshot,
+  blueprint: CohesionBlueprint | undefined,
+): string {
+  const lines: string[] = [];
+  lines.push(`Goal: ${goal}`);
+  lines.push("");
+  if (blueprint && blueprint.modules.length > 0) {
+    lines.push(
+      `Structural module map: ${blueprint.modules.length} module(s), ${blueprint.contracts.length} frozen contract(s).`,
+    );
+    lines.push("Modules the planner could place:");
+    for (const module of blueprint.modules.slice(0, MAX_SUMMARY_ITEMS)) {
+      const deps =
+        module.dependsOn.length > 0 ? ` (depends on ${module.dependsOn.join(", ")})` : "";
+      lines.push(`  - ${module.label}: ${module.paths.join(", ")}${deps}`);
+    }
+    if (blueprint.modules.length > MAX_SUMMARY_ITEMS) {
+      lines.push(`  - ...and ${blueprint.modules.length - MAX_SUMMARY_ITEMS} more`);
+    }
+    if (blueprint.contracts.length > 0) {
+      lines.push("Frozen read-only contracts (owned by no unit):");
+      for (const contract of blueprint.contracts.slice(0, MAX_SUMMARY_ITEMS)) {
+        lines.push(`  - ${contract.path}`);
+      }
+      if (blueprint.contracts.length > MAX_SUMMARY_ITEMS) {
+        lines.push(`  - ...and ${blueprint.contracts.length - MAX_SUMMARY_ITEMS} more`);
+      }
+    }
+  } else {
+    lines.push(
+      `Structural file map: ${snapshot.sourceFiles.length} source file(s), no frozen contracts (non-modular repo).`,
+    );
+    lines.push("Source files the planner could place:");
+    for (const file of snapshot.sourceFiles.slice(0, MAX_SUMMARY_ITEMS)) {
+      lines.push(`  - ${file.path}`);
+    }
+    if (snapshot.sourceFiles.length > MAX_SUMMARY_ITEMS) {
+      lines.push(`  - ...and ${snapshot.sourceFiles.length - MAX_SUMMARY_ITEMS} more`);
+    }
+  }
+  return lines.join("\n");
+}
+
+/** The maximum number of modules/files/contracts a prompt summary lists. */
+const MAX_SUMMARY_ITEMS = 20;
 
 /** Render the structural map the planner reasons over as a compact text block. */
 function structuralMap(

@@ -72,7 +72,7 @@ export type {
   PlanTransport,
   RecordedPlan,
 } from "./plan-goal.ts";
-export { buildPlannerMessages, planGoal, validatePlan } from "./plan-goal.ts";
+export { buildPlannerMessages, planGoal, summarizePlannerPrompt, validatePlan } from "./plan-goal.ts";
 
 export type {
   BlueprintContract,

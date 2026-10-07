@@ -8,6 +8,7 @@ import {
   type GraphNode,
   type UnitDetailSnapshot,
   type NodeBacking,
+  type PlannerDetailSnapshot,
   type WorkGraphModel,
 } from "@switchyard-change/orchestration/graph-model";
 
@@ -750,7 +751,7 @@ function EscalationPanel({
  * synthesized: every field is read straight from the node's backing or the
  * unit's recorded steps/detail, which were validated against the state.
  */
-function NodeDetail({
+export function NodeDetail({
   node,
   onClose,
 }: {
@@ -791,6 +792,10 @@ function NodeDetail({
       </dl>
 
       {detail ? <ModelDetail detail={detail} /> : null}
+
+      {node.kind === "planner" && node.plannerDetail ? (
+        <PlannerDetail detail={node.plannerDetail} />
+      ) : null}
 
       {backing.kind === "verify-attempt" || backing.kind === "retry-attempt" ? (
         <LadderDetail backing={backing} />
@@ -918,6 +923,92 @@ function ModelDetail({ detail }: { detail: UnitDetailSnapshot }) {
           <pre className="detail-diff">{detail.diff}</pre>
         </>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * The planner detail panel: the real recorded plan the PLANNER node produced,
+ * read straight from the node's plannerDetail (derived from the recorded plan,
+ * never synthesized). It is the planner's parallel of the agent ModelDetail, in
+ * the same styling family:
+ *
+ *   - SOURCE: whether the inference planner decided the decomposition, or the
+ *     deterministic heuristic fallback did (when no model returned a usable
+ *     plan). This is the honest provenance of the plan.
+ *   - MODEL: the model that produced an accepted plan (empty on the fallback).
+ *   - PROMPT SUMMARY: a readable, secret-free summary of what the planner was
+ *     asked (the goal plus the structural module map it was handed).
+ *   - RATIONALE: the model's short explanation of why this decomposition, when
+ *     it supplied one.
+ *   - THE PLAN: the planned units with their objectives, the agent count the
+ *     plan chose (one agent per unit), and the frozen read-only contracts the
+ *     plan froze (owned by no unit).
+ *
+ * Every field comes from the recorded plan, so the panel can only show a plan
+ * that genuinely drove the Change.
+ */
+function PlannerDetail({ detail }: { detail: PlannerDetailSnapshot }) {
+  const isPlanner = detail.source === "planner";
+  return (
+    <div className="model-detail planner-detail">
+      <h3>Plan</h3>
+      <dl className="meta">
+        <div>
+          <dt>Source</dt>
+          <dd>{isPlanner ? "inference planner" : "heuristic fallback"}</dd>
+        </div>
+        <div>
+          <dt>Model</dt>
+          <dd>{detail.model ? <code>{detail.model}</code> : <span className="muted">none (heuristic)</span>}</dd>
+        </div>
+        <div>
+          <dt>Agents</dt>
+          <dd>{detail.agentCount}</dd>
+        </div>
+      </dl>
+      <p className="muted">
+        {isPlanner
+          ? "The schema-constrained planner decided the in-scope modules, each unit objective, the agent count, and the dependency order within the real structure."
+          : "No model returned a usable plan, so the deterministic heuristic decomposed the goal. The plan is honest about being the fallback."}
+      </p>
+      {detail.promptSummary ? (
+        <>
+          <h4>Prompt summary</h4>
+          <pre className="detail-pre">{detail.promptSummary}</pre>
+        </>
+      ) : null}
+      {detail.rationale ? (
+        <>
+          <h4>Rationale</h4>
+          <pre className="detail-pre">{detail.rationale}</pre>
+        </>
+      ) : null}
+      <h4>Planned units ({detail.units.length})</h4>
+      {detail.units.length === 0 ? (
+        <p className="muted">The plan recorded no units.</p>
+      ) : (
+        <ul className="planner-units">
+          {detail.units.map((unit) => (
+            <li key={unit.id}>
+              <code>{unit.id}</code>
+              {unit.objective ? <span className="planner-objective"> {unit.objective}</span> : null}
+            </li>
+          ))}
+        </ul>
+      )}
+      <h4>Frozen contracts ({detail.contracts.length})</h4>
+      {detail.contracts.length === 0 ? (
+        <p className="muted">The plan froze no read-only contracts.</p>
+      ) : (
+        <ul className="paths">
+          {detail.contracts.map((path) => (
+            <li key={path}>
+              <code>{path}</code>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

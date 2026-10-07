@@ -148,4 +148,61 @@ work:
   it("rejects invalid YAML", () => {
     expect(() => parseChangeSpec("id: : :\n  - broken")).toThrow(ChangeSpecError);
   });
+
+  it("round-trips an optional plan with prompt summary and rationale, empty-safe", () => {
+    // A spec carrying a recorded plan with the optional, multi-line prompt
+    // summary and a rationale: both survive the parse, and a plan without them
+    // still validates (empty-safe).
+    const change = parseChangeSpec(`
+id: change-planned
+objective: Add input validation
+work:
+  - id: users
+    objective: validate users
+    paths: [src/resources/users.js]
+plan:
+  source: planner
+  model: gpt-4o-mini
+  prompt_summary: "Goal: Add input validation\\n\\nStructural module map: 1 module(s)."
+  rationale: "one owner per resource keeps the seams frozen"
+  units:
+    - id: users
+      objective: validate users
+      paths: [src/resources/users.js]
+  contracts:
+    - src/contracts/auth.js
+`);
+    expect(change.plan).toBeDefined();
+    expect(change.plan!.source).toBe("planner");
+    expect(change.plan!.model).toBe("gpt-4o-mini");
+    expect(change.plan!.promptSummary).toContain("Add input validation");
+    // The escaped newline decodes back to a real newline (multi-line survives).
+    expect(change.plan!.promptSummary).toContain("\n");
+    expect(change.plan!.rationale).toBe("one owner per resource keeps the seams frozen");
+    expect(change.plan!.units.map((u) => u.id)).toEqual(["users"]);
+    expect(change.plan!.contracts).toEqual(["src/contracts/auth.js"]);
+  });
+
+  it("round-trips a plan with no prompt summary or rationale (both absent)", () => {
+    const change = parseChangeSpec(`
+id: change-fallback
+objective: Add input validation
+work:
+  - id: users
+    objective: validate users
+    paths: [src/resources/users.js]
+plan:
+  source: heuristic-fallback
+  model: ""
+  units:
+    - id: users
+      objective: validate users
+      paths: [src/resources/users.js]
+  contracts: []
+`);
+    expect(change.plan).toBeDefined();
+    expect(change.plan!.source).toBe("heuristic-fallback");
+    expect(change.plan!.promptSummary).toBeUndefined();
+    expect(change.plan!.rationale).toBeUndefined();
+  });
 });

@@ -130,6 +130,14 @@ export interface PlanView {
   readonly model: string;
   readonly units: readonly string[];
   readonly contracts: readonly string[];
+  /**
+   * A readable, secret-free summary of what the planner was asked (the goal plus
+   * the structural module map it was handed). Mirrors the Worker's PlanView so
+   * the console projects both identically. Optional/empty-safe.
+   */
+  readonly promptSummary?: string;
+  /** The model's optional explanation of why this decomposition, when present. */
+  readonly rationale?: string;
 }
 
 /** Project a Change's recorded plan onto the serializable PlanView, or undefined. */
@@ -143,6 +151,8 @@ function planViewFromChange(change: Change): PlanView | undefined {
     model: plan.model,
     units: plan.units.map((unit) => unit.id),
     contracts: [...plan.contracts],
+    ...(plan.promptSummary !== undefined ? { promptSummary: plan.promptSummary } : {}),
+    ...(plan.rationale !== undefined ? { rationale: plan.rationale } : {}),
   };
 }
 

@@ -86,6 +86,19 @@ export interface ChangePlan {
   readonly units: readonly ChangePlanUnit[];
   /** The frozen read-only contract paths the plan froze (owned by no unit). */
   readonly contracts: readonly string[];
+  /**
+   * A readable, secret-free summary of what the planner was asked: the goal plus
+   * the structural module map it was handed. Carried on the Change so it survives
+   * the spec round-trip and is surfaced in the console's planner detail panel.
+   * Optional and empty-safe: absent on a hand-authored or fallback plan.
+   */
+  readonly promptSummary?: string;
+  /**
+   * The model's short, optional explanation of WHY this decomposition. Present
+   * only when the planner model supplied one; absent otherwise. Purely
+   * explanatory and surfaced in the console's planner detail panel.
+   */
+  readonly rationale?: string;
 }
 
 /** One owned module carried on a Change: exactly one WorkUnit writes its file(s). */

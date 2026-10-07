@@ -64,6 +64,15 @@ export interface PlannerPlan {
   readonly units: readonly PlannerPlanUnit[];
   /** The frozen read-only contract paths (owned by no unit). */
   readonly contracts: readonly string[];
+  /**
+   * A short, optional explanation of WHY the model decomposed the goal this way
+   * (which modules it put in scope, why it grouped the units as it did, and why
+   * it froze those contracts). It is OPTIONAL in the schema, so a plan without a
+   * rationale still conforms and still validates; when present it is surfaced in
+   * the console's planner detail panel. It is never a credential and never
+   * drives any decision; it is purely explanatory.
+   */
+  readonly rationale?: string;
 }
 
 /** What the caller hands the plan transport: the goal and the structural map. */
@@ -130,6 +139,11 @@ export const PLANNER_PLAN_JSON_SCHEMA = {
       type: "array",
       items: { type: "string" },
     },
+    // An OPTIONAL short explanation of why the model decomposed the goal this
+    // way. It is not in `required`, so a plan that omits it still conforms to the
+    // strict schema; a model that can explain its plan may include it, and the
+    // console surfaces it in the planner detail panel.
+    rationale: { type: "string" },
   },
 } as const;
 
@@ -265,7 +279,15 @@ export function parsePlannerPlan(replyText: string): PlannerPlan {
     return { id, objective, paths, dependsOn };
   });
   const contracts = requireStringArray(parsed["contracts"], "plan.contracts");
-  return { units, contracts };
+  // The rationale is OPTIONAL: a plan may omit it (then it is simply absent), and
+  // only a non-empty string is carried. A non-string is ignored rather than
+  // rejected, so a slightly loose reply still yields a usable plan.
+  const rawRationale = parsed["rationale"];
+  const rationale =
+    typeof rawRationale === "string" && rawRationale.trim() !== ""
+      ? rawRationale
+      : undefined;
+  return { units, contracts, ...(rationale !== undefined ? { rationale } : {}) };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

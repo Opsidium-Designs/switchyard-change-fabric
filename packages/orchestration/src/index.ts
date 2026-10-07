@@ -135,6 +135,8 @@ export type {
   LeaseEdgeSnapshot,
   NodeBacking,
   PlanSnapshot,
+  PlannerDetailSnapshot,
+  PlannerUnitDetail,
   RecruitmentEventSnapshot,
   ToolConsumptionSnapshot,
   ToolSnapshot,

@@ -77,6 +77,7 @@ const GOOD_PLAN: PlannedShape = {
     { id: "search", objective: "validate search", paths: ["src/resources/search.js"], dependsOn: [] },
   ],
   contracts: ["src/contracts/auth.js", "src/contracts/response.js"],
+  rationale: "one owner per resource over the two shared frozen seams",
 };
 
 const fixedPlan: PlanTransport = async () => GOOD_PLAN;
@@ -156,6 +157,15 @@ describe("planned Change round-trips through spec YAML with contracts + exports 
     ]);
     const reloadedOrders = reloaded.plan!.units.find((u) => u.id === "orders");
     expect(reloadedOrders?.dependsOn).toEqual(["users"]);
+
+    // The prompt summary and rationale ride the round-trip too (empty-safe): the
+    // deterministic prompt summary is present and multi-line, and the model's
+    // rationale survives verbatim, so the Worker-side planner detail can show
+    // what the planner was asked and why it decomposed as it did.
+    expect(result.change.plan?.promptSummary).toBeDefined();
+    expect(reloaded.plan!.promptSummary).toContain("Add input validation");
+    expect(reloaded.plan!.promptSummary).toContain("\n");
+    expect(reloaded.plan!.rationale).toBe("one owner per resource over the two shared frozen seams");
   });
 
   it("the plain heuristic decomposition (no planner injected) carries NO plan on the Change", async () => {
@@ -204,6 +214,11 @@ describe("planned Change round-trips through spec YAML with contracts + exports 
         "src/contracts/auth.js",
         "src/contracts/response.js",
       ]);
+      // The view also surfaces the prompt summary (deterministic, secret-free)
+      // and the model's rationale, so the planner detail panel can show them.
+      expect(view.plan!.promptSummary).toBeDefined();
+      expect(view.plan!.promptSummary).toContain("Add input validation");
+      expect(view.plan!.rationale).toBe("one owner per resource over the two shared frozen seams");
 
       // The graph model (fed the view as a ChangeStateSnapshot) roots a single
       // backed planner node and a goal -> planner edge.
@@ -212,6 +227,21 @@ describe("planned Change round-trips through spec YAML with contracts + exports 
       expect(planner).toHaveLength(1);
       expect(planner[0]?.id).toBe(plannerNodeId(change.id));
       expect(planner[0]?.backing.kind).toBe("planner");
+      // The planner node carries the inspectable plan detail the console renders:
+      // source, model, planned units with objectives, agent count, contracts.
+      const plannerDetail = planner[0]?.plannerDetail;
+      expect(plannerDetail).toBeDefined();
+      expect(plannerDetail!.source).toBe("planner");
+      expect(plannerDetail!.agentCount).toBe(4);
+      expect(plannerDetail!.units.map((u) => u.id).sort()).toEqual(
+        ["orders", "products", "search", "users"].sort(),
+      );
+      const detailUsers = plannerDetail!.units.find((u) => u.id === "users");
+      expect(detailUsers?.objective).toBe("validate users");
+      expect(plannerDetail!.promptSummary).toContain("Add input validation");
+      expect(plannerDetail!.rationale).toBe(
+        "one owner per resource over the two shared frozen seams",
+      );
       expect(
         model.edges.some(
           (e) => e.from === goalNodeId(change.id) && e.to === plannerNodeId(change.id),
@@ -276,6 +306,8 @@ describe("the graph emits a backed planner node between the goal and the agents"
         model: "gpt-4o-mini",
         units: ["users", "orders"],
         contracts: ["src/contracts/auth.js", "src/contracts/response.js"],
+        promptSummary: "Goal: validate every resource\n\nStructural module map: 2 module(s).",
+        rationale: "one owner per resource keeps the shared seams frozen",
       },
     };
   }
@@ -310,6 +342,56 @@ describe("the graph emits a backed planner node between the goal and the agents"
         ),
       ).toBe(false);
     }
+  });
+
+  it("exposes an inspectable plan detail on the planner node (source/model/units/objectives/contracts)", () => {
+    const model = buildWorkGraphModel(plannedSnapshot());
+    const planner = model.nodes.find((n) => n.kind === "planner");
+    expect(planner).toBeDefined();
+
+    const detail = planner!.plannerDetail;
+    expect(detail).toBeDefined();
+    expect(detail!.source).toBe("planner");
+    expect(detail!.model).toBe("gpt-4o-mini");
+    // The agent count equals the number of planned units.
+    expect(detail!.agentCount).toBe(2);
+    // The planned units carry their objectives, resolved from the Change's units.
+    expect(detail!.units.map((u) => u.id).sort()).toEqual(["orders", "users"]);
+    const users = detail!.units.find((u) => u.id === "users");
+    expect(users?.objective).toBe("validate users");
+    // The frozen contracts are carried on the detail.
+    expect([...detail!.contracts].sort()).toEqual([
+      "src/contracts/auth.js",
+      "src/contracts/response.js",
+    ]);
+    // The optional prompt summary and rationale are surfaced when present.
+    expect(detail!.promptSummary).toContain("validate every resource");
+    expect(detail!.rationale).toBe("one owner per resource keeps the shared seams frozen");
+  });
+
+  it("the heuristic-fallback planner node shows source=heuristic-fallback with its units", () => {
+    const fallback: ChangeStateSnapshot = {
+      ...plannedSnapshot(),
+      plan: {
+        source: "heuristic-fallback",
+        model: "",
+        units: ["users", "orders"],
+        contracts: [],
+      },
+    };
+    const model = buildWorkGraphModel(fallback);
+    const planner = model.nodes.find((n) => n.kind === "planner");
+    expect(planner).toBeDefined();
+    expect(planner!.backing.kind).toBe("planner");
+    const detail = planner!.plannerDetail;
+    expect(detail).toBeDefined();
+    expect(detail!.source).toBe("heuristic-fallback");
+    expect(detail!.model).toBe("");
+    expect(detail!.agentCount).toBe(2);
+    expect(detail!.units.map((u) => u.id).sort()).toEqual(["orders", "users"]);
+    // The fallback carried no prompt summary or rationale (empty-safe).
+    expect(detail!.promptSummary).toBeUndefined();
+    expect(detail!.rationale).toBeUndefined();
   });
 
   it("assertBacked throws for a planner node when no plan is recorded (no unbacked node)", () => {

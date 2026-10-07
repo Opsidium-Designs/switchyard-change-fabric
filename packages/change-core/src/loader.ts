@@ -159,7 +159,18 @@ function parsePlan(value: unknown, work: readonly WorkUnit[]): ChangePlan | unde
   const model = optionalString(value, "model") ?? "";
   const contracts = parseStringList(value["contracts"], "plan.contracts");
   const units = parsePlanUnits(value["units"], work);
-  return { source, model, units, contracts };
+  // The prompt summary and rationale are OPTIONAL and empty-safe: a plan without
+  // them still validates. Only a non-empty string is carried.
+  const promptSummary = optionalNonEmptyString(value, "prompt_summary");
+  const rationale = optionalNonEmptyString(value, "rationale");
+  return {
+    source,
+    model,
+    units,
+    contracts,
+    ...(promptSummary !== undefined ? { promptSummary } : {}),
+    ...(rationale !== undefined ? { rationale } : {}),
+  };
 }
 
 function parsePlanUnits(
@@ -339,4 +350,21 @@ function optionalNumber(obj: Record<string, unknown>, key: string): number | und
     throw new ChangeSpecError(`field ${key} must be a number when present`);
   }
   return value;
+}
+
+/**
+ * Read an optional string field, returning undefined when it is absent, null, or
+ * an empty/blank string. Used for the plan's optional, empty-safe explanatory
+ * fields (prompt summary, rationale) so a plan without them still validates and
+ * an empty one is treated as absent rather than carried as a blank.
+ */
+function optionalNonEmptyString(obj: Record<string, unknown>, key: string): string | undefined {
+  const value = obj[key];
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw new ChangeSpecError(`field ${key} must be a string when present`);
+  }
+  return value.trim() === "" ? undefined : value;
 }
