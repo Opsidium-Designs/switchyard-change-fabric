@@ -7,19 +7,21 @@
  * This is deliberately a SEPARATE transport from both the executor edit path and
  * the planner plan path. The executor posts a chat-completions body; the planner
  * posts a chat-completions body with a json_schema response_format. A decision
- * call instead posts to the gateway run endpoint (`/ai/run`) with the gateway
- * routing header `cf-aig-gateway-id` and a body of
+ * call instead posts to the NATIVE Cloudflare account run endpoint
+ * (`/accounts/<accountId>/ai/run`) with the gateway routing header
+ * `cf-aig-gateway-id` and a body of
  * `{ model: "typesafe/jev", input: { state, questions } }`, so routing a
  * decision through either of the other transports would break their body shape
  * or silently drop the decision contract. The decision call lives here with its
  * own body builder and parser.
  *
- * It reuses everything else from the other transports in spirit: the same
- * gateway URL and `cf-aig-authorization: Bearer <token>` header (NO provider
- * `authorization` header, so the raw provider key never lives here), the same
- * AbortController timeout pattern, and the same no-leak error drain. No
- * credential lives in this package at rest: the gateway token is held in the
- * closure only and is never logged or returned.
+ * It authenticates the account run endpoint with the account API token
+ * (`Authorization: Bearer <CLOUDFLARE_API_TOKEN>`) and routes through the gateway
+ * with `cf-aig-gateway-id`, so the gateway injects the stored provider key (BYOK)
+ * and no raw provider key lives here. It reuses the same AbortController timeout
+ * pattern and the same no-leak error drain as the other transports. No credential
+ * lives in this package at rest: the account token is held in the closure only
+ * and is never logged or returned.
  *
  * The transport is injectable (its `fetchFn` defaults to the global fetch) so a
  * test drives it with a deterministic fake and never touches the network, and
@@ -106,26 +108,35 @@ export type AskJev = (
   questions: JevQuestions,
 ) => Promise<Readonly<Record<string, JevAnswer>>>;
 
+/** The native Cloudflare account run API base the decision call posts under. */
+export const DEFAULT_CLOUDFLARE_API_BASE = "https://api.cloudflare.com/client/v4";
+
 /** Options for the live AI Gateway decision transport (holds the credential). */
 export interface AiGatewayJevOptions {
   /**
-   * The AI Gateway base URL (for example
-   * `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>`). The transport
-   * posts to the gateway run endpoint at this base; a trailing slash is tolerated.
+   * The Cloudflare account id. The decision call posts to the NATIVE account run
+   * endpoint `<apiBase>/accounts/<accountId>/ai/run`, so the URL is built from
+   * the account id, not from the gateway URL.
    */
-  readonly gatewayUrl: string;
+  readonly accountId: string;
   /**
-   * The Cloudflare AI Gateway credential, sent as `cf-aig-authorization: Bearer
-   * <token>`. This is NOT a raw provider key: the provider key lives in the
-   * Cloudflare account and the gateway injects it. Never logged or returned.
+   * The Cloudflare account API token, sent as `Authorization: Bearer <token>`.
+   * The native account run endpoint authenticates with the account API token
+   * (the gateway still injects the stored provider key via `cf-aig-gateway-id`
+   * routing). It is held in the closure only and is never logged or returned.
    */
-  readonly gatewayToken: string;
+  readonly apiToken: string;
   /**
-   * The gateway id (slug) the decision call routes to, sent as the
+   * The gateway id (slug) the decision call routes through, sent as the
    * `cf-aig-gateway-id` header. Derived from the gateway URL or supplied
    * explicitly by the caller (see `gatewaySlugFromUrl`).
    */
   readonly gatewayId: string;
+  /**
+   * An optional Cloudflare API base override (for tests), defaulting to the
+   * public `https://api.cloudflare.com/client/v4`. A trailing slash is tolerated.
+   */
+  readonly apiBase?: string;
   /** How long a single decision call may run before it is aborted, in ms. */
   readonly timeoutMs?: number;
   /** The maximum tokens the decision reply may use. */
@@ -159,22 +170,26 @@ export function gatewaySlugFromUrl(gatewayUrl: string): string {
 }
 
 /**
- * Build a live AI Gateway decision transport. It posts to the gateway run
- * endpoint with the gateway routing header, asking the decision model the
- * caller's questions over the state summary, and parses the typed answers. The
- * call is NON-STREAMING and bounded by a timeout via an AbortController, exactly
- * like the planner transport, so a hung call cannot wedge a decision juncture.
+ * Build a live AI Gateway decision transport. It posts to the NATIVE Cloudflare
+ * account run endpoint (`<apiBase>/accounts/<accountId>/ai/run`) with the account
+ * API token as `Authorization: Bearer <token>` and the gateway routing header
+ * `cf-aig-gateway-id`, asking the decision model the caller's questions over the
+ * state summary, and parses the typed answers. The call is NON-STREAMING and
+ * bounded by a timeout via an AbortController, exactly like the planner
+ * transport, so a hung call cannot wedge a decision juncture.
  */
 export function createAiGatewayJevInvoke(options: AiGatewayJevOptions): JevInvoke {
   const fetchFn = options.fetchFn ?? fetch;
-  const base = options.gatewayUrl.replace(/\/$/, "");
+  const apiBase = (options.apiBase ?? DEFAULT_CLOUDFLARE_API_BASE).replace(/\/+$/, "");
+  const accountId = options.accountId;
   const timeoutMs = options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS;
   const maxTokens = options.maxTokens ?? DEFAULT_JEV_MAX_TOKENS;
   return async (request: JevRequest): Promise<Readonly<Record<string, JevAnswer>>> => {
-    // Post to the gateway run endpoint root, NOT the OpenAI chat-completions
-    // path: the decision model is a typed-decision endpoint routed by the gateway
-    // id header, so its body shape and path differ from the executor/planner.
-    const url = `${base}/ai/run`;
+    // Post to the NATIVE account run endpoint, NOT the gateway URL or the OpenAI
+    // chat-completions path: the decision model is a typed-decision endpoint
+    // reached through the account run API and routed by the gateway id header,
+    // so its path, auth, and body differ from the executor/planner.
+    const url = `${apiBase}/accounts/${accountId}/ai/run`;
     const controller = timeoutMs > 0 ? new AbortController() : undefined;
     const timer =
       controller !== undefined ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
@@ -183,10 +198,10 @@ export function createAiGatewayJevInvoke(options: AiGatewayJevOptions): JevInvok
       res = await fetchFn(url, {
         method: "POST",
         headers: {
-          // The gateway credential, NOT a provider key. There is deliberately no
-          // provider `authorization` header: the gateway injects the stored
-          // provider key (BYOK), so the raw key never lives here.
-          "cf-aig-authorization": `Bearer ${options.gatewayToken}`,
+          // The account API token authenticates the native run endpoint. The
+          // gateway still injects the stored provider key (BYOK); this token is
+          // the account credential, held in the closure only and never logged.
+          Authorization: `Bearer ${options.apiToken}`,
           // The gateway routing header: which gateway this decision call runs
           // through, derived from the gateway URL or supplied as an env slug.
           "cf-aig-gateway-id": options.gatewayId,
@@ -242,8 +257,30 @@ export function createAiGatewayJevInvoke(options: AiGatewayJevOptions): JevInvok
         `AI Gateway returned a non-JSON response for the decision call (${DEFAULT_JEV_MODEL})`,
       );
     }
-    return parseJevAnswers(body);
+    // The native run response nests the inner run result TWO levels deep:
+    // `{ result: { state, result: { answers: { <name>: {...} } } } }`. Unwrap to
+    // the inner run result before parsing; tolerate a flatter `{ result: {...} }`
+    // or a bare body for the fake/offline path.
+    return parseJevAnswers(unwrapRunResult(body));
   };
+}
+
+/**
+ * Unwrap the native account run response to the object that carries the answers
+ * map. The working response nests the inner run result under
+ * `body.result.result` (with `body.result.state`), so prefer that; fall back to
+ * `body.result` and then the bare body so the fake/offline shapes still parse.
+ */
+function unwrapRunResult(body: unknown): unknown {
+  if (isRecord(body) && isRecord(body["result"])) {
+    const outer = body["result"] as Record<string, unknown>;
+    if (isRecord(outer["result"])) {
+      return outer["result"];
+    }
+    // A flatter `{ result: { answers: {...} } }` (or `{ result: { <key>: {...} } }`).
+    return outer;
+  }
+  return body;
 }
 
 /**

@@ -101,6 +101,7 @@ export type {
 } from "./jev.ts";
 export {
   createAiGatewayJevInvoke,
+  DEFAULT_CLOUDFLARE_API_BASE,
   DEFAULT_JEV_MAX_TOKENS,
   DEFAULT_JEV_MODEL,
   gatewaySlugFromUrl,

@@ -19,6 +19,7 @@ import {
   type DecomposeResult,
   type GoalAnalyzer,
   type JevTransport,
+  type PlanDiagnostic,
   type PlanTransport,
   type RecordedPlan,
   type WorkGraph,
@@ -72,6 +73,14 @@ export interface PlannerInjection {
   readonly jev?: JevTransport;
   /** The accept-when-confident threshold for the plan-review juncture (default 0.75). */
   readonly jevThreshold?: number;
+  /**
+   * An optional diagnostic sink. When present, the planner pass reports WHY each
+   * ladder model failed (a transport error or a specific validatePlan rejection,
+   * per model), so a live run can surface the cause of a heuristic fall-back
+   * rather than silently discarding it. It carries no credential and does not
+   * change the pass's control flow.
+   */
+  readonly onDiagnostic?: (diagnostic: PlanDiagnostic) => void;
 }
 
 /** The outcome of decomposing a goal: the Change, its graph, and the intent. */
@@ -109,6 +118,9 @@ export async function decomposeGoal(options: DecomposeGoalOptions): Promise<Deco
       ...(options.planner.jev ? { jev: options.planner.jev } : {}),
       ...(options.planner.jevThreshold !== undefined
         ? { jevThreshold: options.planner.jevThreshold }
+        : {}),
+      ...(options.planner.onDiagnostic
+        ? { onDiagnostic: options.planner.onDiagnostic }
         : {}),
       ...(options.changeId ? { changeId: options.changeId } : {}),
     });

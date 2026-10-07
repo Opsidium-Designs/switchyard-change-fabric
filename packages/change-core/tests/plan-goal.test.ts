@@ -19,6 +19,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildPlannerMessages,
   planGoal,
   validatePlan,
   type PlannedShape,
@@ -296,6 +297,105 @@ describe("planGoal: schema-constrained planner over the structural backbone", ()
     });
     expect(result.plan.source).toBe("heuristic-fallback");
     expect(result.change.work.length).toBeGreaterThan(0);
+  });
+
+  it("records NO diagnostics when the first model's plan is accepted (source 'planner')", async () => {
+    const result = await planGoal({
+      goal: GOAL,
+      repo: SERVICE_REPO,
+      plan: fixedPlan(GOOD_PLAN),
+      baseModel: "gpt-4o-mini",
+    });
+    expect(result.plan.source).toBe("planner");
+    expect(result.diagnostics).toEqual([]);
+  });
+
+  it("surfaces the SPECIFIC validatePlan rejection reason per model (why it fell back), via result + sink", async () => {
+    // A plan that lets a unit OWN a frozen contract: the exact rejection the
+    // debugger named as the most-likely live cause for the service-api goal
+    // ("require auth" tempts a unit onto src/contracts/auth.js).
+    const ownsContract: PlannedShape = {
+      units: [
+        { id: "auth", objective: "rewrite the auth contract", paths: ["src/contracts/auth.js"], dependsOn: [] },
+      ],
+      contracts: ["src/contracts/auth.js", "src/contracts/response.js"],
+    };
+    const seen: { model: string; kind: string; reason: string }[] = [];
+    const result = await planGoal({
+      goal: GOAL,
+      repo: SERVICE_REPO,
+      plan: fixedPlan(ownsContract),
+      baseModel: "gpt-4o-mini",
+      escalationModels: ["gpt-4o"],
+      onDiagnostic: (d) => seen.push({ model: d.model, kind: d.kind, reason: d.reason }),
+    });
+    // It still falls back honestly on a genuinely invalid plan.
+    expect(result.plan.source).toBe("heuristic-fallback");
+    // Both ladder models reported the SAME specific reason: a unit owning a
+    // frozen contract. The reason is on the result's diagnostics AND streamed to
+    // the sink, so a live run can pin the cause rather than guessing.
+    expect(result.diagnostics).toHaveLength(2);
+    expect(result.diagnostics.map((d) => d.model)).toEqual(["gpt-4o-mini", "gpt-4o"]);
+    for (const d of result.diagnostics) {
+      expect(d.kind).toBe("validation-rejected");
+      expect(d.reason).toContain("owns frozen contract src/contracts/auth.js");
+    }
+    expect(seen).toEqual(result.diagnostics.map((d) => ({ model: d.model, kind: d.kind, reason: d.reason })));
+  });
+
+  it("surfaces a transport-error diagnostic (not a validation reject) when the model throws", async () => {
+    const throwing: PlanTransport = async () => {
+      throw new Error("gateway rejected json_schema strict:true");
+    };
+    const result = await planGoal({
+      goal: GOAL,
+      repo: SERVICE_REPO,
+      plan: throwing,
+      baseModel: "gpt-4o-mini",
+    });
+    expect(result.plan.source).toBe("heuristic-fallback");
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0]?.kind).toBe("transport-error");
+    expect(result.diagnostics[0]?.reason).toContain("gateway rejected json_schema");
+  });
+
+  it("accepts a valid escalation plan after a rejected base plan, recording only the base rejection", async () => {
+    const badBase: PlannedShape = {
+      units: [{ id: "ghost", objective: "bad", paths: ["src/resources/ghost.js"], dependsOn: [] }],
+      contracts: [],
+    };
+    const result = await planGoal({
+      goal: GOAL,
+      repo: SERVICE_REPO,
+      plan: perModelPlan("gpt-4o-mini", badBase, GOOD_PLAN),
+      baseModel: "gpt-4o-mini",
+      escalationModels: ["gpt-4o"],
+    });
+    // The escalation model's plan was accepted (planner, not fallback).
+    expect(result.plan.source).toBe("planner");
+    expect(result.plan.model).toBe("gpt-4o");
+    // Only the base model's rejection was recorded; the accepted model recorded none.
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0]?.model).toBe("gpt-4o-mini");
+    expect(result.diagnostics[0]?.kind).toBe("validation-rejected");
+    expect(result.diagnostics[0]?.reason).toContain("unknown path src/resources/ghost.js");
+  });
+
+  it("the planner prompt enumerates the exact frozen-contract paths and the honor-not-rewrite rule", () => {
+    // The service-api-like repo has two frozen seams; the tightened system
+    // prompt names them verbatim and states that 'require auth' is satisfied by
+    // CALLING the frozen contract, so the model is not driven to own a seam
+    // (the live rejection the debugger pinned). This is a deterministic unit
+    // check of the prompt the live planner is handed.
+    const snap = buildRepoSnapshot(SERVICE_REPO);
+    const bp = deriveCohesionBlueprint(snap);
+    const messages = buildPlannerMessages(GOAL, snap, bp);
+    const system = messages.find((m) => m.role === "system")?.content ?? "";
+    expect(system).toContain("src/contracts/auth.js");
+    expect(system).toContain("src/contracts/response.js");
+    expect(system).toContain("VERBATIM");
+    expect(system).toContain("CALLING");
+    expect(system).toContain("HONOR the frozen contracts");
   });
 });
 

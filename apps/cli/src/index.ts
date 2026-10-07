@@ -870,6 +870,14 @@ function plannerInjectionFromEnv(): PlannerInjection | undefined {
       ? { escalationModels: selected.escalationModels }
       : {}),
     ...(jev.live && jev.ask ? { jev: jev.ask, jevThreshold: jev.threshold } : {}),
+    // Surface WHY each ladder model failed on a live run, so a fall-back to the
+    // heuristic reports the specific cause (a transport error or a validatePlan
+    // rejection) rather than being silent. The message carries no credential.
+    onDiagnostic: (diagnostic) => {
+      console.error(
+        `planner: model ${diagnostic.model} ${diagnostic.kind}: ${diagnostic.reason}`,
+      );
+    },
   };
 }
 

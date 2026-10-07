@@ -589,11 +589,23 @@ describe("selectJev gating: the decision layer is off by default (heuristic + de
     expect(selectJev({ EXECUTOR: "ai-gateway" }).live).toBe(false);
   });
 
-  it("is live for ai-gateway with gateway credentials, deriving the gateway id from the URL", () => {
+  it("is not live for ai-gateway with gateway but WITHOUT account credentials (native /ai/run needs them)", () => {
     const jev = selectJev({
       EXECUTOR: "ai-gateway",
       CLOUDFLARE_AI_GATEWAY_URL: "https://gateway.ai.cloudflare.com/v1/acct/my-gateway",
       CLOUDFLARE_AI_GATEWAY_TOKEN: "t",
+    });
+    expect(jev.live).toBe(false);
+    expect(jev.ask).toBeUndefined();
+  });
+
+  it("is live for ai-gateway with gateway + account credentials, deriving the gateway id from the URL", () => {
+    const jev = selectJev({
+      EXECUTOR: "ai-gateway",
+      CLOUDFLARE_AI_GATEWAY_URL: "https://gateway.ai.cloudflare.com/v1/acct/my-gateway",
+      CLOUDFLARE_AI_GATEWAY_TOKEN: "t",
+      CLOUDFLARE_ACCOUNT_ID: "acct-123",
+      CLOUDFLARE_API_TOKEN: "account-token",
     });
     expect(jev.live).toBe(true);
     expect(typeof jev.ask).toBe("function");

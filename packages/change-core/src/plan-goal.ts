@@ -205,12 +205,45 @@ export interface PlanGoalOptions {
    * escalates. Defaults to 0.75 when a Jev transport is injected without one.
    */
   readonly jevThreshold?: number;
+  /**
+   * An optional diagnostic sink. When present, the pass reports WHY each ladder
+   * model failed: a transport/schema error (the thrown message) or a reality
+   * rejection (the validatePlan reason), per model, so a live run can surface
+   * the specific cause of a fall-back rather than silently discarding it. It is
+   * never fed a credential (only the model id and a shape/validation message),
+   * and the pass behaves identically whether or not it is provided.
+   */
+  readonly onDiagnostic?: (diagnostic: PlanDiagnostic) => void;
+}
+
+/**
+ * One recorded reason a ladder model did not yield an accepted plan: either a
+ * thrown transport/schema error or a reality-check rejection, named with the
+ * model it came from. Collected onto the result's `diagnostics` and optionally
+ * streamed through `onDiagnostic`, so the cause of a heuristic fall-back is
+ * observable. It carries no credential.
+ */
+export interface PlanDiagnostic {
+  /** The model id the attempt ran on. */
+  readonly model: string;
+  /** Whether the attempt threw in transport/parse, or was rejected by validatePlan. */
+  readonly kind: "transport-error" | "validation-rejected";
+  /** The thrown error message or the validatePlan rejection reason (no secrets). */
+  readonly reason: string;
 }
 
 /** The result of a plan pass: a decomposition plus the recorded plan. */
 export interface PlanGoalResult extends DecomposeResult {
   /** The recorded plan that drove the Change (planner or heuristic fallback). */
   readonly plan: RecordedPlan;
+  /**
+   * The per-model reasons the ladder did not accept a plan, in attempt order.
+   * Empty when the first model's plan was accepted; populated when a model threw
+   * or was rejected (so a run can report WHY it fell back to the heuristic). It
+   * carries no credential. Always present (possibly empty) so a caller can read
+   * it without a guard.
+   */
+  readonly diagnostics: readonly PlanDiagnostic[];
 }
 
 /**
@@ -248,32 +281,53 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
   // Jev escalated rather than accepted. Null until a valid plan is reviewed.
   let escalatedCandidate: PlanGoalResult | null = null;
 
+  // The per-model reasons the ladder did not accept a plan, collected in attempt
+  // order so a run can report WHY it fell back. Recording is diagnostic only; the
+  // control flow is identical to before.
+  const diagnostics: PlanDiagnostic[] = [];
+  const record = (diagnostic: PlanDiagnostic): void => {
+    diagnostics.push(diagnostic);
+    options.onDiagnostic?.(diagnostic);
+  };
+
   for (const model of ladder) {
     let proposed: PlannedShape;
     try {
       proposed = await options.plan({ model, messages });
-    } catch {
-      // A transport/schema error on this model: try the next model in the
-      // ordered ladder rather than failing the whole pass.
+    } catch (error) {
+      // A transport/schema error on this model: record WHY, then try the next
+      // model in the ordered ladder rather than failing the whole pass. The
+      // message is the thrown error's text (no credential), so a live run can
+      // distinguish a transport error from a validation rejection.
+      record({
+        model,
+        kind: "transport-error",
+        reason: error instanceof Error ? error.message : String(error),
+      });
       continue;
     }
     const validation = validatePlan(proposed, snapshot, blueprint);
     if (!validation.ok) {
       // A schema-conforming but unreal plan (invented path, a unit owning a
-      // contract, a bad dependency): escalate to the next model.
+      // contract, a bad dependency): record the specific rejection reason, then
+      // escalate to the next model.
+      record({ model, kind: "validation-rejected", reason: validation.reason });
       continue;
     }
-    const projected = projectPlanToChange({
-      plan: validation.plan,
-      snapshot,
-      model,
-      changeId: options.changeId,
-      goal: options.goal,
-      budgetUsd: options.budgetUsd,
-      assurance: options.assurance,
-      promptSummary,
-      ...(proposed.rationale !== undefined ? { rationale: proposed.rationale } : {}),
-    });
+    const projected = withDiagnostics(
+      projectPlanToChange({
+        plan: validation.plan,
+        snapshot,
+        model,
+        changeId: options.changeId,
+        goal: options.goal,
+        budgetUsd: options.budgetUsd,
+        assurance: options.assurance,
+        promptSummary,
+        ...(proposed.rationale !== undefined ? { rationale: proposed.rationale } : {}),
+      }),
+      diagnostics,
+    );
 
     // The PLAN-REVIEW juncture: when a Jev transport is injected, ask whether
     // the projected plan covers the goal (a noul). A confident-yes at or above
@@ -314,7 +368,15 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
   // The ladder is exhausted with no usable plan: fall back to the deterministic
   // heuristic decomposition so the run proceeds with an honest, backbone-true
   // Change rather than a broken plan.
-  return heuristicFallback(options, snapshot);
+  return withDiagnostics(heuristicFallback(options, snapshot), diagnostics);
+}
+
+/** Attach the collected per-model diagnostics onto a plan result. */
+function withDiagnostics(
+  result: PlanGoalResult,
+  diagnostics: readonly PlanDiagnostic[],
+): PlanGoalResult {
+  return { ...result, diagnostics: [...diagnostics] };
 }
 
 /**
@@ -562,6 +624,9 @@ function projectPlanToChange(input: {
     snapshot,
     ...(blueprint ? { blueprint } : {}),
     plan: recordedPlan,
+    // Default empty: the loop replaces this with the collected diagnostics via
+    // withDiagnostics so a reader always has the field present.
+    diagnostics: [],
   };
 }
 
@@ -600,7 +665,7 @@ function heuristicFallback(
   // is honest about being the heuristic fallback. The plain offline path (no
   // planner injected) never enters this module, so it still carries no plan.
   const change: Change = { ...result.change, plan: recordedPlan };
-  return { ...result, change, plan: recordedPlan };
+  return { ...result, change, plan: recordedPlan, diagnostics: [] };
 }
 
 /**
@@ -617,13 +682,28 @@ export function buildPlannerMessages(
   blueprint: CohesionBlueprint | undefined,
 ): readonly { readonly role: "system" | "user"; readonly content: string }[] {
   const structure = structuralMap(snapshot, blueprint);
+  // The exact frozen-contract paths the plan MUST copy verbatim into contracts
+  // and MUST NOT place on any unit. Enumerated here so the model is never tempted
+  // to let a unit own a seam (which validatePlan rejects) or to omit/rename one.
+  const frozenPaths = (blueprint?.contracts ?? []).map((c) => c.path);
+  const frozenRules =
+    frozenPaths.length > 0
+      ? [
+          `- The frozen contracts are EXACTLY these read-only seam paths: ${frozenPaths.join(", ")}.`,
+          "- Copy every one of those paths VERBATIM into the top-level contracts array, and list no other path there.",
+          "- NO unit may own, edit, or list a frozen contract path. If the goal asks to 'require auth' or similar, a unit SATISFIES it by CALLING the exported function from the frozen contract (for example requireAuth), never by owning or rewriting the contract. The resources HONOR the frozen contracts, they do not rewrite them.",
+        ]
+      : [
+          "- There are no frozen contracts in this repository; the contracts array is empty.",
+        ];
   const system = [
     "You are a planner that decomposes a software goal into a work plan over a REAL repository.",
     "You are given the goal and a structural map of the repository: its modules, each module's files and exported symbols, the shared frozen contracts, and the import-graph dependency edges.",
     "Decide which modules are in scope, one objective per unit, how many units, and the dependency order WITHIN the real structure.",
+    "Use the EXACT module file paths from the structural map verbatim; never paraphrase, normalize, or invent a path.",
     "Hard rules you must obey:",
-    "- Every path you put on a unit MUST be a real source file path from the structural map. Never invent a path.",
-    "- The frozen contracts are read-only. No unit may own a contract path. List the frozen contract paths under contracts.",
+    "- Every path you put on a unit MUST be a real source file path copied verbatim from the structural map. Never invent a path.",
+    ...frozenRules,
     "- Each real source file is owned by at most one unit (single writer).",
     "- A unit's dependsOn must reference other unit ids in your plan, following the import order in the structural map.",
     "Return only the plan object the schema describes.",

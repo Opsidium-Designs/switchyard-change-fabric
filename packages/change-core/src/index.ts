@@ -67,6 +67,7 @@ export { decompose, decomposeToChange } from "./decompose.ts";
 export type {
   PlannedShape,
   PlannedUnit,
+  PlanDiagnostic,
   PlanGoalOptions,
   PlanGoalResult,
   PlanReviewDecision,

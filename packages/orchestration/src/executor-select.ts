@@ -363,18 +363,19 @@ export interface SelectedJev {
  * Select the Jev typed-decision layer from the environment, independently of the
  * executor and the planner. It is live ONLY for EXECUTOR=ai-gateway with gateway
  * credentials present (exactly like selectPlanner): it builds the decision
- * transport over the same gateway URL and token the executor uses, routing by
- * the gateway id read from CF_AIG_GATEWAY_ID (falling back to the slug derived
- * from CLOUDFLARE_AI_GATEWAY_URL), and reads the accept-when-confident threshold
- * from JEV_CONFIDENCE_THRESHOLD (default 0.75, clamped to [0, 1]).
+ * transport over the NATIVE account run endpoint, sourcing the account id from
+ * CLOUDFLARE_ACCOUNT_ID and the account API token from CLOUDFLARE_API_TOKEN, and
+ * routing by the gateway id read from CF_AIG_GATEWAY_ID (falling back to the slug
+ * derived from CLOUDFLARE_AI_GATEWAY_URL). It reads the accept-when-confident
+ * threshold from JEV_CONFIDENCE_THRESHOLD (default 0.75, clamped to [0, 1]).
  *
  * For any other EXECUTOR (or an unset one, the noop/offline path), it is NOT
  * live: the caller runs no decision juncture, so Jev is simply absent and the
  * heuristic + mechanical-gate path is unchanged, keeping `make check`, the demo,
- * and the anti-puppet substrate offline and deterministic. Missing gateway
- * credentials under EXECUTOR=ai-gateway also yield a non-live Jev here (the
- * executor selection surfaces that misconfig as an error), so Jev never attempts
- * an unauthenticated network call.
+ * and the anti-puppet substrate offline and deterministic. Missing gateway or
+ * account credentials under EXECUTOR=ai-gateway also yield a non-live Jev here
+ * (the executor selection surfaces that misconfig as an error), so Jev never
+ * attempts an unauthenticated network call.
  */
 export function selectJev(env: ExecutorEnv = process.env): SelectedJev {
   const threshold = parseConfidenceThreshold(
@@ -390,6 +391,14 @@ export function selectJev(env: ExecutorEnv = process.env): SelectedJev {
   if (gatewayUrl === "" || gatewayToken === "") {
     return { live: false, description: "jev off (gateway credentials absent)", threshold };
   }
+  // The decision call posts to the NATIVE account run endpoint, so it needs the
+  // account id and the account API token in addition to the gateway routing id.
+  // Without them Jev is not live rather than posting an unauthenticated call.
+  const accountId = (env.CLOUDFLARE_ACCOUNT_ID ?? "").trim();
+  const apiToken = (env.CLOUDFLARE_API_TOKEN ?? "").trim();
+  if (accountId === "" || apiToken === "") {
+    return { live: false, description: "jev off (account credentials absent)", threshold };
+  }
   // The gateway id routes the decision call: prefer the explicit env slug, else
   // derive it from the gateway URL. When neither yields a slug, Jev is not live
   // rather than posting without a routing header.
@@ -397,7 +406,7 @@ export function selectJev(env: ExecutorEnv = process.env): SelectedJev {
   if (gatewayId === "") {
     return { live: false, description: "jev off (no gateway id)", threshold };
   }
-  const invoke = createAiGatewayJevInvoke({ gatewayUrl, gatewayToken, gatewayId });
+  const invoke = createAiGatewayJevInvoke({ accountId, apiToken, gatewayId });
   const ask: AskJev = (state, questions) => invoke({ state, questions });
   return {
     live: true,
