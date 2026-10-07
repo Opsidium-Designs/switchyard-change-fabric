@@ -154,6 +154,11 @@ export { formatDoctorReport, runDoctor } from "./doctor.ts";
 
 export type { ExecutorEnv, SelectedExecutor, SelectedPlanner, PlanTransport } from "./executor-select.ts";
 export { DEFAULT_WORKERS_AI_ESCALATION_MODEL, selectExecutor, selectPlanner } from "./executor-select.ts";
+export {
+  DEFAULT_JEV_CONFIDENCE_THRESHOLD,
+  selectJev,
+} from "./executor-select.ts";
+export type { SelectedJev } from "./executor-select.ts";
 
 export type { AppGateWiring, AppGateWiringInput } from "./app-gate-wiring.ts";
 export {

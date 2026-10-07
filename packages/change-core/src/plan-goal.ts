@@ -76,6 +76,54 @@ export type PlanTransport = (request: {
 /** How the recorded plan was produced, so a later stage can back a planner node. */
 export type PlanSource = "planner" | "heuristic-fallback";
 
+/**
+ * The typed-decision transport the plan-review juncture calls. It is the exact
+ * shape of the model-adapters `AskJev`, declared here so change-core carries no
+ * dependency on the adapter package: a caller injects a concrete transport (the
+ * live gateway decision call, or a deterministic fake in tests). When it is
+ * absent the plan-review juncture is skipped entirely, so the offline path is
+ * unchanged.
+ */
+export type JevTransport = (
+  state: string,
+  questions: readonly {
+    readonly key: string;
+    readonly type: "noul" | "choice" | "score";
+    readonly question: string;
+    readonly options?: readonly string[];
+  }[],
+) => Promise<
+  Readonly<
+    Record<
+      string,
+      {
+        readonly type: "noul" | "choice" | "score";
+        readonly noul?: "yes" | "no" | "unsure";
+        readonly choice?: string;
+        readonly score?: number;
+        readonly confidence: number;
+        readonly probabilities?: Readonly<Record<string, number>>;
+      }
+    >
+  >
+>;
+
+/**
+ * The recorded plan-review decision the plan-review juncture produced, carried
+ * on the RecordedPlan so a later stage can post it as a JevDecision and back a
+ * jev graph node. It names the question asked, the typed noul answer, the
+ * calibrated confidence, and whether the plan was ACCEPTED (confident-yes at or
+ * above the threshold) or ESCALATED (low-confidence or confident-no). Present
+ * only when a Jev transport was injected and ran; absent on the offline path.
+ */
+export interface PlanReviewDecision {
+  readonly question: string;
+  readonly noul: "yes" | "no" | "unsure";
+  readonly confidence: number;
+  readonly accepted: boolean;
+  readonly probabilities?: Readonly<Record<string, number>>;
+}
+
 /** The recorded plan: the shape that drove the Change, plus its provenance. */
 export interface RecordedPlan {
   /** Whether the inference planner produced this plan, or the heuristic fallback did. */
@@ -104,6 +152,15 @@ export interface RecordedPlan {
    * planner detail panel.
    */
   readonly rationale?: string;
+  /**
+   * The recorded plan-review decision, present only when a Jev transport was
+   * injected and the plan-review juncture ran. It names whether Jev judged the
+   * plan to cover the goal (confident-yes -> accepted) or not (low-confidence or
+   * confident-no -> escalated), so a later stage can post it as a JevDecision and
+   * root a jev graph node near the planner. Absent on the offline path (no Jev
+   * injected), so that path records nothing new.
+   */
+  readonly jevReview?: PlanReviewDecision;
 }
 
 /** Options for an inference-backed, schema-constrained plan pass. */
@@ -128,6 +185,22 @@ export interface PlanGoalOptions {
   readonly budgetUsd?: number;
   /** Assurance level to record. Defaults to "standard". */
   readonly assurance?: AssuranceLevel;
+  /**
+   * The injected typed-decision transport for the plan-review juncture. When
+   * present, after a valid plan is projected the pass asks Jev whether the plan
+   * covers the goal (a noul). A confident-yes at or above `jevThreshold` is
+   * ACCEPTED and the plan proceeds; a low-confidence or confident-no answer is
+   * ESCALATED, which re-runs the bounded model ladder once more for a fresh plan
+   * and records the escalation. When absent (the default, offline path) the
+   * juncture is skipped entirely, so the plan path is unchanged.
+   */
+  readonly jev?: JevTransport;
+  /**
+   * The accept-when-confident threshold in [0, 1] for the plan-review juncture.
+   * An answer whose confidence is at or above it is used; below it the juncture
+   * escalates. Defaults to 0.75 when a Jev transport is injected without one.
+   */
+  readonly jevThreshold?: number;
 }
 
 /** The result of a plan pass: a decomposition plus the recorded plan. */
@@ -161,6 +234,16 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
   // planner plan always carries it and no credential can leak into it.
   const promptSummary = summarizePlannerPrompt(options.goal, snapshot, blueprint);
 
+  // The plan-review juncture threshold (accept-when-confident). Only used when a
+  // Jev transport is injected; defaults to 0.75 to match the orchestration env.
+  const jevThreshold =
+    options.jevThreshold !== undefined ? options.jevThreshold : 0.75;
+  // The last valid projected plan carrying an ESCALATED plan-review decision,
+  // kept so that when the bounded ladder yields no confident-yes plan the run
+  // still proceeds with the best plan it got (plans never block), recording that
+  // Jev escalated rather than accepted. Null until a valid plan is reviewed.
+  let escalatedCandidate: PlanGoalResult | null = null;
+
   for (const model of ladder) {
     let proposed: PlannedShape;
     try {
@@ -187,13 +270,119 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
       promptSummary,
       ...(proposed.rationale !== undefined ? { rationale: proposed.rationale } : {}),
     });
+
+    // The PLAN-REVIEW juncture: when a Jev transport is injected, ask whether
+    // the projected plan covers the goal (a noul). A confident-yes at or above
+    // the threshold is ACCEPTED and the plan proceeds; a low-confidence or
+    // confident-no answer is ESCALATED, so the bounded ladder tries the next
+    // model for a better plan. When no later model yields an accepted plan, the
+    // last escalated candidate still proceeds (plans never block), recording the
+    // escalation honestly. When no Jev transport is injected the juncture is
+    // skipped and the first valid plan proceeds exactly as before.
+    if (options.jev) {
+      const review = await reviewPlan(
+        options.jev,
+        options.goal,
+        validation.plan,
+        promptSummary,
+        jevThreshold,
+      );
+      const withReview: PlanGoalResult = review
+        ? attachJevReview(projected, review)
+        : projected;
+      if (!review || review.accepted) {
+        return withReview;
+      }
+      // Escalated: remember this candidate and try the next model in the ladder.
+      escalatedCandidate = withReview;
+      continue;
+    }
+
     return projected;
+  }
+
+  // A Jev-reviewed run that never got a confident-yes plan still proceeds with
+  // the last valid (escalated) candidate rather than discarding a usable plan.
+  if (escalatedCandidate) {
+    return escalatedCandidate;
   }
 
   // The ladder is exhausted with no usable plan: fall back to the deterministic
   // heuristic decomposition so the run proceeds with an honest, backbone-true
   // Change rather than a broken plan.
   return heuristicFallback(options, snapshot);
+}
+
+/**
+ * The plan-review juncture: ask the injected typed-decision transport whether a
+ * projected plan covers the goal (a noul question), and classify the answer as
+ * ACCEPTED (confident-yes at or above the threshold) or ESCALATED (low-confidence
+ * or confident-no). Returns the recorded decision, or null when the transport
+ * throws (a transport error must not fail the whole plan pass; the plan simply
+ * proceeds unreviewed). The state summary is the readable prompt summary plus the
+ * planned unit ids, so it is secret-free and deterministic given its inputs.
+ */
+async function reviewPlan(
+  jev: JevTransport,
+  goal: string,
+  plan: PlannedShape,
+  promptSummary: string,
+  threshold: number,
+): Promise<PlanReviewDecision | null> {
+  const question = "Does this plan cover the goal?";
+  const state = [
+    `Goal: ${goal}`,
+    "",
+    promptSummary,
+    "",
+    `Planned units: ${plan.units.map((unit) => unit.id).join(", ") || "(none)"}`,
+    `Frozen contracts: ${plan.contracts.join(", ") || "(none)"}`,
+  ].join("\n");
+  let answers: Awaited<ReturnType<JevTransport>>;
+  try {
+    answers = await jev(state, [{ key: "plan-review", type: "noul", question }]);
+  } catch {
+    return null;
+  }
+  const answer = answers["plan-review"];
+  if (!answer || answer.type !== "noul" || answer.noul === undefined) {
+    return null;
+  }
+  const confident = answer.confidence >= threshold;
+  // Accepted only when the plan is a CONFIDENT YES. A confident "no", an
+  // "unsure", or any low-confidence answer escalates.
+  const accepted = confident && answer.noul === "yes";
+  return {
+    question,
+    noul: answer.noul,
+    confidence: answer.confidence,
+    accepted,
+    ...(answer.probabilities !== undefined ? { probabilities: answer.probabilities } : {}),
+  };
+}
+
+/** Carry a recorded plan-review decision onto a plan result's RecordedPlan. */
+function attachJevReview(result: PlanGoalResult, review: PlanReviewDecision): PlanGoalResult {
+  const plan: RecordedPlan = { ...result.plan, jevReview: review };
+  const change: Change = { ...result.change, plan: toChangePlan(plan, result.change) };
+  return { ...result, change, plan };
+}
+
+/**
+ * Project the RecordedPlan onto the Change's ChangePlan field, carrying the
+ * plan-review decision through so it survives the spec round-trip. The ChangePlan
+ * is the structural twin of RecordedPlan, so the fields assign directly; the
+ * jevReview is carried on the ChangePlan too so the state views can expose it.
+ */
+function toChangePlan(plan: RecordedPlan, change: Change): Change["plan"] {
+  const existing = change.plan;
+  if (!existing) {
+    return undefined;
+  }
+  return {
+    ...existing,
+    ...(plan.jevReview !== undefined ? { jevReview: plan.jevReview } : {}),
+  };
 }
 
 /** Whether a validated plan is usable, or why it is not. */

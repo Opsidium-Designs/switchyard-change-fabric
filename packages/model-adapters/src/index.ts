@@ -88,3 +88,21 @@ export {
   PLANNER_PLAN_SCHEMA_NAME,
   PlannerResponseError,
 } from "./planner.ts";
+
+export type {
+  AiGatewayJevOptions,
+  AskJev,
+  JevAnswer,
+  JevAnswerType,
+  JevInvoke,
+  JevQuestion,
+  JevRequest,
+} from "./jev.ts";
+export {
+  createAiGatewayJevInvoke,
+  DEFAULT_JEV_MAX_TOKENS,
+  DEFAULT_JEV_MODEL,
+  gatewaySlugFromUrl,
+  JevResponseError,
+  parseJevAnswers,
+} from "./jev.ts";

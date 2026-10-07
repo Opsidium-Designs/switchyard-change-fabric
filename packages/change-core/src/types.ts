@@ -99,6 +99,29 @@ export interface ChangePlan {
    * explanatory and surfaced in the console's planner detail panel.
    */
   readonly rationale?: string;
+  /**
+   * The recorded plan-review decision from the Jev typed-decision layer, present
+   * only when a decision model reviewed the plan. It names whether Jev judged the
+   * plan to cover the goal (accepted vs escalated), so the console and the graph
+   * can root a jev node near the planner. Optional and empty-safe: absent on a
+   * hand-authored or heuristic plan, or when no decision model was configured.
+   */
+  readonly jevReview?: ChangePlanReview;
+}
+
+/**
+ * A recorded plan-review decision carried on a Change's ChangePlan: the typed
+ * noul verdict the Jev decision layer returned for "does this plan cover the
+ * goal?", its calibrated confidence, and whether the plan was accepted or
+ * escalated. The structural twin of the planner pass's PlanReviewDecision,
+ * declared here so the core type carries no dependency on the planner module.
+ */
+export interface ChangePlanReview {
+  readonly question: string;
+  readonly noul: "yes" | "no" | "unsure";
+  readonly confidence: number;
+  readonly accepted: boolean;
+  readonly probabilities?: Readonly<Record<string, number>>;
 }
 
 /** One owned module carried on a Change: exactly one WorkUnit writes its file(s). */

@@ -9,6 +9,7 @@ import {
   type UnitDetailSnapshot,
   type NodeBacking,
   type PlannerDetailSnapshot,
+  type JevDetailSnapshot,
   type WorkGraphModel,
 } from "@switchyard-change/orchestration/graph-model";
 
@@ -645,6 +646,8 @@ function Legend() {
       {/* A retry node is the SAME hexagon shape in a different color (the
           smarter-model re-attempt). */}
       <li><span className="swatch-hex sw-retry" aria-hidden="true" /> retry</li>
+      {/* A jev node is a PENTAGON (a typed-decision beat at a juncture). */}
+      <li><span className="swatch-pentagon sw-jev" aria-hidden="true" /> jev</li>
       {/* A tool is a YELLOW SQUARE. */}
       <li><span className="swatch-square sw-tool" aria-hidden="true" /> tool</li>
       {/* The rendered edge vocabulary is exactly these three kinds. */}
@@ -795,6 +798,10 @@ export function NodeDetail({
 
       {node.kind === "planner" && node.plannerDetail ? (
         <PlannerDetail detail={node.plannerDetail} />
+      ) : null}
+
+      {node.kind === "jev" && node.jevDetail ? (
+        <JevDetail detail={node.jevDetail} />
       ) : null}
 
       {backing.kind === "verify-attempt" || backing.kind === "retry-attempt" ? (
@@ -1009,6 +1016,92 @@ function PlannerDetail({ detail }: { detail: PlannerDetailSnapshot }) {
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+/**
+ * The Jev decision detail panel: the real recorded typed decision the `jev` node
+ * stands for, read straight from the node's jevDetail (derived from the recorded
+ * decision, never synthesized). It shows:
+ *
+ *   - JUNCTURE: plan-review ("does this plan cover the goal?"), attribution
+ *     ("which module(s) does this failure implicate?"), or fix-confidence ("is
+ *     this fix acceptable?"). A fix-confidence decision is advisory ONLY: it is a
+ *     recorded confidence signal and never changed the authoritative mechanical
+ *     gate verdict or the promote/deploy decision.
+ *   - QUESTION: the exact question the decision model answered.
+ *   - TYPED ANSWER: the noul verdict, the chosen option, or the score, by kind.
+ *   - CALIBRATED CONFIDENCE: the model's confidence in [0, 1], and any per
+ *     outcome probabilities it returned.
+ *   - ACCEPTED or ESCALATED: whether the engine confidently used the answer, or
+ *     escalated because it was low-confidence or a confident "no".
+ *
+ * Every field comes from the recorded decision, so the panel can only show a
+ * decision that genuinely happened.
+ */
+function JevDetail({ detail }: { detail: JevDetailSnapshot }) {
+  const answer =
+    detail.answerType === "noul"
+      ? (detail.noul ?? "unsure")
+      : detail.answerType === "choice"
+        ? (detail.choice ?? "(none)")
+        : String(detail.score ?? "");
+  const probabilities = detail.probabilities
+    ? Object.entries(detail.probabilities)
+    : [];
+  const juncture =
+    detail.juncture === "plan-review"
+      ? "plan review (does this plan cover the goal?)"
+      : detail.juncture === "attribution"
+        ? "failure attribution (which module(s) does this implicate?)"
+        : "fix confidence (is this fix acceptable?) - advisory only";
+  return (
+    <div className="model-detail jev-detail">
+      <h3>Typed decision</h3>
+      <dl className="meta">
+        <div>
+          <dt>Juncture</dt>
+          <dd>{juncture}</dd>
+        </div>
+        <div>
+          <dt>Answer</dt>
+          <dd>
+            <code>{answer}</code> <span className="muted">({detail.answerType})</span>
+          </dd>
+        </div>
+        <div>
+          <dt>Confidence</dt>
+          <dd>{detail.confidence.toFixed(2)}</dd>
+        </div>
+        <div>
+          <dt>Outcome</dt>
+          <dd className={detail.accepted ? "verdict-pass" : "verdict-fail"}>
+            {detail.accepted ? "accepted (confident)" : "escalated (unsure)"}
+          </dd>
+        </div>
+      </dl>
+      <h4>Question</h4>
+      <pre className="detail-pre">{detail.question}</pre>
+      {detail.juncture === "fix-confidence" ? (
+        <p className="muted">
+          This is a secondary advisory signal. The mechanical gate verdict is
+          authoritative and decides promotion and deploy; this never flips it.
+        </p>
+      ) : null}
+      {probabilities.length > 0 ? (
+        <>
+          <h4>Calibrated probabilities</h4>
+          <dl className="meta">
+            {probabilities.map(([key, value]) => (
+              <div key={key}>
+                <dt>{key}</dt>
+                <dd>{Number(value).toFixed(2)}</dd>
+              </div>
+            ))}
+          </dl>
+        </>
+      ) : null}
     </div>
   );
 }

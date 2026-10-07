@@ -26,7 +26,7 @@ import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-wo
 
 import { changeToSpecYaml, decomposeGoal } from "../src/decompose-goal.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
-import { selectPlanner } from "../src/executor-select.ts";
+import { selectJev, selectPlanner } from "../src/executor-select.ts";
 import {
   assertBacked,
   buildWorkGraphModel,
@@ -467,5 +467,142 @@ describe("selectPlanner gating: inference planner off by default (heuristic + de
       AI_GATEWAY_PLANNER_MODEL: "gpt-4.1",
     });
     expect(selected.baseModel).toBe("gpt-4.1");
+  });
+});
+
+describe("JUNCTURE (a) PLAN REVIEW: accept-when-confident / escalate-when-unsure (offline fake Jev)", () => {
+  /** A fake Jev transport returning a fixed noul answer for the plan-review key. */
+  function fakeJev(noul: "yes" | "no" | "unsure", confidence: number) {
+    return async (
+      _state: string,
+      _questions: readonly { readonly key: string }[],
+    ): Promise<Readonly<Record<string, { type: "noul"; noul: "yes" | "no" | "unsure"; confidence: number }>>> => {
+      return { "plan-review": { type: "noul", noul, confidence } };
+    };
+  }
+
+  it("proceeds (accepted) on a confident-yes plan-review, recording the decision on the Change", async () => {
+    const result = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      planner: {
+        plan: fixedPlan,
+        baseModel: "gpt-4o-mini",
+        jev: fakeJev("yes", 0.9),
+        jevThreshold: 0.75,
+      },
+      changeId: "change-service-jev-accept",
+    });
+    // The plan proceeded with the plan the first model produced, and the recorded
+    // plan carries an ACCEPTED plan-review decision.
+    expect(result.change.plan?.source).toBe("planner");
+    expect(result.change.plan?.jevReview).toBeDefined();
+    expect(result.change.plan?.jevReview?.noul).toBe("yes");
+    expect(result.change.plan?.jevReview?.accepted).toBe(true);
+    // The decision rides the spec round-trip to the Worker.
+    const reloaded = parseChangeSpec(changeToSpecYaml(result.change));
+    expect(reloaded.plan?.jevReview?.accepted).toBe(true);
+  });
+
+  it("escalates (not accepted) on a low-confidence plan-review, still proceeding with a plan but recording the escalation", async () => {
+    const result = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      planner: {
+        plan: fixedPlan,
+        baseModel: "gpt-4o-mini",
+        // Below the threshold: the plan-review escalates. With no better model in
+        // the ladder, the last valid (escalated) candidate still proceeds, and the
+        // decision is recorded as NOT accepted.
+        jev: fakeJev("yes", 0.4),
+        jevThreshold: 0.75,
+      },
+      changeId: "change-service-jev-escalate",
+    });
+    expect(result.change.plan?.jevReview).toBeDefined();
+    expect(result.change.plan?.jevReview?.accepted).toBe(false);
+    expect(result.change.plan?.jevReview?.confidence).toBe(0.4);
+    // The plan still proceeds (plans never block), so a Change is still produced.
+    expect(result.change.work.length).toBeGreaterThan(0);
+  });
+
+  it("escalates on a confident-NO plan-review (a confident no is not an accept)", async () => {
+    const result = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      planner: {
+        plan: fixedPlan,
+        baseModel: "gpt-4o-mini",
+        jev: fakeJev("no", 0.95),
+        jevThreshold: 0.75,
+      },
+      changeId: "change-service-jev-no",
+    });
+    expect(result.change.plan?.jevReview?.noul).toBe("no");
+    expect(result.change.plan?.jevReview?.accepted).toBe(false);
+  });
+
+  it("the threshold is configurable: a 0.5 answer accepts under threshold 0.4 but escalates under 0.75", async () => {
+    const accept = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      planner: { plan: fixedPlan, baseModel: "gpt-4o-mini", jev: fakeJev("yes", 0.5), jevThreshold: 0.4 },
+      changeId: "change-service-jev-th-low",
+    });
+    expect(accept.change.plan?.jevReview?.accepted).toBe(true);
+
+    const escalate = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      planner: { plan: fixedPlan, baseModel: "gpt-4o-mini", jev: fakeJev("yes", 0.5), jevThreshold: 0.75 },
+      changeId: "change-service-jev-th-high",
+    });
+    expect(escalate.change.plan?.jevReview?.accepted).toBe(false);
+  });
+
+  it("records NO plan-review when no Jev transport is injected (offline path unchanged)", async () => {
+    const result = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      planner: { plan: fixedPlan, baseModel: "gpt-4o-mini" },
+      changeId: "change-service-jev-absent",
+    });
+    expect(result.change.plan?.source).toBe("planner");
+    expect(result.change.plan?.jevReview).toBeUndefined();
+  });
+});
+
+describe("selectJev gating: the decision layer is off by default (heuristic + determinism preserved)", () => {
+  it("is not live when EXECUTOR is unset (the offline/noop path)", () => {
+    const jev = selectJev({});
+    expect(jev.live).toBe(false);
+    expect(jev.ask).toBeUndefined();
+    // The default accept-when-confident threshold is 0.75.
+    expect(jev.threshold).toBe(0.75);
+  });
+
+  it("is not live for a non-gateway executor", () => {
+    expect(selectJev({ EXECUTOR: "workers-ai" }).live).toBe(false);
+  });
+
+  it("is not live for ai-gateway without gateway credentials", () => {
+    expect(selectJev({ EXECUTOR: "ai-gateway" }).live).toBe(false);
+  });
+
+  it("is live for ai-gateway with gateway credentials, deriving the gateway id from the URL", () => {
+    const jev = selectJev({
+      EXECUTOR: "ai-gateway",
+      CLOUDFLARE_AI_GATEWAY_URL: "https://gateway.ai.cloudflare.com/v1/acct/my-gateway",
+      CLOUDFLARE_AI_GATEWAY_TOKEN: "t",
+    });
+    expect(jev.live).toBe(true);
+    expect(typeof jev.ask).toBe("function");
+  });
+
+  it("reads a configurable threshold from JEV_CONFIDENCE_THRESHOLD, clamped to [0, 1]", () => {
+    expect(selectJev({ JEV_CONFIDENCE_THRESHOLD: "0.6" }).threshold).toBe(0.6);
+    expect(selectJev({ JEV_CONFIDENCE_THRESHOLD: "2" }).threshold).toBe(1);
+    expect(selectJev({ JEV_CONFIDENCE_THRESHOLD: "-1" }).threshold).toBe(0);
+    expect(selectJev({ JEV_CONFIDENCE_THRESHOLD: "garbage" }).threshold).toBe(0.75);
   });
 });

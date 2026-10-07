@@ -43,6 +43,7 @@ import {
 } from "@switchyard-change/change-core";
 import type { ExecutorProvider } from "@switchyard-change/model-adapters";
 import { ScopedNoopExecutor } from "@switchyard-change/model-adapters";
+import type { AskJev, JevAnswer } from "@switchyard-change/model-adapters";
 import {
   authenticatedRemote,
   clone,
@@ -359,6 +360,25 @@ export interface RunFullLiveOptions {
    * in, and no tool node can appear when none is built.
    */
   readonly enableToolBuild?: boolean;
+  /**
+   * The injected Jev typed-decision caller. When present (EXECUTOR=ai-gateway
+   * with gateway credentials, selected via selectJev), the run asks Jev at the
+   * failure-attribution and fix-confidence junctures and records each decision
+   * on the Change (backing a jev graph node). The plan-review juncture runs in
+   * change-core and rides the plan; the fix-confidence juncture is ADVISORY only
+   * (it never flips the authoritative mechanical gate verdict or gates promote/
+   * deploy). When absent (the default, offline path) no decision juncture runs,
+   * so the heuristic + gate path is unchanged and no jev node appears. A test
+   * injects a deterministic fake, keeping make check offline.
+   */
+  readonly jev?: AskJev;
+  /**
+   * The accept-when-confident threshold in [0, 1] the junctures use. An answer
+   * whose confidence is at or above it is used; below it the juncture keeps the
+   * mechanical fallback (attribution) or records an escalated advisory
+   * (fix-confidence). Defaults to 0.75 when a Jev caller is injected without one.
+   */
+  readonly jevThreshold?: number;
 }
 
 /** A progress event emitted during a full live run. */
@@ -506,6 +526,25 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     maxConcurrency: options.dial.maxConcurrency,
   });
   emit({ kind: "change-created", changeId });
+
+  // JUNCTURE (a) PLAN REVIEW: the plan-review decision is made inside change-core
+  // (pure/offline), riding on the Change as change.plan.jevReview when a Jev
+  // transport was injected into the planner pass. Record it on the Worker here as
+  // a jev decision so it backs a jev node near the planner. Absent on the offline
+  // path (no decision made), so nothing is recorded.
+  const planReview = options.change.plan?.jevReview;
+  if (planReview) {
+    await recordJevDecision(post, changeId, {
+      juncture: "plan-review",
+      question: planReview.question,
+      answer: {
+        type: "noul",
+        noul: planReview.noul,
+        confidence: planReview.confidence,
+      },
+      accepted: planReview.accepted,
+    });
+  }
 
   const waves: LiveWave[] = [];
   const allWorkspaces = new Set<string>();
@@ -886,6 +925,8 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       identity,
       post,
       emit,
+      ...(options.jev ? { jev: options.jev } : {}),
+      jevThreshold: options.jevThreshold ?? 0.75,
     });
   }
 
@@ -986,6 +1027,49 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       reportStep(unit.id, "verified", "deterministic verification passed; integrated");
     } else {
       reportStep(unit.id, "not-integrated", "verification did not integrate this unit");
+    }
+  }
+
+  // JUNCTURE (c) FIX CONFIDENCE: a SECONDARY ADVISORY signal only. With Jev live,
+  // ask whether the integrated fix is acceptable AFTER the authoritative
+  // mechanical gate verdict is already decided, and record the advisory answer.
+  // The mechanical gate + gate-equals-deploy REMAIN AUTHORITATIVE: this decision
+  // is recorded alongside the verdict for display and confidence, and NEVER feeds
+  // the promote/deploy decision below or flips changePassed / the integrated set.
+  // Offline (no Jev injected) this is skipped entirely, so the gate path is
+  // unchanged. The question is a noul; a confident answer is recorded accepted,
+  // a low-confidence one escalated, but either way it is advisory only.
+  if (options.jev) {
+    const jevThreshold = options.jevThreshold ?? 0.75;
+    const verdict = evidence.integration.verdict;
+    const integratedCount = evidence.integration.integratedUnits.length;
+    const question = "Is this fix acceptable?";
+    const state = [
+      `Change: ${effectiveChange.id}`,
+      `Objective: ${effectiveChange.objective}`,
+      `Mechanical gate verdict (authoritative): ${verdict}`,
+      `Integrated units: ${evidence.integration.integratedUnits.join(", ") || "(none)"} (${integratedCount})`,
+    ].join("\n");
+    try {
+      const answers = await options.jev(state, [
+        { key: "fix-confidence", type: "noul", question },
+      ]);
+      const answer = answers["fix-confidence"];
+      if (answer && answer.type === "noul" && answer.noul !== undefined) {
+        // "accepted" here records whether Jev was CONFIDENTLY positive, as a
+        // display/confidence signal. It does NOT change the verdict: the gate is
+        // authoritative, so a confident "unacceptable" with a passing gate still
+        // ships and a confident "acceptable" with a failing gate still fails.
+        const accepted = answer.confidence >= jevThreshold && answer.noul === "yes";
+        await recordJevDecision(post, changeId, {
+          juncture: "fix-confidence",
+          question,
+          answer,
+          accepted,
+        });
+      }
+    } catch {
+      // Advisory only: a decision-transport error never fails the run.
     }
   }
 
@@ -1187,6 +1271,15 @@ interface ChangeLevelLadderInput {
   readonly identity: GitIdentity;
   readonly post: (path: string, body?: unknown, contentType?: string) => Promise<Record<string, unknown>>;
   readonly emit: (event: FullLiveEvent) => void;
+  /**
+   * The injected Jev typed-decision caller for the FAILURE-ATTRIBUTION juncture.
+   * When present and confident, its choice over the gated unit ids complements
+   * the string-parse attribution; the string-parse + re-fan-all fallback remain
+   * intact (Jev only overrides when confident). Absent on the offline path.
+   */
+  readonly jev?: AskJev;
+  /** The accept-when-confident threshold for the attribution juncture. */
+  readonly jevThreshold?: number;
 }
 
 /**
@@ -1339,7 +1432,61 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
       // failing gate output named. When the failure cannot be attributed to any
       // specific unit, FALL BACK to re-fanning ALL gated units (never silently
       // skip). This narrowing is best-effort; the fallback keeps it honest.
-      const implicated = selectImplicatedUnits(gatedUnits, lastEvidence);
+      const parsed = selectImplicatedUnits(gatedUnits, lastEvidence);
+      // JUNCTURE (b) FAILURE ATTRIBUTION: when Jev is live, ask which module the
+      // failure implicates (a choice over the gated unit ids) and UNION a
+      // confident choice with the string-parse result, so Jev is a SMARTER
+      // COMPLEMENT, never a replacement. A low-confidence or unrecognized choice
+      // leaves the parse+fallback result exactly as it was (the fallback is never
+      // silently dropped). The decision is recorded on the Change (backing a jev
+      // node). Offline (no Jev) this is a no-op and the parse+fallback stands.
+      let implicated = parsed;
+      if (input.jev) {
+        const threshold = input.jevThreshold ?? 0.75;
+        const unitIds = gatedUnits.map((u) => u.unitId);
+        const question = "Which module(s) does this failure implicate?";
+        const state = [
+          `Change: ${changeId}`,
+          `Gated units: ${unitIds.join(", ")}`,
+          "Failing gate evidence:",
+          lastEvidence.slice(0, 2000),
+        ].join("\n");
+        try {
+          const answers = await input.jev(state, [
+            { key: "attribution", type: "choice", question, options: unitIds },
+          ]);
+          const answer = answers["attribution"];
+          const confident =
+            answer !== undefined &&
+            answer.type === "choice" &&
+            answer.confidence >= threshold &&
+            typeof answer.choice === "string" &&
+            unitIds.includes(answer.choice);
+          if (answer && answer.type === "choice") {
+            // Record the decision either way (accepted when confident and the
+            // choice is a real gated unit; escalated otherwise), so the jev node
+            // honestly shows whether Jev's choice was used.
+            await recordJevDecision(post, changeId, {
+              juncture: "attribution",
+              question,
+              answer,
+              accepted: confident,
+            });
+          }
+          if (confident && answer) {
+            // Union the confident Jev choice with the string-parse result, so a
+            // unit either the parse OR Jev implicates is re-fanned. The fallback
+            // (re-fan all when the parse found nothing) is preserved because
+            // `parsed` already carries it.
+            const chosen = gatedUnits.find((u) => u.unitId === answer.choice);
+            if (chosen && !parsed.some((u) => u.unitId === chosen.unitId)) {
+              implicated = [...parsed, chosen];
+            }
+          }
+        } catch {
+          // A decision-transport error leaves the parse+fallback result intact.
+        }
+      }
 
       // Record the change-level model-escalation beat (a retry node + a
       // model-escalation edge, carrying the implicated units) BEFORE running it,
@@ -1828,6 +1975,37 @@ async function recordVerifyAttempt(
     // The real failing gate output, recorded only on a fail (truncated by the
     // DO), so the console can show WHY the round failed. Never on a pass.
     ...(passed ? {} : { failingOutput: evidence }),
+  }).catch(() => {});
+}
+
+/**
+ * Record one Jev typed decision on the Worker (best-effort, never throws into
+ * the run). It POSTs to the `/changes/:id/jev-decision` route exactly as the
+ * verify/retry helpers post their attempts, so a decision surfaces in state and
+ * backs a jev graph node. A fix-confidence decision is advisory only: recording
+ * it never touches the authoritative gate verdict or the promote/deploy guard.
+ */
+async function recordJevDecision(
+  post: (path: string, body?: unknown, contentType?: string) => Promise<Record<string, unknown>>,
+  changeId: string,
+  decision: {
+    readonly juncture: "plan-review" | "attribution" | "fix-confidence";
+    readonly question: string;
+    readonly answer: JevAnswer;
+    readonly accepted: boolean;
+  },
+): Promise<void> {
+  const { answer } = decision;
+  await post(`/changes/${encodeURIComponent(changeId)}/jev-decision`, {
+    juncture: decision.juncture,
+    question: decision.question,
+    answerType: answer.type,
+    ...(answer.noul !== undefined ? { noul: answer.noul } : {}),
+    ...(answer.choice !== undefined ? { choice: answer.choice } : {}),
+    ...(answer.score !== undefined ? { score: answer.score } : {}),
+    confidence: answer.confidence,
+    ...(answer.probabilities !== undefined ? { probabilities: answer.probabilities } : {}),
+    accepted: decision.accepted,
   }).catch(() => {});
 }
 

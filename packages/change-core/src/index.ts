@@ -19,6 +19,7 @@ export type {
   ChangeBlueprintContract,
   ChangeBlueprintModule,
   ChangePlan,
+  ChangePlanReview,
   ChangePlanSource,
   ChangePlanUnit,
   Dependency,
@@ -68,8 +69,10 @@ export type {
   PlannedUnit,
   PlanGoalOptions,
   PlanGoalResult,
+  PlanReviewDecision,
   PlanSource,
   PlanTransport,
+  JevTransport,
   RecordedPlan,
 } from "./plan-goal.ts";
 export { buildPlannerMessages, planGoal, summarizePlannerPrompt, validatePlan } from "./plan-goal.ts";

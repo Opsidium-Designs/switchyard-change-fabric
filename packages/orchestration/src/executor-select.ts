@@ -25,6 +25,7 @@
 
 import type { ExecutorProvider, PlannerPlan } from "@switchyard-change/model-adapters";
 import {
+  createAiGatewayJevInvoke,
   createAiGatewayPlannerInvoke,
   createAiGatewayRestInvoke,
   createWorkersAiRestInvoke,
@@ -32,8 +33,10 @@ import {
   DEFAULT_AI_GATEWAY_MAX_MODEL_RETRIES,
   DEFAULT_AI_GATEWAY_MODEL,
   DEFAULT_WORKERS_AI_MODEL,
+  gatewaySlugFromUrl,
   ScopedNoopExecutor,
   WorkersAiExecutor,
+  type AskJev,
 } from "@switchyard-change/model-adapters";
 
 /**
@@ -60,6 +63,8 @@ export interface ExecutorEnv {
   readonly AI_GATEWAY_MAX_MODEL_RETRIES?: string;
   readonly CLOUDFLARE_AI_GATEWAY_URL?: string;
   readonly CLOUDFLARE_AI_GATEWAY_TOKEN?: string;
+  readonly CF_AIG_GATEWAY_ID?: string;
+  readonly JEV_CONFIDENCE_THRESHOLD?: string;
 }
 
 /** The outcome of selecting an executor: the provider plus a readable label. */
@@ -327,4 +332,93 @@ export function selectPlanner(env: ExecutorEnv = process.env): SelectedPlanner {
     baseModel,
     escalationModels,
   };
+}
+
+/** The default accept-when-confident threshold for the Jev decision junctures. */
+export const DEFAULT_JEV_CONFIDENCE_THRESHOLD = 0.75;
+
+/**
+ * The outcome of selecting the Jev typed-decision layer: whether a decision model
+ * is live, the injectable typed caller when it is, and the accept-when-confident
+ * threshold the junctures use. When not live the caller keeps the deterministic
+ * heuristic + mechanical-gate path and Jev is simply absent (no jev nodes), so
+ * offline runs, the demo, and `make check` stay deterministic and offline.
+ */
+export interface SelectedJev {
+  /**
+   * True when a decision model is configured (EXECUTOR=ai-gateway with gateway
+   * credentials present). When false the caller runs no decision juncture, so
+   * the heuristic + mechanical-gate path is unchanged and no jev node appears.
+   */
+  readonly live: boolean;
+  /** A human-readable description of what was selected (no secrets). */
+  readonly description: string;
+  /** The injected typed-decision caller, present only when `live` is true. */
+  readonly ask?: AskJev;
+  /** The accept-when-confident threshold in [0, 1] the junctures use. */
+  readonly threshold: number;
+}
+
+/**
+ * Select the Jev typed-decision layer from the environment, independently of the
+ * executor and the planner. It is live ONLY for EXECUTOR=ai-gateway with gateway
+ * credentials present (exactly like selectPlanner): it builds the decision
+ * transport over the same gateway URL and token the executor uses, routing by
+ * the gateway id read from CF_AIG_GATEWAY_ID (falling back to the slug derived
+ * from CLOUDFLARE_AI_GATEWAY_URL), and reads the accept-when-confident threshold
+ * from JEV_CONFIDENCE_THRESHOLD (default 0.75, clamped to [0, 1]).
+ *
+ * For any other EXECUTOR (or an unset one, the noop/offline path), it is NOT
+ * live: the caller runs no decision juncture, so Jev is simply absent and the
+ * heuristic + mechanical-gate path is unchanged, keeping `make check`, the demo,
+ * and the anti-puppet substrate offline and deterministic. Missing gateway
+ * credentials under EXECUTOR=ai-gateway also yield a non-live Jev here (the
+ * executor selection surfaces that misconfig as an error), so Jev never attempts
+ * an unauthenticated network call.
+ */
+export function selectJev(env: ExecutorEnv = process.env): SelectedJev {
+  const threshold = parseConfidenceThreshold(
+    env.JEV_CONFIDENCE_THRESHOLD,
+    DEFAULT_JEV_CONFIDENCE_THRESHOLD,
+  );
+  const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
+  if (choice !== "ai-gateway") {
+    return { live: false, description: "jev off (heuristic + gate path)", threshold };
+  }
+  const gatewayUrl = (env.CLOUDFLARE_AI_GATEWAY_URL ?? "").trim();
+  const gatewayToken = (env.CLOUDFLARE_AI_GATEWAY_TOKEN ?? "").trim();
+  if (gatewayUrl === "" || gatewayToken === "") {
+    return { live: false, description: "jev off (gateway credentials absent)", threshold };
+  }
+  // The gateway id routes the decision call: prefer the explicit env slug, else
+  // derive it from the gateway URL. When neither yields a slug, Jev is not live
+  // rather than posting without a routing header.
+  const gatewayId = (env.CF_AIG_GATEWAY_ID ?? "").trim() || gatewaySlugFromUrl(gatewayUrl);
+  if (gatewayId === "") {
+    return { live: false, description: "jev off (no gateway id)", threshold };
+  }
+  const invoke = createAiGatewayJevInvoke({ gatewayUrl, gatewayToken, gatewayId });
+  const ask: AskJev = (state, questions) => invoke({ state, questions });
+  return {
+    live: true,
+    description: `ai-gateway jev (gateway ${gatewayId}, threshold ${threshold})`,
+    ask,
+    threshold,
+  };
+}
+
+/**
+ * Parse the accept-when-confident threshold from the environment. A missing,
+ * non-finite, or out-of-range value falls back to the provided default; a valid
+ * value is clamped to [0, 1]. Mirrors parseMaxModelRetries' defensive parse.
+ */
+function parseConfidenceThreshold(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") {
+    return fallback;
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n)) {
+    return fallback;
+  }
+  return Math.min(1, Math.max(0, n));
 }

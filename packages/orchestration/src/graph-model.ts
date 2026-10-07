@@ -286,6 +286,39 @@ export interface RetryAttemptSnapshot {
  * the backing retry (which names the unit among its implicated units) exist, so
  * it is backed like every other node.
  */
+/**
+ * The decision juncture a Jev typed decision was recorded at: "plan-review"
+ * (does this plan cover the goal?), "attribution" (which modules does this
+ * failure implicate?), or "fix-confidence" (is this fix acceptable?). A jev node
+ * is placed near its juncture: plan-review by the planner, attribution at the
+ * verify-fail -> retry hop, and fix-confidence at the verify.
+ */
+export type JevJuncture = "plan-review" | "attribution" | "fix-confidence";
+
+/**
+ * A recorded Jev typed decision, as reported by the state. This is the real
+ * backing for a `jev` node: a typed decision the Jev layer made at one juncture,
+ * carrying the question, the typed answer (noul/choice/score), the calibrated
+ * confidence (and optional probabilities), and whether the engine ACCEPTED the
+ * answer or ESCALATED. A jev node is only emitted when this record is present,
+ * so a jev node always maps to a real recorded decision (the no-unbacked-node
+ * rule for the new kind). A fix-confidence decision is advisory ONLY: it never
+ * flips the authoritative mechanical gate verdict or gates promotion/deploy; it
+ * is display + a confidence signal.
+ */
+export interface JevDecisionSnapshot {
+  readonly juncture: JevJuncture;
+  readonly question: string;
+  readonly answerType: "noul" | "choice" | "score";
+  readonly noul?: "yes" | "no" | "unsure";
+  readonly choice?: string;
+  readonly score?: number;
+  readonly confidence: number;
+  readonly probabilities?: Readonly<Record<string, number>>;
+  readonly accepted: boolean;
+  readonly at?: string;
+}
+
 export interface RoundAgentSnapshot {
   readonly unitId: string;
   readonly round: number;
@@ -367,6 +400,26 @@ export interface PlannerDetailSnapshot {
 }
 
 /**
+ * The inspectable detail carried on a `jev` graph node, so the console can
+ * render a Jev detail panel showing the real recorded typed decision: the
+ * juncture, the question, the typed answer (noul/choice/score), the calibrated
+ * confidence (and optional per-outcome probabilities), and whether the engine
+ * accepted or escalated. Every field is derived from the real recorded decision,
+ * so it is backed exactly like the node.
+ */
+export interface JevDetailSnapshot {
+  readonly juncture: JevJuncture;
+  readonly question: string;
+  readonly answerType: "noul" | "choice" | "score";
+  readonly noul?: "yes" | "no" | "unsure";
+  readonly choice?: string;
+  readonly score?: number;
+  readonly confidence: number;
+  readonly probabilities?: Readonly<Record<string, number>>;
+  readonly accepted: boolean;
+}
+
+/**
  * The subset of the live ChangeState projection the graph model reads. Both the
  * Worker's `ChangeStateView` and the offline control surface's view are
  * structurally assignable to this, so the model projects either without a
@@ -440,6 +493,15 @@ export interface ChangeStateSnapshot {
    * and the graph has no planner node, exactly as before.
    */
   readonly plan?: PlanSnapshot;
+  /**
+   * The Jev typed decisions recorded for this Change, each at one juncture
+   * (plan-review, attribution, or fix-confidence). Each becomes one `jev` node
+   * placed near its juncture (plan-review by the planner, attribution at the
+   * verify-fail -> retry hop, fix-confidence at the verify), backed by this
+   * record. Optional/absent on the offline path (no decision model configured),
+   * where the graph has no jev node, exactly as before.
+   */
+  readonly jevDecisions?: readonly JevDecisionSnapshot[];
 }
 
 /** The kind of a node in the rendered graph. */
@@ -450,7 +512,8 @@ export type GraphNodeKind =
   | "agent" // a WorkUnit an agent has been recruited for (a real repo exists)
   | "tool" // an agent-built tool published to its own repo, consumed downstream
   | "verify" // one mechanical gate run against a unit's candidate edit (pass/fail)
-  | "retry"; // one bounded model-escalation retry on a stronger model after a verify-fail
+  | "retry" // one bounded model-escalation retry on a stronger model after a verify-fail
+  | "jev"; // one Jev typed decision at a juncture (plan-review, attribution, or fix-confidence)
 
 /**
  * The kind of an edge in the rendered graph. The vocabulary is exactly these
@@ -535,6 +598,17 @@ export type NodeBacking =
       readonly round: number;
       readonly unitId: string;
       readonly toModel: string;
+    }
+  | {
+      // A jev node is backed by a real recorded Jev typed decision at one
+      // juncture, so it can never be a decorative "it decided" node: a decision
+      // record for the same change and juncture must be present in the state.
+      readonly kind: "jev-decision";
+      readonly changeId: string;
+      readonly juncture: JevJuncture;
+      readonly question: string;
+      readonly answerType: "noul" | "choice" | "score";
+      readonly confidence: number;
     };
 
 /** The real state element an edge is backed by. */
@@ -623,6 +697,13 @@ export interface GraphNode {
    * derived from the real recorded plan, so it is backed exactly like the node.
    */
   readonly plannerDetail?: PlannerDetailSnapshot;
+  /**
+   * The inspectable decision detail carried on a `jev` node, so the console can
+   * render a Jev detail panel (juncture, question, typed answer, calibrated
+   * confidence/probabilities, accepted-or-escalated). Present only on a jev node,
+   * derived from the real recorded decision, so it is backed exactly like the node.
+   */
+  readonly jevDetail?: JevDetailSnapshot;
   /** The concrete state element this node was derived from. */
   readonly backing: NodeBacking;
 }
@@ -684,6 +765,16 @@ export function retryNodeId(changeId: string, round: number): string {
  */
 export function roundAgentNodeId(changeId: string, round: number, unitId: string): string {
   return `round-agent:${changeId}#${round}:${unitId}`;
+}
+
+/**
+ * The id used for a `jev` decision node at a juncture. Keyed by (changeId,
+ * juncture, index) so multiple decisions at the same juncture (for example a
+ * fix-confidence decision per retry round) each get their own node rather than
+ * colliding. The index is the decision's position among same-juncture decisions.
+ */
+export function jevNodeId(changeId: string, juncture: JevJuncture, index: number): string {
+  return `jev:${changeId}#${juncture}:${index}`;
 }
 
 /**
@@ -868,6 +959,31 @@ export function assertBacked(node: GraphNode, snapshot: ChangeStateSnapshot): Gr
       if (node.status !== "running" && !recorded) {
         throw new Error(
           `unbacked node ${node.id}: round-agent claims status ${node.status} but no round-N agent instance is recorded for unit ${backing.unitId} round ${backing.round}`,
+        );
+      }
+      return node;
+    }
+    case "jev-decision": {
+      // A jev node must map to a real recorded Jev typed decision: its change
+      // must match AND a decision at the same juncture with the same question,
+      // answer type, and confidence must be present in the state. A jev node
+      // with no backing decision record is exactly the decorative "it decided"
+      // node the no-unbacked-node rule forbids.
+      if (backing.changeId !== snapshot.id) {
+        throw new Error(
+          `unbacked node ${node.id}: jev decision names change ${backing.changeId}, not ${snapshot.id}`,
+        );
+      }
+      const decision = (snapshot.jevDecisions ?? []).find(
+        (d) =>
+          d.juncture === backing.juncture &&
+          d.question === backing.question &&
+          d.answerType === backing.answerType &&
+          d.confidence === backing.confidence,
+      );
+      if (!decision) {
+        throw new Error(
+          `unbacked node ${node.id}: no recorded jev decision at juncture ${backing.juncture} for change ${backing.changeId}`,
         );
       }
       return node;
@@ -1545,6 +1661,92 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
         },
       });
     }
+  }
+
+  // The Jev typed-decision nodes, when the state records any. Each decision at
+  // one juncture becomes a `jev` node placed near that juncture by a dependency
+  // edge from its anchor: plan-review hangs off the planner (or the goal when
+  // there is no planner), attribution hangs off the retry node (the verify-fail
+  // -> retry hop), and fix-confidence hangs off the latest verify node. The node
+  // greens when the decision was ACCEPTED and reds when it ESCALATED, so a glance
+  // shows confident-use vs escalate. Each is backed by the real recorded decision
+  // (assertBacked rejects an unbacked jev node), so a jev node always maps to a
+  // genuine decision; a fix-confidence decision is advisory only and never
+  // changes any verdict. The offline path records no decisions, so no jev node
+  // appears and the heuristic + gate path is unchanged.
+  const jevDecisions = snapshot.jevDecisions ?? [];
+  // Per-juncture index so multiple decisions at one juncture get distinct ids.
+  const jevIndexByJuncture = new Map<JevJuncture, number>();
+  // Anchors: the planner node (plan-review), the latest retry node (attribution),
+  // and the latest verify node (fix-confidence). Each falls back to the goal when
+  // its preferred anchor is absent, so a jev node is always rooted.
+  const latestVerifyRound =
+    verifyAttempts.length > 0
+      ? verifyAttempts.reduce((a, b) => (b.round >= a.round ? b : a)).round
+      : undefined;
+  const latestRetryRound =
+    retryAttempts.length > 0
+      ? retryAttempts.reduce((a, b) => (b.round >= a.round ? b : a)).round
+      : undefined;
+  const jevAnchorFor = (juncture: JevJuncture): string => {
+    if (juncture === "plan-review" && plan) {
+      return plannerNodeId(snapshot.id);
+    }
+    if (juncture === "attribution" && latestRetryRound !== undefined) {
+      return retryNodeId(snapshot.id, latestRetryRound);
+    }
+    if (juncture === "fix-confidence" && latestVerifyRound !== undefined) {
+      return verifyNodeId(snapshot.id, latestVerifyRound);
+    }
+    return goalNodeId(snapshot.id);
+  };
+
+  for (const decision of jevDecisions) {
+    const index = jevIndexByJuncture.get(decision.juncture) ?? 0;
+    jevIndexByJuncture.set(decision.juncture, index + 1);
+    const id = jevNodeId(snapshot.id, decision.juncture, index);
+    const jevDetail: JevDetailSnapshot = {
+      juncture: decision.juncture,
+      question: decision.question,
+      answerType: decision.answerType,
+      ...(decision.noul !== undefined ? { noul: decision.noul } : {}),
+      ...(decision.choice !== undefined ? { choice: decision.choice } : {}),
+      ...(decision.score !== undefined ? { score: decision.score } : {}),
+      confidence: decision.confidence,
+      ...(decision.probabilities !== undefined ? { probabilities: decision.probabilities } : {}),
+      accepted: decision.accepted,
+    };
+    const jevNode: GraphNode = {
+      id,
+      kind: "jev",
+      // A readable label naming the juncture and whether it was accepted, e.g.
+      // "jev: plan-review accepted".
+      label: `jev: ${decision.juncture} ${decision.accepted ? "accepted" : "escalated"}`,
+      // The node greens when the decision was accepted (confident-use) and reads
+      // as not-verified when it escalated. This is display only; it never changes
+      // the authoritative gate verdict.
+      status: decision.accepted ? "integrated" : "running",
+      verified: decision.accepted,
+      escalated: false,
+      jevDetail,
+      backing: {
+        kind: "jev-decision",
+        changeId: snapshot.id,
+        juncture: decision.juncture,
+        question: decision.question,
+        answerType: decision.answerType,
+        confidence: decision.confidence,
+      },
+    };
+    nodes.push(assertBacked(jevNode, snapshot));
+    const anchor = jevAnchorFor(decision.juncture);
+    edges.push({
+      id: `jev-flow:${snapshot.id}#${decision.juncture}:${index}`,
+      kind: "dependency",
+      from: anchor,
+      to: id,
+      backing: { kind: "dependency", from: snapshot.id, to: `jev#${decision.juncture}:${index}` },
+    });
   }
 
   return { changeId: snapshot.id, nodes, edges, dial: snapshot.dial };

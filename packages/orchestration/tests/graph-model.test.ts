@@ -30,6 +30,7 @@ import {
   assertBacked,
   buildWorkGraphModel,
   goalNodeId,
+  jevNodeId,
   retryNodeId,
   roundAgentNodeId,
   unitNodeId,
@@ -1100,5 +1101,156 @@ describe("the goal node reflects the authoritative verify verdict, not the first
       work: firstWaveDone().work.map((u) => ({ ...u, status: "running" as const })),
     });
     expect(notAllIntegrated.nodes.find((n) => n.kind === "goal")?.verified).toBe(false);
+  });
+});
+
+
+/**
+ * H2: the `jev` typed-decision node and the no-unbacked-node rule for it. A jev
+ * node is emitted only when the state records a matching Jev decision, placed
+ * near its juncture (plan-review by the planner, attribution at the retry,
+ * fix-confidence at the verify), and backed by that recorded decision.
+ */
+describe("the graph emits a backed jev node per recorded Jev decision", () => {
+  /** A snapshot with a planner, a verify/retry ladder, and three Jev decisions. */
+  function jevSnapshot(): ChangeStateSnapshot {
+    return {
+      id: "change-jev",
+      objective: "fix with typed decisions",
+      completed: [],
+      work: [
+        {
+          id: "fix",
+          objective: "fix the bug",
+          dependsOn: [],
+          paths: ["src/fix.js"],
+          status: "running",
+          leased: true,
+          workspace: workspace("fix"),
+        },
+      ],
+      edges: [],
+      plan: {
+        source: "planner",
+        model: "gpt-4o-mini",
+        units: ["fix"],
+        contracts: [],
+      },
+      verifyAttempts: [
+        { round: 1, outcome: "fail", model: "base-model", at: "2026-10-04T10:00:00.000Z" },
+        { round: 2, outcome: "pass", model: "escalation-model", at: "2026-10-04T10:01:00.000Z" },
+      ],
+      retryAttempts: [
+        {
+          round: 2,
+          fromModel: "base-model",
+          toModel: "escalation-model",
+          implicatedUnits: ["fix"],
+          reason: "verify round 1 failed",
+          at: "2026-10-04T10:00:30.000Z",
+        },
+      ],
+      jevDecisions: [
+        {
+          juncture: "plan-review",
+          question: "Does this plan cover the goal?",
+          answerType: "noul",
+          noul: "yes",
+          confidence: 0.9,
+          accepted: true,
+        },
+        {
+          juncture: "attribution",
+          question: "Which module(s) does this failure implicate?",
+          answerType: "choice",
+          choice: "fix",
+          confidence: 0.85,
+          accepted: true,
+        },
+        {
+          juncture: "fix-confidence",
+          question: "Is this fix acceptable?",
+          answerType: "noul",
+          noul: "no",
+          confidence: 0.95,
+          accepted: false,
+        },
+      ],
+    };
+  }
+
+  it("emits one backed jev node per recorded decision, each carrying its typed detail", () => {
+    const snapshot = jevSnapshot();
+    const model = buildWorkGraphModel(snapshot);
+    const jevNodes = model.nodes.filter((n) => n.kind === "jev");
+    expect(jevNodes).toHaveLength(3);
+    for (const node of jevNodes) {
+      expect(node.backing.kind).toBe("jev-decision");
+      expect(node.jevDetail).toBeDefined();
+    }
+    // The accepted plan-review greens; the escalated fix-confidence does not.
+    const planReview = jevNodes.find((n) => n.jevDetail?.juncture === "plan-review");
+    const fixConf = jevNodes.find((n) => n.jevDetail?.juncture === "fix-confidence");
+    expect(planReview?.verified).toBe(true);
+    expect(fixConf?.verified).toBe(false);
+    // The attribution node carries its choice; the fix-confidence its noul.
+    const attribution = jevNodes.find((n) => n.jevDetail?.juncture === "attribution");
+    expect(attribution?.jevDetail?.choice).toBe("fix");
+    expect(fixConf?.jevDetail?.noul).toBe("no");
+  });
+
+  it("places each jev node near its juncture (plan-review by planner, attribution at retry, fix-confidence at verify)", () => {
+    const snapshot = jevSnapshot();
+    const model = buildWorkGraphModel(snapshot);
+    const planReview = jevNodeId("change-jev", "plan-review", 0);
+    const attribution = jevNodeId("change-jev", "attribution", 0);
+    const fixConf = jevNodeId("change-jev", "fix-confidence", 0);
+    // plan-review hangs off the planner node.
+    expect(
+      model.edges.some((e) => e.to === planReview && e.from.startsWith("planner:")),
+    ).toBe(true);
+    // attribution hangs off the retry node.
+    expect(
+      model.edges.some((e) => e.to === attribution && e.from === retryNodeId("change-jev", 2)),
+    ).toBe(true);
+    // fix-confidence hangs off a verify node.
+    expect(
+      model.edges.some((e) => e.to === fixConf && e.from === verifyNodeId("change-jev", 2)),
+    ).toBe(true);
+  });
+
+  it("every emitted jev node passes the backing guard against the snapshot", () => {
+    const snapshot = jevSnapshot();
+    const model = buildWorkGraphModel(snapshot);
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
+  });
+
+  it("rejects a jev node with no recorded decision (cannot render unbacked)", () => {
+    const snapshot = jevSnapshot();
+    const bogus: GraphNode = {
+      id: jevNodeId("change-jev", "plan-review", 9),
+      kind: "jev",
+      label: "jev: plan-review accepted",
+      status: "integrated",
+      verified: true,
+      escalated: false,
+      backing: {
+        kind: "jev-decision",
+        changeId: "change-jev",
+        juncture: "plan-review",
+        question: "ghost question",
+        answerType: "noul",
+        confidence: 0.99,
+      },
+    };
+    expect(() => assertBacked(bogus, snapshot)).toThrow(/no recorded jev decision/);
+  });
+
+  it("emits NO jev node when the state records no decisions (the offline path is unchanged)", () => {
+    const snapshot: ChangeStateSnapshot = { ...jevSnapshot(), jevDecisions: [] };
+    const model = buildWorkGraphModel(snapshot);
+    expect(model.nodes.some((n) => n.kind === "jev")).toBe(false);
   });
 });

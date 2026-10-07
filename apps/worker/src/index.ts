@@ -1,7 +1,7 @@
 import { parseChangeSpec } from "@switchyard-change/change-core";
 import type { DiscoveredWorkUnit } from "@switchyard-change/change-core";
 
-import type { EscalationKind, LeaseWorkspace, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
+import type { EscalationKind, JevDecisionView, JevJuncture, LeaseWorkspace, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
 import type { ChangeState } from "./change-state.ts";
 import type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 import { selectProvisioner } from "./workspace-provisioner.ts";
@@ -447,6 +447,43 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         reason: body.reason ?? "verify-fail escalation",
       });
       return json({ retryAttempt: attempt }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Record one Jev typed decision at one juncture (plan-review, attribution, or
+  // fix-confidence). This is the real backing for a `jev` graph node, so a jev
+  // node can only exist once this record does. A fix-confidence decision is
+  // ADVISORY only: recording it never touches the completed/failed/integrated
+  // sets, so the mechanical gate and gate-equals-deploy remain authoritative and
+  // Jev never flips a verdict or gates promotion/deploy.
+  const jevDecisionMatch = url.pathname.match(/^\/changes\/([^/]+)\/jev-decision$/);
+  if (request.method === "POST" && jevDecisionMatch) {
+    const changeId = decodeURIComponent(jevDecisionMatch[1] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: JevDecisionBody;
+    try {
+      body = (await request.json()) as JevDecisionBody;
+    } catch {
+      return json({ error: "invalid jev-decision body" }, 400);
+    }
+    try {
+      const decision = await stub.recordJevDecision({
+        juncture: (body.juncture ?? "plan-review") as JevJuncture,
+        question: body.question ?? "",
+        answerType: body.answerType === "choice" || body.answerType === "score" ? body.answerType : "noul",
+        ...(body.noul ? { noul: body.noul } : {}),
+        ...(body.choice ? { choice: body.choice } : {}),
+        ...(typeof body.score === "number" ? { score: body.score } : {}),
+        confidence: numberOr(body.confidence, 0),
+        ...(body.probabilities ? { probabilities: body.probabilities } : {}),
+        accepted: body.accepted === true,
+      });
+      return json({ jevDecision: decision }, 201);
     } catch (error) {
       return json({ error: errorMessage(error) }, 400);
     }
@@ -999,6 +1036,19 @@ interface RetryAttemptBody {
   readonly toModel?: string;
   readonly implicatedUnits?: readonly string[];
   readonly reason?: string;
+}
+
+/** Body of POST /changes/:id/jev-decision: one Jev typed decision at a juncture. */
+interface JevDecisionBody {
+  readonly juncture?: JevJuncture;
+  readonly question?: string;
+  readonly answerType?: "noul" | "choice" | "score";
+  readonly noul?: "yes" | "no" | "unsure";
+  readonly choice?: string;
+  readonly score?: number;
+  readonly confidence?: number;
+  readonly probabilities?: Readonly<Record<string, number>>;
+  readonly accepted?: boolean;
 }
 
 /** Body of POST /changes/:id/dial. Accepts min/max under either spelling. */

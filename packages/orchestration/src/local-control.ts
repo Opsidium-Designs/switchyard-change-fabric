@@ -205,6 +205,12 @@ export interface ChangeStateView {
    * `agent` nodes with recorded status/workspace/activity/detail.
    */
   readonly roundAgents: readonly RoundAgentView[];
+  /**
+   * The Jev typed decisions recorded for this Change (mirrors the Worker); back
+   * the graph's `jev` nodes offline exactly like the live Worker. A
+   * fix-confidence decision is advisory only and never flips the gate verdict.
+   */
+  readonly jevDecisions: readonly JevDecisionView[];
 }
 
 /** A recorded WorkUnit failure (mirrors the Worker's FailureRecord). */
@@ -281,6 +287,29 @@ export interface RoundAgentView {
   readonly status: WorkUnitStatus;
   readonly activity?: readonly ActivityStep[];
   readonly detail?: UnitDetail;
+}
+
+/** The decision juncture a Jev typed decision was recorded at (mirrors the DO). */
+export type JevJuncture = "plan-review" | "attribution" | "fix-confidence";
+
+/**
+ * One recorded Jev typed decision (mirrors the DO's JevDecisionView): the
+ * juncture, the question, the typed answer (noul/choice/score), the calibrated
+ * confidence, optional probabilities, and whether the engine accepted or
+ * escalated. Backs the graph's `jev` nodes offline exactly like the live Worker.
+ * A fix-confidence decision is advisory only and never flips the gate verdict.
+ */
+export interface JevDecisionView {
+  readonly juncture: JevJuncture;
+  readonly question: string;
+  readonly answerType: "noul" | "choice" | "score";
+  readonly noul?: "yes" | "no" | "unsure";
+  readonly choice?: string;
+  readonly score?: number;
+  readonly confidence: number;
+  readonly probabilities?: Readonly<Record<string, number>>;
+  readonly accepted: boolean;
+  readonly at: string;
 }
 
 /** The kind of a fork that must be escalated to a human (mirrors the Worker). */
@@ -390,6 +419,8 @@ class ChangeRecord {
    * recorded workspace and a real status lifecycle.
    */
   readonly roundAgents = new Map<string, RoundAgentView>();
+  /** Jev typed decisions recorded at the three junctures (mirrors the DO). */
+  readonly jevDecisions: JevDecisionView[] = [];
   constructor(change: Change) {
     this.change = change;
   }
@@ -794,6 +825,45 @@ export class LocalChangeControl {
   }
 
   /**
+   * Record one Jev typed decision at one juncture (mirrors the DO). This is the
+   * real backing for a `jev` graph node, so a jev node can only exist once this
+   * record does. A fix-confidence decision is advisory ONLY: recording it never
+   * touches the completed/failed/integrated sets, so the mechanical gate and
+   * gate-equals-deploy remain authoritative and Jev never flips a verdict.
+   */
+  recordJevDecision(changeId: string, input: Omit<JevDecisionView, "at">): JevDecisionView {
+    const record = this.require(changeId);
+    const answerType =
+      input.answerType === "choice" || input.answerType === "score" ? input.answerType : "noul";
+    const stored: JevDecisionView = {
+      juncture: normalizeJuncture(input.juncture),
+      question: sanitizeText(typeof input.question === "string" ? input.question : "", 500),
+      answerType,
+      ...(answerType === "noul" &&
+      (input.noul === "yes" || input.noul === "no" || input.noul === "unsure")
+        ? { noul: input.noul }
+        : {}),
+      ...(answerType === "choice" && typeof input.choice === "string" && input.choice !== ""
+        ? { choice: input.choice.slice(0, 200) }
+        : {}),
+      ...(answerType === "score" && typeof input.score === "number" && Number.isFinite(input.score)
+        ? { score: input.score }
+        : {}),
+      confidence: clampUnit(input.confidence),
+      ...(input.probabilities ? { probabilities: sanitizeProbabilities(input.probabilities) } : {}),
+      accepted: input.accepted === true,
+      at: new Date().toISOString(),
+    };
+    record.jevDecisions.push(stored);
+    return stored;
+  }
+
+  /** The Jev typed decisions recorded for a Change (mirrors the DO). */
+  jevDecisionsFor(changeId: string): readonly JevDecisionView[] {
+    return this.require(changeId).jevDecisions;
+  }
+
+  /**
    * Record (or re-lease) a round-N agent instance keyed by (unitId, round),
    * against an already-provisioned round-N workspace (mirrors the DO's
    * recordRoundLease). A retry round's re-fanned unit is a BRAND NEW agent that
@@ -1073,6 +1143,7 @@ export class LocalChangeControl {
       roundAgents: [...record.roundAgents.values()].sort((a, b) =>
         a.round !== b.round ? a.round - b.round : a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0,
       ),
+      jevDecisions: record.jevDecisions,
     };
   }
 
@@ -1167,6 +1238,29 @@ export class LocalChangeControl {
           reason: String(b.reason ?? "verify-fail escalation"),
         });
         return json({ retryAttempt: recorded }, 201);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
+    const jevDecisionRoute = url.pathname.match(/^\/changes\/([^/]+)\/jev-decision$/);
+    if (method === "POST" && jevDecisionRoute) {
+      const b = parseBody(init);
+      try {
+        const recorded = this.recordJevDecision(dec(jevDecisionRoute[1]), {
+          juncture: (b.juncture as JevJuncture) ?? "plan-review",
+          question: String(b.question ?? ""),
+          answerType:
+            b.answerType === "choice" || b.answerType === "score"
+              ? (b.answerType as "choice" | "score")
+              : "noul",
+          ...(b.noul ? { noul: b.noul as "yes" | "no" | "unsure" } : {}),
+          ...(typeof b.choice === "string" && b.choice !== "" ? { choice: b.choice } : {}),
+          ...(typeof b.score === "number" ? { score: b.score } : {}),
+          confidence: numberOr(b.confidence, 0),
+          ...(b.probabilities ? { probabilities: b.probabilities as Record<string, number> } : {}),
+          accepted: b.accepted === true,
+        });
+        return json({ jevDecision: recorded }, 201);
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 400);
       }
@@ -1469,6 +1563,39 @@ function roundAgentKey(unitId: string, round: number): string {
 /** Normalize a retry round to a positive integer (round 2 is the first retry). */
 function normalizeRound(round: number): number {
   return Number.isFinite(round) && round > 0 ? Math.floor(round) : 2;
+}
+
+/** Normalize a Jev juncture to one of the three known junctures. */
+function normalizeJuncture(juncture: unknown): JevJuncture {
+  return juncture === "plan-review" || juncture === "attribution" || juncture === "fix-confidence"
+    ? juncture
+    : "plan-review";
+}
+
+/** Clamp a confidence/probability to [0, 1]; a non-finite value becomes 0. */
+function clampUnit(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.min(1, Math.max(0, value));
+}
+
+/** Keep only finite numeric probability entries, bounded in count. */
+function sanitizeProbabilities(
+  probabilities: Readonly<Record<string, number>>,
+): Readonly<Record<string, number>> {
+  const out: Record<string, number> = {};
+  let count = 0;
+  for (const [key, value] of Object.entries(probabilities)) {
+    if (count >= 50) {
+      break;
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      out[key.slice(0, 200)] = value;
+      count += 1;
+    }
+  }
+  return out;
 }
 
 function json(body: unknown, status: number): Response {

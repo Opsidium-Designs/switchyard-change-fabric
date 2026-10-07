@@ -39,6 +39,7 @@ import { LocalChangeControl } from "../src/local-control.ts";
 import {
   assertBacked,
   buildWorkGraphModel,
+  jevNodeId,
   roundAgentNodeId,
   type ChangeStateSnapshot,
 } from "../src/graph-model.ts";
@@ -250,7 +251,7 @@ function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWork
     // LocalChangeControl so the recorded attempts surface in state identically
     // to the live Worker (and back the graph nodes/edges).
     const delegated =
-      /^\/changes\/[^/]+\/(verify-attempt|retry-attempt)$/.test(url.pathname) ||
+      /^\/changes\/[^/]+\/(verify-attempt|retry-attempt|jev-decision)$/.test(url.pathname) ||
       /^\/changes\/[^/]+\/work\/[^/]+\/(verify-fail|step|detail|stream)$/.test(url.pathname) ||
       /^\/changes\/[^/]+\/work\/[^/]+\/round\/[^/]+\/(lease|step|detail|complete|fail)$/.test(
         url.pathname,
@@ -326,6 +327,31 @@ async function runLadder(options: {
    * ESCALATION_MODEL is used for every retry round (the pre-list behavior).
    */
   readonly escalationModels?: readonly string[];
+  /**
+   * An optional injected Jev typed-decision caller for the attribution and
+   * fix-confidence junctures, plus its accept-when-confident threshold. When set
+   * the ladder asks Jev which module a failure implicates and the post-gate step
+   * records a fix-confidence advisory; a deterministic fake keeps it offline.
+   */
+  readonly jev?: (
+    state: string,
+    questions: readonly { readonly key: string; readonly type: "noul" | "choice" | "score"; readonly question: string; readonly options?: readonly string[] }[],
+  ) => Promise<
+    Readonly<
+      Record<
+        string,
+        {
+          readonly type: "noul" | "choice" | "score";
+          readonly noul?: "yes" | "no" | "unsure";
+          readonly choice?: string;
+          readonly score?: number;
+          readonly confidence: number;
+          readonly probabilities?: Readonly<Record<string, number>>;
+        }
+      >
+    >
+  >;
+  readonly jevThreshold?: number;
 }) {
   const spec = options.spec ?? SPEC;
   const changeId = options.changeId ?? "change-ladder";
@@ -372,6 +398,7 @@ async function runLadder(options: {
     escalationModel: ESCALATION_MODEL,
     ...(options.escalationModels ? { escalationModels: options.escalationModels } : {}),
     maxModelRetries: options.maxModelRetries ?? 1,
+    ...(options.jev ? { jev: options.jev, jevThreshold: options.jevThreshold ?? 0.75 } : {}),
     // Redeploy-in-place wiring (M8.4): the app was already deployed, so a
     // verified fix refreshes it; a red run must not redeploy.
     deployAppDir: projectDir,
@@ -1274,5 +1301,237 @@ blueprint:
       expect(attempt.frozenContracts).toEqual([]);
       expect(attempt.frozenContractFiles).toEqual([]);
     }
+  });
+});
+
+
+/**
+ * The Jev typed-decision junctures on the live run path, proven offline with a
+ * deterministic fake Jev caller (NO network): failure attribution complements
+ * the string-parse (fallback-to-all preserved), fix-confidence is recorded but
+ * NEVER changes the authoritative mechanical gate verdict, each recorded
+ * decision renders a backed jev node, and Jev is absent when unconfigured.
+ */
+type FakeJevAnswer = {
+  readonly type: "noul" | "choice" | "score";
+  readonly noul?: "yes" | "no" | "unsure";
+  readonly choice?: string;
+  readonly score?: number;
+  readonly confidence: number;
+  readonly probabilities?: Readonly<Record<string, number>>;
+};
+
+/**
+ * A deterministic fake Jev caller: it answers by question key. An attribution
+ * question gets the configured choice + confidence; a fix-confidence question
+ * gets the configured noul + confidence. Records every call so a test can assert
+ * what Jev was asked. No network.
+ */
+function makeFakeJev(options: {
+  readonly attribution?: FakeJevAnswer;
+  readonly fixConfidence?: FakeJevAnswer;
+}) {
+  const calls: { state: string; keys: string[] }[] = [];
+  const jev = async (
+    state: string,
+    questions: readonly { readonly key: string }[],
+  ): Promise<Readonly<Record<string, FakeJevAnswer>>> => {
+    calls.push({ state, keys: questions.map((q) => q.key) });
+    const out: Record<string, FakeJevAnswer> = {};
+    for (const q of questions) {
+      if (q.key === "attribution" && options.attribution) {
+        out.attribution = options.attribution;
+      }
+      if (q.key === "fix-confidence" && options.fixConfidence) {
+        out["fix-confidence"] = options.fixConfidence;
+      }
+    }
+    return out;
+  };
+  return { jev, calls };
+}
+
+describe("H2: the Jev typed-decision junctures (offline, faked Jev, no network)", () => {
+  it("JUNCTURE (b) attribution: a confident Jev choice complements the string-parse (fallback-to-all preserved)", async () => {
+    // Two units; alpha already passes, only beta needs escalation. Jev confidently
+    // names beta too, so the recorded attribution decision is accepted and beta is
+    // re-fanned. The string-parse already found beta, so the union is still beta.
+    const { jev, calls } = makeFakeJev({
+      attribution: { type: "choice", choice: "beta", confidence: 0.9 },
+    });
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      alwaysPassingUnits: ["alpha"],
+      subdir: "jev-attribution",
+      jev,
+      jevThreshold: 0.75,
+    });
+
+    // The ladder asked Jev the attribution question on the round-1 fail.
+    expect(calls.some((c) => c.keys.includes("attribution"))).toBe(true);
+    // The retry re-fanned beta (the parse + Jev agree), never alpha.
+    expect(snapshot.retryAttempts).toHaveLength(1);
+    expect(snapshot.retryAttempts?.[0]?.implicatedUnits).toContain("beta");
+    expect(snapshot.retryAttempts?.[0]?.implicatedUnits).not.toContain("alpha");
+    // A backed attribution jev node is recorded and renders.
+    const attribution = (snapshot.jevDecisions ?? []).find((d) => d.juncture === "attribution");
+    expect(attribution).toBeDefined();
+    expect(attribution?.answerType).toBe("choice");
+    expect(attribution?.choice).toBe("beta");
+    expect(attribution?.accepted).toBe(true);
+    const model = buildWorkGraphModel(snapshot);
+    const jevNode = model.nodes.find((n) => n.kind === "jev" && n.jevDetail?.juncture === "attribution");
+    expect(jevNode).toBeDefined();
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
+  });
+
+  it("JUNCTURE (b) attribution: a low-confidence Jev choice is recorded ESCALATED and the parse+fallback still re-fans", async () => {
+    // Jev is unsure (below threshold), so its choice is NOT used; the string-parse
+    // + re-fan-all fallback still drives the re-fan, so the change still settles.
+    const { jev } = makeFakeJev({
+      attribution: { type: "choice", choice: "beta", confidence: 0.2 },
+    });
+    const { snapshot, result } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      alwaysPassingUnits: ["alpha"],
+      subdir: "jev-attribution-lowconf",
+      jev,
+      jevThreshold: 0.75,
+    });
+    const attribution = (snapshot.jevDecisions ?? []).find((d) => d.juncture === "attribution");
+    expect(attribution?.accepted).toBe(false);
+    // The parse+fallback preserved: beta still re-fanned and the change settled.
+    expect(snapshot.retryAttempts?.[0]?.implicatedUnits).toContain("beta");
+    expect(result.evidence.integration.integratedUnits).toContain("beta");
+  });
+
+  it("JUNCTURE (c) fix-confidence is ADVISORY: a confident 'unacceptable' with a PASSING gate still ships", async () => {
+    // The gate passes on the escalation model, so the fix integrates and
+    // redeploys. Jev confidently says the fix is NOT acceptable, but that is
+    // advisory only: the mechanical gate is authoritative, so the fix still ships.
+    const { jev } = makeFakeJev({
+      fixConfidence: { type: "noul", noul: "no", confidence: 0.95 },
+    });
+    const { snapshot, result, redeployed } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      subdir: "jev-fix-unacceptable-passing",
+      jev,
+      jevThreshold: 0.75,
+    });
+    // The mechanical gate is authoritative: the fix integrated and redeployed
+    // EVEN THOUGH Jev said unacceptable.
+    expect(result.evidence.integration.integratedUnits).toContain("fix");
+    expect(result.evidence.integration.verdict).toBe("verified");
+    expect(redeployed).toEqual(["switchyard-change-fabric-ladder-app"]);
+    // The fix-confidence decision is recorded as a sidecar, marked NOT accepted
+    // (Jev's negative advisory), but it never flipped the verdict.
+    const fixConf = (snapshot.jevDecisions ?? []).find((d) => d.juncture === "fix-confidence");
+    expect(fixConf).toBeDefined();
+    expect(fixConf?.noul).toBe("no");
+    expect(fixConf?.accepted).toBe(false);
+    // The decision renders a backed jev node, and every node stays backed.
+    const model = buildWorkGraphModel(snapshot);
+    expect(
+      model.nodes.some((n) => n.kind === "jev" && n.jevDetail?.juncture === "fix-confidence"),
+    ).toBe(true);
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
+  });
+
+  it("JUNCTURE (c) fix-confidence is ADVISORY: a confident 'acceptable' with a FAILING gate still fails", async () => {
+    // No model passes the gate, so the change is a terminal failure and does NOT
+    // integrate or redeploy. Jev confidently says the fix IS acceptable, but that
+    // is advisory only: the mechanical gate is authoritative, so the fix fails.
+    const { jev } = makeFakeJev({
+      fixConfidence: { type: "noul", noul: "yes", confidence: 0.99 },
+    });
+    const { snapshot, result, redeployed } = await runLadder({
+      passingModel: "no-model-ever-passes",
+      subdir: "jev-fix-acceptable-failing",
+      jev,
+      jevThreshold: 0.75,
+    });
+    // The mechanical gate is authoritative: the change failed, nothing integrated
+    // or redeployed, EVEN THOUGH Jev said the fix was acceptable.
+    expect(result.evidence.integration.integratedUnits).not.toContain("fix");
+    expect(redeployed).toEqual([]);
+    // The fix-confidence decision is recorded (accepted, a confident yes) but it
+    // did not green or ship the change.
+    const fixConf = (snapshot.jevDecisions ?? []).find((d) => d.juncture === "fix-confidence");
+    expect(fixConf?.noul).toBe("yes");
+    expect(fixConf?.accepted).toBe(true);
+    const model = buildWorkGraphModel(snapshot);
+    // The goal and verify nodes still read red (the authoritative failure signal).
+    expect(model.nodes.find((n) => n.kind === "goal")?.verified).toBe(false);
+    expect(model.nodes.filter((n) => n.kind === "verify").every((n) => n.verified === false)).toBe(
+      true,
+    );
+  });
+
+  it("records a backed jev node per decision, placed near its juncture, and rejects an unbacked jev node", async () => {
+    const { jev } = makeFakeJev({
+      attribution: { type: "choice", choice: "fix", confidence: 0.9 },
+      fixConfidence: { type: "noul", noul: "yes", confidence: 0.9 },
+    });
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      subdir: "jev-nodes",
+      jev,
+      jevThreshold: 0.75,
+    });
+    const model = buildWorkGraphModel(snapshot);
+    const jevNodes = model.nodes.filter((n) => n.kind === "jev");
+    // Both an attribution and a fix-confidence decision were recorded, so two jev
+    // nodes render, each backed by its recorded decision.
+    expect(jevNodes.length).toBeGreaterThanOrEqual(2);
+    for (const node of jevNodes) {
+      expect(node.backing.kind).toBe("jev-decision");
+      expect(node.jevDetail).toBeDefined();
+    }
+    // An attribution jev node hangs off the retry (its juncture); a fix-confidence
+    // jev node hangs off a verify (its juncture). Assert each has an incoming edge.
+    for (const node of jevNodes) {
+      expect(model.edges.some((e) => e.to === node.id)).toBe(true);
+    }
+    // assertBacked THROWS for a jev node with no recorded decision.
+    const bogus = {
+      id: jevNodeId(snapshot.id, "plan-review", 9),
+      kind: "jev" as const,
+      label: "jev: plan-review accepted",
+      status: "integrated" as const,
+      verified: true,
+      escalated: false,
+      backing: {
+        kind: "jev-decision" as const,
+        changeId: snapshot.id,
+        juncture: "plan-review" as const,
+        question: "ghost",
+        answerType: "noul" as const,
+        confidence: 0.99,
+      },
+    };
+    expect(() => assertBacked(bogus, snapshot)).toThrow(/no recorded jev decision/);
+  });
+
+  it("Jev is ABSENT when unconfigured: no jev node, heuristic + gate path unchanged", async () => {
+    // No Jev caller injected (the offline default): no jev decisions are recorded
+    // and no jev node appears, so the heuristic + mechanical-gate path is exactly
+    // as before.
+    const { snapshot, result } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      subdir: "jev-absent",
+    });
+    expect(snapshot.jevDecisions ?? []).toHaveLength(0);
+    const model = buildWorkGraphModel(snapshot);
+    expect(model.nodes.some((n) => n.kind === "jev")).toBe(false);
+    // The change still settled green through the normal ladder.
+    expect(result.evidence.integration.integratedUnits).toContain("fix");
   });
 });

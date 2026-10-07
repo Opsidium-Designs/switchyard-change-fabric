@@ -41,6 +41,7 @@ import {
   runRecruitment,
   runRecruitmentLive,
   selectExecutor,
+  selectJev,
   selectPlanner,
   stableAppWorkerName,
   type Change,
@@ -521,6 +522,15 @@ const commands: Command[] = [
         ...(gateWiring.maxModelRetries !== undefined
           ? { maxModelRetries: gateWiring.maxModelRetries }
           : {}),
+        // The Jev typed-decision layer for the attribution and fix-confidence
+        // junctures, selected from the same gateway env. When live, inject the
+        // typed caller + threshold so the ladder asks which module a failure
+        // implicates and the post-gate step records a fix-confidence advisory.
+        // When not live (offline), Jev is absent, so no decision juncture runs.
+        ...(() => {
+          const jev = selectJev();
+          return jev.live && jev.ask ? { jev: jev.ask, jevThreshold: jev.threshold } : {};
+        })(),
         ...(deployAppDir ? { deployAppDir: resolve(deployAppDir) } : {}),
         ...(deployAppName ? { deployAppName } : {}),
         ...(deployApp ? { deployApp } : {}),
@@ -838,12 +848,19 @@ function plannerInjectionFromEnv(): PlannerInjection | undefined {
   if (!selected.live || !selected.plan) {
     return undefined;
   }
+  // The Jev typed-decision layer for the plan-review juncture, selected from the
+  // same gateway env. When Jev is live, inject its typed caller + threshold so
+  // the planner pass asks "does this plan cover the goal?" and escalates on a
+  // low-confidence answer. When not live (offline/no gateway), Jev is absent, so
+  // the plan-review juncture is skipped and the plan path is unchanged.
+  const jev = selectJev();
   return {
     plan: selected.plan,
     baseModel: selected.baseModel,
     ...(selected.escalationModels.length > 0
       ? { escalationModels: selected.escalationModels }
       : {}),
+    ...(jev.live && jev.ask ? { jev: jev.ask, jevThreshold: jev.threshold } : {}),
   };
 }
 

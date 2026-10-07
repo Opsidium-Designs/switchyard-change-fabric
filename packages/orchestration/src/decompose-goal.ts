@@ -18,6 +18,7 @@ import {
   type Change,
   type DecomposeResult,
   type GoalAnalyzer,
+  type JevTransport,
   type PlanTransport,
   type RecordedPlan,
   type WorkGraph,
@@ -60,6 +61,17 @@ export interface PlannerInjection {
   readonly plan: PlanTransport;
   readonly baseModel: string;
   readonly escalationModels?: readonly string[];
+  /**
+   * The injected typed-decision transport for the PLAN-REVIEW juncture. When
+   * present, after a valid plan is projected the planner pass asks Jev whether
+   * the plan covers the goal; a confident-yes proceeds, a low-confidence or
+   * confident-no escalates (bounded re-plan) and records the decision. When
+   * absent (the default, offline path) the juncture is skipped, so change-core
+   * stays pure and offline and the plan path is unchanged.
+   */
+  readonly jev?: JevTransport;
+  /** The accept-when-confident threshold for the plan-review juncture (default 0.75). */
+  readonly jevThreshold?: number;
 }
 
 /** The outcome of decomposing a goal: the Change, its graph, and the intent. */
@@ -93,6 +105,10 @@ export async function decomposeGoal(options: DecomposeGoalOptions): Promise<Deco
       baseModel: options.planner.baseModel,
       ...(options.planner.escalationModels
         ? { escalationModels: options.planner.escalationModels }
+        : {}),
+      ...(options.planner.jev ? { jev: options.planner.jev } : {}),
+      ...(options.planner.jevThreshold !== undefined
+        ? { jevThreshold: options.planner.jevThreshold }
         : {}),
       ...(options.changeId ? { changeId: options.changeId } : {}),
     });
@@ -228,6 +244,17 @@ export function changeToSpecYaml(change: Change): string {
     }
     if (change.plan.rationale) {
       lines.push(`  rationale: ${quote(change.plan.rationale)}`);
+    }
+    // The plan-review decision rides the round-trip so the Worker-side Change
+    // carries it and the console/graph can root a jev node near the planner.
+    // Optional and empty-safe: omitted when the plan has none.
+    if (change.plan.jevReview) {
+      const review = change.plan.jevReview;
+      lines.push("  jev_review:");
+      lines.push(`    question: ${quote(review.question)}`);
+      lines.push(`    noul: ${quote(review.noul)}`);
+      lines.push(`    confidence: ${review.confidence}`);
+      lines.push(`    accepted: ${review.accepted ? "true" : "false"}`);
     }
     if (units.length > 0) {
       lines.push("  units:");

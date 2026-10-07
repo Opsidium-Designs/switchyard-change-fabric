@@ -34,6 +34,7 @@ import type {
   ChangeBlueprintContract,
   ChangeBlueprintModule,
   ChangePlan,
+  ChangePlanReview,
   ChangePlanSource,
   ChangePlanUnit,
   WorkUnit,
@@ -163,6 +164,7 @@ function parsePlan(value: unknown, work: readonly WorkUnit[]): ChangePlan | unde
   // them still validates. Only a non-empty string is carried.
   const promptSummary = optionalNonEmptyString(value, "prompt_summary");
   const rationale = optionalNonEmptyString(value, "rationale");
+  const jevReview = parsePlanReview(value["jev_review"]);
   return {
     source,
     model,
@@ -170,7 +172,38 @@ function parsePlan(value: unknown, work: readonly WorkUnit[]): ChangePlan | unde
     contracts,
     ...(promptSummary !== undefined ? { promptSummary } : {}),
     ...(rationale !== undefined ? { rationale } : {}),
+    ...(jevReview !== undefined ? { jevReview } : {}),
   };
+}
+
+/**
+ * Parse the optional plan-review decision carried on a Change spec: the typed
+ * noul verdict the Jev decision layer returned for whether the plan covers the
+ * goal, its confidence, and whether the plan was accepted or escalated. OPTIONAL
+ * and empty-safe: a plan with no decision omits it and this returns undefined.
+ * When present it is validated so a malformed decision is rejected rather than
+ * silently dropped, keeping the jev node honest once it survives the round-trip.
+ */
+function parsePlanReview(value: unknown): ChangePlanReview | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!isRecord(value)) {
+    throw new ChangeSpecError("plan.jev_review must be a mapping when present");
+  }
+  const noul = value["noul"];
+  if (noul !== "yes" && noul !== "no" && noul !== "unsure") {
+    throw new ChangeSpecError(
+      `plan.jev_review.noul must be one of yes, no, unsure, got ${JSON.stringify(noul)}`,
+    );
+  }
+  const confidence = value["confidence"];
+  if (typeof confidence !== "number" || !Number.isFinite(confidence)) {
+    throw new ChangeSpecError("plan.jev_review.confidence must be a finite number");
+  }
+  const question = optionalString(value, "question") ?? "Does this plan cover the goal?";
+  const accepted = value["accepted"] === true;
+  return { question, noul, confidence, accepted };
 }
 
 function parsePlanUnits(

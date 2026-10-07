@@ -325,6 +325,24 @@ function trianglePoints(r: number): string {
   return pts.join(" ");
 }
 
+/**
+ * The five points of a regular pentagon with circumradius `r`, centered at the
+ * node origin (point up). Used for the JEV decision node so a typed-decision
+ * beat reads as its own distinct shape, set apart from the goal diamond, the
+ * planner triangle, the agent circles, the tool square, and the verify/retry
+ * hexagons, while keeping the same visual footprint as a circle of radius `r`.
+ */
+function pentagonPoints(r: number): string {
+  const pts: string[] = [];
+  for (let i = 0; i < 5; i += 1) {
+    const angle = (2 * Math.PI / 5) * i - Math.PI / 2; // start at the top
+    const x = r * Math.cos(angle);
+    const y = r * Math.sin(angle);
+    pts.push(`${x.toFixed(2)},${y.toFixed(2)}`);
+  }
+  return pts.join(" ");
+}
+
 /** The fill color for a node from its kind and verified/escalated/failed state. */
 function nodeFill(node: GraphNode): string {
   if (node.escalated) {
@@ -344,6 +362,16 @@ function nodeFill(node: GraphNode): string {
   // normal running agent (blue) and the human-escalation red.
   if (node.kind === "retry") {
     return "#a371f7";
+  }
+  // A jev node is a typed-decision beat: a distinct AMBER/ORANGE fill, set apart
+  // from the teal planner and every other kind. An ACCEPTED decision (confident
+  // use) reads as a brighter amber; an ESCALATED one reads as a muted amber, so
+  // a glance distinguishes confident-use from escalate. It is checked before the
+  // generic verified-green and the kind switch so a jev node is always drawn in
+  // its own hue, never as a generic green/running node. It is display only and
+  // never changes an authoritative verdict.
+  if (node.kind === "jev") {
+    return node.verified ? "#e3883e" : "#9a5a1f";
   }
   if (node.status === "failed") {
     // A failed unit is a distinct terminal state: a dark, muted red, clearly not
@@ -698,6 +726,13 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                   ) : node.kind === "verify" || node.kind === "retry" ? (
                     <polygon
                       points={hexagonPoints(r)}
+                      fill={nodeFill(node)}
+                      stroke={selected ? "#e6edf3" : "#0d1117"}
+                      strokeWidth={selected ? 3 : 1.5}
+                    />
+                  ) : node.kind === "jev" ? (
+                    <polygon
+                      points={pentagonPoints(r)}
                       fill={nodeFill(node)}
                       stroke={selected ? "#e6edf3" : "#0d1117"}
                       strokeWidth={selected ? 3 : 1.5}

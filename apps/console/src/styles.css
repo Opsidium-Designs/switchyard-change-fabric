@@ -436,6 +436,11 @@ body {
    graph itself. */
 .sw-verify { background: #238636; }
 .sw-retry { background: #a371f7; }
+/* The jev node is a typed-decision beat, drawn as an AMBER pentagon in the
+   graph, so its legend glyph is an amber pentagon too. The graph colors it
+   brighter when the decision was accepted and muted when it escalated; the
+   legend lists only the kind, so it uses the accepted amber. */
+.sw-jev { background: #e3883e; }
 
 /* The tool legend glyph is a YELLOW SQUARE, matching the yellow square tool
    node drawn in the graph, so the legend and the graph agree the agent-built
@@ -465,6 +470,20 @@ body {
 
 .swatch-triangle.sw-planner {
   border-bottom-color: #2bb3a3;
+}
+
+/* The jev legend glyph is a PENTAGON (via clip-path), matching the amber
+   pentagon jev node drawn in the graph. It keeps roughly the same footprint as
+   the circular swatches. */
+.swatch-pentagon {
+  width: 0.9rem;
+  height: 0.9rem;
+  display: inline-block;
+  clip-path: polygon(50% 0%, 100% 38%, 82% 100%, 18% 100%, 0% 38%);
+}
+
+.swatch-pentagon.sw-jev {
+  background: #e3883e;
 }
 
 /* The goal legend glyph is a DIAMOND (a CSS-rotated square), matching the
