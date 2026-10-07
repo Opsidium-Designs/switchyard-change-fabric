@@ -335,7 +335,9 @@ async function runLadder(options: {
    */
   readonly jev?: (
     state: string,
-    questions: readonly { readonly key: string; readonly type: "noul" | "choice" | "score"; readonly question: string; readonly options?: readonly string[] }[],
+    questions: Readonly<
+      Record<string, { readonly type: "noul" | "choice" | "score"; readonly instructions: string; readonly criteria?: readonly string[] }>
+    >,
   ) => Promise<
     Readonly<
       Record<
@@ -352,6 +354,19 @@ async function runLadder(options: {
     >
   >;
   readonly jevThreshold?: number;
+  /**
+   * An optional injected re-plan transport for the retry re-fan. When set, the
+   * ladder asks it (fed the failing evidence + candidate unit ids) for a REVISED
+   * set of units to re-fan this round and re-fans only those; an invalid/empty
+   * reply falls back to the string-parse implicated set. A deterministic fake
+   * keeps it offline.
+   */
+  readonly rePlan?: (input: {
+    readonly evidence: string;
+    readonly candidateUnitIds: readonly string[];
+    readonly attributionChoice?: string;
+    readonly round: number;
+  }) => Promise<readonly string[]>;
 }) {
   const spec = options.spec ?? SPEC;
   const changeId = options.changeId ?? "change-ladder";
@@ -399,6 +414,7 @@ async function runLadder(options: {
     ...(options.escalationModels ? { escalationModels: options.escalationModels } : {}),
     maxModelRetries: options.maxModelRetries ?? 1,
     ...(options.jev ? { jev: options.jev, jevThreshold: options.jevThreshold ?? 0.75 } : {}),
+    ...(options.rePlan ? { rePlan: options.rePlan } : {}),
     // Redeploy-in-place wiring (M8.4): the app was already deployed, so a
     // verified fix refreshes it; a red run must not redeploy.
     deployAppDir: projectDir,
@@ -1334,15 +1350,16 @@ function makeFakeJev(options: {
   const calls: { state: string; keys: string[] }[] = [];
   const jev = async (
     state: string,
-    questions: readonly { readonly key: string }[],
+    questions: Readonly<Record<string, { readonly type: "noul" | "choice" | "score" }>>,
   ): Promise<Readonly<Record<string, FakeJevAnswer>>> => {
-    calls.push({ state, keys: questions.map((q) => q.key) });
+    const keys = Object.keys(questions);
+    calls.push({ state, keys });
     const out: Record<string, FakeJevAnswer> = {};
-    for (const q of questions) {
-      if (q.key === "attribution" && options.attribution) {
+    for (const key of keys) {
+      if (key === "attribution" && options.attribution) {
         out.attribution = options.attribution;
       }
-      if (q.key === "fix-confidence" && options.fixConfidence) {
+      if (key === "fix-confidence" && options.fixConfidence) {
         out["fix-confidence"] = options.fixConfidence;
       }
     }
@@ -1533,5 +1550,74 @@ describe("H2: the Jev typed-decision junctures (offline, faked Jev, no network)"
     expect(model.nodes.some((n) => n.kind === "jev")).toBe(false);
     // The change still settled green through the normal ladder.
     expect(result.evidence.integration.integratedUnits).toContain("fix");
+  });
+});
+
+describe("re-plan on retry (offline, faked planner): choose a revised unit set to re-fan", () => {
+  it("re-fans ONLY the re-planned subset (fewer than all), recording the revised plan per round", async () => {
+    // Three units all need escalation, so the round-1 fail names all three files
+    // and the string-parse would re-fan ALL THREE. The injected re-plan narrows
+    // the retry to just "two", so the recorded retry re-fans ONLY "two" (a
+    // spurious unit like a passing module is dropped). The mechanical gate stays
+    // authoritative; the re-plan only chooses which units re-run.
+    const seen: { candidate: string[]; round: number }[] = [];
+    const rePlan = async (input: {
+      readonly candidateUnitIds: readonly string[];
+      readonly round: number;
+    }): Promise<readonly string[]> => {
+      seen.push({ candidate: [...input.candidateUnitIds], round: input.round });
+      return ["two"]; // revise the plan to re-run only "two"
+    };
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_THREE_UNITS,
+      changeId: "change-ladder-three",
+      subdir: "replan-subset",
+      maxConcurrency: 3,
+      rePlan,
+    });
+
+    // The re-plan was asked, handed every gated unit as a candidate.
+    expect(seen.length).toBeGreaterThanOrEqual(1);
+    expect(seen[0]?.candidate.sort()).toEqual(["one", "three", "two"]);
+    // The retry re-fanned ONLY the re-planned subset: "two", not all three.
+    expect(snapshot.retryAttempts).toHaveLength(1);
+    const implicated = [...(snapshot.retryAttempts?.[0]?.implicatedUnits ?? [])].sort();
+    expect(implicated).toEqual(["two"]);
+    // The recorded reason names the re-plan provenance so the revised plan is
+    // visible per round (not the default implicated-unit re-fan reason).
+    expect(snapshot.retryAttempts?.[0]?.reason).toContain("re-planned");
+    // Only the re-planned unit got a round-N agent; the dropped units did not.
+    const model = buildWorkGraphModel(snapshot);
+    const roundAgents = model.nodes.filter(
+      (n) => n.kind === "agent" && n.backing.kind === "round-agent",
+    );
+    expect(roundAgents.map((n) => (n.backing as { unitId: string }).unitId)).toEqual(["two"]);
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
+  });
+
+  it("FALLS BACK to the implicated set when the re-plan returns an invalid/empty revision", async () => {
+    // The re-plan returns an empty (unusable) revision, so the ladder falls back
+    // to the string-parse implicated set, which for three failing units is all
+    // three. The fallback is never silently dropped.
+    const rePlan = async (): Promise<readonly string[]> => {
+      return []; // no usable revision -> fall back to the implicated set
+    };
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_THREE_UNITS,
+      changeId: "change-ladder-three",
+      subdir: "replan-fallback",
+      maxConcurrency: 3,
+      rePlan,
+    });
+    expect(snapshot.retryAttempts).toHaveLength(1);
+    const implicated = [...(snapshot.retryAttempts?.[0]?.implicatedUnits ?? [])].sort();
+    // Fell back to the full implicated set (all three failing units).
+    expect(implicated).toEqual(["one", "three", "two"]);
+    // The reason is the default implicated-unit re-fan reason, not re-planned.
+    expect(snapshot.retryAttempts?.[0]?.reason).not.toContain("re-planned");
   });
 });

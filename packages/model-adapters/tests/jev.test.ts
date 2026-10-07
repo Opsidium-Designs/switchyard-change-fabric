@@ -45,7 +45,9 @@ describe("createAiGatewayJevInvoke (BYOK /ai/run + cf-aig-gateway-id, offline fa
     });
     const answers = await invoke({
       state: "Goal: fix the bug",
-      questions: [{ key: "plan-review", type: "noul", question: "Does this plan cover the goal?" }],
+      questions: {
+        "plan-review": { type: "noul", instructions: "Does this plan cover the goal?" },
+      },
     });
 
     // The URL is the gateway base plus the /ai/run run endpoint, NOT the OpenAI
@@ -58,17 +60,20 @@ describe("createAiGatewayJevInvoke (BYOK /ai/run + cf-aig-gateway-id, offline fa
     expect(seenHeaders.authorization).toBeUndefined();
     expect(seenHeaders["content-type"]).toBe("application/json");
 
-    // The body carries the decision model and the state + questions input.
+    // The body carries the decision model and the state + questions input. The
+    // questions ride as an OBJECT keyed by question name (not a positional
+    // array), each carrying type + instructions (+ criteria for a choice).
     const body = JSON.parse(seenBody);
     expect(body.model).toBe(DEFAULT_JEV_MODEL);
     expect(body.input.state).toContain("Goal: fix the bug");
-    expect(body.input.questions[0]).toMatchObject({
-      key: "plan-review",
+    expect(Array.isArray(body.input.questions)).toBe(false);
+    expect(body.input.questions["plan-review"]).toEqual({
       type: "noul",
-      question: "Does this plan cover the goal?",
+      instructions: "Does this plan cover the goal?",
     });
 
-    // The reply is parsed into a typed noul answer with its confidence.
+    // The reply is parsed into a typed noul answer with its confidence, keyed by
+    // the same question name.
     expect(answers["plan-review"]).toMatchObject({ type: "noul", noul: "yes", confidence: 0.9 });
   });
 
@@ -84,13 +89,15 @@ describe("createAiGatewayJevInvoke (BYOK /ai/run + cf-aig-gateway-id, offline fa
       gatewayId: "g",
       fetchFn: fakeFetch,
     });
-    await invoke({ state: "x", questions: [] });
+    await invoke({ state: "x", questions: {} });
     expect(seenUrl).toBe("https://gw/base/ai/run");
   });
 
   it("parses a choice answer over option ids and a score answer", async () => {
-    const fakeFetch = (async () =>
-      new Response(
+    let seenBody = "";
+    const fakeFetch = (async (_url: string, init?: RequestInit) => {
+      seenBody = String(init?.body ?? "");
+      return new Response(
         JSON.stringify({
           answers: {
             attribution: {
@@ -103,7 +110,8 @@ describe("createAiGatewayJevInvoke (BYOK /ai/run + cf-aig-gateway-id, offline fa
           },
         }),
         { status: 200 },
-      )) as unknown as typeof fetch;
+      );
+    }) as unknown as typeof fetch;
     const invoke = createAiGatewayJevInvoke({
       gatewayUrl: "https://gw/base",
       gatewayToken: "t",
@@ -112,11 +120,21 @@ describe("createAiGatewayJevInvoke (BYOK /ai/run + cf-aig-gateway-id, offline fa
     });
     const answers = await invoke({
       state: "s",
-      questions: [
-        { key: "attribution", type: "choice", question: "which?", options: ["users", "orders"] },
-        { key: "quality", type: "score", question: "how good?" },
-      ],
+      questions: {
+        attribution: { type: "choice", instructions: "which?", criteria: ["users", "orders"] },
+        quality: { type: "score", instructions: "how good?" },
+      },
     });
+    // The request body carries the questions object-keyed, with a choice
+    // question's allowed options under `criteria`.
+    const body = JSON.parse(seenBody);
+    expect(body.input.questions.attribution).toEqual({
+      type: "choice",
+      instructions: "which?",
+      criteria: ["users", "orders"],
+    });
+    expect(body.input.questions.quality).toEqual({ type: "score", instructions: "how good?" });
+    // The answers come back object-keyed by the same question names.
     expect(answers.attribution).toMatchObject({ type: "choice", choice: "users", confidence: 0.82 });
     expect(answers.attribution?.probabilities).toEqual({ users: 0.82, orders: 0.18 });
     expect(answers.quality).toMatchObject({ type: "score", score: 7.5, confidence: 0.6 });
@@ -131,10 +149,10 @@ describe("createAiGatewayJevInvoke (BYOK /ai/run + cf-aig-gateway-id, offline fa
       gatewayId: "g",
       fetchFn: fakeFetch,
     });
-    await expect(invoke({ state: "s", questions: [] })).rejects.toThrow(
+    await expect(invoke({ state: "s", questions: {} })).rejects.toThrow(
       /AI Gateway decision call failed/,
     );
-    await expect(invoke({ state: "s", questions: [] })).rejects.not.toThrow(/gateway-token-value/);
+    await expect(invoke({ state: "s", questions: {} })).rejects.not.toThrow(/gateway-token-value/);
   });
 
   it("rejects a non-JSON decision reply with a clear jev error", async () => {
@@ -146,7 +164,7 @@ describe("createAiGatewayJevInvoke (BYOK /ai/run + cf-aig-gateway-id, offline fa
       gatewayId: "g",
       fetchFn: fakeFetch,
     });
-    await expect(invoke({ state: "s", questions: [] })).rejects.toBeInstanceOf(JevResponseError);
+    await expect(invoke({ state: "s", questions: {} })).rejects.toBeInstanceOf(JevResponseError);
   });
 });
 

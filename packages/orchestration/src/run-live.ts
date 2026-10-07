@@ -204,6 +204,30 @@ export type TeardownApp = (input: {
   readonly appName: string;
 }) => Promise<void>;
 
+/**
+ * The injected re-plan transport the change-level ladder calls on a verify-fail
+ * to produce a REVISED set of units to re-fan for the next retry round. It is
+ * handed the failing gate evidence, the candidate unit ids (every gated unit),
+ * and the optional Jev attribution choice, and returns the subset of those unit
+ * ids the re-plan judges should re-run on the stronger model. Returning a subset
+ * (possibly fewer than all, dropping a spurious unit like a passing module)
+ * narrows the re-fan; returning an empty or invalid set means the re-plan could
+ * not revise the plan, so the ladder falls back to the string-parse +
+ * Jev-attribution implicated set it already computed. The transport is goal
+ * agnostic and injectable, so a caller wires a schema-constrained planner call
+ * and a test injects a deterministic fake, keeping the ladder offline-safe.
+ */
+export type RePlanTransport = (input: {
+  /** The failing gate output the previous round produced (secret-free). */
+  readonly evidence: string;
+  /** The candidate unit ids the re-plan may choose to re-fan (the gated units). */
+  readonly candidateUnitIds: readonly string[];
+  /** The Jev attribution choice, when a confident one was recorded this round. */
+  readonly attributionChoice?: string;
+  /** The retry round the revised plan is for (2 for the first retry). */
+  readonly round: number;
+}) => Promise<readonly string[]>;
+
 /** Options for a full live run. */
 export interface RunFullLiveOptions {
   readonly change: Change;
@@ -379,9 +403,19 @@ export interface RunFullLiveOptions {
    * (fix-confidence). Defaults to 0.75 when a Jev caller is injected without one.
    */
   readonly jevThreshold?: number;
+  /**
+   * The injected re-plan transport. When present, on a verify-fail the ladder
+   * asks it for a REVISED set of units to re-fan for the next retry round (fed
+   * the failing evidence and the optional Jev attribution choice), and re-fans
+   * ONLY those units instead of the string-parse implicated set. When it returns
+   * an invalid or empty set, or when it is absent (the default, offline path),
+   * the ladder falls back to the string-parse + Jev-attribution implicated set,
+   * so the offline path is unchanged. The mechanical gate stays authoritative;
+   * the re-plan only chooses which units re-run. A test injects a deterministic
+   * fake, keeping make check offline.
+   */
+  readonly rePlan?: RePlanTransport;
 }
-
-/** A progress event emitted during a full live run. */
 export type FullLiveEvent =
   | { readonly kind: "change-created"; readonly changeId: string }
   | { readonly kind: "tool-built"; readonly tool: ToolBuildResult }
@@ -927,6 +961,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       emit,
       ...(options.jev ? { jev: options.jev } : {}),
       jevThreshold: options.jevThreshold ?? 0.75,
+      ...(options.rePlan ? { rePlan: options.rePlan } : {}),
     });
   }
 
@@ -1051,9 +1086,9 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       `Integrated units: ${evidence.integration.integratedUnits.join(", ") || "(none)"} (${integratedCount})`,
     ].join("\n");
     try {
-      const answers = await options.jev(state, [
-        { key: "fix-confidence", type: "noul", question },
-      ]);
+      const answers = await options.jev(state, {
+        "fix-confidence": { type: "noul", instructions: question },
+      });
       const answer = answers["fix-confidence"];
       if (answer && answer.type === "noul" && answer.noul !== undefined) {
         // "accepted" here records whether Jev was CONFIDENTLY positive, as a
@@ -1280,6 +1315,15 @@ interface ChangeLevelLadderInput {
   readonly jev?: AskJev;
   /** The accept-when-confident threshold for the attribution juncture. */
   readonly jevThreshold?: number;
+  /**
+   * The injected re-plan transport. When present, on a verify-fail the ladder
+   * asks it for a REVISED set of units to re-fan this round (fed the failing
+   * evidence and the optional confident Jev attribution choice) and re-fans only
+   * those; an invalid/empty reply or an absent transport falls back to the
+   * string-parse + Jev-attribution implicated set. Offline (no transport) the
+   * attribution + fallback path is unchanged.
+   */
+  readonly rePlan?: RePlanTransport;
 }
 
 /**
@@ -1441,6 +1485,9 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
       // silently dropped). The decision is recorded on the Change (backing a jev
       // node). Offline (no Jev) this is a no-op and the parse+fallback stands.
       let implicated = parsed;
+      // The confident Jev attribution choice this round, when one was recorded,
+      // so the re-plan transport can be fed it as a hint. Undefined otherwise.
+      let attributionChoice: string | undefined;
       if (input.jev) {
         const threshold = input.jevThreshold ?? 0.75;
         const unitIds = gatedUnits.map((u) => u.unitId);
@@ -1452,9 +1499,9 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
           lastEvidence.slice(0, 2000),
         ].join("\n");
         try {
-          const answers = await input.jev(state, [
-            { key: "attribution", type: "choice", question, options: unitIds },
-          ]);
+          const answers = await input.jev(state, {
+            attribution: { type: "choice", instructions: question, criteria: unitIds },
+          });
           const answer = answers["attribution"];
           const confident =
             answer !== undefined &&
@@ -1478,6 +1525,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             // unit either the parse OR Jev implicates is re-fanned. The fallback
             // (re-fan all when the parse found nothing) is preserved because
             // `parsed` already carries it.
+            attributionChoice = answer.choice;
             const chosen = gatedUnits.find((u) => u.unitId === answer.choice);
             if (chosen && !parsed.some((u) => u.unitId === chosen.unitId)) {
               implicated = [...parsed, chosen];
@@ -1485,6 +1533,44 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
           }
         } catch {
           // A decision-transport error leaves the parse+fallback result intact.
+        }
+      }
+
+      // RE-PLAN ON RETRY: when a re-plan transport is injected, feed it the
+      // failing gate evidence, the candidate (gated) unit ids, and the confident
+      // Jev attribution choice (when one was recorded this round), and let it
+      // return a REVISED set of units to re-fan. A valid revision (a non-empty
+      // subset of the gated units) REPLACES the string-parse + Jev-attribution
+      // implicated set, so a spurious unit (a passing module the string-parse
+      // over-selected) is dropped and only the revised units re-run. An invalid
+      // or empty reply, a thrown transport, or an absent transport FALLS BACK to
+      // the implicated set exactly as before, so the attribution + re-fan-all
+      // fallback is never silently lost. The mechanical gate stays authoritative:
+      // the re-plan only chooses WHICH units re-run, never the verdict. Recorded
+      // per round via implicatedUnits + the reason, so the revised plan is
+      // visible and a dropped unit is not re-fanned.
+      let refanSource: "re-plan" | "attribution" = "attribution";
+      if (input.rePlan) {
+        const candidateUnitIds = gatedUnits.map((u) => u.unitId);
+        try {
+          const revisedIds = await input.rePlan({
+            evidence: lastEvidence,
+            candidateUnitIds,
+            round: nextRound,
+            ...(attributionChoice !== undefined ? { attributionChoice } : {}),
+          });
+          const revisedSet = new Set(
+            revisedIds.filter((id) => candidateUnitIds.includes(id)),
+          );
+          const revised = gatedUnits.filter((u) => revisedSet.has(u.unitId));
+          if (revised.length > 0) {
+            // A valid revised unit set: re-fan ONLY those units this round.
+            implicated = revised;
+            refanSource = "re-plan";
+          }
+          // An empty/all-invalid reply leaves `implicated` as the fallback.
+        } catch {
+          // A re-plan transport error leaves the implicated fallback intact.
         }
       }
 
@@ -1496,7 +1582,10 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
         fromModel,
         toModel: roundModel,
         implicatedUnits: implicated.map((u) => u.unitId),
-        reason: `verify round ${round} failed; re-fanning ${implicated.length} implicated unit(s) on a stronger model fed the failing evidence`,
+        reason:
+          refanSource === "re-plan"
+            ? `verify round ${round} failed; re-planned to ${implicated.length} unit(s) and re-fanning them on a stronger model fed the failing evidence`
+            : `verify round ${round} failed; re-fanning ${implicated.length} implicated unit(s) on a stronger model fed the failing evidence`,
       }).catch(() => {});
       emit({
         kind: "model-escalation",

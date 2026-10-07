@@ -42,20 +42,27 @@ export const DEFAULT_JEV_MAX_TOKENS = 1024;
 export type JevAnswerType = "noul" | "choice" | "score";
 
 /**
- * One question the caller asks the decision model: a stable key, the kind of
- * answer it expects, the human-readable prompt, and (for a choice) the allowed
- * option ids the model must pick from.
+ * One question the caller asks the decision model, keyed by name in the request
+ * map. It names the kind of answer it expects, the human-readable instructions,
+ * and (for a choice) the allowed option ids the model must pick from. The
+ * question's NAME is the map key under which its answer comes back, so the
+ * request and the reply are object-keyed the same way (no positional array).
  */
 export interface JevQuestion {
-  /** A stable key for this question, used to look up its answer in the reply. */
-  readonly key: string;
   /** The kind of answer expected: a noul (yes/no/unsure), a choice, or a score. */
   readonly type: JevAnswerType;
-  /** The human-readable question text. */
-  readonly question: string;
+  /** The human-readable instructions describing what to decide. */
+  readonly instructions: string;
   /** For a choice question, the allowed option ids the model must pick among. */
-  readonly options?: readonly string[];
+  readonly criteria?: readonly string[];
 }
+
+/**
+ * The set of questions a caller asks, keyed by question name. The reply's answers
+ * come back keyed the same way, so each answer maps straight back to its question
+ * name with no positional array.
+ */
+export type JevQuestions = Readonly<Record<string, JevQuestion>>;
 
 /**
  * A typed answer the decision model returned for one question, after the reply
@@ -86,8 +93,8 @@ export interface JevRequest {
    * deterministically by the caller and never carries a credential.
    */
   readonly state: string;
-  /** The set of questions to answer, keyed so the reply maps back to each. */
-  readonly questions: readonly JevQuestion[];
+  /** The set of questions to answer, keyed by name so the reply maps back to each. */
+  readonly questions: JevQuestions;
 }
 
 /** The decision transport: a state + questions in, a typed answer per key out. */
@@ -96,7 +103,7 @@ export type JevInvoke = (request: JevRequest) => Promise<Readonly<Record<string,
 /** The typed decision caller the orchestration injects into the junctures. */
 export type AskJev = (
   state: string,
-  questions: readonly JevQuestion[],
+  questions: JevQuestions,
 ) => Promise<Readonly<Record<string, JevAnswer>>>;
 
 /** Options for the live AI Gateway decision transport (holds the credential). */
@@ -189,12 +196,19 @@ export function createAiGatewayJevInvoke(options: AiGatewayJevOptions): JevInvok
           model: DEFAULT_JEV_MODEL,
           input: {
             state: request.state,
-            questions: request.questions.map((question) => ({
-              key: question.key,
-              type: question.type,
-              question: question.question,
-              ...(question.options ? { options: [...question.options] } : {}),
-            })),
+            // The questions ride as an OBJECT keyed by question name, the same
+            // shape the reply's answers come back in, so there is no positional
+            // array and each answer maps straight back to its question name.
+            questions: Object.fromEntries(
+              Object.entries(request.questions).map(([name, question]) => [
+                name,
+                {
+                  type: question.type,
+                  instructions: question.instructions,
+                  ...(question.criteria ? { criteria: [...question.criteria] } : {}),
+                },
+              ]),
+            ),
           },
           ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
         }),

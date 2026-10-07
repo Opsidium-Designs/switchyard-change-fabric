@@ -86,12 +86,16 @@ export type PlanSource = "planner" | "heuristic-fallback";
  */
 export type JevTransport = (
   state: string,
-  questions: readonly {
-    readonly key: string;
-    readonly type: "noul" | "choice" | "score";
-    readonly question: string;
-    readonly options?: readonly string[];
-  }[],
+  questions: Readonly<
+    Record<
+      string,
+      {
+        readonly type: "noul" | "choice" | "score";
+        readonly instructions: string;
+        readonly criteria?: readonly string[];
+      }
+    >
+  >,
 ) => Promise<
   Readonly<
     Record<
@@ -340,7 +344,7 @@ async function reviewPlan(
   ].join("\n");
   let answers: Awaited<ReturnType<JevTransport>>;
   try {
-    answers = await jev(state, [{ key: "plan-review", type: "noul", question }]);
+    answers = await jev(state, { "plan-review": { type: "noul", instructions: question } });
   } catch {
     return null;
   }

@@ -13,7 +13,7 @@ import {
   type WorkGraphModel,
 } from "@switchyard-change/orchestration/graph-model";
 
-import { GraphView } from "./graph-view";
+import { GraphView, changeHasPassed } from "./graph-view";
 import { TEMPLATES, type Template } from "./templates";
 
 /**
@@ -536,6 +536,7 @@ export function App() {
       {selectedNode ? (
         <NodeDetail
           node={selectedNode}
+          changePassed={model ? changeHasPassed(model) : false}
           onClose={() => setSelectedId(null)}
         />
       ) : null}
@@ -756,9 +757,11 @@ function EscalationPanel({
  */
 export function NodeDetail({
   node,
+  changePassed = false,
   onClose,
 }: {
   node: GraphNode;
+  changePassed?: boolean;
   onClose: () => void;
 }) {
   const backing = node.backing;
@@ -793,6 +796,15 @@ export function NodeDetail({
           <dd>{backing.kind}</dd>
         </div>
       </dl>
+
+      {backing.kind === "round-agent" && node.status === "failed" && changePassed ? (
+        <p className="detail-note muted">
+          This retry agent failed its own attempt, but the change still passed its
+          authoritative gate. It is a per-attempt retry failure that did not block
+          the change (an earlier edit sufficed, or this re-fan produced no change),
+          not a failure of the overall change.
+        </p>
+      ) : null}
 
       {detail ? <ModelDetail detail={detail} /> : null}
 

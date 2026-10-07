@@ -67,6 +67,7 @@ export type {
   EscalationResolution,
   EscalationResolver,
   FullLiveEvent,
+  RePlanTransport,
   RunFullLiveOptions,
   RunFullLiveResult,
   TeardownApp,

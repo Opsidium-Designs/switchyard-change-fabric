@@ -96,6 +96,7 @@ export type {
   JevAnswerType,
   JevInvoke,
   JevQuestion,
+  JevQuestions,
   JevRequest,
 } from "./jev.ts";
 export {

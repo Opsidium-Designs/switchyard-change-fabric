@@ -475,7 +475,7 @@ describe("JUNCTURE (a) PLAN REVIEW: accept-when-confident / escalate-when-unsure
   function fakeJev(noul: "yes" | "no" | "unsure", confidence: number) {
     return async (
       _state: string,
-      _questions: readonly { readonly key: string }[],
+      _questions: Readonly<Record<string, { readonly type: "noul" | "choice" | "score" }>>,
     ): Promise<Readonly<Record<string, { type: "noul"; noul: "yes" | "no" | "unsure"; confidence: number }>>> => {
       return { "plan-review": { type: "noul", noul, confidence } };
     };

@@ -456,20 +456,23 @@ body {
   background: #e3b341;
 }
 
-/* The planner legend glyph is a TRIANGLE (a CSS triangle via borders), matching
-   the triangle planner node drawn in the graph. It keeps roughly the same
-   footprint as the circular swatches. */
+/* The planner legend glyph is an upward EQUILATERAL triangle, drawn with the
+   SAME geometry as the planner node polygon in the graph (apex up, flat base),
+   so the legend swatch and the node read as the exact same shape and
+   orientation rather than only roughly similar. The clip-path mirrors the SVG
+   node's equilateral apex-up triangle (apex top-center, base spanning the full
+   width at the bottom); the box is sized width:height = 2:√3 so the clipped
+   triangle is equilateral, matching the node's circumradius-r equilateral. */
 .swatch-triangle {
-  width: 0;
-  height: 0;
+  width: 0.9rem;
+  height: 0.78rem;
   display: inline-block;
-  border-left: 0.45rem solid transparent;
-  border-right: 0.45rem solid transparent;
-  border-bottom: 0.8rem solid #2bb3a3;
+  clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+  background: #2bb3a3;
 }
 
 .swatch-triangle.sw-planner {
-  border-bottom-color: #2bb3a3;
+  background: #2bb3a3;
 }
 
 /* The jev legend glyph is a PENTAGON (via clip-path), matching the amber

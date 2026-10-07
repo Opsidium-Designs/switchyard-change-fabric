@@ -49,6 +49,7 @@ import {
   type DeployApp,
   type Escalation,
   type PlannerInjection,
+  type RePlanTransport,
   type TeardownApp,
 } from "@switchyard-change/orchestration";
 import { DiscoveringExecutor } from "@switchyard-change/model-adapters";
@@ -531,6 +532,14 @@ const commands: Command[] = [
           const jev = selectJev();
           return jev.live && jev.ask ? { jev: jev.ask, jevThreshold: jev.threshold } : {};
         })(),
+        // The opt-in re-plan transport. When the schema-constrained planner is
+        // live, the ladder re-plans WHICH units to re-fan on a verify-fail
+        // instead of re-fanning the string-parse implicated set; offline it is
+        // absent, so the deterministic attribution + fallback path is unchanged.
+        ...(() => {
+          const rePlan = rePlanFromEnv();
+          return rePlan ? { rePlan } : {};
+        })(),
         ...(deployAppDir ? { deployAppDir: resolve(deployAppDir) } : {}),
         ...(deployAppName ? { deployAppName } : {}),
         ...(deployApp ? { deployApp } : {}),
@@ -861,6 +870,66 @@ function plannerInjectionFromEnv(): PlannerInjection | undefined {
       ? { escalationModels: selected.escalationModels }
       : {}),
     ...(jev.live && jev.ask ? { jev: jev.ask, jevThreshold: jev.threshold } : {}),
+  };
+}
+
+/**
+ * Build the opt-in re-plan transport for the change-level ladder from the same
+ * gateway env the planner uses. When the schema-constrained planner is live, the
+ * returned transport asks it, on a verify-fail, to decide WHICH of the candidate
+ * (gated) units should re-run given the failing gate evidence (and the Jev
+ * attribution choice when one was recorded), and maps the planner's chosen unit
+ * ids back to the subset that intersects the candidates. The ladder re-fans only
+ * that subset; an empty or non-intersecting reply makes the ladder fall back to
+ * its string-parse + Jev-attribution implicated set. When the planner is not
+ * live (offline, no gateway) this returns undefined, so the ladder keeps the
+ * deterministic attribution + re-fan-all path and make check stays offline.
+ */
+function rePlanFromEnv(): RePlanTransport | undefined {
+  const selected = selectPlanner();
+  if (!selected.live || !selected.plan) {
+    return undefined;
+  }
+  const plan = selected.plan;
+  const baseModel = selected.baseModel;
+  return async (input) => {
+    const candidate = new Set(input.candidateUnitIds);
+    const messages = [
+      {
+        role: "system" as const,
+        content: [
+          "You revise a failing software change's retry plan.",
+          "You are given the failing gate output and the candidate unit ids that could re-run.",
+          "Decide WHICH of those candidate units should re-run to fix the failure.",
+          "Hard rules you must obey:",
+          "- Every unit id you return MUST be one of the candidate unit ids. Never invent an id.",
+          "- Return only the units the failing output implicates; drop units the failure does not touch.",
+          "- Return the plan object the schema describes; put the units to re-run under units (one per id, with that id and a short objective).",
+        ].join("\n"),
+      },
+      {
+        role: "user" as const,
+        content: [
+          `Candidate unit ids: ${input.candidateUnitIds.join(", ")}`,
+          input.attributionChoice !== undefined
+            ? `A decision model attributed the failure to: ${input.attributionChoice}`
+            : "",
+          `Retry round: ${input.round}`,
+          "",
+          "Failing gate output:",
+          input.evidence.slice(0, 2000),
+        ]
+          .filter((line) => line !== "")
+          .join("\n"),
+      },
+    ];
+    const proposed = await plan({ model: baseModel, messages });
+    // Map the planner's chosen unit ids back to the candidates. A unit id that
+    // is not a candidate is dropped (the planner may only re-run gated units).
+    const chosen = proposed.units
+      .map((unit) => unit.id)
+      .filter((id) => candidate.has(id));
+    return chosen;
   };
 }
 

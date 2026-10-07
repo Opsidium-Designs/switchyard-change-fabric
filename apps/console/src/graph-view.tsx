@@ -33,14 +33,14 @@ import { goalNodeId } from "@switchyard-change/orchestration/graph-model";
  */
 
 const WIDTH = 1100;
-const LAYER_HEIGHT = 210;
+const LAYER_HEIGHT = 280;
 const TOP_MARGIN = 80;
 const NODE_RADIUS = 24;
 const GOAL_RADIUS = 32;
 /** Vertical gap between a node's circle edge and its label row (outside it). */
 const LABEL_GAP = 10;
 /** Minimum horizontal gap between adjacent node centers in a dense row. */
-const MIN_NODE_GAP = 150;
+const MIN_NODE_GAP = 200;
 /** Vertical stagger step applied by column so siblings are not on one flat row. */
 const STAGGER_STEP = 34;
 /** Deterministic per-node horizontal jitter amplitude (SVG units). */
@@ -203,6 +203,31 @@ function jitter(id: string, axis: string, amp: number): number {
   const frac = (hash >>> 0) / 0xffffffff;
   return (frac * 2 - 1) * amp;
 }
+
+/**
+ * Derive a SHORT, legible display label from a node's full label. An agent (and
+ * round-N retry agent) node's label is the full unit id, optionally with a
+ * "(retry N)" suffix, e.g. "validate-src-resources-notifications (retry 2)".
+ * That is too long to read in the graph, so the visible label is shortened to
+ * the MODULE TAIL (the last path/segment token of the unit id) plus any
+ * "(retry N)" suffix, e.g. "notifications (retry 2)". The FULL unit id is kept
+ * elsewhere (the node detail panel and the SVG <title> tooltip), so nothing is
+ * lost: this only shortens what is drawn beneath the node. A label with no
+ * segment separators is returned unchanged (already short). Pure and
+ * deterministic, so the layout and tests stay reproducible.
+ */
+export function shortNodeLabel(label: string): string {
+  // Split a trailing " (retry N)" (or any parenthetical suffix) off the id, so
+  // the module-tail transform applies to the id and the suffix is re-appended.
+  const match = /^(.*?)(\s*\([^)]*\))?$/.exec(label.trim());
+  const id = (match?.[1] ?? label).trim();
+  const suffix = match?.[2] ?? "";
+  // The module tail: the last token after splitting on "-" and "/" path
+  // separators (e.g. "validate-src-resources-notifications" -> "notifications").
+  const segments = id.split(/[-/]/).filter((s) => s !== "");
+  const tail = segments.length > 0 ? segments[segments.length - 1]! : id;
+  return `${tail}${suffix}`.trim();
+}
 function computeLayers(model: WorkGraphModel): Map<string, number> {
   const deps = new Map<string, string[]>();
   // Build the per-unit dependency list from the declared dependency AND spawn
@@ -343,10 +368,47 @@ function pentagonPoints(r: number): string {
   return pts.join(" ");
 }
 
+/**
+ * Whether a round-N retry agent node failed on its own attempt WHILE the whole
+ * change ultimately PASSED. Such a node is an honest per-attempt failure (its
+ * re-fan produced no edit, or an earlier edit already sufficed), NOT a failure
+ * that blocked the change, so it is rendered in a muted neutral tone rather than
+ * the terminal dead-red of a change that genuinely failed. The round-N instance
+ * is identified by its round-agent backing; the overall pass is read from the
+ * model's verify nodes (a verified verify round means the change passed).
+ */
+export function isNonBlockingRoundFail(node: GraphNode, changePassed: boolean): boolean {
+  return (
+    changePassed &&
+    node.kind === "agent" &&
+    node.status === "failed" &&
+    node.backing.kind === "round-agent"
+  );
+}
+
+/**
+ * Whether the whole change PASSED, read from the model's verify nodes: a
+ * verified verify round means the authoritative mechanical gate passed, so the
+ * change passed. Used only for DISPLAY clarity (a non-blocking round fail), never
+ * to change a verdict.
+ */
+export function changeHasPassed(model: WorkGraphModel): boolean {
+  return model.nodes.some((n) => n.kind === "verify" && n.verified);
+}
+
 /** The fill color for a node from its kind and verified/escalated/failed state. */
-function nodeFill(node: GraphNode): string {
+function nodeFill(node: GraphNode, changePassed = false): string {
   if (node.escalated) {
     return "#f85149"; // a pending human escalation lights this node (the human beat)
+  }
+  // A round-N retry agent that failed its own attempt while the change still
+  // PASSED is an honest per-attempt failure that did NOT block the change, so it
+  // is drawn in a MUTED SLATE tone, visibly distinct from the terminal dead-red
+  // of a change that genuinely failed. Checked before the generic failed case so
+  // this clarity treatment wins for a non-blocking round fail; a round fail in a
+  // change that did NOT pass still reads as the terminal dead-red below.
+  if (isNonBlockingRoundFail(node, changePassed)) {
+    return "#495366";
   }
   // A verify node is a mechanical gate run: GREEN on a real pass, a bright RED on
   // a real fail. This is the ladder's pass/fail beat and is checked before the
@@ -414,6 +476,11 @@ const DRAG_THRESHOLD = 4;
 
 export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
   const { placed, height, width } = useMemo(() => placeNodes(model), [model]);
+  // Whether the whole change passed, read from the model's verify nodes. Used
+  // only for DISPLAY clarity: a round-N retry agent that failed its own attempt
+  // while the change still passed is drawn muted (a non-blocking per-attempt
+  // failure), never recolored into or out of a verdict.
+  const changePassed = useMemo(() => changeHasPassed(model), [model]);
   const byId = useMemo(() => {
     const map = new Map<string, Placed>();
     for (const p of placed) {
@@ -705,56 +772,62 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                   {node.kind === "goal" ? (
                     <polygon
                       points={diamondPoints(r)}
-                      fill={nodeFill(node)}
+                      fill={nodeFill(node, changePassed)}
                       stroke={selected ? "#e6edf3" : "#0d1117"}
                       strokeWidth={selected ? 3 : 1.5}
                     />
                   ) : node.kind === "planner" ? (
                     <polygon
                       points={trianglePoints(r)}
-                      fill={nodeFill(node)}
+                      fill={nodeFill(node, changePassed)}
                       stroke={selected ? "#e6edf3" : "#0d1117"}
                       strokeWidth={selected ? 3 : 1.5}
                     />
                   ) : node.kind === "tool" ? (
                     <polygon
                       points={squarePoints(r)}
-                      fill={nodeFill(node)}
+                      fill={nodeFill(node, changePassed)}
                       stroke={selected ? "#e6edf3" : "#0d1117"}
                       strokeWidth={selected ? 3 : 1.5}
                     />
                   ) : node.kind === "verify" || node.kind === "retry" ? (
                     <polygon
                       points={hexagonPoints(r)}
-                      fill={nodeFill(node)}
+                      fill={nodeFill(node, changePassed)}
                       stroke={selected ? "#e6edf3" : "#0d1117"}
                       strokeWidth={selected ? 3 : 1.5}
                     />
                   ) : node.kind === "jev" ? (
                     <polygon
                       points={pentagonPoints(r)}
-                      fill={nodeFill(node)}
+                      fill={nodeFill(node, changePassed)}
                       stroke={selected ? "#e6edf3" : "#0d1117"}
                       strokeWidth={selected ? 3 : 1.5}
                     />
                   ) : (
                     <circle
                       r={r}
-                      fill={nodeFill(node)}
+                      fill={nodeFill(node, changePassed)}
                       stroke={selected ? "#e6edf3" : "#0d1117"}
                       strokeWidth={selected ? 3 : 1.5}
                     />
                   )}
                   {/* Labels sit OUTSIDE the node, below it, so they are legible
-                      and never crammed inside the small node. The full label is
-                      shown (not truncated into the node); the kind is a smaller
-                      caption line beneath it. */}
+                      and never crammed inside the small node. An agent (and
+                      round-N retry agent) node's visible label is SHORTENED to
+                      the module tail (e.g. "notifications (retry 2)") so a long
+                      unit id does not sprawl; the FULL unit id is kept in the
+                      SVG <title> tooltip (and the node detail panel). Other
+                      kinds keep their full label. The kind is a smaller caption
+                      line beneath it. */}
                   <text
                     className="node-label"
                     textAnchor="middle"
                     y={r + LABEL_GAP + 11 + labelOffset}
                   >
-                    {node.label}
+                    {node.kind === "agent" || node.kind === "work"
+                      ? shortNodeLabel(node.label)
+                      : node.label}
                   </text>
                   <text
                     className="node-kind"
@@ -763,7 +836,15 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                   >
                     {node.kind}
                   </text>
-                  <title>{`${node.label} [${node.kind}] status=${node.status}`}</title>
+                  {/* The tooltip keeps the FULL label and, for a round-N retry
+                      agent that failed its own attempt while the change still
+                      passed, a short note making clear it is a per-attempt
+                      failure that did NOT block the change. */}
+                  <title>{`${node.label} [${node.kind}] status=${node.status}${
+                    isNonBlockingRoundFail(node, changePassed)
+                      ? " (per-attempt retry failure; the change still passed)"
+                      : ""
+                  }`}</title>
                 </g>
               );
             })}
