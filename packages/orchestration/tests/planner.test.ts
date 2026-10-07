@@ -22,8 +22,10 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { parseChangeSpec, type PlannedShape, type PlanTransport } from "@switchyard-change/change-core";
+import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 
 import { changeToSpecYaml, decomposeGoal } from "../src/decompose-goal.ts";
+import { LocalChangeControl } from "../src/local-control.ts";
 import { selectPlanner } from "../src/executor-select.ts";
 import {
   assertBacked,
@@ -134,6 +136,111 @@ describe("planned Change round-trips through spec YAML with contracts + exports 
     // preserve it downstream, exactly like a heuristic Change).
     for (const module of reloaded.blueprint!.modules) {
       expect(module.exports).toEqual(["handle"]);
+    }
+
+    // The recorded plan RIDES the Change: the planned Change carries it, and it
+    // survives the spec YAML round-trip to the Worker so a live run can root a
+    // real planner node. (This is what makes snapshot.plan populated live, which
+    // the run-live path now produces by injecting the planner into the change
+    // resolution exactly like the decompose/run-goal commands.)
+    expect(result.change.plan?.source).toBe("planner");
+    expect(reloaded.plan).toBeDefined();
+    expect(reloaded.plan!.source).toBe("planner");
+    expect(reloaded.plan!.model).toBe("gpt-4o-mini");
+    expect(reloaded.plan!.units.map((u) => u.id).sort()).toEqual(
+      ["orders", "products", "search", "users"].sort(),
+    );
+    expect([...reloaded.plan!.contracts].sort()).toEqual([
+      "src/contracts/auth.js",
+      "src/contracts/response.js",
+    ]);
+    const reloadedOrders = reloaded.plan!.units.find((u) => u.id === "orders");
+    expect(reloadedOrders?.dependsOn).toEqual(["users"]);
+  });
+
+  it("the plain heuristic decomposition (no planner injected) carries NO plan on the Change", async () => {
+    // Without a planner injection decomposeGoal takes the deterministic heuristic
+    // path, which produces no plan record and carries no plan on the Change, so a
+    // round-tripped heuristic Change has no plan and the graph has no planner node
+    // (the offline/demo path stays exactly as before).
+    const result = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      changeId: "change-service",
+    });
+    expect(result.plan).toBeUndefined();
+    expect(result.change.plan).toBeUndefined();
+    const reloaded = parseChangeSpec(changeToSpecYaml(result.change));
+    expect(reloaded.plan).toBeUndefined();
+  });
+
+  it("the live state view surfaces the recorded plan so the graph roots a planner node", async () => {
+    // Mirror the live path end to end OFFLINE: a planned Change (planner injected,
+    // a fake transport, no network) is serialized to spec YAML and handed to the
+    // control surface exactly as the Worker reconstructs it from the run-live
+    // POST. The state view must surface the recorded plan, and the graph model
+    // must then root a BACKED planner node between the goal and the agents.
+    const result = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      planner: { plan: fixedPlan, baseModel: "gpt-4o-mini" },
+      changeId: "change-service-view",
+    });
+    const artifactsRoot = await mkdtemp(join(tmpdir(), "scf-planner-ws-"));
+    try {
+      const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: artifactsRoot });
+      const control = new LocalChangeControl(workspaces);
+      const change = control.createChange(changeToSpecYaml(result.change));
+      const view = control.state(change.id);
+
+      // The view surfaces the plan (source, model, unit ids, frozen contracts).
+      expect(view.plan).toBeDefined();
+      expect(view.plan!.source).toBe("planner");
+      expect(view.plan!.model).toBe("gpt-4o-mini");
+      expect([...view.plan!.units].sort()).toEqual(
+        ["orders", "products", "search", "users"].sort(),
+      );
+      expect([...view.plan!.contracts].sort()).toEqual([
+        "src/contracts/auth.js",
+        "src/contracts/response.js",
+      ]);
+
+      // The graph model (fed the view as a ChangeStateSnapshot) roots a single
+      // backed planner node and a goal -> planner edge.
+      const model = buildWorkGraphModel(view as unknown as ChangeStateSnapshot);
+      const planner = model.nodes.filter((n) => n.kind === "planner");
+      expect(planner).toHaveLength(1);
+      expect(planner[0]?.id).toBe(plannerNodeId(change.id));
+      expect(planner[0]?.backing.kind).toBe("planner");
+      expect(
+        model.edges.some(
+          (e) => e.from === goalNodeId(change.id) && e.to === plannerNodeId(change.id),
+        ),
+      ).toBe(true);
+    } finally {
+      await rm(artifactsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("the heuristic state view carries no plan so the graph has no planner node", async () => {
+    // The plain heuristic path produces a Change with no plan, so its state view
+    // surfaces no plan and the graph has no planner node (the offline path).
+    const result = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      changeId: "change-service-heuristic-view",
+    });
+    const artifactsRoot = await mkdtemp(join(tmpdir(), "scf-planner-ws2-"));
+    try {
+      const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: artifactsRoot });
+      const control = new LocalChangeControl(workspaces);
+      const change = control.createChange(changeToSpecYaml(result.change));
+      const view = control.state(change.id);
+      expect(view.plan).toBeUndefined();
+      const model = buildWorkGraphModel(view as unknown as ChangeStateSnapshot);
+      expect(model.nodes.some((n) => n.kind === "planner")).toBe(false);
+    } finally {
+      await rm(artifactsRoot, { recursive: true, force: true });
     }
   });
 });

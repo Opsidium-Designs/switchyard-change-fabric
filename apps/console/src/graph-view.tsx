@@ -1,4 +1,11 @@
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import {
+  IDENTITY_VIEW,
+  shouldZoomOnWheel,
+  zoomAt,
+  type ViewTransform,
+} from "./graph-interactions";
 
 import type {
   GraphEdge,
@@ -374,23 +381,8 @@ interface GraphViewProps {
   readonly onSelect: (nodeId: string) => void;
 }
 
-/** The pan/zoom view transform: a scale `k` and a translation in SVG units. */
-interface ViewTransform {
-  readonly k: number;
-  readonly tx: number;
-  readonly ty: number;
-}
-
-const IDENTITY_VIEW: ViewTransform = { k: 1, tx: 0, ty: 0 };
-const MIN_SCALE = 0.3;
-const MAX_SCALE = 4;
 /** Pixels of mouse movement before a press is treated as a drag, not a click. */
 const DRAG_THRESHOLD = 4;
-
-/** Clamp a zoom scale into the allowed range. */
-function clampScale(k: number): number {
-  return Math.max(MIN_SCALE, Math.min(MAX_SCALE, k));
-}
 
 export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
   const { placed, height, width } = useMemo(() => placeNodes(model), [model]);
@@ -439,31 +431,43 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
 
   // Wheel to zoom, centered on the cursor: solve for the translation that keeps
   // the SVG-space point under the pointer fixed as the scale changes.
-  const onWheel = useCallback(
-    (event: React.WheelEvent<SVGSVGElement>) => {
+  //
+  // This is attached as a NATIVE, NON-PASSIVE wheel listener (see the useEffect
+  // below), not via React's onWheel prop. React registers wheel listeners as
+  // PASSIVE at its root, which makes event.preventDefault() a silent no-op there;
+  // a native listener added with { passive: false } is the only way preventDefault
+  // actually blocks the page from scrolling while alt + wheel zooms the graph. A
+  // plain wheel (no alt) returns early WITHOUT preventDefault, so the page scrolls
+  // normally and only alt + wheel is intercepted.
+  const handleWheel = useCallback(
+    (event: WheelEvent) => {
       // Zoom is gated behind the ALT key: a plain wheel scrolls the page as
       // normal, and alt + wheel zooms the graph. Without the modifier we do not
       // preventDefault, so page scrolling is never hijacked.
-      if (!event.altKey) {
+      if (!shouldZoomOnWheel(event)) {
         return;
       }
       event.preventDefault();
       const { x, y } = clientToSvg(event.clientX, event.clientY);
-      setView((prev) => {
-        const factor = Math.exp(-event.deltaY * 0.0015);
-        const k = clampScale(prev.k * factor);
-        if (k === prev.k) {
-          return prev;
-        }
-        // Keep (x,y) fixed: x = tx + k * sx  =>  sx = (x - tx)/k ; after zoom,
-        // tx' = x - k' * sx.
-        const sx = (x - prev.tx) / prev.k;
-        const sy = (y - prev.ty) / prev.k;
-        return { k, tx: x - k * sx, ty: y - k * sy };
-      });
+      setView((prev) => zoomAt(prev, x, y, event.deltaY));
     },
     [clientToSvg],
   );
+
+  // Register the wheel handler natively with { passive: false } on the svg, so
+  // event.preventDefault() inside it genuinely blocks the page scroll (a React
+  // onWheel prop cannot, because React's wheel listener is passive). Re-attached
+  // if handleWheel changes and cleaned up on unmount.
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) {
+      return;
+    }
+    svg.addEventListener("wheel", handleWheel, { passive: false });
+    return () => {
+      svg.removeEventListener("wheel", handleWheel);
+    };
+  }, [handleWheel]);
 
   // Begin a potential pan on left-button press anywhere in the SVG background.
   const onMouseDown = useCallback(
@@ -551,7 +555,6 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
         viewBox={`0 0 ${width} ${height}`}
         role="img"
         aria-label="Living work graph"
-        onWheel={onWheel}
         onMouseDown={onMouseDown}
         onMouseMove={onMouseMove}
         onMouseUp={endDrag}

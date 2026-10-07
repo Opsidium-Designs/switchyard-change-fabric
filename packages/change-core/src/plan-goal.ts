@@ -291,7 +291,6 @@ function projectPlanToChange(input: {
     importedByCount: byPath.get(path)?.importedByCount ?? 0,
   }));
   const changeBlueprint: ChangeBlueprint = { modules, contracts };
-  const planned: Change = { ...change, blueprint: changeBlueprint };
 
   const recordedPlan: RecordedPlan = {
     source: "planner",
@@ -303,6 +302,16 @@ function projectPlanToChange(input: {
       dependsOn: [...unit.dependsOn],
     })),
     contracts: [...plan.contracts],
+  };
+
+  // Carry the recorded plan ON the Change so it survives the spec YAML
+  // round-trip to the Worker and reaches the state views; the graph projection
+  // reads it to root a real planner node. RecordedPlan is the structural twin of
+  // the Change's ChangePlan field, so it assigns directly.
+  const planned: Change = {
+    ...change,
+    blueprint: changeBlueprint,
+    plan: recordedPlan,
   };
 
   // Produce the same shape DecomposeResult carries so a caller can treat a
@@ -354,7 +363,13 @@ function heuristicFallback(
     })),
     contracts: (result.change.blueprint?.contracts ?? []).map((c) => c.path),
   };
-  return { ...result, plan: recordedPlan };
+  // Carry the recorded plan ON the Change so the planner-pass provenance survives
+  // the spec round-trip even on the fallback: a configured planner that could not
+  // get a usable plan still ran the pass, so its graph shows a planner node that
+  // is honest about being the heuristic fallback. The plain offline path (no
+  // planner injected) never enters this module, so it still carries no plan.
+  const change: Change = { ...result.change, plan: recordedPlan };
+  return { ...result, change, plan: recordedPlan };
 }
 
 /**

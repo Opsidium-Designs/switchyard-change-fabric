@@ -1119,7 +1119,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
 }
 
 /** One gated unit the change-level ladder may re-fan on a verify-fail. */
-interface GatedUnitInput {
+export interface GatedUnitInput {
   readonly unitId: string;
   readonly objective: string;
   readonly paths: readonly string[];
@@ -1569,7 +1569,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
  * ALL gated units (never silently skip): the change genuinely failed, so
  * attribution is best-effort narrowing, not a correctness claim.
  */
-function selectImplicatedUnits(
+export function selectImplicatedUnits(
   gatedUnits: readonly GatedUnitInput[],
   evidence: string,
 ): readonly GatedUnitInput[] {
@@ -1601,12 +1601,29 @@ function selectImplicatedUnits(
 function extractFailingNames(evidence: string): readonly string[] {
   const found = new Set<string>();
   const lines = evidence.split(/\r?\n/);
-  // Deterministic tokens emitted by node:test for a failing assertion: a
-  // `not ok` TAP line or a bare assertion-name line of the shape
-  // `<name>: <message>` or `<name> must <message>`. Capture the leading
-  // identifier token in either shape.
-  const colonShape = /^(?:not ok\s+\d+\s+-\s+|#\s+|\s*)?([A-Za-z0-9_-]+):\s+\S/;
-  const mustShape = /^(?:not ok\s+\d+\s+-\s+|#\s+|\s*)?([A-Za-z0-9_-]+)\s+must\s+\S/;
+  // Deterministic tokens for a failing assertion across BOTH node:test reporters:
+  //   - the TAP reporter: `not ok 1 - <name>: ...` / a bare `<name>: ...` /
+  //     `<name> must ...` at the line start;
+  //   - the SPEC reporter (the DEFAULT when node --test runs piped/non-TTY, which
+  //     is how the gate runs): a failing test line is prefixed by a STATUS GLYPH
+  //     such as `✖ users: ...` (U+2716) or `✔`/`✓`/`✗`, so the leading identifier
+  //     sits AFTER that glyph, not at the line start.
+  // The optional prefix therefore allows the TAP shapes AND a leading FAILING
+  // status glyph with its whitespace, so `✖ <name>: ...` yields `<name>`. Only
+  // the FAILING glyphs (`✖` U+2716, `✗` U+2717, `×` U+00D7) are allowed, NOT the
+  // passing `✔`/`✓`: the SPEC reporter prints a `✔ <name>: ...` line for every
+  // PASSING test too, so matching a passing glyph would misattribute a passing
+  // resource as failing and re-fan a unit that did not fail.
+  const prefix = String.raw`(?:not ok\s+\d+\s+-\s+|#\s+|[\u2716\u2717\u00d7]\s+|\s*)?`;
+  const colonShape = new RegExp(`^${prefix}([A-Za-z0-9_-]+):\\s+\\S`);
+  const mustShape = new RegExp(`^${prefix}([A-Za-z0-9_-]+)\\s+must\\s+\\S`);
+  // The SPEC reporter prints the failure detail as an indented assertion message
+  // such as `  AssertionError [ERR_ASSERTION]: users must reject ...`, where the
+  // real resource token sits MID-LINE after the error class and code, not at the
+  // line start. Scan that message anywhere in the line for the leading resource
+  // token that precedes a `must`/`:` so the name is recovered even when the
+  // top-level `✖ <name>` line was not captured.
+  const assertionShape = /(?:Error|AssertionError)[^:]*:\s+([A-Za-z0-9_-]+)\s+(?:must\b|should\b)/;
   for (const line of lines) {
     const colon = colonShape.exec(line);
     if (colon && colon[1]) {
@@ -1616,6 +1633,11 @@ function extractFailingNames(evidence: string): readonly string[] {
     const must = mustShape.exec(line);
     if (must && must[1]) {
       found.add(must[1]);
+      continue;
+    }
+    const assertion = assertionShape.exec(line);
+    if (assertion && assertion[1]) {
+      found.add(assertion[1]);
     }
   }
   return [...found];

@@ -234,6 +234,52 @@ describe("M3: the graph is a projection of real ChangeState, not a script", () =
     expect(kickoffSpawns).toHaveLength(0);
   });
 
+  it("materializes a recruited unit and its spawn edge from the recruitment event alone, before its own workspace lands", () => {
+    // Live, the repo-pushed recruitment event (naming completedUnit -> recruited)
+    // can land before the recruited unit's own WorkUnit snapshot records a
+    // workspace/lease or advances past waiting. A recruited unit HAS been
+    // recruited, so it is spawned and must render, with the spawn edge from its
+    // spawner. Here `right` is still a bare waiting unit (no workspace, no lease)
+    // but a repo-pushed event recruited it: it must materialize and the spawn
+    // edge base->right must be drawn.
+    const base = layeredSnapshot();
+    const snapshot: ChangeStateSnapshot = {
+      ...base,
+      recruitments: [
+        ...(base.recruitments ?? []),
+        {
+          trigger: "repo-pushed",
+          pushedWorkspace: "change-demo--base",
+          completedUnit: "base",
+          recruited: ["right"],
+          ceiling: 3,
+          inFlightAfter: 1,
+          at: "2026-10-04T10:06:00.000Z",
+        },
+      ],
+    };
+    const model = buildWorkGraphModel(snapshot);
+
+    // The recruited unit materialized even though it has no workspace/lease yet.
+    const right = model.nodes.find((n) => n.id === unitNodeId("right"));
+    expect(right).toBeDefined();
+    // With no workspace recorded it is a plain work node, still fully backed.
+    expect(right?.kind).toBe("work");
+    expect(right?.backing.kind).toBe("work-unit");
+
+    // The spawn edge from the spawner (base) to the recruited unit (right) is
+    // drawn, backed by the real recruitment event: the event-spawned node branches
+    // off its spawner rather than being dropped.
+    const spawnToRight = model.edges.find(
+      (e) => e.kind === "spawn" && e.from === unitNodeId("base") && e.to === unitNodeId("right"),
+    );
+    expect(spawnToRight).toBeDefined();
+    expect(spawnToRight?.backing).toMatchObject({
+      kind: "recruitment-event",
+      completedUnit: "base",
+    });
+  });
+
   it("roots every spawned unit to the goal so nothing floats unattached to the Change", () => {
     const model = buildWorkGraphModel(layeredSnapshot());
     for (const unitId of ["base", "left"]) {

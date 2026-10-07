@@ -310,6 +310,16 @@ body {
   animation: node-appear 0.5s ease both;
 }
 
+/* A node group carries tabIndex/role=button, so the browser draws its default
+   rectangular focus OUTLINE around the group's bounding box on select/focus:
+   the square box. Suppress that box here. The white selection RING is the
+   per-shape stroke set inline in graph-view (independent of this outline), so it
+   is kept; only the rectangular UA outline is removed. No box. */
+.node:focus,
+.node:focus-visible {
+  outline: none;
+}
+
 @keyframes node-appear {
   from {
     opacity: 0;

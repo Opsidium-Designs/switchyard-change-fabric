@@ -206,6 +206,44 @@ export function changeToSpecYaml(change: Change): string {
       }
     }
   }
+  // Serialize the recorded plan when the Change carries one, so the planner pass
+  // provenance (how the Change was decomposed) survives the spec round-trip to
+  // the Worker. The loader parses this `plan:` block back into Change.plan, and
+  // the live/offline state views expose it so the graph projection can root a
+  // real `planner` node (goal -> planner -> agents). Absent on the plain
+  // heuristic path, so that path emits no `plan:` block and renders no planner
+  // node, exactly as before.
+  if (change.plan) {
+    const { source, model, units, contracts } = change.plan;
+    lines.push("plan:");
+    lines.push(`  source: ${quote(source)}`);
+    lines.push(`  model: ${quote(model)}`);
+    if (units.length > 0) {
+      lines.push("  units:");
+      for (const unit of units) {
+        lines.push(`    - id: ${quote(unit.id)}`);
+        lines.push(`      objective: ${quote(unit.objective)}`);
+        if (unit.dependsOn.length > 0) {
+          lines.push("      depends_on:");
+          for (const dep of unit.dependsOn) {
+            lines.push(`        - ${quote(dep)}`);
+          }
+        }
+        if (unit.paths.length > 0) {
+          lines.push("      paths:");
+          for (const path of unit.paths) {
+            lines.push(`        - ${quote(path)}`);
+          }
+        }
+      }
+    }
+    if (contracts.length > 0) {
+      lines.push("  contracts:");
+      for (const contract of contracts) {
+        lines.push(`    - ${quote(contract)}`);
+      }
+    }
+  }
   return lines.join("\n");
 }
 

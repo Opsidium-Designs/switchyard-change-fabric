@@ -11,6 +11,7 @@ import {
   runnableUnits,
   workUnitStatuses,
   type Change,
+  type ChangePlan,
   type ConcurrencyDial,
   type Dependency,
   type DiscoveredWorkUnit,
@@ -276,6 +277,34 @@ export interface RoundAgentView {
   readonly detail?: UnitDetail;
 }
 
+/**
+ * The projection of the recorded plan surfaced on the state view. It is the
+ * graph `planner` node's backing: the plan source (planner vs heuristic
+ * fallback), the model that produced it, the planned unit ids (matching the
+ * Change's own ids), and the frozen read-only contract paths. The structural
+ * twin of the graph model's PlanSnapshot, so it feeds the projection directly.
+ */
+export interface PlanView {
+  readonly source: ChangePlan["source"];
+  readonly model: string;
+  readonly units: readonly string[];
+  readonly contracts: readonly string[];
+}
+
+/** Project a Change's recorded plan onto the serializable PlanView, or undefined. */
+function planViewFromChange(change: Change): PlanView | undefined {
+  const plan = change.plan;
+  if (!plan) {
+    return undefined;
+  }
+  return {
+    source: plan.source,
+    model: plan.model,
+    units: plan.units.map((unit) => unit.id),
+    contracts: [...plan.contracts],
+  };
+}
+
 /** The live, serializable projection of a Change's orchestration state. */
 export interface ChangeStateView {
   readonly id: string;
@@ -296,6 +325,15 @@ export interface ChangeStateView {
   readonly dial: ConcurrencyDial;
   /** The inspectable recruitment-event log (why/what triggered each wave). */
   readonly recruitments: readonly RecruitmentEvent[];
+  /**
+   * The schema-constrained plan recorded for this Change, when the goal was
+   * decomposed through the inference-backed planner pass (or its heuristic
+   * fallback). It rode the Change spec round-trip (parsed into change.plan) and
+   * is surfaced here so the graph projection can root a real `planner` node
+   * (goal -> planner -> agents). Absent on the plain heuristic path (no plan on
+   * the Change), where the graph has no planner node, exactly as before.
+   */
+  readonly plan?: PlanView;
   /**
    * The agent-built tool for this Change, when one was built; otherwise absent.
    * Backs the console's tool node.
@@ -1463,6 +1501,7 @@ export class ChangeState extends DurableObject<Env> {
       transitions,
       dial,
       recruitments,
+      ...(planViewFromChange(change) ? { plan: planViewFromChange(change)! } : {}),
       ...(tool ? { tool } : {}),
       toolConsumptions,
       leaseEdges,

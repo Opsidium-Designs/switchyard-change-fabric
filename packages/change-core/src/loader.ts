@@ -33,6 +33,9 @@ import type {
   ChangeBlueprint,
   ChangeBlueprintContract,
   ChangeBlueprintModule,
+  ChangePlan,
+  ChangePlanSource,
+  ChangePlanUnit,
   WorkUnit,
 } from "./types.ts";
 
@@ -81,6 +84,7 @@ export function normalizeChange(doc: unknown): Change {
   assertKnownDependencies(work);
 
   const blueprint = parseBlueprint(doc["blueprint"], work);
+  const plan = parsePlan(doc["plan"], work);
   return {
     id,
     objective,
@@ -89,6 +93,7 @@ export function normalizeChange(doc: unknown): Change {
     assurance,
     work,
     ...(blueprint ? { blueprint } : {}),
+    ...(plan ? { plan } : {}),
   };
 }
 
@@ -117,6 +122,75 @@ function parseBlueprint(
   const modules = parseBlueprintModules(value["modules"], knownUnitIds);
   const contracts = parseBlueprintContracts(value["contracts"]);
   return { modules, contracts };
+}
+
+const PLAN_SOURCES: readonly ChangePlanSource[] = ["planner", "heuristic-fallback"];
+
+/**
+ * Parse the optional recorded plan carried on a Change spec. The plan is how the
+ * Change was decomposed by the inference-backed, schema-constrained planner pass
+ * (or its heuristic fallback), carried so it survives the spec round-trip to the
+ * Worker and backs the graph's `planner` node. It is OPTIONAL: a hand-authored or
+ * plain heuristic Change omits it, in which case this returns undefined and the
+ * Change carries no plan (so the graph has no planner node). When present it is
+ * validated so a malformed plan is rejected with a clear error rather than
+ * silently dropped, keeping the planner node honest once it survives the
+ * round-trip.
+ */
+function parsePlan(value: unknown, work: readonly WorkUnit[]): ChangePlan | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (!isRecord(value)) {
+    throw new ChangeSpecError("plan must be a mapping when present");
+  }
+  const rawSource = value["source"];
+  if (
+    typeof rawSource !== "string" ||
+    !(PLAN_SOURCES as readonly string[]).includes(rawSource)
+  ) {
+    throw new ChangeSpecError(
+      `plan.source must be one of ${PLAN_SOURCES.join(", ")}, got ${JSON.stringify(rawSource)}`,
+    );
+  }
+  const source = rawSource as ChangePlanSource;
+  // The model is empty on the heuristic fallback, so it is optional and defaults
+  // to the empty string rather than being required.
+  const model = optionalString(value, "model") ?? "";
+  const contracts = parseStringList(value["contracts"], "plan.contracts");
+  const units = parsePlanUnits(value["units"], work);
+  return { source, model, units, contracts };
+}
+
+function parsePlanUnits(
+  value: unknown,
+  work: readonly WorkUnit[],
+): readonly ChangePlanUnit[] {
+  if (value === undefined || value === null) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw new ChangeSpecError("plan.units must be a list when present");
+  }
+  const knownUnitIds = new Set(work.map((unit) => unit.id));
+  return value.map((item, index) => {
+    if (!isRecord(item)) {
+      throw new ChangeSpecError(`plan.units[${index}] must be a mapping`);
+    }
+    const id = requireString(item, "id", `plan.units[${index}]`);
+    if (!knownUnitIds.has(id)) {
+      throw new ChangeSpecError(
+        `plan.units[${index}] names unknown WorkUnit id: ${id}`,
+      );
+    }
+    const objective = requireString(item, "objective", `plan.units[${index}] (${id})`);
+    const paths = parseStringList(item["paths"], `plan.units[${index}].paths`);
+    const dependsOn = parseStringList(
+      item["depends_on"],
+      `plan.units[${index}].depends_on`,
+    );
+    return { id, objective, paths, dependsOn };
+  });
 }
 
 function parseBlueprintModules(

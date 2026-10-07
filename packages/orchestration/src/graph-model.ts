@@ -1010,6 +1010,31 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     spawnedIds.add(unitId);
   }
 
+  // A unit named by a repo-pushed recruitment event HAS been recruited, so it is
+  // spawned and its node must materialize even if its own WorkUnit snapshot has
+  // not yet recorded a workspace/lease/advanced status (the recruitment event and
+  // the per-unit workspace record can land out of order live). This covers both
+  // endpoints of a spawn edge: the pushing unit (completedUnit) that drove the
+  // wave and each unit it recruited. Without this the materialize-on-spawn gate
+  // could withhold a genuinely-recruited node, which in turn drops the spawn edge
+  // (an edge needs both endpoints spawned), so a live repo-pushed wave would show
+  // no spawn edges even though the recruitment really happened. Only real units
+  // of this Change are admitted, and every admitted node is still backed by its
+  // own WorkUnit snapshot, so the no-unbacked-node rule is preserved.
+  for (const event of snapshot.recruitments ?? []) {
+    if (event.trigger !== "repo-pushed") {
+      continue;
+    }
+    if (event.completedUnit && unitIds.has(event.completedUnit)) {
+      spawnedIds.add(event.completedUnit);
+    }
+    for (const recruitedId of event.recruited) {
+      if (unitIds.has(recruitedId)) {
+        spawnedIds.add(recruitedId);
+      }
+    }
+  }
+
   // The goal node: the Change root the graph self-organizes toward. Its status
   // comes from the authoritative whole-change verdict (see goalOutcome).
   const goal = goalOutcome(snapshot);

@@ -26,6 +26,7 @@ import {
   runnableUnits,
   workUnitStatuses,
   type Change,
+  type ChangePlan,
   type ConcurrencyDial,
   type Dependency,
   type DiscoveredWorkUnit,
@@ -118,6 +119,33 @@ export interface WorkspaceIdentity {
   readonly leasedAt: string;
 }
 
+/**
+ * The projection of the recorded plan surfaced on the state view (mirrors the
+ * Worker's PlanView): the plan source, the model, the planned unit ids, and the
+ * frozen read-only contract paths. The structural twin of the graph model's
+ * PlanSnapshot, so it feeds the projection directly.
+ */
+export interface PlanView {
+  readonly source: ChangePlan["source"];
+  readonly model: string;
+  readonly units: readonly string[];
+  readonly contracts: readonly string[];
+}
+
+/** Project a Change's recorded plan onto the serializable PlanView, or undefined. */
+function planViewFromChange(change: Change): PlanView | undefined {
+  const plan = change.plan;
+  if (!plan) {
+    return undefined;
+  }
+  return {
+    source: plan.source,
+    model: plan.model,
+    units: plan.units.map((unit) => unit.id),
+    contracts: [...plan.contracts],
+  };
+}
+
 /** The live, serializable projection of a Change's orchestration state. */
 export interface ChangeStateView {
   readonly id: string;
@@ -133,6 +161,15 @@ export interface ChangeStateView {
   readonly costEvents: readonly CostEvent[];
   readonly dial: ConcurrencyDial;
   readonly recruitments: readonly RecruitmentEvent[];
+  /**
+   * The schema-constrained plan recorded for this Change, when it was decomposed
+   * through the inference-backed planner pass (or its heuristic fallback). It
+   * rode the Change (change.plan) and backs the graph's `planner` node. Absent on
+   * the plain heuristic path (no plan on the Change), where there is no planner
+   * node. Mirrors the Worker's ChangeStateView so the console projects both
+   * identically.
+   */
+  readonly plan?: PlanView;
   /** The agent-built tool for this Change, when one was recorded. */
   readonly tool?: ToolRecord;
   /** Real tool-consumption records; each backs one consumed-tool edge. */
@@ -1012,6 +1049,7 @@ export class LocalChangeControl {
       costEvents: record.costEvents,
       dial: record.dial,
       recruitments: record.recruitments,
+      ...(planViewFromChange(change) ? { plan: planViewFromChange(change)! } : {}),
       ...(record.tool ? { tool: record.tool } : {}),
       toolConsumptions: record.toolConsumptions,
       leaseEdges,

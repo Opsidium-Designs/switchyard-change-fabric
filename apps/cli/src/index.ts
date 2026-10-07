@@ -863,7 +863,20 @@ async function resolveChange(args: readonly string[]): Promise<Change | undefine
   if (goal === undefined || !projectDir) {
     return undefined;
   }
-  const decomposition = await decomposeGoal({ goal, projectDir });
+  // Inject the opt-in schema-constrained planner exactly like the decompose and
+  // run-goal commands do, so the live run path (run-live) decomposes through the
+  // planner when inference is configured. The planner records how the Change was
+  // decomposed ON the Change (change.plan), which rides changeToSpecYaml to the
+  // Worker so the live graph roots a real planner node. When inference is not
+  // configured this returns undefined, so decomposeGoal stays on the
+  // deterministic heuristic path and the Change carries no plan (no planner
+  // node), keeping make check and the demo offline and deterministic.
+  const planner = plannerInjectionFromEnv();
+  const decomposition = await decomposeGoal({
+    goal,
+    projectDir,
+    ...(planner ? { planner } : {}),
+  });
   return decomposition.change;
 }
 

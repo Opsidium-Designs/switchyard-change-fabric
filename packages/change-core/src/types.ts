@@ -48,6 +48,44 @@ export interface Change {
    * per-file shape), in which case there are no frozen contracts to carry.
    */
   readonly blueprint?: ChangeBlueprint;
+  /**
+   * The recorded plan that drove this Change, present only when the Change was
+   * produced by the inference-backed, schema-constrained planner pass (or its
+   * heuristic fallback). It rides the Change so it survives the spec YAML
+   * round-trip to the Worker and is exposed by the live/offline state views,
+   * which lets the graph projection back a real `planner` node (goal -> planner
+   * -> agents). Absent on the plain heuristic decomposition path, so that path
+   * carries no plan and the graph has no planner node, exactly as before.
+   */
+  readonly plan?: ChangePlan;
+}
+
+/** How a recorded plan was produced, so a reader can tell planner from fallback. */
+export type ChangePlanSource = "planner" | "heuristic-fallback";
+
+/** One unit a plan proposed, projected onto the Change's own unit ids. */
+export interface ChangePlanUnit {
+  readonly id: string;
+  readonly objective: string;
+  readonly paths: readonly string[];
+  readonly dependsOn: readonly string[];
+}
+
+/**
+ * The portable record of how a Change was decomposed, carried on the Change so
+ * it round-trips through the spec and the state views. It is the structural twin
+ * of the planner pass's RecordedPlan, declared here so the core type carries no
+ * dependency on the planner module.
+ */
+export interface ChangePlan {
+  /** Whether the inference planner produced the plan, or the heuristic fallback. */
+  readonly source: ChangePlanSource;
+  /** The model that produced an accepted plan (empty on the heuristic fallback). */
+  readonly model: string;
+  /** The planned units projected onto the Change's own unit ids. */
+  readonly units: readonly ChangePlanUnit[];
+  /** The frozen read-only contract paths the plan froze (owned by no unit). */
+  readonly contracts: readonly string[];
 }
 
 /** One owned module carried on a Change: exactly one WorkUnit writes its file(s). */
