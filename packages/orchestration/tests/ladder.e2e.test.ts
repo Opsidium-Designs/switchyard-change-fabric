@@ -41,11 +41,12 @@ import {
   buildWorkGraphModel,
   jevNodeId,
   roundAgentNodeId,
+  retryNodeId,
   verifyNodeId,
   type ChangeStateSnapshot,
   type GraphNode,
 } from "../src/graph-model.ts";
-import { runFullLive, type DeployApp, type FullLiveEvent } from "../src/run-live.ts";
+import { runFullLive, createPlanningChange, type DeployApp, type FullLiveEvent } from "../src/run-live.ts";
 import {
   MarkerGateRunner,
   ModelAwareExecutor,
@@ -169,6 +170,10 @@ work:
  * them. The lease/recruit/fail/deployment handling mirrors the other e2e fakes.
  */
 function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWorkspaceProvider) {
+  // An ordered log of the create/plan lifecycle ops, so a test can assert that a
+  // planning placeholder is created BEFORE the plan is attached (create-precedes-
+  // plan). Each entry is the op name in the order the Worker handled it.
+  const opLog: string[] = [];
   const provisionAndRecord = async (
     changeId: string,
     unitIds: readonly string[],
@@ -205,9 +210,45 @@ function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWork
     const body = () =>
       typeof init?.body === "string" && init.body !== "" ? JSON.parse(init.body) : {};
 
+    // Create a "planning" PLACEHOLDER Change (header only, status "planning")
+    // BEFORE the planner ran, exactly as the live Worker's POST /changes/planning
+    // does. Recorded in the op log so a test can assert create-precedes-plan.
+    if (method === "POST" && url.pathname === "/changes/planning") {
+      const b = body() as {
+        id?: string;
+        objective?: string;
+        baseline?: string;
+        budgetUsd?: number;
+        assurance?: string;
+      };
+      control.createPlanning({
+        id: String(b.id ?? ""),
+        objective: String(b.objective ?? ""),
+        baseline: String(b.baseline ?? "HEAD"),
+        budgetUsd: typeof b.budgetUsd === "number" ? b.budgetUsd : 0,
+        assurance: (b.assurance ?? "standard") as "none" | "standard" | "strict",
+      });
+      opLog.push("planning");
+      return json({ ok: true }, 201);
+    }
     if (method === "POST" && url.pathname === "/changes") {
       control.createChange(String(init?.body ?? ""));
+      opLog.push("create");
       return json({ ok: true }, 201);
+    }
+    // Attach the decomposed plan to a planning placeholder (flips status to
+    // "running"), exactly as the live Worker's POST /changes/:id/plan does. A
+    // 404 when no placeholder exists lets runFullLive fall back to a plain
+    // create, mirroring the live behavior.
+    const planAttach = url.pathname.match(/^\/changes\/([^/]+)\/plan$/);
+    if (method === "POST" && planAttach) {
+      try {
+        control.attachPlan(String(init?.body ?? ""));
+        opLog.push("plan");
+        return json({ ok: true }, 200);
+      } catch {
+        return json({ error: "no such Change" }, 404);
+      }
     }
     const dial = url.pathname.match(/^\/changes\/([^/]+)\/dial$/);
     if (method === "POST" && dial) {
@@ -312,7 +353,7 @@ function fakeWorker(control: LocalChangeControl, workspaces: LocalFilesystemWork
     return json({ error: `not found: ${method} ${url.pathname}` }, 404);
   }) as unknown as typeof fetch;
 
-  return { fetchFn };
+  return { fetchFn, opLog };
 }
 
 function json(bodyValue: unknown, status = 200): Response {
@@ -408,7 +449,15 @@ async function runLadder(options: {
     readonly candidateUnitIds: readonly string[];
     readonly attributionChoice?: string;
     readonly round: number;
-  }) => Promise<readonly string[]>;
+    readonly priorRevisedUnitIds?: readonly string[];
+  }) => Promise<
+    | readonly string[]
+    | {
+        readonly units: readonly { readonly id: string; readonly objective: string }[];
+        readonly rationale?: string;
+        readonly model?: string;
+      }
+  >;
   /**
    * Use the ResourceNameGateRunner (names failing units by RESOURCE NAME in the
    * real assertion-line forms) instead of the file-path MarkerGateRunner, so a
@@ -423,6 +472,14 @@ async function runLadder(options: {
    * selector that narrows the re-fan even when the parse cannot.
    */
   readonly useCrashGate?: boolean;
+  /**
+   * When true, create a "planning" PLACEHOLDER Change on the (fake) Worker
+   * BEFORE the ladder runs, exactly as the live CLI does before the LLM planner.
+   * runFullLive then ATTACHES the plan to that placeholder (status planning ->
+   * running). Used by the create-first test to assert create-precedes-plan and
+   * the status transition.
+   */
+  readonly preCreatePlanning?: boolean;
 }) {
   const spec = options.spec ?? SPEC;
   const changeId = options.changeId ?? "change-ladder";
@@ -430,11 +487,32 @@ async function runLadder(options: {
     rootDir: join(workRoot, options.subdir, "artifacts"),
   });
   const control = new LocalChangeControl(workspaces);
-  const { fetchFn } = fakeWorker(control, workspaces);
+  const { fetchFn, opLog } = fakeWorker(control, workspaces);
   const change = parseChangeSpec(spec);
 
   const projectDir = join(workRoot, options.subdir, "project");
   await seedProject(projectDir);
+
+  // CREATE-FIRST: when asked, create the planning placeholder on the fake Worker
+  // BEFORE the ladder/run touches it, so the console would attach to a Change
+  // that already exists with status "planning". runFullLive attaches the plan
+  // afterwards. The placeholder captured here lets the test assert the planning
+  // status and empty work before the plan lands.
+  let planningStateBeforeAttach: ChangeStateSnapshot | undefined;
+  if (options.preCreatePlanning) {
+    await createPlanningChange({
+      workerUrl: "http://w",
+      header: {
+        id: changeId,
+        objective: change.objective,
+        baseline: change.baseline,
+        budgetUsd: change.budgetUsd,
+        assurance: change.assurance,
+      },
+      fetchFn,
+    });
+    planningStateBeforeAttach = control.state(changeId) as ChangeStateSnapshot;
+  }
 
   const events: FullLiveEvent[] = [];
   const redeployed: string[] = [];
@@ -491,7 +569,7 @@ async function runLadder(options: {
   });
 
   const snapshot = control.state(changeId) as ChangeStateSnapshot;
-  return { result, control, snapshot, events, redeployed, executor };
+  return { result, control, snapshot, events, redeployed, executor, opLog, planningStateBeforeAttach };
 }
 
 describe("T10: the bounded model-escalation ladder (offline, deterministic)", () => {
@@ -1796,25 +1874,58 @@ describe("re-plan on retry (offline, faked planner): choose a revised unit set t
     expect(replanPlanner.label).toContain("round 2");
     // No `replan` node kind exists anywhere in the model.
     expect(model.nodes.some((n) => (n.kind as string) === "replan")).toBe(false);
-    // The ladder causal chain verify(failed) -> planner(re-plan) -> retry-agents
-    // is drawn with `trigger`-kind edges (ladder control-flow), NOT `spawn`
-    // (which is reserved for an Artifact repo-pushed recruitment). A trigger edge
-    // from the failing verify into the re-plan planner, and a trigger edge from
-    // the re-plan planner into the re-fanned round-N agent.
+    // The ladder causal chain is strictly verify(failed) -> planner(re-plan) ->
+    // retry -> round-agents, drawn with `trigger`-kind edges (ladder
+    // control-flow), NOT `spawn` (reserved for an Artifact repo-pushed
+    // recruitment). The failing verify's ONLY trigger-child is the re-plan
+    // planner; the planner's trigger-child is the RETRY node; the round agents
+    // hang off the RETRY node. There is NO planner -> agent edge and NO
+    // verify -> retry / verify -> agent edge that bypasses the planner.
     const replanId = replanPlanner.id;
+    const retryId = retryNodeId(snapshot.id, 2);
+    const agentId = roundAgentNodeId(snapshot.id, 2, "two");
+    const verify1Id = verifyNodeId(snapshot.id, 1);
+
+    // verify(failed) --trigger--> planner(re-plan)
     const verifyToReplan = model.edges.find(
-      (e) => e.kind === "trigger" && e.to === replanId && e.from === verifyNodeId(snapshot.id, 1),
+      (e) => e.kind === "trigger" && e.to === replanId && e.from === verify1Id,
     );
     expect(verifyToReplan).toBeDefined();
-    const replanToAgent = model.edges.find(
+    // The failing verify's ONLY trigger-child is the planner (no verify -> retry
+    // and no verify -> agent bypass).
+    const verifyChildren = model.edges.filter(
+      (e) => e.kind === "trigger" && e.from === verify1Id,
+    );
+    expect(verifyChildren.map((e) => e.to)).toEqual([replanId]);
+
+    // planner(re-plan) --trigger--> retry (the planner's trigger-child is the
+    // retry node, NOT the agent).
+    const replanToRetry = model.edges.find(
+      (e) => e.kind === "trigger" && e.from === replanId && e.to === retryId,
+    );
+    expect(replanToRetry).toBeDefined();
+    // The planner has NO edge directly to any round-N agent.
+    expect(
+      model.edges.some((e) => e.from === replanId && e.to === agentId),
+    ).toBe(false);
+    // The planner's ONLY trigger-child is the retry node.
+    const replanChildren = model.edges.filter(
       (e) => e.kind === "trigger" && e.from === replanId,
     );
-    expect(replanToAgent).toBeDefined();
-    expect(replanToAgent?.to).toBe(roundAgentNodeId(snapshot.id, 2, "two"));
+    expect(replanChildren.map((e) => e.to)).toEqual([retryId]);
+
+    // retry --trigger--> round-agent (the agent hangs off the RETRY node).
+    const retryToAgent = model.edges.find(
+      (e) => e.kind === "trigger" && e.from === retryId && e.to === agentId,
+    );
+    expect(retryToAgent).toBeDefined();
+
     // NO `spawn` edge is emitted for the re-plan/retry chain: a spawn edge always
     // means an Artifact repo-pushed recruitment, never a re-plan/retry trigger.
     expect(model.edges.some((e) => e.kind === "spawn" && e.id.startsWith("replan-"))).toBe(false);
     expect(model.edges.some((e) => e.kind === "spawn" && e.id.startsWith("re-fan:"))).toBe(false);
+    // The removed planner -> agent edge (replan-refan) is gone entirely.
+    expect(model.edges.some((e) => e.id.startsWith("replan-refan:"))).toBe(false);
     for (const node of model.nodes) {
       expect(() => assertBacked(node, snapshot)).not.toThrow();
     }
@@ -1877,5 +1988,281 @@ describe("re-plan on retry (offline, faked planner): choose a revised unit set t
     // re-plan planner node).
     expect(model.edges.some((e) => e.id.startsWith("replan-trigger:"))).toBe(false);
     expect(model.edges.some((e) => e.id.startsWith("replan-refan:"))).toBe(false);
+  });
+});
+
+describe("create-first: the Change exists with 'planning' status BEFORE the planner, then the plan attaches", () => {
+  it("creates a planning placeholder (empty work) before the plan, then attaches the plan and flips status to running", async () => {
+    // A planning placeholder is created on the Worker BEFORE the run decomposes
+    // (preCreatePlanning), so the console would attach to a Change that already
+    // exists with status "planning" and no work. runFullLive then ATTACHES the
+    // decomposed plan, filling in the work and flipping the status to "running".
+    const { snapshot, opLog, planningStateBeforeAttach } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      subdir: "create-first",
+      preCreatePlanning: true,
+    });
+
+    // The Change existed with status "planning" and an EMPTY work set BEFORE the
+    // plan was attached: the console can see it (and that it is planning) at once.
+    expect(planningStateBeforeAttach).toBeDefined();
+    expect(planningStateBeforeAttach?.status).toBe("planning");
+    expect(planningStateBeforeAttach?.work).toHaveLength(0);
+
+    // CREATE PRECEDES PLAN: the planning placeholder was created before the plan
+    // was attached, and the normal full-spec create never ran (the attach took
+    // its place on the planning placeholder).
+    expect(opLog.indexOf("planning")).toBeGreaterThanOrEqual(0);
+    expect(opLog.indexOf("plan")).toBeGreaterThan(opLog.indexOf("planning"));
+    expect(opLog).not.toContain("create");
+
+    // After attach the status is "running" and the real work is present.
+    expect(snapshot.status).toBe("running");
+    expect(snapshot.work.length).toBeGreaterThan(0);
+  });
+
+  it("offline/no placeholder: runFullLive creates the Change the normal way (status running), unchanged", async () => {
+    // With no planning placeholder pre-created, runFullLive falls back to the
+    // normal POST /changes create, so the op log shows a plain create (no
+    // planning, no attach) and the status is "running" from the start.
+    const { snapshot, opLog } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      subdir: "create-first-fallback",
+    });
+    expect(opLog).toContain("create");
+    expect(opLog).not.toContain("planning");
+    expect(opLog).not.toContain("plan");
+    expect(snapshot.status).toBe("running");
+  });
+});
+
+describe("re-plan EVERY failing retry round (not only the first)", () => {
+  it("re-plans at BOTH failing rounds: refanSource 're-plan' on each, a planner node per round", async () => {
+    // A two-unit change where NO model ever passes the gate, so every round
+    // fails: round 1 (base) fails, retry round 2 fails, retry round 3 fails.
+    // With maxModelRetries=2 and a two-model ladder, there are TWO retry rounds
+    // (2 and 3). The injected re-plan is called EACH retry iteration and returns
+    // a usable revised set each time (narrowing to one unit per round), so BOTH
+    // retry rounds record refanSource "re-plan" and a planner (re-plan) node is
+    // emitted per round. The re-plan is also fed the prior round's revised ids,
+    // proving the transport is per-round stateful rather than dropping to the
+    // fallback on a later round.
+    const seen: { round: number; prior: readonly string[] }[] = [];
+    const rePlan = async (input: {
+      readonly round: number;
+      readonly priorRevisedUnitIds?: readonly string[];
+    }): Promise<readonly string[]> => {
+      seen.push({ round: input.round, prior: input.priorRevisedUnitIds ?? [] });
+      // Round 2 narrows to "alpha"; round 3 narrows to "beta". A later round
+      // still returns a usable (intersecting) set rather than falling back.
+      return input.round <= 2 ? ["alpha"] : ["beta"];
+    };
+    const { snapshot } = await runLadder({
+      passingModel: "no-model-ever-passes",
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      subdir: "replan-every-round",
+      maxConcurrency: 2,
+      maxModelRetries: 2,
+      escalationModels: ["esc-1", "esc-2"],
+      rePlan,
+    });
+
+    // The re-plan was called at BOTH retry rounds (2 and 3).
+    expect(seen.map((s) => s.round)).toEqual([2, 3]);
+    // Round 3 was fed round 2's revised set (per-round stateful, not stateless).
+    expect(seen[1]?.prior).toEqual(["alpha"]);
+
+    // TWO retry attempts recorded, BOTH with refanSource "re-plan" (round 2
+    // re-planned, and round 3 ALSO re-planned, not falling back to "parse").
+    expect(snapshot.retryAttempts).toHaveLength(2);
+    expect(snapshot.retryAttempts?.[0]).toMatchObject({ round: 2, refanSource: "re-plan" });
+    expect(snapshot.retryAttempts?.[1]).toMatchObject({ round: 3, refanSource: "re-plan" });
+    expect(snapshot.rePlans).toBe(2);
+
+    // A re-plan planner node is emitted for EACH failing round (round 2 and 3).
+    const model = buildWorkGraphModel(snapshot);
+    const replanNodes = model.nodes.filter(
+      (n) => n.kind === "planner" && n.backing.kind === "planner" && n.backing.round !== undefined,
+    );
+    expect(
+      replanNodes
+        .map((n) => (n.backing as { round?: number }).round)
+        .sort((a, b) => (a ?? 0) - (b ?? 0)),
+    ).toEqual([2, 3]);
+  });
+});
+
+describe("re-plan planner node detail is at PARITY with the kickoff planner", () => {
+  it("carries model + rationale + units-with-objectives from the re-plan transport", async () => {
+    // The re-plan transport returns the RICH result shape: the revised units WITH
+    // their re-plan objectives, a rationale for the re-plan, and the model. The
+    // round-keyed planner node must surface all three in its planner detail, at
+    // parity with the kickoff planner node's detail (which carries model,
+    // rationale, and units-with-objectives).
+    const RE_PLAN_RATIONALE = "the auth module is the only one the failure implicates";
+    const RE_PLAN_OBJECTIVE = "require auth on the beta route and return 401 when missing";
+    const rePlan = async (): Promise<{
+      units: { id: string; objective: string }[];
+      rationale: string;
+      model: string;
+    }> => ({
+      units: [{ id: "beta", objective: RE_PLAN_OBJECTIVE }],
+      rationale: RE_PLAN_RATIONALE,
+      model: ESCALATION_MODEL,
+    });
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      subdir: "replan-parity",
+      maxConcurrency: 2,
+      alwaysPassingUnits: ["alpha"],
+      rePlan,
+    });
+
+    // The retry recorded the rich re-plan detail (rationale + revised units).
+    expect(snapshot.retryAttempts).toHaveLength(1);
+    expect(snapshot.retryAttempts?.[0]?.refanSource).toBe("re-plan");
+    expect(snapshot.retryAttempts?.[0]?.rationale).toBe(RE_PLAN_RATIONALE);
+    expect(snapshot.retryAttempts?.[0]?.revisedUnits).toEqual([
+      { id: "beta", objective: RE_PLAN_OBJECTIVE },
+    ]);
+
+    const model = buildWorkGraphModel(snapshot);
+    const replanPlanner = model.nodes.find(
+      (n) => n.kind === "planner" && n.backing.kind === "planner" && n.backing.round === 2,
+    );
+    expect(replanPlanner).toBeDefined();
+    const detail = replanPlanner!.plannerDetail;
+    // PARITY with the kickoff planner detail: model + rationale + units-with-
+    // objectives (not just ids).
+    expect(detail?.model).toBe(ESCALATION_MODEL);
+    expect(detail?.rationale).toBe(RE_PLAN_RATIONALE);
+    expect(detail?.units).toEqual([{ id: "beta", objective: RE_PLAN_OBJECTIVE }]);
+    expect(detail?.agentCount).toBe(1);
+    // The detail shape matches the kickoff planner detail shape exactly (same
+    // keys), proving parity rather than a thin id-only panel.
+    expect(detail?.source).toBe("planner");
+    // Still backed by the recorded re-plan retry (assertBacked does not throw).
+    expect(() => assertBacked(replanPlanner!, snapshot)).not.toThrow();
+  });
+});
+
+describe("graph chain is strictly verify -> planner -> retry -> agents (no bypass)", () => {
+  it("the failing verify's only trigger-child is the planner; agents hang off the retry; no planner->agent edge", async () => {
+    const rePlan = async (): Promise<readonly string[]> => ["beta"];
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      subdir: "replan-chain",
+      maxConcurrency: 2,
+      alwaysPassingUnits: ["alpha"],
+      rePlan,
+    });
+    const model = buildWorkGraphModel(snapshot);
+    const verify1 = verifyNodeId(snapshot.id, 1);
+    const retry2 = retryNodeId(snapshot.id, 2);
+    const agentBeta = roundAgentNodeId(snapshot.id, 2, "beta");
+    const replan = model.nodes.find(
+      (n) => n.kind === "planner" && n.backing.kind === "planner" && n.backing.round === 2,
+    );
+    expect(replan).toBeDefined();
+    const replanId = replan!.id;
+
+    // verify(failed)'s ONLY trigger-child is the re-plan planner (no verify->retry
+    // and no verify->agent bypass).
+    const verifyTriggers = model.edges.filter((e) => e.kind === "trigger" && e.from === verify1);
+    expect(verifyTriggers.map((e) => e.to)).toEqual([replanId]);
+
+    // planner(re-plan)'s ONLY trigger-child is the retry (no planner->agent edge).
+    const plannerTriggers = model.edges.filter((e) => e.kind === "trigger" && e.from === replanId);
+    expect(plannerTriggers.map((e) => e.to)).toEqual([retry2]);
+    expect(model.edges.some((e) => e.from === replanId && e.to === agentBeta)).toBe(false);
+
+    // retry --trigger--> round-agent (the agent hangs off the RETRY node).
+    expect(
+      model.edges.some((e) => e.kind === "trigger" && e.from === retry2 && e.to === agentBeta),
+    ).toBe(true);
+
+    // The removed planner->agent edge is gone; the chain edges are all 'trigger',
+    // and 'spawn' is reserved for Artifact repo-pushed recruitment only.
+    expect(model.edges.some((e) => e.id.startsWith("replan-refan:"))).toBe(false);
+    expect(
+      model.edges.some(
+        (e) => e.kind === "spawn" && (e.id.startsWith("replan-") || e.id.startsWith("re-fan:")),
+      ),
+    ).toBe(false);
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
+  });
+});
+
+describe("Jev attribution is recorded at EACH failing round", () => {
+  it("records a backed jev attribution decision+node on every verify-fail, even on a non-confident reply", async () => {
+    // A two-model ladder where no model passes, so rounds 1, 2, 3 all fail (two
+    // retry rounds). Jev returns a LOW-CONFIDENCE choice each round (below the
+    // threshold), so it is advisory and never flips the gate; the point is that
+    // the attribution decision is RECORDED on EACH failing round, not only when
+    // Jev is confident. The result: one plan-review decision is absent (no
+    // planner plan injected here), and an attribution decision per failing round.
+    const jev = async (
+      _state: string,
+      questions: Readonly<
+        Record<string, { readonly type: "noul" | "choice" | "score"; readonly criteria?: readonly string[] }>
+      >,
+    ) => {
+      const out: Record<
+        string,
+        { type: "noul" | "choice" | "score"; choice?: string; noul?: "yes" | "no" | "unsure"; confidence: number }
+      > = {};
+      if (questions["attribution"]) {
+        // A low-confidence choice: advisory, below the 0.75 threshold, so it is
+        // recorded ESCALATED each round and never narrows/flips the gate.
+        out["attribution"] = { type: "choice", choice: "alpha", confidence: 0.2 };
+      }
+      if (questions["fix-confidence"]) {
+        out["fix-confidence"] = { type: "noul", noul: "no", confidence: 0.2 };
+      }
+      return out;
+    };
+
+    const { snapshot } = await runLadder({
+      passingModel: "no-model-ever-passes",
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      subdir: "jev-each-round",
+      maxConcurrency: 2,
+      maxModelRetries: 2,
+      escalationModels: ["esc-1", "esc-2"],
+      jev,
+      jevThreshold: 0.75,
+    });
+
+    // Two retry rounds happened (round 2 and round 3), each a verify-fail that
+    // consulted Jev for attribution. An attribution decision is recorded at EACH
+    // failing round (round 1 fail -> re-fan into round 2, round 2 fail -> re-fan
+    // into round 3), so there are at least TWO attribution decisions, not just
+    // the start/end ones.
+    const attributions = (snapshot.jevDecisions ?? []).filter(
+      (d) => d.juncture === "attribution",
+    );
+    expect(attributions.length).toBeGreaterThanOrEqual(2);
+    // The low-confidence attribution is recorded ESCALATED (advisory, never used
+    // to flip the gate), so each attribution decision reads accepted === false.
+    expect(attributions.every((d) => d.accepted === false)).toBe(true);
+
+    // Each attribution decision backs a real jev node placed at the attribution
+    // juncture, and every node is backed (assertBacked does not throw).
+    const model = buildWorkGraphModel(snapshot);
+    const jevNodes = model.nodes.filter(
+      (n) => n.kind === "jev" && n.jevDetail?.juncture === "attribution",
+    );
+    expect(jevNodes.length).toBeGreaterThanOrEqual(2);
+    for (const node of model.nodes) {
+      expect(() => assertBacked(node, snapshot)).not.toThrow();
+    }
   });
 });

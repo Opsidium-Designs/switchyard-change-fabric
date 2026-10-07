@@ -1,7 +1,7 @@
 import { parseChangeSpec } from "@switchyard-change/change-core";
 import type { DiscoveredWorkUnit } from "@switchyard-change/change-core";
 
-import type { EscalationKind, JevDecisionView, JevJuncture, LeaseWorkspace, RefanSource, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
+import type { EscalationKind, JevDecisionView, JevJuncture, LeaseWorkspace, PlanningChangeHeader, RefanSource, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
 import type { ChangeState } from "./change-state.ts";
 import type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 import { selectProvisioner } from "./workspace-provisioner.ts";
@@ -104,6 +104,63 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     try {
       const state = await stub.createFromSpec(specYaml);
       return json(state, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Create a "planning" PLACEHOLDER Change from just its header, BEFORE the
+  // planner has decided the work. The body is a JSON header (id, objective,
+  // baseline, budgetUsd, assurance). This exists so a live run can create the
+  // Change on the Worker the instant it begins (status "planning", empty work),
+  // and the console can attach and see the Change within one poll instead of
+  // 404ing for the whole LLM planner latency. The plan is attached afterwards via
+  // POST /changes/:id/plan, which fills in the real work and flips the status to
+  // "running".
+  if (request.method === "POST" && url.pathname === "/changes/planning") {
+    let body: PlanningBody;
+    try {
+      body = (await request.json()) as PlanningBody;
+    } catch {
+      return json({ error: "invalid planning-change body" }, 400);
+    }
+    if (!body.id || !body.objective || !body.baseline) {
+      return json({ error: "a planning Change requires id, objective, and baseline" }, 400);
+    }
+    const stub = changeStateStub(env, body.id);
+    try {
+      const state = await stub.createPlanning({
+        id: body.id,
+        objective: body.objective,
+        baseline: body.baseline,
+        budgetUsd: numberOr(body.budgetUsd, 0),
+        assurance: (body.assurance ?? "standard") as PlanningChangeHeader["assurance"],
+      });
+      return json(state, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
+  }
+
+  // Attach the decomposed plan to a "planning" placeholder Change: the body is
+  // the full Change spec YAML (now carrying the real work units and the recorded
+  // plan). It replaces the stored placeholder with the full Change and flips the
+  // status from "planning" to "running", so the console (already attached to the
+  // planning placeholder) now sees the real graph and the rooted planner node.
+  const planMatch = url.pathname.match(/^\/changes\/([^/]+)\/plan$/);
+  if (request.method === "POST" && planMatch) {
+    const changeId = decodeURIComponent(planMatch[1] ?? "");
+    const specYaml = await request.text();
+    if (specYaml.trim() === "") {
+      return json({ error: "empty Change spec body" }, 400);
+    }
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    try {
+      const state = await stub.attachPlan(specYaml);
+      return json(state, 200);
     } catch (error) {
       return json({ error: errorMessage(error) }, 400);
     }
@@ -478,6 +535,16 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         implicatedUnits: Array.isArray(body.implicatedUnits) ? body.implicatedUnits : [],
         ...(body.refanSource ? { refanSource: body.refanSource } : {}),
         reason: body.reason ?? "verify-fail escalation",
+        ...(Array.isArray(body.revisedUnits) && body.revisedUnits.length > 0
+          ? {
+              revisedUnits: body.revisedUnits
+                .filter((u) => u && typeof u.id === "string")
+                .map((u) => ({ id: String(u.id), objective: String(u.objective ?? "") })),
+            }
+          : {}),
+        ...(typeof body.rationale === "string" && body.rationale !== ""
+          ? { rationale: body.rationale }
+          : {}),
       });
       return json({ retryAttempt: attempt }, 201);
     } catch (error) {
@@ -1053,6 +1120,15 @@ interface DeploymentBody {
   readonly app?: string;
 }
 
+/** Body of POST /changes/planning: the header for a planning placeholder Change. */
+interface PlanningBody {
+  readonly id?: string;
+  readonly objective?: string;
+  readonly baseline?: string;
+  readonly budgetUsd?: number;
+  readonly assurance?: string;
+}
+
 /** Body of POST /changes/:id/verify-attempt: one change-level mechanical gate run. */
 interface VerifyAttemptBody {
   readonly round?: number;
@@ -1072,6 +1148,12 @@ interface RetryAttemptBody {
   readonly implicatedUnits?: readonly string[];
   readonly refanSource?: RefanSource;
   readonly reason?: string;
+  /** The revised units (with objectives) a re-plan chose this round, when any. */
+  readonly revisedUnits?: readonly { readonly id?: string; readonly objective?: string }[];
+  /** The re-plan rationale, when a re-plan round carried one. */
+  readonly rationale?: string;
+  /** The re-plan model, when the transport reported one distinct from toModel. */
+  readonly replanModel?: string;
 }
 
 /** Body of POST /changes/:id/jev-decision: one Jev typed decision at a juncture. */

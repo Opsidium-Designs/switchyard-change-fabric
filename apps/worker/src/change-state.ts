@@ -24,6 +24,30 @@ import {
 
 import type { Env } from "./env.ts";
 
+/**
+ * The Change-level lifecycle status, distinct from a WorkUnit's status. It lets
+ * the console attach to a Change the instant it exists, before the planner has
+ * decomposed it:
+ *   - "planning": the Change was created on the Worker as a placeholder (header
+ *     only, no work yet) while the planner runs, so the console sees the Change
+ *     exists (and that it is planning) within one poll instead of 404ing for the
+ *     whole planner latency;
+ *   - "running": the plan has been attached (the real work units are present) and
+ *     the run is proceeding. A Change created from a full spec (the hand-authored
+ *     path, or any create that already carries its work) is "running" from the
+ *     start, so that path is unchanged.
+ */
+export type ChangeStatus = "planning" | "running";
+
+/** The header fields needed to create a "planning" placeholder Change. */
+export interface PlanningChangeHeader {
+  readonly id: string;
+  readonly objective: string;
+  readonly baseline: string;
+  readonly budgetUsd: number;
+  readonly assurance: Change["assurance"];
+}
+
 /** How a WorkUnit's workspace was provisioned, as recorded on its lease. */
 export interface LeaseWorkspace {
   readonly workspaceId: string;
@@ -257,6 +281,20 @@ export interface RetryAttempt {
   readonly refanSource?: RefanSource;
   /** A short, human-readable reason the ladder escalated (never a secret). */
   readonly reason: string;
+  /**
+   * The revised units a re-plan chose this round, each WITH the re-plan
+   * objective it assigned, so a round-keyed planner node can render the re-plan
+   * at parity with the kickoff planner (units-with-objectives, not just ids).
+   * Present only on a re-plan round (refanSource "re-plan"); absent on a
+   * parse/jev/all retry, which carries only implicatedUnits.
+   */
+  readonly revisedUnits?: readonly { readonly id: string; readonly objective: string }[];
+  /**
+   * The re-plan's rationale for revising the plan this way, so the round-keyed
+   * planner node can show WHY, at parity with the kickoff planner's rationale.
+   * Present only on a re-plan round that carried one.
+   */
+  readonly rationale?: string;
   readonly at: string;
 }
 
@@ -380,6 +418,14 @@ function planViewFromChange(change: Change): PlanView | undefined {
 export interface ChangeStateView {
   readonly id: string;
   readonly objective: string;
+  /**
+   * The Change-level lifecycle status: "planning" while the Change exists as a
+   * placeholder and the planner is still deciding the work, "running" once the
+   * plan is attached (or from the start for a full-spec create). The console
+   * reads this so it can show that a just-created Change exists and is planning
+   * within one poll, rather than 404ing for the whole planner latency.
+   */
+  readonly status: ChangeStatus;
   readonly baseline: string;
   readonly budgetUsd: number;
   readonly assurance: Change["assurance"];
@@ -634,7 +680,62 @@ export class ChangeState extends DurableObject<Env> {
   /** Create (or replace) the Change held by this object from spec YAML text. */
   async createFromSpec(specYaml: string): Promise<ChangeStateView> {
     const change = parseChangeSpec(specYaml);
+    await this.initChange(change, "running");
+    return this.view();
+  }
+
+  /**
+   * Create a "planning" PLACEHOLDER Change from just its header (id, objective,
+   * baseline, budget, assurance), with an EMPTY work set and status "planning",
+   * BEFORE the planner has decided the work. This is what lets the console attach
+   * to the Change the instant a run begins: the Change exists (and reports it is
+   * planning) within one poll, instead of the console 404ing for the whole
+   * planner latency. The real work and plan are attached later by `attachPlan`,
+   * which flips the status to "running". An empty work set is intentional here
+   * (the placeholder has no units yet); the full-spec `createFromSpec` path still
+   * requires a non-empty parsed spec, so this is the only create that admits an
+   * empty work set, and only transiently while planning.
+   */
+  async createPlanning(header: PlanningChangeHeader): Promise<ChangeStateView> {
+    const change: Change = {
+      id: header.id,
+      objective: header.objective,
+      baseline: header.baseline,
+      budgetUsd: header.budgetUsd,
+      assurance: header.assurance,
+      work: [],
+    };
+    await this.initChange(change, "planning");
+    return this.view();
+  }
+
+  /**
+   * Attach the decomposed plan to a Change that was created as a "planning"
+   * placeholder: re-parse the full spec YAML (which now carries the real work
+   * units and the recorded plan), replace the stored Change with it, and flip the
+   * status from "planning" to "running". This is the second half of the
+   * create-first-then-plan flow: the console has already attached to the planning
+   * placeholder, and this fills in the real graph and roots the planner node. The
+   * run has not advanced yet (no leases/completions), so re-initializing the
+   * bookkeeping is correct. Idempotent in spirit: attaching the same plan again
+   * simply re-stores it and keeps the status "running".
+   */
+  async attachPlan(specYaml: string): Promise<ChangeStateView> {
+    const change = parseChangeSpec(specYaml);
+    await this.initChange(change, "running");
+    return this.view();
+  }
+
+  /**
+   * Initialize (or re-initialize) all the per-Change bookkeeping for a freshly
+   * created Change at the given lifecycle status. Shared by createFromSpec (full
+   * spec, "running"), createPlanning (header-only placeholder, "planning"), and
+   * attachPlan (plan attached, "running"), so the three creates stay consistent
+   * and only differ in the Change they store and the status they set.
+   */
+  private async initChange(change: Change, status: ChangeStatus): Promise<void> {
     await this.ctx.storage.put("change", change);
+    await this.ctx.storage.put("changeStatus", status);
     await this.ctx.storage.put("completed", [] as string[]);
     await this.ctx.storage.put("leases", {} as Record<string, LeaseRecord>);
     await this.ctx.storage.put("costEvents", [] as CostEvent[]);
@@ -686,7 +787,6 @@ export class ChangeState extends DurableObject<Env> {
     // attribution, fix-confidence). Empty until the decision layer is live and
     // a juncture records one; absent entirely on the offline path (no jev node).
     await this.ctx.storage.put("jevDecisions", [] as JevDecisionView[]);
-    return this.view();
   }
 
   /**
@@ -1102,6 +1202,19 @@ export class ChangeState extends DurableObject<Env> {
         ? { refanSource: normalizeRefanSource(input.refanSource)! }
         : {}),
       reason: sanitizeReason(input.reason),
+      ...(Array.isArray(input.revisedUnits) && input.revisedUnits.length > 0
+        ? {
+            revisedUnits: input.revisedUnits
+              .filter((u) => u && typeof u.id === "string")
+              .map((u) => ({
+                id: String(u.id),
+                objective: sanitizeText(typeof u.objective === "string" ? u.objective : "", 500),
+              })),
+          }
+        : {}),
+      ...(typeof input.rationale === "string" && input.rationale !== ""
+        ? { rationale: sanitizeText(input.rationale, MAX_DETAIL_TEXT) }
+        : {}),
       at: new Date().toISOString(),
     };
     attempts.push(stored);
@@ -1660,6 +1773,7 @@ export class ChangeState extends DurableObject<Env> {
     return {
       id: change.id,
       objective: change.objective,
+      status: await this.loadChangeStatus(),
       baseline: change.baseline,
       budgetUsd: change.budgetUsd,
       assurance: change.assurance,
@@ -1698,6 +1812,16 @@ export class ChangeState extends DurableObject<Env> {
       throw new Error("Change not initialized");
     }
     return change;
+  }
+
+  /**
+   * Read the Change-level lifecycle status. Defaults to "running" for a Change
+   * created before this status existed (a stored Change with no recorded status
+   * is a normal full-spec create, which is "running"), so the field is always
+   * present and backward compatible.
+   */
+  private async loadChangeStatus(): Promise<ChangeStatus> {
+    return (await this.ctx.storage.get<ChangeStatus>("changeStatus")) ?? "running";
   }
 
   private async loadCompleted(): Promise<string[]> {

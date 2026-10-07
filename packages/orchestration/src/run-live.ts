@@ -216,14 +216,47 @@ export type TeardownApp = (input: {
 export type RefanSource = "parse" | "jev" | "re-plan" | "all";
 
 /**
+ * One revised unit a re-plan chose to re-fan, carrying BOTH its id and the
+ * re-plan-specific objective the planner assigned it this round. This is what
+ * lets a re-plan reach parity with the kickoff planner detail (which shows every
+ * unit's objective), rather than only naming the unit ids.
+ */
+export interface RePlanUnit {
+  readonly id: string;
+  /** The objective the re-plan assigned this unit (may differ from the kickoff). */
+  readonly objective: string;
+}
+
+/**
+ * The RICH result a re-plan transport may return. It carries the revised units
+ * WITH their objectives, an optional rationale for the re-plan, and the model
+ * that produced it, so a re-plan reaches parity with the kickoff planner detail
+ * (model, rationale, units-with-objectives) rather than only naming unit ids.
+ * The ladder threads these onto the retry-attempt record so the round-keyed
+ * planner node can render the full re-plan detail.
+ */
+export interface RePlanResult {
+  /** The revised units to re-fan, each with its re-plan objective. */
+  readonly units: readonly RePlanUnit[];
+  /** The planner's explanation of why it revised the plan this way, when present. */
+  readonly rationale?: string;
+  /** The model that produced the re-plan, when the transport reported one. */
+  readonly model?: string;
+}
+
+/**
  * The injected re-plan transport the change-level ladder calls on a verify-fail
  * to produce a REVISED set of units to re-fan for the next retry round. It is
  * handed the failing gate evidence, the candidate unit ids (every gated unit),
- * and the optional Jev attribution choice, and returns the subset of those unit
- * ids the re-plan judges should re-run on the stronger model. Returning a subset
- * (possibly fewer than all, dropping a spurious unit like a passing module)
- * narrows the re-fan; returning an empty or invalid set means the re-plan could
- * not revise the plan, so the ladder falls back to the string-parse +
+ * the optional Jev attribution choice, AND the prior round's revised unit ids
+ * (so a per-round transport can carry its own history and still narrow on a
+ * later round rather than falling back). It returns either the legacy subset of
+ * unit ids, OR a RICH `RePlanResult` carrying the revised units with their
+ * objectives plus an optional rationale and model, so the round-keyed planner
+ * node can render the re-plan at parity with the kickoff planner. Returning a
+ * subset (possibly fewer than all, dropping a spurious unit like a passing
+ * module) narrows the re-fan; returning an empty or invalid set means the
+ * re-plan could not narrow, so the ladder falls back to the string-parse +
  * Jev-attribution implicated set it already computed. The transport is goal
  * agnostic and injectable, so a caller wires a schema-constrained planner call
  * and a test injects a deterministic fake, keeping the ladder offline-safe.
@@ -237,7 +270,14 @@ export type RePlanTransport = (input: {
   readonly attributionChoice?: string;
   /** The retry round the revised plan is for (2 for the first retry). */
   readonly round: number;
-}) => Promise<readonly string[]>;
+  /**
+   * The unit ids the PREVIOUS round's re-plan revised to, when there was one.
+   * A per-round transport is handed this so round N can re-plan from round N-1's
+   * evidence and revised set rather than being stateless and dropping to the
+   * fallback on a later round. Empty on the first retry round.
+   */
+  readonly priorRevisedUnitIds?: readonly string[];
+}) => Promise<readonly string[] | RePlanResult>;
 
 /** Options for a full live run. */
 export interface RunFullLiveOptions {
@@ -565,7 +605,29 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   };
 
   // 1. Create the Change and set the dial.
-  await post(`/changes`, options.specYaml, "text/plain");
+  //
+  // CREATE-FIRST / ATTACH-PLAN: when the caller (the CLI live run) has ALREADY
+  // created a "planning" PLACEHOLDER Change on the Worker before the LLM planner
+  // ran, the console is already attached and the Change exists with status
+  // "planning". In that case this step ATTACHES the decomposed plan (the full
+  // spec, now carrying the real work + plan) via POST /changes/:id/plan, which
+  // fills in the graph and flips the status "planning" -> "running". When no
+  // placeholder exists (the offline/heuristic path, or any caller that did not
+  // pre-create), the attach returns 404 and this FALLS BACK to the normal create
+  // (POST /changes), so every existing path is unchanged. The attach is probed
+  // with a tolerant fetch (it must not throw on the expected 404), unlike the
+  // throwing `post` helper.
+  const attachRes = await fetchFn(`${base}/changes/${encodeURIComponent(changeId)}/plan`, {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: options.specYaml,
+  }).catch(() => undefined);
+  if (!attachRes || attachRes.status >= 400) {
+    // No planning placeholder to attach to (or attach is unsupported): create
+    // the Change the normal way. This is the unchanged path for offline runs and
+    // every existing test.
+    await post(`/changes`, options.specYaml, "text/plain");
+  }
   await post(`/changes/${encodeURIComponent(changeId)}/dial`, {
     minConcurrency: options.dial.minConcurrency,
     maxConcurrency: options.dial.maxConcurrency,
@@ -1434,6 +1496,11 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
     let round = 1;
     let currentModel = input.baseModel;
     let lastEvidence = "";
+    // The unit ids the PREVIOUS retry round's re-plan revised to, carried
+    // forward so a per-round re-plan transport can re-plan round N from round
+    // N-1's revised set rather than being stateless and dropping to the fallback
+    // on a later round. Empty until the first re-plan narrows a round.
+    let priorRevisedUnitIds: readonly string[] = [];
 
     const runChangeGate = async (): Promise<{ passed: boolean; evidence: string }> => {
       // Build a fresh integration worktree for this round: the project baseline
@@ -1508,6 +1575,15 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
       // The confident Jev attribution choice this round, when one was recorded,
       // so the re-plan transport can be fed it as a hint. Undefined otherwise.
       let attributionChoice: string | undefined;
+      // The RICH re-plan detail for this round, when a re-plan narrowed it: the
+      // revised units WITH their objectives, an optional rationale, and the
+      // re-plan model. These are threaded onto the retry-attempt record so the
+      // round-keyed planner node renders the re-plan at parity with the kickoff
+      // planner (model + rationale + units-with-objectives). They stay undefined
+      // on a parse/jev/all round, so only a genuine re-plan carries them.
+      let replanUnits: readonly { readonly id: string; readonly objective: string }[] | undefined;
+      let replanRationale: string | undefined;
+      let replanModel: string | undefined;
       if (input.jev) {
         const threshold = input.jevThreshold ?? 0.75;
         const unitIds = gatedUnits.map((u) => u.unitId);
@@ -1529,17 +1605,32 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             answer.confidence >= threshold &&
             typeof answer.choice === "string" &&
             unitIds.includes(answer.choice);
-          if (answer && answer.type === "choice") {
-            // Record the decision either way (accepted when confident and the
-            // choice is a real gated unit; escalated otherwise), so the jev node
-            // honestly shows whether Jev's choice was used.
-            await recordJevDecision(post, changeId, {
-              juncture: "attribution",
-              question,
-              answer,
-              accepted: confident,
-            });
-          }
+          // Record the attribution decision on EVERY verify-fail where Jev was
+          // consulted, so a jev attribution node appears at EACH failing round
+          // (not only when Jev returned a confident choice). A real choice-typed
+          // answer is recorded as-is (accepted when confident and the choice is a
+          // real gated unit; escalated otherwise). A non-choice, low-confidence,
+          // or missing reply is still recorded as an ESCALATED attribution (a
+          // choice-type decision carrying whatever confidence came back, or 0),
+          // mirroring how plan-review and fix-confidence always record. This keeps
+          // the decision ADVISORY (it only informs unit selection below and never
+          // flips the gate) while making Jev visible at every failing round.
+          const recordableAnswer: JevAnswer =
+            answer && answer.type === "choice"
+              ? answer
+              : {
+                  type: "choice",
+                  ...(answer && typeof answer.choice === "string"
+                    ? { choice: answer.choice }
+                    : {}),
+                  confidence: answer ? answer.confidence : 0,
+                };
+          await recordJevDecision(post, changeId, {
+            juncture: "attribution",
+            question,
+            answer: recordableAnswer,
+            accepted: confident,
+          });
           if (confident && answer) {
             // A confident Jev choice is the PRIMARY implicated-unit selector:
             // the Jev-chosen unit drives the re-fan. Union it with any
@@ -1588,12 +1679,26 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
       if (input.rePlan) {
         const candidateUnitIds = gatedUnits.map((u) => u.unitId);
         try {
-          const revisedIds = await input.rePlan({
+          const revisedReply = await input.rePlan({
             evidence: lastEvidence,
             candidateUnitIds,
             round: nextRound,
             ...(attributionChoice !== undefined ? { attributionChoice } : {}),
+            ...(priorRevisedUnitIds.length > 0
+              ? { priorRevisedUnitIds }
+              : {}),
           });
+          // Normalize the reply: a legacy string[] of unit ids, or a rich
+          // RePlanResult carrying the revised units with their objectives, a
+          // rationale, and the model. Either way the chosen units are mapped
+          // back to the candidate (gated) set so the re-plan can only re-run a
+          // real gated unit; a unit id outside the candidates is dropped.
+          const revisedRich = Array.isArray(revisedReply)
+            ? undefined
+            : (revisedReply as RePlanResult);
+          const revisedIds = Array.isArray(revisedReply)
+            ? revisedReply
+            : (revisedReply as RePlanResult).units.map((u) => u.id);
           const revisedSet = new Set(
             revisedIds.filter((id) => candidateUnitIds.includes(id)),
           );
@@ -1602,6 +1707,35 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             // A valid revised unit set: re-fan ONLY those units this round.
             implicated = revised;
             refanSource = "re-plan";
+            // Carry the per-round revised ids forward so a later round can
+            // re-plan from this round's revision rather than from nothing.
+            priorRevisedUnitIds = revised.map((u) => u.unitId);
+            // Thread the rich re-plan detail (rationale, the model, and each
+            // revised unit's re-plan objective) onto the retry-attempt record
+            // below, so the round-keyed planner node renders the re-plan at
+            // parity with the kickoff planner. The objective prefers the
+            // re-plan's own objective, falling back to the gated unit's objective
+            // when the transport returned only ids.
+            if (revisedRich) {
+              if (revisedRich.rationale !== undefined && revisedRich.rationale !== "") {
+                replanRationale = revisedRich.rationale;
+              }
+              if (revisedRich.model !== undefined && revisedRich.model !== "") {
+                replanModel = revisedRich.model;
+              }
+              const objectiveById = new Map(
+                revisedRich.units.map((u) => [u.id, u.objective] as const),
+              );
+              replanUnits = revised.map((u) => ({
+                id: u.unitId,
+                objective: objectiveById.get(u.unitId) ?? u.objective,
+              }));
+            } else {
+              // Only ids returned: use each unit's own objective so the re-plan
+              // detail still shows objectives (units-with-objectives parity),
+              // not just ids.
+              replanUnits = revised.map((u) => ({ id: u.unitId, objective: u.objective }));
+            }
           }
           // An empty/all-invalid reply leaves `implicated` as the fallback.
         } catch {
@@ -1628,6 +1762,20 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
         implicatedUnits: implicatedIds,
         refanSource,
         reason: refanReason,
+        // The rich re-plan detail (only present on a genuine re-plan round): the
+        // revised units WITH their objectives, the re-plan rationale, and the
+        // re-plan model, so the round-keyed planner node renders the re-plan at
+        // parity with the kickoff planner. Absent on a parse/jev/all round, so a
+        // non-re-plan retry records exactly as before.
+        ...(refanSource === "re-plan" && replanUnits
+          ? { revisedUnits: replanUnits }
+          : {}),
+        ...(refanSource === "re-plan" && replanRationale !== undefined
+          ? { rationale: replanRationale }
+          : {}),
+        ...(refanSource === "re-plan" && replanModel !== undefined
+          ? { replanModel }
+          : {}),
       }).catch(() => {});
       // Patch the failing verify of the PREVIOUS round with the implicated units
       // and the re-fan source it produced, so the console detail panel for that
@@ -2801,6 +2949,51 @@ export async function cleanupLive(options: {
     archived,
     ...(appTornDown ? { appTornDown } : {}),
   };
+}
+
+/**
+ * The header fields a "planning" placeholder Change is created from, before the
+ * planner has decided the work.
+ */
+export interface PlanningChangeHeader {
+  readonly id: string;
+  readonly objective: string;
+  readonly baseline: string;
+  readonly budgetUsd: number;
+  readonly assurance: string;
+}
+
+/**
+ * Create a "planning" PLACEHOLDER Change on the Worker (status "planning", empty
+ * work) BEFORE the LLM planner runs, so the console can attach and see the
+ * Change within one poll instead of 404ing for the whole planner latency. The
+ * caller (the CLI live run) calls this with the Change header the instant a run
+ * begins, then decomposes the goal, then hands the full decomposed spec to
+ * runFullLive, which ATTACHES the plan (flipping the status to "running"). It is
+ * best-effort: a Worker that does not support the planning route (or an
+ * unreachable Worker) simply means the console sees the Change a little later
+ * when runFullLive creates it the normal way, so a failure here never fails the
+ * run. The injectable fetch keeps it offline-testable.
+ */
+export async function createPlanningChange(options: {
+  readonly workerUrl: string;
+  readonly header: PlanningChangeHeader;
+  readonly fetchFn?: typeof fetch;
+}): Promise<boolean> {
+  const fetchFn = options.fetchFn ?? fetch;
+  const base = options.workerUrl.replace(/\/$/, "");
+  try {
+    const res = await fetchFn(`${base}/changes/planning`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(options.header),
+    });
+    return res.status < 400;
+  } catch {
+    // Best-effort: the Change is still created by runFullLive the normal way,
+    // so a failed placeholder create only delays the console attach slightly.
+    return false;
+  }
 }
 
 /**

@@ -156,10 +156,34 @@ function planViewFromChange(change: Change): PlanView | undefined {
   };
 }
 
+/**
+ * The Change-level lifecycle status (mirrors the Worker DO's ChangeStatus):
+ * "planning" while a Change exists as a placeholder and the planner is still
+ * deciding the work, "running" once the plan is attached (or from the start for
+ * a full-spec create).
+ */
+export type ChangeStatus = "planning" | "running";
+
+/** The header fields needed to create a "planning" placeholder Change. */
+export interface PlanningChangeHeader {
+  readonly id: string;
+  readonly objective: string;
+  readonly baseline: string;
+  readonly budgetUsd: number;
+  readonly assurance: Change["assurance"];
+}
+
 /** The live, serializable projection of a Change's orchestration state. */
 export interface ChangeStateView {
   readonly id: string;
   readonly objective: string;
+  /**
+   * The Change-level lifecycle status (mirrors the Worker DO): "planning" while
+   * the Change exists as a placeholder and the planner is still deciding the
+   * work, "running" once the plan is attached (or from the start for a full-spec
+   * create).
+   */
+  readonly status: ChangeStatus;
   readonly baseline: string;
   readonly budgetUsd: number;
   readonly assurance: Change["assurance"];
@@ -278,6 +302,10 @@ export interface RetryAttempt {
   readonly implicatedUnits: readonly string[];
   readonly refanSource?: RefanSource;
   readonly reason: string;
+  /** The revised units (with objectives) a re-plan chose this round (re-plan only). */
+  readonly revisedUnits?: readonly { readonly id: string; readonly objective: string }[];
+  /** The re-plan rationale, when a re-plan round carried one. */
+  readonly rationale?: string;
   readonly at: string;
 }
 
@@ -429,6 +457,12 @@ class ChangeRecord {
   readonly roundAgents = new Map<string, RoundAgentView>();
   /** Jev typed decisions recorded at the three junctures (mirrors the DO). */
   readonly jevDecisions: JevDecisionView[] = [];
+  /**
+   * The Change-level lifecycle status (mirrors the DO): "planning" for a
+   * placeholder created before the planner ran, "running" once the plan is
+   * attached or for a full-spec create. Mutable so attachPlan can flip it.
+   */
+  status: ChangeStatus = "running";
   constructor(change: Change) {
     this.change = change;
   }
@@ -449,6 +483,47 @@ export class LocalChangeControl {
   createChange(specYaml: string): Change {
     const change = parseChangeSpec(specYaml);
     this.records.set(change.id, new ChangeRecord(change));
+    return change;
+  }
+
+  /**
+   * Create a "planning" PLACEHOLDER Change from just its header (mirrors the DO's
+   * createPlanning), with an EMPTY work set and status "planning", BEFORE the
+   * planner has decided the work. This lets a run create the Change the instant
+   * it begins so the console attaches at once; the real work and plan are
+   * attached later by attachPlan, which flips the status to "running".
+   */
+  createPlanning(header: PlanningChangeHeader): Change {
+    const change: Change = {
+      id: header.id,
+      objective: header.objective,
+      baseline: header.baseline,
+      budgetUsd: header.budgetUsd,
+      assurance: header.assurance,
+      work: [],
+    };
+    const record = new ChangeRecord(change);
+    record.status = "planning";
+    this.records.set(change.id, record);
+    return change;
+  }
+
+  /**
+   * Attach the decomposed plan to a "planning" placeholder Change (mirrors the
+   * DO's attachPlan): re-parse the full spec YAML (now carrying the real work and
+   * the recorded plan), replace the stored Change with it, and flip the status to
+   * "running". The run has not advanced (no leases/completions), so a fresh
+   * record is correct, but a planning placeholder must already exist for this id.
+   */
+  attachPlan(specYaml: string): Change {
+    const change = parseChangeSpec(specYaml);
+    const existing = this.records.get(change.id);
+    if (!existing) {
+      throw new Error(`no such Change: ${change.id}`);
+    }
+    const record = new ChangeRecord(change);
+    record.status = "running";
+    this.records.set(change.id, record);
     return change;
   }
 
@@ -862,6 +937,19 @@ export class LocalChangeControl {
         ? { refanSource: normalizeRefanSource(input.refanSource)! }
         : {}),
       reason: sanitizeText(input.reason ?? "verify-fail escalation", 300) || "verify-fail escalation",
+      ...(Array.isArray(input.revisedUnits) && input.revisedUnits.length > 0
+        ? {
+            revisedUnits: input.revisedUnits
+              .filter((u) => u && typeof u.id === "string")
+              .map((u) => ({
+                id: String(u.id),
+                objective: sanitizeText(typeof u.objective === "string" ? u.objective : "", 500),
+              })),
+          }
+        : {}),
+      ...(typeof input.rationale === "string" && input.rationale !== ""
+        ? { rationale: sanitizeText(input.rationale, 20_000) }
+        : {}),
       at: new Date().toISOString(),
     };
     record.retryAttempts.push(stored);
@@ -1162,6 +1250,7 @@ export class LocalChangeControl {
     return {
       id: change.id,
       objective: change.objective,
+      status: record.status,
       baseline: change.baseline,
       budgetUsd: change.budgetUsd,
       assurance: change.assurance,
@@ -1308,6 +1397,16 @@ export class LocalChangeControl {
             ? { refanSource: normalizeRefanSource(b.refanSource)! }
             : {}),
           reason: String(b.reason ?? "verify-fail escalation"),
+          ...(Array.isArray(b.revisedUnits) && (b.revisedUnits as unknown[]).length > 0
+            ? {
+                revisedUnits: (b.revisedUnits as { id?: unknown; objective?: unknown }[])
+                  .filter((u) => u && typeof u.id === "string")
+                  .map((u) => ({ id: String(u.id), objective: String(u.objective ?? "") })),
+              }
+            : {}),
+          ...(typeof b.rationale === "string" && b.rationale !== ""
+            ? { rationale: b.rationale }
+            : {}),
         });
         return json({ retryAttempt: recorded }, 201);
       } catch (error) {

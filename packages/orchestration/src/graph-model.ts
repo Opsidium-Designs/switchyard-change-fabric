@@ -289,6 +289,15 @@ export interface RetryAttemptSnapshot {
   readonly refanSource?: RefanSource;
   /** A short, human-readable reason the ladder escalated. */
   readonly reason: string;
+  /**
+   * The revised units (with objectives) a re-plan chose this round, present only
+   * on a re-plan round. The round-keyed planner node reads these so its detail
+   * shows the re-plan units WITH their objectives at parity with the kickoff
+   * planner, rather than falling back to the kickoff unit objectives.
+   */
+  readonly revisedUnits?: readonly { readonly id: string; readonly objective: string }[];
+  /** The re-plan rationale, present only on a re-plan round that carried one. */
+  readonly rationale?: string;
   readonly at: string;
 }
 
@@ -445,6 +454,15 @@ export interface JevDetailSnapshot {
 export interface ChangeStateSnapshot {
   readonly id: string;
   readonly objective: string;
+  /**
+   * The Change-level lifecycle status, when the state reports one: "planning"
+   * while the Change exists as a placeholder and the planner is still deciding
+   * the work, "running" once the plan is attached. Optional so a snapshot that
+   * predates the status field still projects; the graph model does not key any
+   * node/edge off it (the goal outcome comes from the verify attempts), so it is
+   * purely informational for a reader of the snapshot.
+   */
+  readonly status?: "planning" | "running";
   readonly work: readonly WorkUnitSnapshot[];
   readonly edges: readonly DependencySnapshot[];
   readonly completed: readonly string[];
@@ -1636,16 +1654,45 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     nodes.push(assertBacked(retryNode, snapshot));
 
     // The model-escalation edge: the FAILING verify of the previous round
-    // escalated to this retry on a stronger model. Only drawn when the previous
-    // verify is a real recorded failing round, so the hop is backed by both the
-    // retry record and the failing verify it followed. This is the base ->
-    // escalation beat, distinct from the human-escalation flag and the lease
-    // edge.
+    // escalated to this retry on a stronger model. The retry's trigger-parent
+    // depends on whether this round was driven by a live re-plan:
+    //   - a RE-PLAN round routes the chain through the planner node, so the retry
+    //     hangs off the RE-PLAN PLANNER (verify(fail) -> planner(re-plan) ->
+    //     retry), NOT off the verify. The verify's ONLY trigger-child in that
+    //     case is the planner (drawn in the re-plan block below), so there is NO
+    //     verify -> retry edge that bypasses the planner.
+    //   - a non-re-plan round (parse/jev/all) keeps the direct verify(fail) ->
+    //     retry hop exactly as before.
+    // Either way the edge is only drawn when the previous verify is a real
+    // recorded failing round (for the verify->retry case) or when a re-plan node
+    // exists (for the planner->retry case), so the hop stays backed. This is the
+    // base -> escalation beat, distinct from the human-escalation flag and the
+    // lease edge.
     const prevRound = retry.round - 1;
     const prevVerifyFailed = verifyAttempts.some(
       (a) => a.round === prevRound && a.outcome === "fail",
     );
-    if (prevVerifyFailed) {
+    const replanned = retry.refanSource === "re-plan";
+    if (replanned) {
+      // The re-plan round: the retry's trigger-parent is the RE-PLAN PLANNER, so
+      // the chain reads verify(fail) -> planner(re-plan) -> retry. The planner
+      // node and the verify -> planner edge are emitted in the re-plan block
+      // below; here we draw planner -> retry so the retry hangs off the planner,
+      // never off the verify.
+      edges.push({
+        id: `replan-to-retry:${snapshot.id}#${retry.round}`,
+        kind: "trigger",
+        from: replanNodeId(snapshot.id, retry.round),
+        to: retryNodeId(snapshot.id, retry.round),
+        backing: {
+          kind: "model-escalation",
+          changeId: snapshot.id,
+          round: retry.round,
+          fromModel: retry.fromModel,
+          toModel: retry.toModel,
+        },
+      });
+    } else if (prevVerifyFailed) {
       edges.push({
         id: `model-escalation:${snapshot.id}#${prevRound}->${retry.round}`,
         // The escalation hop is ladder control-flow (a verify-fail caused this
@@ -1682,23 +1729,32 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     // offline/attribution round (no re-plan) draws no re-plan planner node and
     // the parse/attribution path is unchanged. It is emitted BEFORE its edges so
     // every edge endpoint is in the node set.
-    const replanned = retry.refanSource === "re-plan";
     if (replanned) {
       const replanCount = retry.implicatedUnits.length;
-      // Build the planner detail from the real recorded re-plan retry: resolve
-      // each revised unit id to its objective from the Change's WorkUnits (as the
-      // kickoff planner detail does), carry the agent count (= number of revised
-      // units), the escalation model as the plan model, and reuse the recorded
-      // plan's frozen contracts when present. This is derived wholly from the
-      // retry record (and the Change's own units), so it is backed exactly like
-      // the node.
-      const replanUnits: PlannerUnitDetail[] = retry.implicatedUnits.map((unitId) => {
-        const unit = snapshot.work.find((u) => u.id === unitId);
-        return { id: unitId, objective: unit?.objective ?? "" };
-      });
+      // Build the planner detail from the real recorded re-plan retry: PREFER the
+      // retry's own revised units (each carrying the re-plan objective the
+      // transport assigned it this round), so the re-plan detail shows the SAME
+      // detail shape as the kickoff planner (model + rationale + units-with-
+      // objectives). Fall back to resolving each implicated unit id to its
+      // kickoff objective from the Change's WorkUnits when the retry carried no
+      // revised-unit detail (a re-plan that returned only ids). Carry the agent
+      // count (= number of revised units), the re-plan model, the recorded
+      // rationale when present, and the kickoff plan's frozen contracts. This is
+      // derived wholly from the retry record (and the Change's own units), so it
+      // is backed exactly like the node.
+      const replanUnits: PlannerUnitDetail[] =
+        retry.revisedUnits && retry.revisedUnits.length > 0
+          ? retry.revisedUnits.map((u) => ({ id: u.id, objective: u.objective }))
+          : retry.implicatedUnits.map((unitId) => {
+              const unit = snapshot.work.find((u) => u.id === unitId);
+              return { id: unitId, objective: unit?.objective ?? "" };
+            });
       const replanDetail: PlannerDetailSnapshot = {
         source: "planner",
         model: retry.toModel,
+        ...(retry.rationale !== undefined && retry.rationale !== ""
+          ? { rationale: retry.rationale }
+          : {}),
         units: replanUnits,
         agentCount: replanUnits.length,
         contracts: snapshot.plan ? [...snapshot.plan.contracts] : [],
@@ -1823,27 +1879,13 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
         },
       });
 
-      // When this round was driven by a live re-plan, also draw the `trigger`
-      // edge planner(re-plan) -> round-N agent, so the control-flow chain reads
-      // verify(failed) -> planner(re-plan) -> retry-agents. It is backed by the
-      // same re-fan provenance as the retry -> agent edge; the re-plan planner
-      // node it points from is itself backed by the recorded re-plan (gated
-      // above), so the edge never references a node the graph did not emit.
-      if (replanned) {
-        edges.push({
-          id: `replan-refan:${snapshot.id}#${retry.round}->${unitId}`,
-          kind: "trigger",
-          from: replanNodeId(snapshot.id, retry.round),
-          to: roundAgentNodeId(snapshot.id, retry.round, unitId),
-          backing: {
-            kind: "re-fan",
-            changeId: snapshot.id,
-            round: retry.round,
-            unitId,
-            toModel: retry.toModel,
-          },
-        });
-      }
+      // The round-N agents hang ONLY off the retry node (retry -> agent). The
+      // strict ladder chain is verify(failed) -> planner(re-plan) -> retry ->
+      // round-agents, so there is NO planner -> agent edge: when this round was
+      // driven by a re-plan, the planner's trigger-child is the retry (drawn
+      // above), and the retry's trigger-children are the round agents, so the
+      // chain flows through the retry rather than the planner reaching the agents
+      // directly.
     }
   }
 

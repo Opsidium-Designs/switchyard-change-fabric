@@ -68,12 +68,15 @@ export type {
   EscalationResolution,
   EscalationResolver,
   FullLiveEvent,
+  PlanningChangeHeader,
+  RePlanResult,
   RePlanTransport,
+  RePlanUnit,
   RunFullLiveOptions,
   RunFullLiveResult,
   TeardownApp,
 } from "./run-live.ts";
-export { cleanupLive, runFullLive } from "./run-live.ts";
+export { cleanupLive, createPlanningChange, runFullLive } from "./run-live.ts";
 
 export type { AppDeploymentMarker } from "./app-deploy.ts";
 export {

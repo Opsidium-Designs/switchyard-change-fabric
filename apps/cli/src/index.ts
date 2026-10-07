@@ -24,6 +24,7 @@ import {
   changeToSpecYaml,
   cleanupLive,
   clearAppDeployment,
+  createPlanningChange,
   decomposeGoal,
   describeChange,
   formatChangePlan,
@@ -333,19 +334,7 @@ const commands: Command[] = [
       "Full live run: decompose -> recruit real agents (Workers AI) -> escalate -> verify -> integrate -> promote -> cleanup.",
     usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--id <changeId>] [--watch] [--await-escalation] [--gate|--no-gate] [--max-model-retries N]`,
     async run(args) {
-      const change = await resolveChange(args);
-      if (!change) {
-        console.error(
-          `Usage: ${CLI_NAME} run-live "<goal text>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>]\n` +
-            `   or: ${CLI_NAME} run-live --change <change.yaml> --project <dir> --worker <url> [--min N] [--max N]`,
-        );
-        return 1;
-      }
       const projectDir = requireProjectDir(args);
-      if (!projectDir) {
-        console.error("A target project is required: pass --project <dir>.");
-        return 1;
-      }
       const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
       const dial = dialFromArgs(args);
 
@@ -355,6 +344,84 @@ const commands: Command[] = [
       // id) so the console can auto-load it without the human hand-typing it.
       // A normal (non-watch) run keeps the unique per-run id and cleans up.
       const watch = hasFlag(args, "--watch") || hasFlag(args, "--no-cleanup");
+      const explicitId = optionValue(args, "--id");
+      const runId = Date.now().toString(36);
+
+      // CREATE THE CHANGE FIRST (kill the 30s of 404s): when the final Change id
+      // is known CHEAPLY (without running the slow LLM planner) and a project is
+      // set, create a "planning" PLACEHOLDER Change on the Worker BEFORE
+      // decomposing, so the console attaches and sees the Change (status
+      // "planning") within one poll instead of 404ing for the whole planner
+      // latency. runFullLive later ATTACHES the decomposed plan to that same id,
+      // flipping the status to "running".
+      //
+      // The id is cheaply known for an explicit --id (the console launcher always
+      // passes one) and for a --change file (its id is parsed, no planner). For a
+      // bare goal with no --id the base id is a slug of the goal the planner path
+      // computes, so there is nothing cheap to pre-create against; that case
+      // falls back to runFullLive creating the Change the normal way (the console
+      // simply attaches a little later), with no change in behavior. The
+      // placeholder create is best-effort: a failure never fails the run.
+      const changeFileForHeader = optionValue(args, "--change");
+      let plannedId: string | undefined;
+      let planningHeader: {
+        id: string;
+        objective: string;
+        baseline: string;
+        budgetUsd: number;
+        assurance: string;
+      } | undefined;
+      if (explicitId) {
+        plannedId = explicitId;
+      } else if (changeFileForHeader) {
+        try {
+          const headerYaml = await readFile(resolve(changeFileForHeader), "utf8");
+          const headerChange = describeChange(headerYaml).change;
+          const baseId = headerChange.id;
+          plannedId = watch ? baseId : `${baseId}-${runId}`;
+          planningHeader = {
+            id: plannedId,
+            objective: headerChange.objective,
+            baseline: headerChange.baseline,
+            budgetUsd: headerChange.budgetUsd,
+            assurance: headerChange.assurance,
+          };
+        } catch {
+          // Could not cheaply read the change file header: skip the pre-create.
+        }
+      }
+      // For an explicit --id with a goal (the console launcher's shape), the
+      // objective is the goal text and the baseline defaults to HEAD, both known
+      // without the planner, so a placeholder can still be created up front.
+      if (explicitId && !planningHeader) {
+        const goalForHeader = await resolveGoal(args).catch(() => undefined);
+        planningHeader = {
+          id: explicitId,
+          objective: goalForHeader ?? explicitId,
+          baseline: "HEAD",
+          budgetUsd: 0,
+          assurance: "standard",
+        };
+      }
+      if (planningHeader && projectDir) {
+        // Fire the placeholder create BEFORE the planner runs. Best-effort: the
+        // console attaches at once when it lands, and runFullLive still creates
+        // the Change the normal way if it did not.
+        await createPlanningChange({ workerUrl, header: planningHeader }).catch(() => false);
+      }
+
+      const change = await resolveChange(args);
+      if (!change) {
+        console.error(
+          `Usage: ${CLI_NAME} run-live "<goal text>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>]\n` +
+            `   or: ${CLI_NAME} run-live --change <change.yaml> --project <dir> --worker <url> [--min N] [--max N]`,
+        );
+        return 1;
+      }
+      if (!projectDir) {
+        console.error("A target project is required: pass --project <dir>.");
+        return 1;
+      }
 
       // Select the executor from the environment (.env). workers-ai is the live
       // inference path; anything else is the deterministic noop. The credential
@@ -376,14 +443,16 @@ const commands: Command[] = [
       // An explicit --id overrides both strategies: the browser console
       // launcher generates a FRESH UNIQUE id per launch and passes it here so it
       // can follow exactly that run (no stable id, no collisions). An explicit
-      // id is used verbatim.
-      const explicitId = optionValue(args, "--id");
-      const runId = Date.now().toString(36);
-      const liveChange: Change = explicitId
-        ? { ...change, id: explicitId }
-        : watch
-          ? change
-          : { ...change, id: `${change.id}-${runId}` };
+      // id is used verbatim. When a planning placeholder was pre-created above,
+      // reuse exactly that id so runFullLive ATTACHES the plan to the placeholder
+      // the console already attached to rather than creating a second Change.
+      const liveChange: Change = plannedId
+        ? { ...change, id: plannedId }
+        : explicitId
+          ? { ...change, id: explicitId }
+          : watch
+            ? change
+            : { ...change, id: `${change.id}-${runId}` };
 
       // Whether to BLOCK on a human answering the escalation in the browser
       // rather than auto-answering it. The console launcher sets this so the
