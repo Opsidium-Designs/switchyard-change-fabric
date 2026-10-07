@@ -95,7 +95,7 @@ function buildParentLists(model: WorkGraphModel): Map<string, string[]> {
     if (edge.from === goalNodeId(model.changeId)) {
       continue;
     }
-    if (edge.kind === "dependency" || edge.kind === "spawn") {
+    if (edge.kind === "dependency" || edge.kind === "spawn" || edge.kind === "trigger") {
       const list = parents.get(edge.to);
       if (list) {
         list.push(edge.from);
@@ -251,13 +251,13 @@ function computeLayers(model: WorkGraphModel): Map<string, number> {
     }
     // The ladder reads top to bottom: a verify node hangs below its unit (fed by
     // a dependency edge), a retry node hangs below the failing verify it
-    // escalated from (a dependency edge), and a round-N agent hangs below its
-    // retry (a dependency re-fan edge). The escalation hop and the per-unit
-    // re-fan ride the dependency kind, so following it lays the whole chain down
-    // the rows. The spawn kind is followed too, so an event-spawned (recruited)
-    // node sits a layer BELOW the unit whose push recruited it, hanging off its
+    // escalated from (a trigger edge), and a round-N agent hangs below its retry
+    // (a trigger re-fan edge). The escalation hop and the per-unit re-fan ride
+    // the `trigger` kind, so following it lays the whole ladder chain down the
+    // rows. The spawn kind is followed too, so an event-spawned (recruited) node
+    // sits a layer BELOW the unit whose push recruited it, hanging off its
     // spawner instead of floating in a flat, detached row.
-    if (edge.kind === "dependency" || edge.kind === "spawn") {
+    if (edge.kind === "dependency" || edge.kind === "spawn" || edge.kind === "trigger") {
       const list = deps.get(edge.to);
       if (list) {
         list.push(edge.from);
@@ -287,11 +287,18 @@ function computeLayers(model: WorkGraphModel): Map<string, number> {
   return layer;
 }
 
-/** The stroke style per edge kind. The vocabulary is exactly three kinds. */
+/** The stroke style per edge kind. */
 function edgeStyle(kind: GraphEdge["kind"]): { stroke: string; dash?: string } {
   switch (kind) {
     case "spawn":
-      return { stroke: "#d2a8ff", dash: "2 5" }; // event-driven recruitment
+      return { stroke: "#d2a8ff", dash: "2 5" }; // event-driven Artifact recruitment ONLY
+    case "trigger":
+      // Ladder control-flow (verify-fail -> planner(re-plan) -> retry, the
+      // escalation hop, the re-fan, the verify flow): a distinct AMBER-GOLD
+      // dashed stroke, clearly different from the violet event-driven spawn dash
+      // and the muted grey dependency line, with a longer dash cadence so a
+      // watcher reads it as a caused control-flow hop, not a declared dependency.
+      return { stroke: "#d9a441", dash: "6 4" };
     case "consumed-tool":
       // A real tool run: a bright AMBER edge, drawn solid (no dash), so it reads
       // as a distinct tool-consumption. A consumed-tool edge only ever appears
@@ -442,13 +449,6 @@ function nodeFill(node: GraphNode, changePassed = false): string {
   // never changes an authoritative verdict.
   if (node.kind === "jev") {
     return node.verified ? "#e3883e" : "#9a5a1f";
-  }
-  // A replan node is the re-plan-of-the-unit-set beat between a failing verify
-  // and the retry agents it triggered: a distinct TEAL-VIOLET, associated with
-  // the planner (it is a re-plan) yet clearly its own node, so the trigger chain
-  // verify(failed) -> replan -> retry-agents reads as one beat.
-  if (node.kind === "replan") {
-    return "#6f7bd6";
   }
   if (node.status === "failed") {
     // A failed unit is a distinct terminal state: a dark, muted red, clearly not
@@ -791,7 +791,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                       stroke={selected ? "#e6edf3" : "#0d1117"}
                       strokeWidth={selected ? 3 : 1.5}
                     />
-                  ) : node.kind === "planner" || node.kind === "replan" ? (
+                  ) : node.kind === "planner" ? (
                     <polygon
                       points={trianglePoints(r)}
                       fill={nodeFill(node, changePassed)}

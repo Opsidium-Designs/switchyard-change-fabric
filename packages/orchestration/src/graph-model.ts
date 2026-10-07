@@ -233,7 +233,8 @@ export interface EscalationSnapshot {
  * output), "jev" (a confident Jev attribution choice), "re-plan" (a configured
  * re-plan transport returned a revised unit set), or "all" (nothing could be
  * attributed, so the honest fallback re-fanned every gated unit). A "re-plan"
- * source is what backs a `replan` graph node and makes a live re-plan countable.
+ * source is what backs a round-keyed `planner` graph node (the re-plan is a
+ * plan) and makes a live re-plan countable.
  */
 export type RefanSource = "parse" | "jev" | "re-plan" | "all";
 
@@ -535,21 +536,29 @@ export type GraphNodeKind =
   | "tool" // an agent-built tool published to its own repo, consumed downstream
   | "verify" // one mechanical gate run against a unit's candidate edit (pass/fail)
   | "retry" // one bounded model-escalation retry on a stronger model after a verify-fail
-  | "replan" // one re-plan of the unit set to re-fan, between a failing verify and the retry agents
   | "jev"; // one Jev typed decision at a juncture (plan-review, attribution, or fix-confidence)
 
 /**
- * The kind of an edge in the rendered graph. The vocabulary is exactly these
- * three: the ladder's escalation hop, the per-unit re-fan, a live push
- * promotion, a verify flow, and goal/retry->agent connections all reuse
- * `dependency` rather than carrying their own bespoke kinds, so the rendered
- * edge set stays small and legible. The edge's `backing` still records the
- * precise provenance (including the model-escalation / re-fan state it came
- * from), so no honesty is lost by folding them onto the shared kinds.
+ * The kind of an edge in the rendered graph. The vocabulary separates three
+ * distinct causal meanings so the edge set stays legible AND honest about WHY an
+ * edge exists:
+ *   - `dependency` is a declared WorkGraph dependency or a plan/promotion edge
+ *     (goal->planner->agent and a live push promotion): declared structure, not
+ *     ladder control-flow;
+ *   - `spawn` is reserved for an event-driven Artifact recruitment ONLY: a
+ *     repo-pushed event recruited the target. A spawn edge therefore ALWAYS means
+ *     an Artifact push recruited this, never a re-plan/retry trigger;
+ *   - `trigger` is the ladder's causal control-flow: the verify-fail ->
+ *     planner(re-plan) -> retry-agents chain, the model-escalation hop, the
+ *     per-unit re-fan, and the verify flow. These are caused by the ladder, not
+ *     by a declared dependency and not by an Artifact event.
+ * The edge's `backing` still records the precise provenance (including the
+ * model-escalation / re-fan state it came from), so no honesty is lost.
  */
 export type GraphEdgeKind =
-  | "dependency" // a declared WorkGraph dependency (also the ladder escalation hop, a live push promotion, a verify flow, and a ladder re-fan)
-  | "spawn" // an event-driven recruitment: a push recruited the target
+  | "dependency" // a declared WorkGraph dependency, or a plan/promotion edge (goal->planner->agent, a live push promotion)
+  | "spawn" // an event-driven Artifact recruitment ONLY: a repo-pushed event recruited the target
+  | "trigger" // ladder control-flow: the verify-fail -> planner(re-plan) -> retry chain, the escalation hop, the re-fan, and the verify flow
   | "consumed-tool"; // a downstream agent actually ran an agent-built tool
 
 /**
@@ -562,10 +571,17 @@ export type NodeBacking =
   | {
       // A planner node is backed by the real recorded plan the planner pass
       // produced for this Change, so it can never be a decorative "it planned"
-      // node: a plan record with the same change must be present in the state.
+      // node. The kickoff planner (no `round`) maps to the recorded plan record
+      // whose source matches. A round-N re-plan planner (`round` present) is the
+      // SAME kind, keyed by its retry round: it maps to the recorded re-plan
+      // retry for that round (a retry attempt with refanSource "re-plan"), so a
+      // re-plan renders as a plain planner node yet stays backed by the real
+      // recorded re-plan decision.
       readonly kind: "planner";
       readonly changeId: string;
       readonly source: "planner" | "heuristic-fallback";
+      /** The retry round when this planner node is a round-N re-plan; absent for the kickoff plan. */
+      readonly round?: number;
     }
   | {
       readonly kind: "work-unit";
@@ -614,18 +630,6 @@ export type NodeBacking =
       readonly reason: string;
       /** How the implicated units were chosen (parse | jev | re-plan | all). */
       readonly refanSource?: RefanSource;
-    }
-  | {
-      // A replan node is backed by a real recorded CHANGE-LEVEL retry whose
-      // refanSource is "re-plan": a configured re-plan transport revised the
-      // unit set to re-fan on a verify-fail. It can never be drawn without that
-      // recorded re-plan decision (a retry attempt with refanSource "re-plan"
-      // for the same round), so a replan node always maps to a genuine re-plan.
-      // It carries the revised units the re-plan chose for the round.
-      readonly kind: "replan";
-      readonly changeId: string;
-      readonly round: number;
-      readonly implicatedUnits: readonly string[];
     }
   | {
       // A round-N agent-instance node is backed by a real recorded CHANGE-LEVEL
@@ -798,10 +802,12 @@ export function retryNodeId(changeId: string, round: number): string {
 }
 
 /**
- * The id used for the change-level REPLAN node for a given round: a re-plan of
- * the unit set to re-fan, sitting BETWEEN the failing verify of the previous
- * round and that round's retry agents. One per retry round that a live re-plan
- * drove (refanSource "re-plan"); absent on the offline/attribution path.
+ * The id used for a round-N RE-PLAN planner node: a re-plan of the unit set to
+ * re-fan, rendered as a plain `planner` node sitting BETWEEN the failing verify
+ * of the previous round and that round's retry agents. It is keyed by round so a
+ * round-N re-plan planner never collides with the kickoff planner node id
+ * (`plannerNodeId`). One per retry round that a live re-plan drove (refanSource
+ * "re-plan"); absent on the offline/attribution path.
  */
 export function replanNodeId(changeId: string, round: number): string {
   return `replan:${changeId}#${round}`;
@@ -846,23 +852,41 @@ export function assertBacked(node: GraphNode, snapshot: ChangeStateSnapshot): Gr
       }
       return node;
     case "planner": {
-      // A planner node must map to the real recorded plan the state reports: its
-      // change must match AND a plan record whose source matches must be present.
-      // A planner node with no backing plan record is exactly the decorative
-      // "it planned" node the no-unbacked-node rule forbids.
+      // A planner node must map to a real recorded decision, so it can never be
+      // a decorative "it planned" node. Its change must match either way.
       if (backing.changeId !== snapshot.id) {
         throw new Error(
           `unbacked node ${node.id}: planner backing ${backing.changeId} is not the Change ${snapshot.id}`,
         );
       }
-      if (!snapshot.plan) {
-        throw new Error(
-          `unbacked node ${node.id}: no plan recorded in the state for change ${backing.changeId}`,
-        );
+      if (backing.round === undefined) {
+        // The kickoff planner: a plan record whose source matches must be present.
+        // A planner node with no backing plan record is exactly the decorative
+        // node the no-unbacked-node rule forbids. (Unchanged.)
+        if (!snapshot.plan) {
+          throw new Error(
+            `unbacked node ${node.id}: no plan recorded in the state for change ${backing.changeId}`,
+          );
+        }
+        if (snapshot.plan.source !== backing.source) {
+          throw new Error(
+            `unbacked node ${node.id}: planner source ${backing.source} does not match the recorded plan source ${snapshot.plan.source}`,
+          );
+        }
+        return node;
       }
-      if (snapshot.plan.source !== backing.source) {
+      // A round-N re-plan planner: a configured re-plan transport revised the
+      // unit set to re-fan on a verify-fail. A retry attempt for the same round
+      // with refanSource "re-plan" must be present. A re-plan planner node with
+      // no such re-plan record is exactly the decorative node the no-unbacked-node
+      // rule forbids, so an offline/attribution round (no re-plan) can never draw
+      // one.
+      const replanRetry = (snapshot.retryAttempts ?? []).find(
+        (a) => a.round === backing.round && a.refanSource === "re-plan",
+      );
+      if (!replanRetry) {
         throw new Error(
-          `unbacked node ${node.id}: planner source ${backing.source} does not match the recorded plan source ${snapshot.plan.source}`,
+          `unbacked node ${node.id}: no recorded re-plan (retry round ${backing.round} with refanSource re-plan) for change ${backing.changeId}`,
         );
       }
       return node;
@@ -951,29 +975,6 @@ export function assertBacked(node: GraphNode, snapshot: ChangeStateSnapshot): Gr
       if (!retry) {
         throw new Error(
           `unbacked node ${node.id}: no recorded model-escalation retry round ${backing.round} to ${backing.toModel} for change ${backing.changeId}`,
-        );
-      }
-      return node;
-    }
-    case "replan": {
-      // A replan node must map to a real recorded CHANGE-LEVEL retry whose
-      // refanSource is "re-plan": a configured re-plan transport revised the
-      // unit set to re-fan on a verify-fail. Its change must match AND a retry
-      // attempt for the same round with refanSource "re-plan" must be present. A
-      // replan node with no such re-plan record is exactly the decorative node
-      // the no-unbacked-node rule forbids, so an offline/attribution round (no
-      // re-plan) can never draw one.
-      if (backing.changeId !== snapshot.id) {
-        throw new Error(
-          `unbacked node ${node.id}: replan names change ${backing.changeId}, not ${snapshot.id}`,
-        );
-      }
-      const replanRetry = (snapshot.retryAttempts ?? []).find(
-        (a) => a.round === backing.round && a.refanSource === "re-plan",
-      );
-      if (!replanRetry) {
-        throw new Error(
-          `unbacked node ${node.id}: no recorded re-plan (retry round ${backing.round} with refanSource re-plan) for change ${backing.changeId}`,
         );
       }
       return node;
@@ -1597,7 +1598,11 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
         : retryNodeId(snapshot.id, attempt.round);
     edges.push({
       id: `verify-flow:${snapshot.id}#${attempt.round}`,
-      kind: "dependency",
+      // The verify flow is ladder control-flow (the integrated change flows into
+      // each round's gate), not a declared WorkGraph dependency and not an
+      // Artifact event, so it rides the `trigger` kind. Its backing still records
+      // the attempt's own existence.
+      kind: "trigger",
       from: fromId,
       to: verifyNodeId(snapshot.id, attempt.round),
       backing: { kind: "dependency", from: snapshot.id, to: `verify#${attempt.round}` },
@@ -1643,10 +1648,12 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     if (prevVerifyFailed) {
       edges.push({
         id: `model-escalation:${snapshot.id}#${prevRound}->${retry.round}`,
-        // The escalation hop reuses the `dependency` kind (the retry depends on
-        // the failing verify of the previous round). Its backing still records
-        // the full model-escalation provenance, so nothing honest is lost.
-        kind: "dependency",
+        // The escalation hop is ladder control-flow (a verify-fail caused this
+        // retry on a stronger model), not a declared dependency and not an
+        // Artifact event, so it rides the `trigger` kind. Its backing still
+        // records the full model-escalation provenance, so nothing honest is
+        // lost.
+        kind: "trigger",
         from: verifyNodeId(snapshot.id, prevRound),
         to: retryNodeId(snapshot.id, retry.round),
         backing: {
@@ -1659,45 +1666,69 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
       });
     }
 
-    // The REPLAN node: when this retry round was driven by a LIVE re-plan
-    // (refanSource "re-plan"), a configured re-plan transport revised the unit
-    // set to re-fan. Draw a replan node BETWEEN the failing verify of the
-    // previous round and this round's retry agents, with SPAWN-kind edges
-    // verify(failed) -> replan -> retry-agents, so the graph shows WHAT
-    // triggered the retry. The node is backed by this retry's re-plan decision
-    // (assertBacked rejects an unbacked replan node), so an offline/attribution
-    // round (no re-plan) draws no replan node and the parse/attribution path is
-    // unchanged. It is emitted BEFORE its edges so every edge endpoint is in the
-    // node set.
+    // The round-N RE-PLAN planner node: when this retry round was driven by a
+    // LIVE re-plan (refanSource "re-plan"), a configured re-plan transport
+    // revised the unit set to re-fan. A re-plan is just the planner running
+    // again for this round, so it renders as a PLAIN `planner` node (same
+    // triangle, same teal, same detail panel as the kickoff planner), positioned
+    // BETWEEN the failing verify of the previous round and this round's retry
+    // agents, with `trigger` edges verify(failed) -> planner -> retry-agents so
+    // the graph shows the ladder control-flow that caused the retry. Its
+    // plan-like detail (the round, the revised unit set it chose to re-fan, and
+    // the model) is derived from THIS retry record (snapshot.plan is a single
+    // kickoff record and does not carry per-round re-plans), so a round-N planner
+    // node is keyed by its round. It is backed by this retry's re-plan decision
+    // (assertBacked rejects an unbacked round-N planner node), so an
+    // offline/attribution round (no re-plan) draws no re-plan planner node and
+    // the parse/attribution path is unchanged. It is emitted BEFORE its edges so
+    // every edge endpoint is in the node set.
     const replanned = retry.refanSource === "re-plan";
     if (replanned) {
       const replanCount = retry.implicatedUnits.length;
+      // Build the planner detail from the real recorded re-plan retry: resolve
+      // each revised unit id to its objective from the Change's WorkUnits (as the
+      // kickoff planner detail does), carry the agent count (= number of revised
+      // units), the escalation model as the plan model, and reuse the recorded
+      // plan's frozen contracts when present. This is derived wholly from the
+      // retry record (and the Change's own units), so it is backed exactly like
+      // the node.
+      const replanUnits: PlannerUnitDetail[] = retry.implicatedUnits.map((unitId) => {
+        const unit = snapshot.work.find((u) => u.id === unitId);
+        return { id: unitId, objective: unit?.objective ?? "" };
+      });
+      const replanDetail: PlannerDetailSnapshot = {
+        source: "planner",
+        model: retry.toModel,
+        units: replanUnits,
+        agentCount: replanUnits.length,
+        contracts: snapshot.plan ? [...snapshot.plan.contracts] : [],
+      };
       const replanNode: GraphNode = {
         id: replanNodeId(snapshot.id, retry.round),
-        kind: "replan",
-        // A readable label naming the round and the revised unit count, e.g.
-        // "re-plan round 2 (1 unit)".
-        label: `re-plan round ${retry.round} (${replanCount} unit${replanCount === 1 ? "" : "s"})`,
+        kind: "planner",
+        // A planner-style label naming the round, the revised unit count, and the
+        // model, e.g. "re-plan round 2: glm-5.3 (1 unit)".
+        label: `re-plan round ${retry.round}: ${retry.toModel || "escalation"} (${replanCount} unit${
+          replanCount === 1 ? "" : "s"
+        })`,
+        // Mirror the kickoff planner node's status/verified (integrated/true).
         status: "integrated",
-        verified: false,
+        verified: true,
         escalated: false,
-        backing: {
-          kind: "replan",
-          changeId: snapshot.id,
-          round: retry.round,
-          implicatedUnits: retry.implicatedUnits,
-        },
+        plannerDetail: replanDetail,
+        backing: { kind: "planner", changeId: snapshot.id, source: "planner", round: retry.round },
       };
       nodes.push(assertBacked(replanNode, snapshot));
 
-      // The SPAWN trigger edge verify(failed) -> replan: the failing verify of
-      // the previous round spawned the re-plan. Only drawn when that previous
-      // verify is a real recorded failing round, so the hop is backed by both
-      // the re-plan record and the failing verify it followed.
+      // The `trigger` edge verify(failed) -> planner(re-plan): the failing verify
+      // of the previous round caused the re-plan (ladder control-flow, not an
+      // Artifact event). Only drawn when that previous verify is a real recorded
+      // failing round, so the hop is backed by both the re-plan record and the
+      // failing verify it followed.
       if (prevVerifyFailed) {
         edges.push({
           id: `replan-trigger:${snapshot.id}#${prevRound}->${retry.round}`,
-          kind: "spawn",
+          kind: "trigger",
           from: verifyNodeId(snapshot.id, prevRound),
           to: replanNodeId(snapshot.id, retry.round),
           backing: {
@@ -1776,11 +1807,11 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
 
       edges.push({
         id: `re-fan:${snapshot.id}#${retry.round}->${unitId}`,
-        // The per-unit re-fan reuses the `dependency` kind (the round-N agent
-        // depends on the retry that fed it its escalation edit), so goal->agent
-        // and retry->agent share one kind. Its backing still records the full
-        // re-fan provenance, so the shared kind loses no honesty.
-        kind: "dependency",
+        // The per-unit re-fan is ladder control-flow (the round-N agent was
+        // caused by the retry that fed it its escalation edit), not a declared
+        // dependency and not an Artifact event, so it rides the `trigger` kind.
+        // Its backing still records the full re-fan provenance.
+        kind: "trigger",
         from: retryNodeId(snapshot.id, retry.round),
         to: roundAgentNodeId(snapshot.id, retry.round, unitId),
         backing: {
@@ -1792,16 +1823,16 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
         },
       });
 
-      // When this round was driven by a live re-plan, also draw the SPAWN edge
-      // replan -> round-N agent, so the trigger chain reads
-      // verify(failed) -> replan -> retry-agents. It is backed by the same
-      // re-fan provenance as the retry -> agent edge; the replan node it points
-      // from is itself backed by the recorded re-plan (gated above), so the edge
-      // never references a node the graph did not emit.
+      // When this round was driven by a live re-plan, also draw the `trigger`
+      // edge planner(re-plan) -> round-N agent, so the control-flow chain reads
+      // verify(failed) -> planner(re-plan) -> retry-agents. It is backed by the
+      // same re-fan provenance as the retry -> agent edge; the re-plan planner
+      // node it points from is itself backed by the recorded re-plan (gated
+      // above), so the edge never references a node the graph did not emit.
       if (replanned) {
         edges.push({
           id: `replan-refan:${snapshot.id}#${retry.round}->${unitId}`,
-          kind: "spawn",
+          kind: "trigger",
           from: replanNodeId(snapshot.id, retry.round),
           to: roundAgentNodeId(snapshot.id, retry.round, unitId),
           backing: {

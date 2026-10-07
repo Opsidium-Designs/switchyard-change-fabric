@@ -57,6 +57,34 @@ interface LaunchStatus {
   readonly log: readonly string[];
 }
 
+/**
+ * How a GET /changes/:id response should be treated at render time. Right after
+ * a launch the run exists but has not POSTed the Change yet, so the Worker
+ * answers 404; that is EXPECTED and must read as a quiet "pending" (keep polling,
+ * surface no error) rather than a hard failure, so the first paint after a launch
+ * does not flicker an alarming error. Once the Change has appeared at least once,
+ * a later 404 is no longer the launch race and is handled as before (an error).
+ * Any other non-ok status is a real error immediately. This is a pure decision so
+ * it is unit-tested offline without a browser.
+ */
+export type ChangeFetchDisposition = "ok" | "pending" | "error";
+
+export function classifyChangeResponse(
+  status: number,
+  ok: boolean,
+  hasAppeared: boolean,
+): ChangeFetchDisposition {
+  if (ok) {
+    return "ok";
+  }
+  // An early 404 (before the Change has ever appeared) is the launch race, not a
+  // failure: treat it as pending and keep polling quietly.
+  if (status === 404 && !hasAppeared) {
+    return "pending";
+  }
+  return "error";
+}
+
 export function App() {
   // No change-id box and no ?change= reliance: the console follows the UNIQUE id
   // the launcher hands back when a template is launched. Null means no run yet.
@@ -65,6 +93,14 @@ export function App() {
   const [templates, setTemplates] = useState<readonly Template[]>(TEMPLATES);
   const [snapshot, setSnapshot] = useState<ChangeStateSnapshot | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A quiet "waiting for the launched run to create the Change" flag. Right after
+  // a launch the Worker answers 404 until the run POSTs the Change, which is the
+  // launch race, not a failure. This flag shows a soft waiting line instead of
+  // the generic empty state and clears on the first real snapshot.
+  const [pending, setPending] = useState(false);
+  // Whether the followed Change has appeared at least once. Once it has, a later
+  // 404 is no longer the launch race and is handled as a real error.
+  const hasAppearedRef = useRef(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [min, setMin] = useState(1);
   const [max, setMax] = useState(3);
@@ -101,24 +137,30 @@ export function App() {
   const load = useCallback(async (id: string) => {
     try {
       const res = await fetch(`${WORKER_BASE}/changes/${encodeURIComponent(id)}`);
-      if (!res.ok) {
-        // Before the launched run has created the Change, a 404 is expected; show
-        // it as a soft "waiting" rather than a hard error so the first paint
-        // after a launch is not alarming.
-        if (res.status === 404) {
-          setError(null);
-          return;
-        }
+      const disposition = classifyChangeResponse(res.status, res.ok, hasAppearedRef.current);
+      if (disposition === "pending") {
+        // The launched run has not created the Change yet (an expected early
+        // 404). Keep polling quietly: show a soft "waiting" state, surface no
+        // error, and do not spam the console or clobber any prior snapshot.
+        setError(null);
+        setPending(true);
+        return;
+      }
+      if (disposition === "error") {
         const body = (await res.json().catch(() => ({}))) as { error?: string };
         setError(body.error ?? `request failed (${res.status})`);
         setSnapshot(null);
+        setPending(false);
         return;
       }
+      hasAppearedRef.current = true;
       setSnapshot((await res.json()) as ChangeStateSnapshot);
       setError(null);
+      setPending(false);
     } catch {
       setError(`cannot reach the Worker at ${WORKER_BASE}`);
       setSnapshot(null);
+      setPending(false);
     }
   }, []);
 
@@ -251,6 +293,10 @@ export function App() {
       setSelectedId(null);
       setLaunchStatus(null);
       setError(null);
+      // A fresh run: the Change has not appeared yet, so an early 404 reads as
+      // the launch race (pending) until the run POSTs it.
+      hasAppearedRef.current = false;
+      setPending(true);
       setActiveTemplate(template);
       setChangeId(body.changeId);
       setNotice(
@@ -428,6 +474,9 @@ export function App() {
           </p>
         )}
         {error ? <p className="error">{error}</p> : null}
+        {pending && !snapshot && !error ? (
+          <p className="muted">Waiting for the launched run to create the change...</p>
+        ) : null}
         {notice ? <p className="notice">{notice}</p> : null}
       </section>
 
@@ -651,9 +700,10 @@ function Legend() {
       <li><span className="swatch-pentagon sw-jev" aria-hidden="true" /> jev</li>
       {/* A tool is a YELLOW SQUARE. */}
       <li><span className="swatch-square sw-tool" aria-hidden="true" /> tool</li>
-      {/* The rendered edge vocabulary is exactly these three kinds. */}
+      {/* The rendered edge vocabulary and what each kind means. */}
       <li><span className="line ln-dependency" /> dependency</li>
-      <li><span className="line ln-spawn" /> event-driven spawn</li>
+      <li><span className="line ln-spawn" /> event-driven spawn (an Artifact push recruited this)</li>
+      <li><span className="line ln-trigger" /> trigger (ladder re-plan / retry control-flow)</li>
       <li><span className="line ln-tool" /> consumed tool</li>
     </ul>
   );

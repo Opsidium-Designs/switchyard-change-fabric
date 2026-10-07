@@ -524,6 +524,10 @@ body {
 
 .ln-dependency { border-top-color: #5a6472; }
 .ln-spawn { border-top-color: #d2a8ff; border-top-style: dashed; }
+/* A trigger edge is the ladder's control-flow (re-plan / retry): a GOLD dashed
+   line, mirroring the graph-view trigger stroke, clearly distinct from the
+   violet event-driven spawn dash and the grey dependency line. */
+.ln-trigger { border-top-color: #d9a441; border-top-style: dashed; }
 /* A consumed-tool edge is a SOLID amber line, mirroring the graph-view edge
    styling exactly, so the legend reads the same as the graph. */
 .ln-tool { border-top-color: #f0883e; border-top-style: solid; }

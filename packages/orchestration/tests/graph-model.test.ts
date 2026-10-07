@@ -211,9 +211,9 @@ describe("M3: the graph is a projection of real ChangeState, not a script", () =
     const pending = buildWorkGraphModel({ ...layeredSnapshot(), completed: [] });
     expect(pending.edges.find((e) => e.id === "base->left")?.kind).toBe("dependency");
 
-    // The rendered edge vocabulary is exactly three kinds: no data-flow or lease.
+    // The rendered edge vocabulary: no data-flow or lease edges leak in.
     for (const edge of model.edges) {
-      expect(["dependency", "spawn", "consumed-tool"]).toContain(edge.kind);
+      expect(["dependency", "spawn", "trigger", "consumed-tool"]).toContain(edge.kind);
     }
   });
 
@@ -419,16 +419,18 @@ describe("the graph materializes on spawn and exposes only the allowed node/edge
     }
   });
 
-  it("exposes ONLY the five node kinds and three edge kinds across a rich snapshot", () => {
+  it("exposes ONLY the allowed node kinds and edge kinds across a rich snapshot", () => {
     // The ladder snapshot carries goal + agent + verify + retry + round-N agent
-    // nodes and dependency/model-escalation(folded)/re-fan(folded) edges; a
-    // tool/lease snapshot adds tool + consumed-tool (the lease coordination no
-    // longer renders an edge). Together the rendered vocabulary must stay inside
-    // the allowed five node kinds + three edge kinds.
+    // nodes, declared `dependency` edges, and the ladder control-flow on the
+    // `trigger` kind (verify flow, escalation hop, re-fan); a tool/lease snapshot
+    // adds tool + consumed-tool (the lease coordination no longer renders an
+    // edge). Together the rendered vocabulary must stay inside the allowed node
+    // kinds + edge kinds.
     const allowedNodeKinds = new Set(["goal", "agent", "verify", "retry", "tool"]);
     const allowedEdgeKinds = new Set([
       "dependency",
       "spawn",
+      "trigger",
       "consumed-tool",
     ]);
     for (const snapshot of [ladderSnapshot(), partialSnapshot(), layeredSnapshot()]) {
@@ -660,12 +662,13 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
       implicatedUnits: ["fix"],
     });
 
-    // The escalation hop reuses the `dependency` kind in the rendered vocabulary
-    // (the three kinds), but still carries its full model-escalation provenance
-    // on its backing. Assert via the backing so the beat remains pinned.
+    // The escalation hop is ladder control-flow, so it rides the `trigger` kind
+    // in the rendered vocabulary, but still carries its full model-escalation
+    // provenance on its backing. Assert via the backing so the beat remains
+    // pinned.
     const escalationEdge = model.edges.find((e) => e.backing.kind === "model-escalation");
     expect(escalationEdge).toBeDefined();
-    expect(escalationEdge?.kind).toBe("dependency");
+    expect(escalationEdge?.kind).toBe("trigger");
     expect(escalationEdge?.from).toBe(verifyNodeId("change-ladder", 1));
     expect(escalationEdge?.to).toBe(retryNodeId("change-ladder", 2));
     expect(escalationEdge?.backing).toMatchObject({
@@ -703,12 +706,12 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
 
   it("draws the re-fan edge from the retry node to the round-N agent node (not back to the original unit)", () => {
     const model = buildWorkGraphModel(ladderSnapshot());
-    // The per-unit re-fan reuses the `dependency` kind in the rendered
-    // vocabulary (so goal->agent and retry->agent share one kind) but still
-    // carries its re-fan provenance on its backing; assert via backing.
+    // The per-unit re-fan is ladder control-flow, so it rides the `trigger` kind
+    // in the rendered vocabulary but still carries its re-fan provenance on its
+    // backing; assert via backing.
     const refan = model.edges.filter((e) => e.backing.kind === "re-fan");
     expect(refan).toHaveLength(1);
-    expect(refan[0]?.kind).toBe("dependency");
+    expect(refan[0]?.kind).toBe("trigger");
     expect(refan[0]?.id).toBe("re-fan:change-ladder#2->fix");
     expect(refan[0]?.from).toBe(retryNodeId("change-ladder", 2));
     // The edge targets the FRESH round-N agent node beneath the retry, never the
@@ -845,19 +848,24 @@ describe("T4: the change-level model-escalation ladder renders as backed verify/
     expect(model.edges.some((e) => e.backing.kind === "re-fan")).toBe(false);
   });
 
-  it("renders the ladder edges within the three-kind vocabulary (no bespoke model-escalation/re-fan edge kinds)", () => {
+  it("renders the ladder edges within the edge vocabulary, with ladder control-flow on the trigger kind", () => {
     const model = buildWorkGraphModel(ladderSnapshot());
-    // The rendered edge vocabulary is exactly these three kinds; the escalation
-    // hop and the per-unit re-fan ride `dependency`, never a bespoke kind, so the
-    // console legend stays the three-kind set.
-    const allowed = new Set(["dependency", "spawn", "consumed-tool"]);
+    // The rendered edge vocabulary: declared/promotion `dependency`, Artifact
+    // `spawn`, ladder control-flow `trigger`, and `consumed-tool`. The escalation
+    // hop and the per-unit re-fan are ladder control-flow, so they ride
+    // `trigger`, not a bespoke kind.
+    const allowed = new Set(["dependency", "spawn", "trigger", "consumed-tool"]);
     for (const edge of model.edges) {
       expect(allowed.has(edge.kind)).toBe(true);
     }
-    // The escalation hop and the re-fan are still present, just under the shared
-    // `dependency` kind, with their provenance intact on the backing.
-    expect(model.edges.some((e) => e.backing.kind === "model-escalation" && e.kind === "dependency")).toBe(true);
-    expect(model.edges.some((e) => e.backing.kind === "re-fan" && e.kind === "dependency")).toBe(true);
+    // The escalation hop and the re-fan are still present, now on the `trigger`
+    // kind, with their provenance intact on the backing.
+    expect(model.edges.some((e) => e.backing.kind === "model-escalation" && e.kind === "trigger")).toBe(true);
+    expect(model.edges.some((e) => e.backing.kind === "re-fan" && e.kind === "trigger")).toBe(true);
+    // No ladder control-flow edge is miscoded as an Artifact `spawn`: a spawn
+    // edge always means a repo-pushed recruitment.
+    expect(model.edges.some((e) => e.backing.kind === "model-escalation" && e.kind === "spawn")).toBe(false);
+    expect(model.edges.some((e) => e.backing.kind === "re-fan" && e.kind === "spawn")).toBe(false);
   });
 
   it("projects a round-N agent node's status from the RECORDED round-N state (integrated -> green, with its own workspace)", () => {

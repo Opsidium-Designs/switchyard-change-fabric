@@ -43,6 +43,7 @@ import {
   roundAgentNodeId,
   verifyNodeId,
   type ChangeStateSnapshot,
+  type GraphNode,
 } from "../src/graph-model.ts";
 import { runFullLive, type DeployApp, type FullLiveEvent } from "../src/run-live.ts";
 import {
@@ -1765,27 +1766,65 @@ describe("re-plan on retry (offline, faked planner): choose a revised unit set t
       (n) => n.kind === "agent" && n.backing.kind === "round-agent",
     );
     expect(roundAgents.map((n) => (n.backing as { unitId: string }).unitId)).toEqual(["two"]);
-    // A backed REPLAN node is emitted for the re-planned round, positioned
-    // between the failing verify and the retry agents.
-    const replanNodes = model.nodes.filter((n) => n.kind === "replan");
+    // A re-plan renders as a PLAIN `planner` node (not a distinct `replan` kind),
+    // positioned between the failing verify and the retry agents, backed by the
+    // recorded re-plan retry (round-keyed planner backing). Its planner detail
+    // carries the plan-like info: the round (via the label) and the revised unit
+    // set it chose to re-fan (the detail units + agent count), plus the model.
+    const replanNodes = model.nodes.filter(
+      (n) => n.kind === "planner" && n.backing.kind === "planner" && n.backing.round === 2,
+    );
     expect(replanNodes).toHaveLength(1);
-    expect(replanNodes[0]?.backing.kind).toBe("replan");
-    // The trigger chain verify(failed) -> replan -> retry-agents is drawn with
-    // SPAWN-kind edges: a spawn edge from the failing verify into the replan, and
-    // a spawn edge from the replan into the re-fanned round-N agent.
-    const replanId = replanNodes[0]!.id;
+    const replanPlanner = replanNodes[0]!;
+    expect(replanPlanner.backing.kind).toBe("planner");
+    // The kickoff planner node (when the run recorded a plan) is UNCHANGED: it is
+    // round-less. Only the re-plan planner is keyed to a retry round, so exactly
+    // one round-keyed planner node exists.
+    const kickoffPlanner = model.nodes.filter(
+      (n) => n.kind === "planner" && n.backing.kind === "planner" && n.backing.round === undefined,
+    );
+    expect(kickoffPlanner.length).toBeLessThanOrEqual(1);
+    const roundKeyedPlanners = model.nodes.filter(
+      (n) => n.kind === "planner" && n.backing.kind === "planner" && n.backing.round !== undefined,
+    );
+    expect(roundKeyedPlanners).toHaveLength(1);
+    // The re-plan planner detail carries the revised unit set and the model.
+    expect(replanPlanner.plannerDetail?.units.map((u) => u.id)).toEqual(["two"]);
+    expect(replanPlanner.plannerDetail?.agentCount).toBe(1);
+    expect(replanPlanner.plannerDetail?.model).toBe(ESCALATION_MODEL);
+    // The round is visible in the label.
+    expect(replanPlanner.label).toContain("round 2");
+    // No `replan` node kind exists anywhere in the model.
+    expect(model.nodes.some((n) => (n.kind as string) === "replan")).toBe(false);
+    // The ladder causal chain verify(failed) -> planner(re-plan) -> retry-agents
+    // is drawn with `trigger`-kind edges (ladder control-flow), NOT `spawn`
+    // (which is reserved for an Artifact repo-pushed recruitment). A trigger edge
+    // from the failing verify into the re-plan planner, and a trigger edge from
+    // the re-plan planner into the re-fanned round-N agent.
+    const replanId = replanPlanner.id;
     const verifyToReplan = model.edges.find(
-      (e) => e.kind === "spawn" && e.to === replanId && e.from === verifyNodeId(snapshot.id, 1),
+      (e) => e.kind === "trigger" && e.to === replanId && e.from === verifyNodeId(snapshot.id, 1),
     );
     expect(verifyToReplan).toBeDefined();
     const replanToAgent = model.edges.find(
-      (e) => e.kind === "spawn" && e.from === replanId,
+      (e) => e.kind === "trigger" && e.from === replanId,
     );
     expect(replanToAgent).toBeDefined();
     expect(replanToAgent?.to).toBe(roundAgentNodeId(snapshot.id, 2, "two"));
+    // NO `spawn` edge is emitted for the re-plan/retry chain: a spawn edge always
+    // means an Artifact repo-pushed recruitment, never a re-plan/retry trigger.
+    expect(model.edges.some((e) => e.kind === "spawn" && e.id.startsWith("replan-"))).toBe(false);
+    expect(model.edges.some((e) => e.kind === "spawn" && e.id.startsWith("re-fan:"))).toBe(false);
     for (const node of model.nodes) {
       expect(() => assertBacked(node, snapshot)).not.toThrow();
     }
+    // assertBacked REJECTS an unbacked round-N re-plan planner node: a planner
+    // node keyed to a round with no recorded re-plan retry is dishonest.
+    const unbackedReplan: GraphNode = {
+      ...replanPlanner,
+      backing: { kind: "planner", changeId: snapshot.id, source: "planner", round: 99 },
+    };
+    expect(() => assertBacked(unbackedReplan, snapshot)).toThrow();
   });
 
   it("FALLS BACK to the implicated set when the re-plan returns an invalid/empty revision", async () => {
@@ -1823,9 +1862,19 @@ describe("re-plan on retry (offline, faked planner): choose a revised unit set t
     expect(snapshot.rePlans).toBe(0);
     expect(snapshot.retryAttempts?.[0]?.refanSource).toBe("parse");
     const model = buildWorkGraphModel(snapshot);
-    expect(model.nodes.some((n) => n.kind === "replan")).toBe(false);
-    // No spawn-kind trigger edge is drawn either (the parse/attribution path
-    // keeps the model-escalation dependency edge, not a replan spawn edge).
+    // No round-N re-plan planner node is emitted on the offline/attribution path
+    // (a planner node keyed to a retry round). The kickoff planner (round-less)
+    // is unaffected.
+    expect(
+      model.nodes.some(
+        (n) => n.kind === "planner" && n.backing.kind === "planner" && n.backing.round !== undefined,
+      ),
+    ).toBe(false);
+    // The dead `replan` kind is gone entirely.
+    expect(model.nodes.some((n) => (n.kind as string) === "replan")).toBe(false);
+    // No re-plan trigger edge is drawn either (the parse/attribution path keeps
+    // the model-escalation trigger hop, not a re-plan trigger edge from a
+    // re-plan planner node).
     expect(model.edges.some((e) => e.id.startsWith("replan-trigger:"))).toBe(false);
     expect(model.edges.some((e) => e.id.startsWith("replan-refan:"))).toBe(false);
   });
