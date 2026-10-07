@@ -119,7 +119,10 @@ export interface AiGatewayPlannerOptions {
 export const PLANNER_PLAN_JSON_SCHEMA = {
   type: "object",
   additionalProperties: false,
-  required: ["units", "contracts"],
+  // Under OpenAI strict json_schema, `required` MUST list every key in
+  // `properties` (a property absent from `required` is a schema error that the
+  // gateway rejects with HTTP 400), so every property below is required.
+  required: ["units", "contracts", "rationale"],
   properties: {
     units: {
       type: "array",
@@ -139,10 +142,11 @@ export const PLANNER_PLAN_JSON_SCHEMA = {
       type: "array",
       items: { type: "string" },
     },
-    // An OPTIONAL short explanation of why the model decomposed the goal this
-    // way. It is not in `required`, so a plan that omits it still conforms to the
-    // strict schema; a model that can explain its plan may include it, and the
-    // console surfaces it in the planner detail panel.
+    // A short explanation of why the model decomposed the goal this way. Strict
+    // json_schema does not support optional properties, so `rationale` is in
+    // `required`; the model always emits it (it may be a short string) and the
+    // console surfaces it in the planner detail panel. The caller still tolerates
+    // an empty rationale.
     rationale: { type: "string" },
   },
 } as const;

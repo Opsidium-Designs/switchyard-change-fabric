@@ -39,7 +39,7 @@ describe("createAiGatewayJevInvoke (native /ai/run + cf-aig-gateway-id, offline 
       seenHeaders = (init?.headers as Record<string, string>) ?? {};
       seenBody = String(init?.body ?? "");
       return runResponse({
-        "plan-review": { type: "noul", noul: "yes", confidence: 0.9 },
+        "plan-review": { type: "noul", noul: 0.9 },
       });
     }) as unknown as typeof fetch;
 
@@ -79,8 +79,9 @@ describe("createAiGatewayJevInvoke (native /ai/run + cf-aig-gateway-id, offline 
       instructions: "Does this plan cover the goal?",
     });
 
-    // The reply is parsed from the NESTED result.result.answers into a typed noul
-    // answer with its confidence, keyed by the same question name.
+    // The reply is parsed from the NESTED result.result.answers. The decision
+    // model returns `noul` as a NUMBER (the probability toward yes); the parser
+    // maps it to the yes/no verdict and uses the probability as the confidence.
     expect(answers["plan-review"]).toMatchObject({ type: "noul", noul: "yes", confidence: 0.9 });
   });
 
@@ -125,10 +126,9 @@ describe("createAiGatewayJevInvoke (native /ai/run + cf-aig-gateway-id, offline 
         attribution: {
           type: "choice",
           choice: "users",
-          confidence: 0.82,
           probabilities: { users: 0.82, orders: 0.18 },
         },
-        quality: { type: "score", score: 7.5, confidence: 0.6 },
+        quality: { type: "score", score: 7.5 },
       });
     }) as unknown as typeof fetch;
     const invoke = createAiGatewayJevInvoke({
@@ -154,15 +154,18 @@ describe("createAiGatewayJevInvoke (native /ai/run + cf-aig-gateway-id, offline 
     });
     expect(body.input.questions.quality).toEqual({ type: "score", instructions: "how good?" });
     // The answers come back object-keyed by the same question names.
+    // A choice answer carries the chosen option; its confidence is derived from
+    // the chosen option's probability when the model does not send one. A score
+    // answer with no probabilities defaults its confidence to 1.
     expect(answers.attribution).toMatchObject({ type: "choice", choice: "users", confidence: 0.82 });
     expect(answers.attribution?.probabilities).toEqual({ users: 0.82, orders: 0.18 });
-    expect(answers.quality).toMatchObject({ type: "score", score: 7.5, confidence: 0.6 });
+    expect(answers.quality).toMatchObject({ type: "score", score: 7.5, confidence: 1 });
   });
 
   it("tolerates a flatter result.answers nesting (one level) as well", async () => {
     const fakeFetch = (async () =>
       new Response(
-        JSON.stringify({ result: { answers: { k: { type: "noul", noul: "no", confidence: 0.4 } } } }),
+        JSON.stringify({ result: { answers: { k: { type: "noul", noul: 0.4 } } } }),
         { status: 200 },
       )) as unknown as typeof fetch;
     const invoke = createAiGatewayJevInvoke({
@@ -172,7 +175,7 @@ describe("createAiGatewayJevInvoke (native /ai/run + cf-aig-gateway-id, offline 
       fetchFn: fakeFetch,
     });
     const answers = await invoke({ state: "s", questions: {} });
-    expect(answers.k).toMatchObject({ type: "noul", noul: "no", confidence: 0.4 });
+    expect(answers.k).toMatchObject({ type: "noul", noul: "no", confidence: 0.6 });
   });
 
   it("throws without leaking the account token when the run endpoint returns an error", async () => {
@@ -207,20 +210,20 @@ describe("createAiGatewayJevInvoke (native /ai/run + cf-aig-gateway-id, offline 
 
 describe("parseJevAnswers (shape enforcement only)", () => {
   it("accepts both the wrapped {answers:{...}} and the bare {<key>:{...}} shapes", () => {
-    const wrapped = parseJevAnswers({ answers: { k: { type: "noul", noul: "no", confidence: 0.5 } } });
-    expect(wrapped.k).toMatchObject({ type: "noul", noul: "no", confidence: 0.5 });
-    const bare = parseJevAnswers({ k: { type: "noul", noul: "unsure", confidence: 0.3 } });
-    expect(bare.k).toMatchObject({ type: "noul", noul: "unsure", confidence: 0.3 });
+    const wrapped = parseJevAnswers({ answers: { k: { type: "noul", noul: 0.2 } } });
+    expect(wrapped.k).toMatchObject({ type: "noul", noul: "no", confidence: 0.8 });
+    const bare = parseJevAnswers({ k: { type: "noul", noul: 0.7 } });
+    expect(bare.k).toMatchObject({ type: "noul", noul: "yes", confidence: 0.7 });
   });
 
-  it("rejects a noul answer with a bad verdict", () => {
-    expect(() => parseJevAnswers({ answers: { k: { type: "noul", noul: "maybe", confidence: 0.5 } } })).toThrow(
+  it("rejects a noul answer whose noul is not a number", () => {
+    expect(() => parseJevAnswers({ answers: { k: { type: "noul", noul: "maybe" } } })).toThrow(
       JevResponseError,
     );
   });
 
-  it("rejects a confidence outside [0, 1]", () => {
-    expect(() => parseJevAnswers({ answers: { k: { type: "noul", noul: "yes", confidence: 1.5 } } })).toThrow(
+  it("rejects an explicit confidence outside [0, 1]", () => {
+    expect(() => parseJevAnswers({ answers: { k: { type: "noul", noul: 0.9, confidence: 1.5 } } })).toThrow(
       JevResponseError,
     );
   });

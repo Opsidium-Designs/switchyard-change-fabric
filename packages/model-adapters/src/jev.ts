@@ -315,13 +315,28 @@ function parseOneAnswer(value: unknown, where: string): JevAnswer {
   if (type !== "noul" && type !== "choice" && type !== "score") {
     throw new JevResponseError(`${where}.type must be one of noul, choice, score`);
   }
-  const confidence = requireUnitInterval(value["confidence"], `${where}.confidence`);
   const probabilities = parseProbabilities(value["probabilities"], `${where}.probabilities`);
   if (type === "noul") {
-    const noul = value["noul"];
-    if (noul !== "yes" && noul !== "no" && noul !== "unsure") {
-      throw new JevResponseError(`${where}.noul must be one of yes, no, unsure`);
+    // The decision model returns `noul` as a NUMBER: the probability the answer
+    // is "yes" (verified against the live API, which returns e.g. {noul: 0.95}),
+    // NOT a yes/no/unsure string. Map it to the verdict plus a derived
+    // confidence: the probability toward yes gives "yes", below 0.5 gives "no",
+    // and the confidence is how far the probability is from an even 0.5 (so a
+    // noul near 0.5 is low-confidence and the juncture escalates). A caller may
+    // still send an explicit `confidence`; honor it when present.
+    const rawNoul = value["noul"];
+    if (typeof rawNoul !== "number" || !Number.isFinite(rawNoul)) {
+      throw new JevResponseError(`${where}.noul must be a finite number in [0, 1]`);
     }
+    const p = clampUnit(rawNoul);
+    const noul: "yes" | "no" = p >= 0.5 ? "yes" : "no";
+    // The confidence reflects the CHOSEN verdict: the probability toward yes for
+    // a "yes", and its complement for a "no", so a decisive answer in either
+    // direction is high-confidence and a noul near 0.5 is low-confidence (and the
+    // juncture escalates). A caller may still send an explicit confidence.
+    const derivedConfidence = noul === "yes" ? p : 1 - p;
+    const confidence =
+      optionalUnitInterval(value["confidence"], `${where}.confidence`) ?? derivedConfidence;
     return {
       type,
       noul,
@@ -330,10 +345,33 @@ function parseOneAnswer(value: unknown, where: string): JevAnswer {
     };
   }
   if (type === "choice") {
-    const choice = value["choice"];
-    if (typeof choice !== "string" || choice.trim() === "") {
-      throw new JevResponseError(`${where}.choice must be a non-empty string`);
+    // A choice answer carries the chosen option id as a string. The live API may
+    // also return per-option `probabilities`; when `choice` is absent but
+    // probabilities are present, the chosen option is the argmax, and the
+    // confidence is that option's probability.
+    const rawChoice = value["choice"];
+    let choice: string | undefined =
+      typeof rawChoice === "string" && rawChoice.trim() !== "" ? rawChoice : undefined;
+    let derivedConfidence: number | undefined;
+    if (choice === undefined && probabilities !== undefined) {
+      const best = argmax(probabilities);
+      if (best !== undefined) {
+        choice = best.key;
+        derivedConfidence = best.value;
+      }
+    } else if (choice !== undefined && probabilities !== undefined) {
+      // The chosen option's own probability is its confidence when the model
+      // returns a per-option distribution alongside an explicit choice.
+      const p = probabilities[choice];
+      if (typeof p === "number" && Number.isFinite(p)) {
+        derivedConfidence = p;
+      }
     }
+    if (choice === undefined) {
+      throw new JevResponseError(`${where}.choice must be a non-empty string or have probabilities`);
+    }
+    const confidence =
+      optionalUnitInterval(value["confidence"], `${where}.confidence`) ?? derivedConfidence ?? 1;
     return {
       type,
       choice,
@@ -345,12 +383,46 @@ function parseOneAnswer(value: unknown, where: string): JevAnswer {
   if (typeof score !== "number" || !Number.isFinite(score)) {
     throw new JevResponseError(`${where}.score must be a finite number`);
   }
+  const confidence = optionalUnitInterval(value["confidence"], `${where}.confidence`) ?? 1;
   return {
     type,
     score,
     confidence,
     ...(probabilities !== undefined ? { probabilities } : {}),
   };
+}
+
+/** Clamp a number into [0, 1]. */
+function clampUnit(value: number): number {
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
+/** The entry with the largest finite value in a probabilities map, if any. */
+function argmax(
+  probabilities: Readonly<Record<string, number>>,
+): { key: string; value: number } | undefined {
+  let best: { key: string; value: number } | undefined;
+  for (const [key, value] of Object.entries(probabilities)) {
+    if (best === undefined || value > best.value) {
+      best = { key, value };
+    }
+  }
+  return best;
+}
+
+/**
+ * Parse an OPTIONAL confidence in [0, 1]: the live decision model does not send
+ * a separate `confidence` field (it is derived from the noul probability), but a
+ * caller or a future model may, so honor it when present and reject only a
+ * present-but-malformed value.
+ */
+function optionalUnitInterval(value: unknown, where: string): number | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  return requireUnitInterval(value, where);
 }
 
 /** Parse an optional probabilities map, keeping only finite numeric entries. */
