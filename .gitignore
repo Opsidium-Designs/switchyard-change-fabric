@@ -32,3 +32,9 @@ reports/
 .idea/
 .vscode/
 *.swp
+
+fabric-nodes.png
+
+# Local agent instructions (not part of the public spike)
+AGENTS.md
+CLAUDE.md
