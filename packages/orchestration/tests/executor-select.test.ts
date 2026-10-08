@@ -8,7 +8,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import { selectExecutor, type ExecutorEnv } from "../src/executor-select.ts";
+import {
+  ALLOW_HEURISTIC_PLANNER_FLAG,
+  decideLivePlanner,
+  plannerFallbackBanner,
+  selectExecutor,
+  type ExecutorEnv,
+} from "../src/executor-select.ts";
 
 describe("selectExecutor ai-gateway branch", () => {
   it("selects a live ai-gateway executor with the env base/escalation models and retry budget", () => {
@@ -121,5 +127,56 @@ describe("selectExecutor ai-gateway branch", () => {
     expect(selected.escalationModel).toBe("");
     expect(selected.escalationModels).toEqual([]);
     expect(selected.maxModelRetries).toBeUndefined();
+  });
+});
+
+describe("selectExecutor rejects unsupported EXECUTOR values", () => {
+  it("throws on an executor this repo does not implement (no silent noop on a live run)", () => {
+    expect(() => selectExecutor({ EXECUTOR: "codex" })).toThrow(/unsupported EXECUTOR="codex"/);
+    expect(() => selectExecutor({ EXECUTOR: "workers_ai" })).toThrow(/supported values are/);
+  });
+
+  it("still selects the noop stub for an explicit EXECUTOR=noop", () => {
+    const selected = selectExecutor({ EXECUTOR: "noop" });
+    expect(selected.live).toBe(false);
+    expect(selected.executor.name).toBe("noop");
+  });
+});
+
+describe("decideLivePlanner", () => {
+  it("uses the LLM planner when the gateway planner is live", () => {
+    expect(
+      decideLivePlanner({ planner: { live: true, description: "ai-gateway" }, allowHeuristic: false }),
+    ).toEqual({ kind: "llm" });
+  });
+
+  it("REFUSES a live run with no LLM planner unless the operator opts in", () => {
+    const refused = decideLivePlanner({
+      planner: { live: false, description: "heuristic (gateway credentials absent)" },
+      allowHeuristic: false,
+    });
+    expect(refused.kind).toBe("refused");
+    if (refused.kind === "refused") {
+      expect(refused.error).toContain(ALLOW_HEURISTIC_PLANNER_FLAG);
+      expect(refused.error).toContain("gateway credentials absent");
+    }
+  });
+
+  it("allows the heuristic only with the explicit flag, and returns a loud banner", () => {
+    const allowed = decideLivePlanner({
+      planner: { live: false, description: "heuristic (deterministic, offline decomposition)" },
+      allowHeuristic: true,
+    });
+    expect(allowed.kind).toBe("heuristic-allowed");
+    if (allowed.kind === "heuristic-allowed") {
+      expect(allowed.banner).toContain("HEURISTIC PLANNER IN USE ON A LIVE RUN");
+      expect(allowed.banner).toContain(ALLOW_HEURISTIC_PLANNER_FLAG);
+    }
+  });
+
+  it("the fallback banner names the recorded heuristic-fallback plan source", () => {
+    const banner = plannerFallbackBanner([{ model: "gpt-4o-mini", reason: "invalid plan" }]);
+    expect(banner).toContain('plan.source "heuristic-fallback"');
+    expect(banner).toContain("gpt-4o-mini: invalid plan");
   });
 });

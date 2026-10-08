@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
   buildWorkGraphModel,
@@ -15,6 +15,7 @@ import {
 
 import { GraphView, changeHasPassed } from "./graph-view";
 import { TEMPLATES, type Template } from "./templates";
+import { postToWorker } from "./worker-post";
 
 /**
  * Console for the Switchyard Change Fabric: the control plane.
@@ -85,6 +86,41 @@ export function classifyChangeResponse(
   return "error";
 }
 
+/**
+ * The lines worth showing when a launched run exits non-zero: the last few log
+ * lines, with the last `Error:` line pulled in first when it scrolled out of
+ * that tail. The log is the launcher's already-redacted rolling CLI output.
+ */
+export function runFailureLines(log: readonly string[], max = 6): string[] {
+  const tail = log.slice(-max);
+  const errorLine = [...log].reverse().find((line) => /\b\w*Error:/.test(line));
+  if (errorLine === undefined || tail.includes(errorLine)) {
+    return tail;
+  }
+  return [errorLine, ...tail.slice(-(max - 1))];
+}
+
+/**
+ * The cost cell for a model transcript. A recorded positive USD is shown as is.
+ * The gateway executor records `usd: 0` because no pricing table exists for
+ * those models, so a zero (or missing) cost next to real token counts reads
+ * "not metered" rather than a false $0. Null means there is nothing to show.
+ */
+export function formatCost(detail: {
+  readonly usd?: number;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+}): string | null {
+  const tokens = (detail.inputTokens ?? 0) + (detail.outputTokens ?? 0);
+  if (detail.usd !== undefined && detail.usd > 0) {
+    return `$${detail.usd}`;
+  }
+  if (tokens > 0) {
+    return "not metered";
+  }
+  return detail.usd !== undefined ? "0" : null;
+}
+
 export function App() {
   // No change-id box and no ?change= reliance: the console follows the UNIQUE id
   // the launcher hands back when a template is launched. Null means no run yet.
@@ -113,6 +149,29 @@ export function App() {
   // place to the SAME URL), to teardown. This is the pre-run break the watcher
   // sees before launching a fix.
   const [deployedUrls, setDeployedUrls] = useState<Record<string, string>>({});
+  // The template gallery collapses to a one-line strip while a run is active so
+  // the graph sits near the top of the page.
+  const [galleryOpen, setGalleryOpen] = useState(true);
+
+  // Restore the per-app deployments the launcher already knows about (its
+  // .deployments markers), so a reload does not forget a prior manual Deploy.
+  useEffect(() => {
+    let cancelled = false;
+    void fetch("/api/deployments")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body: { deployments?: Record<string, string> } | null) => {
+        if (!cancelled && body?.deployments) {
+          const known = body.deployments;
+          setDeployedUrls((prev) => ({ ...known, ...prev }));
+        }
+      })
+      .catch(() => {
+        /* best-effort: no launcher means no restored deployments */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Load the gallery from the launcher so the UI and the launcher share one
   // source of truth; fall back to the bundled descriptors when the launcher is
@@ -245,13 +304,12 @@ export function App() {
     return model.nodes.find((n) => n.id === selectedId) ?? null;
   }, [model, selectedId]);
 
+  // Mutations go through the dev launcher's auth proxy when it has one (it adds
+  // the Worker bearer server-side, so no secret is ever in this bundle), and
+  // fall back to a direct Worker POST otherwise. See worker-post.ts.
   const post = useCallback(async (path: string, body?: unknown): Promise<boolean> => {
     try {
-      const res = await fetch(`${WORKER_BASE}${path}`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
+      const res = await postToWorker(fetch, WORKER_BASE, path, body);
       if (!res.ok) {
         const parsed = (await res.json().catch(() => ({}))) as { error?: string };
         setNotice(parsed.error ?? `request failed (${res.status})`);
@@ -299,6 +357,7 @@ export function App() {
       setPending(true);
       setActiveTemplate(template);
       setChangeId(body.changeId);
+      setGalleryOpen(false);
       setNotice(
         template.escalates
           ? `launched ${template.name} as ${body.changeId}. It will pause for your decision when it hits the shared path.`
@@ -370,6 +429,7 @@ export function App() {
         setChangeId(null);
         setActiveTemplate(null);
         setLaunchStatus(null);
+        setGalleryOpen(true);
         if (teardownApp) {
           setDeployedUrls((prev) => {
             const next = { ...prev };
@@ -398,80 +458,41 @@ export function App() {
         activeId={activeTemplate?.id ?? null}
         busy={busy}
         deployedUrls={deployedUrls}
+        collapsed={Boolean(changeId) && !galleryOpen}
+        onToggle={() => setGalleryOpen((open) => !open)}
         onLaunch={launchTemplate}
         onDeploy={deployApp}
-      />
-
-      <section className="app-panel" aria-label="How this works">
-        <p className="muted">
-          The flow for an app template: <strong>Deploy</strong> to see it broken
-          at a stable URL, then <strong>Launch the fix</strong> and watch the same
-          URL become correct (the run redeploys the fix in place, it never creates
-          a new URL), then <strong>Tear down</strong> to delete the deployment and
-          the run&apos;s repos. A run with no prior Deploy still fixes the code and
-          promotes it to Git; it simply shows no live URL.
-        </p>
-      </section>
+      >
+        <DialControl
+          min={min}
+          max={max}
+          locked={Boolean(changeId)}
+          onMin={setMin}
+          onMax={setMax}
+        />
+      </TemplateGallery>
 
       <section className="app-panel" aria-label="Run status">
         {changeId ? (
-          <div className="run-status">
-            <p className="muted">
-              Following live run <code>{changeId}</code>
-              {activeTemplate ? ` (${activeTemplate.name})` : ""}
-              {launchStatus
-                ? launchStatus.status === "running"
-                  ? " - the run is working"
-                  : launchStatus.exitCode === 0
-                    ? " - the run finished"
-                    : ` - the run exited (code ${launchStatus.exitCode ?? "?"})`
-                : ""}
-            </p>
-            {activeTemplate ? (
-              <dl className="run-header-detail">
-                <dt>What this does</dt>
-                <dd>{activeTemplate.whatItDoes}</dd>
-                <dt>What this run solves</dt>
-                <dd>{activeTemplate.problemItSolves}</dd>
-              </dl>
-            ) : null}
-            {(() => {
-              const app = activeTemplate?.app;
-              const manualUrl = app ? deployedUrls[app] : undefined;
-              const liveUrl = snapshot?.deployment?.url ?? manualUrl;
-              if (!liveUrl) {
-                return null;
-              }
-              const redeployed = Boolean(snapshot?.deployment?.url);
-              return (
-                <p className="deploy-proof">
-                  {redeployed ? "Live URL (fix redeployed in place): " : "Live URL (deployed before the fix): "}
-                  <a href={liveUrl} target="_blank" rel="noreferrer">
-                    {liveUrl}
-                  </a>{" "}
-                  <span className="muted">
-                    {redeployed
-                      ? "the same URL now serves the fixed app; torn down on Tear down"
-                      : "this shows the CURRENT (broken) app; launch the fix to update it in place"}
-                  </span>
-                </p>
-              );
-            })()}
-            <button
-              type="button"
-              className="secondary"
-              onClick={() => void cleanupRun()}
-              disabled={busy}
-              title="Delete this run's real Artifact repos and, if the app was deployed, its stable deployed Worker"
-            >
-              Tear down (repos{activeTemplate?.app ? " + deployed app" : ""})
-            </button>
-          </div>
+          <RunStatus
+            changeId={changeId}
+            template={activeTemplate}
+            launchStatus={launchStatus}
+            liveUrl={
+              snapshot?.deployment?.url ??
+              (activeTemplate?.app ? deployedUrls[activeTemplate.app] : undefined)
+            }
+            redeployed={Boolean(snapshot?.deployment?.url)}
+            dial={
+              reportedDial
+                ? { min: reportedDial.minConcurrency, max: reportedDial.maxConcurrency }
+                : { min, max }
+            }
+            busy={busy}
+            onTearDown={() => void cleanupRun()}
+          />
         ) : (
-          <p className="muted">
-            Pick a template above to launch a live run. The run gets a unique id
-            this console follows automatically.
-          </p>
+          <p className="muted">Pick a template above to launch a live run.</p>
         )}
         {error ? <p className="error">{error}</p> : null}
         {pending && !snapshot && !error ? (
@@ -480,78 +501,19 @@ export function App() {
         {notice ? <p className="notice">{notice}</p> : null}
       </section>
 
-      {/*
-        The concurrency dial is SET BEFORE a run and LOCKED DURING one. Before a
-        run (no changeId yet) the sliders are live: the min/max you choose here
-        becomes the launched run's config, passed through POST /api/launch so the
-        run recruits under exactly this dial from its first wave. Once a run is
-        active the control is READ-ONLY: it shows the in-force dial the run was
-        launched with (synced from the real reported dial), and there is no
-        mid-run re-POST that changes concurrency live. To run with a different
-        dial, set it here before launching the next run.
-      */}
-      <section className="app-panel dial-panel" aria-label="Concurrency dial">
-        <h2>Concurrency dial</h2>
-        <p className="muted">
-          The min/max dial is the real recruitment config: it bounds how many
-          agent nodes run at once, by the same engine mechanism.{" "}
-          {changeId
-            ? "A run is active, so the dial is locked to the config it launched with."
-            : "Set the concurrency for the next run, then launch a template above to apply it."}
-        </p>
-        <div className="dial-row">
-          <label htmlFor="dial-min">min</label>
-          <input
-            id="dial-min"
-            type="range"
-            min={0}
-            max={8}
-            value={min}
-            disabled={Boolean(changeId)}
-            onChange={(event) => setMin(Number(event.target.value))}
-          />
-          <span className="dial-value">{min}</span>
-          <label htmlFor="dial-max">max</label>
-          <input
-            id="dial-max"
-            type="range"
-            min={1}
-            max={8}
-            value={max}
-            disabled={Boolean(changeId)}
-            onChange={(event) => setMax(Number(event.target.value))}
-          />
-          <span className="dial-value">{max}</span>
-          {changeId ? (
-            <span className="dial-locked" title="The dial is fixed for the life of a run">
-              locked for this run
-            </span>
-          ) : null}
-        </div>
-        {changeId ? (
-          reportedDial ? (
-            <p className="muted">
-              in force for this run: min {reportedDial.minConcurrency}, max{" "}
-              {reportedDial.maxConcurrency} (read-only until the run ends)
-            </p>
-          ) : (
-            <p className="muted">
-              launched with min {min}, max {max}: this run keeps that dial for its
-              lifetime
-            </p>
-          )
-        ) : (
-          <p className="muted">
-            no run yet: this is the concurrency the next launched run will use
-          </p>
-        )}
-      </section>
-
       {backingError ? (
         <section className="app-panel" aria-label="Honesty guard">
           <p className="error">
             Refusing to render: a node had no backing state ({backingError}). The graph
             only draws nodes that map to real ChangeState.
+          </p>
+        </section>
+      ) : null}
+
+      {snapshot?.planningFailure ? (
+        <section className="app-panel" aria-label="Planning failed">
+          <p className="detail-warning" role="alert">
+            <strong>Planning failed:</strong> {snapshot.planningFailure.reason}
           </p>
         </section>
       ) : null}
@@ -594,34 +556,61 @@ export function App() {
 }
 
 /**
- * The template gallery: the shipped scenarios as selectable cards. Each card
- * declares its display name, a one-line description, an agent count hint, and
- * whether it escalates (pauses for a human) or runs autonomously. Clicking a
- * card launches a real live run with a fresh unique id the console follows.
+ * The template gallery: the shipped scenarios as selectable cards (name, a
+ * one-line description, what it does, what it solves, an agent count hint, and
+ * whether it pauses for a human). While a run is active it collapses to a
+ * one-line strip so the graph stays near the top; the strip can be expanded.
+ * The dial (the launch config) is rendered inside it as `children`.
  */
 function TemplateGallery({
   templates,
   activeId,
   busy,
   deployedUrls,
+  collapsed,
+  onToggle,
   onLaunch,
   onDeploy,
+  children,
 }: {
   templates: readonly Template[];
   activeId: string | null;
   busy: boolean;
   deployedUrls: Record<string, string>;
+  collapsed: boolean;
+  onToggle: () => void;
   onLaunch: (template: Template) => void | Promise<void>;
   onDeploy: (template: Template) => void | Promise<void>;
+  children?: ReactNode;
 }) {
+  if (collapsed) {
+    return (
+      <section className="app-panel template-gallery is-collapsed" aria-label="Template gallery">
+        <div className="template-strip">
+          <h2>Templates</h2>
+          <span className="muted">{templates.map((t) => t.name).join(" / ")}</span>
+          <button type="button" className="secondary" onClick={onToggle}>
+            Show templates
+          </button>
+        </div>
+      </section>
+    );
+  }
   return (
     <section className="app-panel template-gallery" aria-label="Template gallery">
-      <h2>Templates</h2>
+      <div className="template-strip">
+        <h2>Templates</h2>
+        {activeId ? (
+          <button type="button" className="secondary" onClick={onToggle}>
+            Hide templates
+          </button>
+        ) : null}
+      </div>
       <p className="muted">
-        Pick a scenario to launch a live run. The browser is the launcher: there
-        is no CLI step. For an app template, Deploy it first to see it broken at a
-        stable URL, then launch the fix to update that same URL in place.
+        Launch a live run from here. For an app, Deploy first to see it broken; a
+        verified fix then redeploys to the same URL.
       </p>
+      {children}
       <ul className="template-list">
         {templates.map((template) => {
           const deployedUrl = template.app ? deployedUrls[template.app] : undefined;
@@ -646,11 +635,10 @@ function TemplateGallery({
               <p className="muted template-count">{template.agentCountHint}</p>
               {deployedUrl ? (
                 <p className="deploy-proof template-deployed">
-                  Deployed (current state):{" "}
+                  Deployed:{" "}
                   <a href={deployedUrl} target="_blank" rel="noreferrer">
                     {deployedUrl}
-                  </a>{" "}
-                  <span className="muted">the fix will update this same URL in place</span>
+                  </a>
                 </p>
               ) : null}
               <div className="template-actions">
@@ -660,7 +648,6 @@ function TemplateGallery({
                     className="secondary"
                     onClick={() => void onDeploy(template)}
                     disabled={busy}
-                    title="Deploy this app in its CURRENT (broken) state to its stable live URL, before any fix"
                   >
                     {deployedUrl ? "Redeploy current state" : "Deploy app (see it broken)"}
                   </button>
@@ -677,35 +664,158 @@ function TemplateGallery({
   );
 }
 
-/** The legend explaining node and edge kinds, matching graph-view exactly. */
+/**
+ * The concurrency dial: the real min/max recruitment config, set BEFORE a run
+ * (passed through POST /api/launch) and locked while one is active (there is no
+ * mid-run re-POST). The run panel shows the in-force dial during a run.
+ */
+function DialControl({
+  min,
+  max,
+  locked,
+  onMin,
+  onMax,
+}: {
+  min: number;
+  max: number;
+  locked: boolean;
+  onMin: (value: number) => void;
+  onMax: (value: number) => void;
+}) {
+  return (
+    <div className="dial-panel" aria-label="Concurrency dial">
+      <div className="dial-row">
+        <strong>Concurrency</strong>
+        <label htmlFor="dial-min">min</label>
+        <input
+          id="dial-min"
+          type="range"
+          min={0}
+          max={8}
+          value={min}
+          disabled={locked}
+          onChange={(event) => onMin(Number(event.target.value))}
+        />
+        <span className="dial-value">{min}</span>
+        <label htmlFor="dial-max">max</label>
+        <input
+          id="dial-max"
+          type="range"
+          min={1}
+          max={8}
+          value={max}
+          disabled={locked}
+          onChange={(event) => onMax(Number(event.target.value))}
+        />
+        <span className="dial-value">{max}</span>
+        {locked ? (
+          <span className="dial-locked">locked for this run</span>
+        ) : (
+          <span className="muted">agents running at once, for the next launch</span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The run status panel: only the template name, the run state, the live URL
+ * (when the app was deployed), the in-force dial, and Tear down. On a non-zero
+ * exit it shows the tail of the launcher's redacted run log so the reason is
+ * visible. Exported for tests.
+ */
+export function RunStatus({
+  changeId,
+  template,
+  launchStatus,
+  liveUrl,
+  redeployed,
+  dial,
+  busy,
+  onTearDown,
+}: {
+  changeId: string;
+  template: Template | null;
+  launchStatus: LaunchStatus | null;
+  liveUrl?: string;
+  redeployed: boolean;
+  dial: { min: number; max: number };
+  busy: boolean;
+  onTearDown: () => void;
+}) {
+  const failed =
+    launchStatus !== null && launchStatus.status === "exited" && launchStatus.exitCode !== 0;
+  const state = !launchStatus
+    ? "starting"
+    : launchStatus.status === "running"
+      ? "running"
+      : launchStatus.exitCode === 0
+        ? "finished"
+        : `exited (code ${launchStatus.exitCode ?? "?"})`;
+  return (
+    <div className="run-status">
+      <div className="run-status-row">
+        <strong>{template?.name ?? "Live run"}</strong>
+        <span className={`run-state${failed ? " is-failed" : ""}`}>{state}</span>
+        <code className="muted">{changeId}</code>
+        <span className="dial-locked">
+          dial min {dial.min} / max {dial.max} (locked)
+        </span>
+        <button type="button" className="secondary" onClick={onTearDown} disabled={busy}>
+          Tear down (repos{template?.app ? " + deployed app" : ""})
+        </button>
+      </div>
+      {liveUrl ? (
+        <p className="deploy-proof">
+          {redeployed ? "Live URL (fix redeployed): " : "Live URL (deployed before the fix): "}
+          <a href={liveUrl} target="_blank" rel="noreferrer">
+            {liveUrl}
+          </a>
+        </p>
+      ) : null}
+      {failed && launchStatus ? (
+        <div className="run-failure" role="alert">
+          <p className="error">The run exited with code {launchStatus.exitCode ?? "?"}. Last log lines:</p>
+          <pre className="detail-pre">
+            {runFailureLines(launchStatus.log).join("\n") || "(no output captured)"}
+          </pre>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * The legend. Node SHAPE encodes the kind (drawn neutral here), and node COLOR
+ * encodes status, so the legend has a separate status key that matches the fills
+ * graph-view actually draws. retry and jev keep a fixed hue of their own.
+ */
 function Legend() {
   return (
-    <ul className="legend" aria-label="Legend">
-      {/* The node kinds, matching the shapes graph-view draws. Node COLOR still
-          conveys status in the graph (a failed agent circle red, a verify
-          hexagon green/red), but the legend lists only the kinds, never a status
-          swatch. */}
-      {/* The goal is a DIAMOND. */}
-      <li><span className="swatch-diamond sw-goal" aria-hidden="true" /> goal</li>
-      {/* The planner is a TRIANGLE (the schema-constrained decomposer). */}
-      <li><span className="swatch-triangle sw-planner" aria-hidden="true" /> planner</li>
-      {/* An agent is a CIRCLE. */}
-      <li><span className="swatch sw-agent" /> agent</li>
-      {/* A verify node is a HEXAGON (a mechanical gate run). */}
-      <li><span className="swatch-hex sw-verify" aria-hidden="true" /> verify</li>
-      {/* A retry node is the SAME hexagon shape in a different color (the
-          smarter-model re-attempt). */}
-      <li><span className="swatch-hex sw-retry" aria-hidden="true" /> retry</li>
-      {/* A jev node is a PENTAGON (a typed-decision beat at a juncture). */}
-      <li><span className="swatch-pentagon sw-jev" aria-hidden="true" /> jev</li>
-      {/* A tool is a YELLOW SQUARE. */}
-      <li><span className="swatch-square sw-tool" aria-hidden="true" /> tool</li>
-      {/* The rendered edge vocabulary and what each kind means. */}
-      <li><span className="line ln-dependency" /> dependency</li>
-      <li><span className="line ln-spawn" /> event-driven spawn (an Artifact push recruited this)</li>
-      <li><span className="line ln-trigger" /> trigger (ladder re-plan / retry control-flow)</li>
-      <li><span className="line ln-tool" /> consumed tool</li>
-    </ul>
+    <div className="legend-wrap">
+      <ul className="legend" aria-label="Legend">
+        <li><span className="swatch-diamond sw-neutral" aria-hidden="true" /> goal</li>
+        <li><span className="swatch-triangle sw-neutral" aria-hidden="true" /> planner</li>
+        <li><span className="swatch sw-neutral" aria-hidden="true" /> agent</li>
+        <li><span className="swatch-hex sw-neutral" aria-hidden="true" /> verify / retry</li>
+        <li><span className="swatch-pentagon sw-neutral" aria-hidden="true" /> jev decision</li>
+        <li><span className="swatch-square sw-neutral" aria-hidden="true" /> tool</li>
+        <li><span className="line ln-dependency" /> dependency</li>
+        <li><span className="line ln-spawn" /> spawn (Artifact push recruited it)</li>
+        <li><span className="line ln-trigger" /> trigger (re-plan / retry)</li>
+        <li><span className="line ln-tool" /> consumed tool</li>
+      </ul>
+      <ul className="legend legend-status" aria-label="Status colors">
+        <li><span className="swatch sw-verified" aria-hidden="true" /> verified / passed</li>
+        <li><span className="swatch sw-failed" aria-hidden="true" /> failed</li>
+        <li><span className="swatch sw-running" aria-hidden="true" /> running</li>
+        <li><span className="swatch sw-pending" aria-hidden="true" /> pending</li>
+        <li><span className="swatch sw-warning" aria-hidden="true" /> warning (heuristic fallback)</li>
+        <li><span className="swatch sw-escalated" aria-hidden="true" /> awaiting you</li>
+        <li><span className="swatch sw-retry" aria-hidden="true" /> retry</li>
+        <li><span className="swatch sw-jev" aria-hidden="true" /> jev</li>
+      </ul>
+    </div>
   );
 }
 
@@ -858,6 +968,27 @@ export function NodeDetail({
 
       {detail ? <ModelDetail detail={detail} /> : null}
 
+      {backing.kind === "change" && backing.planningFailure !== undefined ? (
+        <p className="detail-warning" role="note">
+          <strong>Planning failed:</strong> {backing.planningFailure}. The run never got a
+          plan, so the change cannot pass.
+        </p>
+      ) : null}
+
+      {backing.kind === "change" && backing.integrationVerdict !== undefined ? (
+        <p className="detail-note muted">
+          Authoritative integration verdict: <strong>{backing.integrationVerdict}</strong>{" "}
+          (the final integration gate on the integrated tree decides the goal; ladder
+          rounds are advisory).
+        </p>
+      ) : null}
+
+      {node.warning ? (
+        <p className="detail-warning" role="note">
+          <strong>Warning:</strong> {node.warning}
+        </p>
+      ) : null}
+
       {node.kind === "planner" && node.plannerDetail ? (
         <PlannerDetail detail={node.plannerDetail} />
       ) : null}
@@ -905,12 +1036,11 @@ export function NodeDetail({
             ) : null}
           </dl>
         </>
-      ) : (
+      ) : unitId ? (
         <p className="muted">
-          No agent has been recruited for this unit yet, so it has no Artifact repo.
-          It becomes an agent node (with a real repo) once the engine recruits it.
+          No agent recruited yet, so this unit has no Artifact repo.
         </p>
-      )}
+      ) : null}
 
       <details className="raw-backing">
         <summary>Raw backing state</summary>
@@ -929,10 +1059,9 @@ export function NodeDetail({
  * is done, not a live token stream.
  */
 function ModelDetail({ detail }: { detail: UnitDetailSnapshot }) {
+  const cost = formatCost(detail);
   const hasTokens =
-    detail.inputTokens !== undefined ||
-    detail.outputTokens !== undefined ||
-    detail.usd !== undefined;
+    detail.inputTokens !== undefined || detail.outputTokens !== undefined || cost !== null;
   return (
     <div className="model-detail">
       <h3>Model transcript</h3>
@@ -955,10 +1084,10 @@ function ModelDetail({ detail }: { detail: UnitDetailSnapshot }) {
               <dd>{detail.outputTokens}</dd>
             </div>
           ) : null}
-          {detail.usd !== undefined ? (
+          {cost !== null ? (
             <div>
               <dt>Cost (USD)</dt>
-              <dd>{detail.usd}</dd>
+              <dd>{cost}</dd>
             </div>
           ) : null}
         </dl>
@@ -1186,7 +1315,7 @@ function JevDetail({ detail }: { detail: JevDetailSnapshot }) {
 /**
  * A readable label for a re-fan source (how the implicated units were chosen):
  * the string-parse of the failing gate output, a confident Jev attribution
- * choice, a configured re-plan, or the honest re-fan-all fallback.
+ * choice, the LLM planner's re-plan, or the honest re-fan-all fallback.
  */
 function refanSourceLabel(source: "parse" | "jev" | "re-plan" | "all"): string {
   switch (source) {
@@ -1203,7 +1332,7 @@ function refanSourceLabel(source: "parse" | "jev" | "re-plan" | "all"): string {
 
 /** A short explainer of what the re-fan source values mean. */
 const refanSourceExplainer =
-  "a parse of the failing gate output, a confident Jev attribution choice, a configured re-plan, or the honest re-fan-all fallback when the failure could not be attributed";
+  "a parse of the failing gate output, a confident Jev attribution, the LLM planner re-planning (it re-plans on every failing round), or re-fan-all when the failure could not be attributed";
 
 function LadderDetail({
   backing,
@@ -1222,7 +1351,7 @@ function LadderDetail({
           <div>
             <dt>Verdict</dt>
             <dd className={backing.outcome === "pass" ? "verdict-pass" : "verdict-fail"}>
-              {backing.outcome === "pass" ? "pass" : "fail"}
+              {backing.outcome === "pass" ? "pass (advisory)" : "fail (advisory)"}
             </dd>
           </div>
           {backing.gateCommand ? (
@@ -1235,8 +1364,9 @@ function LadderDetail({
           ) : null}
         </dl>
         <p className="muted">
-          The per-app gate ran ONCE against the whole integrated change for this
-          round. The verdict is real evidence, not the model grading itself.
+          This round&apos;s gate ran on an overlay of the round&apos;s unit results
+          and is advisory: it decides whether to retry. The final integration
+          gate on the integrated tree decides the goal.
         </p>
         {backing.outcome === "fail" && backing.failingOutput ? (
           <>
@@ -1303,9 +1433,7 @@ function LadderDetail({
         </ul>
       )}
       <p className="muted">
-        A change-level verify-fail re-fanned the implicated units on a stronger
-        model, fed the failing evidence. This is a distinct beat from a human
-        escalation.
+        Re-ran the implicated units on a stronger model with the failing evidence.
       </p>
     </div>
   );

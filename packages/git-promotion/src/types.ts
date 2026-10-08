@@ -54,6 +54,14 @@ export interface PromotionInput {
    * normal no-op.
    */
   readonly expectedFixes?: boolean;
+  /**
+   * The authoritative integration verdict the mechanical gate produced for the
+   * integrated tree. When supplied, promotion REFUSES anything other than
+   * "verified": a tree whose gate failed (or could not run) never gets a
+   * delivery branch. Omitted means the caller did not gate (an older or offline
+   * caller), which keeps the previous behavior.
+   */
+  readonly verdict?: "verified" | "failed";
 }
 
 /** Where and how to promote the result into the local source repository. */
@@ -96,6 +104,12 @@ export interface PromotionResult {
   readonly removedPaths: readonly string[];
   /** True when the promotion created a commit; false when there was nothing to do. */
   readonly committed: boolean;
+  /**
+   * Why the run did not promote at all (for example the integration verdict was
+   * not "verified"), when it refused. Absent on a normal promotion or no-op.
+   * A refused promotion has no branch commit and `committed` is false.
+   */
+  readonly refusedReason?: string;
 }
 
 /** Promote a verified and integrated Change result to a delivery target. */

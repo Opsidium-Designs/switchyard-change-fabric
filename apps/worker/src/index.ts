@@ -1,7 +1,9 @@
 import { parseChangeSpec } from "@switchyard-change/change-core";
 import type { DiscoveredWorkUnit } from "@switchyard-change/change-core";
 
-import type { EscalationKind, JevDecisionView, JevJuncture, LeaseWorkspace, PlanningChangeHeader, RefanSource, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
+import { configuredApiToken, hasValidBearer, requiresAuth } from "./auth.ts";
+import type { EscalationKind, IntegrationVerdict, JevDecisionView, JevJuncture, LeaseWorkspace, PlanningChangeHeader, RefanSource, SupersededLease, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
+import { STATUS_CONFLICT_PREFIX } from "./change-state.ts";
 import type { ChangeState } from "./change-state.ts";
 import type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 import { selectProvisioner } from "./workspace-provisioner.ts";
@@ -13,15 +15,23 @@ export { ChangeWorkflow } from "./workflow.ts";
 
 export type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 
-function json(body: unknown, status = 200): Response {
+// CORS: the console is served from a separate origin in local dev, so the
+// Worker answers any origin. That is safe with the optional bearer auth because
+// the credential is an explicit `authorization` header (never a cookie), so a
+// foreign origin cannot ride a browser's ambient credentials; it would have to
+// already hold the token. `authorization` is listed so a preflighted request
+// carrying the bearer header is allowed.
+const CORS_ALLOW_HEADERS = "content-type, authorization";
+
+function json(body: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body, null, 2), {
     status,
     headers: {
       "content-type": "application/json",
-      // The console is served from a separate origin in local dev.
       "access-control-allow-origin": "*",
       "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
-      "access-control-allow-headers": "content-type",
+      "access-control-allow-headers": CORS_ALLOW_HEADERS,
+      ...extraHeaders,
     },
   });
 }
@@ -36,7 +46,7 @@ function corsPreflight(): Response {
     headers: {
       "access-control-allow-origin": "*",
       "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
-      "access-control-allow-headers": "content-type",
+      "access-control-allow-headers": CORS_ALLOW_HEADERS,
       "access-control-max-age": "86400",
     },
   });
@@ -76,7 +86,18 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
   const url = new URL(request.url);
 
   if (request.method === "OPTIONS") {
+    // A preflight never carries the authorization header (browsers strip it), so
+    // it is answered before the auth check; the real request is then gated.
     return corsPreflight();
+  }
+
+  // Optional bearer auth (see auth.ts): when SWITCHYARD_API_TOKEN is set, every
+  // mutating request must present it. Read-only GETs stay open.
+  const apiToken = configuredApiToken(env);
+  if (apiToken !== undefined && requiresAuth(request.method) && !hasValidBearer(request, apiToken)) {
+    return json({ error: "unauthorized: this route requires a bearer token" }, 401, {
+      "www-authenticate": 'Bearer realm="switchyard-change-fabric"',
+    });
   }
 
   // Health / readiness probe.
@@ -102,8 +123,11 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
     const stub = changeStateStub(env, probeId);
     try {
-      const state = await stub.createFromSpec(specYaml);
-      return json(state, 201);
+      const { state, superseded } = await stub.createFromSpec(specYaml);
+      // Re-creating an existing id is a fresh run: revoke every lease the prior
+      // run still held (the DO captured them atomically with the wipe).
+      const revokeFailures = await revokeSuperseded(env, superseded);
+      return json(withSuperseded(state, superseded, revokeFailures), 201);
     } catch (error) {
       return json({ error: errorMessage(error) }, 400);
     }
@@ -129,14 +153,19 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
     const stub = changeStateStub(env, body.id);
     try {
-      const state = await stub.createPlanning({
+      // A planning create on an id a prior run used (the stable watch-mode id,
+      // or an explicit --id re-run) starts a fresh run: the DO wipes every
+      // per-run key and hands back the leases the prior run still held, which
+      // are revoked here so none is dropped without revocation.
+      const { state, superseded } = await stub.createPlanning({
         id: body.id,
         objective: body.objective,
         baseline: body.baseline,
         budgetUsd: numberOr(body.budgetUsd, 0),
         assurance: (body.assurance ?? "standard") as PlanningChangeHeader["assurance"],
       });
-      return json(state, 201);
+      const revokeFailures = await revokeSuperseded(env, superseded);
+      return json(withSuperseded(state, superseded, revokeFailures), 201);
     } catch (error) {
       return json({ error: errorMessage(error) }, 400);
     }
@@ -158,11 +187,24 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     if (!(await stub.isInitialized())) {
       return json({ error: `no such Change: ${changeId}` }, 404);
     }
+    // A plan can only be attached to a Change that is still "planning". Attaching
+    // to a running (or prior-run) Change would wipe a live run's leases and
+    // history, so it is a 409; a caller that means to start over re-creates the
+    // Change instead (the run-live driver falls back to POST /changes on any
+    // attach failure, which supersedes the prior run and revokes its leases).
+    const status = await stub.getStatus();
+    if (status !== "planning") {
+      return json(
+        { error: `a plan can only be attached while the Change is planning (it is ${status})` },
+        409,
+      );
+    }
     try {
       const state = await stub.attachPlan(specYaml);
       return json(state, 200);
     } catch (error) {
-      return json({ error: errorMessage(error) }, 400);
+      const message = errorMessage(error);
+      return json({ error: message }, message.includes(STATUS_CONFLICT_PREFIX) ? 409 : 400);
     }
   }
 
@@ -440,6 +482,76 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
     const deployment = await stub.recordDeployment({ url: body.url, app: body.app });
     return json({ deployment }, 201);
+  }
+
+  // Mark a "planning" placeholder as FAILED before its plan was attached (the
+  // planner threw, or the run could not proceed). Without this the placeholder
+  // would sit in "planning" forever on the console. Only a planning Change can
+  // move to planning-failed (409 otherwise); the reason is recorded and backs
+  // the goal node's terminal red.
+  const planningFailedMatch = url.pathname.match(/^\/changes\/([^/]+)\/planning-failed$/);
+  if (request.method === "POST" && planningFailedMatch) {
+    const changeId = decodeURIComponent(planningFailedMatch[1] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: PlanningFailedBody = {};
+    const raw = await request.text();
+    if (raw.trim() !== "") {
+      try {
+        body = JSON.parse(raw) as PlanningFailedBody;
+      } catch {
+        return json({ error: "invalid planning-failed body" }, 400);
+      }
+    }
+    const reason = typeof body?.reason === "string" && body.reason.trim() !== "" ? body.reason : "planning failed";
+    try {
+      const state = await stub.failPlanning(reason);
+      return json(state, 200);
+    } catch (error) {
+      const message = errorMessage(error);
+      return json({ error: message }, message.includes(STATUS_CONFLICT_PREFIX) ? 409 : 400);
+    }
+  }
+
+  // Record the AUTHORITATIVE whole-change integration verdict: the outcome of
+  // the final integration gate on the exact integrated/promoted tree. The run
+  // posts this once, after that gate ran. It is the sole source of truth for the
+  // goal node's verified/failed state (the ladder verify attempts are an
+  // advisory overlay), so the console greens the goal only on a real verdict.
+  const integrationMatch = url.pathname.match(/^\/changes\/([^/]+)\/integration$/);
+  if (request.method === "POST" && integrationMatch) {
+    const changeId = decodeURIComponent(integrationMatch[1] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: IntegrationBody;
+    try {
+      body = (await request.json()) as IntegrationBody;
+    } catch {
+      return json({ error: "invalid integration body" }, 400);
+    }
+    if (body === null || typeof body !== "object") {
+      return json({ error: "invalid integration body" }, 400);
+    }
+    if (body.verdict !== "verified" && body.verdict !== "failed") {
+      return json({ error: 'integration verdict must be "verified" or "failed"' }, 400);
+    }
+    if (!isStringArray(body.integratedUnits) || !isStringArray(body.excludedUnits)) {
+      return json({ error: "integratedUnits and excludedUnits must be string arrays" }, 400);
+    }
+    try {
+      const integration = await stub.recordIntegration({
+        verdict: body.verdict,
+        integratedUnits: body.integratedUnits,
+        excludedUnits: body.excludedUnits,
+      });
+      return json({ integration }, 201);
+    } catch (error) {
+      return json({ error: errorMessage(error) }, 400);
+    }
   }
 
   // Record one mechanical CHANGE-LEVEL VERIFY attempt: a single run of the
@@ -1066,6 +1178,9 @@ async function handleRepoPushed(
     return { completedUnit: null, recruited: [], done: false };
   }
   const outcome = await stub.recordRepoPushed(workspace);
+  // The pushed unit's token is deliberately NOT revoked here: verify-and-integrate
+  // clones the unit's repo with it after the waves finish, so revoking on push
+  // makes integration fail with an expired token. The run's cleanup revokes it.
   const recruited = await provisionAndRecordWave(env, changeId, outcome.recruited);
   await stub.recordRecruitment({
     trigger: "repo-pushed",
@@ -1080,6 +1195,50 @@ async function handleRepoPushed(
     recruited,
     done: outcome.done && recruited.length === 0,
   };
+}
+
+/**
+ * Revoke every lease a re-create superseded. Best-effort per lease (a token in
+ * a repo a prior cleanup already deleted cannot be revoked and has nothing left
+ * to protect), but every lease gets a revocation attempt, and the ones that
+ * failed are reported back to the caller rather than silently dropped.
+ */
+async function revokeSuperseded(
+  env: EnvWithProvisioner,
+  superseded: readonly SupersededLease[],
+): Promise<SupersededLease[]> {
+  if (superseded.length === 0) {
+    return [];
+  }
+  const provisioner = selectProvisioner(env);
+  const failures: SupersededLease[] = [];
+  for (const lease of superseded) {
+    try {
+      await provisioner.revoke(lease.workspaceName, lease.tokenId);
+    } catch {
+      failures.push(lease);
+    }
+  }
+  return failures;
+}
+
+/**
+ * Attach the superseded-lease report to a create response, only when a prior
+ * run's leases were actually superseded, so a plain create's body is unchanged.
+ */
+function withSuperseded<T extends object>(
+  state: T,
+  superseded: readonly SupersededLease[],
+  revokeFailures: readonly SupersededLease[],
+): T | (T & { supersededLeases: readonly SupersededLease[]; revokeFailures: readonly SupersededLease[] }) {
+  if (superseded.length === 0) {
+    return state;
+  }
+  return { ...state, supersededLeases: superseded, revokeFailures };
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((v) => typeof v === "string");
 }
 
 /**
@@ -1127,6 +1286,18 @@ interface PlanningBody {
   readonly baseline?: string;
   readonly budgetUsd?: number;
   readonly assurance?: string;
+}
+
+/** Body of POST /changes/:id/planning-failed: why the planning placeholder failed. */
+interface PlanningFailedBody {
+  readonly reason?: unknown;
+}
+
+/** Body of POST /changes/:id/integration: the authoritative final integration verdict. */
+interface IntegrationBody {
+  readonly verdict?: IntegrationVerdict;
+  readonly integratedUnits?: unknown;
+  readonly excludedUnits?: unknown;
 }
 
 /** Body of POST /changes/:id/verify-attempt: one change-level mechanical gate run. */

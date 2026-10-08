@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   detectPathCollisions,
+  leaseOwnerOverridesFromEscalations,
   parseChangeSpec,
   planWriteLeases,
   unitLeaseViews,
@@ -148,5 +149,103 @@ work:
 `);
     const plan = planWriteLeases(change, detectPathCollisions(change));
     expect([...unitLeaseViews(plan).keys()]).toEqual([]);
+  });
+});
+
+describe("planWriteLeases with a human owner decision", () => {
+  it("makes a valid human decision authoritative: the chosen unit owns, the default yields", () => {
+    const change = auditChange();
+    const plan = planWriteLeases(change, detectPathCollisions(change), {
+      ownerOverrides: { "src/audit/events.ts": "tests" },
+    });
+    const decision = plan.decisions[0];
+    expect(decision?.resolution).toBe("serialized");
+    expect(decision?.owner).toBe("tests");
+    expect(decision?.waiters).toEqual(["api"]);
+    expect(decision?.ownerSource).toBe("human-decision");
+    expect(decision?.requestedOwner).toBe("tests");
+    expect(plan.ordering).toEqual([{ waiter: "api", owner: "tests" }]);
+    const views = unitLeaseViews(plan);
+    expect(views.get("tests")).toEqual({ owns: ["src/audit/events.ts"], yields: [] });
+    expect(views.get("api")).toEqual({ owns: [], yields: ["src/audit/events.ts"] });
+  });
+
+  it("rejects a decision that names no contender, keeps the deterministic owner, and says why", () => {
+    const change = auditChange();
+    const plan = planWriteLeases(change, detectPathCollisions(change), {
+      ownerOverrides: { "src/audit/events.ts": "model" },
+    });
+    const decision = plan.decisions[0];
+    expect(decision?.owner).toBe("api");
+    expect(decision?.waiters).toEqual(["tests"]);
+    expect(decision?.ownerSource).toBe("declared-order");
+    expect(decision?.requestedOwner).toBe("model");
+    expect(decision?.reason).toContain('human owner decision "model" is not a contender');
+  });
+
+  it("rejects a decision that would create a dependency cycle and keeps the deterministic owner", () => {
+    const change = parseChangeSpec(`
+id: cyclic-override
+objective: override would cycle
+work:
+  - id: first
+    objective: first
+    paths: [src/shared.ts]
+  - id: second
+    objective: second
+    depends_on: [first]
+    paths: [src/shared.ts]
+`);
+    const plan = planWriteLeases(change, detectPathCollisions(change), {
+      ownerOverrides: { "src/shared.ts": "second" },
+    });
+    const decision = plan.decisions[0];
+    expect(decision?.resolution).toBe("serialized");
+    expect(decision?.owner).toBe("first");
+    expect(decision?.ownerSource).toBe("declared-order");
+    expect(decision?.reason).toContain("would create a dependency cycle");
+    expect(plan.needsAttention).toBe(false);
+  });
+
+  it("a human decision can serialize a collision the declared order would have flagged", () => {
+    const change = parseChangeSpec(`
+id: cyclic-lease
+objective: serialization would cycle
+work:
+  - id: first
+    objective: first
+    depends_on: [second]
+    paths: [src/shared.ts]
+  - id: second
+    objective: second
+    paths: [src/shared.ts]
+`);
+    const plan = planWriteLeases(change, detectPathCollisions(change), {
+      ownerOverrides: { "src/shared.ts": "second" },
+    });
+    expect(plan.needsAttention).toBe(false);
+    expect(plan.decisions[0]?.owner).toBe("second");
+    expect(plan.decisions[0]?.ownerSource).toBe("human-decision");
+  });
+
+  it("without overrides the decision carries no ownerSource (unchanged default behavior)", () => {
+    const change = auditChange();
+    const plan = planWriteLeases(change, detectPathCollisions(change));
+    expect(plan.decisions[0]?.ownerSource).toBeUndefined();
+    expect(plan.decisions[0]?.requestedOwner).toBeUndefined();
+  });
+});
+
+describe("leaseOwnerOverridesFromEscalations", () => {
+  it("takes only resolved lease-owner escalations with a path and a decision; later wins", () => {
+    const overrides = leaseOwnerOverridesFromEscalations([
+      { kind: "lease-owner", path: "a.ts", status: "pending" },
+      { kind: "lease-owner", path: "b.ts", status: "resolved", decision: " tests " },
+      { kind: "decision", path: "c.ts", status: "resolved", decision: "x" },
+      { kind: "lease-owner", status: "resolved", decision: "y" },
+      { kind: "lease-owner", path: "d.ts", status: "resolved", decision: "   " },
+      { kind: "lease-owner", path: "b.ts", status: "resolved", decision: "api" },
+    ]);
+    expect(overrides).toEqual({ "b.ts": "api" });
   });
 });

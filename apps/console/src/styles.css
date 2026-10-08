@@ -245,6 +245,18 @@ body {
   font-size: 0.9rem;
 }
 
+/* A node that completed in a degraded way (a heuristic-fallback plan) carries a
+   warning: the graph draws it AMBER and the detail panel names why, so it never
+   reads as plain success. */
+.detail-warning {
+  margin: 0.75rem 0;
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid #d29922;
+  background: rgba(210, 153, 34, 0.12);
+  color: #e3b341;
+  font-size: 0.9rem;
+}
+
 .graph-panel {
   overflow-x: auto;
 }
@@ -420,27 +432,24 @@ body {
   border: 1px solid #0d1117;
 }
 
-.sw-goal { background: #1f6feb; }
-.sw-planner { background: #2bb3a3; }
-.sw-work { background: #21262d; border-color: var(--border); }
-.sw-agent { background: #30497a; }
+/* Shape swatches are NEUTRAL: shape encodes the node kind, while color encodes
+   status (the status key below), so the legend never contradicts the graph. */
+.sw-neutral { background: #8b949e; }
+/* The status key, mirroring graph-view nodeFill. */
 .sw-verified { background: #238636; }
-.sw-failed { background: #8b2c22; border-color: #f85149; }
-.sw-tool { background: #9e6a03; }
+.sw-failed { background: #da3633; }
+.sw-running { background: #388bfd; }
+.sw-pending { background: #30497a; }
+/* A heuristic-fallback plan (WARNING_FILL in graph-view). */
+.sw-warning { background: #d29922; }
 .sw-escalated { background: #f85149; }
-/* The ladder's own node kinds, mirroring graph-view nodeFill: a verify node is
-   drawn green on a pass and red on a fail in the graph, so its single legend
-   swatch uses the healthy green (the kind, not the status), and a retry is the
-   magenta smarter-model beat (the same hue as the model-escalation edge that
-   reaches it). The legend lists only the kind; node COLOR conveys status in the
-   graph itself. */
-.sw-verify { background: #238636; }
+/* retry and jev nodes keep a fixed hue of their own. */
 .sw-retry { background: #a371f7; }
-/* The jev node is a typed-decision beat, drawn as an AMBER pentagon in the
-   graph, so its legend glyph is an amber pentagon too. The graph colors it
-   brighter when the decision was accepted and muted when it escalated; the
-   legend lists only the kind, so it uses the accepted amber. */
 .sw-jev { background: #e3883e; }
+
+.legend-wrap .legend-status {
+  margin-top: 0.5rem;
+}
 
 /* The tool legend glyph is a YELLOW SQUARE, matching the yellow square tool
    node drawn in the graph, so the legend and the graph agree the agent-built
@@ -452,9 +461,6 @@ body {
   border: 1px solid #0d1117;
 }
 
-.swatch-square.sw-tool {
-  background: #e3b341;
-}
 
 /* The planner legend glyph is an upward EQUILATERAL triangle, drawn with the
    SAME geometry as the planner node polygon in the graph (apex up, flat base),
@@ -468,11 +474,6 @@ body {
   height: 0.78rem;
   display: inline-block;
   clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
-  background: #2bb3a3;
-}
-
-.swatch-triangle.sw-planner {
-  background: #2bb3a3;
 }
 
 /* The jev legend glyph is a PENTAGON (via clip-path), matching the amber
@@ -485,9 +486,6 @@ body {
   clip-path: polygon(50% 0%, 100% 38%, 82% 100%, 18% 100%, 0% 38%);
 }
 
-.swatch-pentagon.sw-jev {
-  background: #e3883e;
-}
 
 /* The goal legend glyph is a DIAMOND (a CSS-rotated square), matching the
    diamond goal node drawn in the graph. It keeps the same footprint as the
@@ -500,9 +498,6 @@ body {
   border: 1px solid #0d1117;
 }
 
-.swatch-diamond.sw-goal {
-  background: #1f6feb;
-}
 
 /* The verify/retry legend glyphs are HEXAGONS, matching the hexagon verify and
    retry nodes drawn in the graph (verify and retry share the hexagon shape and
@@ -889,24 +884,20 @@ body {
   margin: 0;
 }
 
-/* "What this does" / "What this run solves" detail lists on cards and the run
-   header, so the human-readable description is visible before and during a run. */
-.template-detail,
-.run-header-detail {
+/* "What this does" / "What this run solves" detail lists, shown once on the card. */
+.template-detail {
   margin: 0.4rem 0 0;
   font-size: 0.82rem;
   line-height: 1.4;
 }
 
-.template-detail dt,
-.run-header-detail dt {
+.template-detail dt {
   font-weight: 600;
   color: var(--accent);
   margin-top: 0.4rem;
 }
 
-.template-detail dd,
-.run-header-detail dd {
+.template-detail dd {
   margin: 0.1rem 0 0;
   color: var(--text);
 }
@@ -968,10 +959,61 @@ body {
 
 .run-status {
   display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.run-status-row {
+  display: flex;
   flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
   gap: 0.75rem;
+}
+
+.run-status-row button {
+  margin-left: auto;
+}
+
+.run-state {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+}
+
+.run-state.is-failed {
+  color: #ff7b72;
+}
+
+.run-failure .detail-pre {
+  margin: 0.25rem 0 0;
+}
+
+/* The gallery header row; while a run is active the whole gallery collapses to
+   just this one-line strip so the graph sits near the top. */
+.template-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.template-strip h2 {
+  margin: 0;
+}
+
+.template-strip button {
+  margin-left: auto;
+  padding: 0.35rem 0.8rem;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.template-gallery .dial-panel {
+  margin-top: 0.5rem;
 }
 
 .run-status .muted {

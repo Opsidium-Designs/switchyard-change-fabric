@@ -38,6 +38,8 @@ import {
   type GitIdentity,
 } from "@switchyard-change/local-runner";
 
+import { withWorkerAuth } from "./worker-auth.ts";
+
 /** How the next wave was triggered on the live run, for honest reporting. */
 export type LiveTrigger = "subscription" | "ingress";
 
@@ -119,7 +121,7 @@ export async function runRecruitmentLive(
 ): Promise<RunRecruitmentLiveResult> {
   const executor = options.executor ?? new ScopedNoopExecutor();
   const identity = options.identity ?? RUNNER_IDENTITY;
-  const fetchFn = options.fetchFn ?? fetch;
+  const fetchFn = withWorkerAuth(options.fetchFn ?? fetch);
   const base = options.workerUrl.replace(/\/$/, "");
   const trigger: LiveTrigger = options.waveTrigger ?? "ingress";
   const changeId = options.change.id;

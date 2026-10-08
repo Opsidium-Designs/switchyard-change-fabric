@@ -21,9 +21,11 @@
  *       deterministic verifier, not the executor.
  */
 
+import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -405,6 +407,95 @@ describe("M5: the full end-to-end run with the human escalation beat", () => {
     });
     expect(second.id).toBe(first.id);
     expect(control.escalations("change-m5").length).toBe(1);
+  });
+});
+
+/** Read one file from a commit of the promoted source repo (the shipped tree). */
+async function showPromoted(repoDir: string, commit: string, path: string): Promise<string> {
+  const { stdout } = await promisify(execFile)("git", ["show", `${commit}:${path}`], {
+    cwd: repoDir,
+  });
+  return stdout;
+}
+
+describe("the resolved lease-owner escalation is authoritative for the contested path", () => {
+  async function runWithDecision(label: string, decision: string) {
+    const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, `${label}-a`) });
+    const control = new LocalChangeControl(workspaces);
+    const { fetchFn } = fakeWorker(control, workspaces);
+    const projectDir = join(workRoot, `${label}-project`);
+    await mkdir(join(projectDir, "src"), { recursive: true });
+    await writeFile(join(projectDir, "src", "index.ts"), "export const seeded = true;\n", "utf8");
+    const result = await runFullLive({
+      change: parseChangeSpec(SPEC),
+      dial: { minConcurrency: 1, maxConcurrency: 3 },
+      workerUrl: "http://w",
+      specYaml: SPEC,
+      projectDir,
+      workRoot: join(workRoot, `${label}-run`),
+      fetchFn,
+      resolveEscalation: async () => decision,
+    });
+    return { result, control };
+  }
+
+  it("resolving with the NON-default unit lands that unit's version and the default owner yields", async () => {
+    // The declared-order default owner of src/audit/events.ts is `api`; the human
+    // picks `tests`, so `tests`' write must be the one that ships.
+    const { result, control } = await runWithDecision("human-tests", "tests");
+    expect(result.escalation.resolved?.decision).toBe("tests");
+
+    const decision = result.evidence.coordination?.decisions.find(
+      (d) => d.path === "src/audit/events.ts",
+    );
+    expect(decision?.owner).toBe("tests");
+    expect(decision?.waiters).toEqual(["api"]);
+    expect(decision?.ownerSource).toBe("human-decision");
+
+    // The authoritative gate-and-promote path shipped tests' version.
+    expect(result.evidence.integration.verdict).toBe("verified");
+    expect(result.promotion.committed).toBe(true);
+    const shipped = await showPromoted(
+      result.sourceRepoDir,
+      String(result.promotion.commit),
+      "src/audit/events.ts",
+    );
+    expect(shipped).toContain("work-unit: tests");
+    expect(shipped).not.toContain("work-unit: api");
+
+    // The lease view the graph draws reflects the human-chosen owner.
+    const edge = control
+      .state("change-m5")
+      .leaseEdges.find((e) => e.path === "src/audit/events.ts");
+    expect(edge?.owner).toBe("tests");
+    expect(edge?.waiters).toEqual(["api"]);
+  });
+
+  it("an invalid decision falls back honestly to the deterministic owner and records why", async () => {
+    const { result, control } = await runWithDecision("human-bogus", "nobody");
+    expect(result.escalation.resolved?.decision).toBe("nobody");
+
+    const decision = result.evidence.coordination?.decisions.find(
+      (d) => d.path === "src/audit/events.ts",
+    );
+    expect(decision?.owner).toBe("api");
+    expect(decision?.waiters).toEqual(["tests"]);
+    expect(decision?.ownerSource).toBe("declared-order");
+    expect(decision?.requestedOwner).toBe("nobody");
+    expect(decision?.reason).toContain('human owner decision "nobody" is not a contender');
+
+    const shipped = await showPromoted(
+      result.sourceRepoDir,
+      String(result.promotion.commit),
+      "src/audit/events.ts",
+    );
+    expect(shipped).toContain("work-unit: api");
+    expect(shipped).not.toContain("work-unit: tests");
+
+    const edge = control
+      .state("change-m5")
+      .leaseEdges.find((e) => e.path === "src/audit/events.ts");
+    expect(edge?.owner).toBe("api");
   });
 });
 

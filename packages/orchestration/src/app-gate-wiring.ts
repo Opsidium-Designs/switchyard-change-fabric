@@ -93,6 +93,14 @@ export interface AppGateWiringInput {
 export interface AppGateWiring {
   /** True when the gate applies to this run (a real app with the gate enabled). */
   readonly enabled: boolean;
+  /**
+   * True when the project DECLARES a gate, whether or not it is enabled for this
+   * run. Passed to run-live as `requireAppGate`: a project with a gate that the
+   * operator disabled (--no-gate) still requires it, so its integration verdict
+   * is cannot-pass ("failed"), never a silent auto-pass. Absent for a project
+   * with no gate, so --no-gate keeps working there unchanged.
+   */
+  readonly requireAppGate?: boolean;
   /** The per-unit gate command resolver (the same per-app command every unit). */
   readonly appGateCommandFor?: (unitId: string) => readonly string[] | undefined;
   /** The injectable command runner the gate and final verify run through. */
@@ -113,7 +121,8 @@ export interface AppGateWiring {
 /**
  * Decide the gate wiring for a run. The gate is enabled when the project has a
  * `gate` script and the toggle does not force it off, OR when the toggle forces
- * it on. When enabled, every unit of the app shares the one per-app gate command
+ * it on. Forcing it off on a project that HAS a gate does not skip the gate: the
+ * result carries `requireAppGate`, so the run's verdict is cannot-pass. When enabled, every unit of the app shares the one per-app gate command
  * (the gate verifies the whole app, not one unit), the real command runner is
  * used unless a fake is injected, and the escalation/base model ids are passed
  * only when the executor is a live inference path (the deterministic noop has no
@@ -122,8 +131,11 @@ export interface AppGateWiring {
  */
 export function buildAppGateWiring(input: AppGateWiringInput): AppGateWiring {
   const enabled = input.gateFlag ?? input.projectHasGate;
+  // A declared gate is required regardless of the toggle: disabling it can only
+  // make the run unable to pass, never turn the gate into an auto-pass.
+  const requireAppGate = input.projectHasGate ? { requireAppGate: true } : {};
   if (!enabled) {
-    return { enabled: false };
+    return { enabled: false, ...requireAppGate };
   }
   const runner = input.commandRunner ?? new ChildProcessCommandRunner();
   // The gate is per-app (the whole app), so the same gate command applies to
@@ -145,6 +157,7 @@ export function buildAppGateWiring(input: AppGateWiringInput): AppGateWiring {
   const baseModel = input.executorLive ? input.baseModel : "";
   return {
     enabled: true,
+    ...requireAppGate,
     appGateCommandFor,
     verifyCommandRunner: runner,
     escalationModel,

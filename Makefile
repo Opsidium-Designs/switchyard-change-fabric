@@ -59,13 +59,16 @@ dev-all:
 # 0.0.0.0 (WRANGLER_DEV_IP), the console (Vite) already binds 0.0.0.0 via
 # host:true, and VITE_WORKER_URL is set to this host's LAN IP so the remote
 # browser AND the spawned runs reach the Worker by its LAN address, not
-# 127.0.0.1. Override LAN_IP=... to pick a specific interface. NOTE: this exposes
-# an UNAUTHENTICATED dev control plane (it can launch runs, spend AI/Artifacts,
-# and deploy) to everyone on the LAN; only use it on a trusted network.
+# 127.0.0.1. Override LAN_IP=... to pick a specific interface. AUTH: set
+# SWITCHYARD_API_TOKEN (the Worker secret, via a gitignored apps/worker/.dev.vars,
+# and the same value in .env) to require a bearer on every Worker mutation;
+# without it the Worker control plane is unauthenticated. The console launcher
+# (launch runs, spend AI/Artifacts, deploy) has no auth of its own either way,
+# so only use this on a trusted network.
 LAN_IP ?= $(shell hostname -I 2>/dev/null | awk '{print $$1}')
 dev-all-lan:
 	@echo "LAN console: http://$(LAN_IP):5173  (Worker: http://$(LAN_IP):8787)"
-	@echo "WARNING: this exposes an unauthenticated dev control plane to the LAN."
+	@echo "Set SWITCHYARD_API_TOKEN (apps/worker/.dev.vars + the same value in .env) to require a bearer on Worker mutations; otherwise the Worker is unauthenticated. The console launcher is open to the LAN: trusted networks only."
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	export WRANGLER_DEV_IP=0.0.0.0; \
 	export VITE_WORKER_URL=http://$(LAN_IP):8787; \
@@ -141,7 +144,9 @@ recruit:
 # scoped CLOUDFLARE_API_TOKEN in a gitignored .env). Then run this: multiple
 # agents concurrently hold distinct real Artifact repos and push to them, each
 # wave after the first driven by the repo-pushed event. Raise MAX to widen
-# concurrency. The run deletes the real repos it created on the way out.
+# concurrency. The run deletes the real repos it created on the way out. A goal
+# run plans with the LLM (EXECUTOR=ai-gateway in .env); without a live planner it
+# fails unless you pass --allow-heuristic-planner.
 WORKER ?= http://127.0.0.1:8787
 
 recruit-live:
@@ -151,9 +156,11 @@ recruit-live:
 # The full live headline run against a running Worker (start it with `make dev`
 # in another terminal). It decomposes a goal, recruits real agents into real
 # Cloudflare Artifact repos, runs the chosen executor per agent (set
-# EXECUTOR=workers-ai in .env for real inference; otherwise the deterministic
-# noop), drives event-driven waves, runs the human escalation beat, then
-# verifies, integrates, promotes to local Git, and cleans up the real repos.
+# EXECUTOR=ai-gateway plus the AI Gateway URL/token in .env: the LLM planner and
+# the executor both run through the gateway; without a live planner a goal run
+# fails unless you pass --allow-heuristic-planner), drives event-driven waves,
+# runs the human escalation beat, then verifies, integrates, promotes to local
+# Git, and cleans up the real repos.
 # Keep inference cheap: a small seeded project and a low MAX. Override GOAL /
 # PROJECT / OWNER as needed; OWNER answers the escalation non-interactively.
 OWNER ?=
@@ -206,8 +213,9 @@ run-live-watch:
 # backgrounding long-lived dev servers), seeds the demo audit Change, runs the
 # watchable live run (stable id change-audit-logging, escalation beat fires,
 # real Artifact repos left up), and prints the console URL to open to watch the
-# morph. The executor comes from .env (set EXECUTOR=workers-ai for real
-# inference). Tear the real repos down afterwards with `make clean-live`.
+# morph. The executor comes from .env (set EXECUTOR=ai-gateway with the AI
+# Gateway URL/token for real inference; unset means the deterministic noop).
+# Tear the real repos down afterwards with `make clean-live`.
 demo-live:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	bash tools/demo-live.sh

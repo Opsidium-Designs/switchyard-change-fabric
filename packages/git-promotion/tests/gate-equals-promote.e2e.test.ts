@@ -175,6 +175,39 @@ describe("gate-equals-promote: the gated tree is the promoted tree", () => {
     expect(branches.stdout.trim()).toBe("");
   });
 
+  it("refuses to promote a tree whose integration verdict is not verified (no branch created)", async () => {
+    // The integrated tree DIFFERS from the baseline (an edit landed), but the
+    // authoritative gate failed on it. A failed verdict must never get a
+    // delivery branch, regardless of whether the tree changed.
+    const baseline = { "src/broken.ts": "export const value = 'BASELINE';\n" };
+    const integrated = { "src/broken.ts": "export const value = 'STILL BROKEN';\n" };
+    const integrationUrl = await makeIntegrationRepo("integration", baseline, integrated);
+    const sourceRepo = await makeSourceRepo("source", baseline);
+
+    const delivery = new LocalGitDeliveryProvider({ workRoot });
+    await expect(
+      delivery.promote(
+        {
+          changeId: "change-failed",
+          integrationGitUrl: integrationUrl,
+          integrationBranch: "main",
+          expectedIntegratedUnits: 1,
+          verdict: "failed",
+        },
+        { repoDir: sourceRepo, startPoint: "main" },
+      ),
+    ).rejects.toThrow(/verdict is "failed"/);
+
+    const branches = await run("git", [
+      "-C",
+      sourceRepo,
+      "branch",
+      "--list",
+      defaultBranch("change-failed"),
+    ]);
+    expect(branches.stdout.trim()).toBe("");
+  });
+
   it("allows an unchanged promotion when no fix was expected (additive no-op)", async () => {
     // expectedIntegratedUnits omitted (or zero): a change that landed no fix is a
     // legitimate no-op and must not trip the guard.

@@ -60,6 +60,15 @@ export class LocalGitDeliveryProvider implements DeliveryProvider {
     const identity: GitIdentity | undefined = target.identity;
     const commitMessage = target.commitMessage ?? defaultCommitMessage(input);
 
+    // Never promote a tree the authoritative gate did not verify. Checked before
+    // any Git work, so a refused promotion creates no delivery branch at all.
+    if (input.verdict !== undefined && input.verdict !== "verified") {
+      throw new Error(
+        `promotion refused: the integration verdict is "${input.verdict}", not "verified". ` +
+          "Only a tree the authoritative gate verified may be promoted.",
+      );
+    }
+
     const integrationDir = await mkdtemp(join(workRoot, "scf-promote-src-"));
     try {
       // 1. Clone the integrated workspace to read the combined result from.

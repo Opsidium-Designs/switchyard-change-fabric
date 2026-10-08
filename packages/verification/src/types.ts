@@ -161,4 +161,12 @@ export interface CoordinationDecision {
   readonly waiters: readonly string[];
   /** A short, human-readable reason for the decision. */
   readonly reason: string;
+  /**
+   * Present when a human owner decision was supplied for this path:
+   * "human-decision" when it was applied, "declared-order" when it was rejected
+   * and the deterministic owner was kept (the reason says why).
+   */
+  readonly ownerSource?: "human-decision" | "declared-order";
+  /** The human owner decision that was requested for this path, when one was. */
+  readonly requestedOwner?: string;
 }

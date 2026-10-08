@@ -1,143 +1,140 @@
 # Switchyard Change Fabric
 
-**The living work graph for agents on Cloudflare.** A human states a goal; the
-engine decomposes it into a work graph, recruits agents into isolated Cloudflare
-Artifact repositories, coordinates them as they run, verifies their output,
-integrates the verified work, and promotes one coherent result back into
-ordinary Git. The console renders that work graph morphing in real time against
-real durable state.
+**A living work graph for agents on Cloudflare.** A human states a goal. An LLM
+planner decomposes it into a work graph, agents are recruited into their own
+Cloudflare Artifact repos, a mechanical gate verifies the integrated result, and
+only a verified result is promoted back to ordinary Git. The browser console
+renders the graph morphing in real time against real durable state.
 
 > Branches are implementation details. **Changes** are the unit of agentic
 > software development.
 
 Built for Cloudflare's "Build the next Git platform" challenge. Early spike;
-interfaces and layout will change.
+interfaces will change.
 
-## Run it (live on Cloudflare Workers AI)
+## Quick start (offline, no account)
 
-The headline run decomposes a goal, recruits real agents into real Artifact
-repos, drives event-driven waves on Workers AI, pauses for a human escalation,
-then verifies, integrates, and promotes. Follow these steps in order.
+Requires Node.js 20+ and Git.
 
-1. **Prerequisites.** Node.js 20 or newer, Git, and a Cloudflare account with
-   Workers and Artifacts (open beta) enabled and Workers AI available.
+```bash
+make install
+make check   # typecheck + build + test, offline and deterministic
+make demo    # the whole flow end to end with the noop executor, no Cloudflare
+```
 
-2. **Configure `.env`.** Copy the example and fill in your values.
+## Live run
+
+1. **Configure `.env`** (gitignored; never commit it):
    ```bash
    cp .env.example .env
-   # then set in .env:
-   #   CLOUDFLARE_ACCOUNT_ID=<your account id>
-   #   CLOUDFLARE_API_TOKEN=<a scoped token: Workers + Artifacts>
-   #   EXECUTOR=workers-ai
-   #   WORKERS_AI_MODEL=@cf/qwen/qwen2.5-coder-32b-instruct
+   # CLOUDFLARE_ACCOUNT_ID=...        account with Workers + Artifacts (beta)
+   # CLOUDFLARE_API_TOKEN=...         scoped token: Workers + Artifacts
+   # EXECUTOR=ai-gateway
+   # CLOUDFLARE_AI_GATEWAY_URL=https://gateway.ai.cloudflare.com/v1/<account>/<gateway>
+   # CLOUDFLARE_AI_GATEWAY_TOKEN=...  the gateway credential, not a provider key
    ```
-   The token stays in your gitignored `.env` and is never printed.
+   Inference is BYOK through Cloudflare AI Gateway: the OpenAI key lives in the
+   Cloudflare account and the gateway injects it. `EXECUTOR` accepts
+   `ai-gateway | workers-ai | noop` (unset means `noop`); anything else is an
+   error. Only `ai-gateway` provides the LLM planner and the Jev decision model.
 
-3. **Install dependencies.**
-   ```bash
-   make install
-   ```
-
-4. **Stand up the hosted infrastructure.** Deploys the hosted Worker, the Queue,
-   and the Artifacts `repo.pushed` subscription. These are REAL billable hosted
-   resources on the account in your `.env`; it is idempotent and prints what now
-   exists.
-   ```bash
-   make infra-up
-   ```
-
-5. **Start the local Worker and console** in their own terminal, and leave them
-   running.
+2. **Start the local Worker and console** and leave them running:
    ```bash
    make dev-all
    ```
 
-6. **Open the console and drive everything from the browser.**
-   ```text
-   http://127.0.0.1:5173/
-   ```
-   The console is the control plane. Pick a template from the gallery to launch
-   a live run: it starts with a fresh unique Change id the console follows
-   automatically, and the graph morphs in real time against the run's durable
-   state. There is no CLI step for the demo.
+3. **Open `http://127.0.0.1:5173/`** and launch a template:
+   - **Audit logging (intro):** about 3 agents; two contend for a shared module,
+     so the run pauses and asks you in the console which agent owns it.
+   - **Fix a multi-resource API (many agents):** about 6 agents, one per
+     resource of `examples/apps/service-api`. Optionally click **Deploy app** first
+     to see the broken app at a stable `workers.dev` URL; a verified fix is then
+     redeployed in place at the same URL.
 
-   - **Audit logging** (about 3 agents) hits a shared contested path, so the run
-     pauses and the console asks you which agent owns it. Answer in the browser
-     and the run continues.
-   - **Validation fan-out** (about 5 agents) and **Large (scale)** (13 agents)
-     run to completion on their own, with no human step.
+   Each launch gets a fresh unique Change id. **Tear down** deletes that run's
+   Artifact repos (and the deployed app, if any).
 
-7. **Tear down the run from the console.** Each template leaves its real Artifact
-   repos up so you can study the finished graph; click **Tear down this run's
-   repos** to delete them (scoped to that run's unique id). Launching another
-   template uses a fresh unique id, so repeated runs never collide.
+CLI equivalents: `make run-live-service` (the service-api fix),
+`make run-live-watch` / `make demo-live` (the audit-logging run, repos left up;
+remove them with `make clean-live`).
 
-   A CLI-driven alternative to steps 6 and 7 is `make demo-live` (it drives one
-   watchable run from the terminal); the console template gallery is the primary
-   browser path.
-
-8. **Tear down the hosted infrastructure when done.** Per-run Artifact repos are
-   removed from the console (step 7) or with `make clean-live` for a CLI run;
-   `make infra-down` removes the hosted Worker, Queue, and subscription so
-   nothing keeps billing.
-   ```bash
-   make infra-down
-   ```
-
-### What you are watching
-
-- **Nodes** are the goal, the work-graph units, the recruited agents, and the
-  tools agents build; a node greens as its work is verified or integrated.
-- **Edges** are dependencies, data-flow (a satisfied dependency), event-driven
-  spawn (a real repo-pushed event recruited the target), consumed-tool (a
-  downstream agent ran an agent-built tool), and write-lease (a waiter ordered
-  behind the single owner of a contested path).
-- **Click a node** to see its real backing: an agent's actual Artifact repo,
-  clone URL, backend, status, and evidence.
-- **The min/max dial** is a real control: raise it and the next wave recruits
-  more agents at once through the same engine.
-- **The human escalation beat** pauses the run for a decision rather than
-  guessing on a contested path; you answer the question in the console and the
-  run continues.
-- **Per-run cleanup** is a console control: tear down a run's real Artifact repos
-  when you are done watching, scoped to that run's unique id.
-
-### Other ways to run
-
-- `make demo` runs the whole flow offline and deterministically with no
-  Cloudflare account (the `noop` executor plus an honest local-filesystem
-  fallback). It is the test substrate and the fastest way to see the flow.
-- Other executors exist and are selected in `.env`: `codex` (an already
-  authenticated Codex CLI) and `switchyard-gateway` (AI Gateway BYOK). See
-  [`.env.example`](.env.example) for the shape of each.
-- `make infra-status` is read-only and reports what is live on your account
-  right now, so you can answer "am I paying for anything?".
+**Hosted infrastructure (optional).** `make infra-up` deploys the hosted Worker,
+the Queue, and the Artifacts `repo.pushed` subscription (real, billable,
+idempotent). `make infra-status` is read-only ("am I paying for anything?").
+`make infra-down` removes it all, including leftover repos. See
+[`docs/EVENT-SUBSCRIPTION.md`](docs/EVENT-SUBSCRIPTION.md) and
+[`docs/LIVE-DEPLOY.md`](docs/LIVE-DEPLOY.md).
 
 ## How it works
 
-The engine is one durable pipeline, each stage backed by code you can read:
+1. **Goal to Change.** The Change is created on the Worker (a ChangeState
+   Durable Object) in status `planning` before any planning happens, so the
+   console shows it at once.
+2. **Plan.** The LLM planner (schema-constrained JSON through AI Gateway)
+   decomposes the goal into single-writer work units against frozen shared
+   contracts, and Jev records an advisory plan-review decision. A live goal run
+   without the planner fails unless `--allow-heuristic-planner` is passed (with
+   a loud banner). If every model in the planner ladder fails, the run falls
+   back to the heuristic plan with a loud banner and an amber planner node.
+3. **Recruit.** Agents are recruited under a min/max concurrency dial (set
+   before the run), each in its own Artifact repo with a short-lived scoped
+   token. An agent's push raises a `repo-pushed` event that recruits the next
+   wave (through the Worker's ingress locally, or the Artifacts subscription and
+   Queue consumer when deployed; both hit one handler).
+4. **Verify every round.** The app's own gate runs on each round's integrated
+   edits. On every failing round, Jev records an advisory failure-attribution
+   decision and the planner re-plans which units re-run; those units retry on
+   an escalated model, fed the real gate evidence.
+5. **Integrate and promote.** A final authoritative integration gate runs on
+   the integrated tree (Jev adds an advisory fix-confidence decision beside
+   it). Only a `verified` verdict is promoted to a local Git
+   branch `switchyard/<change-id>`. If the app was deployed before the run, it is
+   redeployed in place from a checkout of the promoted commit. The console's goal
+   node turns green or red only from this integration verdict.
 
-- **Decompose** a goal into a WorkGraph from generic goal features and generic
-  repo structure, so different goals yield differently-shaped graphs through one
-  code path (`packages/change-core`).
-- **Durable run loop:** a Cloudflare Workflow advances the graph one scheduling
-  wave per durable step, idempotent and restartable (`apps/worker`).
-- **Recruitment and the dial:** each wave recruits runnable units bounded by a
-  min/max concurrency dial, each agent getting its own Artifact repo and
-  short-lived scoped token (`packages/change-core`, `packages/artifact-workspace`).
-- **Event-driven waves:** a runner's push emits a repo-pushed event that triggers
-  the next wave (a Queue consumer live, a deterministic faked event offline).
-- **Agent-for-agent tooling:** an agent can build and publish a tool that
-  downstream agents consume.
-- **Write-lease coordination:** contested paths get a single lease owner; others
-  wait rather than silently merging.
-- **Verify, integrate, promote:** deterministic verification, an integration
-  workspace, and a promoted local Git commit (`packages/verification`,
-  `packages/git-promotion`).
+### What the graph shows
 
-The live and offline paths share the same scheduling kernel, so they cannot
-drift. The deployed `repo.pushed` to Queue to consumer hop is documented, with
-its honest status and teardown, in
-[`docs/EVENT-SUBSCRIPTION.md`](docs/EVENT-SUBSCRIPTION.md).
+Nodes are the goal, the planner (kickoff and each re-plan), work units and
+recruited agents, agent-built tools, verify attempts, retries, and Jev
+decisions. Click a node to see its real backing (repo, clone URL, status,
+evidence). Edges are exactly four kinds:
+
+- `dependency`: a declared work-graph dependency, or a plan/promotion edge.
+- `spawn`: an Artifact `repo-pushed` event recruited the target, and only that.
+- `trigger`: ladder control flow (verify fail, re-plan, retry, agents).
+- `consumed-tool`: a downstream agent ran a tool another agent built.
+
+### Honesty invariants
+
+- **Gate-equals-deploy:** the gate runs on the exact tree that is promoted and
+  deployed; divergence fails honestly.
+- **No unbacked node:** every graph node maps to real recorded state.
+- **Jev is advisory:** it never flips a verdict or gates promote/deploy; the
+  mechanical gate decides.
+- **No silent pass:** a project that declares a gate, run with `--no-gate`,
+  cannot pass.
+- **Offline `make check`:** the planner, Jev, and executor are faked in tests.
+
+## Security
+
+- The Worker optionally requires `authorization: Bearer <SWITCHYARD_API_TOKEN>`
+  on every mutating route (including those that return Artifact write tokens);
+  read-only GETs stay open. Set it as a Worker secret (`wrangler secret put`, or
+  `apps/worker/.dev.vars` locally) and the same value in the root `.env`.
+- The browser never holds that token: console mutations go through the dev
+  launcher's `/api/worker` proxy, which adds the bearer server-side.
+- CLI errors and run logs redact credentials (URL userinfo, Artifact tokens).
+- `make dev-all-lan` exposes the dev control plane (it can launch runs, spend
+  inference, and deploy) to the LAN. Set `SWITCHYARD_API_TOKEN` first and use it
+  only on a trusted network.
+
+## Layout
+
+`apps/worker` (control plane), `apps/console` (React/Vite console and dev
+launcher), `apps/cli` (run driver), `packages/change-core` (domain, planning),
+`packages/orchestration` (run loop, graph model), `packages/model-adapters` (AI
+Gateway transports), `packages/verification` (gate, integration),
+`packages/artifact-workspace`, `packages/git-promotion`, `packages/local-runner`.
+The `Makefile` lists every command.
 
 Apache-2.0. See [LICENSE](./LICENSE).

@@ -11,7 +11,8 @@
     "deploy": "wrangler deploy",
     "cf-typegen": "wrangler types",
     "typecheck": "wrangler types && tsc --noEmit",
-    "build": "wrangler types && tsc --noEmit"
+    "build": "wrangler types && tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@switchyard-change/artifact-workspace": "*",
@@ -19,6 +20,7 @@
   },
   "devDependencies": {
     "typescript": "5.9.3",
+    "vitest": "^2.1.8",
     "wrangler": "^4.40.0"
   }
 }

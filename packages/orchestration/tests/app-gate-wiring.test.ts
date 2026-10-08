@@ -127,6 +127,23 @@ describe("buildAppGateWiring", () => {
     });
     expect(forcedOff.enabled).toBe(false);
     expect(forcedOff.appGateCommandFor).toBeUndefined();
+    // Disabling a DECLARED gate does not make it optional: the run still
+    // requires it, so its verdict is cannot-pass rather than an auto-pass.
+    expect(forcedOff.requireAppGate).toBe(true);
+  });
+
+  it("keeps --no-gate a plain skip for a project that declares no gate", () => {
+    const noGate = buildAppGateWiring({
+      projectHasGate: false,
+      gateFlag: false,
+      executorLive: false,
+      escalationModel: "",
+      baseModel: "",
+      maxModelRetries: 1,
+      commandRunner: new FakeRunner(),
+    });
+    expect(noGate.enabled).toBe(false);
+    expect(noGate.requireAppGate).toBeUndefined();
   });
 });
 

@@ -76,7 +76,9 @@ export type {
   RunFullLiveResult,
   TeardownApp,
 } from "./run-live.ts";
-export { cleanupLive, createPlanningChange, runFullLive } from "./run-live.ts";
+export { cleanupLive, createPlanningChange, failPlanningChange, runFullLive } from "./run-live.ts";
+export { WORKER_API_TOKEN_ENV, withWorkerAuth, workerApiToken } from "./worker-auth.ts";
+export { redactSecrets } from "./redact.ts";
 
 export type { AppDeploymentMarker } from "./app-deploy.ts";
 export {
@@ -158,7 +160,16 @@ export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor
 export { formatDoctorReport, runDoctor } from "./doctor.ts";
 
 export type { ExecutorEnv, SelectedExecutor, SelectedPlanner, PlanTransport } from "./executor-select.ts";
-export { DEFAULT_WORKERS_AI_ESCALATION_MODEL, selectExecutor, selectPlanner } from "./executor-select.ts";
+export type { LivePlannerDecision } from "./executor-select.ts";
+export {
+  ALLOW_HEURISTIC_PLANNER_FLAG,
+  DEFAULT_WORKERS_AI_ESCALATION_MODEL,
+  decideLivePlanner,
+  plannerFallbackBanner,
+  selectExecutor,
+  selectPlanner,
+  SUPPORTED_EXECUTORS,
+} from "./executor-select.ts";
 export {
   DEFAULT_JEV_CONFIDENCE_THRESHOLD,
   selectJev,

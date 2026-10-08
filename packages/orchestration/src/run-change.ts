@@ -280,6 +280,14 @@ export async function runChange(options: RunChangeOptions): Promise<RunChangeRes
     workRoot: worktreeRoot,
     identity,
   });
+  // Record the AUTHORITATIVE integration verdict on the control surface, exactly
+  // as a live run posts it to the Worker, so the offline snapshot's goal follows
+  // the final integration gate (not the legacy every-unit-integrated reading).
+  control.recordIntegration(change.id, {
+    verdict: evidence.integration.verdict === "verified" ? "verified" : "failed",
+    integratedUnits: [...evidence.integration.integratedUnits],
+    excludedUnits: [...evidence.integration.excludedUnits],
+  });
 
   // 5. Promote the integrated result into an ordinary local Git repository. We
   // clone the project into the work root first so the caller's tree is untouched.

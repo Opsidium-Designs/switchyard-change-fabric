@@ -658,6 +658,10 @@ describe("T10: the bounded model-escalation ladder (offline, deterministic)", ()
     expect(result.evidence.integration.integratedUnits).not.toContain("fix");
     expect(redeployed).toEqual([]);
     expect(result.deployment).toBeUndefined();
+    // A failed verdict is never promoted: no commit and an honest refusal.
+    expect(result.evidence.integration.verdict).toBe("failed");
+    expect(result.promotion.committed).toBe(false);
+    expect(result.promotion.refusedReason).toMatch(/not "verified"/);
 
     // The bounded retry was honored exactly once (default max-retries = 1): two
     // change-level verify rounds (both FAIL) and one retry round, then it stops.

@@ -15,7 +15,7 @@
  * is done over ordinary Git, so it runs in Node, not inside a Worker.
  */
 
-import { cp, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -134,17 +134,13 @@ export class Integrator {
       }
 
       let committed = false;
-      // Commit the combined result when the integration workspace changed.
+      // Commit the combined result when the integration workspace changed. The
+      // commit is NOT pushed yet: it is pushed only after the authoritative gate
+      // below passes, so the integration workspace (the tree promotion clones)
+      // only ever advances to a tree that was gated and verified.
       if (await git(integrationDir, ["status", "--porcelain"]).then((s) => s.trim() !== "")) {
         await commitAll(integrationDir, "Integrate verified WorkUnits", identity);
         committed = true;
-      }
-      if (committed) {
-        await git(integrationDir, [
-          "push",
-          authenticated(integrationRef.gitUrl, options.integrationToken),
-          `HEAD:${integrationRef.defaultBranch}`,
-        ]);
       }
 
       // HARD ERROR on a silent baseline, enforced on the LIVE path (not only in a
@@ -169,8 +165,8 @@ export class Integrator {
       }
 
       // The AUTHORITATIVE gate. It runs the per-app behavioral gate on THIS exact
-      // integrationDir, which is the tree we just committed and pushed to the
-      // integration workspace and which promotion then clones and deploys. So the
+      // integrationDir, which is the tree we just committed and (on a pass) push
+      // to the integration workspace, which promotion then clones and deploys. So the
       // composition that is gated here is byte-for-byte the composition that
       // promotes/deploys (baseline + verified units, with yielded contested paths
       // and every excluded unit already removed above). This is what makes a pass
@@ -185,6 +181,18 @@ export class Integrator {
         integrationDir,
       );
       const verdict: Verdict = finalCheck.skipped || finalCheck.passed ? "verified" : "failed";
+
+      // Push the gated commit only on a verified verdict. The pushed commit is
+      // the exact HEAD the gate just ran on, so gated tree == pushed tree; a
+      // failed tree never reaches the integration workspace and so can never be
+      // cloned by promotion.
+      if (committed && verdict === "verified") {
+        await git(integrationDir, [
+          "push",
+          authenticated(integrationRef.gitUrl, options.integrationToken),
+          `HEAD:${integrationRef.defaultBranch}`,
+        ]);
+      }
 
       return {
         verdict,
@@ -206,7 +214,9 @@ export class Integrator {
    * the baseline, and copy those files into the integration checkout. Because
    * verified WorkUnits touch non-overlapping declared paths, copies do not
    * clobber one another. Any path this unit yielded to a lease owner is skipped
-   * so the owner is the only contributor of a contested path.
+   * so the owner is the only contributor of a contested path. A changed path
+   * that no longer exists in the unit's tree is a deletion, so it is removed
+   * from the integration checkout rather than copied.
    */
   private async applyUnit(
     unit: VerifiedWorkspace,
@@ -226,6 +236,12 @@ export class Integrator {
         }
         const from = join(unitDir, rel);
         const to = join(integrationDir, rel);
+        if (!(await pathExists(from))) {
+          // The unit deleted this file: carry the deletion into the integrated
+          // tree so it matches the unit's verified result.
+          await rm(to, { force: true });
+          continue;
+        }
         await mkdir(dirname(to), { recursive: true });
         await cp(from, to, { recursive: true });
       }
@@ -352,6 +368,16 @@ function authenticated(gitUrl: string, token: string): string {
     return `https://token:${encodeURIComponent(token)}@${rest}`;
   }
   return gitUrl;
+}
+
+/** True when a path exists (a symlink counts, even a dangling one). */
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function sanitize(name: string): string {

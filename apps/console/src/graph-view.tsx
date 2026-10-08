@@ -45,10 +45,11 @@ const LABEL_GAP = 10;
  * a sparse spread, while staying comfortably above the no-overlap floor: with
  * the per-node X jitter (X_JITTER below) the closest two centers can get is
  * MIN_NODE_GAP - 2*X_JITTER, which must stay >= 2*NODE_RADIUS (a node diameter),
- * so 130 - 44 = 86 >= 48 holds. The positional variance (jitter/stagger) is
+ * so 150 - 44 = 106 >= 48 holds. Widened from 130 so adjacent labels (an agent
+ * beside a jev decision) do not run into each other. The positional variance (jitter/stagger) is
  * deliberately kept unchanged, so the row stays organic, not collinear.
  */
-const MIN_NODE_GAP = 130;
+const MIN_NODE_GAP = 150;
 /** Vertical stagger step applied by column so siblings are not on one flat row. */
 const STAGGER_STEP = 34;
 /** Deterministic per-node horizontal jitter amplitude (SVG units). */
@@ -212,30 +213,111 @@ function jitter(id: string, axis: string, amp: number): number {
   return (frac * 2 - 1) * amp;
 }
 
+/** The longest visible agent label before it is truncated with an ellipsis. */
+export const MAX_AGENT_LABEL = 22;
+
+/** Split a trailing parenthetical suffix (e.g. " (retry 2)") off a label. */
+function splitSuffix(label: string): { id: string; suffix: string } {
+  const match = /^(.*?)(\s*\([^)]*\))?$/.exec(label.trim());
+  return { id: (match?.[1] ?? label).trim(), suffix: (match?.[2] ?? "").trim() };
+}
+
+/** Strip the planner's `unit-` prefix and any path head, keeping the meaningful id. */
+function baseUnitLabel(id: string): string {
+  const tail = id.includes("/") ? id.slice(id.lastIndexOf("/") + 1) : id;
+  const stripped = tail.replace(/^unit-/, "");
+  return stripped === "" ? tail : stripped;
+}
+
+/** Truncate a label to `max` characters with a trailing ellipsis. */
+function truncateLabel(label: string, max: number = MAX_AGENT_LABEL): string {
+  return label.length <= max ? label : `${label.slice(0, max - 1)}\u2026`;
+}
+
 /**
- * Derive a SHORT, legible display label from a node's full label. An agent (and
- * round-N retry agent) node's label is the full unit id, optionally with a
- * "(retry N)" suffix, e.g. "validate-src-resources-notifications (retry 2)".
- * That is too long to read in the graph, so the visible label is shortened to
- * the MODULE TAIL (the last path/segment token of the unit id) plus any
- * "(retry N)" suffix, e.g. "notifications (retry 2)". The FULL unit id is kept
- * elsewhere (the node detail panel and the SVG <title> tooltip), so nothing is
- * lost: this only shortens what is drawn beneath the node. A label with no
- * segment separators is returned unchanged (already short). Pure and
- * deterministic, so the layout and tests stay reproducible.
+ * A SHORT, legible display label for one agent/work node, from its full label
+ * (the unit id, optionally with a "(retry N)" suffix). It strips the planner's
+ * `unit-` prefix and any path head, then truncates a very long id, so
+ * "unit-auth-resource-guards (retry 2)" reads "auth-resource-guards (retry 2)".
+ * The FULL unit id stays in the SVG <title> tooltip and the node detail panel.
+ * Pure and deterministic.
  */
 export function shortNodeLabel(label: string): string {
-  // Split a trailing " (retry N)" (or any parenthetical suffix) off the id, so
-  // the module-tail transform applies to the id and the suffix is re-appended.
-  const match = /^(.*?)(\s*\([^)]*\))?$/.exec(label.trim());
-  const id = (match?.[1] ?? label).trim();
-  const suffix = match?.[2] ?? "";
-  // The module tail: the last token after splitting on "-" and "/" path
-  // separators (e.g. "validate-src-resources-notifications" -> "notifications").
-  const segments = id.split(/[-/]/).filter((s) => s !== "");
-  const tail = segments.length > 0 ? segments[segments.length - 1]! : id;
-  return `${tail}${suffix}`.trim();
+  const { id, suffix } = splitSuffix(label);
+  return [truncateLabel(baseUnitLabel(id)), suffix].filter((s) => s !== "").join(" ");
 }
+
+/**
+ * Distinguishable display labels for every agent/work node in a model, keyed by
+ * node id. Sibling unit ids usually share a prefix and/or suffix (for example
+ * `unit-<resource>-resource-guards`), so a per-label tail would collapse them
+ * all to the same word. This strips the dash-separated tokens EVERY distinct
+ * base id shares at the start and at the end, leaving the part that tells them
+ * apart ("auth", "orders", ...). With a single distinct id, or when stripping
+ * would empty a label, it falls back to shortNodeLabel. Pure and deterministic.
+ */
+export function agentDisplayLabels(nodes: readonly GraphNode[]): Map<string, string> {
+  const agents = nodes.filter((n) => n.kind === "agent" || n.kind === "work");
+  const parts = agents.map((n) => {
+    const { id, suffix } = splitSuffix(n.label);
+    return { node: n, base: baseUnitLabel(id), suffix };
+  });
+  const distinct = [...new Set(parts.map((p) => p.base))];
+  const tokenLists = distinct.map((b) => b.split("-"));
+  let prefix = 0;
+  let suffixLen = 0;
+  if (distinct.length >= 2) {
+    const shortest = Math.min(...tokenLists.map((t) => t.length));
+    while (
+      prefix < shortest - 1 &&
+      tokenLists.every((t) => t[prefix] === tokenLists[0]![prefix])
+    ) {
+      prefix += 1;
+    }
+    while (
+      suffixLen < shortest - prefix - 1 &&
+      tokenLists.every(
+        (t) => t[t.length - 1 - suffixLen] === tokenLists[0]![tokenLists[0]!.length - 1 - suffixLen],
+      )
+    ) {
+      suffixLen += 1;
+    }
+  }
+  const out = new Map<string, string>();
+  for (const { node, base, suffix } of parts) {
+    const tokens = base.split("-");
+    const core = tokens.slice(prefix, tokens.length - suffixLen).join("-");
+    const label = core === "" ? base : core;
+    out.set(node.id, [truncateLabel(label), suffix].filter((s) => s !== "").join(" "));
+  }
+  return out;
+}
+
+/** The small caption under a node: its kind, plus a jev decision's outcome. */
+function nodeCaption(node: GraphNode): string {
+  if (node.kind === "jev") {
+    const outcome = /\s(accepted|escalated)$/.exec(node.label)?.[1];
+    return outcome ? `jev ${outcome}` : "jev";
+  }
+  return node.kind;
+}
+
+/**
+ * The visible label for a non-agent node. The kind is already drawn as the
+ * caption beneath, so a jev node shows only its juncture (its outcome moves to
+ * the caption) and a verify node drops its "verify"/"(app gate)" words; the full
+ * label stays in the tooltip.
+ */
+function compactLabel(node: GraphNode): string {
+  if (node.kind === "jev") {
+    return node.label.replace(/^jev:\s*/, "").replace(/\s+(accepted|escalated)$/, "");
+  }
+  if (node.kind === "verify") {
+    return node.label.replace(/^verify\s+/, "").replace(/\s*\(app gate\)/, "");
+  }
+  return node.label;
+}
+
 function computeLayers(model: WorkGraphModel): Map<string, number> {
   const deps = new Map<string, string[]>();
   // Build the per-unit dependency list from the declared dependency AND spawn
@@ -402,14 +484,24 @@ export function isNonBlockingRoundFail(node: GraphNode, changePassed: boolean): 
 }
 
 /**
- * Whether the whole change PASSED, read from the model's verify nodes: a
- * verified verify round means the authoritative mechanical gate passed, so the
- * change passed. Used only for DISPLAY clarity (a non-blocking round fail), never
- * to change a verdict.
+ * Whether the whole change PASSED. When the goal node carries the authoritative
+ * integration verdict (the final integration gate on the integrated tree), that
+ * verdict alone decides; a passing ladder round is only an advisory overlay and
+ * cannot override it. Without a recorded verdict on the goal (still in progress,
+ * or a legacy/offline snapshot) a verified verify round stands in, as before.
+ * Used only for DISPLAY clarity (a non-blocking round fail), never to change a
+ * verdict.
  */
 export function changeHasPassed(model: WorkGraphModel): boolean {
+  const goal = model.nodes.find((n) => n.kind === "goal");
+  if (goal && goal.backing.kind === "change" && goal.backing.integrationVerdict !== undefined) {
+    return goal.backing.integrationVerdict === "verified";
+  }
   return model.nodes.some((n) => n.kind === "verify" && n.verified);
 }
+
+/** The amber used for a node that completed in a degraded way (node.warning). */
+export const WARNING_FILL = "#d29922";
 
 /** The fill color for a node from its kind and verified/escalated/failed state. */
 function nodeFill(node: GraphNode, changePassed = false): string {
@@ -460,6 +552,11 @@ function nodeFill(node: GraphNode, changePassed = false): string {
   if (node.kind === "tool") {
     return "#e3b341"; // agent-built tool: a distinct YELLOW square, its own repo
   }
+  if (node.warning) {
+    // Completed, but in a degraded way that must not read as plain success (a
+    // heuristic-fallback plan): AMBER, never the healthy green.
+    return WARNING_FILL;
+  }
   if (node.verified) {
     return "#238636"; // greened: evidence landed (verified/integrated)
   }
@@ -496,6 +593,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
   // while the change still passed is drawn muted (a non-blocking per-attempt
   // failure), never recolored into or out of a verdict.
   const changePassed = useMemo(() => changeHasPassed(model), [model]);
+  const agentLabels = useMemo(() => agentDisplayLabels(model.nodes), [model]);
   const byId = useMemo(() => {
     const map = new Map<string, Placed>();
     for (const p of placed) {
@@ -757,7 +855,9 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                   key={node.id}
                   className={`node node-${node.kind} ${node.verified ? "is-verified" : ""} ${
                     node.escalated ? "is-escalated" : ""
-                  } ${node.status === "failed" ? "is-failed" : ""} ${selected ? "is-selected" : ""}`}
+                  } ${node.status === "failed" ? "is-failed" : ""} ${node.warning ? "is-warning" : ""} ${
+                    selected ? "is-selected" : ""
+                  }`}
                   transform={`translate(${x}, ${y})`}
                   tabIndex={0}
                   role="button"
@@ -829,27 +929,26 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                   )}
                   {/* Labels sit OUTSIDE the node, below it, so they are legible
                       and never crammed inside the small node. An agent (and
-                      round-N retry agent) node's visible label is SHORTENED to
-                      the module tail (e.g. "notifications (retry 2)") so a long
-                      unit id does not sprawl; the FULL unit id is kept in the
-                      SVG <title> tooltip (and the node detail panel). Other
-                      kinds keep their full label. The kind is a smaller caption
-                      line beneath it. */}
+                      round-N retry agent) node's visible label is the part of its
+                      unit id that tells it apart from its siblings (e.g.
+                      "orders (retry 2)"); the FULL unit id is kept in the SVG
+                      <title> tooltip (and the node detail panel). jev and verify
+                      labels drop the words the kind caption already says. */}
                   <text
                     className="node-label"
                     textAnchor="middle"
                     y={r + LABEL_GAP + 11 + labelOffset}
                   >
                     {node.kind === "agent" || node.kind === "work"
-                      ? shortNodeLabel(node.label)
-                      : node.label}
+                      ? (agentLabels.get(node.id) ?? shortNodeLabel(node.label))
+                      : compactLabel(node)}
                   </text>
                   <text
                     className="node-kind"
                     textAnchor="middle"
                     y={r + LABEL_GAP + 24 + labelOffset}
                   >
-                    {node.kind}
+                    {nodeCaption(node)}
                   </text>
                   {/* The tooltip keeps the FULL label and, for a round-N retry
                       agent that failed its own attempt while the change still
@@ -859,7 +958,7 @@ export function GraphView({ model, selectedId, onSelect }: GraphViewProps) {
                     isNonBlockingRoundFail(node, changePassed)
                       ? " (per-attempt retry failure; the change still passed)"
                       : ""
-                  }`}</title>
+                  }${node.warning ? ` WARNING: ${node.warning}` : ""}`}</title>
                 </g>
               );
             })}

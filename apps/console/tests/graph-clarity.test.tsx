@@ -3,11 +3,12 @@
  *
  *   item 3  the planner NODE shape and the legend SWATCH are the same upward
  *           triangle (the rendered node is an apex-up polygon; the legend uses an
- *           apex-up clip-path triangle, both teal), so legend and graph agree;
+ *           apex-up clip-path triangle drawn neutral, since color is status);
  *   item 4  SPACING: no two placed nodes overlap for a dense
  *           planner+verify+retry+round-N graph (a coordinate min-distance check);
- *   item 5  SHORTER labels: an agent/round-N label is shortened to the module
- *           tail (keeping any "(retry N)" suffix), with the full id preserved;
+ *   item 5  SHORTER labels: an agent/round-N label drops the `unit-` prefix and
+ *           the prefix/suffix its siblings share (keeping any "(retry N)"
+ *           suffix), with the full id preserved;
  *   item 6  a failed round-N agent in a PASSING change is rendered without
  *           implying the change failed (a muted tone + a clarity note), while the
  *           change still reads as passed.
@@ -158,14 +159,16 @@ describe("item 3: the planner node shape matches the legend swatch (both upward 
     expect(markup).toContain("-20.78,12.00");
   });
 
-  it("draws the legend planner swatch as an apex-up clip-path triangle in the same teal", async () => {
+  it("draws the legend planner swatch as an apex-up clip-path triangle, neutral (color is status)", async () => {
     const css = await readFile(join(here, "..", "src", "styles.css"), "utf8");
     const normalized = css.replace(/\s+/g, " ");
     // The legend triangle is a clip-path triangle (not a border triangle), apex
     // at top-center with a flat base at the bottom, matching the SVG node shape.
     expect(normalized).toMatch(/\.swatch-triangle[^{]*\{[^}]*clip-path: polygon\(50% 0%, 100% 100%, 0% 100%\)/);
-    // The same teal fill as the node (so legend and node agree on shape + color).
-    expect(normalized).toMatch(/\.swatch-triangle[^{]*\{[^}]*background: #2bb3a3/);
+    // Shape swatches carry no kind color: the graph colors nodes by status, so a
+    // per-kind legend color would contradict it. The swatch takes the neutral fill.
+    expect(normalized).not.toMatch(/\.swatch-triangle[^{]*\{[^}]*background: #2bb3a3/);
+    expect(normalized).toMatch(/\.sw-neutral \{ background: #8b949e; \}/);
     // The old border-triangle shape is gone (it was a different proportion).
     expect(normalized).not.toMatch(/\.swatch-triangle[^{]*\{[^}]*border-bottom: 0\.8rem solid/);
   });
@@ -301,15 +304,19 @@ describe("item 4b: tighter agent spacing (seam 5): a wide agent fan is closer to
   });
 });
 
-describe("item 5: shorter labels (module tail), full id preserved", () => {
-  it("derives the module tail from a full unit id, keeping any (retry N) suffix", () => {
-    expect(shortNodeLabel("validate-src-resources-notifications")).toBe("notifications");
-    expect(shortNodeLabel("validate-src-resources-notifications (retry 2)")).toBe(
-      "notifications (retry 2)",
+describe("item 5: shorter, distinguishable labels, full id preserved", () => {
+  it("strips the unit- prefix and path head, truncating a long id, keeping any (retry N) suffix", () => {
+    expect(shortNodeLabel("unit-auth-resource-guards")).toBe("auth-resource-guards");
+    expect(shortNodeLabel("unit-auth-resource-guards (retry 2)")).toBe(
+      "auth-resource-guards (retry 2)",
     );
     expect(shortNodeLabel("users")).toBe("users");
-    // A slash-separated path id also reduces to its tail.
+    // A slash-separated path id reduces to its last path segment.
     expect(shortNodeLabel("src/resources/orders (retry 1)")).toBe("orders (retry 1)");
+    // A very long id is truncated with an ellipsis rather than sprawling.
+    const long = shortNodeLabel("validate-src-resources-notifications");
+    expect(long.length).toBeLessThanOrEqual(22);
+    expect(long.endsWith("\u2026")).toBe(true);
   });
 
   it("renders the short label on an agent node but keeps the FULL id in the title tooltip", () => {

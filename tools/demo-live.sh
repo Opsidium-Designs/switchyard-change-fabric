@@ -13,7 +13,7 @@
 #      repos up for watching;
 #   4. prints the console URL to open to watch the morph.
 #
-# The executor comes from .env (set EXECUTOR=workers-ai for real inference).
+# The executor comes from .env (set EXECUTOR=ai-gateway for real inference).
 # Cleanup is the separate `make clean-live`.
 #
 # Requires a running `make dev-all`. The make target sources your gitignored
@@ -75,7 +75,7 @@ curl -s -X POST -H "content-type: text/plain" \
 echo ""
 
 echo "== Step 3: watchable live run (escalation beat fires; repos left up) =="
-echo "Executor comes from .env (EXECUTOR). Set EXECUTOR=workers-ai for real"
+echo "Executor comes from .env (EXECUTOR). Set EXECUTOR=ai-gateway for real"
 echo "inference; otherwise the deterministic noop executor runs."
 echo ""
 # run-live --watch uses the stable Change id and leaves the real Artifact repos

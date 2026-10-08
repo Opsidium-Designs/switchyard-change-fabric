@@ -4,6 +4,7 @@ import {
   appendDiscoveredUnits,
   buildWorkGraph,
   detectPathCollisions,
+  leaseOwnerOverridesFromEscalations,
   normalizeDial,
   parseChangeSpec,
   planWriteLeases,
@@ -35,9 +36,20 @@ import type { Env } from "./env.ts";
  *   - "running": the plan has been attached (the real work units are present) and
  *     the run is proceeding. A Change created from a full spec (the hand-authored
  *     path, or any create that already carries its work) is "running" from the
- *     start, so that path is unchanged.
+ *     start, so that path is unchanged;
+ *   - "planning-failed": the run exited before a plan was attached (the planner
+ *     threw, or a precondition failed after the placeholder was created), so the
+ *     placeholder is terminally failed with the recorded reason instead of
+ *     sitting in "planning" forever. Only a "planning" Change can move here.
  */
-export type ChangeStatus = "planning" | "running";
+export type ChangeStatus = "planning" | "running" | "planning-failed";
+
+/** Why a "planning" placeholder failed before its plan was attached. */
+export interface PlanningFailureRecord {
+  /** A short, human-readable reason (bounded, never a secret). */
+  readonly reason: string;
+  readonly at: string;
+}
 
 /** The header fields needed to create a "planning" placeholder Change. */
 export interface PlanningChangeHeader {
@@ -376,6 +388,60 @@ export interface RoundAgentView {
   readonly detail?: UnitDetail;
 }
 
+/** The verdict of the authoritative final integration gate for a whole Change. */
+export type IntegrationVerdict = "verified" | "failed";
+
+/**
+ * The AUTHORITATIVE whole-change integration verdict: the outcome of the final
+ * integration gate run on the exact integrated/promoted tree, recorded by the
+ * run after that gate ran. It is the sole source of truth for whether the Change
+ * (the goal node) is verified or failed. The per-round ladder verify attempts are
+ * an advisory overlay on the way there and never decide the goal on their own.
+ * Null until the run records it, and reset whenever the Change is re-created.
+ */
+export interface IntegrationRecord {
+  readonly verdict: IntegrationVerdict;
+  /** The unit ids the final integration actually integrated. */
+  readonly integratedUnits: readonly string[];
+  /** The unit ids the final integration excluded (not shipped). */
+  readonly excludedUnits: readonly string[];
+  readonly at: string;
+}
+
+/**
+ * An outstanding lease (kickoff or round-N) that a re-create of the Change
+ * superseded. Re-creating a Change id wipes its bookkeeping, so every lease that
+ * was still live at that moment is captured here (atomically, inside the same
+ * Durable Object call that wipes it) and handed back to the Worker, which
+ * revokes each token. A lease is therefore never dropped from the record
+ * without a revocation attempt. Carries only the token id, never the plaintext.
+ */
+export interface SupersededLease {
+  readonly unitId: string;
+  /** The retry round for a round-N lease; absent for a kickoff lease. */
+  readonly round?: number;
+  readonly workspaceName: string;
+  readonly tokenId: string;
+}
+
+/** The result of a create that may have superseded a prior run of the same id. */
+export interface CreateResult {
+  readonly state: ChangeStateView;
+  /** Leases that were live when the prior run was wiped; the caller revokes them. */
+  readonly superseded: readonly SupersededLease[];
+}
+
+/** Thrown when a lifecycle call does not fit the Change's current status. */
+export class ChangeStatusConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ChangeStatusConflictError";
+  }
+}
+
+/** The message prefix every status conflict carries, so the Worker can map it to 409. */
+export const STATUS_CONFLICT_PREFIX = "status conflict:";
+
 /**
  * The projection of the recorded plan surfaced on the state view. It is the
  * graph `planner` node's backing: the plan source (planner vs heuristic
@@ -523,6 +589,18 @@ export interface ChangeStateView {
    * gate verdict or gates promotion/deploy; it is display + a confidence signal.
    */
   readonly jevDecisions: readonly JevDecisionView[];
+  /**
+   * The AUTHORITATIVE whole-change integration verdict (the final integration
+   * gate on the exact integrated tree), or null until the run records it. This,
+   * not the latest ladder verify attempt, decides whether the goal node is
+   * verified or failed; before it exists the goal is still in progress.
+   */
+  readonly integration: IntegrationRecord | null;
+  /**
+   * Why the planning placeholder failed (status "planning-failed"), or null.
+   * It backs the goal node's terminal red when the run never got a plan.
+   */
+  readonly planningFailure: PlanningFailureRecord | null;
 }
 
 /**
@@ -678,10 +756,10 @@ export interface RaiseEscalationInput {
  */
 export class ChangeState extends DurableObject<Env> {
   /** Create (or replace) the Change held by this object from spec YAML text. */
-  async createFromSpec(specYaml: string): Promise<ChangeStateView> {
+  async createFromSpec(specYaml: string): Promise<CreateResult> {
     const change = parseChangeSpec(specYaml);
-    await this.initChange(change, "running");
-    return this.view();
+    const superseded = await this.initChange(change, "running");
+    return { state: await this.view(), superseded };
   }
 
   /**
@@ -696,7 +774,7 @@ export class ChangeState extends DurableObject<Env> {
    * requires a non-empty parsed spec, so this is the only create that admits an
    * empty work set, and only transiently while planning.
    */
-  async createPlanning(header: PlanningChangeHeader): Promise<ChangeStateView> {
+  async createPlanning(header: PlanningChangeHeader): Promise<CreateResult> {
     const change: Change = {
       id: header.id,
       objective: header.objective,
@@ -705,8 +783,8 @@ export class ChangeState extends DurableObject<Env> {
       assurance: header.assurance,
       work: [],
     };
-    await this.initChange(change, "planning");
-    return this.view();
+    const superseded = await this.initChange(change, "planning");
+    return { state: await this.view(), superseded };
   }
 
   /**
@@ -717,12 +795,53 @@ export class ChangeState extends DurableObject<Env> {
    * create-first-then-plan flow: the console has already attached to the planning
    * placeholder, and this fills in the real graph and roots the planner node. The
    * run has not advanced yet (no leases/completions), so re-initializing the
-   * bookkeeping is correct. Idempotent in spirit: attaching the same plan again
-   * simply re-stores it and keeps the status "running".
+   * bookkeeping is correct.
+   *
+   * It is ONLY allowed while the Change is still "planning". Attaching a plan to
+   * a Change that is already running (or that a prior run left behind) would
+   * silently wipe a live run's leases and history, so that is rejected with a
+   * status conflict; a caller that genuinely means to start over re-creates the
+   * Change (POST /changes or POST /changes/planning), which supersedes the prior
+   * run and revokes its outstanding leases.
    */
   async attachPlan(specYaml: string): Promise<ChangeStateView> {
+    const status = await this.loadChangeStatus();
+    if (status !== "planning") {
+      throw new ChangeStatusConflictError(
+        `${STATUS_CONFLICT_PREFIX} a plan can only be attached while the Change is planning (it is ${status})`,
+      );
+    }
     const change = parseChangeSpec(specYaml);
+    // A planning placeholder holds no leases (nothing can be leased with an
+    // empty work set), so there is nothing to supersede here.
     await this.initChange(change, "running");
+    return this.view();
+  }
+
+  /** The Change-level lifecycle status (planning | running | planning-failed). */
+  async getStatus(): Promise<ChangeStatus> {
+    return this.loadChangeStatus();
+  }
+
+  /**
+   * Mark a "planning" placeholder as FAILED before its plan was attached, with
+   * the recorded reason. Only allowed while the Change is planning: a running
+   * Change's outcome is decided by its integration verdict, never by this. A
+   * re-create of the id (a fresh run) clears it.
+   */
+  async failPlanning(reason: string): Promise<ChangeStateView> {
+    const status = await this.loadChangeStatus();
+    if (status !== "planning") {
+      throw new ChangeStatusConflictError(
+        `${STATUS_CONFLICT_PREFIX} only a planning Change can be marked planning-failed (it is ${status})`,
+      );
+    }
+    const record: PlanningFailureRecord = {
+      reason: sanitizeReason(reason),
+      at: new Date().toISOString(),
+    };
+    await this.ctx.storage.put("planningFailure", record);
+    await this.ctx.storage.put("changeStatus", "planning-failed" as ChangeStatus);
     return this.view();
   }
 
@@ -732,8 +851,18 @@ export class ChangeState extends DurableObject<Env> {
    * spec, "running"), createPlanning (header-only placeholder, "planning"), and
    * attachPlan (plan attached, "running"), so the three creates stay consistent
    * and only differ in the Change they store and the status they set.
+   *
+   * Re-creating an existing Change id is a fresh run: EVERY per-run key is reset
+   * (including the ladder's verify/retry attempts and the integration verdict),
+   * so a new run never inherits the previous run's history. Any lease still
+   * outstanding at that moment (a kickoff lease not yet completed/failed, or a
+   * round-N agent still running) is captured BEFORE the wipe and returned, so the
+   * Worker revokes its token: a lease is never wiped without revocation. The
+   * capture and the wipe happen inside this one Durable Object call, so no lease
+   * can be recorded between them.
    */
-  private async initChange(change: Change, status: ChangeStatus): Promise<void> {
+  private async initChange(change: Change, status: ChangeStatus): Promise<SupersededLease[]> {
+    const superseded = await this.outstandingLeases();
     await this.ctx.storage.put("change", change);
     await this.ctx.storage.put("changeStatus", status);
     await this.ctx.storage.put("completed", [] as string[]);
@@ -787,6 +916,58 @@ export class ChangeState extends DurableObject<Env> {
     // attribution, fix-confidence). Empty until the decision layer is live and
     // a juncture records one; absent entirely on the offline path (no jev node).
     await this.ctx.storage.put("jevDecisions", [] as JevDecisionView[]);
+    // The change-level ladder history (verify attempts and model-escalation
+    // retries) and the authoritative integration verdict are per-run too: a
+    // re-created Change must not inherit the previous run's rounds or verdict.
+    await this.ctx.storage.put("verifyAttempts", [] as VerifyAttempt[]);
+    await this.ctx.storage.put("retryAttempts", [] as RetryAttempt[]);
+    await this.ctx.storage.put("integration", null);
+    await this.ctx.storage.put("planningFailure", null);
+    return superseded;
+  }
+
+  /**
+   * Every lease still outstanding on this Change: kickoff leases (a recorded
+   * lease is released on completion/failure, so any remaining one is live) and
+   * round-N agents still running (a completed/failed round agent already had its
+   * token revoked). Empty for a fresh object.
+   */
+  private async outstandingLeases(): Promise<SupersededLease[]> {
+    if ((await this.ctx.storage.get<Change>("change")) === undefined) {
+      return [];
+    }
+    const out: SupersededLease[] = [];
+    for (const lease of Object.values(await this.loadLeases())) {
+      out.push({ unitId: lease.unitId, workspaceName: lease.workspaceName, tokenId: lease.tokenId });
+    }
+    for (const agent of Object.values(await this.loadRoundAgents())) {
+      if (agent.status === "running") {
+        out.push({
+          unitId: agent.unitId,
+          round: agent.round,
+          workspaceName: agent.workspace.workspaceName,
+          tokenId: agent.workspace.tokenId,
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Record the AUTHORITATIVE whole-change integration verdict: the outcome of
+   * the final integration gate on the exact integrated tree. The run posts this
+   * once, after that gate ran; a later post replaces it (latest wins). It is the
+   * sole source of truth for the goal node's verified/failed state.
+   */
+  async recordIntegration(input: Omit<IntegrationRecord, "at">): Promise<IntegrationRecord> {
+    const stored: IntegrationRecord = {
+      verdict: input.verdict,
+      integratedUnits: [...input.integratedUnits],
+      excludedUnits: [...input.excludedUnits],
+      at: new Date().toISOString(),
+    };
+    await this.ctx.storage.put("integration", stored);
+    return stored;
   }
 
   /**
@@ -882,6 +1063,15 @@ export class ChangeState extends DurableObject<Env> {
     };
     escalations[index] = resolved;
     await this.ctx.storage.put("escalations", escalations);
+    // A resolved lease-owner decision is AUTHORITATIVE for its path: recompute
+    // and persist the write-lease plan so the stored plan (and the lease edges
+    // the console draws from it) name the human-chosen owner. An invalid
+    // decision (not a contender) is rejected by the planner, which keeps the
+    // deterministic owner and records why on the decision.
+    if (resolved.kind === "lease-owner") {
+      const change = await this.loadChange();
+      await this.ctx.storage.put("leasePlan", await this.computeLeasePlan(change));
+    }
     return resolved;
   }
 
@@ -1081,7 +1271,12 @@ export class ChangeState extends DurableObject<Env> {
       inFlightAfter: plan.inFlight + plan.recruit.length,
       at: new Date().toISOString(),
     };
-    return { completedUnit, recruited: plan.recruit, done, event };
+    return {
+      completedUnit,
+      recruited: plan.recruit,
+      done,
+      event,
+    };
   }
 
   /** Read the lease currently held for a WorkUnit, if any. */
@@ -1497,7 +1692,8 @@ export class ChangeState extends DurableObject<Env> {
     // Recompute the write-lease plan: a discovered unit may declare a path that
     // now collides with an existing unit, so the single-owner coordination must
     // reflect the grown graph.
-    const leasePlan = planWriteLeases(newChange, detectPathCollisions(newChange));
+    // Resolved human owner decisions stay authoritative across the regrowth.
+    const leasePlan = await this.computeLeasePlan(newChange);
     await this.ctx.storage.put("leasePlan", leasePlan);
     return added.map((u) => u.id);
   }
@@ -1728,6 +1924,9 @@ export class ChangeState extends DurableObject<Env> {
     const retryAttempts = await this.loadRetryAttempts();
     const roundAgents = await this.loadRoundAgents();
     const jevDecisions = await this.loadJevDecisions();
+    const integration = await this.loadIntegration();
+    const planningFailure =
+      (await this.ctx.storage.get<PlanningFailureRecord | null>("planningFailure")) ?? null;
     const statuses = workUnitStatuses(change, completed);
     const graph = buildWorkGraph(change);
     const collisions = detectPathCollisions(change);
@@ -1803,6 +2002,8 @@ export class ChangeState extends DurableObject<Env> {
         a.round !== b.round ? a.round - b.round : a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0,
       ),
       jevDecisions,
+      integration,
+      planningFailure,
     };
   }
 
@@ -1863,7 +2064,18 @@ export class ChangeState extends DurableObject<Env> {
     }
     // Backfill for a Change created before lease planning existed in state.
     const change = await this.loadChange();
-    return planWriteLeases(change, detectPathCollisions(change));
+    return this.computeLeasePlan(change);
+  }
+
+  /**
+   * The write-lease plan for a Change with every resolved human lease-owner
+   * decision applied as an owner override (validated by the planner).
+   */
+  private async computeLeasePlan(change: Change): Promise<LeasePlan> {
+    const escalations = await this.loadEscalations();
+    return planWriteLeases(change, detectPathCollisions(change), {
+      ownerOverrides: leaseOwnerOverridesFromEscalations(escalations),
+    });
   }
 
   private async loadTool(): Promise<ToolRecord | null> {
@@ -1908,6 +2120,10 @@ export class ChangeState extends DurableObject<Env> {
 
   private async loadJevDecisions(): Promise<JevDecisionView[]> {
     return (await this.ctx.storage.get<JevDecisionView[]>("jevDecisions")) ?? [];
+  }
+
+  private async loadIntegration(): Promise<IntegrationRecord | null> {
+    return (await this.ctx.storage.get<IntegrationRecord | null>("integration")) ?? null;
   }
 }
 

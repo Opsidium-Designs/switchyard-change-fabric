@@ -104,11 +104,15 @@ export interface SelectedExecutor {
   readonly maxModelRetries?: number;
 }
 
+/** The EXECUTOR values selectExecutor accepts (unset also selects the noop). */
+export const SUPPORTED_EXECUTORS: readonly string[] = ["ai-gateway", "workers-ai", "noop"];
+
 /**
  * Select the executor from the environment. `env` defaults to `process.env`.
  * Throws a clear error when a live path (`workers-ai` or `ai-gateway`) is
- * requested but its credentials are missing, rather than silently falling back
- * to a noop that would mask a real edit as deterministic.
+ * requested but its credentials are missing, or when EXECUTOR names an
+ * unsupported executor, rather than silently falling back to a noop that would
+ * mask a real edit as deterministic. Unset or "noop" selects the noop stub.
  */
 export function selectExecutor(env: ExecutorEnv = process.env): SelectedExecutor {
   const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
@@ -183,6 +187,16 @@ export function selectExecutor(env: ExecutorEnv = process.env): SelectedExecutor
       escalationModels,
       maxModelRetries,
     };
+  }
+  // Only an unset/blank EXECUTOR or an explicit "noop" selects the deterministic
+  // stub. Any other value (a typo, or an executor this repo does not implement)
+  // is an error: silently running the noop on a run the operator meant to be
+  // live would mask the missing inference as a real edit.
+  if (choice !== "" && choice !== "noop") {
+    throw new Error(
+      `unsupported EXECUTOR=${JSON.stringify(env.EXECUTOR ?? "")}: supported values are ` +
+        `${SUPPORTED_EXECUTORS.join(", ")} (or leave it unset for the deterministic noop)`,
+    );
   }
   return {
     executor: new ScopedNoopExecutor(),
@@ -332,6 +346,77 @@ export function selectPlanner(env: ExecutorEnv = process.env): SelectedPlanner {
     baseModel,
     escalationModels,
   };
+}
+
+/** The run-live flag that explicitly opts a live run into the heuristic planner. */
+export const ALLOW_HEURISTIC_PLANNER_FLAG = "--allow-heuristic-planner";
+
+/**
+ * The decision for which planner a LIVE goal-driven run may use. On a live run
+ * the LLM is the planner; the heuristic decomposition is the offline stub and
+ * must never be a SILENT live substitute. So:
+ *   - "llm": the gateway planner is live, plan with it;
+ *   - "heuristic-allowed": no live planner, but the operator passed the explicit
+ *     opt-in flag, so plan heuristically and print `banner` loudly;
+ *   - "refused": no live planner and no opt-in, so the run must fail with
+ *     `error` before it creates anything on the Worker.
+ * Offline commands (run, run-goal, decompose, the demo) never call this.
+ */
+export type LivePlannerDecision =
+  | { readonly kind: "llm" }
+  | { readonly kind: "heuristic-allowed"; readonly banner: string }
+  | { readonly kind: "refused"; readonly error: string };
+
+/** Decide which planner a live goal-driven run may use (pure, offline-testable). */
+export function decideLivePlanner(input: {
+  readonly planner: Pick<SelectedPlanner, "live" | "description">;
+  readonly allowHeuristic: boolean;
+}): LivePlannerDecision {
+  if (input.planner.live) {
+    return { kind: "llm" };
+  }
+  if (input.allowHeuristic) {
+    return {
+      kind: "heuristic-allowed",
+      banner: loudBanner([
+        "HEURISTIC PLANNER IN USE ON A LIVE RUN (explicit opt-in)",
+        `No LLM planner is available: ${input.planner.description}.`,
+        "The goal is decomposed by the deterministic heuristic, not by a model.",
+        `This was allowed only because ${ALLOW_HEURISTIC_PLANNER_FLAG} was passed.`,
+      ]),
+    };
+  }
+  return {
+    kind: "refused",
+    error:
+      `a live run needs the LLM planner, but none is available (${input.planner.description}). ` +
+      "Set EXECUTOR=ai-gateway with CLOUDFLARE_AI_GATEWAY_URL and CLOUDFLARE_AI_GATEWAY_TOKEN, " +
+      `pass --change <change.yaml> to run a hand-authored Change, or pass ${ALLOW_HEURISTIC_PLANNER_FLAG} ` +
+      "to knowingly use the heuristic decomposition.",
+  };
+}
+
+/**
+ * The loud banner a live run prints when the gateway planner's model ladder was
+ * exhausted and the plan fell back to the heuristic decomposition. The fallback
+ * is also recorded on the Change itself (`plan.source: "heuristic-fallback"`),
+ * which rides the spec to the Worker so the planner node shows it.
+ */
+export function plannerFallbackBanner(
+  diagnostics: readonly { readonly model: string; readonly reason: string }[] = [],
+): string {
+  return loudBanner([
+    "PLANNER FELL BACK TO THE HEURISTIC DECOMPOSITION",
+    "Every model in the planner ladder failed to produce a usable plan, so this live",
+    'run uses the deterministic heuristic plan (recorded as plan.source "heuristic-fallback").',
+    ...diagnostics.map((d) => `  ${d.model}: ${d.reason}`),
+  ]);
+}
+
+/** Frame lines in a rule so a warning cannot be missed in the run output. */
+function loudBanner(lines: readonly string[]): string {
+  const rule = "=".repeat(78);
+  return [rule, ...lines.map((line) => `!! ${line}`), rule].join("\n");
 }
 
 /** The default accept-when-confident threshold for the Jev decision junctures. */

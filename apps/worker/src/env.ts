@@ -19,4 +19,14 @@ export interface Env {
    * an honest, clearly-labelled fallback when it is absent.
    */
   readonly ARTIFACTS?: ArtifactsBinding;
+  /**
+   * Optional bearer token for the control plane (a Worker secret, never a
+   * committed var). When set, every mutating route and every route that returns
+   * a plaintext Artifact token requires `authorization: Bearer <token>`; the
+   * read-only snapshot GETs stay open. When unset or blank, the Worker behaves
+   * as an unauthenticated local-dev control plane. Set it with
+   * `wrangler secret put SWITCHYARD_API_TOKEN` (deploy) or a gitignored
+   * `apps/worker/.dev.vars` (wrangler dev). See src/auth.ts.
+   */
+  readonly SWITCHYARD_API_TOKEN?: string;
 }

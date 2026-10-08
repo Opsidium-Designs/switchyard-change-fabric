@@ -43,11 +43,17 @@ export {
 
 export type {
   LeaseDecision,
+  LeaseOwnerEscalationLike,
   LeasePlan,
   LeaseResolution,
+  PlanWriteLeasesOptions,
   UnitLeaseView,
 } from "./lease.ts";
-export { planWriteLeases, unitLeaseViews } from "./lease.ts";
+export {
+  leaseOwnerOverridesFromEscalations,
+  planWriteLeases,
+  unitLeaseViews,
+} from "./lease.ts";
 
 export type {
   ExportedSymbol,

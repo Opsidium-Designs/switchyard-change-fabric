@@ -43,6 +43,64 @@ export interface LeaseDecision {
   readonly waiters: readonly string[];
   /** A short, human-readable reason for the decision. */
   readonly reason: string;
+  /**
+   * Where the owner came from. Present only when a human owner decision was
+   * supplied for this path: "human-decision" when that decision was applied,
+   * "declared-order" when it was rejected (not a contender, or it would create a
+   * dependency cycle) and the deterministic owner was kept. Absent when no human
+   * decision was supplied, in which case the owner is the deterministic one.
+   */
+  readonly ownerSource?: "human-decision" | "declared-order";
+  /** The human owner decision that was requested for this path, when one was. */
+  readonly requestedOwner?: string;
+}
+
+/**
+ * Optional inputs to planWriteLeases. `ownerOverrides` maps a contested path to
+ * the WorkUnit id a human chose as its single writer (the resolved lease-owner
+ * escalation). A valid choice (one of the path's contenders, and acyclic) is
+ * authoritative for that path; an invalid one is rejected and the deterministic
+ * owner is kept, with the reason recorded on the decision.
+ */
+export interface PlanWriteLeasesOptions {
+  readonly ownerOverrides?: Readonly<Record<string, string>>;
+}
+
+/**
+ * The minimal shape of a recorded human escalation that this module reads. It
+ * matches the Worker's and the local control's escalation records.
+ */
+export interface LeaseOwnerEscalationLike {
+  readonly kind: string;
+  readonly path?: string;
+  readonly status: string;
+  readonly decision?: string;
+}
+
+/**
+ * Derive the owner overrides (path -> chosen unit id) from recorded escalations:
+ * every RESOLVED `lease-owner` escalation with a path and a non-empty decision
+ * contributes one entry. When the same path was resolved more than once, the
+ * later record wins. Pending escalations contribute nothing. Validation against
+ * the contenders happens in planWriteLeases, so an invalid decision is still
+ * passed through here and rejected (with a recorded reason) there.
+ */
+export function leaseOwnerOverridesFromEscalations(
+  escalations: readonly LeaseOwnerEscalationLike[],
+): Record<string, string> {
+  const overrides: Record<string, string> = {};
+  for (const escalation of escalations) {
+    if (escalation.kind !== "lease-owner" || escalation.status !== "resolved") {
+      continue;
+    }
+    const path = escalation.path;
+    const decision = typeof escalation.decision === "string" ? escalation.decision.trim() : "";
+    if (!path || decision === "") {
+      continue;
+    }
+    overrides[path] = decision;
+  }
+  return overrides;
 }
 
 /**
@@ -68,10 +126,17 @@ export interface LeasePlan {
  * would introduce a dependency cycle (for example two WorkUnits that each
  * already depend on the other through different paths). In that case the path is
  * flagged for attention and left for a human to resolve.
+ *
+ * When `options.ownerOverrides` names an owner for a contested path (a resolved
+ * human lease-owner decision), that owner replaces the declared-order default
+ * if it is one of the path's contenders and serializing behind it is acyclic.
+ * Otherwise the decision is rejected, the deterministic owner is kept, and the
+ * decision's reason says why.
  */
 export function planWriteLeases(
   change: Change,
   collisions: readonly PathCollision[],
+  options: PlanWriteLeasesOptions = {},
 ): LeasePlan {
   const order = declaredOrder(change);
   const decisions: LeaseDecision[] = [];
@@ -80,8 +145,50 @@ export function planWriteLeases(
 
   for (const collision of collisions) {
     const contenders = [...collision.unitIds];
-    const owner = pickOwner(contenders, order);
+    const defaultOwner = pickOwner(contenders, order);
+    const requested = options.ownerOverrides?.[collision.path];
+    const edgesFor = (owner: string) =>
+      contenders.filter((id) => id !== owner).map((waiter) => ({ waiter, owner }));
+
+    // Resolve a requested (human) owner first: it must be one of the contenders
+    // and serializing behind it must not create a dependency cycle. A rejected
+    // request keeps the deterministic owner and records why.
+    let owner = defaultOwner;
+    let override: { readonly applied: boolean; readonly note: string } | undefined;
+    if (requested !== undefined) {
+      if (!contenders.includes(requested)) {
+        override = {
+          applied: false,
+          note:
+            `human owner decision "${requested}" is not a contender (${contenders.join(", ")}), ` +
+            `so the declared-order owner ${defaultOwner} was kept`,
+        };
+      } else if (
+        requested !== defaultOwner &&
+        wouldCycle(change, [...ordering, ...edgesFor(requested)])
+      ) {
+        override = {
+          applied: false,
+          note:
+            `human owner decision "${requested}" would create a dependency cycle, ` +
+            `so the declared-order owner ${defaultOwner} was kept`,
+        };
+      } else {
+        owner = requested;
+        override = { applied: true, note: `owner chosen by a human decision` };
+      }
+    }
     const waiters = contenders.filter((id) => id !== owner);
+    const overrideFields =
+      override === undefined
+        ? {}
+        : {
+            ownerSource: override.applied
+              ? ("human-decision" as const)
+              : ("declared-order" as const),
+            requestedOwner: requested,
+          };
+    const notePrefix = override === undefined ? "" : `${override.note}; `;
 
     // Serializing means each waiter waits for the owner. Reject the serialized
     // plan if those edges would create a cycle in the dependency graph.
@@ -92,7 +199,9 @@ export function planWriteLeases(
         contenders,
         resolution: "flagged",
         waiters: [],
+        ...overrideFields,
         reason:
+          notePrefix +
           `serializing ${contenders.join(", ")} on ${collision.path} would create a ` +
           "dependency cycle, so the collision is flagged for attention",
       });
@@ -107,7 +216,9 @@ export function planWriteLeases(
       resolution: "serialized",
       owner,
       waiters,
+      ...overrideFields,
       reason:
+        notePrefix +
         `granted the write lease on ${collision.path} to ${owner}; ` +
         `${waiters.join(", ")} wait for it before integrating`,
     });

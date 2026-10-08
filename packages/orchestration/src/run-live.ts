@@ -32,10 +32,11 @@
 
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, isAbsolute, relative, resolve } from "node:path";
 
 import {
   detectPathCollisions,
+  leaseOwnerOverridesFromEscalations,
   planWriteLeases,
   type Change,
   type ConcurrencyDial,
@@ -67,6 +68,7 @@ import {
 } from "@switchyard-change/git-promotion";
 
 import { maybeBuildTool, type ToolBuildResult } from "./tool-build.ts";
+import { withWorkerAuth } from "./worker-auth.ts";
 import { stableAppWorkerName } from "./app-deploy.ts";
 import type { Escalation } from "./local-control.ts";
 import type { LiveTrigger } from "./recruit-live.ts";
@@ -191,7 +193,9 @@ export interface RunFullLiveResult {
  * live workers.dev URL and return the reachable URL. The live implementation
  * runs `wrangler deploy` in the app directory (the M8.0 deploy hop); a test
  * passes a deterministic fake so `make check` never touches the network. It is
- * only ever called AFTER verification passed, so a broken fix is never deployed.
+ * only ever called AFTER verification passed, so a broken fix is never deployed,
+ * and `appDir` is always the app inside a checkout of the PROMOTED commit (never
+ * the original source directory), so the deployed tree is the gated tree.
  */
 export type DeployApp = (input: {
   readonly appDir: string;
@@ -386,6 +390,15 @@ export interface RunFullLiveOptions {
    */
   readonly appGateCommandFor?: (unitId: string) => readonly string[] | undefined;
   /**
+   * True when the target project DECLARES a per-app gate (its package.json has a
+   * `gate` script), independent of whether the gate is wired for this run. When
+   * true and no gate command resolves (for example the operator passed
+   * --no-gate), the integrated tree still REQUIRES a gate it does not get, so the
+   * integration verdict is cannot-pass ("failed"), never a silent auto-pass.
+   * Omitted or false keeps the previous behavior for projects without a gate.
+   */
+  readonly requireAppGate?: boolean;
+  /**
    * The injectable command runner the per-app gate runs through, used by BOTH
    * the ladder's per-attempt gate and the final integration verify, so a single
    * deterministic fake keeps `make check` offline. Defaults to the verification
@@ -489,7 +502,13 @@ export type FullLiveEvent =
       readonly toModel: string;
       readonly implicatedUnits: readonly string[];
     }
+  | {
+      readonly kind: "integration-verdict";
+      readonly verdict: "verified" | "failed";
+      readonly integratedUnits: readonly string[];
+    }
   | { readonly kind: "promoting"; readonly branch: string }
+  | { readonly kind: "promotion-skipped"; readonly reason: string }
   | { readonly kind: "redeployed"; readonly url: string; readonly app: string }
   | { readonly kind: "deploy-skipped"; readonly reason: string }
   | { readonly kind: "cleaned-up"; readonly archived: readonly string[] };
@@ -502,7 +521,7 @@ export type FullLiveEvent =
 export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullLiveResult> {
   const executor = options.executor ?? new ScopedNoopExecutor();
   const identity = options.identity ?? RUNNER_IDENTITY;
-  const fetchFn = options.fetchFn ?? fetch;
+  const fetchFn = withWorkerAuth(options.fetchFn ?? fetch);
   const base = options.workerUrl.replace(/\/$/, "");
   const trigger: LiveTrigger = options.waveTrigger ?? "ingress";
   const changeId = options.change.id;
@@ -710,7 +729,11 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       // when the unit is done: the real recorded prompt + the real proposed
       // edit + the real commit message, read straight from the executor result,
       // never synthesized.
-      const diff = await buildEditDiff(worktreeDir, result.changedPaths);
+      // The kickoff worktree is a clone of a freshly leased (empty) repo, so
+      // diff each edited file against its prior content in the project
+      // baseline, not against the empty tree (which would show every file as
+      // brand new).
+      const diff = await buildEditDiff(worktreeDir, result.changedPaths, options.projectDir);
       reportDetail(agent.unitId, {
         ...(result.cost.model ? { model: result.cost.model } : {}),
         editedPaths: result.changedPaths,
@@ -945,6 +968,17 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   // set, so discovered units are verified and integrated like declared ones.
   const grownState = await getJson(`/changes/${encodeURIComponent(changeId)}`);
   const effectiveChange = effectiveChangeFromState(options.change, grownState);
+  // The resolved human lease-owner decision is AUTHORITATIVE for its path: the
+  // chosen unit's write integrates and the other contenders yield it. Read the
+  // durable escalation records (the Worker's state) and the beat's own resolved
+  // record, so the answer the run waited on actually decides ownership instead
+  // of being asked and ignored. Validation (the decision must name a contender)
+  // happens in the lease planner, which keeps the deterministic owner and
+  // records why when the decision is invalid.
+  const leaseOwnerOverrides = leaseOwnerOverridesFromEscalations([
+    ...((grownState.escalations as Escalation[] | undefined) ?? []),
+    ...(escalation.resolved ? [escalation.resolved] : []),
+  ]);
 
   // T6: the bounded, verify-verdict-driven CHANGE-LEVEL model-escalation ladder.
   // After the wave completed, run the per-app gate ONCE for the whole change
@@ -967,13 +1001,15 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   // (yielded contested paths and excluded units are removed), so the promoted
   // tree can differ from this overlay. Final success is settled later by running
   // the SAME per-app gate on the real INTEGRATED tree inside verifyAndIntegrate
-  // (see completedInputs below, which carry appGateCommand/requiresAppGate so the
-  // integrator gates the exact tree it promotes). That guarantees the gated
-  // composition equals the promoted/deployed composition. When the ladder never
-  // passes its advisory overlay, every gated unit is marked FAILED (real red
-  // nodes) and kept out of integration, so a non-fixing or broken change can
-  // never green or redeploy. The verifier is mechanical on every round (the
-  // escalation model gets another round, it never grades itself).
+  // (see integrationGateCommand below, which the integrator runs on the exact
+  // tree it promotes). That guarantees the gated composition equals the
+  // promoted/deployed composition. The ladder's own pass/fail is NOT used to
+  // exclude units: when the ladder never passes its advisory overlay, the units
+  // still go to integration as usual, and the authoritative gate on the
+  // integrated tree fails for the same reason, so the verdict is "failed" and
+  // the change is neither promoted nor redeployed. The verifier is mechanical on
+  // every round (the escalation model gets another round, it never grades
+  // itself).
   const gateCommandRunner = options.verifyCommandRunner;
   const maxModelRetries = Math.max(0, Math.floor(options.maxModelRetries ?? 1));
   const escalationModel = (options.escalationModel ?? "").trim();
@@ -1001,12 +1037,11 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       unitAuthRemotes.get(unit.id) !== undefined
     );
   });
-  // Whether the whole change passed the change-level gate. Starts true so a run
-  // with no gate (no gated units, or no runner) behaves exactly as before: no
-  // ladder, nothing marked failed, integration proceeds unchanged.
-  let changePassed = true;
+  // A run with no gate (no gated units, or no runner) skips the ladder entirely.
+  // The ladder's boolean result is advisory (it only decided whether to retry),
+  // so it is not read here: the final verdict is the integration gate below.
   if (options.appGateCommandFor && gateCommandRunner && gatedUnits.length > 0) {
-    changePassed = await runChangeLevelEscalationLadder({
+    await runChangeLevelEscalationLadder({
       changeId,
       baselineRef: effectiveChange.baseline,
       projectDir: options.projectDir,
@@ -1082,9 +1117,12 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   const integrationGateCommand = effectiveChange.work
     .map((unit) => options.appGateCommandFor?.(unit.id))
     .find((cmd) => cmd !== undefined && cmd.length > 0);
-  const requiresIntegrationGate = Boolean(
-    integrationGateCommand && integrationGateCommand.length > 0,
-  );
+  // A project that DECLARES a gate requires it even when the gate is not wired
+  // for this run (--no-gate): the integrator then has no command for a tree that
+  // requires one, so the verdict is cannot-pass, never a silent auto-pass.
+  const requiresIntegrationGate =
+    Boolean(integrationGateCommand && integrationGateCommand.length > 0) ||
+    options.requireAppGate === true;
 
   // When the change-level ladder never passed the gate (both rounds failed, or
   // escalation was disabled), the change is terminally FAILED, but that failure
@@ -1106,22 +1144,62 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     integrationProvider,
     gateCommandRunner ? { commandRunner: gateCommandRunner } : {},
   );
-  const evidence = await verification.verifyAndIntegrate({
-    change: effectiveChange,
-    completed: completedInputs,
-    integrationRef,
-    integrationToken,
-    // The WHOLE-APP gate runs ONCE here, on the exact composed integrated tree
-    // (baseline + the per-unit-verified units' real edits, with write-lease
-    // yields and exclusions applied), which is the same tree that is committed,
-    // pushed, promoted, and redeployed. This is the authoritative verdict a pass
-    // is recorded on, so a pass means the SHIPPED tree is fixed. Requiring the
-    // gate means a tree that cannot be gated can never green, and the Integrator
-    // hard-fails a silent baseline (fixes expected but apply produced nothing).
-    ...(requiresIntegrationGate ? { integrationGateCommand, requiresIntegrationGate } : {}),
-    workRoot: worktreeRoot,
-    identity,
-  });
+  // Report the AUTHORITATIVE integration verdict to the Worker. This is the
+  // goal's source of truth on the console (not the ladder's per-unit overlay),
+  // so it is posted before any promotion or deploy event. Best-effort like the
+  // other observability posts: a failed post never fails the run.
+  const reportIntegrationVerdict = async (
+    verdict: "verified" | "failed",
+    integratedUnits: readonly string[],
+    excludedUnits: readonly string[],
+  ): Promise<void> => {
+    await post(`/changes/${encodeURIComponent(changeId)}/integration`, {
+      verdict,
+      integratedUnits: [...integratedUnits],
+      excludedUnits: [...excludedUnits],
+    }).catch(() => {});
+    emit({ kind: "integration-verdict", verdict, integratedUnits });
+  };
+
+  let evidence: EvidenceSummary;
+  try {
+    evidence = await verification.verifyAndIntegrate({
+      change: effectiveChange,
+      completed: completedInputs,
+      integrationRef,
+      integrationToken,
+      // The WHOLE-APP gate runs ONCE here, on the exact composed integrated tree
+      // (baseline + the per-unit-verified units' real edits, with write-lease
+      // yields and exclusions applied), which is the same tree that is committed,
+      // pushed, promoted, and redeployed. This is the authoritative verdict a pass
+      // is recorded on, so a pass means the SHIPPED tree is fixed. Requiring the
+      // gate means a tree that cannot be gated can never green, and the Integrator
+      // hard-fails a silent baseline (fixes expected but apply produced nothing).
+      ...(requiresIntegrationGate
+        ? {
+            ...(integrationGateCommand ? { integrationGateCommand } : {}),
+            requiresIntegrationGate,
+          }
+        : {}),
+      ...(Object.keys(leaseOwnerOverrides).length > 0 ? { leaseOwnerOverrides } : {}),
+      workRoot: worktreeRoot,
+      identity,
+    });
+  } catch (error) {
+    // Integration itself refused (for example the silent-baseline guard): the
+    // change did not verify, so the goal must not go green from the overlay.
+    await reportIntegrationVerdict(
+      "failed",
+      [],
+      completedInputs.map((c) => c.unitId),
+    );
+    throw error;
+  }
+  await reportIntegrationVerdict(
+    evidence.integration.verdict,
+    evidence.integration.integratedUnits,
+    evidence.integration.excludedUnits,
+  );
 
   // Record the mechanical verification verdict per unit as a real activity step,
   // so a completed node's log ends with the honest, deterministic outcome (the
@@ -1143,7 +1221,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   // mechanical gate verdict is already decided, and record the advisory answer.
   // The mechanical gate + gate-equals-deploy REMAIN AUTHORITATIVE: this decision
   // is recorded alongside the verdict for display and confidence, and NEVER feeds
-  // the promote/deploy decision below or flips changePassed / the integrated set.
+  // the promote/deploy decision below or flips the verdict / the integrated set.
   // Offline (no Jev injected) this is skipped entirely, so the gate path is
   // unchanged. The question is a noul; a confident answer is recorded accepted,
   // a low-confidence one escalated, but either way it is advisory only.
@@ -1181,31 +1259,54 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     }
   }
 
-  // 6. Promote the integrated result into a local Git repository.
+  // 6. Promote the integrated result into a local Git repository, but ONLY when
+  // the authoritative integration verdict is "verified". A failed (or
+  // cannot-pass) tree gets no switchyard/<id> branch at all: the run reports the
+  // refusal honestly instead of shipping a tree the gate rejected.
   const sourceRepoDir = join(workRoot, "source");
   await cloneProjectForPromotion(options.projectDir, sourceRepoDir);
   const startPoint = await currentBranch(sourceRepoDir);
-  emit({ kind: "promoting", branch: defaultBranch(options.change.id) });
-  const delivery = new LocalGitDeliveryProvider({ workRoot: worktreeRoot });
-  const promotion = await delivery.promote(
-    {
+  const integrationVerdict = evidence.integration.verdict;
+  let promotion: PromotionResult;
+  if (integrationVerdict !== "verified") {
+    const refusedReason =
+      `integration verdict was "${integrationVerdict}", not "verified": not promoting ` +
+      "(no delivery branch was created)";
+    promotion = {
       changeId: options.change.id,
-      objective: options.change.objective,
-      integrationGitUrl: integrationRef.gitUrl,
-      integrationBranch: integrationRef.defaultBranch,
-      // Guard gate-equals-deploy at the promote step: when a fix was expected
-      // (the change required a behavioral app gate, OR the integration reported
-      // landed fixes), the integrated tree the authoritative gate ran on must
-      // differ from the baseline, or promotion refuses to ship the baseline.
-      // Passing BOTH signals makes the guard effective on the LIVE path even
-      // when a failed/empty integration left integratedUnits at zero: a run that
-      // required an app gate always carries expectedFixes, so a baseline-identical
-      // integrated tree is a hard error rather than a silent baseline ship.
-      expectedIntegratedUnits: evidence.integration.integratedUnits.length,
-      ...(requiresIntegrationGate ? { expectedFixes: true } : {}),
-    },
-    { repoDir: sourceRepoDir, startPoint, identity },
-  );
+      branch: defaultBranch(options.change.id),
+      commit: "",
+      deliveredPaths: [],
+      removedPaths: [],
+      committed: false,
+      refusedReason,
+    };
+    emit({ kind: "promotion-skipped", reason: refusedReason });
+  } else {
+    emit({ kind: "promoting", branch: defaultBranch(options.change.id) });
+    const delivery = new LocalGitDeliveryProvider({ workRoot: worktreeRoot });
+    promotion = await delivery.promote(
+      {
+        changeId: options.change.id,
+        objective: options.change.objective,
+        integrationGitUrl: integrationRef.gitUrl,
+        integrationBranch: integrationRef.defaultBranch,
+        // Guard gate-equals-deploy at the promote step: when a fix was expected
+        // (the change required a behavioral app gate, OR the integration reported
+        // landed fixes), the integrated tree the authoritative gate ran on must
+        // differ from the baseline, or promotion refuses to ship the baseline.
+        // Passing BOTH signals makes the guard effective on the LIVE path even
+        // when a failed/empty integration left integratedUnits at zero: a run that
+        // required an app gate always carries expectedFixes, so a baseline-identical
+        // integrated tree is a hard error rather than a silent baseline ship.
+        expectedIntegratedUnits: evidence.integration.integratedUnits.length,
+        ...(requiresIntegrationGate ? { expectedFixes: true } : {}),
+        // Defense in depth: the provider itself refuses a non-verified verdict.
+        verdict: integrationVerdict,
+      },
+      { repoDir: sourceRepoDir, startPoint, identity },
+    );
+  }
 
   // 6b. Redeploy-in-place proof: the run NEVER deploys fresh. Deploy is a manual
   // human step taken BEFORE the fix (so a watcher sees the break at a stable
@@ -1249,10 +1350,21 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       });
     } else {
       try {
+        // GATE-EQUALS-DEPLOY: deploy from a checkout of the PROMOTED commit, never
+        // from the original app directory (which still holds the unfixed
+        // baseline). The app's position inside the promoted tree is its position
+        // relative to the project directory the promotion was cloned from.
+        const promotedAppDir = await checkoutPromotedApp({
+          sourceRepoDir,
+          promotion,
+          projectDir: options.projectDir,
+          deployAppDir: options.deployAppDir,
+          targetDir: join(workRoot, "deploy-tree"),
+        });
         // Redeploy the fixed code to the SAME stable worker name, so the
         // existing deployment is updated in place at the same URL.
         const { url } = await options.deployApp({
-          appDir: options.deployAppDir,
+          appDir: promotedAppDir,
           appName: options.deployAppName,
         });
         deployment = { url, app: options.deployAppName };
@@ -2842,6 +2954,46 @@ async function cloneProjectForPromotion(projectDir: string, targetDir: string): 
   ]);
 }
 
+/**
+ * Materialize the PROMOTED commit as a detached worktree and return the app
+ * directory inside it, so a redeploy ships exactly the tree the authoritative
+ * gate verified and promotion committed. The app directory is mapped from the
+ * caller's `deployAppDir` by its position relative to `projectDir` (the tree the
+ * promotion was cloned from). Throws (so the caller skips the deploy honestly)
+ * when nothing was promoted or the app lies outside the promoted project.
+ */
+export async function checkoutPromotedApp(input: {
+  readonly sourceRepoDir: string;
+  readonly promotion: PromotionResult;
+  readonly projectDir: string;
+  readonly deployAppDir: string;
+  readonly targetDir: string;
+}): Promise<string> {
+  if (!input.promotion.committed || input.promotion.commit === "") {
+    throw new Error("nothing was promoted, so there is no promoted tree to deploy");
+  }
+  const appRel = relative(resolve(input.projectDir), resolve(input.deployAppDir));
+  if (appRel.startsWith("..") || isAbsolute(appRel)) {
+    throw new Error(
+      "the app directory is outside the promoted project, so it cannot be deployed from the promoted tree",
+    );
+  }
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  await rm(input.targetDir, { recursive: true, force: true });
+  await run("git", [
+    "-C",
+    input.sourceRepoDir,
+    "worktree",
+    "add",
+    "--detach",
+    input.targetDir,
+    input.promotion.commit,
+  ]);
+  return appRel === "" ? input.targetDir : join(input.targetDir, appRel);
+}
+
 async function currentBranch(dir: string): Promise<string> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
@@ -2909,7 +3061,7 @@ export async function cleanupLive(options: {
   /** Called with the app name after a successful teardown, to clear its marker. */
   readonly onAppTornDown?: (app: string) => Promise<void>;
 }): Promise<CleanupLiveResult> {
-  const fetchFn = options.fetchFn ?? fetch;
+  const fetchFn = withWorkerAuth(options.fetchFn ?? fetch);
   const base = options.workerUrl.replace(/\/$/, "");
   const res = await fetchFn(`${base}/changes/${encodeURIComponent(options.changeId)}`);
   if (res.status >= 400) {
@@ -2980,7 +3132,7 @@ export async function createPlanningChange(options: {
   readonly header: PlanningChangeHeader;
   readonly fetchFn?: typeof fetch;
 }): Promise<boolean> {
-  const fetchFn = options.fetchFn ?? fetch;
+  const fetchFn = withWorkerAuth(options.fetchFn ?? fetch);
   const base = options.workerUrl.replace(/\/$/, "");
   try {
     const res = await fetchFn(`${base}/changes/planning`, {
@@ -2992,6 +3144,39 @@ export async function createPlanningChange(options: {
   } catch {
     // Best-effort: the Change is still created by runFullLive the normal way,
     // so a failed placeholder create only delays the console attach slightly.
+    return false;
+  }
+}
+
+/**
+ * Mark a "planning" PLACEHOLDER Change as failed when the run exits before the
+ * plan is attached (the planner threw, no Change could be resolved, or a
+ * precondition failed after the placeholder was created). Without this the
+ * placeholder would sit in "planning" forever on the console. It posts
+ * `{ reason }` to `POST /changes/:id/planning-failed`. Best-effort like the
+ * placeholder create: a Worker without the route (404) or an unreachable Worker
+ * returns false and never masks the original error. The reason is bounded and
+ * carries no credential.
+ */
+export async function failPlanningChange(options: {
+  readonly workerUrl: string;
+  readonly changeId: string;
+  readonly reason: string;
+  readonly fetchFn?: typeof fetch;
+}): Promise<boolean> {
+  const fetchFn = withWorkerAuth(options.fetchFn ?? fetch);
+  const base = options.workerUrl.replace(/\/$/, "");
+  try {
+    const res = await fetchFn(
+      `${base}/changes/${encodeURIComponent(options.changeId)}/planning-failed`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ reason: failureReason(options.reason) }),
+      },
+    );
+    return res.status < 400;
+  } catch {
     return false;
   }
 }
@@ -3112,17 +3297,35 @@ function effectiveChangeFromState(original: Change, state: Record<string, unknow
   return { ...original, work };
 }
 
+/** The largest diff stored for the console; a bigger edit shows its head. */
+const MAX_EDIT_DIFF = 16_000;
+
+/** Bound a diff for storage, marking a truncation honestly. */
+function boundDiff(text: string): string {
+  const trimmed = text.trim();
+  return trimmed.length > MAX_EDIT_DIFF
+    ? `${trimmed.slice(0, MAX_EDIT_DIFF)}\n... (diff truncated)`
+    : trimmed;
+}
+
 /**
  * Build a readable unified diff of the model's edit from the cloned worktree,
- * for the console's click-detail. The edit was written into the worktree but not
- * yet committed, so `git diff` (including untracked files) shows exactly what the
- * model proposed against the baseline. The result is bounded so a huge edit does
- * not bloat the state, and it is the REAL diff of the real edit, not synthesized.
+ * for the console's click-detail. The result is bounded so a huge edit does not
+ * bloat the state, and it is the REAL diff of the real edit, not synthesized.
  * Returns an empty string when there is nothing to diff or Git is unavailable.
+ *
+ * With a `baselineDir` (the kickoff wave, whose worktree is a clone of a freshly
+ * leased EMPTY repo), each changed path is diffed against that file's prior
+ * content in the project baseline, so an edit to an existing file reads as a
+ * real change rather than a whole new file; only a file genuinely absent from
+ * the baseline shows as new. Without one (a retry round, whose worktree shares
+ * the unit repo history), the uncommitted edit is diffed against HEAD, or the
+ * empty tree when the repo has no commit yet.
  */
-async function buildEditDiff(
+export async function buildEditDiff(
   worktreeDir: string,
   changedPaths: readonly string[],
+  baselineDir?: string,
 ): Promise<string> {
   if (changedPaths.length === 0) {
     return "";
@@ -3130,6 +3333,9 @@ async function buildEditDiff(
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const run = promisify(execFile);
+  if (baselineDir !== undefined && baselineDir !== "") {
+    return boundDiff(await diffAgainstBaseline(worktreeDir, changedPaths, baselineDir));
+  }
   try {
     // Stage intent-to-add so untracked new files appear in the diff too.
     await run("git", ["-C", worktreeDir, "add", "-AN"]).catch(() => {});
@@ -3151,13 +3357,79 @@ async function buildEditDiff(
       ["-C", worktreeDir, "--no-pager", "diff", "--no-color", ...against],
       { maxBuffer: 2 * 1024 * 1024 },
     );
-    const text = stdout.trim();
-    if (text === "") {
-      return "";
-    }
-    // Bound the stored diff; the console shows the head of a very large edit.
-    return text.length > 16_000 ? `${text.slice(0, 16_000)}\n... (diff truncated)` : text;
+    return boundDiff(stdout);
   } catch {
     return "";
   }
+}
+
+/**
+ * Diff each changed path in the worktree against the same path in the baseline
+ * directory with `git diff --no-index`, rewriting the absolute file names in the
+ * headers to the repo-relative path so the output reads like a normal
+ * `a/<path>` / `b/<path>` diff. A path missing from the baseline is diffed
+ * against /dev/null (a genuinely new file); a path deleted in the worktree is
+ * diffed to /dev/null. Paths escaping either root are skipped.
+ */
+async function diffAgainstBaseline(
+  worktreeDir: string,
+  changedPaths: readonly string[],
+  baselineDir: string,
+): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const { access } = await import("node:fs/promises");
+  const { isAbsolute, relative, resolve: resolvePath } = await import("node:path");
+  const run = promisify(execFile);
+  const exists = async (p: string): Promise<boolean> =>
+    access(p).then(
+      () => true,
+      () => false,
+    );
+  const inside = (root: string, p: string): boolean => {
+    const rel = relative(root, p);
+    return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  };
+  const parts: string[] = [];
+  for (const rel of [...new Set(changedPaths)].sort()) {
+    const before = resolvePath(baselineDir, rel);
+    const after = resolvePath(worktreeDir, rel);
+    if (!inside(resolvePath(baselineDir), before) || !inside(resolvePath(worktreeDir), after)) {
+      continue;
+    }
+    const left = (await exists(before)) ? before : "/dev/null";
+    const right = (await exists(after)) ? after : "/dev/null";
+    if (left === "/dev/null" && right === "/dev/null") {
+      continue;
+    }
+    let out = "";
+    try {
+      const { stdout } = await run(
+        "git",
+        ["--no-pager", "diff", "--no-index", "--no-color", "--", left, right],
+        { maxBuffer: 2 * 1024 * 1024 },
+      );
+      out = stdout;
+    } catch (err) {
+      // `git diff --no-index` exits 1 when the files differ; its stdout is the diff.
+      const stdout = (err as { stdout?: unknown }).stdout;
+      out = typeof stdout === "string" ? stdout : "";
+    }
+    if (out.trim() === "") {
+      continue;
+    }
+    // git prints absolute operands without their leading slash after a/ and b/.
+    const strip = (p: string): string => p.replace(/^\/+/, "");
+    out = out
+      .split(`a/${strip(before)}`)
+      .join(`a/${rel}`)
+      .split(`b/${strip(after)}`)
+      .join(`b/${rel}`)
+      .split(`b/${strip(before)}`)
+      .join(`b/${rel}`)
+      .split(`a/${strip(after)}`)
+      .join(`a/${rel}`);
+    parts.push(out.trimEnd());
+  }
+  return parts.join("\n");
 }

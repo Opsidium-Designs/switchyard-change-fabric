@@ -1114,6 +1114,262 @@ describe("the goal node reflects the authoritative verify verdict, not the first
 
 
 /**
+ * The goal is decided by the AUTHORITATIVE integration verdict (the final
+ * integration gate on the exact integrated tree), never by the ladder overlay.
+ * A Worker snapshot always reports `integration` (null until recorded), so a
+ * passing ladder round alone can never green the goal, and a recorded failed
+ * integration reds it even when a ladder round passed.
+ */
+describe("the goal node follows the authoritative integration verdict over the ladder overlay", () => {
+  /** The ladder snapshot (round 1 failed, round 2 PASSED on the overlay). */
+  function passingLadder(): ChangeStateSnapshot {
+    return ladderSnapshot();
+  }
+
+  it("ladder verify-attempt PASS + integration FAILED => the goal is red, not green", () => {
+    const snapshot: ChangeStateSnapshot = {
+      ...passingLadder(),
+      integration: { verdict: "failed", integratedUnits: [], excludedUnits: ["fix"] },
+    };
+    const model = buildWorkGraphModel(snapshot);
+    const goal = model.nodes.find((n) => n.kind === "goal")!;
+    expect(goal.verified).toBe(false);
+    expect(goal.status).toBe("failed");
+    // The red goal is backed by the recorded verdict (no-unbacked-node).
+    expect(goal.backing).toEqual({
+      kind: "change",
+      changeId: "change-ladder",
+      integrationVerdict: "failed",
+    });
+    expect(() => assertBacked(goal, snapshot)).not.toThrow();
+    // The ladder overlay is still drawn honestly: its round-2 verify passed.
+    expect(model.nodes.find((n) => n.id === verifyNodeId("change-ladder", 2))?.verified).toBe(true);
+  });
+
+  it("before the integration verdict exists the goal is in progress, even after a ladder pass", () => {
+    const model = buildWorkGraphModel({ ...passingLadder(), integration: null });
+    const goal = model.nodes.find((n) => n.kind === "goal")!;
+    expect(goal.verified).toBe(false);
+    expect(goal.status).toBe("running");
+  });
+
+  it("before the integration verdict exists the goal is in progress, even with every unit integrated and no ladder", () => {
+    const model = buildWorkGraphModel({
+      ...passingLadder(),
+      verifyAttempts: [],
+      retryAttempts: [],
+      roundAgents: [],
+      integration: null,
+    });
+    const goal = model.nodes.find((n) => n.kind === "goal")!;
+    expect(goal.verified).toBe(false);
+    expect(goal.status).toBe("running");
+  });
+
+  it("before the integration verdict exists an exhausted failing ladder does not red the goal on its own", () => {
+    const model = buildWorkGraphModel({
+      ...passingLadder(),
+      verifyAttempts: [
+        { round: 1, outcome: "fail", model: "base-model", at: "t1" },
+        { round: 2, outcome: "fail", model: "escalation-model", at: "t2" },
+      ],
+      integration: null,
+    });
+    expect(model.nodes.find((n) => n.kind === "goal")?.status).toBe("running");
+  });
+
+  it("integration VERIFIED greens the goal, even if the latest ladder round failed", () => {
+    const snapshot: ChangeStateSnapshot = {
+      ...passingLadder(),
+      verifyAttempts: [{ round: 1, outcome: "fail", model: "base-model", at: "t1" }],
+      retryAttempts: [],
+      roundAgents: [],
+      integration: { verdict: "verified", integratedUnits: ["fix"], excludedUnits: [] },
+    };
+    const goal = buildWorkGraphModel(snapshot).nodes.find((n) => n.kind === "goal")!;
+    expect(goal.verified).toBe(true);
+    expect(goal.status).toBe("integrated");
+    expect(() => assertBacked(goal, snapshot)).not.toThrow();
+  });
+
+  it("rejects a goal that claims a verdict the state does not record, or a green goal with no verdict", () => {
+    const snapshot: ChangeStateSnapshot = { ...passingLadder(), integration: null };
+    const greenWithoutVerdict: GraphNode = {
+      id: goalNodeId("change-ladder"),
+      kind: "goal",
+      label: "x",
+      status: "integrated",
+      verified: true,
+      escalated: false,
+      backing: { kind: "change", changeId: "change-ladder" },
+    };
+    expect(() => assertBacked(greenWithoutVerdict, snapshot)).toThrow(/no integration verdict/);
+    const claimsVerified: GraphNode = {
+      ...greenWithoutVerdict,
+      backing: { kind: "change", changeId: "change-ladder", integrationVerdict: "verified" },
+    };
+    expect(() => assertBacked(claimsVerified, snapshot)).toThrow(/integration verdict/);
+    expect(() =>
+      assertBacked(claimsVerified, {
+        ...snapshot,
+        integration: { verdict: "failed", integratedUnits: [], excludedUnits: ["fix"] },
+      }),
+    ).toThrow(/integration verdict verified/);
+  });
+});
+
+/**
+ * Edge honesty: the verify-flow edge is ladder control-flow (`trigger`) and its
+ * backing names the real recorded verify attempt (and, for a later round, the
+ * real recorded retry it came from), never a fabricated declared dependency.
+ */
+describe("the verify-flow edge is backed by the real recorded verify attempt", () => {
+  it("backs round 1 by its verify attempt and round 2 by its verify attempt plus the retry it came from", () => {
+    const model = buildWorkGraphModel(ladderSnapshot());
+    const flow1 = model.edges.find((e) => e.id === "verify-flow:change-ladder#1")!;
+    const flow2 = model.edges.find((e) => e.id === "verify-flow:change-ladder#2")!;
+    expect(flow1.kind).toBe("trigger");
+    expect(flow1.backing).toEqual({ kind: "verify-flow", changeId: "change-ladder", round: 1, outcome: "fail" });
+    expect(flow2.kind).toBe("trigger");
+    expect(flow2.from).toBe(retryNodeId("change-ladder", 2));
+    expect(flow2.backing).toEqual({
+      kind: "verify-flow",
+      changeId: "change-ladder",
+      round: 2,
+      outcome: "pass",
+      retryRound: 2,
+      toModel: "escalation-model",
+    });
+  });
+
+  it("never pairs a trigger edge with a declared-dependency backing", () => {
+    const model = buildWorkGraphModel(ladderSnapshot());
+    for (const edge of model.edges) {
+      if (edge.kind === "trigger") {
+        expect(edge.backing.kind, edge.id).not.toBe("dependency");
+      }
+    }
+  });
+
+  it("hangs a later round with no recorded retry off the goal, never off a missing retry node", () => {
+    const model = buildWorkGraphModel({ ...ladderSnapshot(), retryAttempts: [], roundAgents: [] });
+    const flow2 = model.edges.find((e) => e.id === "verify-flow:change-ladder#2")!;
+    expect(flow2.from).toBe(goalNodeId("change-ladder"));
+    const nodeIds = new Set(model.nodes.map((n) => n.id));
+    for (const edge of model.edges) {
+      expect(nodeIds.has(edge.from), edge.id).toBe(true);
+      expect(nodeIds.has(edge.to), edge.id).toBe(true);
+    }
+  });
+});
+
+/** A planning placeholder that failed before a plan was attached reds the goal, backed. */
+describe("the goal node reflects a recorded planning failure", () => {
+  function failedPlaceholder(): ChangeStateSnapshot {
+    return {
+      id: "change-pf",
+      objective: "never planned",
+      status: "planning-failed",
+      work: [],
+      edges: [],
+      completed: [],
+      integration: null,
+      planningFailure: { reason: "planner threw", at: "t" },
+    };
+  }
+
+  it("is terminal red, backed by the recorded failure reason", () => {
+    const snapshot = failedPlaceholder();
+    const goal = buildWorkGraphModel(snapshot).nodes.find((n) => n.kind === "goal")!;
+    expect(goal.status).toBe("failed");
+    expect(goal.verified).toBe(false);
+    expect(goal.backing).toEqual({ kind: "change", changeId: "change-pf", planningFailure: "planner threw" });
+    expect(() => assertBacked(goal, snapshot)).not.toThrow();
+  });
+
+  it("rejects a goal claiming a planning failure the state does not record", () => {
+    const snapshot: ChangeStateSnapshot = { ...failedPlaceholder(), status: "planning", planningFailure: null };
+    const bogus: GraphNode = {
+      id: goalNodeId("change-pf"),
+      kind: "goal",
+      label: "x",
+      status: "failed",
+      verified: false,
+      escalated: false,
+      backing: { kind: "change", changeId: "change-pf", planningFailure: "planner threw" },
+    };
+    expect(() => assertBacked(bogus, snapshot)).toThrow(/planning failure/);
+  });
+
+  it("a still-planning placeholder is in progress, not red", () => {
+    const goal = buildWorkGraphModel({ ...failedPlaceholder(), status: "planning", planningFailure: null }).nodes.find(
+      (n) => n.kind === "goal",
+    )!;
+    expect(goal.status).toBe("running");
+  });
+});
+
+/** The jev-flow edge is backed by the real recorded Jev decision, not a placeholder. */
+describe("the jev-flow edge is backed by the recorded Jev decision", () => {
+  it("names the decision's juncture, index, question, answer type, and confidence", () => {
+    const snapshot: ChangeStateSnapshot = {
+      ...ladderSnapshot(),
+      jevDecisions: [
+        { juncture: "fix-confidence", question: "acceptable?", answerType: "noul", noul: "yes", confidence: 0.9, accepted: true },
+        { juncture: "fix-confidence", question: "still acceptable?", answerType: "noul", noul: "no", confidence: 0.7, accepted: false },
+      ],
+    };
+    const model = buildWorkGraphModel(snapshot);
+    const flows = model.edges.filter((e) => e.id.startsWith("jev-flow:"));
+    expect(flows).toHaveLength(2);
+    expect(flows[1]!.backing).toEqual({
+      kind: "jev-decision",
+      changeId: "change-ladder",
+      juncture: "fix-confidence",
+      index: 1,
+      question: "still acceptable?",
+      answerType: "noul",
+      confidence: 0.7,
+    });
+    expect(flows[1]!.to).toBe(jevNodeId("change-ladder", "fix-confidence", 1));
+    // No edge anywhere still carries a placeholder "jev#" dependency backing.
+    for (const edge of model.edges) {
+      if (edge.backing.kind === "dependency") {
+        expect(edge.backing.to.startsWith("jev#"), edge.id).toBe(false);
+      }
+    }
+  });
+});
+
+/**
+ * A heuristic-fallback plan must not read as plain planner success: the planner
+ * node is not greened and carries a warning the console draws amber.
+ */
+describe("the planner node flags a heuristic-fallback plan", () => {
+  function withPlan(source: "planner" | "heuristic-fallback"): ChangeStateSnapshot {
+    return {
+      ...ladderSnapshot(),
+      plan: { source, model: source === "planner" ? "gpt-x" : "", units: ["fix"], contracts: [] },
+    };
+  }
+
+  it("a heuristic-fallback planner node carries a warning and is not verified", () => {
+    const snapshot = withPlan("heuristic-fallback");
+    const planner = buildWorkGraphModel(snapshot).nodes.find((n) => n.kind === "planner")!;
+    expect(planner.verified).toBe(false);
+    expect(planner.warning).toMatch(/heuristic fallback/i);
+    expect(planner.label).toMatch(/heuristic fallback/);
+    expect(() => assertBacked(planner, snapshot)).not.toThrow();
+  });
+
+  it("a real planner node has no warning and stays green", () => {
+    const planner = buildWorkGraphModel(withPlan("planner")).nodes.find((n) => n.kind === "planner")!;
+    expect(planner.verified).toBe(true);
+    expect(planner.warning).toBeUndefined();
+  });
+});
+
+/**
  * H2: the `jev` typed-decision node and the no-unbacked-node rule for it. A jev
  * node is emitted only when the state records a matching Jev decision, placed
  * near its juncture (plan-review by the planner, attribution at the retry,

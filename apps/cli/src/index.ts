@@ -25,7 +25,9 @@ import {
   cleanupLive,
   clearAppDeployment,
   createPlanningChange,
+  decideLivePlanner,
   decomposeGoal,
+  failPlanningChange,
   describeChange,
   formatChangePlan,
   formatDecomposition,
@@ -33,6 +35,8 @@ import {
   formatRecruitmentSummary,
   formatRunSummary,
   buildAppGateWiring,
+  plannerFallbackBanner,
+  ALLOW_HEURISTIC_PLANNER_FLAG,
   projectHasGateScript,
   readAppDeployment,
   recordAppDeployment,
@@ -52,6 +56,7 @@ import {
   type PlannerInjection,
   type RePlanTransport,
   type TeardownApp,
+  redactSecrets,
 } from "@switchyard-change/orchestration";
 import { DiscoveringExecutor } from "@switchyard-change/model-adapters";
 
@@ -280,9 +285,13 @@ const commands: Command[] = [
   {
     name: "recruit-live",
     summary: "Recruit agents into real Cloudflare Artifact repos via a running Worker (wrangler dev).",
-    usage: `${CLI_NAME} recruit-live "<goal>" --project <dir> --worker <url> [--min N] [--max N]`,
+    usage: `${CLI_NAME} recruit-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
-      const change = await resolveChange(args);
+      // A live run: the LLM is the planner (fail without one unless opted in).
+      if (!enforceLivePlanner(args)) {
+        return 1;
+      }
+      const change = await resolveChange(args, { live: true });
       if (!change) {
         console.error(
           `Usage: ${CLI_NAME} recruit-live "<goal text>" --project <dir> --worker <url> [--min N] [--max N]\n` +
@@ -332,11 +341,33 @@ const commands: Command[] = [
     name: "run-live",
     summary:
       "Full live run: decompose -> recruit real agents (Workers AI) -> escalate -> verify -> integrate -> promote -> cleanup.",
-    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--id <changeId>] [--watch] [--await-escalation] [--gate|--no-gate] [--max-model-retries N]`,
+    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--id <changeId>] [--watch] [--await-escalation] [--gate|--no-gate] [--max-model-retries N] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
       const dial = dialFromArgs(args);
+
+      // Cheap preconditions run BEFORE the planning placeholder is created, so a
+      // misconfigured run exits without leaving an orphaned "planning" Change on
+      // the Worker.
+      if (!projectDir) {
+        console.error("A target project is required: pass --project <dir>.");
+        return 1;
+      }
+      // Select the executor from the environment (.env). ai-gateway / workers-ai
+      // are the live inference paths; noop is the deterministic stub. The
+      // credential is read inside selectExecutor and never printed here.
+      let selected;
+      try {
+        selected = selectExecutor();
+      } catch (error) {
+        console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      }
+      // On a live goal-driven run the LLM is the planner (see enforceLivePlanner).
+      if (!enforceLivePlanner(args)) {
+        return 1;
+      }
 
       // Watch mode: leave the real Artifact repos and the Change state in place
       // after the run so a human can watch the finished graph morph in the
@@ -410,27 +441,35 @@ const commands: Command[] = [
         await createPlanningChange({ workerUrl, header: planningHeader }).catch(() => false);
       }
 
-      const change = await resolveChange(args);
+      // Resolve (plan) the Change. If planning throws or yields nothing after the
+      // placeholder was created, mark the placeholder failed (best-effort) so it
+      // does not sit in "planning" forever, then exit.
+      const placeholderId = planningHeader ? planningHeader.id : undefined;
+      let change: Change | undefined;
+      try {
+        change = await resolveChange(args, { live: true });
+      } catch (error) {
+        if (placeholderId) {
+          await failPlanningChange({
+            workerUrl,
+            changeId: placeholderId,
+            reason: `planning failed: ${error instanceof Error ? error.message : String(error)}`,
+          });
+        }
+        throw error;
+      }
       if (!change) {
+        if (placeholderId) {
+          await failPlanningChange({
+            workerUrl,
+            changeId: placeholderId,
+            reason: "no Change could be resolved (no goal or --change supplied)",
+          });
+        }
         console.error(
           `Usage: ${CLI_NAME} run-live "<goal text>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>]\n` +
             `   or: ${CLI_NAME} run-live --change <change.yaml> --project <dir> --worker <url> [--min N] [--max N]`,
         );
-        return 1;
-      }
-      if (!projectDir) {
-        console.error("A target project is required: pass --project <dir>.");
-        return 1;
-      }
-
-      // Select the executor from the environment (.env). workers-ai is the live
-      // inference path; anything else is the deterministic noop. The credential
-      // is read inside selectExecutor and never printed here.
-      let selected;
-      try {
-        selected = selectExecutor();
-      } catch (error) {
-        console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
         return 1;
       }
 
@@ -565,8 +604,13 @@ const commands: Command[] = [
               ? `, escalation model ${selected.escalationModel}`
               : ""),
         );
+      } else if (gateWiring.requireAppGate) {
+        console.error(
+          "  per-app gate: DISABLED by --no-gate, but this project declares a gate. The gate is " +
+            "required, so this run CANNOT pass verification and will not promote or redeploy.",
+        );
       } else {
-        console.log("  per-app gate: OFF (no gate script for this project, or --no-gate)");
+        console.log("  per-app gate: OFF (no gate script for this project)");
       }
 
       const result = await runFullLive({
@@ -581,6 +625,7 @@ const commands: Command[] = [
         // run so the gate and the bounded ladder actually run; when disabled it
         // is empty, so a non-app project runs unchanged.
         ...(gateWiring.appGateCommandFor ? { appGateCommandFor: gateWiring.appGateCommandFor } : {}),
+        ...(gateWiring.requireAppGate ? { requireAppGate: true } : {}),
         ...(gateWiring.verifyCommandRunner
           ? { verifyCommandRunner: gateWiring.verifyCommandRunner }
           : {}),
@@ -649,8 +694,17 @@ const commands: Command[] = [
             case "verifying":
               console.log("Verifying and integrating (mechanical ground truth)...");
               break;
+            case "integration-verdict":
+              console.log(
+                `Integration verdict (authoritative gate): ${event.verdict} ` +
+                  `(${event.integratedUnits.length} unit(s) integrated)`,
+              );
+              break;
             case "promoting":
               console.log(`Promoting to local Git branch ${event.branch}...`);
+              break;
+            case "promotion-skipped":
+              console.log(`Promotion skipped: ${event.reason}`);
               break;
             case "discovered":
               console.log(
@@ -701,6 +755,8 @@ const commands: Command[] = [
         console.log(
           `  promoted: ${result.promotion.branch} (${result.promotion.commit.slice(0, 10)}) in ${result.sourceRepoDir}`,
         );
+      } else if (result.promotion.refusedReason) {
+        console.log(`  promoted: REFUSED (${result.promotion.refusedReason})`);
       } else {
         console.log("  promoted: nothing to promote (no changes)");
       }
@@ -951,6 +1007,32 @@ function plannerInjectionFromEnv(): PlannerInjection | undefined {
 }
 
 /**
+ * The live-planner rule shared by every LIVE goal-driven command (run-live,
+ * recruit-live): on a live run the LLM is the planner, so without a live gateway
+ * planner the command FAILS (returns false after printing the error) unless the
+ * operator explicitly passed --allow-heuristic-planner, in which case a loud
+ * banner says the heuristic is in use. A hand-authored --change is not
+ * decomposed, so it needs no planner. Offline commands never call this.
+ */
+function enforceLivePlanner(args: readonly string[]): boolean {
+  if (optionValue(args, "--change")) {
+    return true;
+  }
+  const decision = decideLivePlanner({
+    planner: selectPlanner(),
+    allowHeuristic: hasFlag(args, ALLOW_HEURISTIC_PLANNER_FLAG),
+  });
+  if (decision.kind === "refused") {
+    console.error(`Error: ${decision.error}`);
+    return false;
+  }
+  if (decision.kind === "heuristic-allowed") {
+    console.error(decision.banner);
+  }
+  return true;
+}
+
+/**
  * Build the opt-in re-plan transport for the change-level ladder from the same
  * gateway env the planner uses. When the schema-constrained planner is live, the
  * returned transport asks it, on a verify-fail, to decide WHICH of the candidate
@@ -1015,7 +1097,10 @@ function rePlanFromEnv(): RePlanTransport | undefined {
  * against a target project) or a hand-authored Change YAML (--change). Returns
  * undefined when neither a goal+project nor a --change file was provided.
  */
-async function resolveChange(args: readonly string[]): Promise<Change | undefined> {
+async function resolveChange(
+  args: readonly string[],
+  options: { readonly live?: boolean } = {},
+): Promise<Change | undefined> {
   const changeFile = optionValue(args, "--change");
   if (changeFile) {
     const specYaml = await readFile(resolve(changeFile), "utf8");
@@ -1040,6 +1125,13 @@ async function resolveChange(args: readonly string[]): Promise<Change | undefine
     projectDir,
     ...(planner ? { planner } : {}),
   });
+  // A live run whose gateway planner exhausted its model ladder fell back to the
+  // heuristic. That is recorded on the Change (plan.source "heuristic-fallback",
+  // which rides the spec to the Worker's planner node); say it loudly here too so
+  // the operator cannot miss that no model planned this run.
+  if (options.live && decomposition.change.plan?.source === "heuristic-fallback") {
+    console.error(plannerFallbackBanner());
+  }
   return decomposition.change;
 }
 
@@ -1079,7 +1171,11 @@ async function wranglerDeploy(appDir: string): Promise<string> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const run = promisify(execFile);
-  const { stdout, stderr } = await run("npx", ["wrangler", "deploy"], {
+  // A redeploy runs in a temporary checkout of the PROMOTED commit (outside the
+  // repo, with no node_modules), so use the repo's own pinned wrangler binary
+  // when present rather than letting npx resolve or download one.
+  const [cmd, cmdArgs] = await wranglerCommand(["deploy"]);
+  const { stdout, stderr } = await run(cmd, cmdArgs, {
     cwd: appDir,
     env: process.env,
     maxBuffer: 4 * 1024 * 1024,
@@ -1090,6 +1186,20 @@ async function wranglerDeploy(appDir: string): Promise<string> {
     throw new Error("wrangler deploy did not print a workers.dev URL");
   }
   return match[0];
+}
+
+/** The wrangler invocation: the repo's installed binary, else npx. */
+async function wranglerCommand(
+  args: readonly string[],
+): Promise<[string, string[]]> {
+  const { access } = await import("node:fs/promises");
+  const bin = resolve(repoRoot(), "node_modules", ".bin", "wrangler");
+  try {
+    await access(bin);
+    return [bin, [...args]];
+  } catch {
+    return ["npx", ["wrangler", ...args]];
+  }
 }
 
 /**
@@ -1140,9 +1250,9 @@ async function main(argv: string[]): Promise<number> {
   try {
     return await command.run(rest);
   } catch (error) {
-    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
-    if (process.env.SCF_DEBUG && error instanceof Error) {
-      console.error(error.stack);
+    console.error(`Error: ${redactSecrets(error instanceof Error ? error.message : String(error))}`);
+    if (process.env.SCF_DEBUG && error instanceof Error && error.stack) {
+      console.error(redactSecrets(error.stack));
     }
     return 1;
   }
@@ -1151,6 +1261,6 @@ async function main(argv: string[]): Promise<number> {
 main(process.argv)
   .then((code) => process.exit(code))
   .catch((error) => {
-    console.error(error);
+    console.error(redactSecrets(String(error instanceof Error ? (error.stack ?? error.message) : error)));
     process.exit(1);
   });

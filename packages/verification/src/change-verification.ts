@@ -94,6 +94,14 @@ export interface VerifyAndIntegrateOptions {
    * cannot be gated.
    */
   readonly requiresIntegrationGate?: boolean;
+  /**
+   * Resolved human lease-owner decisions (contested path -> chosen WorkUnit id).
+   * A valid choice is authoritative for that path: the chosen unit's write
+   * integrates and the other contenders yield the path. An invalid choice (not a
+   * contender, or cyclic) is rejected and the deterministic owner is kept, with
+   * the reason recorded in the coordination evidence.
+   */
+  readonly leaseOwnerOverrides?: Readonly<Record<string, string>>;
   readonly workRoot?: string;
   readonly identity?: GitIdentity;
 }
@@ -153,9 +161,14 @@ export class ChangeVerification {
     const workRoot = options.workRoot ?? tmpdir();
 
     // Coordinate declared path collisions before integration. The plan is a
-    // pure function of the Change, so it is reproducible every run.
+    // pure function of the Change and any resolved human owner decisions, so it
+    // is reproducible every run.
     const collisions = detectPathCollisions(change);
-    const leasePlan = planWriteLeases(change, collisions);
+    const leasePlan = planWriteLeases(
+      change,
+      collisions,
+      options.leaseOwnerOverrides ? { ownerOverrides: options.leaseOwnerOverrides } : {},
+    );
     const leaseViews = unitLeaseViews(leasePlan);
     const coordination: CoordinationSummary | undefined =
       collisions.length === 0
@@ -169,6 +182,8 @@ export class ChangeVerification {
               owner: d.owner,
               waiters: d.waiters,
               reason: d.reason,
+              ...(d.ownerSource !== undefined ? { ownerSource: d.ownerSource } : {}),
+              ...(d.requestedOwner !== undefined ? { requestedOwner: d.requestedOwner } : {}),
             })),
           };
 

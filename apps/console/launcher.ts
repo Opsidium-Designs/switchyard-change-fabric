@@ -14,9 +14,17 @@
  *                                  CURRENT (broken) state to its STABLE live URL,
  *                                  BEFORE any fix, and return the workers.dev URL
  *   GET  /api/runs/:id            the launcher-side status of a launched run
+ *   GET  /api/deployments         the app URLs already deployed (read from the
+ *                                  gitignored .deployments/<app>.json markers),
+ *                                  so a console reload remembers a prior Deploy
  *   POST /api/cleanup {changeId, app?}  tear down that run's real Artifact repos
  *                                  and (when app is given) the app's stable
  *                                  deployed Worker
+ *   POST /api/worker/changes/...  the console's MUTATION proxy to the Worker: it
+ *                                  forwards the POST to the same Worker path and,
+ *                                  when SWITCHYARD_API_TOKEN is set in this dev
+ *                                  process's environment, adds the bearer header
+ *                                  server-side (see proxyWorkerPost)
  *
  * A launch spawns the existing `switchyard-change run-live` CLI (so the live run
  * driver and the CLI commands stay the single underlying implementation; the
@@ -24,18 +32,22 @@
  * polling the Worker's own `GET /changes/:id` exactly as before. For an
  * escalating template the launch passes `--await-escalation`, so the run blocks
  * on the real pending escalation until the human answers in the console; the
- * answer is the console's existing POST straight to the Worker's resolve route.
+ * answer is the console's POST to the Worker's resolve route, sent through the
+ * /api/worker proxy so the browser never holds the Worker API token.
  *
  * The launcher only ever runs one of the fixed, repo-relative templates by id.
  * It never executes a browser-supplied path or command, and it never prints or
  * forwards the Cloudflare token (the spawned CLI inherits the already-sourced
- * environment from the dev process; the launcher reads no secret itself).
+ * environment from the dev process). The only secret it reads itself is the
+ * optional SWITCHYARD_API_TOKEN, which it places ONLY in the authorization
+ * header of a proxied Worker POST and never logs or returns to the browser.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import type { ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import type { Connect, Plugin } from "vite";
 
@@ -63,13 +75,24 @@ interface LaunchedRun {
 
 const runs = new Map<string, LaunchedRun>();
 
+/**
+ * Mask URL userinfo and bare Artifact tokens (a failed `git clone` echoes its
+ * token-bearing URL). Mirrors redactSecrets in the orchestration package; the
+ * launcher stays free of workspace imports.
+ */
+export function redactSecrets(text: string): string {
+  return text
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1***@")
+    .replace(/\bart_v\d+_[A-Za-z0-9_%.=-]+/g, "art_***");
+}
+
 /** Append a line to a run's small rolling log. */
 function pushLog(run: LaunchedRun, chunk: string): void {
   for (const line of chunk.split(/\r?\n/)) {
     if (line.trim() === "") {
       continue;
     }
-    run.log.push(line);
+    run.log.push(redactSecrets(line));
     if (run.log.length > 50) {
       run.log.shift();
     }
@@ -200,6 +223,135 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
+/** The header every /api/worker proxy response carries (see src/worker-post.ts). */
+export const WORKER_PROXY_MARKER = "x-switchyard-proxy";
+
+/** The largest request body the Worker proxy relays (a resolve/dial body is tiny). */
+const MAX_PROXY_BODY_BYTES = 1_000_000;
+
+/** The outcome of one proxied Worker POST, ready to write to the response. */
+export interface ProxiedResponse {
+  readonly status: number;
+  readonly contentType: string;
+  readonly body: string;
+}
+
+/**
+ * Validate a browser-supplied proxy path: it must be a plain Worker Change path
+ * (`/changes/...`), with no query, fragment, backslash, empty segment, or `..`
+ * segment (raw or percent-encoded), so the proxy can only ever reach the
+ * Worker's own Change routes and never another host or path.
+ */
+export function isAllowedProxyPath(path: string): boolean {
+  if (!/^\/changes\/[A-Za-z0-9._~%:@!$&'()*+,;=/-]+$/.test(path)) {
+    return false;
+  }
+  if (path.includes("//") || path.includes("\\")) {
+    return false;
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(path);
+  } catch {
+    return false;
+  }
+  return !decoded.split("/").some((segment) => segment === ".." || segment === ".") && !decoded.includes("\\");
+}
+
+/**
+ * Forward one console mutation to the Worker. The path is validated against the
+ * allowlist; the bearer is added ONLY when a token is configured (it is never
+ * logged and never echoed back); the Worker's status and body are relayed as is.
+ * An unreachable Worker is a 502. Pure apart from the injected fetch, so it is
+ * testable offline.
+ */
+export async function proxyWorkerPost(options: {
+  readonly path: string;
+  readonly body: string;
+  readonly contentType?: string;
+  readonly workerUrl: string;
+  readonly token?: string;
+  readonly fetchFn?: typeof fetch;
+}): Promise<ProxiedResponse> {
+  if (!isAllowedProxyPath(options.path)) {
+    return {
+      status: 400,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "the Worker proxy only forwards /changes/... paths" }),
+    };
+  }
+  const headers: Record<string, string> = {
+    "content-type": options.contentType && options.contentType !== "" ? options.contentType : "application/json",
+  };
+  const token = options.token?.trim();
+  if (token) {
+    headers.authorization = `Bearer ${token}`;
+  }
+  const base = options.workerUrl.replace(/\/$/, "");
+  try {
+    const res = await (options.fetchFn ?? fetch)(`${base}${options.path}`, {
+      method: "POST",
+      headers,
+      body: options.body,
+    });
+    return {
+      status: res.status,
+      contentType: res.headers.get("content-type") ?? "application/json",
+      body: await res.text(),
+    };
+  } catch {
+    return {
+      status: 502,
+      contentType: "application/json",
+      body: JSON.stringify({ error: `cannot reach the Worker at ${base}` }),
+    };
+  }
+}
+
+/** Read a raw request body, refusing one larger than the proxy limit. */
+async function readRawBody(req: Connect.IncomingMessage): Promise<string | null> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    const buffer = chunk as Buffer;
+    size += buffer.length;
+    if (size > MAX_PROXY_BODY_BYTES) {
+      return null;
+    }
+    chunks.push(buffer);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
+ * Read the per-app deployment markers (`.deployments/<app>.json`, written by the
+ * deploy-app CLI and cleared on teardown) for the given known apps and return
+ * app -> URL. Only template apps are read (never a browser-supplied name), and
+ * only an https URL is returned; a missing or malformed marker is skipped. The
+ * marker holds only the public URL, never a secret.
+ */
+export async function readDeployedUrls(
+  repoRoot: string,
+  apps: readonly string[],
+): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  for (const app of apps) {
+    if (!/^[A-Za-z0-9._-]+$/.test(app)) {
+      continue;
+    }
+    try {
+      const raw = await readFile(join(repoRoot, ".deployments", `${app}.json`), "utf8");
+      const parsed = JSON.parse(raw) as { url?: unknown };
+      if (typeof parsed.url === "string" && /^https:\/\/\S+$/.test(parsed.url)) {
+        out[app] = parsed.url;
+      }
+    } catch {
+      /* no marker: the app is not deployed */
+    }
+  }
+  return out;
+}
+
 /** Spawn a run-live child for a template under a chosen dial and track it. */
 function launch(template: Template, dial: LaunchDial): LaunchedRun {
   const changeId = freshChangeId(template);
@@ -247,6 +399,17 @@ export function launcherPlugin(): Plugin {
           return;
         }
         sendJson(res, 200, { templates: TEMPLATES });
+      });
+
+      server.middlewares.use("/api/deployments", (req, res, next) => {
+        if (req.method !== "GET") {
+          next();
+          return;
+        }
+        const apps = TEMPLATES.flatMap((t) => (t.app ? [t.app] : []));
+        void readDeployedUrls(REPO_ROOT, apps).then((deployments) =>
+          sendJson(res, 200, { deployments }),
+        );
       });
 
       server.middlewares.use("/api/launch", (req, res, next) => {
@@ -339,6 +502,40 @@ export function launcherPlugin(): Plugin {
           exitCode: run.exitCode,
           dial: run.dial,
           log: run.log,
+        });
+      });
+
+      // The console's MUTATION proxy. Connect strips the mount prefix, so
+      // req.url is the Worker path (e.g. /changes/<id>/escalations/<e>/resolve).
+      // Every response carries the proxy marker so the console knows it reached
+      // the proxy and never re-sends the mutation directly.
+      server.middlewares.use("/api/worker", (req, res, next) => {
+        if (req.method !== "POST") {
+          next();
+          return;
+        }
+        void (async () => {
+          res.setHeader(WORKER_PROXY_MARKER, "1");
+          const body = await readRawBody(req);
+          if (body === null) {
+            sendJson(res, 413, { error: "request body too large" });
+            return;
+          }
+          const proxied = await proxyWorkerPost({
+            path: req.url ?? "",
+            body,
+            contentType: String(req.headers["content-type"] ?? ""),
+            workerUrl: WORKER_URL,
+            token: process.env.SWITCHYARD_API_TOKEN,
+          });
+          res.statusCode = proxied.status;
+          res.setHeader("content-type", proxied.contentType);
+          res.end(proxied.body);
+        })().catch(() => {
+          if (!res.headersSent) {
+            res.setHeader(WORKER_PROXY_MARKER, "1");
+            sendJson(res, 502, { error: "worker proxy failed" });
+          }
         });
       });
 

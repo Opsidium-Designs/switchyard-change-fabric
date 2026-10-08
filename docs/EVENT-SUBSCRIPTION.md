@@ -15,7 +15,13 @@ second code path to drift:
 2. The ingress path: `POST /events/repo-pushed` on the Worker calls the exact
    same downstream handler (`handleRepoPushed`), so the offline test substrate
    and a run on an account without a provisioned subscription both exercise the
-   identical recruitment logic.
+   identical recruitment logic. The live run driver posts each agent's push to
+   this ingress, which is how a local `make dev-all` run (whose `wrangler dev`
+   consumer cannot see the remote Queue) drives its waves.
+
+Either way, a recruitment caused by a repo-pushed event is what the console draws
+as a `spawn` edge, and only that. Ladder control flow (verify fail, re-plan,
+retry) is a separate `trigger` edge, never a `spawn`.
 
 ## Provisioning the subscription
 
@@ -106,7 +112,7 @@ Proven live against the account:
   event is the only path that could have recruited `b`.
 
   Observed on the deployed Worker
-  `https://switchyard-change-fabric.ckinney.workers.dev`: the next wave appeared
+  `https://switchyard-change-fabric.<your-subdomain>.workers.dev`: the next wave appeared
   within about ten seconds of the push, with the state recording
   `recruitments = [ (kickoff, [a]), (repo-pushed, [b]) ]`.
 

@@ -19,6 +19,7 @@ import {
   appendDiscoveredUnits,
   buildWorkGraph,
   detectPathCollisions,
+  leaseOwnerOverridesFromEscalations,
   normalizeDial,
   parseChangeSpec,
   planWriteLeases,
@@ -160,9 +161,28 @@ function planViewFromChange(change: Change): PlanView | undefined {
  * The Change-level lifecycle status (mirrors the Worker DO's ChangeStatus):
  * "planning" while a Change exists as a placeholder and the planner is still
  * deciding the work, "running" once the plan is attached (or from the start for
- * a full-spec create).
+ * a full-spec create), "planning-failed" once a placeholder failed before its
+ * plan was attached.
  */
-export type ChangeStatus = "planning" | "running";
+export type ChangeStatus = "planning" | "running" | "planning-failed";
+
+/**
+ * The AUTHORITATIVE whole-change integration verdict (mirrors the Worker DO):
+ * the final integration gate's outcome on the exact integrated tree. It alone
+ * decides the goal node's verified/failed state; null until recorded.
+ */
+export interface IntegrationRecord {
+  readonly verdict: "verified" | "failed";
+  readonly integratedUnits: readonly string[];
+  readonly excludedUnits: readonly string[];
+  readonly at: string;
+}
+
+/** Why a planning placeholder failed before a plan was attached (mirrors the DO). */
+export interface PlanningFailureRecord {
+  readonly reason: string;
+  readonly at: string;
+}
 
 /** The header fields needed to create a "planning" placeholder Change. */
 export interface PlanningChangeHeader {
@@ -237,6 +257,14 @@ export interface ChangeStateView {
    * fix-confidence decision is advisory only and never flips the gate verdict.
    */
   readonly jevDecisions: readonly JevDecisionView[];
+  /**
+   * The authoritative integration verdict (mirrors the Worker), or null until
+   * recorded, so the offline graph's goal follows the verdict exactly like the
+   * live one rather than the ladder overlay.
+   */
+  readonly integration: IntegrationRecord | null;
+  /** Why the planning placeholder failed (mirrors the Worker), or null. */
+  readonly planningFailure: PlanningFailureRecord | null;
 }
 
 /** A recorded WorkUnit failure (mirrors the Worker's FailureRecord). */
@@ -463,6 +491,10 @@ class ChangeRecord {
    * attached or for a full-spec create. Mutable so attachPlan can flip it.
    */
   status: ChangeStatus = "running";
+  /** The authoritative integration verdict, once recorded (mirrors the DO). */
+  integration: IntegrationRecord | null = null;
+  /** Why the planning placeholder failed, once recorded (mirrors the DO). */
+  planningFailure: PlanningFailureRecord | null = null;
   constructor(change: Change) {
     this.change = change;
   }
@@ -513,7 +545,9 @@ export class LocalChangeControl {
    * DO's attachPlan): re-parse the full spec YAML (now carrying the real work and
    * the recorded plan), replace the stored Change with it, and flip the status to
    * "running". The run has not advanced (no leases/completions), so a fresh
-   * record is correct, but a planning placeholder must already exist for this id.
+   * record is correct, but a planning placeholder must already exist for this id
+   * and still be "planning" (mirroring the DO, which refuses to wipe a running
+   * or failed Change by attaching to it).
    */
   attachPlan(specYaml: string): Change {
     const change = parseChangeSpec(specYaml);
@@ -521,10 +555,55 @@ export class LocalChangeControl {
     if (!existing) {
       throw new Error(`no such Change: ${change.id}`);
     }
+    if (existing.status !== "planning") {
+      throw new Error(
+        `a plan can only be attached while the Change is planning (it is ${existing.status})`,
+      );
+    }
     const record = new ChangeRecord(change);
     record.status = "running";
     this.records.set(change.id, record);
     return change;
+  }
+
+  /**
+   * Record the AUTHORITATIVE integration verdict (as POST /changes/:id/integration
+   * does): the final integration gate's outcome. Latest wins.
+   */
+  recordIntegration(
+    changeId: string,
+    input: Omit<IntegrationRecord, "at">,
+  ): IntegrationRecord {
+    const record = this.require(changeId);
+    const stored: IntegrationRecord = {
+      verdict: input.verdict,
+      integratedUnits: [...input.integratedUnits],
+      excludedUnits: [...input.excludedUnits],
+      at: new Date().toISOString(),
+    };
+    record.integration = stored;
+    return stored;
+  }
+
+  /**
+   * Mark a planning placeholder as failed (as POST /changes/:id/planning-failed
+   * does). Only a "planning" Change can move to "planning-failed".
+   */
+  failPlanning(changeId: string, reason: string): PlanningFailureRecord {
+    const record = this.require(changeId);
+    if (record.status !== "planning") {
+      throw new Error(
+        `only a planning Change can be marked planning-failed (it is ${record.status})`,
+      );
+    }
+    const text = sanitizeText((reason ?? "").replace(/\s+/g, " ").trim(), 300);
+    const stored: PlanningFailureRecord = {
+      reason: text === "" ? "planning failed" : text,
+      at: new Date().toISOString(),
+    };
+    record.planningFailure = stored;
+    record.status = "planning-failed";
+    return stored;
   }
 
   /** Set the min/max concurrency dial (as POST /changes/:id/dial does). */
@@ -1198,7 +1277,11 @@ export class LocalChangeControl {
     const statuses = workUnitStatuses(change, record.completed);
     const collisions = detectPathCollisions(change);
     const graph = buildWorkGraph(change);
-    const leasePlan = planWriteLeases(change, collisions);
+    // A resolved human lease-owner decision is authoritative for its path, so the
+    // lease edges shown reflect the chosen owner (mirrors the Worker).
+    const leasePlan = planWriteLeases(change, collisions, {
+      ownerOverrides: leaseOwnerOverridesFromEscalations(record.escalations),
+    });
     const leaseEdges: LeaseEdge[] = [];
     for (const decision of leasePlan.decisions as readonly LeaseDecision[]) {
       if (decision.resolution === "serialized" && decision.owner !== undefined) {
@@ -1278,6 +1361,8 @@ export class LocalChangeControl {
         a.round !== b.round ? a.round - b.round : a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0,
       ),
       jevDecisions: record.jevDecisions,
+      integration: record.integration,
+      planningFailure: record.planningFailure,
     };
   }
 
@@ -1337,6 +1422,42 @@ export class LocalChangeControl {
         app: String(b.app ?? ""),
       });
       return json({ deployment: recorded }, 201);
+    }
+    const integrationRoute = url.pathname.match(/^\/changes\/([^/]+)\/integration$/);
+    if (method === "POST" && integrationRoute) {
+      const b = parseBody(init);
+      const isStrings = (v: unknown): v is string[] =>
+        Array.isArray(v) && v.every((x) => typeof x === "string");
+      if (b.verdict !== "verified" && b.verdict !== "failed") {
+        return json({ error: 'integration verdict must be "verified" or "failed"' }, 400);
+      }
+      if (!isStrings(b.integratedUnits) || !isStrings(b.excludedUnits)) {
+        return json({ error: "integratedUnits and excludedUnits must be string arrays" }, 400);
+      }
+      try {
+        const recorded = this.recordIntegration(dec(integrationRoute[1]), {
+          verdict: b.verdict,
+          integratedUnits: b.integratedUnits,
+          excludedUnits: b.excludedUnits,
+        });
+        return json({ integration: recorded }, 201);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 404);
+      }
+    }
+    const planningFailedRoute = url.pathname.match(/^\/changes\/([^/]+)\/planning-failed$/);
+    if (method === "POST" && planningFailedRoute) {
+      const b = parseBody(init);
+      const changeId = dec(planningFailedRoute[1]);
+      if (!this.records.has(changeId)) {
+        return json({ error: `no such Change: ${changeId}` }, 404);
+      }
+      try {
+        const recorded = this.failPlanning(changeId, typeof b.reason === "string" ? b.reason : "");
+        return json({ planningFailure: recorded, status: "planning-failed" }, 200);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 409);
+      }
     }
     const verifyAttemptRoute = url.pathname.match(/^\/changes\/([^/]+)\/verify-attempt$/);
     if (method === "POST" && verifyAttemptRoute) {

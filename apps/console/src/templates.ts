@@ -35,15 +35,13 @@ export interface Template {
   readonly description: string;
   /**
    * A clear, human-readable statement of WHAT THIS DOES: the small app or change
-   * the run operates on, in plain language. Shown on the gallery card and in the
-   * run header so a watcher knows what they are looking at before and during the
-   * run.
+   * the run operates on, in plain language. Shown once, on the gallery card.
    */
   readonly whatItDoes: string;
   /**
    * A clear, human-readable statement of WHAT PROBLEM THIS RUN SOLVES: the
    * planted bug or missing feature the fabric fixes, and the observable
-   * before/after. Shown on the card and in the run header.
+   * before/after. Shown once, on the gallery card.
    */
   readonly problemItSolves: string;
   /** A human-readable hint at how many agents the run recruits. */
@@ -61,8 +59,9 @@ export interface Template {
   readonly projectDir: string;
   /**
    * For a real-app template, the app directory name under examples/apps. When
-   * set, the end of a successful run can deploy this app to a live workers.dev
-   * URL as a clickable proof the fix works, and a per-run teardown deletes it.
+   * set, a human can Deploy the app (broken) to a stable workers.dev URL before
+   * the run; a verified run then redeploys the fix to that same URL in place (it
+   * never deploys fresh), and a per-run teardown deletes it.
    * Absent for the non-app intro template (which promotes to local Git only).
    */
   readonly app?: string;
@@ -79,30 +78,25 @@ export interface Template {
 
 /**
  * The shipped templates. ONE is the simple intro (the audit-logging change);
- * the other is a REAL small web app the fabric fixes, deploying to a live
- * `workers.dev` URL as end-of-run proof.
+ * the other is a REAL small web app the fabric fixes.
  *
- *   - audit-logging: the simple intro. A layered 3-agent change that hits the
- *     shared events module, so it ESCALATES and pauses for a human decision.
- *   - service-api: a multi-resource JSON API served by one Worker, deliberately
- *     modular (each resource owned by its own file) over two frozen shared
- *     contracts (requireAuth, json/problem). Every resource skips input
- *     validation and the auth check, so unauthenticated and invalid requests
- *     wrongly succeed. The fix is per-resource and independent but shares the
- *     frozen contracts, so the fabric recruits one agent per resource and they
- *     each fix their own module against the same interface. The fix is deployed
- *     to a live workers.dev URL as end-of-run proof.
+ *   - audit-logging: the simple intro. A layered 3-agent change where two units
+ *     declare the same shared file, so it ESCALATES and pauses for a human.
+ *   - service-api: a multi-resource JSON API served by one Worker, one module
+ *     per resource over two frozen shared contracts (requireAuth, json/problem).
+ *     Every resource skips validation and auth; the fabric recruits one agent per
+ *     resource. A verified fix redeploys IN PLACE only when the app was manually
+ *     Deployed first; otherwise it promotes to Git with no live URL.
  */
 export const TEMPLATES: readonly Template[] = [
   {
     id: "audit-logging",
     name: "Audit logging (intro)",
-    description:
-      "The simple intro: three agents add audit logging; two contend for a shared module, so the run pauses for your decision.",
+    description: "Three agents add audit logging; two share a file, so the run pauses for you.",
     whatItDoes:
-      "Adds organization-level audit logging to a small TypeScript project across three coordinated agents (model, api, tests).",
+      "Adds audit logging to a small TypeScript project with three agents (model, api, tests).",
     problemItSolves:
-      "The api and tests agents both need to write the shared src/audit/events.ts module. Mechanical evidence cannot decide which agent owns the single write lease, so the run pauses and asks you to choose the owner, then proceeds.",
+      "api and tests both declare src/audit/events.ts. The lease plan keeps it single-writer (one unit owns it, the other yields it at integration), but who should own a shared file is a call evidence cannot settle, so the run escalates and waits for your answer. The unit you choose owns the path: its version is the one integrated and shipped (an answer that names neither unit falls back to the first-declared owner, and the evidence records why).",
     agentCountHint: "about 3 agents",
     escalates: true,
     source: { kind: "change", changeFile: "examples/changes/audit-logging.change.yaml" },
@@ -111,12 +105,11 @@ export const TEMPLATES: readonly Template[] = [
   {
     id: "service-api",
     name: "Fix a multi-resource API (many agents)",
-    description:
-      "A JSON API whose every resource accepts unauthenticated and invalid requests. One agent per resource fixes its own module against two shared contracts.",
+    description: "A JSON API that accepts unauthenticated and invalid requests; one agent per resource fixes it.",
     whatItDoes:
-      "Operates on service-api: a multi-resource JSON API served by one Cloudflare Worker (users, orders, products, auth, search, notifications). Each resource is its own module; two frozen shared contracts (requireAuth and json/problem) sit at the seams. The fix is deployed to a live workers.dev URL as end-of-run proof.",
+      "service-api: one Cloudflare Worker serving users, orders, products, auth, search, and notifications, each its own module over frozen requireAuth and json/problem contracts.",
     problemItSolves:
-      "Every resource skips input validation and does not call the shared requireAuth, so unauthenticated and invalid requests wrongly succeed. The fix is independent per resource (each module validates its inputs and calls requireAuth) but shares the frozen auth and response contracts, so the fabric recruits one agent per resource and each fixes its own module against the same interface. Before: an unauthenticated POST returns 201; after: it returns 401, and an invalid body returns 400.",
+      "No resource validates input or calls requireAuth. Before: an unauthenticated POST returns 201. After: it returns 401, and an invalid body returns 400. If you Deployed the app first, the verified fix redeploys to the same URL.",
     agentCountHint: "about 6 agents, one per resource",
     escalates: false,
     source: { kind: "goal", goalFile: "examples/goals/service-api-validation-auth.goal.txt" },

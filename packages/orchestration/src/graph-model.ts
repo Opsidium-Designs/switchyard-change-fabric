@@ -359,6 +359,22 @@ export interface RoundAgentSnapshot {
 }
 
 /**
+ * The AUTHORITATIVE whole-change integration verdict, as reported by the state:
+ * the outcome of the final integration gate on the exact integrated/promoted
+ * tree (gate-equals-deploy). It is the sole source of truth for the goal node's
+ * verified/failed state; the per-round ladder verify attempts are an advisory
+ * overlay on the way there and never green or red the goal on their own.
+ */
+export interface IntegrationSnapshot {
+  readonly verdict: "verified" | "failed";
+  /** The unit ids the final integration integrated. */
+  readonly integratedUnits: readonly string[];
+  /** The unit ids the final integration excluded. */
+  readonly excludedUnits: readonly string[];
+  readonly at?: string;
+}
+
+/**
  * A recorded schema-constrained plan for this Change, as reported by the state.
  * This is the real backing for the `planner` node: the planner pass decided the
  * in-scope modules, each unit objective, the agent count, and the dependency
@@ -459,10 +475,28 @@ export interface ChangeStateSnapshot {
    * while the Change exists as a placeholder and the planner is still deciding
    * the work, "running" once the plan is attached. Optional so a snapshot that
    * predates the status field still projects; the graph model does not key any
-   * node/edge off it (the goal outcome comes from the verify attempts), so it is
-   * purely informational for a reader of the snapshot.
+   * node/edge off it (the goal outcome comes from the integration verdict), so
+   * it is purely informational for a reader of the snapshot.
    */
-  readonly status?: "planning" | "running";
+  readonly status?: "planning" | "running" | "planning-failed";
+  /**
+   * Why the planning placeholder failed before a plan was attached (status
+   * "planning-failed"), or null/absent. When present it backs the goal node's
+   * terminal red: the run never got a plan, so it can never pass.
+   */
+  readonly planningFailure?: { readonly reason: string; readonly at?: string } | null;
+  /**
+   * The AUTHORITATIVE whole-change integration verdict. Three states:
+   *   - an IntegrationSnapshot: the final integration gate ran; its verdict alone
+   *     decides whether the goal is verified (green) or failed (red);
+   *   - null: the state tracks the verdict (the Worker always reports the field)
+   *     but none is recorded yet, so the goal is still in progress and can NEVER
+   *     show verified, even if a ladder verify round passed;
+   *   - absent (undefined): a snapshot source with no integration concept (the
+   *     offline control surface, or an older Worker), which keeps the legacy
+   *     reading (latest verify round, else every-unit-integrated).
+   */
+  readonly integration?: IntegrationSnapshot | null;
   readonly work: readonly WorkUnitSnapshot[];
   readonly edges: readonly DependencySnapshot[];
   readonly completed: readonly string[];
@@ -585,7 +619,17 @@ export type GraphEdgeKind =
  * unrepresentable rather than merely discouraged.
  */
 export type NodeBacking =
-  | { readonly kind: "change"; readonly changeId: string }
+  | {
+      // The goal node is backed by the Change itself. When its verified/failed
+      // state came from the authoritative integration verdict, the verdict is
+      // named here so assertBacked can check it against the recorded verdict:
+      // a green or red goal can never be claimed without that record.
+      readonly kind: "change";
+      readonly changeId: string;
+      readonly integrationVerdict?: "verified" | "failed";
+      /** The recorded planning-failure reason, when the goal is red because planning failed. */
+      readonly planningFailure?: string;
+    }
   | {
       // A planner node is backed by the real recorded plan the planner pass
       // produced for this Change, so it can never be a decorative "it planned"
@@ -710,6 +754,34 @@ export type EdgeBacking =
       readonly toModel: string;
     }
   | {
+      // A jev-flow edge (a Jev decision hanging off its juncture's anchor) is
+      // backed by the real recorded Jev decision it leads to: the same change,
+      // juncture, question, answer type, and confidence the jev node's own
+      // backing names, at its position among same-juncture decisions.
+      readonly kind: "jev-decision";
+      readonly changeId: string;
+      readonly juncture: JevJuncture;
+      readonly index: number;
+      readonly question: string;
+      readonly answerType: "noul" | "choice" | "score";
+      readonly confidence: number;
+    }
+  | {
+      // A verify-flow edge (the integrated change flowing into one round's
+      // gate) is backed by the real recorded verify attempt for that round and,
+      // for a later round, by the real recorded retry whose edits that round
+      // graded (the edge's source). It is ladder control-flow (a `trigger`
+      // edge), never a declared WorkGraph dependency.
+      readonly kind: "verify-flow";
+      readonly changeId: string;
+      readonly round: number;
+      readonly outcome: "pass" | "fail";
+      /** The retry round whose edits flowed into this verify, when it came from a retry. */
+      readonly retryRound?: number;
+      /** That retry's escalation model, when it came from a retry. */
+      readonly toModel?: string;
+    }
+  | {
       // A re-fan edge is backed by a real recorded CHANGE-LEVEL retry AND a real
       // implicated unit id that retry re-fanned: the retry round re-ran that unit
       // on the escalation model. The edge is only drawn from the retry node to a
@@ -767,6 +839,14 @@ export interface GraphNode {
    * derived from the real recorded decision, so it is backed exactly like the node.
    */
   readonly jevDetail?: JevDetailSnapshot;
+  /**
+   * A short, human-readable WARNING when the node completed but in a degraded
+   * way that must not read as plain success. Today it is set on the kickoff
+   * planner node when the recorded plan is the deterministic heuristic fallback
+   * (no planner model returned a usable plan): the console draws it amber with
+   * this text instead of the healthy green. Absent on a normal node.
+   */
+  readonly warning?: string;
   /** The concrete state element this node was derived from. */
   readonly backing: NodeBacking;
 }
@@ -866,6 +946,30 @@ export function assertBacked(node: GraphNode, snapshot: ChangeStateSnapshot): Gr
       if (backing.changeId !== snapshot.id) {
         throw new Error(
           `unbacked node ${node.id}: goal backing ${backing.changeId} is not the Change ${snapshot.id}`,
+        );
+      }
+      if (backing.planningFailure !== undefined) {
+        // A goal red because planning failed must match the recorded failure.
+        if (!snapshot.planningFailure || snapshot.planningFailure.reason !== backing.planningFailure) {
+          throw new Error(
+            `unbacked node ${node.id}: goal claims a planning failure but none matching is recorded`,
+          );
+        }
+      } else if (backing.integrationVerdict !== undefined) {
+        // A goal claiming an integration verdict must match the recorded one.
+        if (!snapshot.integration || snapshot.integration.verdict !== backing.integrationVerdict) {
+          throw new Error(
+            `unbacked node ${node.id}: goal claims integration verdict ${backing.integrationVerdict} but the state records ${
+              snapshot.integration ? snapshot.integration.verdict : "none"
+            }`,
+          );
+        }
+      } else if (snapshot.integration === null && (node.verified || node.status === "failed")) {
+        // The state tracks the authoritative verdict but has none yet: a goal
+        // that is green or red without it is exactly the unbacked verdict the
+        // rule forbids (the ladder overlay alone cannot decide the goal).
+        throw new Error(
+          `unbacked node ${node.id}: goal is ${node.verified ? "verified" : "failed"} but no integration verdict is recorded`,
         );
       }
       return node;
@@ -1154,15 +1258,32 @@ function isRoundAgentSpawned(agent: RoundAgentSnapshot | undefined): boolean {
 interface GoalOutcome {
   readonly status: WorkUnitStatus;
   readonly verified: boolean;
+  /** The integration verdict the outcome came from, when it came from one. */
+  readonly integrationVerdict?: "verified" | "failed";
+  /** The recorded planning-failure reason, when the outcome came from it. */
+  readonly planningFailure?: string;
 }
 
 /**
  * Derive the goal node's state from the AUTHORITATIVE change outcome, not from
- * the first wave finishing.
+ * the first wave finishing and not from the ladder overlay.
  *
- * The authoritative verdict for the whole change is the promoted-artifact gate
- * run: the change-level verify attempts the ladder records. When the ladder has
- * run, the latest round's outcome is ground truth, so:
+ * The authoritative verdict for the whole change is the FINAL INTEGRATION gate
+ * on the exact integrated/promoted tree (gate-equals-deploy), which the run
+ * records as `integration` after that gate ran:
+ *
+ *   - integration recorded: its verdict ALONE decides the goal (verified ->
+ *     green/integrated, failed -> red/failed), whatever the ladder rounds said.
+ *     A ladder round can pass on its overlay while the final integration fails
+ *     (for example a unit excluded at integration), so the overlay must never
+ *     green the goal;
+ *   - integration tracked but not yet recorded (null): the run is still in
+ *     progress (planning, running a wave, or verifying), so the goal is running
+ *     and NEVER verified, even after a passing ladder round.
+ *
+ * Only a snapshot with no integration concept at all (undefined: the offline
+ * control surface or an older Worker) keeps the legacy reading below, where the
+ * ladder's latest round stands in for the verdict:
  *
  *   - green (integrated) ONLY when the latest recorded verify round PASSED (the
  *     authoritative gate passed on the promoted artifact);
@@ -1181,6 +1302,24 @@ interface GoalOutcome {
  * every-unit-integrated reading it has always used for that path.
  */
 function goalOutcome(snapshot: ChangeStateSnapshot): GoalOutcome {
+  const integration = snapshot.integration;
+  if (integration) {
+    return integration.verdict === "verified"
+      ? { status: "integrated", verified: true, integrationVerdict: "verified" }
+      : { status: "failed", verified: false, integrationVerdict: "failed" };
+  }
+  if (snapshot.planningFailure) {
+    // The run never got a plan (the placeholder failed before one was
+    // attached), so the change can never pass: terminal red, backed by the
+    // recorded failure.
+    return { status: "failed", verified: false, planningFailure: snapshot.planningFailure.reason };
+  }
+  if (integration === null) {
+    // The verdict is tracked but not recorded yet: in progress, never green.
+    return { status: "running", verified: false };
+  }
+
+  // Legacy snapshot (no integration concept): the ladder stands in.
   const verifyAttempts = snapshot.verifyAttempts ?? [];
   if (verifyAttempts.length === 0) {
     // No authoritative gate recorded: fall back to every-unit-integrated.
@@ -1306,14 +1445,20 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
         id: goalNodeId(snapshot.id),
         kind: "goal",
         label: snapshot.objective || snapshot.id,
-        // The goal reads from the AUTHORITATIVE change verdict (the promoted
-        // -artifact gate the ladder records), not from the first wave finishing:
-        // green only after a passing verify round, terminal red once the ladder
-        // exhausts on a failing round, running otherwise. See goalOutcome.
+        // The goal reads from the AUTHORITATIVE change verdict (the final
+        // integration gate on the integrated tree), not from the first wave
+        // finishing and not from the ladder overlay. See goalOutcome.
         status: goal.status,
         verified: goal.verified,
         escalated: goalEscalated,
-        backing: { kind: "change", changeId: snapshot.id },
+        backing: {
+          kind: "change",
+          changeId: snapshot.id,
+          ...(goal.integrationVerdict !== undefined
+            ? { integrationVerdict: goal.integrationVerdict }
+            : {}),
+          ...(goal.planningFailure !== undefined ? { planningFailure: goal.planningFailure } : {}),
+        },
       },
       snapshot,
     ),
@@ -1347,18 +1492,29 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
       agentCount: plannerUnits.length,
       contracts: [...plan.contracts],
     };
+    // A heuristic-fallback plan means no planner model returned a usable plan on
+    // this run, so the decomposition is the structural heuristic, not the LLM
+    // planner's. The node is still done (the plan drove the Change), but it must
+    // not read as plain success: it is not greened and carries a warning the
+    // console draws amber with this text.
+    const fallback = plan.source === "heuristic-fallback";
     nodes.push(
       assertBacked(
         {
           id: plannerNodeId(snapshot.id),
           kind: "planner",
-          label:
-            plan.source === "planner"
-              ? `planner: ${plan.model || "schema-constrained"}`
-              : "planner: heuristic fallback",
+          label: fallback
+            ? "planner: heuristic fallback (warning)"
+            : `planner: ${plan.model || "schema-constrained"}`,
           status: "integrated",
-          verified: true,
+          verified: !fallback,
           escalated: false,
+          ...(fallback
+            ? {
+                warning:
+                  "Heuristic fallback: no planner model returned a usable plan, so the structural heuristic decomposed the goal.",
+              }
+            : {}),
           plannerDetail,
           backing: { kind: "planner", changeId: snapshot.id, source: plan.source },
         },
@@ -1608,22 +1764,31 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
 
     // The integrated change flows into verification each round: round 1 flows
     // from the goal (the whole change after the first wave), a later round flows
-    // from that round's retry node. Drawn as a data-flow edge, backed by the
-    // attempt's own existence.
-    const fromId =
-      attempt.round <= 1
-        ? goalNodeId(snapshot.id)
-        : retryNodeId(snapshot.id, attempt.round);
+    // from the recorded retry whose edits it graded. When a later round has no
+    // recorded retry (nothing to hang it off), it flows from the goal rather
+    // than from a retry node that does not exist.
+    const sourceRetry =
+      attempt.round > 1 ? retryAttempts.find((r) => r.round === attempt.round) : undefined;
+    const fromId = sourceRetry
+      ? retryNodeId(snapshot.id, sourceRetry.round)
+      : goalNodeId(snapshot.id);
     edges.push({
       id: `verify-flow:${snapshot.id}#${attempt.round}`,
       // The verify flow is ladder control-flow (the integrated change flows into
       // each round's gate), not a declared WorkGraph dependency and not an
-      // Artifact event, so it rides the `trigger` kind. Its backing still records
-      // the attempt's own existence.
+      // Artifact event, so it rides the `trigger` kind. Its backing is the real
+      // recorded verify attempt (and the retry it came from, when it did), not
+      // a fabricated dependency.
       kind: "trigger",
       from: fromId,
       to: verifyNodeId(snapshot.id, attempt.round),
-      backing: { kind: "dependency", from: snapshot.id, to: `verify#${attempt.round}` },
+      backing: {
+        kind: "verify-flow",
+        changeId: snapshot.id,
+        round: attempt.round,
+        outcome: attempt.outcome,
+        ...(sourceRetry ? { retryRound: sourceRetry.round, toModel: sourceRetry.toModel } : {}),
+      },
     });
   }
 
@@ -1968,10 +2133,22 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
     const anchor = jevAnchorFor(decision.juncture);
     edges.push({
       id: `jev-flow:${snapshot.id}#${decision.juncture}:${index}`,
+      // The decision hangs off its juncture's anchor. It stays a `dependency`
+      // kind (the decision is placed by structure, not caused by ladder
+      // control-flow or an Artifact event), but its backing is the real
+      // recorded Jev decision, never a placeholder.
       kind: "dependency",
       from: anchor,
       to: id,
-      backing: { kind: "dependency", from: snapshot.id, to: `jev#${decision.juncture}:${index}` },
+      backing: {
+        kind: "jev-decision",
+        changeId: snapshot.id,
+        juncture: decision.juncture,
+        index,
+        question: decision.question,
+        answerType: decision.answerType,
+        confidence: decision.confidence,
+      },
     });
   }
 
