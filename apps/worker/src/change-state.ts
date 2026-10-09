@@ -1,8 +1,17 @@
 import { DurableObject } from "cloudflare:workers";
 
 import {
+  appendBoardMessage,
   appendDiscoveredUnits,
+  appendIntegratedRev,
+  applyBoardEscalations,
+  BoardError,
+  boardDigest,
+  boardResolutionForDecision,
   buildWorkGraph,
+  emptyBoard,
+  summarizeBoard,
+  verifyBoard,
   detectPathCollisions,
   leaseOwnerOverridesFromEscalations,
   normalizeDial,
@@ -11,6 +20,11 @@ import {
   recruit,
   runnableUnits,
   workUnitStatuses,
+  type BoardAppendResult,
+  type BoardDigest,
+  type BoardMessage,
+  type BoardState,
+  type BoardSummary,
   type Change,
   type ChangePlan,
   type ConcurrencyDial,
@@ -601,7 +615,47 @@ export interface ChangeStateView {
    * It backs the goal node's terminal red when the run never got a plan.
    */
   readonly planningFailure: PlanningFailureRecord | null;
+  /**
+   * A count summary of the Change board (messages, agents, items by status,
+   * contests by status, published tools, latest passing integrated revision).
+   * The full log and reduced state are served by GET /changes/:id/board, so the
+   * snapshot stays small.
+   */
+  readonly board: BoardSummary;
 }
+
+/** A board rejection, with its machine-readable code. */
+export interface BoardFailure {
+  readonly ok: false;
+  readonly code: string;
+  readonly error: string;
+}
+
+/** The result of appending one message to the Change board. */
+export type BoardAppendResponse =
+  | {
+      readonly ok: true;
+      /** The posted message followed by the engine messages it triggered. */
+      readonly appended: readonly BoardMessage[];
+      /** Human escalations raised because a contest escalated (usually empty). */
+      readonly escalations: readonly Escalation[];
+      /** The new agent's board token (join only; shown once, stored hashed). */
+      readonly token?: string;
+    }
+  | BoardFailure;
+
+/** The board log after a seq (one page), with the reduced board state. */
+export interface BoardView {
+  readonly lastSeq: number;
+  readonly messages: readonly BoardMessage[];
+  /** True when more messages follow this page. */
+  readonly hasMore: boolean;
+  readonly state: BoardState;
+}
+
+/** Default and largest page of board messages one read returns. */
+export const BOARD_PAGE_DEFAULT = 500;
+export const BOARD_PAGE_MAX = 1000;
 
 /**
  * A recorded WorkUnit failure: an agent ultimately could not complete the unit
@@ -723,6 +777,12 @@ export interface Escalation {
   readonly unitId?: string;
   /** The contested path, for a lease-owner escalation. */
   readonly path?: string;
+  /**
+   * The board contest this escalation was raised for, when a contest on the
+   * Change board ran out of turns. Resolving the escalation posts the decision
+   * to the board as a human claim.resolved, so its options are enforced.
+   */
+  readonly boardContest?: string;
   /** The human-readable question the engine needs answered. */
   readonly question: string;
   /** The candidate answers the human may choose among (advisory, not enforced). */
@@ -739,6 +799,7 @@ export interface RaiseEscalationInput {
   readonly kind: EscalationKind;
   readonly unitId?: string;
   readonly path?: string;
+  readonly boardContest?: string;
   readonly question: string;
   readonly options?: readonly string[];
 }
@@ -923,7 +984,209 @@ export class ChangeState extends DurableObject<Env> {
     await this.ctx.storage.put("retryAttempts", [] as RetryAttempt[]);
     await this.ctx.storage.put("integration", null);
     await this.ctx.storage.put("planningFailure", null);
+    // The Change board: an ordered log of typed coordination messages, stored
+    // one message per key (`board:<seq>`) so no single value grows with the
+    // log, plus the reduced board state and the agent token hashes, all
+    // written in one transaction per append. A fresh run deletes the prior
+    // run's messages and tokens and starts an empty board at seq 0.
+    await this.clearBoardMessages();
+    await this.ctx.storage.put("boardSeq", 0);
+    await this.ctx.storage.put("boardState", emptyBoard());
+    await this.ctx.storage.put("boardTokens", {} as Record<string, string>);
     return superseded;
+  }
+
+  /** Delete every stored board message (a re-created Change starts empty). */
+  private async clearBoardMessages(): Promise<void> {
+    const listed = await this.ctx.storage.list({ prefix: BOARD_KEY_PREFIX });
+    const keys = [...listed.keys()];
+    for (let i = 0; i < keys.length; i += 128) {
+      await this.ctx.storage.delete(keys.slice(i, i + 128));
+    }
+  }
+
+  /**
+   * The one write path for the board. Inside a single storage transaction it
+   * reads the board state and token map, computes the append with the shared
+   * pure model, and writes every appended message, the new state and seq, the
+   * token map, and the escalation records together. A rejected message throws
+   * inside the transaction, so nothing is written. Escalations follow the
+   * board: a settled contest closes its pending escalation, and an escalated
+   * contest raises one.
+   */
+  private async appendToBoard(
+    make: (state: BoardState, tokens: Readonly<Record<string, string>>) => BoardAppendResult,
+    options: {
+      readonly tokens?: (tokens: Record<string, string>) => Record<string, string>;
+      readonly escalations?: (list: Escalation[]) => Escalation[];
+    } = {},
+  ): Promise<{ readonly appended: readonly BoardMessage[]; readonly escalations: readonly Escalation[] }> {
+    return this.ctx.storage.transaction(async (txn) => {
+      const state = (await txn.get<BoardState>("boardState")) ?? emptyBoard();
+      let tokens = (await txn.get<Record<string, string>>("boardTokens")) ?? {};
+      const result = make(state, tokens);
+      if (options.tokens) {
+        tokens = options.tokens(tokens);
+      }
+      const left = new Set(result.appended.filter((m) => m.type === "agent.left").map((m) => m.from));
+      if (left.size > 0) {
+        tokens = Object.fromEntries(Object.entries(tokens).filter(([, agent]) => !left.has(agent)));
+      }
+      let escalations = (await txn.get<Escalation[]>("escalations")) ?? [];
+      if (options.escalations) {
+        escalations = options.escalations(escalations);
+      }
+      const applied = applyBoardEscalations(escalations, result.appended, Date.now());
+      const writes: [string, unknown][] = result.appended.map((m) => [boardMessageKey(m.seq), m]);
+      writes.push(
+        ["boardState", result.state],
+        ["boardSeq", result.state.lastSeq],
+        ["boardTokens", tokens],
+        ["escalations", applied.list],
+      );
+      for (let i = 0; i < writes.length; i += 128) {
+        await txn.put(Object.fromEntries(writes.slice(i, i + 128)));
+      }
+      return { appended: result.appended, escalations: applied.raised };
+    });
+  }
+
+  /** Run a board operation, turning a board rejection into a coded failure. */
+  private async boardOutcome(
+    run: () => Promise<{ readonly appended: readonly BoardMessage[]; readonly escalations: readonly Escalation[] }>,
+    token?: string,
+  ): Promise<BoardAppendResponse> {
+    try {
+      const done = await run();
+      return { ok: true, ...done, ...(token !== undefined ? { token } : {}) };
+    } catch (error) {
+      if (error instanceof BoardError) {
+        return { ok: false, code: error.code, error: error.message };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Join the board as `agent` (the join route, under the shared bearer). Issues
+   * a random per-agent board token, returned once; only its SHA-256 hash is
+   * stored. Every later agent post must present it, and the agent's identity is
+   * taken from it.
+   */
+  async joinBoard(agent: string, body: { readonly role?: unknown; readonly rationale?: unknown }): Promise<BoardAppendResponse> {
+    const token = newBoardToken();
+    const hash = await hashBoardToken(token);
+    return this.boardOutcome(
+      () =>
+        this.appendToBoard(
+          (state) =>
+            appendBoardMessage(
+              state,
+              { kind: "join", agent },
+              {
+                type: "agent.joined",
+                payload: body.role !== undefined ? { role: body.role } : {},
+                ...(body.rationale !== undefined ? { rationale: body.rationale } : {}),
+              },
+              new Date().toISOString(),
+            ),
+          { tokens: (tokens) => ({ ...tokens, [hash]: agent }) },
+        ),
+      token,
+    );
+  }
+
+  /** Append one message as the agent the board token identifies. */
+  async postBoardAsAgent(token: string, raw: unknown): Promise<BoardAppendResponse> {
+    const hash = await hashBoardToken(token);
+    return this.boardOutcome(() =>
+      this.appendToBoard((state, tokens) => {
+        const agent = tokens[hash];
+        if (agent === undefined) {
+          throw new BoardError("AUTH", "unknown or revoked board token");
+        }
+        return appendBoardMessage(state, { kind: "agent", agent }, raw, new Date().toISOString());
+      }),
+    );
+  }
+
+  /** Append one message as the human (the human route, under the shared bearer). */
+  async postBoardAsHuman(raw: unknown): Promise<BoardAppendResponse> {
+    return this.boardOutcome(() =>
+      this.appendToBoard((state) => appendBoardMessage(state, { kind: "human" }, raw, new Date().toISOString())),
+    );
+  }
+
+  /**
+   * Record an integration result on the board: the engine appends the next
+   * integrated.rev, deriving its paths and contributors from the announced
+   * pushes it merged. This is the only way an integrated revision reaches the
+   * board, so the board can never report a pass the integrator did not record.
+   */
+  async recordBoardIntegration(input: unknown): Promise<BoardAppendResponse> {
+    return this.boardOutcome(() =>
+      this.appendToBoard((state) => appendIntegratedRev(state, input, new Date().toISOString())),
+    );
+  }
+
+  /** The board messages after `after` (one page) and the reduced board state. */
+  async getBoard(after = 0, limit = BOARD_PAGE_DEFAULT): Promise<BoardView> {
+    const lastSeq = (await this.ctx.storage.get<number>("boardSeq")) ?? 0;
+    const messages = await this.readBoardMessages(after, limit, lastSeq);
+    const last = messages.at(-1)?.seq ?? after;
+    return { lastSeq, messages, hasMore: last < lastSeq, state: await this.loadBoardState() };
+  }
+
+  /**
+   * One agent's compact digest of the board since `after`, for its next turn.
+   * The board token must identify that agent.
+   */
+  async getBoardDigest(
+    token: string,
+    agent: string,
+    after = 0,
+    limit = BOARD_PAGE_DEFAULT,
+  ): Promise<{ readonly ok: true; readonly digest: BoardDigest; readonly hasMore: boolean } | BoardFailure> {
+    const tokens = (await this.ctx.storage.get<Record<string, string>>("boardTokens")) ?? {};
+    if (tokens[await hashBoardToken(token)] !== agent) {
+      return { ok: false, code: "AUTH", error: `the board token does not identify ${agent}` };
+    }
+    const view = await this.getBoard(after, limit);
+    return { ok: true, digest: boardDigest(view.state, view.messages, agent, after), hasMore: view.hasMore };
+  }
+
+  /** Re-verify the stored board: its log must reduce to exactly the stored state. */
+  async verifyStoredBoard(): Promise<{ readonly ok: true; readonly lastSeq: number } | BoardFailure> {
+    const lastSeq = (await this.ctx.storage.get<number>("boardSeq")) ?? 0;
+    const messages = await this.readBoardMessages(0, Number.MAX_SAFE_INTEGER, lastSeq);
+    try {
+      verifyBoard(messages, await this.loadBoardState());
+      return { ok: true, lastSeq };
+    } catch (error) {
+      if (error instanceof BoardError) {
+        return { ok: false, code: error.code, error: error.message };
+      }
+      throw error;
+    }
+  }
+
+  /** Read messages (after, after + limit] up to lastSeq with one range listing. */
+  private async readBoardMessages(after: number, limit: number, lastSeq: number): Promise<BoardMessage[]> {
+    const from = Math.max(0, Math.floor(after)) + 1;
+    const to = Math.min(lastSeq, from - 1 + Math.max(1, Math.floor(limit)));
+    if (to < from) {
+      return [];
+    }
+    const listed = await this.ctx.storage.list<BoardMessage>({
+      prefix: BOARD_KEY_PREFIX,
+      start: boardMessageKey(from),
+      end: boardMessageKey(to + 1),
+    });
+    const messages = [...listed.values()];
+    if (messages.length !== to - from + 1) {
+      throw new Error(`board messages ${from}..${to} are incomplete in storage`);
+    }
+    return messages;
   }
 
   /**
@@ -1019,7 +1282,8 @@ export class ChangeState extends DurableObject<Env> {
         e.status === "pending" &&
         e.kind === input.kind &&
         e.unitId === input.unitId &&
-        e.path === input.path,
+        e.path === input.path &&
+        e.boardContest === input.boardContest,
     );
     if (existing) {
       return existing;
@@ -1029,6 +1293,7 @@ export class ChangeState extends DurableObject<Env> {
       kind: input.kind,
       ...(input.unitId !== undefined ? { unitId: input.unitId } : {}),
       ...(input.path !== undefined ? { path: input.path } : {}),
+      ...(input.boardContest !== undefined ? { boardContest: input.boardContest } : {}),
       question: input.question,
       options: input.options ?? [],
       status: "pending",
@@ -1061,6 +1326,29 @@ export class ChangeState extends DurableObject<Env> {
       decision,
       resolvedAt: new Date().toISOString(),
     };
+    // An escalation raised for a board contest is answered ON the board: the
+    // decision must name one of the contest's parties and is appended as a
+    // human claim.resolved. The escalation record and the board messages are
+    // written in ONE transaction, so an invalid decision (or any rejected
+    // append) leaves both untouched, and a recorded decision always reached
+    // the board.
+    if (current.boardContest !== undefined) {
+      const contest = current.boardContest;
+      try {
+        await this.appendToBoard(
+          (state) => {
+            const draft = boardResolutionForDecision(state, contest, decision);
+            return draft === undefined
+              ? { appended: [], state }
+              : appendBoardMessage(state, { kind: "human" }, draft, new Date().toISOString());
+          },
+          { escalations: (list) => list.map((e) => (e.id === id ? resolved : e)) },
+        );
+      } catch (error) {
+        throw new Error(errorText(error));
+      }
+      return resolved;
+    }
     escalations[index] = resolved;
     await this.ctx.storage.put("escalations", escalations);
     // A resolved lease-owner decision is AUTHORITATIVE for its path: recompute
@@ -2004,6 +2292,7 @@ export class ChangeState extends DurableObject<Env> {
       jevDecisions,
       integration,
       planningFailure,
+      board: summarizeBoard(await this.loadBoardState()),
     };
   }
 
@@ -2122,9 +2411,37 @@ export class ChangeState extends DurableObject<Env> {
     return (await this.ctx.storage.get<JevDecisionView[]>("jevDecisions")) ?? [];
   }
 
+  private async loadBoardState(): Promise<BoardState> {
+    return (await this.ctx.storage.get<BoardState>("boardState")) ?? emptyBoard();
+  }
+
   private async loadIntegration(): Promise<IntegrationRecord | null> {
     return (await this.ctx.storage.get<IntegrationRecord | null>("integration")) ?? null;
   }
+}
+
+const BOARD_KEY_PREFIX = "board:";
+
+/** The storage key of one board message (zero-padded so keys sort by seq). */
+function boardMessageKey(seq: number): string {
+  return `${BOARD_KEY_PREFIX}${String(seq).padStart(8, "0")}`;
+}
+
+/** A fresh random board token (256 bits, hex). */
+function newBoardToken(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return `sbt_${[...bytes].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
+}
+
+/** The SHA-256 hex digest of a board token: the only form ever stored. */
+async function hashBoardToken(token: string): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**

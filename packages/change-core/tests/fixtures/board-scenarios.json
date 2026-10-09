@@ -1,0 +1,59 @@
+{
+  "formation": {
+    "description": "Agents and a lead join with tokens and form around a goal: a free claim, a contest the owner cedes, a waiting claimant, a read-only claim, a failing then a passing integrated revision (targeted rebase), completion derived from done.proposed plus a merged push, a split whose children complete the parent, a contract the lead accepts, an addressed help request, and a tool proposed, published, and used. Two posts are refused: an unverified tool and an agent trying to complete its own item.",
+    "responders": [{ "id": "agent-a", "answer": "cede" }],
+    "steps": [
+      { "from": "human", "type": "goal.posted", "payload": { "objective": "make the service reject malformed input", "rules": { "maxContestTurns": 3, "contestIdleMessages": 25 } } },
+      { "from": "agent-a", "type": "agent.joined", "payload": { "role": "builder" } },
+      { "from": "agent-b", "type": "agent.joined", "payload": {} },
+      { "from": "agent-c", "type": "agent.joined", "payload": { "role": "reviewer" } },
+      { "from": "lead", "type": "agent.joined", "payload": { "role": "lead" } },
+      { "from": "lead", "type": "item.proposed", "payload": { "item": "validate", "objective": "validate input", "acceptance": ["bad input is rejected"], "scopeHint": ["src/core/"] } },
+      { "from": "lead", "type": "item.proposed", "payload": { "item": "errors", "objective": "shape the error responses", "acceptance": [] } },
+      { "from": "lead", "type": "item.proposed", "payload": { "item": "docs", "objective": "document the behavior" } },
+      { "from": "agent-a", "type": "item.claimed", "payload": { "item": "validate", "intent": { "read": ["src/shared/types.ts"], "write": ["src/core/**"] } } },
+      { "from": "agent-b", "type": "item.claimed", "payload": { "item": "errors", "intent": { "read": [], "write": ["src/core/errors.ts", "src/http/"] } }, "rationale": "errors live next to validation" },
+      { "from": "agent-a", "type": "item.claimed", "payload": { "item": "validate", "intent": { "read": [], "write": ["src/core/**"] } } },
+      { "from": "agent-c", "type": "item.claimed", "payload": { "item": "docs", "intent": { "read": ["src/core/**"], "write": ["docs/**"] } } },
+      { "from": "agent-b", "type": "push.announced", "payload": { "item": "errors", "commit": "c0ffee1", "paths": ["src/core/errors.ts"] } },
+      { "from": "engine", "type": "integrated.rev", "payload": { "commit": "int0001", "gate": "fail", "merged": ["c0ffee1"] } },
+      { "from": "engine", "type": "integrated.rev", "payload": { "commit": "int0002", "gate": "pass", "merged": ["c0ffee1"] } },
+      { "from": "agent-b", "type": "item.completed", "payload": { "item": "errors", "n": 2, "via": "integrated" } },
+      { "from": "agent-b", "type": "done.proposed", "payload": { "item": "errors", "commit": "c0ffee1" } },
+      { "from": "agent-c", "type": "item.split", "payload": { "item": "docs", "children": [ { "item": "docs-api", "objective": "api docs" }, { "item": "docs-guide", "objective": "guide" } ] } },
+      { "from": "agent-c", "type": "item.claimed", "payload": { "item": "docs-api", "intent": { "read": [], "write": ["docs/api.md"] } } },
+      { "from": "agent-b", "type": "item.claimed", "payload": { "item": "docs-guide", "intent": { "read": [], "write": ["docs/guide.md"] } } },
+      { "from": "agent-c", "type": "tool.proposed", "payload": { "tool": "link-check", "capability": "doc-link-scan", "inputs": ["docs"], "outputs": ["findings"] } },
+      { "from": "agent-c", "type": "tool.published", "payload": { "tool": "link-check", "capability": "doc-link-scan", "version": "1", "repo": "tools-repo", "commit": "t00l001", "verified": false } },
+      { "from": "agent-c", "type": "tool.published", "payload": { "tool": "link-check", "capability": "doc-link-scan", "version": "1", "repo": "tools-repo", "commit": "t00l001", "verified": true } },
+      { "from": "agent-b", "type": "tool.used", "payload": { "capability": "doc-link-scan", "version": "1", "changedFiles": ["docs/guide.md"] } },
+      { "from": "agent-c", "type": "push.announced", "payload": { "item": "docs-api", "commit": "papi001", "paths": ["docs/api.md"] } },
+      { "from": "agent-b", "type": "push.announced", "payload": { "item": "docs-guide", "commit": "pgde001", "paths": ["docs/guide.md"] } },
+      { "from": "agent-c", "type": "done.proposed", "payload": { "item": "docs-api" } },
+      { "from": "agent-b", "type": "done.proposed", "payload": { "item": "docs-guide" } },
+      { "from": "engine", "type": "integrated.rev", "payload": { "commit": "int0003", "gate": "pass", "merged": ["papi001", "pgde001"] } },
+      { "from": "agent-a", "type": "contract.proposed", "payload": { "contract": "k-errors", "target": "src/core/errors.ts#ErrorShape", "kind": "modify" } },
+      { "from": "lead", "type": "contract.accepted", "payload": { "contract": "k-errors" }, "rationale": "the shape is shared" },
+      { "from": "agent-a", "type": "help.requested", "payload": { "request": "h-tests", "item": "validate", "need": "review" }, "to": ["agent-c"] },
+      { "from": "agent-c", "type": "help.offered", "payload": { "request": "h-tests" }, "to": "agent-a" }
+    ]
+  },
+  "escalation": {
+    "description": "Two agents both keep an overlapping write intent; after three turns the contest escalates for a human decision, which the human resolves for the claimant.",
+    "responders": [
+      { "id": "agent-a", "answer": "keep" },
+      { "id": "agent-b", "answer": "keep" }
+    ],
+    "steps": [
+      { "from": "human", "type": "goal.posted", "payload": { "objective": "harden the parser" } },
+      { "from": "agent-a", "type": "agent.joined", "payload": {} },
+      { "from": "agent-b", "type": "agent.joined", "payload": {} },
+      { "from": "lead", "type": "agent.joined", "payload": { "role": "lead" } },
+      { "from": "lead", "type": "item.proposed", "payload": { "item": "one", "objective": "first change" } },
+      { "from": "lead", "type": "item.proposed", "payload": { "item": "two", "objective": "second change" } },
+      { "from": "agent-a", "type": "item.claimed", "payload": { "item": "one", "intent": { "read": [], "write": ["src/parse/*.ts"] } } },
+      { "from": "agent-b", "type": "item.claimed", "payload": { "item": "two", "intent": { "read": [], "write": ["src/parse/lexer.ts#nextToken"] } } },
+      { "from": "human", "type": "claim.resolved", "payload": { "contest": "contest-10", "how": "human-decided", "winner": "agent-b" }, "rationale": "the lexer change is the smaller one" }
+    ]
+  }
+}

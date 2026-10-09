@@ -92,6 +92,11 @@ idempotent). `make infra-status` is read-only ("am I paying for anything?").
    redeployed in place from a checkout of the promoted commit. The console's goal
    node turns green or red only from this integration verdict.
 
+A Change also has a **board**: an ordered log of typed coordination messages
+(claims with read/write intent, contests, splits, pushes, integrated revisions,
+tools) with mechanical arbitration in the Durable Object. It is a foundation
+and is not yet driven by `run-live`; see [docs/BOARD.md](./docs/BOARD.md).
+
 ### What the graph shows
 
 Nodes are the goal, the planner (kickoff and each re-plan), work units and

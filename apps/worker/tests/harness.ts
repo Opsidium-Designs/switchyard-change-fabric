@@ -14,14 +14,58 @@ import type {
   WorkspaceProvisioner,
 } from "../src/workspace-provisioner.ts";
 
-class MemoryStorage {
-  private readonly data = new Map<string, unknown>();
+/**
+ * An in-memory stand-in for Durable Object storage: get, put (one key or an
+ * entries object), delete (one key or many), list (prefix/start/end/limit, in
+ * key order), and transaction (all-or-nothing: a throw rolls every write back).
+ */
+export class MemoryStorage {
+  private data = new Map<string, unknown>();
+  /** Writes performed, for tests that assert atomicity. */
+  writes = 0;
+
   async get<T>(key: string): Promise<T | undefined> {
     const value = this.data.get(key);
     return value === undefined ? undefined : (structuredClone(value) as T);
   }
-  async put(key: string, value: unknown): Promise<void> {
-    this.data.set(key, structuredClone(value));
+  async put(keyOrEntries: string | Record<string, unknown>, value?: unknown): Promise<void> {
+    const entries = typeof keyOrEntries === "string" ? { [keyOrEntries]: value } : keyOrEntries;
+    if (Object.keys(entries).length > 128) {
+      throw new Error("put accepts at most 128 keys");
+    }
+    for (const [key, entry] of Object.entries(entries)) {
+      this.data.set(key, structuredClone(entry));
+      this.writes += 1;
+    }
+  }
+  async delete(keys: string | string[]): Promise<boolean | number> {
+    const list = Array.isArray(keys) ? keys : [keys];
+    let count = 0;
+    for (const key of list) {
+      count += this.data.delete(key) ? 1 : 0;
+    }
+    return Array.isArray(keys) ? count : count > 0;
+  }
+  async list<T>(options: { prefix?: string; start?: string; end?: string; limit?: number } = {}): Promise<Map<string, T>> {
+    const keys = [...this.data.keys()]
+      .filter(
+        (key) =>
+          (options.prefix === undefined || key.startsWith(options.prefix)) &&
+          (options.start === undefined || key >= options.start) &&
+          (options.end === undefined || key < options.end),
+      )
+      .sort()
+      .slice(0, options.limit ?? Number.MAX_SAFE_INTEGER);
+    return new Map(keys.map((key) => [key, structuredClone(this.data.get(key)) as T]));
+  }
+  async transaction<T>(closure: (txn: MemoryStorage) => Promise<T>): Promise<T> {
+    const snapshot = new Map(this.data);
+    try {
+      return await closure(this);
+    } catch (error) {
+      this.data = snapshot;
+      throw error;
+    }
   }
 }
 

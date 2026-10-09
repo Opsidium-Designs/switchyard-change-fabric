@@ -15,9 +15,22 @@
  * real service: every workspace it hands out is labelled as a local fallback.
  */
 
+import { createHash, randomBytes } from "node:crypto";
+
 import {
+  appendBoardMessage,
   appendDiscoveredUnits,
+  appendIntegratedRev,
+  applyBoardEscalations,
+  BOARD_LIMITS,
+  BoardError,
+  boardDigest,
+  boardErrorStatus,
+  boardResolutionForDecision,
   buildWorkGraph,
+  emptyBoard,
+  summarizeBoard,
+  verifyBoard,
   detectPathCollisions,
   leaseOwnerOverridesFromEscalations,
   normalizeDial,
@@ -26,6 +39,12 @@ import {
   recruit,
   runnableUnits,
   workUnitStatuses,
+  type BoardAppendResult,
+  type BoardDigest,
+  type BoardErrorCode,
+  type BoardMessage,
+  type BoardState,
+  type BoardSummary,
   type Change,
   type ChangePlan,
   type ConcurrencyDial,
@@ -258,6 +277,11 @@ export interface ChangeStateView {
    */
   readonly jevDecisions: readonly JevDecisionView[];
   /**
+   * A count summary of the Change board (mirrors the Worker). The full log and
+   * reduced state are served by GET /changes/:id/board.
+   */
+  readonly board: BoardSummary;
+  /**
    * The authoritative integration verdict (mirrors the Worker), or null until
    * recorded, so the offline graph's goal follows the verdict exactly like the
    * live one rather than the ladder overlay.
@@ -388,6 +412,8 @@ export interface Escalation {
   readonly kind: EscalationKind;
   readonly unitId?: string;
   readonly path?: string;
+  /** The board contest this escalation was raised for (mirrors the Worker). */
+  readonly boardContest?: string;
   readonly question: string;
   readonly options: readonly string[];
   readonly status: EscalationStatus;
@@ -401,9 +427,41 @@ export interface RaiseEscalationInput {
   readonly kind: EscalationKind;
   readonly unitId?: string;
   readonly path?: string;
+  readonly boardContest?: string;
   readonly question: string;
   readonly options?: readonly string[];
 }
+
+/** A board rejection with its machine-readable code (mirrors the Worker). */
+export interface BoardFailure {
+  readonly ok: false;
+  readonly code: string;
+  readonly error: string;
+}
+
+/** The result of appending to the board (mirrors the Worker). */
+export type BoardAppendResponse =
+  | {
+      readonly ok: true;
+      readonly appended: readonly BoardMessage[];
+      readonly escalations: readonly Escalation[];
+      /** The new agent's board token (join only; stored hashed). */
+      readonly token?: string;
+    }
+  | BoardFailure;
+
+/** One page of the board log after a seq, with the reduced state (mirrors the Worker). */
+export interface BoardView {
+  readonly lastSeq: number;
+  readonly messages: readonly BoardMessage[];
+  readonly hasMore: boolean;
+  readonly state: BoardState;
+}
+
+/** The header an agent presents its board token in (mirrors the Worker). */
+export const BOARD_TOKEN_HEADER = "x-board-agent-token";
+const BOARD_PAGE_DEFAULT = 500;
+const BOARD_PAGE_MAX = 1000;
 
 /** A recruitment plan for one wave in the offline substrate (mirrors the DO). */
 export interface RecruitmentPlan extends RecruitDecision {
@@ -495,6 +553,11 @@ class ChangeRecord {
   integration: IntegrationRecord | null = null;
   /** Why the planning placeholder failed, once recorded (mirrors the DO). */
   planningFailure: PlanningFailureRecord | null = null;
+  /** The Change board log and its reduced state (mirrors the DO). */
+  readonly boardLog: BoardMessage[] = [];
+  boardState: BoardState = emptyBoard();
+  /** Board token SHA-256 hash -> agent id (the plaintext is never kept). */
+  boardTokens = new Map<string, string>();
   constructor(change: Change) {
     this.change = change;
   }
@@ -643,7 +706,8 @@ export class LocalChangeControl {
         e.status === "pending" &&
         e.kind === input.kind &&
         e.unitId === input.unitId &&
-        e.path === input.path,
+        e.path === input.path &&
+        e.boardContest === input.boardContest,
     );
     if (existing) {
       return existing;
@@ -653,6 +717,7 @@ export class LocalChangeControl {
       kind: input.kind,
       ...(input.unitId !== undefined ? { unitId: input.unitId } : {}),
       ...(input.path !== undefined ? { path: input.path } : {}),
+      ...(input.boardContest !== undefined ? { boardContest: input.boardContest } : {}),
       question: input.question,
       options: input.options ?? [],
       status: "pending",
@@ -682,8 +747,172 @@ export class LocalChangeControl {
       decision,
       resolvedAt: new Date().toISOString(),
     };
+    // A board-contest escalation is answered on the board (mirrors the DO): the
+    // board append and the escalation record change together or not at all.
+    if (current.boardContest !== undefined) {
+      const contest = current.boardContest;
+      try {
+        this.appendToBoard(
+          record,
+          (state) => {
+            const draft = boardResolutionForDecision(state, contest, decision);
+            return draft === undefined
+              ? { appended: [], state }
+              : appendBoardMessage(state, { kind: "human" }, draft, new Date().toISOString());
+          },
+          { escalations: (list) => list.map((e) => (e.id === id ? resolved : e)) },
+        );
+      } catch (error) {
+        throw new Error(error instanceof Error ? error.message : String(error));
+      }
+      return resolved;
+    }
     record.escalations[index] = resolved;
     return resolved;
+  }
+
+  /**
+   * The one write path for the board (mirrors the DO's transaction): compute
+   * the append with the shared pure model, then apply the log, state, tokens,
+   * and escalation changes together. A rejection throws before anything
+   * changes.
+   */
+  private appendToBoard(
+    record: ChangeRecord,
+    make: (state: BoardState, tokens: ReadonlyMap<string, string>) => BoardAppendResult,
+    options: {
+      readonly tokens?: (tokens: Map<string, string>) => void;
+      readonly escalations?: (list: Escalation[]) => Escalation[];
+    } = {},
+  ): { readonly appended: readonly BoardMessage[]; readonly escalations: readonly Escalation[] } {
+    const result = make(record.boardState, record.boardTokens);
+    const tokens = new Map(record.boardTokens);
+    options.tokens?.(tokens);
+    for (const message of result.appended) {
+      if (message.type === "agent.left") {
+        for (const [hash, agent] of [...tokens]) {
+          if (agent === message.from) {
+            tokens.delete(hash);
+          }
+        }
+      }
+    }
+    const base = options.escalations ? options.escalations([...record.escalations]) : record.escalations;
+    const applied = applyBoardEscalations(base, result.appended, Date.now());
+    record.boardLog.push(...result.appended);
+    record.boardState = result.state;
+    record.boardTokens = tokens;
+    record.escalations.splice(0, record.escalations.length, ...applied.list);
+    return { appended: result.appended, escalations: applied.raised };
+  }
+
+  private boardOutcome(
+    run: () => { readonly appended: readonly BoardMessage[]; readonly escalations: readonly Escalation[] },
+    token?: string,
+  ): BoardAppendResponse {
+    try {
+      return { ok: true, ...run(), ...(token !== undefined ? { token } : {}) };
+    } catch (error) {
+      if (error instanceof BoardError) {
+        return { ok: false, code: error.code, error: error.message };
+      }
+      throw error;
+    }
+  }
+
+  /** Join the board (as POST /changes/:id/board/join): returns a per-agent token. */
+  joinBoard(changeId: string, agent: string, body: { readonly role?: unknown; readonly rationale?: unknown } = {}): BoardAppendResponse {
+    const record = this.require(changeId);
+    const token = `sbt_${randomBytes(32).toString("hex")}`;
+    const hash = hashBoardToken(token);
+    return this.boardOutcome(
+      () =>
+        this.appendToBoard(
+          record,
+          (state) =>
+            appendBoardMessage(
+              state,
+              { kind: "join", agent },
+              {
+                type: "agent.joined",
+                payload: body.role !== undefined ? { role: body.role } : {},
+                ...(body.rationale !== undefined ? { rationale: body.rationale } : {}),
+              },
+              new Date().toISOString(),
+            ),
+          { tokens: (tokens) => tokens.set(hash, agent) },
+        ),
+      token,
+    );
+  }
+
+  /** Post as the agent the board token identifies (as POST /changes/:id/board). */
+  postBoardAsAgent(changeId: string, token: string, raw: unknown): BoardAppendResponse {
+    const record = this.require(changeId);
+    const hash = hashBoardToken(token);
+    return this.boardOutcome(() =>
+      this.appendToBoard(record, (state, tokens) => {
+        const agent = tokens.get(hash);
+        if (agent === undefined) {
+          throw new BoardError("AUTH", "unknown or revoked board token");
+        }
+        return appendBoardMessage(state, { kind: "agent", agent }, raw, new Date().toISOString());
+      }),
+    );
+  }
+
+  /** Post as the human (as POST /changes/:id/board/human). */
+  postBoardAsHuman(changeId: string, raw: unknown): BoardAppendResponse {
+    const record = this.require(changeId);
+    return this.boardOutcome(() =>
+      this.appendToBoard(record, (state) => appendBoardMessage(state, { kind: "human" }, raw, new Date().toISOString())),
+    );
+  }
+
+  /** Record an integration result as the board's next integrated.rev (as POST /changes/:id/integration/revision). */
+  recordBoardIntegration(changeId: string, input: unknown): BoardAppendResponse {
+    const record = this.require(changeId);
+    return this.boardOutcome(() =>
+      this.appendToBoard(record, (state) => appendIntegratedRev(state, input, new Date().toISOString())),
+    );
+  }
+
+  /** One page of messages after `after` and the reduced state (as GET /changes/:id/board). */
+  board(changeId: string, after = 0, limit = BOARD_PAGE_DEFAULT): BoardView {
+    const record = this.require(changeId);
+    const messages = record.boardLog.slice(after, after + limit);
+    const last = messages.at(-1)?.seq ?? after;
+    return { lastSeq: record.boardState.lastSeq, messages, hasMore: last < record.boardState.lastSeq, state: record.boardState };
+  }
+
+  /** One agent's digest; the token must identify that agent (as GET ?for=<agent>). */
+  boardDigest(
+    changeId: string,
+    token: string,
+    agent: string,
+    after = 0,
+    limit = BOARD_PAGE_DEFAULT,
+  ): { readonly ok: true; readonly digest: BoardDigest; readonly hasMore: boolean } | BoardFailure {
+    const record = this.require(changeId);
+    if (record.boardTokens.get(hashBoardToken(token)) !== agent) {
+      return { ok: false, code: "AUTH", error: `the board token does not identify ${agent}` };
+    }
+    const view = this.board(changeId, after, limit);
+    return { ok: true, digest: boardDigest(view.state, view.messages, agent, after), hasMore: view.hasMore };
+  }
+
+  /** Re-verify the board: its log must reduce to exactly its state. */
+  verifyBoard(changeId: string): { readonly ok: true; readonly lastSeq: number } | BoardFailure {
+    const record = this.require(changeId);
+    try {
+      verifyBoard(record.boardLog, record.boardState);
+      return { ok: true, lastSeq: record.boardState.lastSeq };
+    } catch (error) {
+      if (error instanceof BoardError) {
+        return { ok: false, code: error.code, error: error.message };
+      }
+      throw error;
+    }
   }
 
   /** Whether a pending escalation exists (optionally for a specific unit). */
@@ -1363,6 +1592,7 @@ export class LocalChangeControl {
       jevDecisions: record.jevDecisions,
       integration: record.integration,
       planningFailure: record.planningFailure,
+      board: summarizeBoard(record.boardState),
     };
   }
 
@@ -1370,6 +1600,16 @@ export class LocalChangeControl {
   readonly fetch: FetchLike = async (input, init) => {
     const url = new URL(input, "http://local-control");
     const method = (init?.method ?? "GET").toUpperCase();
+
+    const boardRoute = url.pathname.match(
+      /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|integration\/revision)$/,
+    );
+    if (boardRoute && (method === "POST" || method === "GET")) {
+      const response = this.handleBoard(dec(boardRoute[1]), boardRoute[2] ?? "", method, url, init);
+      if (response) {
+        return response;
+      }
+    }
 
     const lease = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/lease$/);
     if (method === "POST" && lease) {
@@ -1649,6 +1889,79 @@ export class LocalChangeControl {
     return json({ error: "not found" }, 404);
   };
 
+  /** The board routes, mirroring the Worker's (identity from the route, never the body). */
+  private handleBoard(changeId: string, kind: string, method: string, url: URL, init?: RequestInit): Response | undefined {
+    if (!this.records.has(changeId)) {
+      return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
+    }
+    const headers = new Headers(init?.headers);
+    if (method === "GET") {
+      if (kind === "board/verify") {
+        const verified = this.verifyBoard(changeId);
+        return json(verified, verified.ok ? 200 : 409);
+      }
+      if (kind !== "board") {
+        return undefined;
+      }
+      const afterRaw = url.searchParams.get("after");
+      const limitRaw = url.searchParams.get("limit");
+      const after = afterRaw === null || afterRaw === "" ? 0 : /^\d{1,9}$/.test(afterRaw) ? Number(afterRaw) : undefined;
+      const limit =
+        limitRaw === null || limitRaw === ""
+          ? BOARD_PAGE_DEFAULT
+          : /^\d{1,4}$/.test(limitRaw) && Number(limitRaw) >= 1 && Number(limitRaw) <= BOARD_PAGE_MAX
+            ? Number(limitRaw)
+            : undefined;
+      if (after === undefined || limit === undefined) {
+        return json({ code: "BAD_PAYLOAD", error: `after must be a non-negative seq and limit 1..${BOARD_PAGE_MAX}` }, 400);
+      }
+      const forAgent = url.searchParams.get("for");
+      if (forAgent !== null) {
+        const token = headers.get(BOARD_TOKEN_HEADER);
+        if (!token) {
+          return json({ code: "AUTH", error: `a digest requires the ${BOARD_TOKEN_HEADER} header` }, 401);
+        }
+        const digest = this.boardDigest(changeId, token, forAgent, after, limit);
+        return digest.ok ? json(digest, 200) : json({ code: digest.code, error: digest.error }, 401);
+      }
+      return json(this.board(changeId, after, limit), 200);
+    }
+    if (kind === "board/verify") {
+      return undefined;
+    }
+    const raw = typeof init?.body === "string" ? init.body : "";
+    if (Buffer.byteLength(raw, "utf8") > BOARD_LIMITS.maxBodyBytes) {
+      return json({ code: "LIMIT", error: `a board request body is at most ${BOARD_LIMITS.maxBodyBytes} bytes` }, 413);
+    }
+    let body: unknown;
+    try {
+      body = raw.trim() === "" ? {} : (JSON.parse(raw) as unknown);
+    } catch {
+      return json({ code: "BAD_PAYLOAD", error: "the board request body is not valid JSON" }, 400);
+    }
+    let outcome: BoardAppendResponse;
+    if (kind === "board/join") {
+      const join = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
+      if (typeof join.agent !== "string") {
+        return json({ code: "BAD_PAYLOAD", error: "a join requires an agent id" }, 400);
+      }
+      outcome = this.joinBoard(changeId, join.agent, { role: join.role, rationale: join.rationale });
+    } else if (kind === "board/human") {
+      outcome = this.postBoardAsHuman(changeId, body);
+    } else if (kind === "integration/revision") {
+      outcome = this.recordBoardIntegration(changeId, body);
+    } else {
+      const token = headers.get(BOARD_TOKEN_HEADER);
+      if (!token) {
+        return json({ code: "AUTH", error: `an agent board post requires the ${BOARD_TOKEN_HEADER} header` }, 401);
+      }
+      outcome = this.postBoardAsAgent(changeId, token, body);
+    }
+    return outcome.ok
+      ? json(outcome, 201)
+      : json({ code: outcome.code, error: outcome.error }, boardErrorStatus(outcome.code as BoardErrorCode));
+  }
+
   private async handleLease(changeId: string, unitId: string): Promise<Response> {
     const record = this.records.get(changeId);
     if (!record) {
@@ -1895,6 +2208,11 @@ function sanitizeProbabilities(
     }
   }
   return out;
+}
+
+/** The SHA-256 hex digest of a board token: the only form ever kept. */
+function hashBoardToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
 }
 
 function json(body: unknown, status: number): Response {

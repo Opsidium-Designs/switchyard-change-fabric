@@ -1,9 +1,9 @@
-import { parseChangeSpec } from "@switchyard-change/change-core";
+import { BOARD_LIMITS, boardErrorStatus, parseChangeSpec, type BoardErrorCode } from "@switchyard-change/change-core";
 import type { DiscoveredWorkUnit } from "@switchyard-change/change-core";
 
 import { configuredApiToken, hasValidBearer, requiresAuth } from "./auth.ts";
 import type { EscalationKind, IntegrationVerdict, JevDecisionView, JevJuncture, LeaseWorkspace, PlanningChangeHeader, RefanSource, SupersededLease, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
-import { STATUS_CONFLICT_PREFIX } from "./change-state.ts";
+import { BOARD_PAGE_DEFAULT, BOARD_PAGE_MAX, STATUS_CONFLICT_PREFIX } from "./change-state.ts";
 import type { ChangeState } from "./change-state.ts";
 import type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 import { selectProvisioner } from "./workspace-provisioner.ts";
@@ -21,7 +21,7 @@ export type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 // foreign origin cannot ride a browser's ambient credentials; it would have to
 // already hold the token. `authorization` is listed so a preflighted request
 // carrying the bearer header is allowed.
-const CORS_ALLOW_HEADERS = "content-type, authorization";
+const CORS_ALLOW_HEADERS = "content-type, authorization, x-board-agent-token";
 
 function json(body: unknown, status = 200, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body, null, 2), {
@@ -93,8 +93,13 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
 
   // Optional bearer auth (see auth.ts): when SWITCHYARD_API_TOKEN is set, every
   // mutating request must present it. Read-only GETs stay open.
+  // The one exception is an agent's own board post: it authenticates with the
+  // agent's board token (issued by the bearer-protected join route), so an
+  // agent process never needs the shared bearer, which would let it act as the
+  // human or record integration results.
   const apiToken = configuredApiToken(env);
-  if (apiToken !== undefined && requiresAuth(request.method) && !hasValidBearer(request, apiToken)) {
+  const agentBoardPost = request.method === "POST" && /^\/changes\/[^/]+\/board$/.test(url.pathname);
+  if (apiToken !== undefined && requiresAuth(request.method) && !agentBoardPost && !hasValidBearer(request, apiToken)) {
     return json({ error: "unauthorized: this route requires a bearer token" }, 401, {
       "www-authenticate": 'Bearer realm="switchyard-change-fabric"',
     });
@@ -989,6 +994,77 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
   }
 
+  // The Change board. Identity is established by the route, never by the
+  // message body:
+  //   POST /changes/:id/board/join      (bearer) an agent joins; returns its board token
+  //   POST /changes/:id/board           (agent board token) an agent posts as itself
+  //   POST /changes/:id/board/human     (bearer) the human posts (goal, items, decisions)
+  //   POST /changes/:id/integration/revision (bearer) the integrator records a revision
+  //   GET  /changes/:id/board?after=&limit=  the log page and reduced state (open)
+  //   GET  /changes/:id/board?for=<agent>    that agent's digest (agent board token)
+  //   GET  /changes/:id/board/verify         re-verify the stored log against the state
+  // The engine's own messages are never accepted from any route.
+  const boardRoute = url.pathname.match(/^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|integration\/revision)$/);
+  if (boardRoute) {
+    const changeId = decodeURIComponent(boardRoute[1] ?? "");
+    const kind = boardRoute[2];
+    const stub = changeStateStub(env, changeId);
+    if (request.method === "POST" && kind !== "board/verify") {
+      if (!(await stub.isInitialized())) {
+        return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
+      }
+      const body = await readBoardBody(request);
+      if (!body.ok) {
+        return json({ code: body.code, error: body.error }, body.status);
+      }
+      let outcome;
+      if (kind === "board/join") {
+        const join = isPlainObject(body.value) ? body.value : {};
+        if (typeof join.agent !== "string") {
+          return json({ code: "BAD_PAYLOAD", error: "a join requires an agent id" }, 400);
+        }
+        outcome = await stub.joinBoard(join.agent, { role: join.role, rationale: join.rationale });
+      } else if (kind === "board/human") {
+        outcome = await stub.postBoardAsHuman(body.value);
+      } else if (kind === "integration/revision") {
+        outcome = await stub.recordBoardIntegration(body.value);
+      } else {
+        const token = request.headers.get(BOARD_TOKEN_HEADER);
+        if (!token) {
+          return json({ code: "AUTH", error: `an agent board post requires the ${BOARD_TOKEN_HEADER} header` }, 401);
+        }
+        outcome = await stub.postBoardAsAgent(token, body.value);
+      }
+      return outcome.ok
+        ? json(outcome, 201)
+        : json({ code: outcome.code, error: outcome.error }, boardErrorStatus(outcome.code as BoardErrorCode));
+    }
+    if (request.method === "GET" && (kind === "board" || kind === "board/verify")) {
+      if (!(await stub.isInitialized())) {
+        return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
+      }
+      if (kind === "board/verify") {
+        const verified = await stub.verifyStoredBoard();
+        return json(verified, verified.ok ? 200 : 409);
+      }
+      const after = parseAfterSeq(url.searchParams.get("after"));
+      const limit = parseBoardLimit(url.searchParams.get("limit"));
+      if (after === undefined || limit === undefined) {
+        return json({ code: "BAD_PAYLOAD", error: `after must be a non-negative seq and limit 1..${BOARD_PAGE_MAX}` }, 400);
+      }
+      const forAgent = url.searchParams.get("for");
+      if (forAgent !== null) {
+        const token = request.headers.get(BOARD_TOKEN_HEADER);
+        if (!token) {
+          return json({ code: "AUTH", error: `a digest requires the ${BOARD_TOKEN_HEADER} header` }, 401);
+        }
+        const digest = await stub.getBoardDigest(token, forAgent, after, limit);
+        return digest.ok ? json(digest) : json({ code: digest.code, error: digest.error }, 401);
+      }
+      return json(await stub.getBoard(after, limit));
+    }
+  }
+
   // Raise a human escalation for a fork mechanical evidence cannot settle. The
   // engine records it and WAITS (a durable record in the DO, not a sleep) until
   // a human posts a decision. A pending escalation lights the graph's escalated
@@ -1373,6 +1449,57 @@ interface RepoPushedBody {
   readonly changeId?: string;
   /** The backend workspace (Artifact repo) name that was pushed. */
   readonly workspace?: string;
+}
+
+/** The header an agent presents its board token in. */
+export const BOARD_TOKEN_HEADER = "x-board-agent-token";
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Read a board request body as JSON, refusing anything over the board's body
+ * limit (413) before parsing it.
+ */
+async function readBoardBody(
+  request: Request,
+): Promise<{ ok: true; value: unknown } | { ok: false; status: number; code: string; error: string }> {
+  const max = BOARD_LIMITS.maxBodyBytes;
+  const tooLarge = { ok: false as const, status: 413, code: "LIMIT", error: `a board request body is at most ${max} bytes` };
+  const declared = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declared) && declared > max) {
+    return tooLarge;
+  }
+  const text = await request.text();
+  if (new TextEncoder().encode(text).length > max) {
+    return tooLarge;
+  }
+  try {
+    return { ok: true, value: text.trim() === "" ? {} : (JSON.parse(text) as unknown) };
+  } catch {
+    return { ok: false, status: 400, code: "BAD_PAYLOAD", error: "the board request body is not valid JSON" };
+  }
+}
+
+/** Parse the board page `limit`: absent means the default; invalid is undefined. */
+export function parseBoardLimit(value: string | null): number | undefined {
+  if (value === null || value === "") {
+    return BOARD_PAGE_DEFAULT;
+  }
+  if (!/^\d{1,4}$/.test(value)) {
+    return undefined;
+  }
+  const limit = Number(value);
+  return limit >= 1 && limit <= BOARD_PAGE_MAX ? limit : undefined;
+}
+
+/** Parse the board `after` query value: absent means 0; invalid is undefined. */
+export function parseAfterSeq(value: string | null): number | undefined {
+  if (value === null || value === "") {
+    return 0;
+  }
+  return /^\d{1,9}$/.test(value) ? Number(value) : undefined;
 }
 
 /** Body of POST /changes/:id/escalations: a fork for a human to settle. */
