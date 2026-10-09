@@ -442,7 +442,8 @@ body {
 .sw-pending { background: #30497a; }
 /* A heuristic-fallback plan (WARNING_FILL in graph-view). */
 .sw-warning { background: #d29922; }
-.sw-escalated { background: #f85149; }
+/* A pending human escalation (AWAITING_FILL in graph-view): yellow, not red. */
+.sw-escalated { background: #f5d547; }
 /* retry and jev nodes keep a fixed hue of their own. */
 .sw-retry { background: #a371f7; }
 .sw-jev { background: #e3883e; }
@@ -776,9 +777,11 @@ body {
   color: #ff7b72;
 }
 
-/* Human escalation panel: the pending decisions the engine is waiting on. */
+/* Human escalation panel: the pending decisions the engine is waiting on. A
+   pending decision is awaiting the human, not an error, so it is YELLOW (the
+   graph's AWAITING_FILL), never the failed red. */
 .escalation-panel {
-  border-left: 3px solid #f85149;
+  border-left: 3px solid #f5d547;
 }
 
 .escalation-list {
@@ -792,9 +795,9 @@ body {
 
 .escalation.pending {
   padding: 0.75rem;
-  border: 1px solid #f85149;
+  border: 1px solid #f5d547;
   border-radius: 6px;
-  background: rgba(248, 81, 73, 0.08);
+  background: rgba(245, 213, 71, 0.08);
 }
 
 .escalation-question {

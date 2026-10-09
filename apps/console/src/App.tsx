@@ -824,7 +824,7 @@ function Legend() {
  * plus the resolved ones for context. A pending escalation is a durable wait in
  * ChangeState (the engine does not self-certify past it); resolving one here
  * POSTs the human decision to the Worker, which ends the wait and lets the
- * graph advance. Each pending escalation also lights its node red in the graph.
+ * graph advance. Each pending escalation also lights its node yellow in the graph.
  */
 function EscalationPanel({
   escalations,

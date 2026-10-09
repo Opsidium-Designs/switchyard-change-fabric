@@ -503,10 +503,17 @@ export function changeHasPassed(model: WorkGraphModel): boolean {
 /** The amber used for a node that completed in a degraded way (node.warning). */
 export const WARNING_FILL = "#d29922";
 
+/**
+ * The YELLOW used for a node awaiting a human decision (a pending escalation).
+ * It is not an error, so it is never the failed red, and it is a lighter lemon
+ * yellow set apart from the darker WARNING_FILL amber and the orange jev fills.
+ */
+export const AWAITING_FILL = "#f5d547";
+
 /** The fill color for a node from its kind and verified/escalated/failed state. */
 function nodeFill(node: GraphNode, changePassed = false): string {
   if (node.escalated) {
-    return "#f85149"; // a pending human escalation lights this node (the human beat)
+    return AWAITING_FILL; // a pending human escalation lights this node (the human beat)
   }
   // A round-N retry agent that failed its own attempt while the change still
   // PASSED is an honest per-attempt failure that did NOT block the change, so it
@@ -528,7 +535,7 @@ function nodeFill(node: GraphNode, changePassed = false): string {
   // A retry node is the smarter-model re-attempt beat: a MAGENTA fill matching
   // the model-escalation edge that reaches it, so the escalation hop (edge) and
   // the escalated attempt (node) read as one beat, visibly distinct from both a
-  // normal running agent (blue) and the human-escalation red.
+  // normal running agent (blue) and the awaiting-you yellow.
   if (node.kind === "retry") {
     return "#a371f7";
   }

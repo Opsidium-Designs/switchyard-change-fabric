@@ -6,11 +6,17 @@
  *     verdict over a passing ladder round;
  *   - mutations go through the launcher's auth proxy when it exists (so no
  *     Worker secret lives in the bundle) and fall back to a direct Worker POST
- *     only when there is no proxy, never sending a mutation twice.
+ *     only when there is no proxy, never sending a mutation twice;
+ *   - a node awaiting a human decision (a pending escalation) is YELLOW, never
+ *     the failed red and never the heuristic-fallback warning amber.
  *
  * Rendering uses react-dom/server (no jsdom), and fetch is faked, so `make
  * check` stays offline and deterministic.
  */
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
@@ -21,7 +27,7 @@ import {
 } from "@switchyard-change/orchestration/graph-model";
 
 import { NodeDetail } from "../src/App.tsx";
-import { GraphView, WARNING_FILL, changeHasPassed } from "../src/graph-view.tsx";
+import { AWAITING_FILL, GraphView, WARNING_FILL, changeHasPassed } from "../src/graph-view.tsx";
 import { WORKER_PROXY_MARKER, WORKER_PROXY_PREFIX, postToWorker } from "../src/worker-post.ts";
 
 function snapshot(overrides: Partial<ChangeStateSnapshot> = {}): ChangeStateSnapshot {
@@ -152,5 +158,36 @@ describe("console mutations prefer the launcher auth proxy", () => {
     const res = await postToWorker(fn, "http://worker:8787", "/changes/c/dial");
     expect(res.status).toBe(201);
     expect(calls).toHaveLength(2);
+  });
+});
+
+describe("a pending human escalation reads as awaiting you (yellow), not failed", () => {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const FAILED_REDS = ["#f85149", "#da3633", "#8b2c22"];
+
+  it("fills an escalated node with the awaiting yellow, distinct from failed and warning", () => {
+    expect(AWAITING_FILL).not.toBe(WARNING_FILL);
+    expect(FAILED_REDS).not.toContain(AWAITING_FILL);
+    const model = {
+      changeId: "c",
+      nodes: [
+        { id: "work:c#fix", kind: "work", label: "fix", status: "running", verified: false, escalated: true, backing: { kind: "change", changeId: "c" } },
+      ],
+      edges: [],
+    } as unknown as Parameters<typeof GraphView>[0]["model"];
+    const markup = renderToStaticMarkup(
+      createElement(GraphView, { model, selectedId: null, onSelect: () => {} }),
+    );
+    expect(markup).toContain(`fill="${AWAITING_FILL}"`);
+    for (const red of FAILED_REDS) {
+      expect(markup).not.toContain(`fill="${red}"`);
+    }
+  });
+
+  it("keys the legend and the escalation panel to the same yellow, not red", async () => {
+    const css = (await readFile(join(here, "..", "src", "styles.css"), "utf8")).replace(/\s+/g, " ");
+    expect(css).toContain(`.sw-escalated { background: ${AWAITING_FILL}; }`);
+    expect(css).toMatch(new RegExp(`\\.escalation-panel \\{[^}]*border-left: 3px solid ${AWAITING_FILL}`));
+    expect(css).toMatch(new RegExp(`\\.escalation\\.pending \\{[^}]*border: 1px solid ${AWAITING_FILL}`));
   });
 });
