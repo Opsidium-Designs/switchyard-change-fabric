@@ -115,6 +115,8 @@ export interface RunBoardOfflineOptions {
   readonly projectDir: string;
   readonly changeId?: string;
   readonly dial?: ConcurrencyDial;
+  /** Scale the dial's max with the plan size (no explicit --max). */
+  readonly scaleDial?: boolean;
   readonly budgets?: BoardRunBudgets;
   /** Defaults to the generic policy. */
   readonly transport?: AgentTurnTransport<BoardDigest, BoardMessage>;
@@ -181,6 +183,7 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       workerUrl: "http://local-control",
       fetchFn: control.fetch as unknown as typeof fetch,
       dial: options.dial ?? { minConcurrency: 1, maxConcurrency: 3 },
+      ...(options.scaleDial ? { scaleDial: true } : {}),
       transport: options.transport ?? createGenericBoardPolicy(),
       seed:
         options.seed ??
@@ -195,6 +198,8 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
           ? { appGateCommand: OFFLINE_GATE_FIXTURE_COMMAND }
           : {}),
       ...(options.requireAppGate ? { requireAppGate: true } : {}),
+      // The fixture replaces RUNNING the declared gate, never the contract it defines.
+      ...(options.fixtureGate && options.replacesDeclaredGate ? { contractGateCommand: options.replacesDeclaredGate } : {}),
       ...(options.verifyCommandRunner
         ? { verifyCommandRunner: options.verifyCommandRunner }
         : options.fixtureGate && !options.appGateCommand

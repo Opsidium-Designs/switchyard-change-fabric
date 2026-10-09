@@ -306,3 +306,41 @@ describe("cohesion-aware module decomposition", () => {
     expect(JSON.stringify(second)).toBe(JSON.stringify(first));
   });
 });
+
+describe("every feature group of a multi-domain repo (the storefront example's structure)", () => {
+  it("includes catalog, orders, and billing as groups, with the shared contracts (and their whole directory) as frozen seams", async () => {
+    const { readdirSync, readFileSync, statSync } = await import("node:fs");
+    const { join, relative } = await import("node:path");
+    const root = new URL("../../../examples/apps/storefront/src", import.meta.url).pathname;
+    const files: { path: string; content: string }[] = [];
+    const walk = (dir: string): void => {
+      for (const name of readdirSync(dir).sort()) {
+        const full = join(dir, name);
+        if (statSync(full).isDirectory()) walk(full);
+        else files.push({ path: `src/${relative(root, full)}`, content: readFileSync(full, "utf8") });
+      }
+    };
+    walk(root);
+    const { buildRepoSnapshot, deriveCohesionBlueprint } = await import("../src/index.ts");
+    const blueprint = deriveCohesionBlueprint(buildRepoSnapshot(files))!;
+    expect(blueprint.groups!.map((g) => g.dir)).toEqual(["src/billing", "src/catalog", "src/orders"]);
+    expect(blueprint.modules.map((m) => m.label)).toEqual([
+      "src-billing-invoices",
+      "src-billing-payments",
+      "src-billing-refunds",
+      "src-billing-tax",
+      "src-catalog-categories",
+      "src-catalog-products",
+      "src-catalog-search",
+      "src-orders-cart",
+      "src-orders-checkout",
+      "src-orders-history",
+    ]);
+    // The contracts directory is a seam directory: its helper nobody calls yet (auth) is frozen too.
+    expect(blueprint.contracts.map((c) => c.path)).toEqual(["src/contracts/auth.ts", "src/contracts/http.ts", "src/contracts/money.ts", "src/store.ts"]);
+    // A module another group leans on stays owned: a cross-group write dependency.
+    expect(blueprint.modules.find((m) => m.label === "src-orders-checkout")!.dependsOn).toEqual(["src-billing-invoices", "src-billing-tax", "src-orders-cart", "src-orders-history"]);
+    // Deterministic.
+    expect(deriveCohesionBlueprint(buildRepoSnapshot(files))).toEqual(blueprint);
+  });
+});

@@ -76,6 +76,12 @@ export interface CohesionBlueprint {
   readonly contracts: readonly BlueprintContract[];
   /** Inter-module dependency edges (from a prerequisite owner to a dependent). */
   readonly edges: readonly { readonly from: string; readonly to: string }[];
+  /**
+   * Every feature group the structure has (a directory of sibling owners over
+   * shared seams), each with its module labels and the seams it leans on.
+   * The modules and contracts above are the union over all groups.
+   */
+  readonly groups?: readonly { readonly dir: string; readonly modules: readonly string[]; readonly contracts: readonly string[] }[];
 }
 
 /** The minimum number of sibling owner modules for the modular shape to apply. */
@@ -96,9 +102,11 @@ const SHARED_SEAM_FRACTION = 0.5;
  *
  * The structural rule, in one place:
  *   1. Group the source files by their directory (the snapshot's modules).
- *   2. Find a "feature group": a directory whose siblings are many (>= MIN) leaf
- *      files that share a common imported seam. The siblings become owner
- *      modules; the shared seams become frozen contracts.
+ *   2. Find EVERY "feature group": a directory whose siblings are many (>= MIN)
+ *      leaf files that share a common imported seam. The siblings become owner
+ *      modules; the shared seams become frozen contracts (a file one group
+ *      owns stays owned). A directory where at least half (and two) of the
+ *      files are seams is a seam directory: all its files are frozen.
  *   3. A file is a candidate OWNER when it is not an entry point and is not
  *      itself a shared seam within the group (a shared seam is read-only).
  *   4. Dependency edges run between owners only: if an owner imports a file
@@ -110,11 +118,11 @@ const SHARED_SEAM_FRACTION = 0.5;
 export function deriveCohesionBlueprint(snapshot: RepoSnapshot): CohesionBlueprint | undefined {
   const byPath = new Map(snapshot.sourceFiles.map((f) => [f.path, f] as const));
 
-  // Consider each directory group as a candidate feature group of sibling
-  // modules. Pick the first (deterministically ordered) group that is clearly
-  // modular; a repo organized as one resources/features directory is the case
-  // this serves, and taking the first qualifying group keeps the rule simple
-  // and order-stable.
+  // 1-3. Every directory group that is clearly modular is a FEATURE GROUP: its
+  // sibling owners and the seams they share. A repo of several feature
+  // directories (catalog, orders, billing, ...) yields one group each, so a
+  // planner sees the whole structure, not only the first group it met.
+  const groups: { dir: string; owners: SourceFileFacts[]; seams: Set<string>; importCounts: Map<string, number> }[] = [];
   for (const module of snapshot.modules) {
     const siblings = module.files
       .map((p) => byPath.get(p))
@@ -145,50 +153,84 @@ export function deriveCohesionBlueprint(snapshot: RepoSnapshot): CohesionBluepri
     if (owners.length < MIN_MODULES || seamPaths.size === 0) {
       continue;
     }
-
-    const ownerPaths = new Set(owners.map((f) => f.path));
-    const labelByPath = new Map(owners.map((f) => [f.path, moduleLabel(f.path)] as const));
-
-    const modules: BlueprintModule[] = [];
-    const edges: { from: string; to: string }[] = [];
-    for (const owner of owners) {
-      const label = labelByPath.get(owner.path)!;
-      const dependsOn: string[] = [];
-      for (const target of owner.importsFiles) {
-        // An edge only to another OWNED module (a real write dependency), never
-        // to a frozen contract (read-only, no owner to wait for).
-        if (ownerPaths.has(target) && target !== owner.path) {
-          const depLabel = labelByPath.get(target)!;
-          dependsOn.push(depLabel);
-          edges.push({ from: depLabel, to: label });
-        }
-      }
-      modules.push({
-        label,
-        paths: [owner.path],
-        dependsOn: dedupe(dependsOn).sort(compareString),
-        // The module's exported interface: the union of its file(s)' exported
-        // symbol names from the snapshot's already-parsed exports. A pure
-        // structural read (sorted, de-duplicated), never a goal/name branch.
-        exports: moduleExports([owner.path], byPath),
-      });
-    }
-
-    const contracts: BlueprintContract[] = [...seamPaths]
-      .map((path) => ({
-        path,
-        importedByCount: byPath.get(path)?.importedByCount ?? importCounts.get(path) ?? 0,
-      }))
-      .sort((a, b) => comparePath(a.path, b.path));
-
-    return {
-      modules: modules.sort((a, b) => compareString(a.label, b.label)),
-      contracts,
-      edges: edges.sort((a, b) => compareString(a.from, b.from) || compareString(a.to, b.to)),
-    };
+    groups.push({ dir: dirOf(module.files[0] ?? ""), owners, seams: seamPaths, importCounts });
+  }
+  if (groups.length === 0) {
+    return undefined;
   }
 
-  return undefined;
+  // An owner in one group stays an owner (a file another group leans on is a
+  // real write dependency, not a frozen seam).
+  const ownedPaths = new Set(groups.flatMap((g) => g.owners.map((f) => f.path)));
+  const seamsAll = new Set(groups.flatMap((g) => [...g.seams]).filter((p) => !ownedPaths.has(p)));
+  // A SEAM DIRECTORY: when at least half (and two) of a directory's files are
+  // shared seams, its other files are part of the same shared surface (a
+  // contracts directory whose helper no group calls yet is still a contract),
+  // so they are frozen too, never owned.
+  for (const module of snapshot.modules) {
+    const files = module.files.filter((p) => byPath.has(p));
+    const seamCount = files.filter((p) => seamsAll.has(p)).length;
+    if (files.length >= 2 && seamCount >= 2 && seamCount * 2 >= files.length) {
+      for (const path of files) {
+        if (!ownedPaths.has(path) && !byPath.get(path)!.isEntryPoint) {
+          seamsAll.add(path);
+        }
+      }
+    }
+  }
+
+  const owners = groups.flatMap((g) => g.owners).sort((a, b) => comparePath(a.path, b.path));
+  const labelByPath = new Map(owners.map((f) => [f.path, moduleLabel(f.path)] as const));
+
+  const modules: BlueprintModule[] = [];
+  const edges: { from: string; to: string }[] = [];
+  for (const owner of owners) {
+    const label = labelByPath.get(owner.path)!;
+    const dependsOn: string[] = [];
+    for (const target of owner.importsFiles) {
+      // An edge only to another OWNED module (a real write dependency, in any
+      // group), never to a frozen contract (read-only, no owner to wait for).
+      if (ownedPaths.has(target) && target !== owner.path) {
+        const depLabel = labelByPath.get(target)!;
+        dependsOn.push(depLabel);
+        edges.push({ from: depLabel, to: label });
+      }
+    }
+    modules.push({
+      label,
+      paths: [owner.path],
+      dependsOn: dedupe(dependsOn).sort(compareString),
+      // The module's exported interface: the union of its file(s)' exported
+      // symbol names from the snapshot's already-parsed exports. A pure
+      // structural read (sorted, de-duplicated), never a goal/name branch.
+      exports: moduleExports([owner.path], byPath),
+    });
+  }
+
+  const importedBy = (path: string): number =>
+    byPath.get(path)?.importedByCount ?? groups.reduce((n, g) => Math.max(n, g.importCounts.get(path) ?? 0), 0);
+  const contracts: BlueprintContract[] = [...seamsAll]
+    .map((path) => ({ path, importedByCount: importedBy(path) }))
+    .sort((a, b) => comparePath(a.path, b.path));
+
+  return {
+    modules: modules.sort((a, b) => compareString(a.label, b.label)),
+    contracts,
+    edges: edges.sort((a, b) => compareString(a.from, b.from) || compareString(a.to, b.to)),
+    groups: groups
+      .map((g) => ({
+        dir: g.dir,
+        modules: g.owners.map((f) => labelByPath.get(f.path)!).sort(compareString),
+        contracts: [...g.seams].filter((p) => seamsAll.has(p)).sort(comparePath),
+      }))
+      .sort((a, b) => comparePath(a.dir, b.dir)),
+  };
+}
+
+/** The directory of a repo-relative path ("" at the root). */
+function dirOf(path: string): string {
+  const slash = path.lastIndexOf("/");
+  return slash < 0 ? "" : path.slice(0, slash);
 }
 
 /** A short, filesystem-safe label for a path (mirrors the decomposer's). */

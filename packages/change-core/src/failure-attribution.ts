@@ -137,7 +137,8 @@ function extractFailingFiles(evidence: string): readonly string[] {
   // Error LOCATIONS (`<path>:<line>`, as in a syntax error or a stack frame)
   // name the file that failed; prefer them when there are any.
   const located = new Set<string>();
-  const at = /((?:[A-Za-z]:)?[A-Za-z0-9_./-]*\/?[A-Za-z0-9_.-]+\.[A-Za-z0-9]+):\d+/g;
+  // `<path>:<line>` (stack frames, most runners) and tsc's `<path>(<line>,<col>)`.
+  const at = /((?:[A-Za-z]:)?[A-Za-z0-9_./-]*\/?[A-Za-z0-9_.-]+\.[A-Za-z0-9]+)(?::\d+|\(\d+,\d+\))/g;
   let match: RegExpExecArray | null;
   while ((match = at.exec(text)) !== null) {
     const raw = match[1]!.replace(/^file:\/\//, "");
@@ -238,4 +239,40 @@ export function combineAttribution(input: {
     return { items: ordered(parsed), source: "parse" };
   }
   return { items: ordered(new Set([...parsed, ...picks])), source: "jev" };
+}
+
+/**
+ * The repo files a failing gate output points at: error LOCATIONS and
+ * path-shaped tokens resolved to real repo files (an absolute path in the
+ * gate's checkout resolves by its repo-relative suffix), plus failing test
+ * titles mapped to the modules named like them (`users: ...` -> a source file
+ * `users.*`, or its singular/plural). Test files are excluded (they are the
+ * contract, or new tests). Pure, sorted, deduplicated.
+ */
+export function failingRepoFiles(evidence: string, repoFiles: readonly string[]): string[] {
+  const sources = repoFiles.filter((f) => !isTestFile(f));
+  const out = new Set<string>();
+  for (const raw of extractFailingFiles(evidence)) {
+    const clean = raw.replace(/^\.\//, "");
+    const hit = repoFiles.find((f) => clean === f || clean.endsWith(`/${f}`));
+    if (hit && !isTestFile(hit)) {
+      out.add(hit);
+    }
+  }
+  for (const name of extractFailingNames(evidence)) {
+    const n = name.toLowerCase();
+    const variants = new Set([n, `${n}s`, n.endsWith("s") ? n.slice(0, -1) : n]);
+    for (const file of sources) {
+      const base = (file.split("/").pop() ?? "").replace(/\.[A-Za-z0-9]+$/, "").toLowerCase();
+      if (variants.has(base)) {
+        out.add(file);
+      }
+    }
+  }
+  return [...out].sort();
+}
+
+/** A test-shaped path (never a module a failure is "in"). */
+function isTestFile(path: string): boolean {
+  return /(^|\/)(tests?|__tests__|specs?)\//.test(path) || /\.(test|spec)\.[A-Za-z0-9]+$/.test(path) || /(^|\/)test_[^/]+\.py$|_test\.(go|py)$/.test(path);
 }

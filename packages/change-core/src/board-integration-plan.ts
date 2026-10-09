@@ -99,12 +99,24 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
   const announced = new Map<string, { commit: string; seq: number }[]>();
   const passingMerged = new Set<string>();
   const handedOff = new Map<string, Set<string>>();
+  // A sub-lead's push carries its children's commits: when a passing revision
+  // merges it, those child commits are merged too (for their authors' diff base).
+  const mergesOf = new Map<string, readonly { item: string; commit: string }[]>();
   for (const m of messages) {
     if (m.type === "push.announced") {
       announced.set(m.from, [...(announced.get(m.from) ?? []), { commit: m.payload.commit, seq: m.seq }]);
+      if (m.payload.merges !== undefined) {
+        mergesOf.set(m.payload.commit, m.payload.merges);
+      }
     } else if (m.type === "integrated.rev" && m.payload.gate === "pass") {
+      const unverified = new Set((m.payload.unverified ?? []).map((u) => u.item));
       for (const c of m.payload.merged) {
         passingMerged.add(c);
+        for (const merge of mergesOf.get(c) ?? []) {
+          if (!unverified.has(merge.item)) {
+            passingMerged.add(merge.commit);
+          }
+        }
       }
     } else if (m.type === "handoff") {
       handedOff.set(m.from, new Set([...(handedOff.get(m.from) ?? []), m.payload.item]));
@@ -123,7 +135,10 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
     // A sub-lead's push integrates only its merged children's write intents
     // (never the rest of the split item's scope).
     const writeOf = (i: BoardItem): string[] =>
-      i.status === "split" ? mergedChildrenWrite(state, i.lastPush?.merges ?? []) : (i.intent?.write ?? []).map(intentPath);
+      i.status === "split"
+        ? mergedChildrenWrite(state, i.lastPush?.merges ?? [])
+        : // A released contract path (possibly outside the scope: a failing check) is in scope for its item.
+          [...(i.intent?.write ?? []).map(intentPath), ...releasedTargets(state, i.id).filter((t) => !(state.immutable ?? []).includes(t))];
     const scope = [...new Set(mine.flatMap(writeOf))].sort();
     // Items this agent handed to someone else: their files are not its to apply.
     const yieldedScope = [...(handedOff.get(agent) ?? [])]
@@ -134,7 +149,10 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
     // children a sub-lead's push merges (their accepted changes ship through it).
     const released = [
       ...new Set(mine.flatMap((i) => [i.id, ...(i.status === "split" ? (i.lastPush?.merges ?? []).map((m) => m.item) : [])]).flatMap((id) => releasedTargets(state, id))),
-    ].sort();
+    ]
+      // The acceptance gate is always restored, whatever was accepted.
+      .filter((t) => !(state.immutable ?? []).includes(t))
+      .sort();
     units.push({
       agent,
       items: mine,

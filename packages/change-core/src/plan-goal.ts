@@ -167,6 +167,12 @@ export interface RecordedPlan {
    * injected), so that path records nothing new.
    */
   readonly jevReview?: PlanReviewDecision;
+  /**
+   * Plan-review decisions on EARLIER plans of this pass that were not chosen
+   * (in order, each with the model and units it reviewed), so every decision is
+   * recorded, not only the final one.
+   */
+  readonly priorReviews?: readonly (PlanReviewDecision & { readonly model: string; readonly units: readonly string[] })[];
 }
 
 /** Options for an inference-backed, schema-constrained plan pass. */
@@ -292,10 +298,23 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
     options.onDiagnostic?.(diagnostic);
   };
 
-  for (const model of ladder) {
+  // When a review is not accepted, the NEXT attempt carries the doubt as
+  // feedback (once): the next ladder model, or the last model again when the
+  // ladder is spent. Every review is kept; the best-reviewed plan proceeds.
+  const attempts = [...ladder];
+  let feedback: string | undefined;
+  let replanned = false;
+  const reviewed: { result: PlanGoalResult; review: PlanReviewDecision; model: string; units: string[] }[] = [];
+  const score = (r: PlanReviewDecision): number =>
+    r.accepted ? 2 + r.confidence : r.noul === "yes" ? r.confidence : r.noul === "unsure" ? 0 : -r.confidence;
+
+  for (let attempt = 0; attempt < attempts.length; attempt += 1) {
+    const model = attempts[attempt]!;
+    const asked = feedback !== undefined ? [...messages, { role: "user" as const, content: feedback }] : messages;
+    feedback = undefined;
     let proposed: PlannedShape;
     try {
-      proposed = await options.plan({ model, messages });
+      proposed = await options.plan({ model, messages: asked });
     } catch (error) {
       // A transport/schema error on this model: record WHY, then try the next
       // model in the ordered ladder rather than failing the whole pass. The
@@ -353,10 +372,23 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
       // A failed decision call is recorded on the plan but never escalates it
       // (the plan proceeds unreviewed, as before).
       if (!review || review.accepted || review.error !== undefined) {
-        return withReview;
+        return withPriorReviews(withReview, reviewed);
       }
-      // Escalated: remember this candidate and try the next model in the ladder.
-      escalatedCandidate = withReview;
+      // Escalated: remember this candidate and re-plan with the doubt as
+      // feedback, once (the next model, or the last one again).
+      reviewed.push({ result: withReview, review, model, units: validation.plan.units.map((u) => u.id) });
+      if (!replanned) {
+        replanned = true;
+        feedback = [
+          `A reviewer was not confident (answer "${review.noul}", confidence ${review.confidence.toFixed(2)}) that the previous plan covers the WHOLE goal.`,
+          `Previous plan units: ${validation.plan.units.map((u) => `${u.id} [${u.paths.join(", ")}]`).join("; ")}.`,
+          "Re-plan: list each requirement of the goal and the unit covering it, and cover every feature group of the structural map the goal concerns. Return the full plan.",
+        ].join("\n");
+        if (attempt === attempts.length - 1) {
+          attempts.push(model);
+        }
+      }
+      escalatedCandidate = null;
       continue;
     }
 
@@ -364,7 +396,12 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
   }
 
   // A Jev-reviewed run that never got a confident-yes plan still proceeds with
-  // the last valid (escalated) candidate rather than discarding a usable plan.
+  // its BEST-reviewed valid candidate rather than discarding a usable plan; the
+  // other reviews are recorded with it.
+  if (reviewed.length > 0) {
+    const best = reviewed.reduce((a, b) => (score(b.review) > score(a.review) ? b : a));
+    return withPriorReviews(best.result, reviewed.filter((r) => r !== best));
+  }
   if (escalatedCandidate) {
     return escalatedCandidate;
   }
@@ -373,6 +410,20 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
   // heuristic decomposition so the run proceeds with an honest, backbone-true
   // Change rather than a broken plan.
   return withDiagnostics(heuristicFallback(options, snapshot), diagnostics);
+}
+
+/** Carry the reviews of plans not chosen onto the chosen plan (recorded with it). */
+function withPriorReviews(
+  result: PlanGoalResult,
+  others: readonly { readonly review: PlanReviewDecision; readonly model: string; readonly units: readonly string[] }[],
+): PlanGoalResult {
+  if (others.length === 0) {
+    return result;
+  }
+  const priorReviews = others.map((o) => ({ ...o.review, model: o.model, units: [...o.units] }));
+  const plan: RecordedPlan = { ...result.plan, priorReviews };
+  const change: Change = { ...result.change, ...(result.change.plan ? { plan: { ...result.change.plan, priorReviews } } : {}) };
+  return { ...result, plan, change };
 }
 
 /** Attach the collected per-model diagnostics onto a plan result. */
@@ -718,6 +769,7 @@ export function buildPlannerMessages(
     ...frozenRules,
     "- Each real source file is owned by at most one unit (single writer).",
     "- A unit's dependsOn must reference other unit ids in your plan, following the import order in the structural map.",
+    "- Coverage: a goal often spans SEVERAL feature groups (feature_groups in the map). Go through every requirement of the goal and every feature group it concerns; a module whose behavior the goal changes needs a unit, in every group, not only the first one you notice.",
     "Return only the plan object the schema describes.",
   ].join("\n");
   const user = [
@@ -764,6 +816,9 @@ export function summarizePlannerPrompt(
     if (blueprint.modules.length > MAX_SUMMARY_ITEMS) {
       lines.push(`  - ...and ${blueprint.modules.length - MAX_SUMMARY_ITEMS} more`);
     }
+    if ((blueprint.groups ?? []).length > 0) {
+      lines.push(`Feature groups: ${(blueprint.groups ?? []).map((g) => `${g.dir || "."} (${g.modules.length})`).join(", ")}`);
+    }
     if (blueprint.contracts.length > 0) {
       lines.push("Frozen read-only contracts (owned by no unit):");
       for (const contract of blueprint.contracts.slice(0, MAX_SUMMARY_ITEMS)) {
@@ -807,6 +862,12 @@ function structuralMap(
     lines.push("frozen_contracts:");
     for (const contract of blueprint.contracts) {
       lines.push(`  - ${contract.path} (imported_by_count ${contract.importedByCount})`);
+    }
+    if ((blueprint.groups ?? []).length > 0) {
+      lines.push("feature_groups:");
+      for (const group of blueprint.groups ?? []) {
+        lines.push(`  - ${group.dir || "."}: modules ${group.modules.join(", ")}; seams ${group.contracts.join(", ") || "(none)"}`);
+      }
     }
   } else {
     lines.push("source_files:");

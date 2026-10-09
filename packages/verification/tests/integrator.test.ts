@@ -356,6 +356,30 @@ describe("Integrator", () => {
     expect(result.finalCheck.summary).toBe("integration app-gate exited 0 but did not run its tests: test inventory: 1 of the 2 baseline test(s) did not execute");
   });
 
+  it("reads the gate's progress from its FULL output, so a later suite's summary past the bounded capture still counts", async () => {
+    const unitDir = join(root, "unit");
+    const baseline = await unitThatDeletes(unitDir);
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+    const noise = Array.from({ length: 200 }, (_, i) => ` FAIL  gate/a.test.ts > case ${i}\nAssertionError: expected 1 to be 2`).join("\n");
+    const stdout = ` ✓ tests/dev.test.ts (9 tests)\n      Tests  9 passed (9)\n ❯ gate/a.test.ts (210 tests | 200 failed)\n${noise}\n      Tests  200 failed | 10 passed (210)\n`;
+    const runner = new FakeCommandRunner([{ match: "gate", outcome: { code: 1, stdout, stderr: "" } }]);
+    const result = await new Integrator(provider, { commandRunner: runner }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+      excludedUnits: [],
+      integrationGateCommand: ["npm", "run", "gate"],
+      requiresIntegrationGate: true,
+      workRoot: root,
+    });
+    expect(result.finalCheck.outputs[0]!.text).toMatch(/\[truncated \d+ chars\]$/);
+    expect(result.finalCheck.progress?.suites?.map((s) => [s.passed, s.total, s.files])).toEqual([
+      [9, 9, ["tests/dev.test.ts"]],
+      [10, 210, ["gate/a.test.ts"]],
+    ]);
+  });
+
   it("applies a released protected path only for the unit it was released for; never symlinks or dependency trees", async () => {
     const base = join(root, "base");
     await mkdir(join(base, "tests"), { recursive: true });

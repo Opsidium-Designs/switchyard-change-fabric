@@ -129,6 +129,8 @@ export type {
   BoardDigest,
   BoardDigestHelp,
   BoardDigestStruggle,
+  BoardRevProgress,
+  BoardSeam,
   BoardVolunteer,
   BoardDraft,
   BoardErrorCode,
@@ -163,6 +165,8 @@ export type {
 } from "./board.ts";
 export {
   appendBoardMessage,
+  describeProgress,
+  progressHeadline,
   appendDecisionRecorded,
   appendIntegratedRev,
   appendToolGated,
@@ -213,6 +217,12 @@ export {
   mergedChildrenWrite,
   objectiveSubChanges,
   splitCue,
+  uncoveredFailureFiles,
+  contractCue,
+  seamWaits,
+  isSeamItem,
+  seamContractCue,
+  seamItemId,
   verifyBoard,
   withContractTriage,
 } from "./board.ts";
@@ -267,5 +277,5 @@ export {
 export type { BoardIntegrationPlan, BoardIntegrationUnitPlan } from "./board-integration-plan.ts";
 export { awaitingSubLead, narrowToSplitChildren, pendingPushItems, pendingPushKey, planBoardIntegration } from "./board-integration-plan.ts";
 export type { AttributableUnit } from "./failure-attribution.ts";
-export { attributeFailure, combineAttribution } from "./failure-attribution.ts";
+export { attributeFailure, combineAttribution, failingRepoFiles } from "./failure-attribution.ts";
 export type { ImplicationSource } from "./failure-attribution.ts";

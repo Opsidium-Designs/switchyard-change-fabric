@@ -37,6 +37,8 @@ import {
   detectBoardToolNeed,
   entriesOverlap,
   splitCue,
+  uncoveredFailureFiles,
+  failingRepoFiles,
   hasWildcard,
   intentPath,
   isAcceptedItem,
@@ -61,7 +63,7 @@ import type {
 import { AGENT_ACTION_TYPES } from "@switchyard-change/model-adapters";
 import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { authenticatedRemote, clone, push, type GitIdentity } from "@switchyard-change/local-runner";
-import { matchesGlob, partitionByScope, toolSkeleton } from "@switchyard-change/verification";
+import { gateFailureLine, matchesGlob, partitionByScope, toolSkeleton } from "@switchyard-change/verification";
 
 import { ToolUseError, type ToolAuthor, type ToolBench } from "./board-tools.ts";
 
@@ -225,6 +227,20 @@ export const MAX_CLAIM_NUDGES = 3;
  * another turn anyway: it never stalls on held work, and never waits long.
  */
 export const MAX_HELD_WAIT_CUES = 2;
+
+/**
+ * How many times a worker that answers a fix request on its item with a wait
+ * (or an invalid reply) is given another turn at once, per item and failing
+ * revision, with the fix stated plainly. Bounded: then the fix budget and the
+ * board's other cues take over.
+ */
+export const MAX_FIX_CUES = 2;
+/** Items the lead may propose for failing files no item covers, per run. */
+export const MAX_UNCOVERED_PROPOSALS = 4;
+/** An item whose write intent covers at least this many files starts on the strongest model. */
+export const LARGE_ITEM_FILES = 3;
+/** Edits a held item defers while a shared seam change it depends on is on its way. */
+export const MAX_SEAM_DEFERRALS = 3;
 /** The failing gate output a fix edit hands the executor, in characters. */
 const MAX_FIX_EVIDENCE = 4000;
 
@@ -402,8 +418,19 @@ export class BoardAgent {
   private readonly failedEdits = new Map<string, number>();
   /** Struggling reports already posted, per `<item>:<reason>[:<rev>]`. */
   private readonly struggleReported = new Set<string>();
+  /** Items whose edit waited for a shared seam change (they rebase before editing). */
+  private readonly seamWaited = new Set<string>();
+  /** Edits deferred per item for a seam change (bounded by MAX_SEAM_DEFERRALS). */
+  private readonly seamDeferrals = new Map<string, number>();
+  /** The model each pushed edit used (and why a complex item got the strongest). */
+  readonly editModels: { readonly item: string; readonly commit: string; readonly model: string; readonly why?: string }[] = [];
+  /** Lead: items proposed for failures no item covered, and the revisions already examined. */
+  private uncoveredProposals = 0;
+  private readonly uncoveredSeen = new Set<number>();
   /** Waits taken while holding unpushed work, per held item set (bounded re-cues). */
   private readonly heldWaitCues = new Map<string, number>();
+  /** Re-cues after a wait while a fix request is open, per `item@revision` (bounded by MAX_FIX_CUES). */
+  private readonly fixCues = new Map<string, number>();
   /** Lead: the undecided worker proposals it last saw (a change wakes it). */
   private lastProposals = "";
   /** Items (and tool items) this agent proposed: their decision wakes it. */
@@ -545,7 +572,13 @@ export class BoardAgent {
         await this.seedTurn();
         return "acted";
       }
-      const state = await client.state();
+      let state = await client.state();
+      // A failing revision that points at files no item covers is work the plan
+      // missed: the lead proposes it (bounded), recorded with the evidence.
+      const lastFailing = fresh.filter((m) => m.type === "integrated.rev" && m.payload.gate === "fail" && m.payload.failing !== undefined).at(-1);
+      if (lastFailing && lastFailing.type === "integrated.rev" && (await this.proposeUncovered(lastFailing, state))) {
+        state = await client.state();
+      }
       const undecided = Object.values(state.contracts).some((c) => c.status === "proposed");
       const addressed = fresh.some((m) => m.to?.includes(this.id));
       // Workers' proposals wait for the lead: a new undecided set is a reason to take a turn.
@@ -586,6 +619,10 @@ export class BoardAgent {
       }
       // A passing revision is new code a tool this agent built may have something to say about.
       if (m.type === "integrated.rev" && m.payload.gate === "pass" && this.builtTools.size > 0) {
+        return true;
+      }
+      // A passing revision may be the seam change a held item waits for.
+      if (m.type === "integrated.rev" && m.payload.gate === "pass" && digest.claims.some((c) => this.seamWaited.has(c.item))) {
         return true;
       }
       // The decision on a contract change this agent proposed.
@@ -660,7 +697,7 @@ export class BoardAgent {
     readonly minPollMs?: number;
     readonly maxPollMs?: number;
     /** The driver holds the agent back (no step) while this is true; the driver bounds it. */
-    readonly hold?: () => boolean;
+    readonly hold?: () => boolean | Promise<boolean>;
   }): Promise<void> {
     const min = options.minPollMs ?? 250;
     const max = options.maxPollMs ?? 4000;
@@ -668,7 +705,7 @@ export class BoardAgent {
     while (!options.signal.aborted && !this.stop) {
       let result: AgentStepResult;
       try {
-        result = options.hold?.() ? "idle" : await this.step();
+        result = (await options.hold?.()) ? "idle" : await this.step();
       } catch (error) {
         this.stop = { reason: "stopped", detail: `step failed: ${this.scrub(error instanceof Error ? error.message : String(error))}` };
         return;
@@ -714,6 +751,44 @@ export class BoardAgent {
         this.history = this.history.slice(-limit);
       }
     }
+  }
+
+  /**
+   * The lead turns a failing revision's evidence into work when it points at
+   * repo files no item covers (an error location, or a failing test title
+   * naming a module): one item per revision, at most MAX_UNCOVERED_PROPOSALS
+   * per run, scoped to those files, with the failing line in its rationale.
+   * Goal-agnostic: files come from the gate's own output and the repo listing.
+   */
+  private async proposeUncovered(message: Extract<BoardMessage, { type: "integrated.rev" }>, state: BoardState): Promise<boolean> {
+    if (this.uncoveredProposals >= MAX_UNCOVERED_PROPOSALS || this.uncoveredSeen.has(message.payload.n)) {
+      return false;
+    }
+    this.uncoveredSeen.add(message.payload.n);
+    const output = message.payload.failing!.output;
+    const files = uncoveredFailureFiles(state, failingRepoFiles(output, await listRepoFiles(this.baseDir))).slice(0, 16);
+    if (files.length === 0) {
+      return false;
+    }
+    this.uncoveredProposals += 1;
+    const line = gateFailureLine(output) ?? "the gate failed";
+    const action: AgentAction = {
+      type: "propose_item",
+      objective: bounded(`Fix what failing revision ${message.payload.n} reports in ${files.join(", ")}: no planned item covers these files`, 500),
+      acceptance: ["the change gate passes on an integrated revision that merges this item's push"],
+      scopeHint: files,
+    };
+    const outcome = await this.requireClient().post({
+      type: "item.proposed",
+      payload: { item: this.nextId("uncovered"), objective: action.objective, acceptance: action.acceptance, scopeHint: files },
+      rationale: bounded(`revision ${message.payload.n} failed (${this.scrub(line)}) in files no item covers: ${files.join(", ")}`, 600),
+    });
+    this.record(
+      outcome.ok
+        ? { turn: this.turns, action, outcome: "seeded", seqs: outcome.appended.map((m) => m.seq) }
+        : { turn: this.turns, action, outcome: "rejected", code: outcome.code, error: outcome.error },
+    );
+    return outcome.ok;
   }
 
   /** The lead's first turn: the planner's decomposition becomes proposed items. */
@@ -843,7 +918,9 @@ export class BoardAgent {
       this.struggleReported.add(reason === "failing-revision" ? `${claim.item}:failing-revision:${claim.fix!.n}` : `${claim.item}:${reason}`);
       const lastFailure =
         reason === "failing-revision" && digest.failure
-          ? digest.failure.output.split("\n").find((l) => l.trim() !== "")
+          ? // The gate's own failing line (never a command echo such as npm's "> pkg@1.0.0 gate").
+            gateFailureLine(digest.failure.output) ??
+            digest.failure.output.split("\n").find((l) => l.trim() !== "" && !/^\s*[>$] /.test(l) && !/^npm (error|ERR!)/.test(l.trim()))
           : // Only this item's failed edits or tool runs, never an unrelated refusal (a claim, a split).
             this.history
               .filter((h) => h.code !== undefined && (h.action.type === "edit" || h.action.type === "use_tool") && h.action.itemId === claim.item)
@@ -909,6 +986,8 @@ export class BoardAgent {
         proposedBy: c.proposedBy,
         ...(c.item !== undefined ? { item: c.item } : {}),
         ...(c.guarded ? { protected: true } : {}),
+        ...(c.seam !== undefined ? { seam: c.seam } : {}),
+        ...(c.description !== undefined ? { description: c.description } : {}),
       }));
     // The lead decides workers' proposals against the items already on the
     // Change; every agent sees them, so a tool's findings are compared with
@@ -1113,6 +1192,22 @@ export class BoardAgent {
               !state.tools.published.some((p) => p.capability === t.capability) &&
               (t.inputs.length === 0 || write.some((w) => t.inputs.some((i) => entriesOverlap(intentPath(w), i)))),
           );
+        // A fix request is never answered with a wait: the item FAILED the
+        // gate. Re-cue at once, with the fix stated plainly (bounded).
+        if (this.role === "worker") {
+          const fixes = digest.claims.filter((c) => c.fix !== undefined && !state.items[c.item]?.tool);
+          const key = fixes.map((c) => `${c.item}@${c.fix!.n}`).join(",");
+          const cues = this.fixCues.get(key) ?? 0;
+          if (key !== "" && cues < MAX_FIX_CUES) {
+            this.fixCues.set(key, cues + 1);
+            this.followUp = true;
+            this.evidence.push(
+              `FIX REQUIRED: ${fixes.map((c) => `revision ${c.fix!.n} failed the gate and implicates my item ${c.item}`).join("; ")}. ` +
+                "Proposing done did not complete it and I am not waiting for integration: edit it now (or send the contract its cue names); waiting stalls it.",
+            );
+            return;
+          }
+        }
         const unpushed = digest.claims
           .filter((c) => !state.items[c.item]?.tool && (!c.lastPush || c.lastPush.agent !== this.id) && c.fix === undefined && awaitingTool(c.intent.write))
           .map((c) => c.item);
@@ -1185,7 +1280,7 @@ export class BoardAgent {
           await this.offerFork(action, digest, local, posted);
           return;
         }
-        await this.message(action, posted);
+        await this.message(action, posted, state);
         return;
       case "offer_help":
         await posted(
@@ -1239,7 +1334,7 @@ export class BoardAgent {
           await this.helperEdit(grant, action.instruction, local, posted);
           return;
         }
-        await this.edit(action.itemId, action.instruction, digest, local, posted);
+        await this.edit(action.itemId, action.instruction, digest, local, posted, state);
         return;
       }
       case "propose_done": {
@@ -1301,6 +1396,7 @@ export class BoardAgent {
   private async message(
     action: Extract<AgentAction, { type: "message" }>,
     posted: (draft: Record<string, unknown>, note?: Record<string, string>) => Promise<boolean>,
+    state: BoardState,
   ): Promise<void> {
     const to = action.to && action.to.length > 0 ? { to: action.to } : {};
     const p = action.payload;
@@ -1343,7 +1439,18 @@ export class BoardAgent {
         await posted(
           {
             type: "contract.proposed",
-            payload: { contract: this.nextId("contract"), target: p.target, kind: p.change, ...(p.itemId !== undefined ? { item: p.itemId } : {}) },
+            payload: {
+              contract: this.nextId("contract"),
+              target: p.target,
+              kind: p.change,
+              ...(p.itemId !== undefined ? { item: p.itemId } : {}),
+              // The needed change; a shared seam's contract requires one (the rationale stands in when the model gave none).
+              ...(p.description !== undefined
+                ? { description: p.description }
+                : p.target !== undefined && (state.seams ?? []).some((seam) => seam.path === p.target!.split("#")[0])
+                  ? { description: action.rationale.slice(0, 400) }
+                  : {}),
+            },
             rationale: action.rationale,
             ...to,
           },
@@ -1435,6 +1542,7 @@ export class BoardAgent {
     digest: BoardDigest,
     plainLocal: (code: string, error: string, note?: Record<string, string>) => void,
     plainPosted: (draft: Record<string, unknown>, note?: Record<string, string>) => Promise<boolean>,
+    state?: BoardState,
   ): Promise<void> {
     const claim = digest.claims.find((c) => c.item === itemId);
     if (!claim) {
@@ -1449,11 +1557,25 @@ export class BoardAgent {
       local("NOT_ALLOWED", `${this.id} has no executor`);
       return;
     }
+    // SEAM FIRST: a change to a shared seam this item's files import is still
+    // on its way: do not edit yet (bounded by the board), and rebase onto its
+    // integrated revision before editing.
+    const deferred = this.seamDeferrals.get(itemId) ?? 0;
+    if ((claim.waitsFor ?? []).length > 0 && deferred < MAX_SEAM_DEFERRALS) {
+      // Bounded in turns too (a quiet board never stalls held work).
+      this.seamWaited.add(itemId);
+      this.seamDeferrals.set(itemId, deferred + 1);
+      plainLocal(
+        "SEAM_FIRST",
+        `item ${itemId} waits for the shared seam change in ${claim.waitsFor!.join(", ")} to be integrated (${deferred + 1} of ${MAX_SEAM_DEFERRALS}); it rebases then`,
+      );
+      return;
+    }
     // A passing integrated revision changed something this agent reads or
     // writes (or a failing revision asks this agent for a fix): fetch the latest
     // passing revision once, before this edit, and read from it from now on.
     const fix = claim.fix;
-    await this.rebaseIfNeeded(digest, fix !== undefined);
+    await this.rebaseIfNeeded(digest, fix !== undefined || this.seamWaited.has(itemId));
     let worktree: string;
     try {
       worktree = await this.ensureWorktree();
@@ -1486,9 +1608,31 @@ export class BoardAgent {
     const view = await this.editView(allowed, worktree);
 
     // A fix attempt carries the failing gate output and escalates the model one
-    // step per attempt along the configured ladder.
+    // step per attempt along the configured ladder. A COMPLEX item starts on the
+    // strongest configured model: a large one (many files), one touching the
+    // contract (a contract proposed or accepted for it), a reopened one, or one
+    // whose first fix already failed. Small items keep the cheap base model.
     const ladder = this.options.escalationModels ?? [];
-    const model = fix !== undefined && ladder.length > 0 ? ladder[Math.min(fix.attempt, ladder.length) - 1] : undefined;
+    const item = state?.items[itemId];
+    const touchesContract = state !== undefined && Object.values(state.contracts).some((c) => c.item === itemId && c.status !== "rejected");
+    const complexBecause =
+      allowed.filter((f) => !hasWildcard(f)).length >= LARGE_ITEM_FILES
+        ? `it spans ${allowed.length} files`
+        : touchesContract
+          ? "it touches the contract"
+          : item?.reopenedFrom !== undefined
+            ? "it was reopened after another agent's fix budget"
+            : fix !== undefined && fix.attempt >= 2
+              ? "its first fix already failed"
+              : undefined;
+    const model =
+      ladder.length === 0
+        ? undefined
+        : complexBecause !== undefined
+          ? ladder[ladder.length - 1]
+          : fix !== undefined
+            ? ladder[Math.min(fix.attempt, ladder.length) - 1]
+            : undefined;
     const failure = fix !== undefined && digest.failure && digest.failure.n === fix.n ? digest.failure.output : undefined;
     const objective = [
       claim.objective,
@@ -1519,14 +1663,19 @@ export class BoardAgent {
       await rm(view, { recursive: true, force: true });
     }
 
-    const pushed = await this.commitPushAnnounce(itemId, worktree, head, writeGlobs, result.commitMessage, local, posted, `the edit for ${itemId}`);
+    const pushed = await this.commitPushAnnounce(itemId, worktree, head, writeGlobs, result.commitMessage, local, posted, `the edit for ${itemId}`, {
+      rationale: `(model: ${model ?? "base"}${complexBecause !== undefined && model !== undefined ? `, strongest: ${complexBecause}` : ""})`,
+    });
     if (pushed === undefined) {
       return;
     }
+    // Every edit records the model it used (and why a complex item got the strongest).
     this.evidence.push(
-      `pushed ${pushed.commit} for ${itemId}: ${pushed.changed.join(", ")}` +
-        (fix !== undefined ? ` (fix attempt ${fix.attempt} for revision ${fix.n}${model !== undefined ? ` on ${model}` : ""})` : ""),
+      `pushed ${pushed.commit} for ${itemId}: ${pushed.changed.join(", ")} on ${model ?? "the base model"}` +
+        (complexBecause !== undefined && model !== undefined ? ` (the strongest model: ${complexBecause})` : "") +
+        (fix !== undefined ? ` (fix attempt ${fix.attempt} for revision ${fix.n})` : ""),
     );
+    this.editModels.push({ item: itemId, commit: pushed.commit, model: model ?? "base", ...(complexBecause !== undefined ? { why: complexBecause } : {}) });
   }
 
   /**
@@ -1545,7 +1694,7 @@ export class BoardAgent {
     local: (code: string, error: string) => void,
     posted: (draft: Record<string, unknown>) => Promise<boolean>,
     what: string,
-    extra: { readonly payload?: Record<string, unknown>; readonly allowEmpty?: boolean } = {},
+    extra: { readonly payload?: Record<string, unknown>; readonly allowEmpty?: boolean; readonly rationale?: string; readonly paths?: readonly string[] } = {},
   ): Promise<{ readonly commit: string; readonly changed: readonly string[] } | undefined> {
     // What changed is read from Git's status (never `git add -A`, never the
     // executor's word); only these paths are ever staged, and only after they
@@ -1621,8 +1770,8 @@ export class BoardAgent {
     }
     const ok = await posted({
       type: "push.announced",
-      payload: { item: itemId, commit, paths: changed, ...(extra.payload ?? {}) },
-      rationale: bounded(`pushed ${changed.length} file(s) for ${itemId}`, 200),
+      payload: { item: itemId, commit, paths: changed.length > 0 ? changed : [...(extra.paths ?? [])], ...(extra.payload ?? {}) },
+      rationale: bounded(`pushed ${changed.length} file(s) for ${itemId}${extra.rationale ? ` ${extra.rationale}` : ""}`, 200),
     });
     if (!ok) {
       // The board refused the announcement: put the repo back to the last
@@ -2005,6 +2154,17 @@ export class BoardAgent {
       }
     }
     const merges = pending.map((c) => ({ item: c.item, commit: c.lastPush!.commit }));
+    // The children's files this merge carries: when the sub-lead also wrote a
+    // child (its own repo already holds that content) the merge commit changes
+    // nothing new, and announces those files (never an empty push).
+    const carried = (await gitOut(worktree, ["ls-files"]).catch(() => ""))
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l !== "" && pending.some((c) => (state.items[c.item]?.intent?.write ?? state.items[c.item]?.scopeHint ?? []).some((w) => matchesGlob(l, intentPath(w)))));
+    if ((await worktreeChanges(worktree)).length === 0 && carried.length === 0) {
+      local("NO_CHANGE", `the merge of ${action.itemId}'s children carries no file`);
+      return;
+    }
     const writeGlobs = [...new Set(led.write.map(intentPath))];
     const pushed = await this.commitPushAnnounce(
       action.itemId,
@@ -2015,7 +2175,7 @@ export class BoardAgent {
       local,
       posted,
       `the merge of ${action.itemId}'s children`,
-      { payload: { merges } },
+      { payload: { merges }, allowEmpty: true, paths: carried },
     );
     if (pushed !== undefined) {
       this.evidence.push(`as sub-lead of ${action.itemId}, merged ${merges.map((m) => `${m.item}@${m.commit.slice(0, 10)}`).join(", ")}: pushed ${pushed.commit}`);

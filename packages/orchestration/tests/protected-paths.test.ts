@@ -184,3 +184,45 @@ describe("deriveProtectedPaths: the original code's existing tests are the contr
     expect(outside).toEqual([join(REPO, "examples/apps/gate-harness.mjs")]);
   });
 });
+
+describe("two classes: the immutable acceptance gate and contract-changeable developer tests", () => {
+  it("on the storefront: the gate suite, its harness and config, and the configs the gate run uses are immutable; developer tests stay changeable", async () => {
+    const { fileURLToPath } = await import("node:url");
+    const dir = fileURLToPath(new URL("../../../examples/apps/storefront", import.meta.url));
+    const derived = await deriveProtectedPaths(dir, ["npm", "run", "gate"]);
+    expect(derived.immutable).toEqual(expect.arrayContaining(["gate/billing.test.ts", "gate/harness.ts", "gate/money.test.ts", "gate/safety.test.ts", "gate/vitest.config.ts", "tsconfig.json", ".npmrc", "vitest.config.ts"]));
+    // The root vitest.config.ts is read by the gate's plain `vitest run` step:
+    // immutable. Developer TEST FILES stay changeable.
+    const changeable = derived.paths.filter((p) => !derived.immutable.includes(p));
+    expect(changeable).toEqual(["tests/billing/tax.test.ts", "tests/catalog.test.ts", "tests/helpers.ts", "tests/orders.test.ts"]);
+    expect(derived.immutable.every((p) => derived.paths.includes(p))).toBe(true);
+  });
+
+  it("a runner's root default config is immutable only when a gate step runs that runner without an explicit config", async () => {
+    const make = async (gate: string) =>
+      deriveProtectedPaths(
+        await project({
+          "package.json": JSON.stringify({ scripts: { gate } }),
+          "vitest.config.ts": "export default {}\n",
+          "jest.config.js": "module.exports = {}\n",
+          ".mocharc.json": "{}\n",
+          "gate/vitest.config.ts": "export default {}\n",
+          "gate/a.test.ts": "import { it } from 'vitest'; it('a', () => {});\n",
+          "tests/b.test.ts": "import { it } from 'vitest'; it('b', () => {});\n",
+        }),
+        ["npm", "run", "gate"],
+      );
+    const both = await make("tsc --noEmit && vitest run && vitest run --config gate/vitest.config.ts");
+    expect(both.immutable).toEqual(expect.arrayContaining(["vitest.config.ts", "gate/vitest.config.ts", "gate/a.test.ts"]));
+    expect(both.immutable).not.toContain("tests/b.test.ts");
+    expect(both.immutable).not.toContain("jest.config.js");
+    expect(both.immutable).not.toContain(".mocharc.json");
+    const explicitOnly = await make("vitest run --config gate/vitest.config.ts");
+    expect(explicitOnly.immutable).toContain("gate/vitest.config.ts");
+    expect(explicitOnly.immutable).not.toContain("vitest.config.ts");
+    expect(explicitOnly.paths).toContain("vitest.config.ts");
+    const viaNpx = await make("npx jest && npx mocha");
+    expect(viaNpx.immutable).toEqual(expect.arrayContaining(["jest.config.js", ".mocharc.json"]));
+    expect(viaNpx.immutable).not.toContain("vitest.config.ts");
+  });
+});

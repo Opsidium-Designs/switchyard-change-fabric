@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 
 import { readFileSync } from "node:fs";
 
-import { inventoryAfterContracts, inventoryShortfall, readStreamInventory, readTestInventory } from "../src/test-inventory.ts";
+import { inventoryAfterContracts, inventoryShortfall, labelGateProgress, readStreamInventory, readTestInventory, readTestProgress } from "../src/test-inventory.ts";
 
 const NODE_SPEC = [
   "✖ users: unauthenticated request is rejected (401/403) (39.8ms)",
@@ -123,3 +123,86 @@ describe("inventory hardening (live regressions)", () => {
   });
 });
 
+
+describe("readTestProgress (advisory progress per revision)", () => {
+  it("sums several vitest suites and lists each; reads node, jest, pytest, tap", () => {
+    const vitest = " Test Files  2 failed (2)\n      Tests  3 failed | 50 passed (53)\n ...\n      Tests  41 failed | 35 passed (76)\n";
+    expect(readTestProgress(vitest)).toEqual({
+      format: "vitest",
+      passed: 85,
+      failed: 44,
+      total: 129,
+      suites: [
+        { passed: 50, failed: 3, total: 53 },
+        { passed: 35, failed: 41, total: 76 },
+      ],
+    });
+    expect(readTestProgress("ℹ tests 4\nℹ pass 3\nℹ fail 1\n")).toMatchObject({ format: "node-spec", passed: 3, failed: 1, total: 4 });
+    expect(readTestProgress("Tests:       1 failed, 3 passed, 4 total\n")).toMatchObject({ format: "jest", passed: 3, failed: 1 });
+    expect(readTestProgress("===== 2 failed, 8 passed in 0.12s =====\n")).toMatchObject({ format: "pytest", passed: 8, failed: 2 });
+    expect(readTestProgress("ok 1 - a\nnot ok 2 - b\nok 3 - c # SKIP\n")).toMatchObject({ format: "tap", passed: 1, failed: 1, total: 2 });
+    expect(readTestProgress("> pkg gate\nerror TS2304\n")).toBeUndefined();
+  });
+});
+
+describe("progress per suite, labeled against the immutable acceptance gate", () => {
+  const acceptanceFiles = ["gate/billing.test.ts", "gate/money.test.ts", "gate/harness.ts", "tsconfig.json"];
+  const developer = [
+    " RUN  v2.1.8 /work/storefront",
+    " ✓ tests/catalog.test.ts (3 tests) 4ms",
+    " ✓ tests/orders.test.ts (6 tests) 6ms",
+    " Test Files  2 passed (2)",
+    "      Tests  9 passed (9)",
+  ].join("\n");
+  const acceptance = [
+    " RUN  v2.1.8 /work/storefront",
+    " ❯ gate/billing.test.ts (5 tests | 5 failed) 33ms",
+    " ❯ gate/money.test.ts (19 tests | 15 failed) 55ms",
+    " FAIL  gate/billing.test.ts > payments > paying in parts",
+    "AssertionError: expected 1072 to be 1073",
+    " Test Files  2 failed (2)",
+    "      Tests  20 failed | 4 passed (24)",
+  ].join("\n");
+  const gateHeader = "> tsc --noEmit && vitest run && vitest run --config gate/vitest.config.ts";
+
+  it("attributes each summary to the files it listed; the acceptance suite's count is its own, never the developer suite's", () => {
+    const progress = readTestProgress(`${gateHeader}\n${developer}\n${acceptance}\n`);
+    expect(progress?.suites?.map((s) => s.files)).toEqual([["tests/catalog.test.ts", "tests/orders.test.ts"], ["gate/billing.test.ts", "gate/money.test.ts"]]);
+    expect(labelGateProgress(progress, acceptanceFiles)).toEqual({
+      passed: 13,
+      failed: 20,
+      total: 33,
+      suites: [
+        { passed: 9, failed: 0, total: 9, suite: "developer" },
+        { passed: 4, failed: 20, total: 24, suite: "acceptance" },
+      ],
+      acceptance: { passed: 4, failed: 20, total: 24 },
+    });
+  });
+
+  it("a typecheck that failed first: the acceptance suite did not run, stated instead of a number", () => {
+    const output = `${gateHeader}\nsrc/orders/cart.ts(44,12): error TS2339: Property 'user' does not exist on type 'Ctx'.\n`;
+    const progress = readTestProgress(output);
+    expect(progress).toMatchObject({ passed: 0, failed: 0, total: 0, typeErrors: 1 });
+    expect(labelGateProgress(progress, acceptanceFiles)).toEqual({ passed: 0, failed: 0, total: 0, acceptanceNotRun: "typecheck failed (1 error)" });
+  });
+
+  it("a developer suite that passed while the acceptance summary is missing never reads as acceptance progress", () => {
+    const failedDev = developer.replace("✓ tests/orders.test.ts", "❯ tests/orders.test.ts").replace("Tests  9 passed (9)", "Tests  2 failed | 7 passed (9)");
+    expect(labelGateProgress(readTestProgress(`${gateHeader}\n${failedDev}\n`), acceptanceFiles)).toMatchObject({
+      acceptanceNotRun: "the developer suite failed first (2 failed)",
+      suites: [{ passed: 7, failed: 2, total: 9, suite: "developer" }],
+    });
+    // The bounded capture cut the acceptance suite's summary: say so, never "9/9".
+    const cut = `${gateHeader}\n${developer}\n RUN  v2.1.8 /work/storefront\n ❯ gate/billing.test.ts (5 tests | 5 failed)\n...[truncated 9000 chars]`;
+    const labeled = labelGateProgress(readTestProgress(cut), acceptanceFiles);
+    expect(labeled?.acceptance).toBeUndefined();
+    expect(labeled?.acceptanceNotRun).toBe("its summary was not captured (the gate output was cut short)");
+  });
+
+  it("without a known acceptance gate, or with a suite that named no files, nothing is labeled or claimed", () => {
+    expect(labelGateProgress(readTestProgress("      Tests  1 failed | 2 passed (3)\n"), acceptanceFiles)).toEqual({ passed: 2, failed: 1, total: 3 });
+    expect(labelGateProgress(readTestProgress(`${developer}\n`), [])).toEqual({ passed: 9, failed: 0, total: 9 });
+    expect(labelGateProgress(readTestProgress("nothing recognizable"), acceptanceFiles)).toBeUndefined();
+  });
+});

@@ -236,6 +236,13 @@ export function Ticker({ ticker, live, k, lastSeq }: { ticker: BoardTicker; live
       {rev ? (
         <span className={`mc-rev-chip ${gateClass}`} title={`(seq ${rev.seq}, integrated.rev)`}>
           rev {rev.n} [{rev.label}]
+          {rev.progress ? (
+            <span className="mc-progress" title="advisory: parsed from the gate's output; the gate alone decides">
+              {" "}
+              {rev.progress.label}
+              {rev.progress.delta !== undefined ? ` (${rev.progress.delta >= 0 ? "+" : ""}${rev.progress.delta})` : ""}
+            </span>
+          ) : null}
         </span>
       ) : (
         <span className="mc-rev-chip">no integrated revision yet</span>
@@ -1022,6 +1029,11 @@ function NodeLabel({ node, boost = 1 }: { node: BoardGraphNode; boost?: number }
         </text>
         <text className="mc-node-sub" textAnchor="start" x={32} y={5}>
           {d.verdictLabel}
+          {d.progress
+            ? d.progress.passed !== undefined
+              ? ` ${d.progress.acceptance ? "acceptance " : ""}${d.progress.passed}/${d.progress.total}${d.progress.delta !== undefined ? ` (${d.progress.delta >= 0 ? "+" : ""}${d.progress.delta})` : ""}`
+              : " acceptance did not run"
+            : ""}
         </text>
       </>
     );

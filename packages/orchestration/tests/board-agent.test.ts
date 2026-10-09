@@ -656,6 +656,36 @@ describe("day-2 review regressions", () => {
     expect(state.items.i1!.fixRequested).toBeUndefined(); // the push answered the request
   });
 
+  it("a fix request answered with a wait (or an invalid reply) after proposing done is re-cued at once, bounded, with the fix stated plainly", async () => {
+    const env = await setup();
+    const executor = new RecordingExecutor(() => ({ "src/a/x.ts": "export const x = 1;\n" }));
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "first" },
+      { type: "propose_done", itemId: "i1" },
+      ...Array.from({ length: 6 }, () => ({ type: "wait" as const, reason: "waiting for the integration of my proposed done" })),
+    ]);
+    const w1 = env.agent("w1", { transport, executor, fetchRevision: async () => undefined });
+    await w1.join();
+    for (let i = 0; i < 3; i += 1) await w1.step();
+    const push = (await env.log()).messages.find((m) => m.type === "push.announced")!;
+    const rev = await env.operator.recordRevision({
+      commit: "badc0de",
+      gate: "fail",
+      merged: [(push.payload as { commit: string }).commit],
+      failing: { output: "src/a/x.ts(1,14): error TS2339: Property 'user' does not exist on type 'Ctx'.", items: ["i1"] },
+    });
+    expect(rev.ok && rev.appended.map((m) => m.type)).toEqual(["integrated.rev", "fix.requested"]);
+    const results: string[] = [];
+    for (let i = 0; i < 5; i += 1) results.push(await w1.step());
+    // The fix request wakes it; each wait is re-cued at once (MAX_FIX_CUES = 2), then it idles.
+    expect(results).toEqual(["acted", "acted", "acted", "idle", "idle"]);
+    const digestFix = (transport.inputs.at(-1)!.digest as BoardDigest).claims.find((c) => c.item === "i1")!.fix!;
+    expect(digestFix.instruction).toMatch(/FAILED the gate and implicates this item.*done proposal does not complete it/);
+    const cued = transport.inputs.filter((i) => i.capsule.evidence.some((e) => /^FIX REQUIRED: revision 1 failed the gate and implicates my item i1/.test(e)));
+    expect(cued).toHaveLength(2);
+  });
+
   it("never pushes a symlink or a dependency-tree file", async () => {
     const env = await setup();
     const executor: ExecutorProvider = {

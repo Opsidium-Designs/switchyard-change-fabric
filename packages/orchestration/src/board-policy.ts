@@ -18,6 +18,9 @@
  *      question) about the scope they now share a boundary on;
  *   5. fix a held item a failing revision asked it to fix (an edit carrying the
  *      revision), edit a held item that has no push yet, then propose it done;
+ *      a fix whose type error needs a frozen shared seam proposes a seam
+ *      contract instead (the lead accepts it unless someone holds the seam),
+ *      and the proposer claims the seam item it became first;
  *   6. while free, claim the first open item it has not been refused, with the
  *      item's scope hint as the write intent; a claim refused because it
  *      touches the contract (existing tests, gate config) proposes a contract
@@ -665,8 +668,64 @@ function decide(input: Input): AgentAction {
   if (toolTurn) {
     return toolTurn;
   }
+  // The failing check is in the contract: ask a human to change it (once per path), then keep fixing.
   for (const claim of d.claims) {
-    if (claim.fix !== undefined) {
+    for (const target of claim.contractCue?.paths ?? []) {
+      const asked = decisions.some((h) => h.action.type === "message" && h.action.kind === "contract" && h.action.payload.target === target);
+      if (!asked && !input.board.pendingContracts.some((c) => c.target === target)) {
+        return {
+          type: "message",
+          kind: "contract",
+          payload: { target, change: "modify", itemId: claim.item },
+          rationale: `the failing check of revision ${claim.fix?.n ?? "?"} is in the protected ${target}; if it pins the old behavior the goal changes, it needs a human's decision`,
+        };
+      }
+    }
+  }
+  // The failing type error needs a change to a frozen shared seam: propose a
+  // seam contract with the needed change (the lead decides), once per seam.
+  for (const claim of d.claims) {
+    for (const seam of claim.seamCue?.seams ?? []) {
+      const asked = decisions.some(
+        (h) => h.action.type === "message" && h.action.kind === "contract" && h.action.payload.target === seam && h.action.payload.itemId === claim.item,
+      );
+      if (!asked && !input.board.pendingContracts.some((c) => c.seam === seam)) {
+        return {
+          type: "message",
+          kind: "contract",
+          payload: {
+            target: seam,
+            change: "modify",
+            itemId: claim.item,
+            description: `${claim.item} needs the shared seam ${seam} to declare what its code uses: ${claim.seamCue!.errors[0] ?? "see the failing revision"}`.slice(0, 400),
+          },
+          rationale: `revision ${claim.fix?.n ?? "?"} failed on a type the shared seam ${seam} declares and no item owns; I need it changed rather than using an undeclared field`,
+        };
+      }
+    }
+  }
+  // The seam item my accepted seam contract became: take it first (I know the change it needs).
+  const askedSeams = new Set(
+    decisions.flatMap((h) => (h.action.type === "message" && h.action.kind === "contract" && h.outcome === "posted" ? [h.action.payload.target ?? ""] : [])),
+  );
+  const mySeamItem = d.openItems.find(
+    (i) =>
+      i.seam === true &&
+      i.scopeHint.length === 1 &&
+      askedSeams.has(i.scopeHint[0]!) &&
+      !decisions.some((h) => h.action.type === "claim" && h.action.itemId === i.item && h.outcome !== "posted"),
+  );
+  if (mySeamItem) {
+    return {
+      type: "claim",
+      itemId: mySeamItem.item,
+      intent: { read: [], write: [...mySeamItem.scopeHint] },
+      rationale: `the lead accepted my seam contract: I make the change to ${mySeamItem.scopeHint[0]} first, then rebase my item onto it`,
+    };
+  }
+  for (const claim of d.claims) {
+    // A held item waiting for a shared seam change is fixed after it lands.
+    if (claim.fix !== undefined && (claim.waitsFor ?? []).length === 0) {
       const failedFixes = decisions.filter(
         (h) => h.action.type === "edit" && h.action.itemId === claim.item && h.outcome !== "posted" && h.note?.fix === String(claim.fix!.n),
       ).length;
@@ -800,7 +859,11 @@ function decide(input: Input): AgentAction {
     const splitAt = decisions.map((h) => h.action.type === "split" && h.outcome === "posted").lastIndexOf(true);
     const waitedSinceSplit = splitAt < 0 ? 0 : decisions.slice(splitAt + 1).filter((h) => h.action.type === "wait").length;
     const mine = (i: { readonly parent?: string }) => i.parent !== undefined && led.has(i.parent) && waitedSinceSplit < 2;
-    for (const open of d.openItems.filter((i) => i.scopeHint.length > 0 && !otherTools.has(i.item) && !mine(i))) {
+    // Seam-changing items first; items waiting for one are left until it lands.
+    const claimable = d.openItems
+      .filter((i) => i.scopeHint.length > 0 && !otherTools.has(i.item) && !mine(i) && (i.waitsFor ?? []).length === 0)
+      .sort((a, b) => Number(b.seam === true) - Number(a.seam === true));
+    for (const open of claimable) {
       const claims = decisions.filter((h) => h.action.type === "claim" && h.action.itemId === open.item);
       const last = claims.at(-1);
       if (last === undefined || last.outcome === "posted") {
@@ -817,12 +880,15 @@ function decide(input: Input): AgentAction {
       }
       const write = last.action.intent.write;
       const hits = d.protected.filter((p) => write.some((w) => entriesOverlap(w, p)));
+      // The acceptance gate is never contract-changeable: go straight to a new test file.
+      const gateOnly = hits.length > 0 && hits.every((p) => (d.immutable ?? []).includes(p) || hasWildcard(p));
       // A human already said no for this item (the board refuses repeat
       // proposals with CONTRACT_REJECTED): go straight to a new test file.
       const contractRefused = decisions.some(
-        (h) => h.action.type === "message" && h.action.kind === "contract" && h.action.payload.itemId === open.item && h.code === "CONTRACT_REJECTED",
+        (h) =>
+          h.action.type === "message" && h.action.kind === "contract" && h.action.payload.itemId === open.item && (h.code === "CONTRACT_REJECTED" || h.code === "IMMUTABLE"),
       );
-      if (protectedRefusals === 2 || contractRefused) {
+      if (protectedRefusals === 2 || contractRefused || gateOnly) {
         // The human did not release every path: add a NEW test file instead,
         // beside the first protected test, named after the item.
         const first = hits.find((p) => !/[*?]/.test(p));
@@ -852,7 +918,7 @@ function decide(input: Input): AgentAction {
       if (input.board.pendingContracts.some((c) => c.item === open.item && c.proposedBy !== me)) {
         continue;
       }
-      const needed = hits.filter((p) => !proposed.includes(p));
+      const needed = hits.filter((p) => !proposed.includes(p) && !(d.immutable ?? []).includes(p));
       if (needed.length > 0) {
         return {
           type: "message",

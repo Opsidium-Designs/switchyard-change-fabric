@@ -49,6 +49,15 @@ export interface ModelAwareExecutorOptions {
    */
   readonly delayMs?: number;
   /**
+   * Optional overlap barrier for escalation calls, independent of timing: each
+   * escalation call waits until `count` escalation calls are in flight at once
+   * (then the barrier opens for good), or until `timeoutMs` passes. A bounded-
+   * concurrency re-fan opens it deterministically however slow the machine is
+   * (the calls really are concurrent); a strictly sequential loop never reaches
+   * the count, so it times out and peaks at 1.
+   */
+  readonly overlapBarrier?: { readonly count: number; readonly timeoutMs: number };
+  /**
    * Optional best-effort observer called with the exact objective text each
    * execute received, tagged with whether it was an escalation (per-attempt
    * model) call. A prompt-rotation test uses this to assert that the base round
@@ -85,7 +94,31 @@ export class ModelAwareExecutor implements ExecutorProvider {
   inFlight = 0;
   /** The peak number of concurrently in-flight escalation execute calls. */
   maxInFlight = 0;
+  private barrierOpen = false;
+  private readonly barrierWaiters: (() => void)[] = [];
   constructor(private readonly options: ModelAwareExecutorOptions) {}
+
+  /** Wait at the overlap barrier (see `overlapBarrier`); opens once `count` calls are in flight. */
+  private async atBarrier(): Promise<void> {
+    const barrier = this.options.overlapBarrier;
+    if (barrier === undefined || this.barrierOpen) {
+      return;
+    }
+    if (this.inFlight >= barrier.count) {
+      this.barrierOpen = true;
+      for (const release of this.barrierWaiters.splice(0)) {
+        release();
+      }
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, barrier.timeoutMs);
+      this.barrierWaiters.push(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
 
   async execute(context: ExecutorContext): Promise<ExecutionResult> {
     // Only an escalation retry carries a per-attempt model id; the kickoff wave
@@ -106,6 +139,9 @@ export class ModelAwareExecutor implements ExecutorProvider {
       this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
     }
     try {
+      if (isEscalation) {
+        await this.atBarrier();
+      }
       const delay = this.options.delayMs ?? 0;
       if (delay > 0) {
         await new Promise<void>((resolve) => setTimeout(resolve, delay));

@@ -6,6 +6,10 @@ import {
   appendBoardMessage,
   appendDecisionRecorded,
   appendIntegratedRev,
+  describeProgress,
+  progressHeadline,
+  seamContractCue,
+  seamItemId,
   appendToolGated,
   appendToolUsed,
   applyBoardEscalations,
@@ -355,6 +359,35 @@ describe("board identity: who may say what", () => {
     expect(tryAs({ kind: "join", agent: "human" }, { type: "agent.joined" })).toBe("AUTH");
     // An agent that never joined is unknown.
     expect(tryAs({ kind: "agent", agent: "stranger" }, { type: "item.claimed", payload: { item: "one", intent: { write: ["x"] } } })).toBe("UNKNOWN_AGENT");
+  });
+
+  it("a revision's progress labels the acceptance suite, or states why it did not run (never both)", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(push("a", "one", "c1", ["src/a/x.ts"]));
+    const notRun = { passed: 0, failed: 0, total: 0, acceptanceNotRun: "typecheck failed (1 error)" };
+    expect(() => appendIntegratedRev(board.state, { commit: "r1", gate: "fail", merged: ["c1"], progress: { ...notRun, acceptance: { passed: 0, failed: 0, total: 0 } } }, AT)).toThrow(/not both/);
+    expect(() =>
+      appendIntegratedRev(board.state, { commit: "r1", gate: "fail", merged: ["c1"], progress: { passed: 1, failed: 0, total: 1, suites: [{ passed: 1, failed: 0, total: 1, suite: "gate" }] } }, AT),
+    ).toThrow(/"acceptance" or "developer"/);
+    const appended = appendIntegratedRev(board.state, { commit: "r1", gate: "fail", merged: ["c1"], progress: notRun }, AT);
+    const revision = appended.appended.find((m) => m.type === "integrated.rev");
+    expect(revision?.type === "integrated.rev" ? revision.payload.progress : undefined).toEqual(notRun);
+    expect(describeProgress(notRun)).toBe("acceptance suite did not run: typecheck failed (1 error)");
+    expect(progressHeadline(notRun)).toBeUndefined();
+    const labeled = {
+      passed: 13,
+      failed: 20,
+      total: 33,
+      suites: [
+        { passed: 9, failed: 0, total: 9, suite: "developer" as const },
+        { passed: 4, failed: 20, total: 24, suite: "acceptance" as const },
+      ],
+      acceptance: { passed: 4, failed: 20, total: 24 },
+    };
+    expect(describeProgress(labeled)).toBe("acceptance 4/24 passing; developer 9/9");
+    expect(progressHeadline(labeled)).toEqual({ passed: 4, total: 24, acceptance: true });
+    expect(describeProgress({ passed: 2, failed: 1, total: 3 })).toBe("2/3 checks passing");
   });
 
   it("the lead is a joined agent with the lead role; only one lead at a time; plain agents cannot decide contracts", () => {
@@ -1989,5 +2022,228 @@ describe("formation cues: struggling owners, idle volunteers, answers (bounded, 
     expect(splitCue(3, "one change")).toMatchObject({ splittable: true, files: 3 });
     expect(splitCue(1, "one change")).toMatchObject({ splittable: false, subChanges: 1 });
     expect(splitCue(1, "validate input and log errors")).toMatchObject({ splittable: true, subChanges: 2 });
+  });
+});
+
+describe("failures the plan missed, and the contract cue", () => {
+  it("finds the repo files a failing output points at (locations, titles), and those no item covers", async () => {
+    const { failingRepoFiles, uncoveredFailureFiles } = await import("../src/index.ts");
+    const repo = ["src/a/x.ts", "src/extra/users.ts", "src/extra/y.ts", "tests/a.test.ts"];
+    const output = "> pkg@1.0.0 gate\n> vitest run\nAssertionError: boom\n    at /tmp/gate-123/src/extra/y.ts:4:2\n FAIL  tests/a.test.ts > users: rejects\n";
+    expect(failingRepoFiles(output, repo)).toEqual(["src/extra/y.ts"]);
+    expect(failingRepoFiles("✖ users: unauthenticated request is rejected\n", repo)).toEqual(["src/extra/users.ts"]);
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o" }));
+    board.post(msg("human", "item.proposed", { item: "x", objective: "o", scopeHint: ["src/a/**"] }));
+    expect(uncoveredFailureFiles(board.state, ["src/a/x.ts", "src/extra/y.ts", "tools/t/run.mjs"])).toEqual(["src/extra/y.ts"]);
+  });
+
+  it("an owner whose failing check is a protected test gets a contract cue and may propose that contract (a human decides); once accepted it pushes it", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["tests/tax.test.ts"] }));
+    board.post(msg("a", "agent.joined"));
+    board.post(msg("human", "item.proposed", { item: "tax", objective: "round tax", scopeHint: ["src/tax.ts"] }));
+    board.post(claim("a", "tax", ["src/tax.ts"]));
+    // Not the failing check yet: outside the scope, refused.
+    board.reject(msg("a", "contract.proposed", { contract: "k0", target: "tests/tax.test.ts", kind: "modify", item: "tax" }), /not the failing check/, "OUTSIDE_SCOPE");
+    board.post(push("a", "tax", "c1", ["src/tax.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1"], failing: { output: "> s@0 gate\nAssertionError: expected 73 to be 72\n at tests/tax.test.ts:12:5", items: ["tax"] } }));
+    const digest = boardDigest(board.state, board.log, "a", 0);
+    expect(digest.claims[0]!.contractCue).toMatchObject({ paths: ["tests/tax.test.ts"], hint: expect.stringMatching(/propose contract\.proposed \{target: tests\/tax\.test\.ts/) });
+    expect(digest.struggling ?? []).toEqual([{ item: "tax", turnsSpent: 0, failedEdits: 0, reason: "failing-revision", lastFailure: "AssertionError: expected 73 to be 72" }]);
+    expect(board.types(msg("a", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "tax" }))).toEqual(["contract.proposed", "contract.escalated"]);
+    board.reject(push("a", "tax", "c2", ["tests/tax.test.ts"]), /outside the claim's write intent/, "OUTSIDE_INTENT");
+    board.post(msg("human", "contract.accepted", { contract: "k1" }));
+    expect(boardDigest(board.state, board.log, "a", 0).claims[0]!.contractCue).toBeUndefined();
+    expect(board.types(push("a", "tax", "c2", ["src/tax.ts", "tests/tax.test.ts"]))).toEqual(["push.announced"]);
+    expect(planBoardIntegration(board.log, board.state).units[0]).toMatchObject({ scope: ["src/tax.ts", "tests/tax.test.ts"], releasedPaths: ["tests/tax.test.ts"] });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("the immutable acceptance gate", () => {
+  it("refuses any contract on it (even one a human would accept), and never cues it", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["gate/billing.test.ts", "tests/tax.test.ts"], immutable: ["gate/billing.test.ts"] }));
+    board.post(msg("a", "agent.joined"));
+    board.post(msg("human", "item.proposed", { item: "tax", objective: "o", scopeHint: ["src/tax.ts", "gate/**", "tests/**"] }));
+    board.post(claim("a", "tax", ["src/tax.ts"]));
+    board.reject(msg("a", "contract.proposed", { contract: "k1", target: "gate/billing.test.ts", kind: "modify", item: "tax" }), /immutable acceptance gate/, "IMMUTABLE");
+    board.reject(msg("a", "contract.proposed", { contract: "k2", target: "gate/**", kind: "modify", item: "tax" }), /immutable acceptance gate/, "IMMUTABLE");
+    board.post(msg("human", "item.proposed", { item: "g", objective: "o", scopeHint: ["gate/**"] }));
+    board.reject(claim("a", "g", ["gate/billing.test.ts"]), /immutable acceptance gate/, "PROTECTED");
+    board.post(push("a", "tax", "c1", ["src/tax.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1"], failing: { output: "AssertionError at gate/billing.test.ts:3\nand tests/tax.test.ts:9", items: ["tax"] } }));
+    // The cue names only the developer test, never the acceptance suite.
+    expect(boardDigest(board.state, board.log, "a", 0).claims[0]!.contractCue?.paths).toEqual(["tests/tax.test.ts"]);
+    expect(boardDigest(board.state, board.log, "a", 0).immutable).toEqual(["gate/billing.test.ts"]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("seam first", () => {
+  /** A goal with the storefront's money seam and two importers; items for the seam and its importers. */
+  function seamBoard(): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", seams: [{ path: "src/contracts/money.ts", importers: ["src/orders/cart.ts", "src/billing/tax.ts"] }] }));
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("human", "item.proposed", { item: "money", objective: "exact money", scopeHint: ["src/contracts/money.ts"] }));
+    board.post(msg("human", "item.proposed", { item: "cart", objective: "cart totals", scopeHint: ["src/orders/cart.ts"] }));
+    board.post(msg("human", "item.proposed", { item: "catalog", objective: "catalog", scopeHint: ["src/catalog/products.ts"] }));
+    return board;
+  }
+
+  it("an importer's item waits for the seam change's integrated revision; unrelated items do not", () => {
+    const board = seamBoard();
+    // Nobody is changing the seam yet: nothing waits (an unclaimed seam item never stalls dependents).
+    expect(boardDigest(board.state, board.log, "b", 0).openItems.map((i) => [i.item, i.seam ?? false, i.waitsFor ?? []])).toEqual([
+      ["money", true, []],
+      ["cart", false, []],
+      ["catalog", false, []],
+    ]);
+    board.post(claim("a", "money", ["src/contracts/money.ts"]));
+    expect(boardDigest(board.state, board.log, "b", 0).openItems.map((i) => [i.item, i.waitsFor ?? []])).toEqual([
+      ["cart", ["money"]],
+      ["catalog", []],
+    ]);
+    board.reject(claim("b", "cart", ["src/orders/cart.ts"]), /waits for that change's integrated revision/, "SEAM_FIRST");
+    expect(board.types(claim("b", "catalog", ["src/catalog/products.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+    board.post(push("a", "money", "m1", ["src/contracts/money.ts"]));
+    board.reject(claim("b", "cart", ["src/orders/cart.ts"]), /SEAM|seam/, "SEAM_FIRST");
+    board.post(rev("pass", ["m1"], "r1"));
+    expect(board.types(claim("b", "cart", ["src/orders/cart.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("the wait is bounded: after the seam wait the importer proceeds anyway", () => {
+    const board = seamBoard();
+    board.post(claim("a", "money", ["src/contracts/money.ts"]));
+    for (let i = 0; i <= BOARD_LIMITS.seamWaitMessages; i += 1) board.post(msg("human", "item.proposed", { item: `pad-${i}`, objective: "pad", scopeHint: ["pad/**"] }));
+    expect(board.types(claim("b", "cart", ["src/orders/cart.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+  });
+});
+
+describe("seam contracts: a change to a frozen shared seam, decided by the lead", () => {
+  /** The storefront shape: Ctx lives in the shared src/store.ts no item owns; cart and invoices import it. */
+  function storefront(): TestBoard {
+    const board = new TestBoard();
+    board.post(
+      msg("human", "goal.posted", {
+        objective: "o",
+        seams: [
+          { path: "src/store.ts", importers: ["src/orders/cart.ts", "src/billing/invoices.ts"], symbols: ["Ctx", "Store", "Order"] },
+          { path: "src/contracts/money.ts", importers: ["src/orders/cart.ts"], symbols: ["Money", "toCents"] },
+          { path: "src/contracts/http.ts", importers: ["src/orders/cart.ts"], symbols: ["json", "problem"] },
+        ],
+      }),
+    );
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "cart", objective: "cart requires the signed-in user", acceptance: ["it works"], scopeHint: ["src/orders/cart.ts"] }));
+    board.post(msg("lead", "item.proposed", { item: "invoices", objective: "invoices", acceptance: ["it works"], scopeHint: ["src/billing/invoices.ts"] }));
+    board.post(claim("a", "cart", ["src/orders/cart.ts"]));
+    board.post(push("a", "cart", "c1", ["src/orders/cart.ts"]));
+    board.post(
+      msg("engine", "integrated.rev", {
+        commit: "r1",
+        gate: "fail",
+        merged: ["c1"],
+        failing: {
+          output: "> tsc --noEmit\nsrc/orders/cart.ts(44,12): error TS2339: Property 'user' does not exist on type 'Ctx'.\n",
+          items: ["cart"],
+        },
+      }),
+    );
+    return board;
+  }
+
+  it("cues the implicated owner with the seam the type error names, the lead decides, and the accepted contract becomes a seam item scheduled first", () => {
+    const board = storefront();
+    const cue = boardDigest(board.state, board.log, "a", 0).claims.find((c) => c.item === "cart")!.seamCue;
+    // `on type 'Ctx'` names src/store.ts's export: that seam only, not every seam cart.ts imports.
+    expect(cue).toMatchObject({ seams: ["src/store.ts"], errors: ["src/orders/cart.ts(44,12): error TS2339: Property 'user' does not exist on type 'Ctx'."] });
+    expect(cue!.hint).toMatch(/do not use undeclared fields/);
+    expect(seamContractCue(board.state, "invoices")).toBeUndefined();
+
+    // A seam contract needs the exact change, and comes from the owner of the item that needs it.
+    board.reject(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart" }), /describes the exact change/, "BAD_PAYLOAD");
+    board.reject(msg("b", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user" }), /does not hold the claim/, "NOT_OWNER");
+    const change = "add an optional `user?: { id: string }` field to Ctx";
+    expect(board.types(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts#Ctx", kind: "modify", item: "cart", description: change }))).toEqual(["contract.proposed"]);
+    expect(board.state.contracts.k1).toMatchObject({ seam: "src/store.ts", description: change, status: "proposed" });
+    // Not escalated to a human: the lead decides it. Only once per seam at a time; the cue is quiet while it waits.
+    expect(board.log.some((m) => m.type === "contract.escalated")).toBe(false);
+    board.reject(msg("a", "contract.proposed", { contract: "k2", target: "src/store.ts", kind: "modify", item: "cart", description: change }), /already waiting/, "DUPLICATE");
+    expect(boardDigest(board.state, board.log, "a", 0).claims.find((c) => c.item === "cart")!.seamCue).toBeUndefined();
+    board.reject(msg("b", "contract.accepted", { contract: "k1" }), /cannot be sent by an agent/, "NOT_ALLOWED");
+
+    // The lead accepts: the engine proposes the seam item (open, seam-first).
+    expect(board.types(msg("lead", "contract.accepted", { contract: "k1" }))).toEqual(["contract.accepted", "item.proposed"]);
+    const seamItem = board.state.items[seamItemId("k1")]!;
+    expect(seamItem).toMatchObject({ status: "open", scopeHint: ["src/store.ts"], fromContract: "k1", proposedBy: "engine" });
+    expect(seamItem.objective).toContain(change);
+    const open = boardDigest(board.state, board.log, "b", 0).openItems;
+    expect(open.find((i) => i.item === seamItemId("k1"))).toMatchObject({ seam: true });
+
+    // Claimed, it goes first: importers wait for its integrated revision, then rebase.
+    board.post(claim("b", seamItemId("k1"), ["src/store.ts"]));
+    expect(boardDigest(board.state, board.log, "a", 0).claims.find((c) => c.item === "cart")!.waitsFor).toEqual([seamItemId("k1")]);
+    board.reject(claim("a", "invoices", ["src/billing/invoices.ts"]), /waits for that change's integrated revision/, "SEAM_FIRST");
+    board.post(push("b", seamItemId("k1"), "s1", ["src/store.ts"]));
+    const integrated = board.post(rev("pass", ["s1"], "r2"));
+    expect(integrated.some((m) => m.type === "rebase.needed")).toBe(true);
+    expect(boardDigest(board.state, board.log, "a", 0).claims.find((c) => c.item === "cart")!.waitsFor).toBeUndefined();
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("only the engine proposes an item from a seam contract, and only for an accepted one; a seam an item owns is changed by that item", () => {
+    const board = storefront();
+    board.reject(
+      msg("lead", "item.proposed", { item: "seam-k9", objective: "x", acceptance: ["y"], scopeHint: ["src/store.ts"], fromContract: "k9" }),
+      /only the engine proposes an item from a seam contract/,
+      "NOT_ALLOWED",
+    );
+    board.post(msg("lead", "item.proposed", { item: "store", objective: "store", acceptance: ["y"], scopeHint: ["src/store.ts"] }));
+    // Someone owns the seam now: no cue, and a contract on it is refused in favor of asking its owner.
+    expect(seamContractCue(board.state, "cart")).toBeUndefined();
+    board.reject(
+      msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user" }),
+      /in item store's scope: ask its owner/,
+      "NOT_ALLOWED",
+    );
+  });
+
+  it("a rejected seam contract is not cued again until a newer failing revision implicates the item", () => {
+    const board = storefront();
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user" }));
+    expect(board.types(msg("lead", "contract.rejected", { contract: "k1" }))).toEqual(["contract.rejected"]);
+    expect(seamContractCue(board.state, "cart")).toBeUndefined();
+    board.post(push("a", "cart", "c2", ["src/orders/cart.ts"]));
+    board.post(
+      msg("engine", "integrated.rev", {
+        commit: "r2",
+        gate: "fail",
+        merged: ["c2"],
+        failing: { output: "src/orders/cart.ts(50,3): error TS2339: Property 'user' does not exist on type 'Ctx'.\n", items: ["cart"] },
+      }),
+    );
+    expect(seamContractCue(board.state, "cart")?.seams).toEqual(["src/store.ts"]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("integration plans after a sub-lead merge", () => {
+  it("a child owner's later push on another item diffs from its child commit the sub-lead's passing push integrated", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(msg("a", "item.split", { item: "one", children: [{ item: "one-x", objective: "x", scopeHint: ["src/a/x.ts"] }] }));
+    board.post(claim("b", "one-x", ["src/a/x.ts"]));
+    board.post(push("b", "one-x", "px", ["src/a/x.ts"]));
+    board.post(msg("a", "push.announced", { item: "one", commit: "pa", paths: ["src/a/x.ts"], merges: [{ item: "one-x", commit: "px" }] }));
+    board.post(rev("pass", ["pa"], "r1"));
+    board.post(claim("b", "two", ["src/b/**"]));
+    board.post(push("b", "two", "pb", ["src/b/y.ts"]));
+    const unit = planBoardIntegration(board.log, board.state).units.find((u) => u.agent === "b")!;
+    expect(unit).toMatchObject({ commit: "pb", baselineRef: "px", scope: ["src/b/**"] });
   });
 });

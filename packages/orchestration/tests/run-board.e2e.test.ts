@@ -972,3 +972,299 @@ describe("help that nobody takes never stalls the requester (live regression boa
     expect(reduceBoard(result.log)).toEqual(result.state);
   });
 });
+
+describe("failures the plan missed become work (lead, bounded, recorded with the evidence)", () => {
+  it("a failing revision pointing at a file no item covers makes the lead propose an item for it, which completes", async () => {
+    const projectDir = await project();
+    await mkdir(join(projectDir, "src/extra"), { recursive: true });
+    await writeFile(join(projectDir, "src/extra/x.ts"), "export const x = 0;\n");
+    const baseline = "export const x = 0;\n";
+    // The gate fails at src/extra/x.ts (behind npm's echo) until that file changes.
+    const gate: CommandRunner = {
+      async run(_argv, cwd) {
+        const now = await readFile(join(cwd, "src/extra/x.ts"), "utf8").catch(() => baseline);
+        return now === baseline
+          ? { code: 1, stdout: "> p@0.0.0 gate\n> node --test\n", stderr: `AssertionError: x is still wrong\n    at ${cwd}/src/extra/x.ts:1:14\n` }
+          : { code: 0, stdout: "ok 1 - x\n", stderr: "" };
+      },
+    };
+    const narrow = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: [{ item: "core", objective: "report status from core", acceptance: ["gate passes"], scopeHint: ["src/core/**"] }],
+    });
+    const result = await offline({ goal: GOAL, projectDir, seed: narrow, appGateCommand: ["gate"], verifyCommandRunner: gate });
+    const proposed = of(result.log, "item.proposed").filter((m) => m.from === "lead" && m.payload.item.includes("uncovered"));
+    expect(proposed).toHaveLength(1);
+    expect(proposed[0]!.payload.scopeHint).toEqual(["src/extra/x.ts"]);
+    expect(proposed[0]!.rationale).toMatch(/revision 1 failed \(AssertionError: x is still wrong\) in files no item covers: src\/extra\/x\.ts/);
+    expect(result.state.items[proposed[0]!.payload.item]).toMatchObject({ status: "done" });
+    expect(result.verdict).toBe("verified");
+    // Struggling reports carry the gate's failing line, never npm's echo.
+    for (const r of of(result.log, "item.struggling")) {
+      expect(r.payload.lastFailure ?? "").not.toMatch(/^>/);
+    }
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  });
+});
+
+describe("acceptance progress per revision (advisory)", () => {
+  it("records how many gate checks passed on each revision, shows the change, and never decides the verdict", async () => {
+    const projectDir = await project();
+    let runs = 0;
+    // The baseline run, then a failing revision (2 of 3 passing), then a passing one.
+    const gate: CommandRunner = {
+      async run() {
+        runs += 1;
+        return runs <= 2
+          ? { code: 1, stdout: "      Tests  1 failed | 2 passed (3)\n", stderr: "AssertionError: one check still fails\n" }
+          : { code: 0, stdout: "      Tests  3 passed (3)\n", stderr: "" };
+      },
+    };
+    const result = await offline({ goal: GOAL, projectDir, seed, appGateCommand: ["gate"], verifyCommandRunner: gate });
+    const revs = of(result.log, "integrated.rev");
+    expect(revs[0]!.payload.progress).toEqual({ passed: 2, failed: 1, total: 3 });
+    expect(revs.at(-1)!.payload.progress).toEqual({ passed: 3, failed: 0, total: 3 });
+    const summary = formatBoardRunSummary(result);
+    // No suite named its files: the counts are not labeled as the acceptance suite's.
+    expect(summary).toMatch(/rev 1: 2\/3 checks passing \(advisory; the gate decides\)/);
+    expect(summary).toMatch(/rev 2: 3\/3 checks passing \(\+1\)/);
+    const { buildBoardGraph } = await import("../src/board-graph.ts");
+    const graph = buildBoardGraph(result.log);
+    expect(graph.ticker.rev?.progress).toMatchObject({ passed: 3, total: 3 });
+    expect(graph.nodes.find((n) => n.id === "rev:2")!.detail).toMatchObject({ progress: { passed: 3, total: 3, delta: 1 } });
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  });
+});
+
+describe("acceptance progress per suite (advisory)", () => {
+  it("labels the acceptance suite from the immutable gate, never counts the developer suite as acceptance, and says when a typecheck stopped the gate first", async () => {
+    const projectDir = await project();
+    await mkdir(join(projectDir, "gate"), { recursive: true });
+    await writeFile(join(projectDir, "gate/acceptance.test.ts"), "// the acceptance suite\n");
+    const developer = " RUN  v2\n ✓ tests/core.test.ts (9 tests) 5ms\n Test Files  1 passed (1)\n      Tests  9 passed (9)\n";
+    const acceptance = (passed: number, failed: number) =>
+      ` RUN  v2\n ${failed > 0 ? "❯" : "✓"} gate/acceptance.test.ts (${passed + failed} tests${failed > 0 ? ` | ${failed} failed` : ""})\n Test Files  1 ${failed > 0 ? "failed" : "passed"} (1)\n      Tests  ${failed > 0 ? `${failed} failed | ` : ""}${passed} passed (${passed + failed})\n`;
+    let runs = 0;
+    // The baseline (developer 9/9, acceptance 1/4), a revision whose typecheck
+    // fails (no suite runs), then a passing one.
+    const gate: CommandRunner = {
+      async run() {
+        runs += 1;
+        if (runs === 1) {
+          return { code: 1, stdout: `> tsc --noEmit && vitest run && vitest run --config gate/vitest.config.ts\n${developer}${acceptance(1, 3)}`, stderr: "" };
+        }
+        if (runs === 2) {
+          return { code: 2, stdout: "> tsc --noEmit\nsrc/core/a.ts(44,12): error TS2339: Property 'user' does not exist on type 'Ctx'.\n", stderr: "" };
+        }
+        return { code: 0, stdout: `${developer}${acceptance(4, 0)}`, stderr: "" };
+      },
+    };
+    const result = await offline({ goal: GOAL, projectDir, seed, appGateCommand: ["vitest", "run", "gate"], verifyCommandRunner: gate });
+    expect(result.state.immutable).toContain("gate/acceptance.test.ts");
+    const revs = of(result.log, "integrated.rev");
+    expect(revs[0]!.payload.progress).toEqual({ passed: 0, failed: 0, total: 0, acceptanceNotRun: "typecheck failed (1 error)" });
+    expect(revs.at(-1)!.payload.progress).toEqual({
+      passed: 13,
+      failed: 0,
+      total: 13,
+      suites: [
+        { passed: 9, failed: 0, total: 9, suite: "developer" },
+        { passed: 4, failed: 0, total: 4, suite: "acceptance" },
+      ],
+      acceptance: { passed: 4, failed: 0, total: 4 },
+    });
+    const summary = formatBoardRunSummary(result);
+    expect(summary).toMatch(/rev 1: acceptance suite did not run: typecheck failed \(1 error\) \(advisory; the gate decides\)/);
+    expect(summary).toMatch(new RegExp(`rev ${revs.at(-1)!.payload.n}: acceptance 4/4 passing; developer 9/9`));
+    expect(summary).not.toMatch(/9\/9 acceptance/);
+    const { buildBoardGraph } = await import("../src/board-graph.ts");
+    const graph = buildBoardGraph(result.log);
+    expect(graph.ticker.rev?.progress).toMatchObject({ label: "acceptance 4/4 passing; developer 9/9", passed: 4, total: 4, acceptance: true });
+    expect(graph.nodes.find((n) => n.id === "rev:1")!.detail).toMatchObject({ progress: { label: "acceptance suite did not run: typecheck failed (1 error)" } });
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  });
+});
+
+describe("a stronger executor for complex items", () => {
+  it("a large item starts on the strongest configured model, a small one on the base model, and every edit records its model", async () => {
+    const projectDir = await project();
+    const executor = new ModelStampingExecutor();
+    const twoItems = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: [
+        { item: "big", objective: "report status across core and the entry", acceptance: ["gate passes"], scopeHint: ["src/core/**", "src/index.ts"] },
+        { item: "small", objective: "report status from the api", acceptance: ["gate passes"], scopeHint: ["src/api/handler.ts"] },
+      ],
+    });
+    const result = await offline({ goal: GOAL, projectDir, seed: twoItems, executor, escalationModels: ["m1", "m2"] });
+    expect(executor.contexts.find((c) => c.workUnitId === "big")!.model).toBe("m2");
+    expect(executor.contexts.find((c) => c.workUnitId === "small")!.model).toBeUndefined();
+    expect(result.editModels).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ item: "big", model: "m2", why: "it spans 3 files" }),
+        expect.objectContaining({ item: "small", model: "base" }),
+      ]),
+    );
+    expect(of(result.log, "push.announced").find((m) => m.payload.item === "big")!.rationale).toMatch(/model: m2, strongest: it spans 3 files/);
+    expect(formatBoardRunSummary(result)).toMatch(/edit models: .*strongest for complex items: big \(it spans 3 files\)/);
+  });
+});
+
+describe("budgets that scale with the plan (explicit values win)", () => {
+  it("scales fix attempts and the dial's max with the planned items, bounded", async () => {
+    const { scaledBudgets } = await import("../src/run-board.ts");
+    const dial = { minConcurrency: 1, maxConcurrency: 3 };
+    expect(scaledBudgets({ items: 10, dial, scaleDial: true })).toEqual({ maxFixAttempts: 5, fixAttemptsScaled: true, dialMax: 6, dialScaled: true });
+    expect(scaledBudgets({ items: 2, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 3, dialMax: 2 });
+    expect(scaledBudgets({ items: 40, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 6, dialMax: 6 });
+    expect(scaledBudgets({ items: 10, explicitFixAttempts: 2, dial, scaleDial: false })).toEqual({ maxFixAttempts: 2, fixAttemptsScaled: false, dialMax: 3, dialScaled: false });
+  });
+
+  it("a run posts the scaled fix budget with its goal, recruits under the scaled dial, and prints the effective values", async () => {
+    const projectDir = await project();
+    const tenItems = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: Array.from({ length: 10 }, (_, i) => ({ item: `i${i}`, objective: `do part ${i}`, acceptance: ["gate passes"], scopeHint: [`src/part${i}.ts`] })),
+    });
+    const result = await offline({ goal: GOAL, projectDir, seed: tenItems, scaleDial: true });
+    expect(of(result.log, "goal.posted")[0]!.payload.rules.maxFixAttempts).toBe(5);
+    expect(of(result.log, "agent.joined").filter((m) => m.from !== "lead").length).toBeLessThanOrEqual(6);
+    expect(of(result.log, "agent.joined").filter((m) => m.from !== "lead").length).toBeGreaterThan(3);
+    expect(formatBoardRunSummary(result)).toMatch(/budgets: 5 fix attempt\(s\) per item \(scaled with 10 planned item\(s\)\), dial max 6 \(scaled with 10 planned item\(s\)\)/);
+  });
+});
+
+/** The storefront failure, in small: an item's code uses `ctx.user` on the shared Ctx type that no item owns. */
+class CtxUserExecutor implements ExecutorProvider {
+  readonly name = "ctx-user";
+  async execute(context: ExecutorContext): Promise<ExecutionResult> {
+    const written: string[] = [];
+    for (const path of context.paths.filter((p) => !/[*?]/.test(p))) {
+      const body =
+        path === "src/shared/ctx.ts"
+          ? "export interface Ctx {\n  store: string;\n  user?: string;\n}\n"
+          : path === "src/res/a.ts"
+            ? 'import type { Ctx } from "../shared/ctx.ts";\nexport const a = (ctx: Ctx) => ctx.user ?? "anonymous";\n'
+            : `import type { Ctx } from "../shared/ctx.ts";\nexport const ${path.slice(-4, -3)} = (ctx: Ctx) => ctx.store.toUpperCase();\n`;
+      await mkdir(dirname(join(context.worktreeDir, path)), { recursive: true });
+      await writeFile(join(context.worktreeDir, path), body);
+      written.push(path);
+    }
+    return { status: "changed", changedPaths: written, logs: [], cost: { usd: 0 }, commitMessage: `edit ${context.workUnitId}` };
+  }
+}
+
+/** A typecheck-then-test gate over that project: a TS2339 while Ctx lacks `user`, a failing test until a.ts reads it. */
+class CtxTypecheckGate implements CommandRunner {
+  async run(_argv: readonly string[], cwd: string): Promise<CommandOutcome> {
+    const a = await readFile(join(cwd, "src/res/a.ts"), "utf8");
+    const ctx = await readFile(join(cwd, "src/shared/ctx.ts"), "utf8");
+    if (a.includes("ctx.user") && !ctx.includes("user?")) {
+      return { code: 2, stdout: "> tsc --noEmit\nsrc/res/a.ts(2,41): error TS2339: Property 'user' does not exist on type 'Ctx'.\n", stderr: "" };
+    }
+    return a.includes("ctx.user") ? { code: 0, stdout: "ok 1 - a greets the user\n", stderr: "" } : { code: 1, stdout: "not ok 1 - a greets the user\n# src/res/a.ts\n", stderr: "" };
+  }
+}
+
+describe("seam first (shared seams from the cohesion blueprint)", () => {
+  it("derives the storefront's seams and their importers", async () => {
+    const { sharedSeams } = await import("../src/run-board.ts");
+    const { fileURLToPath } = await import("node:url");
+    const seams = await sharedSeams(fileURLToPath(new URL("../../../examples/apps/storefront", import.meta.url)));
+    const money = seams.find((s) => s.path === "src/contracts/money.ts")!;
+    expect(money.importers).toEqual(expect.arrayContaining(["src/orders/cart.ts", "src/billing/tax.ts", "src/catalog/products.ts"]));
+    expect(seams.map((s) => s.path)).toEqual(expect.arrayContaining(["src/contracts/auth.ts", "src/contracts/http.ts", "src/store.ts"]));
+  });
+
+  it("the seam change is integrated before any item importing it is edited, and the importers rebase onto it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scf-seam-project-"));
+    const files: Record<string, string> = {
+      "package.json": '{"name":"p","type":"module","scripts":{}}\n',
+      "src/shared/util.ts": "export const unit = 1;\n",
+    };
+    for (const name of ["a", "b", "c"]) {
+      files[`src/res/${name}.ts`] = `import { unit } from "../shared/util.ts";\nexport const ${name} = unit;\n`;
+    }
+    for (const [rel, body] of Object.entries(files)) {
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      await writeFile(join(dir, rel), body);
+    }
+    const seamSeed = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: [
+        ...["a", "b", "c"].map((n) => ({ item: `res-${n}`, objective: `use the new unit in ${n}`, acceptance: ["gate passes"], scopeHint: [`src/res/${n}.ts`] })),
+        { item: "util", objective: "change the shared unit", acceptance: ["gate passes"], scopeHint: ["src/shared/util.ts"] },
+      ],
+    });
+    const result = await offline({ goal: GOAL, projectDir: dir, seed: seamSeed });
+    const log = result.log;
+    expect(of(log, "goal.posted")[0]!.payload.seams).toEqual([{ path: "src/shared/util.ts", importers: ["src/res/a.ts", "src/res/b.ts", "src/res/c.ts"], symbols: ["unit"] }]);
+    const utilPush = of(log, "push.announced").find((m) => m.payload.item === "util")!;
+    const utilRev = of(log, "integrated.rev").find((r) => r.payload.merged.includes(utilPush.payload.commit))!;
+    const dependentPushes = of(log, "push.announced").filter((m) => m.payload.item.startsWith("res-"));
+    expect(dependentPushes.length).toBe(3);
+    expect(dependentPushes.every((m) => m.seq > utilRev.seq)).toBe(true);
+    expect(result.verdict).not.toBe("failed");
+    expect(result.incompleteItems).toEqual([]);
+    expect(reduceBoard(log)).toEqual(result.state);
+  });
+
+  it("a type error on a frozen shared seam becomes a seam contract the LEAD decides, then a seam item that lands first", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scf-seam-contract-"));
+    const files: Record<string, string> = {
+      "package.json": '{"name":"p","type":"module","scripts":{}}\n',
+      "src/shared/ctx.ts": "export interface Ctx {\n  store: string;\n}\n",
+    };
+    for (const name of ["a", "b", "c"]) {
+      files[`src/res/${name}.ts`] = `import type { Ctx } from "../shared/ctx.ts";\nexport const ${name} = (ctx: Ctx) => ctx.store;\n`;
+    }
+    for (const [rel, body] of Object.entries(files)) {
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      await writeFile(join(dir, rel), body);
+    }
+    // No item owns the seam: it is frozen.
+    const ctxSeed = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: ["a", "b", "c"].map((n) => ({ item: `res-${n}`, objective: `greet the user in ${n}`, acceptance: ["gate passes"], scopeHint: [`src/res/${n}.ts`] })),
+    });
+    const result = await offline({
+      goal: GOAL,
+      projectDir: dir,
+      seed: ctxSeed,
+      executor: new CtxUserExecutor(),
+      appGateCommand: ["gate"],
+      verifyCommandRunner: new CtxTypecheckGate(),
+    });
+    const log = result.log;
+    expect(of(log, "goal.posted")[0]!.payload.seams).toEqual([{ path: "src/shared/ctx.ts", importers: ["src/res/a.ts", "src/res/b.ts", "src/res/c.ts"], symbols: ["Ctx"] }]);
+    // The failing revision's TS2339 is attributed to the item whose file it names.
+    const failing = of(log, "integrated.rev").find((r) => r.payload.gate === "fail" && (r.payload.failing?.output ?? "").includes("TS2339"))!;
+    expect(failing.payload.failing!.items).toEqual(["res-a"]);
+    // The owner proposed a seam contract with the needed change, not an undeclared field.
+    const proposal = of(log, "contract.proposed").find((m) => m.payload.target === "src/shared/ctx.ts")!;
+    expect(proposal.payload).toMatchObject({ item: "res-a", kind: "modify" });
+    expect(proposal.payload.description).toMatch(/Property 'user' does not exist on type 'Ctx'/);
+    expect(proposal.seq).toBeGreaterThan(failing.seq);
+    // The LEAD decided it (no human escalation), and the engine scheduled the seam item.
+    expect(of(log, "contract.escalated")).toEqual([]);
+    const decision = of(log, "contract.accepted").find((m) => m.payload.contract === proposal.payload.contract)!;
+    expect(decision.from).toBe("lead");
+    const seamItem = of(log, "item.proposed").find((m) => m.payload.fromContract === proposal.payload.contract)!;
+    expect(seamItem.from).toBe("engine");
+    expect(seamItem.payload.scopeHint).toEqual(["src/shared/ctx.ts"]);
+    // The seam change landed in a passing revision, with res-a's fix, and both completed.
+    const seamPush = of(log, "push.announced").find((m) => m.payload.item === seamItem.payload.item)!;
+    const seamRev = of(log, "integrated.rev").find((r) => r.payload.merged.includes(seamPush.payload.commit))!;
+    expect(seamRev.payload.gate).toBe("pass");
+    expect(result.state.items[seamItem.payload.item]!.status).toBe("done");
+    expect(result.state.items["res-a"]!.status).toBe("done");
+    expect(result.incompleteItems).toEqual([]);
+    expect(result.verdict).not.toBe("failed");
+    expect(reduceBoard(log)).toEqual(result.state);
+  });
+});

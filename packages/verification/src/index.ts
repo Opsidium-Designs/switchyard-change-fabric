@@ -113,8 +113,9 @@ export type {
   VerifiedWorkspace,
 } from "./integrator.ts";
 export { advanceIntegrationBranch, GATED_REF_PREFIX, gatedRef, Integrator, recordBaselineInventory } from "./integrator.ts";
-export type { TestInventory } from "./test-inventory.ts";
-export { inventoryAfterContracts, inventoryShortfall, readStreamInventory, readTestInventory } from "./test-inventory.ts";
+export type { TestInventory, TestProgress } from "./test-inventory.ts";
+export { inventoryAfterContracts, inventoryShortfall, labelGateProgress, readStreamInventory, readTestInventory, readTestProgress } from "./test-inventory.ts";
+export type { GateProgress, TestSuiteProgress } from "./test-inventory.ts";
 
 export type {
   CompletedWorkUnit,

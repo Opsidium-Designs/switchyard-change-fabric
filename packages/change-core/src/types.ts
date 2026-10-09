@@ -107,6 +107,8 @@ export interface ChangePlan {
    * hand-authored or heuristic plan, or when no decision model was configured.
    */
   readonly jevReview?: ChangePlanReview;
+  /** Plan-review decisions on earlier plans of the pass that were not chosen (model and units each). */
+  readonly priorReviews?: readonly (ChangePlanReview & { readonly model: string; readonly units: readonly string[] })[];
 }
 
 /**

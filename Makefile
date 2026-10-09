@@ -286,9 +286,12 @@ demo-board-storefront:
 	npm -w apps/cli run dev -- run-board --offline --fixture-gate --decide-contracts $(DECIDE_CONTRACTS) --goal-file "$(STOREFRONT_GOAL)" --project "$(STOREFRONT_PROJECT)" \
 	  --min $(MIN) --max $(MAX)
 
+# SF_MAX unset: the dial's max scales with the plan size (min(items, 6)).
+# DECIDE unset: contract changes wait for a human in the console (never auto-accept).
+SF_MAX ?=
 run-board-storefront:
 	npm -w apps/cli run dev -- run-board --goal-file "$(STOREFRONT_GOAL)" --project "$(STOREFRONT_PROJECT)" --worker "$(WORKER)" \
-	  --min $(MIN) --max $(MAX) $(if $(INTEGRATOR),--integrator $(INTEGRATOR),) $(if $(DECIDE),--decide-contracts $(DECIDE),)
+	  --min $(MIN) $(if $(SF_MAX),--max $(SF_MAX),) $(if $(INTEGRATOR),--integrator $(INTEGRATOR),) $(if $(DECIDE),--decide-contracts $(DECIDE),)
 
 storefront-gate:
 	cd examples/apps/storefront && npm ci --no-audit --no-fund && npm run gate

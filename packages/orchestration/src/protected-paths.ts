@@ -30,6 +30,9 @@
  *     `packageManager`, `imports`, `exports`, and the jest, mocha, ava, babel,
  *     c8, nyc, vitest sections). Dependencies and lockfiles stay editable;
  *   - `tsconfig*.json` when the gate runs the type checker;
+ *   - the root config a test runner reads by default (vitest/vite, jest, mocha,
+ *     ava, playwright configs) when a gate step runs that runner without an
+ *     explicit config flag;
  *   - harnesses the gate imports, transitively (see the import rule below).
  *   Root runner configs (pytest.ini, tox.ini, setup.cfg, pyproject.toml,
  *   conftest.py, noxfile.py, and the package-manager configs) are protected even
@@ -71,6 +74,22 @@ export const MANIFEST_RUN_KEYS: readonly string[] = ["type", "packageManager", "
 
 /** Test-runner and build configs (by basename, at any depth). */
 const TEST_CONFIG = /^(vitest\.(config|workspace)|vite\.config|jest\.(config|setup)|playwright\.config|cypress\.config|karma\.conf|ava\.config|babel\.config)\.[A-Za-z0-9.]+$|^\.mocharc(\.[A-Za-z0-9]+)?$|^\.babelrc(\.[A-Za-z0-9]+)?$|^(conftest|noxfile)\.py$|^(pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml)$/;
+/**
+ * The root configs each test runner reads on its own when a step runs it
+ * without an explicit config flag. A gate step that runs the runner reads
+ * them, so they are part of the acceptance gate (immutable).
+ */
+const RUNNER_DEFAULT_CONFIGS: Readonly<Record<string, RegExp>> = {
+  vitest: /^(vitest\.(config|workspace)|vite\.config)\.[A-Za-z0-9.]+$/,
+  jest: /^jest\.(config|setup)\.[A-Za-z0-9.]+$/,
+  mocha: /^\.mocharc(\.[A-Za-z0-9]+)?$/,
+  ava: /^ava\.config\.[A-Za-z0-9.]+$/,
+  playwright: /^playwright\.config\.[A-Za-z0-9.]+$/,
+};
+/** The flags that point a runner at an explicit config (it then skips the root default). */
+const CONFIG_FLAG = /^(--config|-c|--config-file)(=.*)?$/;
+/** Shell separators that end one step of a gate script. */
+const STEP_SEPARATOR = /&&|\|\||;|\|/;
 /** Globs for configs added deeper than the root (removed at gate time). */
 const NESTED_CONFIG_GLOBS: readonly string[] = [
   "**/vitest.config.*",
@@ -121,6 +140,17 @@ export interface ProtectedPaths {
   readonly outside: readonly string[];
   /** Why the conservative fallback applied, if it did. */
   readonly fallback?: string;
+  /**
+   * The IMMUTABLE acceptance gate (a subset of `paths`): what the declared gate
+   * command runs or references by name (its scripts' file arguments, the test
+   * files of a directory it names), the test files and runner configs in those
+   * gate directories, the harness they import, and the toolchain files the gate
+   * invokes (a Makefile, a type-checker config it runs). No agent ever changes
+   * these: there is no contract route for them, even if a human would accept.
+   * The rest of `paths` (the project's pre-existing developer tests and
+   * configs) stays contract-changeable with a human's approval.
+   */
+  readonly immutable: readonly string[];
 }
 
 /** A test-shaped repo path (any ecosystem's convention). */
@@ -311,9 +341,26 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
     }
     if (program === "make" && fileSet.has("Makefile")) {
       paths.add("Makefile");
+      gateFiles.push("Makefile");
     }
     if (program === "just" && fileSet.has("justfile")) {
       paths.add("justfile");
+      gateFiles.push("justfile");
+    }
+  };
+
+  // A step that runs a test runner without an explicit config reads the
+  // runner's root default config: the gate reads it, so it is a gate file.
+  const runnerDefaults = (step: readonly string[]): void => {
+    const runner = step.map((w) => posix.basename(w)).find((w) => RUNNER_DEFAULT_CONFIGS[w] !== undefined);
+    if (runner === undefined || step.some((w) => CONFIG_FLAG.test(w))) {
+      return;
+    }
+    for (const file of files) {
+      if (!file.includes("/") && RUNNER_DEFAULT_CONFIGS[runner]!.test(file)) {
+        paths.add(file);
+        gateFiles.push(file);
+      }
     }
   };
 
@@ -328,17 +375,23 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
     scriptKeys.add(name);
     scriptKeys.add(`pre${name}`);
     scriptKeys.add(`post${name}`);
-    const words = tokens(script);
-    for (let i = 0; i < words.length; i += 1) {
-      const word = words[i]!;
-      const nested = packageScript(words.slice(i));
-      if (nested !== undefined) {
-        await walkScript(nested, depth + 1);
-        i += words[i + 1] === "run" || words[i + 1] === "run-script" ? 2 : 1;
-        continue;
+    for (const step of script.split(STEP_SEPARATOR)) {
+      const words = tokens(step);
+      const stepScript = packageScript(words);
+      if (stepScript === undefined || typeof scripts[stepScript] !== "string") {
+        runnerDefaults(words);
       }
-      runsMakeOrJust(word);
-      await consider(word, words[i - 1]);
+      for (let i = 0; i < words.length; i += 1) {
+        const word = words[i]!;
+        const nested = packageScript(words.slice(i));
+        if (nested !== undefined) {
+          await walkScript(nested, depth + 1);
+          i += words[i + 1] === "run" || words[i + 1] === "run-script" ? 2 : 1;
+          continue;
+        }
+        runsMakeOrJust(word);
+        await consider(word, words[i - 1]);
+      }
     }
   };
 
@@ -349,6 +402,7 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
       if (manifest === undefined || typeof scripts[script] !== "string") {
         fallback = `the gate runs package script "${script}" but the manifest could not be read: the whole package.json is protected`;
         paths.add("package.json");
+        gateFiles.push("package.json");
       } else {
         await walkScript(script, 0);
       }
@@ -357,6 +411,7 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
       for (const file of ["package.json", "Makefile", "justfile"]) {
         if (fileSet.has(file)) {
           paths.add(file);
+          gateFiles.push(file);
         }
       }
       for (let i = 1; i < gateCommand.length; i += 1) {
@@ -364,6 +419,7 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
       }
     } else {
       runsMakeOrJust(program);
+      runnerDefaults(gateCommand);
       for (let i = 1; i < gateCommand.length; i += 1) {
         await consider(gateCommand[i]!, gateCommand[i - 1]);
       }
@@ -375,6 +431,7 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
     for (const file of files) {
       if (/(^|\/)tsconfig[^/]*\.json$/.test(file)) {
         paths.add(file);
+        gateFiles.push(file);
       }
     }
   }
@@ -392,6 +449,7 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
     const dir = posix.dirname(rel);
     return [...testTreeDirs].some((t) => (t === "." ? dir === "." : dir === t || dir.startsWith(`${t}/`)));
   };
+  const importsOf = new Map<string, string[]>();
   const queue = [...new Set([...gateFiles, ...files.filter(isTestShaped)])].filter((f) => MODULE_FILE.test(f)).map((f) => ({ file: f, depth: 0 }));
   const visited = new Set(queue.map((q) => q.file));
   while (queue.length > 0) {
@@ -424,6 +482,7 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
         continue;
       }
       paths.add(rel);
+      importsOf.set(file, [...(importsOf.get(file) ?? []), rel]);
       if (!visited.has(rel) && depth < 6 && MODULE_FILE.test(rel)) {
         visited.add(rel);
         queue.push({ file: rel, depth: depth + 1 });
@@ -436,8 +495,32 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
     const keys = [...[...scriptKeys].sort().map((k) => ["scripts", k]), ...MANIFEST_RUN_KEYS.map((k) => [k])];
     jsonKeys.push({ file: "package.json", keys });
   }
+  // The immutable acceptance gate: the files the gate names, the test files and
+  // runner configs in the (non-root) directories of the test or config files it
+  // names, and the harness those import (transitively).
+  // The package-manager and runner configs protected even when absent change
+  // how the gate itself runs: immutable too.
+  const immutable = new Set<string>([...gateFiles.filter((f) => paths.has(f)), ...RUNNER_CONFIG_FILES]);
+  const gateDirs = new Set(
+    gateFiles.filter((f) => isTestShaped(f) || isRunnerConfig(f)).map((f) => posix.dirname(f)).filter((d) => d !== "."),
+  );
+  for (const file of files) {
+    if (gateDirs.has(posix.dirname(file)) && (isTestShaped(file) || isRunnerConfig(file))) {
+      immutable.add(file);
+    }
+  }
+  const pending = [...immutable];
+  while (pending.length > 0) {
+    for (const rel of importsOf.get(pending.pop()!) ?? []) {
+      if (!immutable.has(rel)) {
+        immutable.add(rel);
+        pending.push(rel);
+      }
+    }
+  }
   const all = [...paths].sort();
   return {
+    immutable: [...immutable].sort(),
     paths: collapse(all, MAX_POSTED_PROTECTED),
     restore: [...all, ...NESTED_CONFIG_GLOBS],
     jsonKeys,

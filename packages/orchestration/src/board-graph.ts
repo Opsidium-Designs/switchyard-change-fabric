@@ -39,6 +39,8 @@
 
 import {
   contractTriageRecommendation,
+  describeProgress,
+  progressHeadline,
   foldBoard,
   toolItemId,
   type BoardItemStatus,
@@ -154,6 +156,24 @@ export interface RevNodeDetail {
   readonly failureLine?: string;
   /** The dependency install outcome, when the revision recorded one. */
   readonly install?: string;
+  /** ADVISORY: how many of the gate's checks passed, and the change since the previous revision that recorded it. */
+  readonly progress?: GraphProgress;
+}
+
+/**
+ * A revision's ADVISORY progress as the graph shows it: the stated line
+ * (`acceptance 40/129 passing; developer 9/9`, or `acceptance suite did not
+ * run: typecheck failed (1 error)`), the headline count when there is one (the
+ * acceptance suite's, else all suites'), and its change since the previous
+ * revision with a comparable headline.
+ */
+export interface GraphProgress {
+  readonly label: string;
+  readonly passed?: number;
+  readonly total?: number;
+  /** True when the headline is the acceptance suite's own count. */
+  readonly acceptance?: boolean;
+  readonly delta?: number;
 }
 
 export interface ToolNodeDetail {
@@ -284,6 +304,8 @@ export interface BoardTicker {
     readonly gate: "pass" | "fail";
     readonly gated: boolean;
     readonly label: string;
+    /** ADVISORY progress of the latest revision that recorded it. */
+    readonly progress?: GraphProgress;
   } | null;
   readonly rebasing: readonly string[];
   readonly agents: { readonly active: number; readonly joined: number };
@@ -721,6 +743,8 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
   const pushByCommit = new Map<string, BoardMessageOf<"push.announced">>();
   let previousRev: BoardMessageOf<"integrated.rev"> | undefined;
   let latestRev: BoardMessageOf<"integrated.rev"> | undefined;
+  let previousProgress: { passed: number; acceptance: boolean } | undefined;
+  let latestProgress: GraphProgress | undefined;
   for (const m of messages) {
     if (isType(m, "push.announced")) {
       pushByCommit.set(m.payload.commit, m);
@@ -731,6 +755,26 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
     }
     latestRev = m;
     const p = m.payload;
+    const headline = p.progress ? progressHeadline(p.progress) : undefined;
+    const progress: GraphProgress | undefined = p.progress
+      ? {
+          label: describeProgress(p.progress),
+          ...(headline
+            ? {
+                passed: headline.passed,
+                total: headline.total,
+                acceptance: headline.acceptance,
+                ...(previousProgress !== undefined && previousProgress.acceptance === headline.acceptance ? { delta: headline.passed - previousProgress.passed } : {}),
+              }
+            : {}),
+        }
+      : undefined;
+    if (headline) {
+      previousProgress = { passed: headline.passed, acceptance: headline.acceptance };
+    }
+    if (progress) {
+      latestProgress = progress;
+    }
     const id = boardRevNodeId(p.n);
     const verdictLabel = revVerdictLabel(p);
     const install = installOf(p);
@@ -757,6 +801,7 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
         ...(p.failing ? { failing: { output: p.failing.output, items: p.failing.items } } : {}),
         ...(failureLine !== undefined ? { failureLine } : {}),
         ...(install !== undefined ? { install } : {}),
+        ...(progress ? { progress } : {}),
       },
     });
     if (previousRev) {
@@ -1136,7 +1181,7 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
     }
   }
 
-  const ticker = buildTicker(messages, state, latestRev, rebasing);
+  const ticker = buildTicker(messages, state, latestRev, rebasing, latestProgress);
   const columns = buildColumns(itemsInOrder.map((i) => i.id), nodes);
   const model: BoardGraphModel = { k: kk, lastSeq, state, nodes, edges, ticker, columns, escalations };
   assertBoardBacked(model, log);
@@ -1226,6 +1271,7 @@ function buildTicker(
   state: BoardState,
   latestRev: BoardMessageOf<"integrated.rev"> | undefined,
   rebasing: Set<string>,
+  progress?: GraphProgress,
 ): BoardTicker {
   const agents = Object.values(state.agents);
   const counts = { proposed: 0, open: 0, claimed: 0, contested: 0, done: 0 };
@@ -1256,6 +1302,7 @@ function buildTicker(
           gate: latestRev.payload.gate,
           gated: latestRev.payload.gated !== false,
           label: revVerdictLabel(latestRev.payload),
+          ...(progress ? { progress } : {}),
         }
       : null,
     rebasing: [...rebasing].sort(),

@@ -14,6 +14,8 @@
  * internals.
  */
 
+import type { TestProgress } from "./test-inventory.ts";
+
 /** The kind of check a verification run performs. */
 export type CheckKind = "clean-state" | "path-scope" | "test" | "lint" | "app-gate";
 
@@ -105,6 +107,12 @@ export interface CheckResult {
   readonly summary: string;
   /** Captured output references for the check (may be empty). */
   readonly outputs: readonly OutputRef[];
+  /**
+   * ADVISORY test progress read from the check's FULL output (the captured
+   * outputs are bounded, so a later suite's summary may be cut from them).
+   * Never a verdict.
+   */
+  readonly progress?: TestProgress;
 }
 
 /** The full verification evidence for one WorkUnit. */

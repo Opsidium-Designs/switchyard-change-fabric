@@ -110,6 +110,8 @@ export const BOARD_LIMITS = {
   maxStruggleReports: 3,
   /** Sub-lead pushes that may merge one child's push. */
   maxChildMerges: 3,
+  /** Board messages a dependent item waits for a seam-changing item before it proceeds anyway. */
+  seamWaitMessages: 60,
   maxVolunteers: 2,
   maxObjective: 500,
   maxAcceptance: 20,
@@ -122,10 +124,70 @@ export const BOARD_LIMITS = {
   maxBodyBytes: 65536,
 } as const;
 
+/** The longest description a contract carries (a seam contract's needed change). */
+const MAX_CONTRACT_DESCRIPTION = 400;
+/** The id of the seam item an accepted seam contract becomes. */
+export function seamItemId(contract: string): string {
+  return `seam-${contract}`;
+}
+
 /** What an agent will read and write. Entries are paths, globs, or `path#symbol`. */
 export interface BoardIntent {
   readonly read: readonly string[];
   readonly write: readonly string[];
+}
+
+/** A shared seam and the files that import it. */
+export interface BoardSeam {
+  readonly path: string;
+  readonly importers: readonly string[];
+  /** The names the seam exports (types, functions, constants), bounded: a type error naming one points at this seam. */
+  readonly symbols?: readonly string[];
+}
+
+/** How many of the gate's checks passed on a revision (advisory). */
+export interface BoardRevProgress {
+  /** All suites of the run, summed. */
+  readonly passed: number;
+  readonly failed: number;
+  readonly total: number;
+  /** Per suite in run order; `suite` labels the acceptance suite (its files are in the immutable gate) and developer suites. */
+  readonly suites?: readonly { readonly passed: number; readonly failed: number; readonly total: number; readonly suite?: "acceptance" | "developer" }[];
+  /** The acceptance suite's own counts, when it ran and was recognized. */
+  readonly acceptance?: { readonly passed: number; readonly failed: number; readonly total: number };
+  /** Why the acceptance suite has no count on this revision (`typecheck failed (1 error)`). */
+  readonly acceptanceNotRun?: string;
+}
+
+/**
+ * The headline count of a revision's progress: the acceptance suite's own when
+ * it was recognized, else all suites summed (`acceptance: false`). Undefined
+ * when the acceptance suite did not run (there is no number to compare).
+ */
+export function progressHeadline(p: BoardRevProgress): { readonly passed: number; readonly total: number; readonly acceptance: boolean } | undefined {
+  if (p.acceptance !== undefined) {
+    return { passed: p.acceptance.passed, total: p.acceptance.total, acceptance: true };
+  }
+  if (p.acceptanceNotRun !== undefined) {
+    return undefined;
+  }
+  return { passed: p.passed, total: p.total, acceptance: false };
+}
+
+/** One line for a revision's advisory progress (`acceptance 40/129 passing; developer 9/9`). */
+export function describeProgress(p: BoardRevProgress): string {
+  const developer = (p.suites ?? []).filter((s) => s.suite === "developer");
+  const dev =
+    developer.length > 0
+      ? `developer ${developer.reduce((n, s) => n + s.passed, 0)}/${developer.reduce((n, s) => n + s.total, 0)}`
+      : undefined;
+  if (p.acceptance !== undefined) {
+    return `acceptance ${p.acceptance.passed}/${p.acceptance.total} passing${dev ? `; ${dev}` : ""}`;
+  }
+  if (p.acceptanceNotRun !== undefined) {
+    return `acceptance suite did not run: ${p.acceptanceNotRun}${dev ? ` (${dev})` : ""}`;
+  }
+  return `${p.passed}/${p.total} checks passing`;
 }
 
 /** A child item declared by an `item.split`. */
@@ -225,6 +287,19 @@ export interface BoardPayloads {
      */
     readonly integrator?: "local" | "cloud";
     /**
+     * The IMMUTABLE acceptance gate (a subset of `protected`): the files the
+     * gate command runs or references and their harness. No contract can ever
+     * change them (`IMMUTABLE`); only the rest of `protected` (developer tests
+     * and configs) is contract-changeable with a human's approval.
+     */
+    readonly immutable?: readonly string[];
+    /**
+     * The shared frozen SEAMS of a modular repo (from the cohesion blueprint)
+     * and the files that import each. An item that changes a seam goes first:
+     * items covering its importers wait (bounded) for its integrated revision.
+     */
+    readonly seams?: readonly BoardSeam[];
+    /**
      * Paths and globs no agent may write: the files that define the gate (the
      * gate's own test files and directory, the project manifest and lockfile).
      * Posted with the goal so the protected set is visible on the board; claims
@@ -255,6 +330,12 @@ export interface BoardPayloads {
      * the proposal still needs the lead's acceptance.
      */
     readonly fromTool?: { readonly capability: string; readonly version: string };
+    /**
+     * ENGINE only: the accepted SEAM contract this item carries out (a change to
+     * a shared seam no item owned). It is open at once (the lead already
+     * decided) and, as a seam item, goes first; its importers rebase onto it.
+     */
+    readonly fromContract?: string;
   };
   /**
    * The lead (or a human) accepts an item a WORKER proposed: it becomes open
@@ -352,6 +433,12 @@ export interface BoardPayloads {
      * change the lead or a human decides, never an agent alone.
      */
     readonly item?: string;
+    /**
+     * The exact change needed (required for a SEAM contract: a change to a
+     * shared seam, such as a type every domain imports, that no item owns).
+     * The LEAD decides a seam contract; accepted, it becomes a seam item.
+     */
+    readonly description?: string;
   };
   /** Engine: a contract on a protected path waits for a HUMAN decision (an escalation). */
   "contract.escalated": { readonly contract: string; readonly item: string; readonly target: string; readonly kind: "add" | "modify" | "remove" };
@@ -394,6 +481,11 @@ export interface BoardPayloads {
      * not integrated by this revision, with the reason.
      */
     readonly unverified?: readonly { readonly item: string; readonly reason: string }[];
+    /**
+     * ADVISORY progress parsed from the gate's own output: how many of its
+     * checks passed (per suite when it ran several). Never a verdict.
+     */
+    readonly progress?: BoardRevProgress;
   };
   "rebase.needed": { readonly agent: string; readonly n: number; readonly paths: readonly string[] };
   "review.requested": { readonly review: string; readonly item: string };
@@ -652,6 +744,8 @@ export type BoardErrorCode =
   | "INVALID_STATE"
   | "LIMIT"
   | "NOT_SUPPORTED"
+  | "IMMUTABLE"
+  | "SEAM_FIRST"
   | "LOG_MISMATCH";
 
 /** A rejected message or an inconsistent log, with a machine-readable code. */
@@ -759,6 +853,8 @@ export interface BoardItem {
   toolBuild?: { readonly commit: string; readonly paths: readonly string[]; readonly seq: number; gated?: boolean; passed?: boolean };
   /** The published tool whose findings this item was proposed from. */
   readonly fromTool?: { readonly capability: string; readonly version: string };
+  /** The accepted seam contract this item carries out (engine-proposed). */
+  readonly fromContract?: string;
   /** The seq at which a human last rejected a contract change for this item. */
   contractRejectedSeq?: number;
   /** The current owner's latest struggling report (cleared when the claim changes hands or completes). */
@@ -850,9 +946,15 @@ export interface BoardContract {
   readonly item?: string;
   /** The target is part of the gate's contract: only a human decides it. */
   readonly guarded?: boolean;
+  /** The target is a shared SEAM no item owns: the lead decides; accepted, it becomes a seam item. */
+  readonly seam?: string;
+  /** The exact change needed (a seam contract's objective). */
+  readonly description?: string;
   readonly proposedBy: string;
+  readonly proposedSeq?: number;
   status: "proposed" | "accepted" | "rejected";
   decidedBy?: string;
+  decidedSeq?: number;
 }
 
 export interface BoardReview {
@@ -920,6 +1022,10 @@ export interface BoardState {
   volunteers?: Record<string, BoardVolunteer>;
   /** Where integration runs, as posted with the goal (absent: local). */
   integrator?: "local" | "cloud";
+  /** The immutable acceptance gate, as posted with the goal (a subset of `protected`). */
+  immutable?: string[];
+  /** The shared seams and their importers, as posted with the goal. */
+  seams?: BoardSeam[];
   contracts: Record<string, BoardContract>;
   reviews: Record<string, BoardReview>;
   tools: {
@@ -1186,6 +1292,51 @@ function unverifiedMerges(value: unknown): { item: string; reason: string }[] {
   });
 }
 
+/** A revision's advisory progress: non-negative counts, passed + failed = total, at most 16 suites. */
+function revProgress(value: unknown): BoardRevProgress {
+  if (!isRecord(value)) {
+    fail("BAD_PAYLOAD", "progress must be an object {passed, failed, total, suites?}");
+  }
+  const one = (v: Raw, where: string) => {
+    const passed = nonNegativeInt(v, "passed");
+    const failed = nonNegativeInt(v, "failed");
+    const total = nonNegativeInt(v, "total");
+    if (passed + failed !== total) {
+      fail("BAD_PAYLOAD", `${where}: passed + failed must equal total`);
+    }
+    return { passed, failed, total };
+  };
+  const base = one(value, "progress");
+  const acceptance =
+    value.acceptance === undefined
+      ? {}
+      : isRecord(value.acceptance)
+        ? { acceptance: one(value.acceptance, "progress.acceptance") }
+        : fail("BAD_PAYLOAD", "progress.acceptance is {passed, failed, total}");
+  const notRun =
+    value.acceptanceNotRun === undefined
+      ? {}
+      : value.acceptance !== undefined
+        ? fail("BAD_PAYLOAD", "progress has either acceptance counts or acceptanceNotRun, not both")
+        : { acceptanceNotRun: text(value, "acceptanceNotRun", 200) };
+  if (value.suites === undefined) {
+    return { ...base, ...acceptance, ...notRun };
+  }
+  if (!Array.isArray(value.suites) || value.suites.length === 0 || value.suites.length > 16) {
+    fail("BAD_PAYLOAD", "progress.suites must be a non-empty array of at most 16 suites");
+  }
+  const suites = value.suites.map((s, i) => {
+    if (!isRecord(s)) {
+      fail("BAD_PAYLOAD", "each suite is {passed, failed, total, suite?}");
+    }
+    if (s.suite !== undefined && s.suite !== "acceptance" && s.suite !== "developer") {
+      fail("BAD_PAYLOAD", `progress.suites[${i}].suite must be "acceptance" or "developer"`);
+    }
+    return { ...one(s, `progress.suites[${i}]`), ...(s.suite !== undefined ? { suite: s.suite as "acceptance" | "developer" } : {}) };
+  });
+  return { ...base, suites, ...acceptance, ...notRun };
+}
+
 function children(raw: Raw): BoardChildItem[] {
   const value = raw.children;
   if (!Array.isArray(value) || value.length === 0 || value.length > BOARD_LIMITS.maxChildren) {
@@ -1367,6 +1518,31 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         ...(keys.length > 0 ? { protectedKeys: keys } : {}),
         ...(inventory !== undefined ? { testInventory: inventory } : {}),
         ...(raw.integrator !== undefined ? { integrator: oneOf(raw, "integrator", ["local", "cloud"] as const) } : {}),
+        ...((): { seams?: BoardSeam[] } => {
+          if (raw.seams === undefined) return {};
+          if (!Array.isArray(raw.seams) || raw.seams.length > L.maxIntentEntries) {
+            fail("BAD_PAYLOAD", `seams must be an array of at most ${L.maxIntentEntries} {path, importers}`);
+          }
+          return {
+            seams: raw.seams.map((seam) => {
+              if (!isRecord(seam)) fail("BAD_PAYLOAD", "each seam is {path, importers, symbols?}");
+              const [path] = pathList({ path: [seam.path] }, "path", { concrete: true });
+              const symbols = seam.symbols;
+              if (symbols !== undefined && (!Array.isArray(symbols) || symbols.length > 64 || !symbols.every((n) => typeof n === "string" && /^[A-Za-z_$][\w$]{0,79}$/.test(n)))) {
+                fail("BAD_PAYLOAD", "a seam's symbols are at most 64 identifiers");
+              }
+              return {
+                path: path!,
+                importers: pathList(seam, "importers", { concrete: true, max: L.maxPaths }),
+                ...(symbols !== undefined && symbols.length > 0 ? { symbols: [...(symbols as string[])] } : {}),
+              };
+            }),
+          };
+        })(),
+        ...((): { immutable?: string[] } => {
+          const immutable = pathList(raw, "immutable", { optional: true, max: L.maxProtected });
+          return immutable.length > 0 ? { immutable } : {};
+        })(),
       };
     }
     case "item.proposed":
@@ -1376,6 +1552,7 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         acceptance: textList(raw, "acceptance", L.maxAcceptance, L.maxObjective),
         scopeHint: pathList(raw, "scopeHint", { optional: true, max: L.maxIntentEntries }),
         ...(raw.fromTool !== undefined ? { fromTool: toolRef(raw.fromTool, "fromTool") } : {}),
+        ...(raw.fromContract !== undefined ? { fromContract: id(raw, "fromContract") } : {}),
       };
     case "item.claimed":
       return { item: id(raw, "item"), intent: intent(raw, "intent") };
@@ -1482,11 +1659,13 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
     case "contract.proposed": {
       const [target] = pathList({ target: [raw.target] }, "target");
       const item = optionalId(raw, "item");
+      const description = raw.description === undefined ? undefined : text(raw, "description", MAX_CONTRACT_DESCRIPTION);
       return {
         contract: id(raw, "contract"),
         target: target!,
         kind: oneOf(raw, "kind", ["add", "modify", "remove"] as const),
         ...(item !== undefined ? { item } : {}),
+        ...(description !== undefined ? { description } : {}),
       };
     }
     case "contract.escalated": {
@@ -1544,6 +1723,7 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         ...(failing !== undefined ? { failing } : {}),
         ...(ungatedFlag(raw) ? { gated: false as const } : {}),
         ...(raw.unverified !== undefined ? { unverified: unverifiedMerges(raw.unverified) } : {}),
+        ...(raw.progress !== undefined ? { progress: revProgress(raw.progress) } : {}),
       };
     }
     case "rebase.needed":
@@ -1772,7 +1952,8 @@ type Senders = "human" | "engine" | "agent" | "lead";
 
 const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "goal.posted": ["human"],
-  "item.proposed": ["human", "agent"],
+  // The engine proposes the seam item an accepted seam contract becomes.
+  "item.proposed": ["human", "agent", "engine"],
   "item.accepted": ["lead", "human"],
   "item.rejected": ["lead", "human"],
   "item.claimed": ["agent"],
@@ -1994,6 +2175,141 @@ export function checkHelpFork(state: BoardState, requestId: string, agent: strin
   return { requester: request.by };
 }
 
+/** True when the latest failing revision implicates `item` and its output names `path`. */
+function failingCheckNames(state: BoardState, item: string, path: string): boolean {
+  const failure = state.lastFailure;
+  return failure !== null && failure.items.includes(item) && failure.output.split(/[\s()'"`]+/).some((token) => {
+    const clean = token.replace(/:\d+(:\d+)?$/, "").replace(/^\.\//, "");
+    return clean === path || clean.endsWith(`/${path}`);
+  });
+}
+
+/**
+ * The CONTRACT CUE of an owner's failing item: protected paths (the original
+ * tests, the gate's configuration) the failing output names, i.e. the failing
+ * check is in the contract. If that check encodes the old behavior the goal
+ * changes, the owner proposes a contract change for it (a human decides).
+ */
+export function contractCue(state: BoardState, item: string): string[] {
+  const failure = state.lastFailure;
+  if (failure === null || !failure.items.includes(item)) {
+    return [];
+  }
+  // Never the acceptance gate: its failures ARE the goal.
+  return state.protected.filter((p) => !hasWildcard(p) && !(state.immutable ?? []).includes(p) && failingCheckNames(state, item, p)).sort();
+}
+
+/** True when an item's scope or write intent covers a path. */
+function itemCovers(item: BoardItem, path: string): boolean {
+  return [...item.scopeHint, ...(item.intent?.write ?? [])].some((e) => entryWithin(path, intentPath(e)));
+}
+
+/**
+ * SEAM FIRST: the seam-changing items `itemId` must wait for. A seam item is a
+ * CLAIMED item whose scope covers a shared seam (posted with the goal) and
+ * whose latest push is not integrated yet; `itemId` depends on it when its own
+ * scope covers a file importing that seam (and it does not change that seam
+ * itself). The wait is bounded: after `seamWaitMessages` board messages from
+ * the seam item's proposal, dependents proceed anyway. Pure.
+ */
+export function seamWaits(state: BoardState, itemId: string): { readonly item: string; readonly seams: readonly string[] }[] {
+  const item = state.items[itemId];
+  if (!item || item.tool !== undefined || (state.seams ?? []).length === 0) {
+    return [];
+  }
+  const out: { item: string; seams: string[] }[] = [];
+  for (const other of Object.values(state.items)) {
+    // Only a seam change someone is working on blocks (a claimed item; a split
+    // item's children stand for it): an unclaimed one never stalls dependents.
+    if (other.id === itemId || other.tool !== undefined || (other.status !== "claimed" && other.status !== "contested")) {
+      continue;
+    }
+    if (other.lastPush?.integratedIn !== undefined || state.lastSeq - other.proposedSeq > BOARD_LIMITS.seamWaitMessages) {
+      continue;
+    }
+    const seams = (state.seams ?? [])
+      .filter((seam) => itemCovers(other, seam.path) && !itemCovers(item, seam.path) && seam.importers.some((imp) => itemCovers(item, imp)))
+      .map((seam) => seam.path);
+    if (seams.length > 0) {
+      out.push({ item: other.id, seams });
+    }
+  }
+  return out.sort((a, b) => (a.item < b.item ? -1 : a.item > b.item ? 1 : 0));
+}
+
+/** The shared seam a contract target names (`path` or `path#symbol`), if any. */
+function seamTarget(state: BoardState, target: string): string | undefined {
+  const path = intentPath(target);
+  return (state.seams ?? []).find((seam) => seam.path === path)?.path;
+}
+
+/** The live item whose scope covers a seam (its owner may change it), if any. */
+function seamOwner(state: BoardState, seam: string): string | undefined {
+  return Object.values(state.items).find(
+    (i) => i.status !== "done" && i.status !== "rejected" && i.tool === undefined && itemCovers(i, seam),
+  )?.id;
+}
+
+/** TypeScript diagnostics that mean a type or contract MISMATCH (a field, member, or signature the code expects but the type lacks). */
+const TYPE_MISMATCH_CODES = new Set(["TS2339", "TS2551", "TS2322", "TS2345", "TS2353", "TS2741", "TS2554", "TS2305", "TS2724", "TS2559", "TS2739", "TS2740"]);
+
+/**
+ * The SEAM CONTRACT CUE of an owner's failing item: the latest failing revision
+ * implicates the item and its output carries type/contract mismatches
+ * (`path(line,col): error TS2339: ...`) located in a shared seam, or in a file
+ * of the item that imports a shared seam, where that seam is FROZEN (no live
+ * item's scope covers it). Instead of using undeclared fields or casts, the
+ * owner proposes a seam contract with the exact change; the lead decides it.
+ * A seam already asked about for this item (a pending or accepted contract,
+ * or one rejected since the item was last implicated) is not cued again. Pure.
+ */
+export function seamContractCue(state: BoardState, itemId: string): { readonly seams: readonly string[]; readonly errors: readonly string[] } | undefined {
+  const failure = state.lastFailure;
+  const item = state.items[itemId];
+  if (failure === null || item === undefined || !failure.items.includes(itemId) || (state.seams ?? []).length === 0) {
+    return undefined;
+  }
+  const seams = new Set<string>();
+  const errors: string[] = [];
+  for (const line of failure.output.split(/\r?\n/)) {
+    const m = /^\s*(?:\.\/)?([^\s()]+)\(\d+,\d+\): error (TS\d+): /.exec(line);
+    if (!m || !TYPE_MISMATCH_CODES.has(m[2]!)) {
+      continue;
+    }
+    const file = m[1]!;
+    const imported = (state.seams ?? []).filter((seam) => seam.path === file || (itemCovers(item, file) && seam.importers.includes(file)));
+    // A type the error names (`on type 'Ctx'`) that a seam exports points at THAT seam.
+    const named = new Set([...line.matchAll(/['"`]([A-Za-z_$][\w$]*)(?:<[^'"`]*>)?['"`]/g)].map((n) => n[1]!));
+    const byName = imported.filter((seam) => seam.path === file || (seam.symbols ?? []).some((sym) => named.has(sym)));
+    const hit = byName.length > 0 ? byName : imported;
+    const frozen = hit.filter((seam) => seamOwner(state, seam.path) === undefined);
+    if (frozen.length === 0) {
+      continue;
+    }
+    for (const seam of frozen) {
+      seams.add(seam.path);
+    }
+    if (errors.length < 4) {
+      errors.push(line.trim().slice(0, 300));
+    }
+  }
+  const asked = (seam: string) =>
+    Object.values(state.contracts).some(
+      (c) =>
+        c.seam === seam &&
+        c.item === itemId &&
+        (c.status !== "rejected" || (c.decidedSeq ?? 0) >= (item.implicatedSeq ?? 0)),
+    );
+  const open = [...seams].filter((seam) => !asked(seam)).sort();
+  return open.length > 0 ? { seams: open, errors } : undefined;
+}
+
+/** True when an item changes a shared seam (it goes first). */
+export function isSeamItem(state: BoardState, itemId: string): boolean {
+  const item = state.items[itemId];
+  return item !== undefined && (state.seams ?? []).some((seam) => itemCovers(item, seam.path));
+}
+
 /** The live help grants on an item (see helpGrantLive). */
 export function liveHelpGrants(state: BoardState, item: string): BoardHelpRequest[] {
   return Object.values(state.help).filter((h) => h.item === item && helpGrantLive(state, h));
@@ -2095,6 +2411,18 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       if (state.items[draft.payload.item]) {
         fail("DUPLICATE", `item ${draft.payload.item} already exists`);
       }
+      if (draft.type === "item.proposed") {
+        const fromContract = draft.payload.fromContract;
+        if (draft.from === BOARD_ENGINE) {
+          // The engine proposes only the seam item of an accepted seam contract.
+          const contract = fromContract === undefined ? undefined : state.contracts[fromContract];
+          if (contract === undefined || contract.seam === undefined || contract.status !== "accepted" || draft.payload.item !== seamItemId(contract.contract)) {
+            fail("NOT_ALLOWED", "the engine proposes an item only for an accepted seam contract");
+          }
+        } else if (fromContract !== undefined) {
+          fail("NOT_ALLOWED", "only the engine proposes an item from a seam contract (the lead accepts the contract)");
+        }
+      }
       if (itemCount + 1 > BOARD_LIMITS.maxItems) {
         fail("LIMIT", `a board holds at most ${BOARD_LIMITS.maxItems} items`);
       }
@@ -2139,6 +2467,16 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       if (item.exhaustedBy?.includes(draft.from)) {
         fail("NOT_ALLOWED", `${draft.from} already spent item ${item.id}'s fix budget; it was reopened for another agent`);
       }
+      // A change to a shared seam goes first: an item covering the seam's
+      // importers waits (bounded) until the seam item's push is integrated.
+      const waits = seamWaits(state, item.id);
+      if (waits.length > 0) {
+        fail(
+          "SEAM_FIRST",
+          `item ${item.id} edits files that import a shared seam item ${waits.map((w) => `${w.item} changes (${w.seams.join(", ")})`).join("; ")}; ` +
+            "it waits for that change's integrated revision (bounded), then rebase and claim it",
+        );
+      }
       // The contract (the original code's existing tests and the gate's own
       // files) is never writable by an agent alone, however the claim is
       // phrased: any write entry that could name a protected path is refused,
@@ -2148,6 +2486,13 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       const locked = hit.filter((p) => !released.some((t) => entryWithin(p, t)));
       if (locked.length > 0) {
         const entries = overlappingEntries(write, locked);
+        const gate = locked.filter((p) => (state.immutable ?? []).includes(p));
+        if (gate.length > 0) {
+          fail(
+            "PROTECTED",
+            `write intent ${entries.join(", ")} overlaps the immutable acceptance gate (${gate.slice(0, 8).join(", ")}${gate.length > 8 ? ", ..." : ""}): it is never changed; narrow your write intent to the code under test (new test files outside the gate are fine)`,
+          );
+        }
         fail(
           "PROTECTED",
           `write intent ${entries.join(", ")} overlaps protected path(s) ${locked.slice(0, 8).join(", ")}${locked.length > 8 ? ", ..." : ""}: ` +
@@ -2444,6 +2789,42 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       if (draft.payload.item !== undefined) {
         requireItem(state, draft.payload.item);
       }
+      // The acceptance gate itself is never changed, by anyone: no contract route.
+      const immutableHit = (state.immutable ?? []).filter((p) => entriesOverlap(draft.payload.target, p));
+      if (immutableHit.length > 0) {
+        fail(
+          "IMMUTABLE",
+          `${draft.payload.target} is part of the immutable acceptance gate (${immutableHit.slice(0, 4).join(", ")}): it is never changed, not even with a human's approval; its failures are the goal, so change the code under test`,
+        );
+      }
+      const seam = seamTarget(state, draft.payload.target);
+      if (seam !== undefined && !state.protected.some((p) => entriesOverlap(draft.payload.target, p))) {
+        // A SEAM contract: a change to a shared seam no item owns, asked by the
+        // owner of an item that needs it; the lead decides.
+        if (draft.payload.item === undefined || draft.payload.description === undefined) {
+          fail("BAD_PAYLOAD", `a contract on the shared seam ${seam} names the item that needs it and describes the exact change (description)`);
+        }
+        const item = requireItem(state, draft.payload.item);
+        if (!((item.status === "claimed" || item.status === "split") && item.owner === draft.from)) {
+          fail("NOT_OWNER", `${draft.from} does not hold the claim on item ${item.id}: a seam contract comes from the owner of the item that needs it`);
+        }
+        const owner = seamOwner(state, seam);
+        if (owner !== undefined) {
+          fail(
+            "NOT_ALLOWED",
+            owner === item.id
+              ? `the seam ${seam} is in item ${item.id}'s own scope: change it there`
+              : `the seam ${seam} is in item ${owner}'s scope: ask its owner (a question or help request) instead of a contract`,
+          );
+        }
+        const pending = Object.values(state.contracts).find((c) => c.seam === seam && c.status === "proposed");
+        if (pending) {
+          fail("DUPLICATE", `contract ${pending.contract} on the seam ${seam} is already waiting for the lead's decision`);
+        }
+        if (seamItemId(draft.payload.contract).length > 128) {
+          fail("BAD_PAYLOAD", "a seam contract's id must leave room for its seam item's id (at most 123 characters)");
+        }
+      }
       if (state.protected.some((p) => entriesOverlap(draft.payload.target, p))) {
         // A contract change to the original tests or the gate's configuration:
         // bounded to one listed path, inside the item's own scope.
@@ -2458,8 +2839,14 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
           fail("NOT_ALLOWED", `${target} is not itself in the contract; name the protected path you need to change`);
         }
         const item = requireItem(state, draft.payload.item);
-        if (!item.scopeHint.some((hint) => entryWithin(target, hint))) {
-          fail("OUTSIDE_SCOPE", `${target} is outside item ${item.id}'s scope hint (${item.scopeHint.join(", ")})`);
+        // Inside the item's scope, or the failing check the latest failing
+        // revision implicating the item names (a protected test that pins the
+        // behavior the goal changes): still a human's decision.
+        if (!item.scopeHint.some((hint) => entryWithin(target, hint)) && !failingCheckNames(state, item.id, target)) {
+          fail(
+            "OUTSIDE_SCOPE",
+            `${target} is outside item ${item.id}'s scope hint (${item.scopeHint.join(", ")}) and is not the failing check of a revision implicating it`,
+          );
         }
         // A human said no for this item: asking again is only legitimate once
         // new evidence (a failing revision implicating the item) exists.
@@ -2561,7 +2948,9 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       if (item.tool) {
         fail("NOT_ALLOWED", `item ${item.id} builds a tool: announce its build with tool.built (a tool is gated by its own gate, never integrated)`);
       }
-      const write = item.intent?.write ?? [];
+      // A path a human released for this item by an accepted contract counts
+      // as inside its write intent (it may lie outside the scope: the failing check).
+      const write = [...(item.intent?.write ?? []), ...releasedTargets(state, item.id)];
       // Each announced path is a concrete file that must lie INSIDE the write
       // intent (a symbol-scoped entry covers its file), not merely touch it.
       const outside = draft.payload.paths.filter((p) => !write.some((w) => entryWithin(p, intentPath(w))));
@@ -2586,6 +2975,7 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         ...(draft.payload.failing !== undefined ? { failing: draft.payload.failing } : {}),
         ...(draft.payload.gated === false ? { gated: false as const } : {}),
         ...(draft.payload.unverified !== undefined ? { unverified: draft.payload.unverified } : {}),
+        ...(draft.payload.progress !== undefined ? { progress: draft.payload.progress } : {}),
       });
       if (!sameJson(expected, draft.payload)) {
         fail("LOG_MISMATCH", "integrated.rev does not match the pushes it claims to merge");
@@ -2910,6 +3300,16 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       if (message.payload.integrator !== undefined) {
         state.integrator = message.payload.integrator;
       }
+      if (message.payload.immutable !== undefined) {
+        state.immutable = [...message.payload.immutable];
+      }
+      if (message.payload.seams !== undefined) {
+        state.seams = message.payload.seams.map((seam) => ({
+          path: seam.path,
+          importers: [...seam.importers],
+          ...(seam.symbols !== undefined ? { symbols: [...seam.symbols] } : {}),
+        }));
+      }
       break;
     case "item.proposed":
       state.items[message.payload.item] = {
@@ -2923,6 +3323,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         children: [],
         doneProposed: false,
         ...(message.payload.fromTool !== undefined ? { fromTool: { ...message.payload.fromTool } } : {}),
+        ...(message.payload.fromContract !== undefined ? { fromContract: message.payload.fromContract } : {}),
       };
       break;
     case "item.discovered": {
@@ -3139,8 +3540,15 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         target: message.payload.target,
         kind: message.payload.kind,
         ...(message.payload.item !== undefined ? { item: message.payload.item } : {}),
-        ...(state.protected.some((p) => entriesOverlap(message.payload.target, p)) ? { guarded: true } : {}),
+        ...(state.protected.some((p) => entriesOverlap(message.payload.target, p))
+          ? { guarded: true }
+          : ((): { seam?: string } => {
+              const seam = seamTarget(state, message.payload.target);
+              return seam !== undefined ? { seam } : {};
+            })()),
+        ...(message.payload.description !== undefined ? { description: message.payload.description } : {}),
         proposedBy: from,
+        proposedSeq: message.seq,
         status: "proposed",
       };
       break;
@@ -3152,6 +3560,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       const contract = state.contracts[message.payload.contract]!;
       contract.status = message.type === "contract.accepted" ? "accepted" : "rejected";
       contract.decidedBy = from;
+      contract.decidedSeq = message.seq;
       if (message.type === "contract.rejected" && contract.guarded && contract.item !== undefined && state.items[contract.item]) {
         state.items[contract.item]!.contractRejectedSeq = message.seq;
       }
@@ -3699,6 +4108,28 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
       }
       break;
     }
+    case "contract.accepted": {
+      // An accepted SEAM contract becomes a seam item: open at once, it goes
+      // first (seam-first), and the items importing the seam rebase onto it.
+      const contract = work.contracts[incoming.payload.contract];
+      if (contract?.seam !== undefined && !work.items[seamItemId(contract.contract)]) {
+        emit({
+          from: BOARD_ENGINE,
+          type: "item.proposed",
+          payload: {
+            item: seamItemId(contract.contract),
+            objective: `Change the shared seam ${contract.seam} (${contract.kind}): ${contract.description ?? ""}`.slice(0, BOARD_LIMITS.maxObjective).trim(),
+            acceptance: [
+              `${contract.seam} provides the change described; every file importing it still compiles`,
+              ...(contract.item !== undefined ? [`item ${contract.item} can use it without undeclared fields or casts`] : []),
+            ],
+            scopeHint: [contract.seam],
+            fromContract: contract.contract,
+          },
+        });
+      }
+      break;
+    }
     case "done.proposed":
       completeIfReady(incoming.payload.item);
       break;
@@ -3824,7 +4255,11 @@ export function arbitrate(state: BoardState, incoming: BoardMessage): BoardDraft
   return arbitrateInPlace(cloneState(state), incoming);
 }
 
-/** rebase.needed for every active agent whose live intent meets the change. */
+/**
+ * rebase.needed for every active agent whose live intent meets the change, or
+ * imports a shared seam the change touched (dependents of a seam change rebase
+ * onto it).
+ */
 function rebaseTargets(state: BoardState, rev: BoardPayloads["integrated.rev"]): BoardDraft[] {
   const out: BoardDraft[] = [];
   for (const agent of Object.values(state.agents)) {
@@ -3837,7 +4272,11 @@ function rebaseTargets(state: BoardState, rev: BoardPayloads["integrated.rev"]):
         entries.push(...item.intent.read, ...item.intent.write);
       }
     }
-    const paths = rev.paths.filter((p) => entries.some((e) => entriesOverlap(p, e)));
+    const paths = rev.paths.filter(
+      (p) =>
+        entries.some((e) => entriesOverlap(p, e)) ||
+        (state.seams ?? []).some((seam) => seam.path === p && seam.importers.some((imp) => entries.some((e) => entriesOverlap(imp, e)))),
+    );
     if (paths.length > 0) {
       out.push({ from: BOARD_ENGINE, type: "rebase.needed", payload: { agent: agent.id, n: rev.n, paths } });
     }
@@ -3857,6 +4296,8 @@ export interface IntegratedRevInput {
   readonly gated?: false;
   /** Sub-lead merges the integrator could not verify in the gated tree (see integrated.rev). */
   readonly unverified?: readonly { readonly item: string; readonly reason: string }[];
+  /** Advisory progress parsed from the gate's output. */
+  readonly progress?: BoardRevProgress;
 }
 
 /**
@@ -3931,6 +4372,7 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
     ...(input.failing !== undefined ? { failing: { output: input.failing.output, items: [...input.failing.items] } } : {}),
     ...(input.gated === false ? { gated: false as const } : {}),
     ...(input.unverified !== undefined ? { unverified: input.unverified.map((u) => ({ ...u })) } : {}),
+    ...(input.progress !== undefined ? { progress: JSON.parse(JSON.stringify(input.progress)) as BoardRevProgress } : {}),
   };
 }
 
@@ -4074,7 +4516,7 @@ export function appendIntegratedRev(state: BoardState, input: unknown, at: strin
     fail("BAD_PAYLOAD", "an integration result must be an object {commit, gate, merged}");
   }
   for (const key of Object.keys(input)) {
-    if (!["commit", "gate", "merged", "failing", "gated", "unverified"].includes(key)) {
+    if (!["commit", "gate", "merged", "failing", "gated", "unverified", "progress"].includes(key)) {
       fail("BAD_PAYLOAD", `an integration result has an unknown field ${JSON.stringify(key)}`);
     }
   }
@@ -4086,6 +4528,7 @@ export function appendIntegratedRev(state: BoardState, input: unknown, at: strin
     ...(failing !== undefined ? { failing } : {}),
     ...(ungatedFlag(input) ? { gated: false as const } : {}),
     ...(input.unverified !== undefined ? { unverified: unverifiedMerges(input.unverified) } : {}),
+    ...(input.progress !== undefined ? { progress: revProgress(input.progress) } : {}),
   };
   if (state.goal === null) {
     fail("NO_GOAL", "the board has no goal yet");
@@ -4261,8 +4704,18 @@ export interface BoardDigest {
     readonly doneProposed: boolean;
     /** The item's latest push; `agent` differs from the claimant after a handoff. */
     readonly lastPush?: { readonly commit: string; readonly agent: string; readonly integratedIn?: number };
-    /** An unanswered fix request: the failing revision and the attempt number. */
-    readonly fix?: { readonly n: number; readonly attempt: number };
+    /**
+     * An unanswered fix request: revision `n` FAILED the gate and implicates
+     * this item. It is not done and not waiting for integration: the owner
+     * edits it (a done proposal does not complete it). `instruction` says so.
+     */
+    readonly fix?: { readonly n: number; readonly attempt: number; readonly instruction: string };
+    /** Seam-changing items this held item waits for before editing (bounded), then it rebases. */
+    readonly waitsFor?: readonly string[];
+    /** The failing check is in a protected path (the contract): propose a contract change if it pins old behavior. */
+    readonly contractCue?: { readonly paths: readonly string[]; readonly hint: string };
+    /** The failing type error involves a frozen shared seam: propose a seam contract with the exact change (the lead decides). */
+    readonly seamCue?: { readonly seams: readonly string[]; readonly errors: readonly string[]; readonly hint: string };
     /** The item's fix budget is spent. */
     readonly fixExhausted?: boolean;
     /**
@@ -4280,6 +4733,10 @@ export interface BoardDigest {
     readonly acceptance: readonly string[];
     readonly scopeHint: readonly string[];
     readonly parent?: string;
+    /** It changes a shared seam: take it first. */
+    readonly seam?: boolean;
+    /** Seam-changing items it waits for (claims are refused until their push is integrated, bounded). */
+    readonly waitsFor?: readonly string[];
   }[];
   readonly integrated: { readonly n: number; readonly commit: string } | null;
   /** The latest revision this agent was told to rebase onto, if any. */
@@ -4288,6 +4745,8 @@ export interface BoardDigest {
   readonly failure: ({ readonly n: number } & BoardFailingEvidence) | null;
   /** Paths no agent may write (posted with the goal). */
   readonly protected: readonly string[];
+  /** The immutable acceptance gate within `protected`: never contract-changeable. */
+  readonly immutable?: readonly string[];
   /** Gate-defining keys inside editable files (posted with the goal). */
   readonly protectedKeys: readonly string[];
   /** Protected paths accepted contracts released for this agent's items. */
@@ -4469,7 +4928,46 @@ export function boardDigest(
             },
           }
         : {}),
-      ...(i.fixRequested !== undefined ? { fix: { n: i.fixRequested, attempt: i.fixAttempts ?? 1 } } : {}),
+      ...(i.fixRequested !== undefined
+        ? {
+            fix: {
+              n: i.fixRequested,
+              attempt: i.fixAttempts ?? 1,
+              instruction:
+                `revision ${i.fixRequested} FAILED the gate and implicates this item (fix attempt ${i.fixAttempts ?? 1} of ${state.rules.maxFixAttempts}): ` +
+                "edit it now to make the gate pass (digest.failure has the output). Your done proposal does not complete it, and you are not waiting for integration",
+            },
+          }
+        : {}),
+      ...((): { waitsFor?: string[] } => {
+        const waits = seamWaits(state, i.id).map((w) => w.item);
+        return waits.length > 0 ? { waitsFor: waits } : {};
+      })(),
+      ...((): { contractCue?: { paths: string[]; hint: string } } => {
+        const paths = i.fixRequested !== undefined ? contractCue(state, i.id).filter((p) => !releasedTargets(state, i.id).includes(p)) : [];
+        return paths.length > 0
+          ? {
+              contractCue: {
+                paths,
+                hint: `the failing check is in the protected test ${paths.join(", ")}; if it encodes the old behavior the goal changes, propose contract.proposed {target: ${paths[0]}, kind: modify, item: ${i.id}} (a human decides)`,
+              },
+            }
+          : {};
+      })(),
+      ...((): { seamCue?: { seams: string[]; errors: string[]; hint: string } } => {
+        const cue = i.fixRequested !== undefined ? seamContractCue(state, i.id) : undefined;
+        return cue
+          ? {
+              seamCue: {
+                seams: [...cue.seams],
+                errors: [...cue.errors],
+                hint:
+                  `the failing type error involves the shared seam ${cue.seams.join(", ")}, which no item owns: do not use undeclared fields or casts; ` +
+                  `propose contract.proposed {target: ${cue.seams[0]}, kind: modify, item: ${i.id}, description: the exact change you need} (the lead decides; accepted, it becomes a seam item that goes first, then you rebase onto it)`,
+              },
+            }
+          : {};
+      })(),
       ...(i.fixExhausted ? { fixExhausted: true } : {}),
       ...((): { toolUnavailable?: { capability: string; reason: string }[] } => {
         const unavailable = i.tool ? [] : unavailableToolsFor(state, i.intent!.write);
@@ -4491,11 +4989,17 @@ export function boardDigest(
         acceptance: i.acceptance,
         scopeHint: i.scopeHint,
         ...(i.parent !== undefined ? { parent: i.parent } : {}),
+        ...(isSeamItem(state, i.id) ? { seam: true } : {}),
+        ...((): { waitsFor?: string[] } => {
+          const waits = seamWaits(state, i.id).map((w) => w.item);
+          return waits.length > 0 ? { waitsFor: waits } : {};
+        })(),
       })),
     integrated: state.integrated ? { n: state.integrated.n, commit: state.integrated.commit } : null,
     rebaseTo: record?.rebaseTo ?? null,
     failure: askedToFix ? failure : null,
     protected: state.protected,
+    ...((state.immutable ?? []).length > 0 ? { immutable: state.immutable } : {}),
     protectedKeys: state.protectedKeys,
     released: [...new Set(held.flatMap((i) => releasedTargets(state, i.id)))],
     ...((): Pick<BoardDigest, "subLead"> => {
@@ -4551,7 +5055,8 @@ export function boardDigest(
         const failureLine =
           report?.lastFailure ??
           (fixing && state.lastFailure?.n === i.fixRequested
-            ? (state.lastFailure!.output.split("\n").find((l) => l.trim() !== "") ?? "").slice(0, 200)
+            ? // Skip command echoes (npm's "> pkg@1.0.0 gate", "$ cmd") and npm noise.
+              (state.lastFailure!.output.split("\n").find((l) => l.trim() !== "" && !/^\s*[>$] /.test(l) && !/^\s*npm (error|ERR!)/.test(l)) ?? "").slice(0, 200)
             : undefined);
         return {
           item: i.id,
@@ -4924,4 +5429,23 @@ export function objectiveSubChanges(objective: string): number {
 export function splitCue(files: number, objective: string): { readonly splittable: boolean; readonly files: number; readonly subChanges: number } {
   const subChanges = objectiveSubChanges(objective);
   return { splittable: files >= 3 || subChanges >= 2, files, subChanges };
+}
+
+/**
+ * Files a failing revision points at that NO item covers (no accepted item's
+ * scope or write intent, in any status, and no undecided proposal): work the
+ * plan missed. Protected paths and tool directories are never proposed. Pure.
+ */
+export function uncoveredFailureFiles(state: BoardState, failingFiles: readonly string[]): string[] {
+  const covers = (entries: readonly string[], file: string) => entries.some((e) => entryWithin(file, intentPath(e)));
+  return failingFiles
+    .filter((file) => !file.startsWith(`${TOOLS_DIR}/`))
+    .filter((file) => !state.protected.some((p) => p === file || entryWithin(file, p)))
+    .filter(
+      (file) =>
+        !Object.values(state.items).some(
+          (i) => i.status !== "rejected" && i.tool === undefined && (covers(i.scopeHint, file) || covers(i.intent?.write ?? [], file)),
+        ),
+    )
+    .sort();
 }

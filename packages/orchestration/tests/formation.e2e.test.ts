@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 import { reduceBoard, type BoardMessage } from "@switchyard-change/change-core";
+import type { ExecutorContext } from "@switchyard-change/model-adapters";
 
 import { assertBoardBacked, buildBoardGraph } from "../src/board-graph.ts";
 import { runBoardOffline } from "../src/run-board-offline.ts";
@@ -127,37 +128,66 @@ describe("formation on the demo-board inputs (offline, deterministic)", () => {
     expect(graph.edges.filter((e) => e.label === "merged").map((e) => e.to)).toEqual(expect.arrayContaining([`item:${parent}`]));
   });
 
-  it("a struggling owner's cue brings volunteers: one is granted a scope, forks, delivers, and is pulled; the other is declined; bounded", async () => {
-    const result = await demo("audit-logging.goal.txt", "examples/demo-project");
-    const log = result.log;
-    const offers = of(log, "help.volunteered");
-    expect(offers.length).toBeGreaterThan(0);
-    const owner = offers[0]!.to![0]!;
-    const item = offers[0]!.payload.item;
-    const report = of(log, "item.struggling").find((m) => m.payload.item === item && m.from === owner && m.seq < offers[0]!.seq)!;
-    expect(report).toBeDefined();
-    // The grant answering a volunteer is addressed to it; it forks, delivers, the owner pulls.
-    const grant = of(log, "help.requested").find((m) => m.payload.item === item && m.from === owner && m.payload.scope !== undefined && m.seq > report.seq)!;
-    const volunteer = grant.to![0]!;
-    expect(offers.map((o) => o.from)).toContain(volunteer);
-    const fork = of(log, "help.offered").find((m) => m.payload.request === grant.payload.request && m.payload.forkOf === owner)!;
-    expect(fork.from).toBe(volunteer);
-    expect(of(log, "help.delivered").some((m) => m.payload.request === grant.payload.request && m.from === volunteer)).toBe(true);
-    expect(of(log, "push.announced").some((m) => m.from === owner && (m.payload.pulled ?? []).includes(grant.payload.request))).toBe(true);
-    // Every other volunteer on the item is declined; nothing storms.
-    for (const other of offers.filter((o) => o.from !== volunteer && o.payload.item === item)) {
-      expect(of(log, "help.declined").some((m) => m.payload.volunteer === other.from && m.payload.item === item)).toBe(true);
+  it("a struggling owner's cue brings a volunteer: granted a scope, it forks, delivers, and is pulled; bounded", async () => {
+    const { mkdtemp, mkdir, writeFile } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const { dirname } = await import("node:path");
+    const { ScopedNoopExecutor } = await import("@switchyard-change/model-adapters");
+    const dir = await mkdtemp(join(tmpdir(), "scf-volunteer-"));
+    for (const [rel, body] of Object.entries({
+      "package.json": '{"name":"p","type":"module","scripts":{}}\n',
+      "src/api/handler.ts": "export const handler = 1;\n",
+      "src/api/extra.ts": "export const extra = 1;\n",
+      "src/core/a.ts": "export const a = 1;\n",
+    })) {
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      await writeFile(join(dir, rel), body);
     }
-    const perKey = new Map<string, number>();
-    for (const o of offers) perKey.set(`${o.from}:${o.payload.item}`, (perKey.get(`${o.from}:${o.payload.item}`) ?? 0) + 1);
-    expect(Math.max(...perKey.values())).toBeLessThanOrEqual(2);
-    const reports = new Map<string, number>();
-    for (const r of of(log, "item.struggling")) reports.set(`${r.from}:${r.payload.item}`, (reports.get(`${r.from}:${r.payload.item}`) ?? 0) + 1);
-    expect(Math.max(...reports.values())).toBeLessThanOrEqual(3);
-    expect(result.state.items[item]).toMatchObject({ status: "done" });
-    expect(result.verdict).toBe("verified");
-    const graph = buildBoardGraph(log, report.seq);
-    expect(graph.nodes.find((n) => n.id === `item:${item}`)!.detail).toMatchObject({ kind: "item", struggling: { reason: report.payload.reason } });
+    // The owner's first two edits of "api" fail (the executor returns no edit): it struggles.
+    const inner = new ScopedNoopExecutor();
+    let apiCalls = 0;
+    const executor = {
+      name: "flaky",
+      async execute(context: ExecutorContext) {
+        if (context.workUnitId === "api" && apiCalls++ < 2) {
+          throw new Error("the model returned no usable edit");
+        }
+        return inner.execute(context);
+      },
+    };
+    const result = await runBoardOffline({
+      goal: "report status",
+      projectDir: dir,
+      resolveContract: reject,
+      executor,
+      seed: async () => ({
+        source: "planner",
+        model: "fake",
+        items: [
+          { item: "core", objective: "report status from core", acceptance: ["gate passes"], scopeHint: ["src/core/**"] },
+          { item: "api", objective: "report status from the api", acceptance: ["gate passes"], scopeHint: ["src/api/**"] },
+        ],
+      }),
+    });
+    const log = result.log;
+    const report = of(log, "item.struggling").find((m) => m.payload.item === "api" && m.payload.reason === "failed-edits")!;
+    expect(report).toBeDefined();
+    const offer = of(log, "help.volunteered").find((m) => m.payload.item === "api" && m.seq > report.seq)!;
+    expect(offer.to).toEqual([report.from]);
+    const grant = of(log, "help.requested").find((m) => m.payload.item === "api" && (m.to ?? []).includes(offer.from))!;
+    expect(grant.payload.scope).toEqual(["src/api/handler.ts"]);
+    const fork = of(log, "help.offered").find((m) => m.payload.request === grant.payload.request && m.payload.forkOf === report.from)!;
+    expect(fork.from).toBe(offer.from);
+    expect(of(log, "help.delivered").some((m) => m.payload.request === grant.payload.request)).toBe(true);
+    expect(of(log, "push.announced").some((m) => (m.payload.pulled ?? []).includes(grant.payload.request))).toBe(true);
+    // Bounded: at most 2 offers per agent and item, 3 reports per owner and item.
+    const offers = new Map<string, number>();
+    for (const o of of(log, "help.volunteered")) offers.set(`${o.from}:${o.payload.item}`, (offers.get(`${o.from}:${o.payload.item}`) ?? 0) + 1);
+    expect(Math.max(...offers.values())).toBeLessThanOrEqual(2);
+    expect(of(log, "item.struggling").filter((r) => r.payload.item === "api").length).toBeLessThanOrEqual(3);
+    expect(result.state.items.api).toMatchObject({ status: "done" });
+    expect(formatBoardRunSummary(result)).toMatch(/volunteer \S+ on api .*granted src\/api\/handler\.ts/);
+    expect(reduceBoard(log)).toEqual(result.state);
   });
 
   it("is deterministic: the formation run repeats byte for byte", async () => {

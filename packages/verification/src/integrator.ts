@@ -37,7 +37,7 @@ import {
   type GitIdentity,
 } from "./git.ts";
 import { matchesAny } from "./pathscope.ts";
-import { inventoryShortfall, readStreamInventory, type TestInventory } from "./test-inventory.ts";
+import { inventoryShortfall, readStreamInventory, readTestProgress, type TestInventory } from "./test-inventory.ts";
 import type { CheckResult, IntegrationResult, OutputRef, Verdict } from "./types.ts";
 
 /** One verified WorkUnit's workspace to feed into integration. */
@@ -519,6 +519,11 @@ export class Integrator {
               (shortfall !== undefined ? `; also, test inventory: ${shortfall}` : "")
             : `integration app-gate exited 0 but did not run its tests: test inventory: ${shortfall}`,
         outputs,
+        // Advisory progress from the FULL output (the captured outputs are bounded).
+        ...((): { progress?: ReturnType<typeof readTestProgress> } => {
+          const progress = readTestProgress(`${outcome.stdout}\n${outcome.stderr}`);
+          return progress ? { progress } : {};
+        })(),
       };
     }
     if (requiresGate) {

@@ -37,7 +37,7 @@
  * demo, tests); `concurrent` runs each agent's own loop (live runs).
  */
 
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -63,9 +63,14 @@ import {
   isAcceptedItem,
   isChangeItem,
   toolUnavailableReason,
+  isSeamItem,
+  deriveCohesionBlueprint,
   type BoardMessage,
   type BoardRules,
   type BoardState,
+  type BoardRevProgress,
+  describeProgress,
+  progressHeadline,
   type Change,
   type ConcurrencyDial,
 } from "@switchyard-change/change-core";
@@ -90,11 +95,14 @@ import {
   recordBaselineInventory,
   GATED_REF_PREFIX,
   matchesGlob,
+  labelGateProgress,
+  readTestProgress,
   type CommandRunner as VerificationCommandRunner,
   type CompletedWorkUnit,
   type EvidenceSummary,
 } from "@switchyard-change/verification";
 
+import { scanRepoSnapshot } from "./scan-repo.ts";
 import { BoardAgent, RunTurnBudget, type AgentStop, type AgentTurnRecord, type BoardSeedItem } from "./board-agent.ts";
 import {
   CloudBoardIntegrator,
@@ -157,6 +165,8 @@ export interface BoardSeed {
   readonly items: readonly BoardSeedItem[];
   /** The planner's plan-review decision (or its failure), when a decision model reviewed the plan. */
   readonly review?: { readonly question: string; readonly noul: string; readonly confidence: number; readonly accepted: boolean; readonly error?: string };
+  /** Reviews of earlier plans of the pass that were not chosen (each recorded too, before the final one). */
+  readonly priorReviews?: readonly { readonly question: string; readonly noul: string; readonly confidence: number; readonly accepted: boolean; readonly error?: string; readonly model: string; readonly units: readonly string[] }[];
   /** How the plan was made ("planner", "heuristic-fallback", or "heuristic"). */
   readonly source: string;
   readonly model?: string;
@@ -191,7 +201,9 @@ export interface BoardRunBudgets {
 /** A progress event of a board run. */
 export type BoardRunEvent =
   | { readonly kind: "change-created"; readonly changeId: string }
-  | { readonly kind: "goal-posted"; readonly protected: readonly string[]; readonly testInventory: string }
+  | { readonly kind: "goal-posted"; readonly protected: readonly string[]; readonly immutable?: readonly string[]; readonly testInventory: string }
+  /** The effective budgets for this run, after scaling with the plan size (explicit flags win). */
+  | { readonly kind: "budgets"; readonly items: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean }
   | { readonly kind: "contract-decision"; readonly contract: string; readonly decision: string; readonly path?: string }
   | { readonly kind: "contract-awaiting-human"; readonly contract: string; readonly escalationId: string; readonly path?: string; readonly recommendation?: string }
   /** The advisory triage of a protected contract, recorded before the human is asked. */
@@ -246,6 +258,8 @@ export interface BoardRevision {
   readonly failure?: string;
   /** Set when accepted contract changes relaxed the test inventory for this revision. */
   readonly inventoryNote?: string;
+  /** ADVISORY: how many of the gate's checks passed on this revision (never a verdict). */
+  readonly progress?: BoardRevProgress;
   /** Items whose fix request the board sent (or whose fix budget it recorded as spent). */
   readonly fixRequested?: readonly string[];
   readonly fixExhausted?: readonly string[];
@@ -274,6 +288,18 @@ export interface RunBoardOptions {
   readonly workerUrl: string;
   readonly fetchFn?: typeof fetch;
   readonly dial: ConcurrencyDial;
+  /**
+   * Scale the dial's max with the plan size (min(items, 6), at least the dial's
+   * min) instead of using `dial.maxConcurrency` as given: set when the operator
+   * did not pass an explicit max.
+   */
+  readonly scaleDial?: boolean;
+  /**
+   * The project's declared gate command, used to derive the contract (the
+   * immutable acceptance gate) when the run's gate is something else (the
+   * offline fixture). Takes precedence over `appGateCommand` for the contract.
+   */
+  readonly contractGateCommand?: readonly string[];
   readonly transport: AgentTurnTransport<BoardDigest, BoardMessage>;
   /** The lead's first turn: the planner's decomposition. */
   readonly seed: (goal: string) => Promise<BoardSeed>;
@@ -377,6 +403,8 @@ export interface RunBoardResult {
   readonly seed: BoardSeed;
   /** The protected set posted with the goal. */
   readonly protected: readonly string[];
+  /** The immutable acceptance gate within it (never contract-changeable). */
+  readonly immutable?: readonly string[];
   /** The gate-defining keys posted with the goal (restored by the integrator). */
   readonly protectedKeys: readonly string[];
   /** Every integrated revision recorded on the board, in order. */
@@ -421,6 +449,10 @@ export interface RunBoardResult {
   /** The run's whole scratch directory when it is wider than `workRoot` (the offline run's control repos too). */
   readonly scratchRoot?: string;
   readonly cleanedUp: readonly string[];
+  /** The effective budgets (scaled with the plan unless explicit). */
+  readonly budgets?: { readonly items: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean };
+  /** The model each pushed app edit used (the strongest for complex items). */
+  readonly editModels?: readonly { readonly agent: string; readonly item: string; readonly commit: string; readonly model: string; readonly why?: string }[];
   /** Every tool gate the run's bench ran and recorded, in order. */
   readonly toolGates?: readonly ToolGateRecord[];
   /** The tool author's label (when the run set one). */
@@ -952,10 +984,18 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     workRoot: options.worktreeRoot,
     scrub,
   });
+  // ADVISORY progress: how many of the gate's checks passed (never a verdict).
+  // Read from the gate's full output (the check's own progress), else the bounded
+  // captured output; each suite is labeled against the immutable acceptance gate.
+  const finalCheck = evidence.integration.finalCheck;
+  const progress = gated
+    ? labelGateProgress(finalCheck.progress ?? readTestProgress(finalCheck.outputs.map((o) => o.text).join("\n")), state.immutable ?? [])
+    : undefined;
   const recorded = await options.operator.recordRevision({
     commit,
     gate,
     merged,
+    ...(progress ? { progress } : {}),
     ...(failing ? { failing } : {}),
     ...(gated ? {} : { gated: false as const }),
     ...(unverified.length > 0 ? { unverified } : {}),
@@ -996,6 +1036,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     excludedItems: pending.filter((i) => !mergedItems.includes(i)).map((i) => i.id),
     excludedAgents,
     completedItems: recorded.appended.flatMap((m) => (m.type === "item.completed" ? [m.payload.item] : [])),
+    ...(progress ? { progress } : {}),
     ...(implicated ? { implicated } : {}),
     ...(gate === "fail" ? { failure: scrub(revisionFailure(evidence.integration.finalCheck)) } : {}),
     ...(adjusted.relaxed !== undefined ? { inventoryNote: adjusted.relaxed } : {}),
@@ -1283,7 +1324,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
 
   // 1. The planning-first Change, then the goal (with the contract and the
   //    baseline gate's test inventory), posted by the human.
-  const guarded = await deriveProtectedPaths(options.projectDir, options.appGateCommand);
+  // The contract (and its immutable acceptance gate) comes from the project's
+  // DECLARED gate, even when an offline fixture stands in for running it.
+  const guarded = await deriveProtectedPaths(options.projectDir, options.contractGateCommand ?? options.appGateCommand);
   const cloud = options.integrator === "cloud";
   // The integration workspace: seeded from the project baseline; only gated,
   // passing, RECORDED revisions ever advance its branch. With the cloud
@@ -1344,12 +1387,42 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       attribution: options.jev ? "driver" : "engine",
     });
   }
+  // Plan BEFORE the goal is posted: the fix budget the goal records, and the
+  // dial, scale with the plan size (explicit values always win).
+  let planned: BoardSeed;
+  try {
+    planned = await options.seed(objective);
+  } catch (error) {
+    await failPlanningChange({
+      workerUrl: base,
+      changeId,
+      reason: scrub(`planning failed: ${error instanceof Error ? error.message : String(error)}`),
+      fetchFn: rawFetch,
+    }).catch(() => false);
+    if (cloudWorkspace) {
+      await withWorkerAuth(rawFetch)(`${base}/workspaces/${encodeURIComponent(cloudWorkspace.workspaceName)}`, { method: "DELETE" }).catch(() => undefined);
+    }
+    throw error;
+  }
+  const seams = await sharedSeams(options.projectDir);
+  const effective = scaledBudgets({
+    items: planned.items.length,
+    explicitFixAttempts: options.rules?.maxFixAttempts ?? options.budgets?.maxFixAttemptsPerItem,
+    dial: options.dial,
+    scaleDial: options.scaleDial === true,
+  });
+  const dial: ConcurrencyDial = { minConcurrency: options.dial.minConcurrency, maxConcurrency: effective.dialMax };
+  emit({ kind: "budgets", items: planned.items.length, ...effective });
   const goal = await operator.postAsHuman({
     type: "goal.posted",
     payload: {
       objective,
-      rules: { ...(options.rules ?? {}), maxFixAttempts: options.rules?.maxFixAttempts ?? budgets.maxFixAttemptsPerItem },
+      rules: { ...(options.rules ?? {}), maxFixAttempts: effective.maxFixAttempts },
       protected: guarded.paths,
+      // The immutable acceptance gate: never contract-changeable.
+      ...(guarded.immutable.length > 0 ? { immutable: guarded.immutable } : {}),
+      // The shared seams (from the cohesion blueprint) and their importers: seam changes go first.
+      ...(seams.length > 0 ? { seams } : {}),
       // Recorded with the goal: the board refuses splits under the cloud integrator.
       ...(cloud ? { integrator: "cloud" } : {}),
       ...(guarded.keyLabels.length > 0 ? { protectedKeys: guarded.keyLabels } : {}),
@@ -1367,7 +1440,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   if (!goal.ok) {
     throw new Error(`the board refused the goal (${goal.code}): ${goal.error}`);
   }
-  emit({ kind: "goal-posted", protected: guarded.paths, testInventory: inventoryLabel });
+  emit({ kind: "goal-posted", protected: guarded.paths, immutable: guarded.immutable, testInventory: inventoryLabel });
 
   const turns: AgentTurnRecord[] = [];
   const runBudget = new RunTurnBudget(budgets.maxRunTurns);
@@ -1554,8 +1627,18 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       ...(role === "lead"
         ? {
             seed: async () => {
-              seed = await options.seed(objective);
+              // Planned before the goal was posted (the budgets scale with it).
+              seed = planned;
               emit({ kind: "seeded", source: seed.source, ...(seed.model ? { model: seed.model } : {}), items: seed.items.length });
+              for (const prior of seed.priorReviews ?? []) {
+                await recordDecision({
+                  juncture: "plan-review",
+                  question: `${prior.question} (an earlier plan by ${prior.model}: ${prior.units.join(", ")}; not chosen)`,
+                  ...(prior.error === undefined ? { answer: prior.noul, confidence: prior.confidence } : {}),
+                  accepted: prior.accepted,
+                  ...(prior.error !== undefined ? { error: prior.error } : {}),
+                });
+              }
               if (seed.review) {
                 await recordDecision({
                   juncture: "plan-review",
@@ -1773,7 +1856,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       // (a helper recruited for one forks the requester's repo).
       const helpWanted = Object.values(state.help).filter((h) => h.scope !== undefined && h.grant === undefined && helpGrantLive(state, h)).length;
       const open = Object.values(state.items).filter((i) => i.status === "open").length + helpWanted;
-      while (workers.length < options.dial.maxConcurrency && (inFlight() < options.dial.minConcurrency || open > inFlight())) {
+      while (workers.length < dial.maxConcurrency && (inFlight() < dial.minConcurrency || open > inFlight())) {
         const worker = makeAgent(`agent-${workers.length + 1}`, "worker");
         await worker.join(open > 0 ? `${open} open item(s) outnumber the ${inFlight()} agent(s) in flight` : "the dial's minimum");
         workers.push(worker);
@@ -1880,8 +1963,17 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         for (const worker of workers.slice(before)) {
           // Tool builders first: an owner whose unpushed work a codemod being
           // built covers waits (bounded by toolHoldMs from when it was first held).
-          const hold = () => {
-            if (!latestState || !toolHold(latestState, worker.id)) {
+          const hold = async () => {
+            // Judged on the board as it is NOW, not the driver's last poll: a
+            // poll that lags (a loaded machine) must not let an owner that just
+            // claimed a covered item past the hold. Read only while a codemod
+            // is still unpublished (otherwise nothing can hold).
+            const building =
+              latestState !== undefined &&
+              Object.values(latestState.tools.proposed).some(
+                (t) => t.kind === "codemod" && !latestState!.tools.published.some((p) => p.capability === t.capability),
+              );
+            if (!building || !toolHold((await operator.page(0, 1)).state, worker.id)) {
               return false;
             }
             const since = heldSince.get(worker.id) ?? Date.now();
@@ -2092,6 +2184,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     })),
     seed: seed ?? { items: [], source: "none" },
     protected: guarded.paths,
+    immutable: guarded.immutable,
     protectedKeys: guarded.keyLabels,
     revisions: [...integrator.revisions],
     ...(last ? { revision: last } : {}),
@@ -2110,6 +2203,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     workRoot,
     cleanedUp,
     toolGates: [...toolBench.gates],
+    editModels: workers.flatMap((w) => w.editModels.map((e) => ({ agent: w.id, ...e }))),
+    budgets: { items: planned.items.length, ...effective },
     ...(options.toolAuthorLabel !== undefined ? { toolAuthorLabel: options.toolAuthorLabel } : {}),
   };
 }
@@ -2154,6 +2249,60 @@ export function toolHold(state: BoardState, agent: string): boolean {
 }
 
 /**
+ * The shared seams of a modular project (the cohesion blueprint's frozen
+ * contracts) and the source files that import each, bounded, for the board's
+ * seam-first sequencing. Empty for a project that is not clearly modular.
+ */
+export async function sharedSeams(projectDir: string): Promise<{ path: string; importers: string[]; symbols?: string[] }[]> {
+  const snapshot = await scanRepoSnapshot(projectDir).catch(() => undefined);
+  const blueprint = snapshot ? deriveCohesionBlueprint(snapshot) : undefined;
+  if (!snapshot || !blueprint) {
+    return [];
+  }
+  return Promise.all(
+    blueprint.contracts.slice(0, 64).map(async (c) => {
+      const symbols = exportedNames(await readFile(join(projectDir, c.path), "utf8").catch(() => ""));
+      return {
+        path: c.path,
+        importers: snapshot.sourceFiles.filter((f) => f.importsFiles.includes(c.path) && f.path !== c.path).map((f) => f.path).sort().slice(0, 256),
+        ...(symbols.length > 0 ? { symbols } : {}),
+      };
+    }),
+  );
+}
+
+/** The names a module exports (declarations and `export { a, b as c }`), bounded: a type error naming one points at it. */
+export function exportedNames(source: string): string[] {
+  const names = new Set<string>();
+  for (const m of source.matchAll(/^\s*export\s+(?:declare\s+)?(?:default\s+)?(?:abstract\s+)?(?:async\s+)?(?:interface|type|class|enum|const|let|var|function\*?|namespace)\s+([A-Za-z_$][\w$]*)/gm)) {
+    names.add(m[1]!);
+  }
+  for (const m of source.matchAll(/^\s*export\s+(?:type\s+)?\{([^}]*)\}/gm)) {
+    for (const part of m[1]!.split(",")) {
+      const name = /(?:^|\sas\s+)([A-Za-z_$][\w$]*)\s*$/.exec(part.trim().replace(/^type\s+/, ""))?.[1];
+      if (name) names.add(name);
+    }
+  }
+  return [...names].filter((n) => n.length <= 80).slice(0, 64);
+}
+
+/**
+ * Budgets that scale with the plan (bounded): fix attempts per item are
+ * 3 + floor(items / 5), at most 6; the dial's max, when scaled, is
+ * min(items, 6) and at least the dial's min. An explicit value always wins.
+ */
+export function scaledBudgets(input: {
+  readonly items: number;
+  readonly explicitFixAttempts?: number;
+  readonly dial: ConcurrencyDial;
+  readonly scaleDial: boolean;
+}): { readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean } {
+  const fix = input.explicitFixAttempts ?? Math.min(6, 3 + Math.floor(input.items / 5));
+  const dialMax = input.scaleDial ? Math.max(input.dial.minConcurrency, Math.min(Math.max(1, input.items), 6)) : input.dial.maxConcurrency;
+  return { maxFixAttempts: fix, fixAttemptsScaled: input.explicitFixAttempts === undefined, dialMax, dialScaled: input.scaleDial };
+}
+
+/**
  * The lockstep order of the workers in a round: agents building a tool that is
  * not published yet go FIRST (schedule priority), so a tool the lead seeded is
  * published before the owners of the items it covers edit by hand; the rest
@@ -2164,7 +2313,14 @@ export function toolHold(state: BoardState, agent: string): boolean {
 export function lockstepOrder<A extends { readonly id: string }>(workers: readonly A[], state: BoardState): A[] {
   const building = new Set(
     Object.values(state.items)
-      .filter((i) => i.tool !== undefined && i.status === "claimed" && i.owner !== undefined && !state.tools.published.some((t) => t.capability === i.tool!.capability))
+      .filter(
+        (i) =>
+          i.status === "claimed" &&
+          i.owner !== undefined &&
+          // A tool still being built, or a shared seam change not yet integrated: these go first.
+          ((i.tool !== undefined && !state.tools.published.some((t) => t.capability === i.tool!.capability)) ||
+            (i.tool === undefined && isSeamItem(state, i.id) && i.lastPush?.integratedIn === undefined)),
+      )
       .map((i) => i.owner!),
   );
   return [...workers.filter((w) => building.has(w.id)), ...workers.filter((w) => !building.has(w.id))];
@@ -2186,8 +2342,22 @@ export function boardSeedFromChange(change: Change): BoardSeed {
     scopeHint: [...unit.paths],
   }));
   const review = change.plan?.jevReview;
+  const priorReviews = change.plan?.priorReviews ?? [];
   return {
     items,
+    ...(priorReviews.length > 0
+      ? {
+          priorReviews: priorReviews.map((r) => ({
+            question: r.question,
+            noul: r.noul,
+            confidence: r.confidence,
+            accepted: r.accepted,
+            ...(r.error !== undefined ? { error: r.error } : {}),
+            model: r.model,
+            units: [...r.units],
+          })),
+        }
+      : {}),
     source: change.plan?.source ?? "heuristic",
     ...(change.plan?.model ? { model: change.plan.model } : {}),
     ...(review
@@ -2221,7 +2391,7 @@ function payloadSummary(m: BoardMessage): string {
       return "";
     case "item.proposed": {
       const from = p.fromTool as { capability: string; version: string } | undefined;
-      return `${String(p.item)}: ${String(p.objective).slice(0, 70)} [scope ${list(p.scopeHint)}]${from ? ` (from ${from.capability}@${from.version} findings)` : ""}`;
+      return `${String(p.item)}: ${String(p.objective).slice(0, 70)} [scope ${list(p.scopeHint)}]${from ? ` (from ${from.capability}@${from.version} findings)` : ""}${p.fromContract ? ` (seam item of accepted contract ${String(p.fromContract)})` : ""}`;
     }
     case "tool.proposed":
       return `${String(p.kind)} ${String(p.capability)} -> item tool-${String(p.capability)}${(p.inputs as string[]).length > 0 ? ` [inputs ${list(p.inputs)}]` : ""}`;
@@ -2302,14 +2472,17 @@ function payloadSummary(m: BoardMessage): string {
       // The most telling line of the failing output: a failing test line when
       // there is one, else the first line.
       const lines = failing ? failing.output.split("\n").map((l) => l.trim()).filter((l) => l !== "") : [];
-      const firstLine = firstLines(lines.find((l) => /^not ok\b|\bFAIL|\u2716/.test(l)) ?? lines[0] ?? "", 300);
+      const firstLine = firstLines(
+        gateFailureLine(failing?.output ?? "") ?? lines.find((l) => /^not ok\b|\bFAIL|\u2716/.test(l)) ?? lines.find((l) => !/^[>$] /.test(l)) ?? lines[0] ?? "",
+        300,
+      );
       return (
         `rev ${String(p.n)} ${p.gated === false ? "no gate: nothing checked" : `gate ${String(p.gate)}`} commit ${String(p.commit).slice(0, 10)} merged ${(p.merged as string[]).length} push(es) from ${list(p.contributors)}` +
         (failing ? `; implicated ${failing.items.join(", ") || "none"}: "${firstLine}"` : "")
       );
     }
     case "contract.proposed":
-      return `${String(p.contract)}: ${String(p.kind)} ${String(p.target)}${p.item ? ` for item ${String(p.item)}` : ""}`;
+      return `${String(p.contract)}: ${String(p.kind)} ${String(p.target)}${p.item ? ` for item ${String(p.item)}` : ""}${p.description ? `: ${String(p.description).slice(0, 160)}` : ""}`;
     case "contract.escalated":
       return `${String(p.contract)}: ${String(p.kind)} ${String(p.target)} for item ${String(p.item)} waits for a human decision`;
     case "contract.accepted":
@@ -2536,19 +2709,41 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     `  agents: ${result.agents.map((a) => `${a.id}${a.role === "lead" ? " (lead)" : ""}${a.stop ? ` [stopped: ${a.stop.detail}]` : ""}`).join(", ")}`,
     `  turns: ${result.turns.length} (${waits} wait(s), ${invalid} invalid model output(s), ${rejected.length} refused action(s))`,
     `  agent phase ended: ${result.stopReason}${result.stopDetail ? ` (${result.stopDetail})` : ""}`,
+    ...(result.budgets
+      ? [
+          `  budgets: ${result.budgets.maxFixAttempts} fix attempt(s) per item (${result.budgets.fixAttemptsScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"}), dial max ${result.budgets.dialMax} (${result.budgets.dialScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"})`,
+        ]
+      : []),
     ...(result.gateLabel !== undefined ? [`  gate: ${result.gateLabel}`] : []),
     `  baseline gate inventory: ${result.testInventory}`,
-    `  contract (existing tests and gate configuration; changing one needs an accepted contract): ${result.protected.join(", ") || "none"}`,
+    `  immutable acceptance gate (never changed by any agent, no contract route): ${(result.immutable ?? []).join(", ") || "none"}`,
+    `  contract-changeable developer tests and configs (changing one needs a human-accepted contract): ${result.protected.filter((p) => !(result.immutable ?? []).includes(p)).join(", ") || "none"}`,
     ...(result.protectedKeys.length > 0 ? [`  contract keys (restored before every gate run): ${result.protectedKeys.join(", ")}`] : []),
   ];
   for (const r of rejected) {
     lines.push(`    refused: ${r.agent} turn ${r.turn} ${r.action.type}: ${r.code} ${r.error ?? ""}`.trimEnd());
   }
   if (result.revisions.length > 0) {
-    for (const rev of result.revisions) {
+    let previous: { passed: number; acceptance: boolean } | undefined;
+    for (let rev of result.revisions) {
       lines.push(
         `  integrated revision ${rev.n}: ${rev.gated ? `gate ${rev.gate}` : "no gate: nothing checked"}, commit ${rev.commit.slice(0, 12)}, merged ${rev.merged.length} push(es) (items ${rev.integratedItems.join(", ") || "none"})`,
       );
+      // From the board (both integrators record it there), else the local record.
+      const recordedProgress = result.log.find((m) => m.type === "integrated.rev" && m.payload.n === rev.n);
+      const progressOf = recordedProgress?.type === "integrated.rev" ? (recordedProgress.payload.progress ?? rev.progress) : rev.progress;
+      if (progressOf) {
+        rev = { ...rev, progress: progressOf };
+      }
+      if (rev.progress) {
+        const headline = progressHeadline(rev.progress);
+        const delta =
+          headline === undefined || previous === undefined || previous.acceptance !== headline.acceptance
+            ? ""
+            : ` (${headline.passed - previous.passed >= 0 ? "+" : ""}${headline.passed - previous.passed})`;
+        lines.push(`    rev ${rev.n}: ${describeProgress(rev.progress)}${delta} (advisory; the gate decides)`);
+        previous = headline ?? previous;
+      }
       if (rev.install) {
         lines.push(`    dependency install: ${formatDependencyInstall(rev.install)}`);
       }
@@ -2590,6 +2785,15 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     );
   }
   lines.push(...formatFormation(result.log, result.state));
+  if ((result.editModels ?? []).length > 0) {
+    const counts = new Map<string, number>();
+    for (const e of result.editModels ?? []) counts.set(e.model, (counts.get(e.model) ?? 0) + 1);
+    const strongest = (result.editModels ?? []).filter((e) => e.why !== undefined && e.model !== "base");
+    lines.push(
+      `  edit models: ${[...counts].map(([m, n]) => `${m} x${n}`).join(", ")}` +
+        (strongest.length > 0 ? `; strongest for complex items: ${[...new Set(strongest.map((e) => `${e.item} (${e.why})`))].join(", ")}` : ""),
+    );
+  }
   const forks = result.cleanedUp.filter((name) => name.includes("--help-"));
   if (result.cleanedUp.length > 0) {
     lines.push(`  repos archived at cleanup: ${result.cleanedUp.length}${forks.length > 0 ? ` (help fork(s): ${forks.join(", ")})` : ""}`);

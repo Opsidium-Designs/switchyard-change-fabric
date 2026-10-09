@@ -102,8 +102,8 @@ work:
  * A three-unit change where EVERY unit needs the escalation model (no
  * always-passing unit), so the round-1 change-level fail names all three files
  * and the single retry re-fans all three units at once. Used to prove the
- * re-fan runs with BOUNDED CONCURRENCY: with a dial max of 3 and an artificial
- * executor delay, all three re-fan calls overlap (peak in-flight = 3), where a
+ * re-fan runs with BOUNDED CONCURRENCY: with a dial max of 3 and an executor
+ * overlap barrier, all three re-fan calls overlap (peak in-flight = 3), where a
  * strictly sequential loop would peak at 1. Each unit's declared path is its own
  * marker file so attribution maps every failing file to its owning unit.
  */
@@ -400,6 +400,8 @@ async function runLadder(options: {
   readonly maxConcurrency?: number;
   /** An artificial per-execute delay so a re-fan can overlap observably. */
   readonly executorDelayMs?: number;
+  /** Escalation calls wait until this many are in flight at once (deterministic overlap; see ModelAwareExecutor). */
+  readonly executorOverlap?: number;
   /** Observe the per-attempt objective each execute received (prompt rotation). */
   readonly onObjective?: (record: {
     readonly unitId: string;
@@ -528,6 +530,7 @@ async function runLadder(options: {
   const executor = new ModelAwareExecutor({
     baseModel: BASE_MODEL,
     ...(options.executorDelayMs ? { delayMs: options.executorDelayMs } : {}),
+    ...(options.executorOverlap ? { overlapBarrier: { count: options.executorOverlap, timeoutMs: 20_000 } } : {}),
     ...(options.onObjective ? { onObjective: options.onObjective } : {}),
   });
 
@@ -979,7 +982,7 @@ describe("T10b: the retry round is a VISIBLE second wave (re-fan edges + per-uni
 
   it("re-fans the implicated units with BOUNDED CONCURRENCY up to the dial cap, not strictly one-after-another", async () => {
     // Three units all need escalation, so the single retry re-fans all three.
-    // With a dial max of 3 and an artificial per-execute delay, a bounded-
+    // With a dial max of 3 and an overlap barrier in the executor, a bounded-
     // concurrency re-fan overlaps all three calls (peak in-flight = 3), while a
     // strictly sequential loop would peak at 1.
     const { snapshot, executor, result } = await runLadder({
@@ -988,7 +991,9 @@ describe("T10b: the retry round is a VISIBLE second wave (re-fan edges + per-uni
       changeId: "change-ladder-three",
       subdir: "concurrent",
       maxConcurrency: 3,
-      executorDelayMs: 25,
+      // Deterministic overlap: each re-fan call waits until 3 are in flight at
+      // once (a sequential loop never gets there), not a timing window.
+      executorOverlap: 3,
     });
 
     // All three units were re-fanned in the single retry round.
@@ -1017,7 +1022,7 @@ describe("T10b: the retry round is a VISIBLE second wave (re-fan edges + per-uni
       changeId: "change-ladder-three",
       subdir: "capped",
       maxConcurrency: 2,
-      executorDelayMs: 25,
+      executorOverlap: 2,
     });
     expect(executor.maxInFlight).toBe(2);
     expect([...result.evidence.integration.integratedUnits].sort()).toEqual(["one", "three", "two"]);

@@ -31,6 +31,7 @@ import {
   planBoardIntegration,
   narrowToSplitChildren,
   type BoardMessage,
+  type BoardRevProgress,
   type BoardState,
 } from "@switchyard-change/change-core";
 import {
@@ -46,6 +47,7 @@ import {
   type TestInventory,
 } from "@switchyard-change/verification/integrate-job";
 
+import { labelGateProgress, readTestProgress } from "@switchyard-change/verification/test-inventory";
 import { DEFAULT_REGISTRY_HOST } from "./integration-egress.ts";
 import type { DrivenPhase } from "./integration-driver.ts";
 
@@ -345,6 +347,7 @@ export type CloudRevisionDecision =
         readonly gate: "pass" | "fail";
         readonly merged: readonly string[];
         readonly unverified?: readonly { readonly item: string; readonly reason: string }[];
+        readonly progress?: BoardRevProgress;
         readonly failing?: { readonly output: string; readonly items: readonly string[] };
         readonly gated?: false;
       };
@@ -402,13 +405,22 @@ export function decideCloudRevision(plan: CloudJobPlan, result: IntegrateJobResu
       : [];
   });
   const withUnverified = unverified.length > 0 ? { unverified } : {};
+  // ADVISORY progress from the gate's own output (never a verdict).
+  // The check's own progress (read from the gate's full output) when the job
+  // carried it, else the bounded captured output; labeled against the immutable gate.
+  const gateCheck = result.evidence.integration.finalCheck;
+  const parsedProgress =
+    result.gated === false
+      ? undefined
+      : labelGateProgress(gateCheck.progress ?? readTestProgress((gateCheck.outputs ?? []).map((o) => o.text).join("\n")), stateNow.immutable ?? []);
+  const withProgress = parsedProgress ? { progress: parsedProgress } : {};
   const integratedItems = mergedItems.map((i) => i.item);
   const excludedItems = plan.items.filter((i) => !mergedAgents.has(i.agent)).map((i) => i.item);
   const check = result.evidence.integration.finalCheck;
   if (result.gate === "pass") {
     return {
       kind: "record",
-      input: { commit: result.commit, gate: "pass", merged, ...(result.gated === false ? { gated: false as const } : {}), ...withUnverified },
+      input: { commit: result.commit, gate: "pass", merged, ...(result.gated === false ? { gated: false as const } : {}), ...withUnverified, ...withProgress },
       integratedItems,
       excludedItems,
       excludedAgents,
@@ -433,7 +445,7 @@ export function decideCloudRevision(plan: CloudJobPlan, result: IntegrateJobResu
   const source: AttributionSource = combined.source;
   return {
     kind: "record",
-    input: { commit: result.commit, gate: "fail", merged, failing: { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: ordered }, ...withUnverified },
+    input: { commit: result.commit, gate: "fail", merged, failing: { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: ordered }, ...withUnverified, ...withProgress },
     integratedItems,
     excludedItems,
     excludedAgents,

@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 
-import { attributeFailure, combineAttribution } from "../src/index.ts";
+import { attributeFailure, combineAttribution, failingRepoFiles } from "../src/index.ts";
 
 const merged = ["u-a", "u-b", "u-c", "u-d", "u-e", "u-f"];
 
@@ -34,5 +34,33 @@ describe("combineAttribution", () => {
     expect(
       combineAttribution({ merged, parsed: parse.attributed ? parse.units.map((u) => u.unitId) : [], attributed: parse.attributed, picks: ["u-e"] }),
     ).toEqual({ items: ["u-e"], source: "jev" });
+  });
+});
+
+describe("type-checker locations", () => {
+  const tscOutput = [
+    "> storefront@0.0.0 gate",
+    "> tsc --noEmit && vitest run && vitest run --config gate/vitest.config.ts",
+    "",
+    "src/orders/cart.ts(44,12): error TS2339: Property 'user' does not exist on type 'Ctx'.",
+    "src/billing/invoices.ts(99,30): error TS2339: Property 'auth' does not exist on type 'Ctx'.",
+  ].join("\n");
+
+  it("parses tsc's `path(line,col): error TSxxxx` form (repo-relative) into the implicated owners", () => {
+    const units = [
+      { unitId: "orders", paths: ["src/orders/cart.ts"] },
+      { unitId: "invoices", paths: ["src/billing/invoices.ts"] },
+      { unitId: "payments", paths: ["src/billing/payments.ts"] },
+    ];
+    const result = attributeFailure(units, tscOutput);
+    expect(result.attributed).toBe(true);
+    expect(result.units.map((u) => u.unitId).sort()).toEqual(["invoices", "orders"]);
+  });
+
+  it("names the failing repo files for a type error", () => {
+    expect(failingRepoFiles(tscOutput, ["src/orders/cart.ts", "src/billing/invoices.ts", "src/contracts/http.ts"]).sort()).toEqual([
+      "src/billing/invoices.ts",
+      "src/orders/cart.ts",
+    ]);
   });
 });

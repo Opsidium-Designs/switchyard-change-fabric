@@ -526,6 +526,50 @@ describe("JUNCTURE (a) PLAN REVIEW: accept-when-confident / escalate-when-unsure
     expect(result.change.work.length).toBeGreaterThan(0);
   });
 
+  it("re-plans ONCE with the reviewer's doubt as feedback, proceeds with the better-reviewed plan, and keeps both decisions", async () => {
+    const asked: { model: string; feedback: boolean }[] = [];
+    const plan: PlanTransport = async (input) => {
+      const last = input.messages.at(-1)!;
+      asked.push({ model: input.model, feedback: /reviewer was not confident/.test(last.content) });
+      return GOOD_PLAN;
+    };
+    let reviews = 0;
+    const jev = async () => {
+      reviews += 1;
+      return { "plan-review": { type: "noul" as const, noul: "yes" as const, confidence: reviews === 1 ? 0.69 : 0.9 } };
+    };
+    const result = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      planner: { plan, baseModel: "gpt-5", jev, jevThreshold: 0.75 },
+      changeId: "change-service-jev-replan",
+    });
+    // The single-model ladder was spent, so the re-plan ran on the same model, with the doubt.
+    expect(asked).toEqual([
+      { model: "gpt-5", feedback: false },
+      { model: "gpt-5", feedback: true },
+    ]);
+    expect(result.change.plan?.jevReview).toMatchObject({ accepted: true, confidence: 0.9 });
+    expect(result.change.plan?.priorReviews).toMatchObject([{ accepted: false, confidence: 0.69, model: "gpt-5" }]);
+    // The board seed carries both decisions (the earlier one is recorded first).
+    const { boardSeedFromChange } = await import("../src/run-board.ts");
+    const seed = boardSeedFromChange(result.change);
+    expect(seed.priorReviews).toMatchObject([{ accepted: false, confidence: 0.69, model: "gpt-5" }]);
+    expect(seed.review).toMatchObject({ accepted: true, confidence: 0.9 });
+    // Bounded: a second unconvincing review does not re-plan again.
+    asked.length = 0;
+    const always = async () => ({ "plan-review": { type: "noul" as const, noul: "yes" as const, confidence: 0.5 } });
+    const stuck = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      planner: { plan, baseModel: "gpt-5", jev: always, jevThreshold: 0.75 },
+      changeId: "change-service-jev-replan-2",
+    });
+    expect(asked).toHaveLength(2);
+    expect(stuck.change.plan?.jevReview?.accepted).toBe(false);
+    expect(stuck.change.plan?.priorReviews).toHaveLength(1);
+  });
+
   it("records a failed decision call on the plan (never silent) and proceeds unreviewed", async () => {
     const result = await decomposeGoal({
       goal: "Add input validation and require auth on every resource",

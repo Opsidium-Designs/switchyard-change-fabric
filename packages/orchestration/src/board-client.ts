@@ -12,6 +12,7 @@
  */
 
 import type {
+  BoardRevProgress,
   BoardDigest,
   BoardMessage,
   BoardPayloads,
@@ -196,6 +197,8 @@ export class BoardOperatorClient {
     readonly failing?: { readonly output: string; readonly items: readonly string[] };
     /** False when no gate ran (a pass that checked nothing). */
     readonly gated?: false;
+    /** Advisory progress parsed from the gate output. */
+    readonly progress?: BoardRevProgress;
     /** Sub-lead merges the integrator could not verify in the gated tree. */
     readonly unverified?: readonly { readonly item: string; readonly reason: string }[];
   }): Promise<BoardPostOutcome> {

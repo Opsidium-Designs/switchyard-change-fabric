@@ -236,3 +236,204 @@ export function inventoryAfterContracts(
     relaxed: `accepted contract change(s) to ${targets.join(", ")}: the ${baseline.format} inventory cannot be adjusted per file, so revisions use the gate's exit code`,
   };
 }
+
+/** One runner summary in a gate run: its counts and the test files it listed. */
+export interface TestSuiteProgress {
+  readonly passed: number;
+  readonly failed: number;
+  /** passed + failed (skipped and todo excluded). */
+  readonly total: number;
+  /** The test files this suite's report named (repo-relative as the runner printed them; bounded). */
+  readonly files?: readonly string[];
+}
+
+/** How many of the gate's checks passed in one run (advisory progress; never a verdict). */
+export interface TestProgress {
+  /** The runner shape; absent when no runner summary was found (only `typeErrors` or `unfinished`). */
+  readonly format?: TestInventory["format"];
+  readonly passed: number;
+  readonly failed: number;
+  /** passed + failed (skipped and todo excluded). */
+  readonly total: number;
+  /** Per suite, in run order, when the gate ran several (one summary each) or a suite listed its files. */
+  readonly suites?: readonly TestSuiteProgress[];
+  /** Type-checker errors the run printed (`path(l,c): error TS2339: ...`): a typecheck step failed. */
+  readonly typeErrors?: number;
+  /** Test files a suite listed after the last summary: it started but its summary is missing. */
+  readonly unfinished?: readonly string[];
+  /** The captured output was cut short (the bounded evidence), so later summaries may be missing. */
+  readonly truncated?: boolean;
+}
+
+/** The most suites and files per suite a progress record keeps. */
+const MAX_PROGRESS_SUITES = 16;
+const MAX_SUITE_FILES = 40;
+/** A test-file path token, as runners print them (`tests/a.test.ts`, `gate/b.spec.js`, `tests/test_x.py`). */
+const TEST_FILE_TOKEN =
+  /(?:^|[\s"'(:])((?:[A-Za-z0-9_.@-]+\/)*(?:[A-Za-z0-9_.-]+\.(?:test|spec)\.[cm]?[jt]sx?|test_[A-Za-z0-9_]+\.py|[A-Za-z0-9_]+_test\.(?:py|go)))\b/g;
+
+function filesIn(text: string): string[] {
+  const out = new Set<string>();
+  for (const m of text.matchAll(TEST_FILE_TOKEN)) {
+    const file = m[1]!.replace(/^\.\//, "");
+    if (!file.startsWith("/") && !file.split("/").includes("..")) {
+      out.add(file);
+    }
+    if (out.size >= MAX_SUITE_FILES) {
+      break;
+    }
+  }
+  return [...out];
+}
+
+/**
+ * Read how many tests passed and failed from a gate run's output, in the same
+ * runner shapes as the inventory (node --test spec and TAP, vitest, jest,
+ * pytest, go). A run with several runner summaries (a gate that runs two
+ * suites, `vitest run && vitest run --config gate/...`) is split per summary:
+ * each suite keeps its own counts and the test files its report named (the
+ * text between the previous summary and its own), so a caller can tell the
+ * acceptance suite from a developer suite. Type-checker errors are counted
+ * (a typecheck step that failed stops a `&&` gate before any suite runs).
+ * Undefined when nothing is recognized. ADVISORY: it measures progress between
+ * revisions and never decides a verdict (the gate's exit code and inventory do).
+ */
+export function readTestProgress(output: string): TestProgress | undefined {
+  const num = (re: RegExp, text: string) => Number(re.exec(text)?.[1] ?? 0);
+  const typeErrors = [...output.matchAll(/\(\d+,\d+\): error TS\d+:|^\s*error TS\d+:/gm)].length;
+  const truncated = /\.\.\.\[truncated \d+ chars\]/.test(output);
+  const extras = { ...(typeErrors > 0 ? { typeErrors } : {}), ...(truncated ? { truncated } : {}) };
+  /** Summaries at their offsets: each suite's text runs from the previous summary's end. */
+  const bySummary = (format: NonNullable<TestProgress["format"]>, matches: { index: number; end: number; passed: number; failed: number }[]): TestProgress | undefined => {
+    if (matches.length === 0) {
+      return undefined;
+    }
+    let from = 0;
+    const suites: TestSuiteProgress[] = matches.slice(0, MAX_PROGRESS_SUITES).map((m) => {
+      const files = filesIn(output.slice(from, m.index));
+      from = m.end;
+      return { passed: m.passed, failed: m.failed, total: m.passed + m.failed, ...(files.length > 0 ? { files } : {}) };
+    });
+    const unfinished = filesIn(output.slice(from));
+    const passed = suites.reduce((n, s) => n + s.passed, 0);
+    const failed = suites.reduce((n, s) => n + s.failed, 0);
+    const listed = suites.length > 1 || suites.some((s) => s.files !== undefined);
+    return {
+      format,
+      passed,
+      failed,
+      total: passed + failed,
+      ...(listed ? { suites } : {}),
+      ...extras,
+      ...(unfinished.length > 0 ? { unfinished } : {}),
+    };
+  };
+  const at = (re: RegExp, counts: (m: RegExpMatchArray) => { passed: number; failed: number }) =>
+    [...output.matchAll(re)].map((m) => ({ index: m.index!, end: m.index! + m[0].length, ...counts(m) }));
+  const vitest = at(/^\s*Tests\s+(.*)\((\d+)\)\s*$/gm, (m) => ({ passed: num(/(\d+) passed/, m[1]!), failed: num(/(\d+) failed/, m[1]!) }));
+  if (vitest.length > 0) {
+    return bySummary("vitest", vitest);
+  }
+  const jest = at(/^\s*Tests:\s+(.*?)(\d+) total\s*$/gm, (m) => ({ passed: num(/(\d+) passed/, m[1]!), failed: num(/(\d+) failed/, m[1]!) }));
+  if (jest.length > 0) {
+    return bySummary("jest", jest);
+  }
+  const nodePass = at(/^\s*ℹ pass (\d+)\s*$/gm, (m) => ({ passed: Number(m[1]), failed: 0 }));
+  if (nodePass.length > 0) {
+    const nodeFail = [...output.matchAll(/^\s*ℹ fail (\d+)\s*$/gm)];
+    return bySummary("node-spec", nodePass.map((m, i) => ({ ...m, failed: Number(nodeFail[i]?.[1] ?? 0) })));
+  }
+  const pytest = at(/(?:^|=\s)((?:\d+ (?:passed|failed|errors?|skipped|xfailed|xpassed|deselected|warnings?)(?:, )?)+) in [\d.]+s/gm, (m) => ({
+    passed: num(/(\d+) passed/, m[1]!),
+    failed: num(/(\d+) failed/, m[1]!) + num(/(\d+) errors?/, m[1]!),
+  }));
+  if (pytest.length > 0) {
+    return bySummary("pytest", pytest);
+  }
+  const goPass = [...output.matchAll(/^\s*--- PASS: /gm)].length;
+  const goFail = [...output.matchAll(/^\s*--- FAIL: /gm)].length;
+  if (goPass + goFail > 0) {
+    return { format: "go-verbose", passed: goPass, failed: goFail, total: goPass + goFail, ...extras };
+  }
+  let ok = 0;
+  let notOk = 0;
+  for (const line of output.split(/\r?\n/)) {
+    const m = /^\s*(not )?ok \d+\b/i.exec(line);
+    if (m && !/#\s*(SKIP|TODO)\b/i.test(line)) {
+      if (m[1]) notOk += 1;
+      else ok += 1;
+    }
+  }
+  if (ok + notOk > 0) {
+    return { format: "tap", passed: ok, failed: notOk, total: ok + notOk, ...extras };
+  }
+  const unfinished = filesIn(output);
+  return typeErrors > 0 ? { passed: 0, failed: 0, total: 0, ...extras, ...(unfinished.length > 0 ? { unfinished } : {}) } : undefined;
+}
+
+/** A revision's advisory progress as the board records it (counts per suite, the acceptance suite labeled). */
+export interface GateProgress {
+  readonly passed: number;
+  readonly failed: number;
+  readonly total: number;
+  readonly suites?: readonly { readonly passed: number; readonly failed: number; readonly total: number; readonly suite?: "acceptance" | "developer" }[];
+  /** The acceptance suite's own counts (the suites whose files are in the immutable acceptance gate). */
+  readonly acceptance?: { readonly passed: number; readonly failed: number; readonly total: number };
+  /** Why the acceptance suite has no count on this run (`typecheck failed (2 errors)`): an earlier step stopped the gate. */
+  readonly acceptanceNotRun?: string;
+}
+
+/**
+ * Label a run's progress against the immutable acceptance gate: a suite whose
+ * listed files include an acceptance file is the ACCEPTANCE suite, one that
+ * listed only other test files is a DEVELOPER suite, and one that listed none
+ * stays unlabeled. When the acceptance gate is known and no suite of the run is
+ * (or may be) the acceptance suite, the reason is stated instead of a number:
+ * a typecheck that failed, a developer suite that failed first (a `&&` gate
+ * stops there), or a summary the bounded output did not capture. Undefined
+ * when there is nothing to report. ADVISORY only.
+ */
+export function labelGateProgress(progress: TestProgress | undefined, acceptanceFiles: readonly string[]): GateProgress | undefined {
+  if (progress === undefined) {
+    return undefined;
+  }
+  const acceptance = new Set(acceptanceFiles);
+  const known = acceptance.size > 0;
+  const raw = progress.suites ?? (progress.total > 0 ? [{ passed: progress.passed, failed: progress.failed, total: progress.total }] : []);
+  const suites = raw.slice(0, MAX_PROGRESS_SUITES).map((s) => {
+    const files = s.files ?? [];
+    const suite: "acceptance" | "developer" | undefined =
+      !known || files.length === 0 ? undefined : files.some((f) => acceptance.has(f)) ? "acceptance" : "developer";
+    return { passed: s.passed, failed: s.failed, total: s.total, ...(suite ? { suite } : {}) };
+  });
+  const accepted = suites.filter((s) => s.suite === "acceptance");
+  const sum = (list: readonly { passed: number; failed: number }[]) => {
+    const passed = list.reduce((n, s) => n + s.passed, 0);
+    const failed = list.reduce((n, s) => n + s.failed, 0);
+    return { passed, failed, total: passed + failed };
+  };
+  const base = {
+    passed: progress.passed,
+    failed: progress.failed,
+    total: progress.total,
+    ...(suites.length > 1 || suites.some((s) => s.suite !== undefined) ? { suites } : {}),
+  };
+  if (accepted.length > 0) {
+    return { ...base, acceptance: sum(accepted) };
+  }
+  // An unlabeled suite may be the acceptance suite: say nothing more.
+  if (!known || suites.some((s) => s.suite === undefined)) {
+    return progress.total > 0 ? base : undefined;
+  }
+  const developerFailed = suites.filter((s) => s.failed > 0).reduce((n, s) => n + s.failed, 0);
+  const unfinishedAcceptance = (progress.unfinished ?? []).some((f) => acceptance.has(f));
+  const reason =
+    progress.typeErrors !== undefined && progress.typeErrors > 0
+      ? `typecheck failed (${progress.typeErrors} error${progress.typeErrors === 1 ? "" : "s"})`
+      : developerFailed > 0
+        ? `the developer suite failed first (${developerFailed} failed)`
+        : unfinishedAcceptance || progress.truncated
+          ? "its summary was not captured (the gate output was cut short)"
+          : "no acceptance suite summary in the gate output";
+  return { ...base, acceptanceNotRun: reason };
+}

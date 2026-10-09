@@ -89,7 +89,13 @@ idempotent). `make infra-status` is read-only ("am I paying for anything?").
    console shows it at once.
 2. **Plan.** The LLM planner (schema-constrained JSON through AI Gateway)
    decomposes the goal into single-writer work units against frozen shared
-   contracts, and Jev records an advisory plan-review decision. A live goal run
+   contracts. Its structural map lists every feature group of a modular repo
+   (each directory of sibling modules with the seams it shares), so a goal
+   spanning several domains is planned across all of them. Jev records an
+   advisory plan-review decision; when it is not confident the plan covers the
+   goal, the planner re-plans once with that doubt as feedback (on the next
+   model of the ladder) and the better-reviewed plan proceeds, both decisions
+   recorded. A live goal run
    without the planner fails unless `--allow-heuristic-planner` is passed (with
    a loud banner). If every model in the planner ladder fails, the run falls
    back to the heuristic plan with a loud banner and an amber planner node.

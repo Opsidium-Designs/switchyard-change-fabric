@@ -31,7 +31,7 @@ import type { ExecutionResult, ExecutorContext, ExecutorProvider } from "@switch
 import { runBoardOffline } from "../src/run-board-offline.ts";
 import { createGenericBoardPolicy } from "../src/board-policy.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
-import { codemodTiming, formatBoardRunSummary, formatBoardTranscript, runBoard, type BoardSeed } from "../src/run-board.ts";
+import { codemodTiming, formatBoardRunSummary, formatBoardTranscript, runBoard, type BoardRunEvent, type BoardSeed } from "../src/run-board.ts";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 import type { AgentTurnTransport } from "@switchyard-change/model-adapters";
 import type { BoardDigest } from "@switchyard-change/change-core";
@@ -595,7 +595,7 @@ describe("agents build tools for each other (offline, deterministic)", () => {
 });
 
 describe("tool rebuilds and builder priority in the concurrent (live) schedule", () => {
-  async function concurrentRun(id: string, toolAuthor: ToolAuthor) {
+  async function concurrentRun(id: string, toolAuthor: ToolAuthor, onEvent?: (event: BoardRunEvent) => void) {
     const projectDir = await project();
     const root = await mkdtemp(join(tmpdir(), `scf-${id}-`));
     const control = new LocalChangeControl(new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "repos") }));
@@ -614,6 +614,7 @@ describe("tool rebuilds and builder priority in the concurrent (live) schedule",
       workRoot: join(root, "work"),
       toolAuthor,
       resolveContract: reject,
+      ...(onEvent ? { onEvent } : {}),
     });
   }
 
@@ -647,16 +648,36 @@ describe("tool rebuilds and builder priority in the concurrent (live) schedule",
   }, 120_000);
 
   it("concurrent: owners whose items a codemod being built covers are held so the builder moves first, and the codemod is used before hand edits", async () => {
+    // A barrier, not a timer: the codemod's build finishes only once two
+    // owners (not its builder) have claimed planned items it covers, so they
+    // are held while it is built however slow the machine is. A generous
+    // fallback keeps a regression from hanging the suite.
+    const claimed = new Set<string>();
+    let release: () => void = () => undefined;
+    const ownersClaimed = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const onEvent = (event: BoardRunEvent) => {
+      if (event.kind === "turn" && event.record.outcome === "posted" && event.record.action.type === "claim" && /^guard-/.test(event.record.action.itemId)) {
+        claimed.add(event.record.agent);
+        if (claimed.size >= 2) release();
+      }
+    };
     const slow: ToolAuthor = async (request) => {
       if (request.kind === "codemod") {
-        await new Promise((resolve) => setTimeout(resolve, 1500));
+        await Promise.race([ownersClaimed, new Promise((resolve) => setTimeout(resolve, 30_000))]);
       }
       return templateToolAuthor(request);
     };
-    const result = await concurrentRun("change-tool-hold", slow);
+    const result = await concurrentRun("change-tool-hold", slow, onEvent);
+    expect(claimed.size).toBeGreaterThanOrEqual(2);
     const timing = codemodTiming(result.log, result.state).find((t) => t.capability === "codemod-guard")!;
     expect(timing.early.length).toBeGreaterThanOrEqual(2);
-    expect(timing.handFirst).toEqual([]);
+    // The PLANNED items the codemod covers: none was edited by hand first.
+    // (A scanner run on a not-yet-rebased tree may re-find a file another
+    // item already fixed; such follow-up items depend on timing, so they are
+    // not part of this ordering claim.)
+    expect(timing.handFirst.filter((i) => /^guard-/.test(i))).toEqual([]);
     // The planned items all completed (later scanner-found work depends on timing).
     expect(["guard-a", "guard-b", "guard-c"].every((i) => result.state.items[i]?.status === "done")).toBe(true);
   }, 120_000);

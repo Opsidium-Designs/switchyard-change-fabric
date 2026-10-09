@@ -1038,6 +1038,8 @@ const commands: Command[] = [
           projectDir,
           ...(optionValue(args, "--id") ? { changeId: optionValue(args, "--id")! } : {}),
           dial,
+          // No explicit --max: the dial's max scales with the plan size.
+          ...(optionValue(args, "--max") === undefined ? { scaleDial: true } : {}),
           budgets,
           // The fixture replaces the declared gate entirely (offline only).
           ...(fixtureGate ? {} : gateOptions),
@@ -1105,6 +1107,8 @@ const commands: Command[] = [
         changeId,
         workerUrl,
         dial,
+        // No explicit --max: the dial's max scales with the plan size.
+        ...(optionValue(args, "--max") === undefined ? { scaleDial: true } : {}),
         transport: turn.transport,
         executor: selected.executor,
         ...(selected.escalationModels.length > 0 ? { escalationModels: selected.escalationModels } : {}),
@@ -1143,8 +1147,14 @@ const commands: Command[] = [
             case "change-created":
               console.log(`Change ${event.changeId} created.`);
               break;
+            case "budgets":
+              console.log(
+                `  budgets: ${event.maxFixAttempts} fix attempt(s) per item (${event.fixAttemptsScaled ? `scaled with ${event.items} planned item(s)` : "explicit"}), dial max ${event.dialMax} (${event.dialScaled ? `scaled with ${event.items} planned item(s)` : "explicit"})`,
+              );
+              break;
             case "goal-posted":
-              console.log(`  goal posted; contract (existing tests, gate configuration): ${event.protected.join(", ")}`);
+              console.log(`  goal posted; immutable acceptance gate (never changed): ${(event.immutable ?? []).join(", ") || "none"}`);
+              console.log(`  contract-changeable developer tests and configs (a human decides): ${event.protected.filter((p) => !(event.immutable ?? []).includes(p)).join(", ") || "none"}`);
               console.log(`  baseline gate inventory: ${event.testInventory}`);
               break;
             case "contract-awaiting-human":

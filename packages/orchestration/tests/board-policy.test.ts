@@ -241,3 +241,15 @@ describe("formation cues in the generic policy (volunteer, answer, wait once for
     expect((await policy(base("w1", cue, [{ turn: 1, action: first.action, outcome: "local" }]))).action).toMatchObject({ type: "edit", itemId: "pair" });
   });
 });
+
+describe("the contract cue in the generic policy", () => {
+  it("proposes a contract for the protected failing check once, then keeps fixing", async () => {
+    const claim = { item: "tax", objective: "o", intent: { read: [], write: ["src/tax.ts"] }, doneProposed: true, fix: { n: 1, attempt: 1 }, contractCue: { paths: ["tests/tax.test.ts"], hint: "h" } };
+    const base = input("w1", "worker", {});
+    const at = (decisions: Input["capsule"]["decisions"]) =>
+      policy({ ...base, capsule: { ...base.capsule, decisions }, digest: { ...(base.digest as unknown as Record<string, unknown>), claims: [claim] } as unknown as BoardDigest });
+    const first = await at([]);
+    expect(first.action).toMatchObject({ type: "message", kind: "contract", payload: { target: "tests/tax.test.ts", change: "modify", itemId: "tax" } });
+    expect((await at([{ turn: 1, action: first.action, outcome: "posted" }])).action).toMatchObject({ type: "edit", itemId: "tax" });
+  });
+});

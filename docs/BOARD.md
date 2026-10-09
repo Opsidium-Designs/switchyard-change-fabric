@@ -191,7 +191,27 @@ need no acceptance from the lead.
    (`CONTRACT_REJECTED`, with the reason) until a failing revision implicating
    the item has been recorded since. Contracts on other paths stay the lead's
    to decide. A split child must stay within its parent's scope
-   hint (and within its owner's write intent). New test files are never protected.
+   hint (and within its owner's write intent). A protected contract may also
+   name the protected path that the latest failing revision implicating the
+   item names as its failing check (the CONTRACT CUE: a test that pins the
+   behavior the goal changes); the owner's digest says so
+   (`claims[].contractCue`), and once a human accepts it the released path is
+   writable for that item even outside its scope (its pushes may carry it and
+   its integration unit applies it). New test files are never protected.
+   TWO CLASSES: the IMMUTABLE acceptance gate (`goal.posted.immutable`: the
+   files the declared gate command runs or references by name, the test
+   files and runner configs in those gate directories, the harness they
+   import, the toolchain files the gate invokes, every config a gate step
+   reads (a step that runs vitest, jest, mocha, ava, or playwright without an
+   explicit config flag reads that runner's root config, so it is immutable;
+   `tsconfig*.json` when a step runs tsc), and the package-manager and
+   runner configs protected even when absent) is never changed by any agent:
+   a contract on it is refused (`IMMUTABLE`) whatever a human would answer,
+   the integrator always restores it, and the contract cue never points at
+   it (its failures ARE the goal). The rest of the protected set, the
+   project's pre-existing developer TEST FILES (and configs no gate step
+   reads), stays contract-changeable with a human's approval. The run summary and the CLI
+   print both classes.
 1. A claim whose write intent overlaps no other agent's live claim is granted.
    An agent's own claims never contest each other (it is one writer).
 2. An overlapping write intent opens a contest naming the earliest-granted
@@ -401,6 +421,64 @@ is distributed changes: items are proposed and claimed, never assigned.
   point lies inside the grant, merges it into the requester's own repo (a
   fast-forward when nothing else moved), pushes, and announces with `pulled`.
   An owner's own edits never touch files it granted while the grant is live.
+- Acceptance progress (advisory): each integrated revision records how many
+  of the gate's checks passed, per suite (`integrated.rev.progress {passed,
+  failed, total, suites?[{..., suite?}], acceptance?, acceptanceNotRun?}`).
+  The gate check reads it from its FULL output (`CheckResult.progress`; the
+  captured evidence is bounded and can cut a later suite's summary), split
+  per runner summary with the test files each suite listed
+  (`readTestProgress`). A suite whose files are in the immutable acceptance
+  gate is labeled `acceptance`, one listing only other test files
+  `developer` (`labelGateProgress`). When an earlier step stopped the gate
+  (a typecheck error, a developer suite that failed first under `&&`, or a
+  summary the capture lost), the revision says so instead of a number:
+  `rev 9: acceptance suite did not run: typecheck failed (1 error)`. The
+  summary prints `rev 7: acceptance 88/129 passing; developer 9/9 (+12)`
+  (`describeProgress`), and the console shows it on revision nodes and the
+  ticker. It never decides a verdict.
+- A stronger executor for complex items: an item whose write intent covers
+  at least 3 files, one with a contract proposed or accepted for it, a
+  reopened item, or one whose first fix failed starts its app edits on the
+  strongest configured model of the ladder; small items keep the base model.
+  Every push records the model in its rationale, and the summary prints
+  `edit models: ...`.
+- Budgets scale with the plan (bounded; explicit flags win): the lead plans
+  BEFORE the goal is posted, so the goal's fix budget is 3 + floor(items / 5)
+  (at most 6) and, without an explicit `--max`, the dial's max is
+  min(items, 6) (at least the dial's min). The effective values are printed
+  (`budgets: ...`).
+- Seam first: the goal records the shared seams of a modular project (the
+  cohesion blueprint's frozen contracts) with their importers
+  (`goal.posted.seams`). An item whose scope covers a seam goes first: a claim
+  on an item covering one of its importers is refused (`SEAM_FIRST`) until
+  the seam item's push is integrated, bounded by 60 board messages
+  (`seamWaits`); open items show `seam` and `waitsFor`, a held dependent does
+  not edit yet and then rebases onto the seam change (a passing revision that
+  changes a seam sends `rebase.needed` to the holders of its importers), and
+  in lockstep the holder of a seam change moves first. Each seam also records
+  the names it exports (`symbols`).
+- Seam contracts (decided by the LEAD): a seam no live item's scope covers is
+  frozen. When a failing revision's type error (a tsc `path(line,col): error
+  TS2339: ...` mismatch) is located in a frozen seam, or in a file of the
+  implicated item that imports one (narrowed to the seam that exports the
+  type the error names, such as `'Ctx'`), the owner's digest carries
+  `claims[].seamCue {seams, errors, hint}`: propose `contract.proposed
+  {target: the seam, kind, item, description: the exact change}` instead of
+  using undeclared fields or casts. Only the owner of the implicated item
+  proposes it, one pending per seam; a seam another item owns is refused
+  (ask its owner). It is not escalated: the lead decides it (`seam` and
+  `description` on `pendingContracts`). Accepted, the engine proposes the
+  seam item `seam-<contract>` (open, `fromContract`, scoped to the seam),
+  which goes first like any seam item; its importers wait for it and rebase
+  onto it. A rejected seam contract is cued again only after a newer failing
+  revision implicates the item.
+- Failures the plan missed become work: when a failing revision's evidence
+  points at repo files (error locations, or failing test titles naming a
+  module) that no item covers in any status, the lead proposes ONE item for
+  them per revision (at most 4 per run), scoped to those files, with the
+  revision's failing line in its rationale (`failingRepoFiles`,
+  `uncoveredFailureFiles`). Struggling reports carry the gate's failing line
+  (`gateFailureLine`), never a command echo.
 - The lead joins with role `lead`. Its first turn is the existing planner (the
   LLM planner live; a live run without one fails unless
   `--allow-heuristic-planner`, with the loud banner on a fallback); each planned
@@ -605,8 +683,9 @@ is distributed changes: items are proposed and claimed, never assigned.
 - Attribution reuses run-live's: parse the failing output for the files and
   names it reports and map them to the items' write intents (command echoes
   such as npm's `> node --check a.js && ...` are ignored, and error locations
-  `<path>:<line>`, which may be absolute paths in the gate's checkout, are
-  preferred when present); then a CONFIDENT
+  `<path>:<line>` and the type checker's `<path>(<line>,<col>): error TS...`,
+  which may be absolute paths in the gate's checkout, are preferred when
+  present; a type error is also the revision's stated failing line); then a CONFIDENT
   typed-decision choice when configured (advisory narrowing only); else every
   item the revision merged. Parse and pick combine the same way locally and in
   the integration Workflow (`combineAttribution` in change-core): an
@@ -624,7 +703,11 @@ is distributed changes: items are proposed and claimed, never assigned.
   untrusted data), edits with the failing output in the executor's objective on
   the next model of the escalation ladder per attempt
   (`AI_GATEWAY_ESCALATION_MODELS`), and pushes again, which triggers the next
-  revision. Fix attempts per owner are bounded by `maxFixAttempts`
+  revision. `claims[].fix.instruction` states it plainly: the item FAILED, a
+  done proposal does not complete it, and the owner is not waiting for
+  integration. An owner that answers a fix request with a wait (or an invalid
+  reply) is given another turn at once with a `FIX REQUIRED` cue, at most
+  twice per item and failing revision (`MAX_FIX_CUES`). Fix attempts per owner are bounded by `maxFixAttempts`
   (`--fix-attempts`, default 3). A spent budget is not a dead end: the engine
   records `fix.exhausted`, then `item.reopened` releases the item for another
   agent (fresh eyes), which starts from the previous owner's latest push; an
@@ -665,7 +748,9 @@ is distributed changes: items are proposed and claimed, never assigned.
   demo-board` rejects, so its tests item adds a NEW test file instead of
   rewriting the existing ones); without it each decision waits durably for the
   console or `POST /changes/:id/escalations/:id/resolve`.
-- Typed decisions (advisory): the lead's plan review (from the planner pass),
+- Typed decisions (advisory): the lead's plan review (from the planner pass;
+  when a review is not accepted the planner re-plans once with the doubt as
+  feedback, and every review is recorded, the plans not chosen first),
   each failure attribution, and a fix-confidence check on the final passing
   revision are recorded on the board as `decision.recorded`, including any
   failed call with its reason (for example an API error message); none of them
