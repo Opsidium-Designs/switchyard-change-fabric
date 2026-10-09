@@ -1452,7 +1452,7 @@ interface RepoPushedBody {
 }
 
 /** The header an agent presents its board token in. */
-export const BOARD_TOKEN_HEADER = "x-board-agent-token";
+const BOARD_TOKEN_HEADER = "x-board-agent-token";
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
