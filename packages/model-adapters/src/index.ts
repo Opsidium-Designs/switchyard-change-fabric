@@ -105,6 +105,41 @@ export {
   DEFAULT_JEV_MAX_TOKENS,
   DEFAULT_JEV_MODEL,
   gatewaySlugFromUrl,
+  jevErrorReason,
   JevResponseError,
   parseJevAnswers,
+  serializeJevQuestion,
 } from "./jev.ts";
+
+export type { GatewayJsonSchemaCall, GatewayJsonSchemaReply } from "./gateway-json-schema.ts";
+export { callGatewayJsonSchema } from "./gateway-json-schema.ts";
+
+export type {
+  AgentAction,
+  AgentActionType,
+  AgentCapsule,
+  AgentChildItem,
+  AgentMessageKind,
+  AgentMessagePayload,
+  AgentRepoExcerpt,
+  AgentReviewFinding,
+  AgentTurnHistoryEntry,
+  AgentTurnInput,
+  AgentTurnOutcome,
+  AgentTurnTransport,
+  AiGatewayAgentTurnOptions,
+} from "./agent-turn.ts";
+export {
+  AGENT_ACTION_LIMITS,
+  AGENT_ACTION_TYPES,
+  AGENT_MESSAGE_KINDS,
+  AGENT_TURN_JSON_SCHEMA,
+  AGENT_TURN_MAX_CONTEXT_CHARS,
+  AGENT_TURN_SCHEMA_NAME,
+  AgentActionError,
+  agentActionOrWait,
+  buildAgentTurnMessages,
+  createAiGatewayAgentTurnInvoke,
+  DEFAULT_AGENT_TURN_MAX_TOKENS,
+  parseAgentAction,
+} from "./agent-turn.ts";

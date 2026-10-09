@@ -1,0 +1,41 @@
+✖ users: unauthenticated request is rejected (401/403) (53.072123ms)
+✖ users: authenticated but invalid input is rejected with 400 (2.236692ms)
+✔ users: authenticated, valid request still succeeds (1.027661ms)
+✖ orders: unauthenticated request is rejected (401/403) (3.488611ms)
+✖ orders: authenticated but invalid input is rejected with 400 (1.426357ms)
+✔ orders: authenticated, valid request still succeeds (0.707992ms)
+✖ products: unauthenticated request is rejected (401/403) (0.846276ms)
+✖ products: authenticated but invalid input is rejected with 400 (0.636994ms)
+✔ products: authenticated, valid request still succeeds (0.826159ms)
+✖ auth: unauthenticated request is rejected (401/403) (1.210108ms)
+✖ auth: authenticated but invalid input is rejected with 400 (0.67983ms)
+✔ auth: authenticated, valid request still succeeds (0.43383ms)
+✖ search: unauthenticated request is rejected (401/403) (0.64686ms)
+✖ search: authenticated but invalid input is rejected with 400 (0.548286ms)
+✔ search: authenticated, valid request still succeeds (0.306081ms)
+✖ notifications: unauthenticated request is rejected (401/403) (0.658979ms)
+✖ notifications: authenticated but invalid input is rejected with 400 (0.53006ms)
+✔ notifications: authenticated, valid request still succeeds (0.434647ms)
+✔ GET / serves the browser-visible resource list (0.934664ms)
+✔ problem responses carry a readable error string (0.498864ms)
+ℹ tests 20
+ℹ suites 0
+ℹ pass 8
+ℹ fail 12
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 210.410713
+✖ failing tests:
+✖ users: unauthenticated request is rejected (401/403) (53.072123ms)
+✖ users: authenticated but invalid input is rejected with 400 (2.236692ms)
+✖ orders: unauthenticated request is rejected (401/403) (3.488611ms)
+✖ orders: authenticated but invalid input is rejected with 400 (1.426357ms)
+✖ products: unauthenticated request is rejected (401/403) (0.846276ms)
+✖ products: authenticated but invalid input is rejected with 400 (0.636994ms)
+✖ auth: unauthenticated request is rejected (401/403) (1.210108ms)
+✖ auth: authenticated but invalid input is rejected with 400 (0.67983ms)
+✖ search: unauthenticated request is rejected (401/403) (0.64686ms)
+✖ search: authenticated but invalid input is rejected with 400 (0.548286ms)
+✖ notifications: unauthenticated request is rejected (401/403) (0.658979ms)
+✖ notifications: authenticated but invalid input is rejected with 400 (0.53006ms)

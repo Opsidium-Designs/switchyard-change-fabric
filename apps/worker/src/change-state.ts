@@ -2,11 +2,15 @@ import { DurableObject } from "cloudflare:workers";
 
 import {
   appendBoardMessage,
+  appendDecisionRecorded,
   appendDiscoveredUnits,
   appendIntegratedRev,
   applyBoardEscalations,
   BoardError,
   boardDigest,
+  checkBoardJoin,
+  LEAD_ROLE,
+  boardContractDecision,
   boardResolutionForDecision,
   buildWorkGraph,
   emptyBoard,
@@ -353,6 +357,8 @@ export interface JevDecisionView {
   readonly probabilities?: Readonly<Record<string, number>>;
   /** True when the answer was confidently used; false when the juncture escalated. */
   readonly accepted: boolean;
+  /** Set when the decision call failed: a short, credential-free reason. */
+  readonly error?: string;
   readonly at: string;
 }
 
@@ -783,6 +789,12 @@ export interface Escalation {
    * to the board as a human claim.resolved, so its options are enforced.
    */
   readonly boardContest?: string;
+  /**
+   * The protected board contract this escalation decides (a change to the
+   * original tests or the gate's configuration). Resolving it posts the human's
+   * accept or reject to the board.
+   */
+  readonly boardContract?: string;
   /** The human-readable question the engine needs answered. */
   readonly question: string;
   /** The candidate answers the human may choose among (advisory, not enforced). */
@@ -1073,10 +1085,14 @@ export class ChangeState extends DurableObject<Env> {
    * stored. Every later agent post must present it, and the agent's identity is
    * taken from it.
    */
-  async joinBoard(agent: string, body: { readonly role?: unknown; readonly rationale?: unknown }): Promise<BoardAppendResponse> {
+  async joinBoard(
+    agent: string,
+    body: { readonly role?: unknown; readonly rationale?: unknown },
+    options: { readonly withWorkspace?: boolean } = {},
+  ): Promise<BoardAppendResponse> {
     const token = newBoardToken();
     const hash = await hashBoardToken(token);
-    return this.boardOutcome(
+    const outcome = await this.boardOutcome(
       () =>
         this.appendToBoard(
           (state) =>
@@ -1094,6 +1110,47 @@ export class ChangeState extends DurableObject<Env> {
         ),
       token,
     );
+    if (outcome.ok && options.withWorkspace) {
+      // Which agents have a repo of their own (the operator's read tokens are only for these).
+      const withRepo = (await this.ctx.storage.get<string[]>("boardRepoAgents")) ?? [];
+      await this.ctx.storage.put("boardRepoAgents", [...withRepo, agent]);
+    }
+    return outcome;
+  }
+
+  /**
+   * Check that `agent` could join now, appending nothing: the join route runs
+   * this BEFORE provisioning a workspace, so a join the board would refuse
+   * never creates a repo or a token.
+   */
+  async checkBoardJoin(agent: string, body: { readonly role?: unknown; readonly rationale?: unknown }): Promise<{ readonly ok: true } | BoardFailure> {
+    try {
+      checkBoardJoin(await this.loadBoardState(), agent, body);
+      return { ok: true };
+    } catch (error) {
+      if (error instanceof BoardError) {
+        return { ok: false, code: error.code, error: error.message };
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * May the operator read `agent`'s repo? Only a joined (not left) agent that
+   * joined with its own workspace, and never the lead (it has no repo).
+   */
+  async checkBoardRepoAgent(agent: string): Promise<{ readonly ok: true } | BoardFailure> {
+    const record = (await this.loadBoardState()).agents[agent];
+    if (record === undefined || record.leftSeq !== undefined) {
+      return { ok: false, code: "UNKNOWN_AGENT", error: `${agent} is not a joined agent of this board` };
+    }
+    if (record.role === LEAD_ROLE) {
+      return { ok: false, code: "NOT_ALLOWED", error: `${agent} is the lead and has no repo` };
+    }
+    if (!((await this.ctx.storage.get<string[]>("boardRepoAgents")) ?? []).includes(agent)) {
+      return { ok: false, code: "NOT_ALLOWED", error: `${agent} joined without a workspace and has no repo` };
+    }
+    return { ok: true };
   }
 
   /** Append one message as the agent the board token identifies. */
@@ -1126,6 +1183,17 @@ export class ChangeState extends DurableObject<Env> {
   async recordBoardIntegration(input: unknown): Promise<BoardAppendResponse> {
     return this.boardOutcome(() =>
       this.appendToBoard((state) => appendIntegratedRev(state, input, new Date().toISOString())),
+    );
+  }
+
+  /**
+   * Record an ADVISORY typed decision and its outcome on the board (the
+   * operator's route): the engine appends decision.recorded. It never affects
+   * arbitration or the verdict.
+   */
+  async recordBoardDecision(input: unknown): Promise<BoardAppendResponse> {
+    return this.boardOutcome(() =>
+      this.appendToBoard((state) => appendDecisionRecorded(state, input, new Date().toISOString())),
     );
   }
 
@@ -1332,12 +1400,14 @@ export class ChangeState extends DurableObject<Env> {
     // written in ONE transaction, so an invalid decision (or any rejected
     // append) leaves both untouched, and a recorded decision always reached
     // the board.
-    if (current.boardContest !== undefined) {
+    if (current.boardContest !== undefined || current.boardContract !== undefined) {
       const contest = current.boardContest;
+      const contract = current.boardContract;
       try {
         await this.appendToBoard(
           (state) => {
-            const draft = boardResolutionForDecision(state, contest, decision);
+            const draft =
+              contest !== undefined ? boardResolutionForDecision(state, contest, decision) : boardContractDecision(state, contract!, decision);
             return draft === undefined
               ? { appended: [], state }
               : appendBoardMessage(state, { kind: "human" }, draft, new Date().toISOString());
@@ -1734,6 +1804,7 @@ export class ChangeState extends DurableObject<Env> {
       confidence: clampUnit(input.confidence),
       ...(input.probabilities ? { probabilities: sanitizeProbabilities(input.probabilities) } : {}),
       accepted: input.accepted === true,
+      ...(typeof input.error === "string" && input.error !== "" ? { error: sanitizeText(input.error, 300) } : {}),
       at: new Date().toISOString(),
     };
     decisions.push(stored);

@@ -19,13 +19,20 @@ import { createHash, randomBytes } from "node:crypto";
 
 import {
   appendBoardMessage,
+  appendDecisionRecorded,
   appendDiscoveredUnits,
+  BOARD_AGENT_ID_PATTERN,
+  boardAgentWorkspaceName,
+  BOARD_WORKSPACE_TTL_BOUNDS,
+  checkBoardJoin,
+  parseBoardJoinWorkspace,
   appendIntegratedRev,
   applyBoardEscalations,
   BOARD_LIMITS,
   BoardError,
   boardDigest,
   boardErrorStatus,
+  boardContractDecision,
   boardResolutionForDecision,
   buildWorkGraph,
   emptyBoard,
@@ -397,6 +404,8 @@ export interface JevDecisionView {
   readonly confidence: number;
   readonly probabilities?: Readonly<Record<string, number>>;
   readonly accepted: boolean;
+  /** Set when the decision call failed: a short, credential-free reason. */
+  readonly error?: string;
   readonly at: string;
 }
 
@@ -414,6 +423,8 @@ export interface Escalation {
   readonly path?: string;
   /** The board contest this escalation was raised for (mirrors the Worker). */
   readonly boardContest?: string;
+  /** The protected board contract this escalation decides (mirrors the Worker). */
+  readonly boardContract?: string;
   readonly question: string;
   readonly options: readonly string[];
   readonly status: EscalationStatus;
@@ -569,10 +580,35 @@ class ChangeRecord {
  * Worker exposes. The lease records are kept so the caller can read each
  * completed WorkUnit's workspace for verification and integration afterwards.
  */
+/** Options for the offline control surface. */
+export interface LocalChangeControlOptions {
+  /**
+   * The clock board messages are stamped with (`at`). Defaults to the wall
+   * clock; an offline demo or test passes a deterministic clock so two runs of
+   * the same board produce byte-identical logs.
+   */
+  readonly now?: () => Date;
+}
+
 export class LocalChangeControl {
   private readonly records = new Map<string, ChangeRecord>();
+  /** Board agents' workspaces by repo name (for the operator's read tokens). */
+  private readonly boardWorkspaces = new Map<string, WorkspaceRef>();
+  /** Read tokens the operator revoked (observable offline). */
+  readonly revokedReadTokens: string[] = [];
+  private readonly boardClock: () => Date;
 
-  constructor(private readonly workspaces: LocalFilesystemWorkspaceProvider) {}
+  constructor(
+    private readonly workspaces: LocalFilesystemWorkspaceProvider,
+    options: LocalChangeControlOptions = {},
+  ) {
+    this.boardClock = options.now ?? (() => new Date());
+  }
+
+  /** The `at` stamp for the next board append. */
+  private boardAt(): string {
+    return this.boardClock().toISOString();
+  }
 
   /** Create a Change from spec YAML text (as POST /changes does). */
   createChange(specYaml: string): Change {
@@ -749,16 +785,18 @@ export class LocalChangeControl {
     };
     // A board-contest escalation is answered on the board (mirrors the DO): the
     // board append and the escalation record change together or not at all.
-    if (current.boardContest !== undefined) {
+    if (current.boardContest !== undefined || current.boardContract !== undefined) {
       const contest = current.boardContest;
+      const contract = current.boardContract;
       try {
         this.appendToBoard(
           record,
           (state) => {
-            const draft = boardResolutionForDecision(state, contest, decision);
+            const draft =
+              contest !== undefined ? boardResolutionForDecision(state, contest, decision) : boardContractDecision(state, contract!, decision);
             return draft === undefined
               ? { appended: [], state }
-              : appendBoardMessage(state, { kind: "human" }, draft, new Date().toISOString());
+              : appendBoardMessage(state, { kind: "human" }, draft, this.boardAt());
           },
           { escalations: (list) => list.map((e) => (e.id === id ? resolved : e)) },
         );
@@ -838,7 +876,7 @@ export class LocalChangeControl {
                 payload: body.role !== undefined ? { role: body.role } : {},
                 ...(body.rationale !== undefined ? { rationale: body.rationale } : {}),
               },
-              new Date().toISOString(),
+              this.boardAt(),
             ),
           { tokens: (tokens) => tokens.set(hash, agent) },
         ),
@@ -856,7 +894,7 @@ export class LocalChangeControl {
         if (agent === undefined) {
           throw new BoardError("AUTH", "unknown or revoked board token");
         }
-        return appendBoardMessage(state, { kind: "agent", agent }, raw, new Date().toISOString());
+        return appendBoardMessage(state, { kind: "agent", agent }, raw, this.boardAt());
       }),
     );
   }
@@ -865,7 +903,7 @@ export class LocalChangeControl {
   postBoardAsHuman(changeId: string, raw: unknown): BoardAppendResponse {
     const record = this.require(changeId);
     return this.boardOutcome(() =>
-      this.appendToBoard(record, (state) => appendBoardMessage(state, { kind: "human" }, raw, new Date().toISOString())),
+      this.appendToBoard(record, (state) => appendBoardMessage(state, { kind: "human" }, raw, this.boardAt())),
     );
   }
 
@@ -873,7 +911,7 @@ export class LocalChangeControl {
   recordBoardIntegration(changeId: string, input: unknown): BoardAppendResponse {
     const record = this.require(changeId);
     return this.boardOutcome(() =>
-      this.appendToBoard(record, (state) => appendIntegratedRev(state, input, new Date().toISOString())),
+      this.appendToBoard(record, (state) => appendIntegratedRev(state, input, this.boardAt())),
     );
   }
 
@@ -1292,6 +1330,7 @@ export class LocalChangeControl {
       confidence: clampUnit(input.confidence),
       ...(input.probabilities ? { probabilities: sanitizeProbabilities(input.probabilities) } : {}),
       accepted: input.accepted === true,
+      ...(typeof input.error === "string" && input.error !== "" ? { error: sanitizeText(input.error, 300) } : {}),
       at: new Date().toISOString(),
     };
     record.jevDecisions.push(stored);
@@ -1602,10 +1641,10 @@ export class LocalChangeControl {
     const method = (init?.method ?? "GET").toUpperCase();
 
     const boardRoute = url.pathname.match(
-      /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|integration\/revision)$/,
+      /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|integration\/revision)$/,
     );
     if (boardRoute && (method === "POST" || method === "GET")) {
-      const response = this.handleBoard(dec(boardRoute[1]), boardRoute[2] ?? "", method, url, init);
+      const response = await this.handleBoard(dec(boardRoute[1]), boardRoute[2] ?? "", method, url, init);
       if (response) {
         return response;
       }
@@ -1626,6 +1665,41 @@ export class LocalChangeControl {
     const fail = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/fail$/);
     if (method === "POST" && fail) {
       return this.handleFail(dec(fail[1]), dec(fail[2]), parseBody(init));
+    }
+    // Escalations (mirrors the Worker): list them, and resolve one with a decision.
+    const escalationList = url.pathname.match(/^\/changes\/([^/]+)\/escalations$/);
+    if (method === "GET" && escalationList) {
+      if (!this.records.has(dec(escalationList[1]))) {
+        return json({ error: "no such Change" }, 404);
+      }
+      return json({ escalations: this.escalations(dec(escalationList[1])) }, 200);
+    }
+    const escalationResolve = url.pathname.match(/^\/changes\/([^/]+)\/escalations\/([^/]+)\/resolve$/);
+    if (method === "POST" && escalationResolve) {
+      const b = parseBody(init);
+      if (typeof b.decision !== "string" || b.decision.trim() === "") {
+        return json({ error: "a resolution requires a decision" }, 400);
+      }
+      try {
+        return json({ escalation: this.resolveEscalation(dec(escalationResolve[1]), dec(escalationResolve[2]), b.decision) }, 200);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
+    }
+    const readToken = url.pathname.match(/^\/changes\/([^/]+)\/board\/read-token$/);
+    if (method === "POST" && readToken) {
+      return this.handleBoardReadToken(dec(readToken[1]), parseBody(init));
+    }
+    const revokeRead = url.pathname.match(/^\/changes\/([^/]+)\/board\/read-token\/revoke$/);
+    if (method === "POST" && revokeRead) {
+      const b = parseBody(init);
+      const ref = typeof b.agent === "string" ? this.boardWorkspaces.get(boardAgentWorkspaceName(dec(revokeRead[1]), b.agent)) : undefined;
+      if (!ref || typeof b.tokenId !== "string") {
+        return json({ code: "BAD_PAYLOAD", error: "a revoke names a board agent with a repo and a tokenId" }, 400);
+      }
+      await this.workspaces.revokeToken(ref, b.tokenId).catch(() => false);
+      this.revokedReadTokens.push(b.tokenId);
+      return json({ revoked: b.tokenId }, 200);
     }
     const discovered = url.pathname.match(/^\/changes\/([^/]+)\/work\/([^/]+)\/discovered$/);
     if (method === "POST" && discovered) {
@@ -1684,6 +1758,23 @@ export class LocalChangeControl {
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 404);
       }
+    }
+    if (method === "POST" && url.pathname === "/changes/planning") {
+      // Mirrors the Worker's planning-first create: a placeholder Change with
+      // no work, status "planning", created before any planner runs.
+      const b = parseBody(init);
+      if (typeof b.id !== "string" || b.id.trim() === "" || typeof b.objective !== "string") {
+        return json({ error: "a planning Change needs an id and an objective" }, 400);
+      }
+      const assurance = b.assurance === "none" || b.assurance === "strict" ? b.assurance : "standard";
+      const change = this.createPlanning({
+        id: b.id,
+        objective: b.objective,
+        baseline: typeof b.baseline === "string" && b.baseline !== "" ? b.baseline : "HEAD",
+        budgetUsd: typeof b.budgetUsd === "number" && Number.isFinite(b.budgetUsd) ? b.budgetUsd : 0,
+        assurance,
+      });
+      return json({ id: change.id, status: "planning" }, 201);
     }
     const planningFailedRoute = url.pathname.match(/^\/changes\/([^/]+)\/planning-failed$/);
     if (method === "POST" && planningFailedRoute) {
@@ -1791,6 +1882,7 @@ export class LocalChangeControl {
           confidence: numberOr(b.confidence, 0),
           ...(b.probabilities ? { probabilities: b.probabilities as Record<string, number> } : {}),
           accepted: b.accepted === true,
+          ...(typeof b.error === "string" && b.error !== "" ? { error: b.error.slice(0, 300) } : {}),
         });
         return json({ jevDecision: recorded }, 201);
       } catch (error) {
@@ -1890,7 +1982,13 @@ export class LocalChangeControl {
   };
 
   /** The board routes, mirroring the Worker's (identity from the route, never the body). */
-  private handleBoard(changeId: string, kind: string, method: string, url: URL, init?: RequestInit): Response | undefined {
+  private async handleBoard(
+    changeId: string,
+    kind: string,
+    method: string,
+    url: URL,
+    init?: RequestInit,
+  ): Promise<Response | undefined> {
     if (!this.records.has(changeId)) {
       return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
     }
@@ -1945,11 +2043,79 @@ export class LocalChangeControl {
       if (typeof join.agent !== "string") {
         return json({ code: "BAD_PAYLOAD", error: "a join requires an agent id" }, 400);
       }
+      // Mirrors the Worker: a join may provision the agent's own workspace (a
+      // local bare repo here) with a write token of the explicit short TTL the
+      // caller asked for. A refused join revokes the just-issued token.
+      const wanted = parseBoardJoinWorkspace(join.workspace);
+      if (!wanted.ok) {
+        return json({ code: "BAD_PAYLOAD", error: wanted.error }, 400);
+      }
+      if (wanted.request) {
+        if (!BOARD_AGENT_ID_PATTERN.test(join.agent)) {
+          return json({ code: "BAD_PAYLOAD", error: "agent must be an id (letters, digits, . _ : -)" }, 400);
+        }
+        // Validate the join FIRST, so a refused join never provisions anything.
+        try {
+          checkBoardJoin(this.require(changeId).boardState, join.agent, { role: join.role, rationale: join.rationale });
+        } catch (error) {
+          if (error instanceof BoardError) {
+            return json({ code: error.code, error: error.message }, boardErrorStatus(error.code));
+          }
+          throw error;
+        }
+        let ref: WorkspaceRef;
+        let token: ScopedToken;
+        try {
+          ref = await this.workspaces.create(boardAgentWorkspaceName(changeId, join.agent), { defaultBranch: "main" });
+          token = await this.workspaces.issueWriteToken(ref, wanted.request.ttlSeconds);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          return json({ code: "INVALID_STATE", error: `could not provision the agent workspace: ${reason}` }, 502);
+        }
+        // A join refused (or failing) after provisioning leaves nothing behind:
+        // the token is revoked AND the repo is archived.
+        const undo = async () => {
+          await this.workspaces.revokeToken(ref, token.id).catch(() => false);
+          await this.workspaces.archive(ref).catch(() => undefined);
+        };
+        let joined: BoardAppendResponse;
+        try {
+          joined = this.joinBoard(changeId, join.agent, { role: join.role, rationale: join.rationale });
+        } catch (error) {
+          await undo();
+          return json({ code: "INVALID_STATE", error: `the join failed: ${error instanceof Error ? error.message : String(error)}` }, 500);
+        }
+        if (!joined.ok) {
+          await undo();
+          return json({ code: joined.code, error: joined.error }, boardErrorStatus(joined.code as BoardErrorCode));
+        }
+        this.boardWorkspaces.set(ref.name, ref);
+        return json(
+          {
+            ...joined,
+            workspace: {
+              workspaceId: ref.id,
+              workspaceName: ref.name,
+              gitUrl: ref.gitUrl,
+              defaultBranch: ref.defaultBranch,
+              backend: ref.backend,
+              fallback: ref.fallback,
+              tokenId: token.id,
+              token: token.token,
+              tokenExpiresAt: token.expiresAt,
+            },
+          },
+          201,
+        );
+      }
       outcome = this.joinBoard(changeId, join.agent, { role: join.role, rationale: join.rationale });
     } else if (kind === "board/human") {
       outcome = this.postBoardAsHuman(changeId, body);
     } else if (kind === "integration/revision") {
       outcome = this.recordBoardIntegration(changeId, body);
+    } else if (kind === "board/decision") {
+      const record = this.require(changeId);
+      outcome = this.boardOutcome(() => this.appendToBoard(record, (state) => appendDecisionRecorded(state, body, this.boardAt())));
     } else {
       const token = headers.get(BOARD_TOKEN_HEADER);
       if (!token) {
@@ -1960,6 +2126,37 @@ export class LocalChangeControl {
     return outcome.ok
       ? json(outcome, 201)
       : json({ code: outcome.code, error: outcome.error }, boardErrorStatus(outcome.code as BoardErrorCode));
+  }
+
+  /** Mirrors the Worker's read-token route: a short-lived read token for a joined agent's repo. */
+  private async handleBoardReadToken(changeId: string, body: Record<string, unknown>): Promise<Response> {
+    const record = this.records.get(changeId);
+    if (!record) {
+      return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
+    }
+    const agent = body.agent;
+    if (typeof agent !== "string" || !BOARD_AGENT_ID_PATTERN.test(agent)) {
+      return json({ code: "BAD_PAYLOAD", error: "a read token names a board agent id" }, 400);
+    }
+    const ttl = body.ttlSeconds === undefined ? 600 : body.ttlSeconds;
+    const { min, max } = BOARD_WORKSPACE_TTL_BOUNDS;
+    if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < min || ttl > max) {
+      return json({ code: "BAD_PAYLOAD", error: `ttlSeconds must be an integer from ${min} to ${max}` }, 400);
+    }
+    const joined = record.boardState.agents[agent];
+    if (joined === undefined || joined.leftSeq !== undefined) {
+      return json({ code: "UNKNOWN_AGENT", error: `${agent} is not a joined agent of this board` }, 400);
+    }
+    if (joined.role === "lead") {
+      return json({ code: "NOT_ALLOWED", error: `${agent} is the lead and has no repo` }, 400);
+    }
+    const workspaceName = boardAgentWorkspaceName(changeId, agent);
+    const ref = this.boardWorkspaces.get(workspaceName);
+    if (!ref) {
+      return json({ code: "NOT_ALLOWED", error: `${agent} joined without a workspace and has no repo` }, 400);
+    }
+    const token = await this.workspaces.issueReadToken(ref, ttl);
+    return json({ workspaceName, tokenId: token.id, token: token.token, tokenExpiresAt: token.expiresAt }, 201);
   }
 
   private async handleLease(changeId: string, unitId: string): Promise<Response> {

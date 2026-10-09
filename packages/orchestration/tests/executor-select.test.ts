@@ -12,6 +12,7 @@ import {
   ALLOW_HEURISTIC_PLANNER_FLAG,
   decideLivePlanner,
   plannerFallbackBanner,
+  selectAgentTurn,
   selectExecutor,
   type ExecutorEnv,
 } from "../src/executor-select.ts";
@@ -178,5 +179,19 @@ describe("decideLivePlanner", () => {
     const banner = plannerFallbackBanner([{ model: "gpt-4o-mini", reason: "invalid plan" }]);
     expect(banner).toContain('plan.source "heuristic-fallback"');
     expect(banner).toContain("gpt-4o-mini: invalid plan");
+  });
+});
+
+describe("selectAgentTurn", () => {
+  it("is live only for ai-gateway with gateway credentials, on the agent model when set", () => {
+    expect(selectAgentTurn({}).live).toBe(false);
+    expect(selectAgentTurn({ EXECUTOR: "ai-gateway" })).toMatchObject({ live: false, description: expect.stringMatching(/credentials absent/) });
+    const env = { EXECUTOR: "ai-gateway", CLOUDFLARE_AI_GATEWAY_URL: "https://gw", CLOUDFLARE_AI_GATEWAY_TOKEN: "secret-token" };
+    const base = selectAgentTurn(env);
+    expect(base).toMatchObject({ live: true, model: "gpt-4o-mini" });
+    expect(typeof base.transport).toBe("function");
+    expect(selectAgentTurn({ ...env, AI_GATEWAY_MODEL: "m-base" }).model).toBe("m-base");
+    expect(selectAgentTurn({ ...env, AI_GATEWAY_MODEL: "m-base", AI_GATEWAY_AGENT_MODEL: "m-agent" }).model).toBe("m-agent");
+    expect(JSON.stringify(selectAgentTurn(env))).not.toContain("secret-token");
   });
 });

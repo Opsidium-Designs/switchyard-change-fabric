@@ -122,6 +122,8 @@ export interface ChangePlanReview {
   readonly confidence: number;
   readonly accepted: boolean;
   readonly probabilities?: Readonly<Record<string, number>>;
+  /** Set when the decision call failed (a short, credential-free reason). */
+  readonly error?: string;
 }
 
 /** One owned module carried on a Change: exactly one WorkUnit writes its file(s). */

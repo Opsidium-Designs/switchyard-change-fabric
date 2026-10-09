@@ -20,6 +20,7 @@ Requires Node.js 20+ and Git.
 make install
 make check   # typecheck + build + test, offline and deterministic
 make demo    # the whole flow end to end with the noop executor, no Cloudflare
+make demo-board  # agents form around a goal on the Change board (offline, deterministic)
 ```
 
 ## Live run
@@ -94,8 +95,15 @@ idempotent). `make infra-status` is read-only ("am I paying for anything?").
 
 A Change also has a **board**: an ordered log of typed coordination messages
 (claims with read/write intent, contests, splits, pushes, integrated revisions,
-tools) with mechanical arbitration in the Durable Object. It is a foundation
-and is not yet driven by `run-live`; see [docs/BOARD.md](./docs/BOARD.md).
+tools) with mechanical arbitration in the Durable Object. `run-live` does not
+use it; the separate `run-board` mode does: the lead's planner proposes items,
+worker agents join with their own repos, claim, contest, narrow, ask each other,
+edit, and push; every push is integrated continuously into the next gated
+revision (the original code's tests and the gate's configuration are a
+contract no agent changes alone), a failing revision asks the
+implicated owners for a fix, and only the last revision, when it passed, is
+promoted (`make demo-board` offline, `make run-board` live). See
+[docs/BOARD.md](./docs/BOARD.md).
 
 ### What the graph shows
 

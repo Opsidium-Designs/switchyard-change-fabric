@@ -267,6 +267,9 @@ export function changeToSpecYaml(change: Change): string {
       lines.push(`    noul: ${quote(review.noul)}`);
       lines.push(`    confidence: ${review.confidence}`);
       lines.push(`    accepted: ${review.accepted ? "true" : "false"}`);
+      if (review.error) {
+        lines.push(`    error: ${quote(review.error)}`);
+      }
     }
     if (units.length > 0) {
       lines.push("  units:");

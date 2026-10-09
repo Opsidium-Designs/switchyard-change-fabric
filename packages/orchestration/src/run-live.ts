@@ -45,6 +45,7 @@ import {
 import type { ExecutorProvider } from "@switchyard-change/model-adapters";
 import { ScopedNoopExecutor } from "@switchyard-change/model-adapters";
 import type { AskJev, JevAnswer } from "@switchyard-change/model-adapters";
+import { jevErrorReason } from "@switchyard-change/model-adapters";
 import {
   authenticatedRemote,
   clone,
@@ -69,6 +70,7 @@ import {
 
 import { maybeBuildTool, type ToolBuildResult } from "./tool-build.ts";
 import { withWorkerAuth } from "./worker-auth.ts";
+import { deriveProtectedPaths } from "./protected-paths.ts";
 import { stableAppWorkerName } from "./app-deploy.ts";
 import type { Escalation } from "./local-control.ts";
 import type { LiveTrigger } from "./recruit-live.ts";
@@ -669,6 +671,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
         confidence: planReview.confidence,
       },
       accepted: planReview.accepted,
+      ...(planReview.error !== undefined ? { error: planReview.error } : {}),
     });
   }
 
@@ -1161,6 +1164,15 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     emit({ kind: "integration-verdict", verdict, integratedUnits });
   };
 
+  // The gate's contract (the original code's existing tests, the test-runner
+  // and package-manager configs, the gate's own files and manifest keys),
+  // derived from the project: the integrator restores it from the baseline
+  // before the authoritative gate runs, so no unit can pass by rewriting what
+  // the gate checks. run-live has no contract-change route, so a unit's edit to
+  // the contract is restored rather than failed: the gate runs on, and ships,
+  // the restored tree, and the restored paths are recorded in the evidence.
+  const contract = await deriveProtectedPaths(options.projectDir, integrationGateCommand);
+
   let evidence: EvidenceSummary;
   try {
     evidence = await verification.verifyAndIntegrate({
@@ -1168,6 +1180,9 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       completed: completedInputs,
       integrationRef,
       integrationToken,
+      protectedPaths: contract.restore,
+      protectedJsonKeys: contract.jsonKeys,
+      onProtectedChange: "restore",
       // The WHOLE-APP gate runs ONCE here, on the exact composed integrated tree
       // (baseline + the per-unit-verified units' real edits, with write-lease
       // yields and exclusions applied), which is the same tree that is committed,
@@ -1253,131 +1268,46 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
           answer,
           accepted,
         });
+      } else {
+        await recordJevDecision(post, changeId, { juncture: "fix-confidence", question, accepted: false, error: "the decision reply carried no fix-confidence answer" });
       }
-    } catch {
-      // Advisory only: a decision-transport error never fails the run.
+    } catch (error) {
+      // Advisory only: a decision-transport error never fails the run, but it
+      // is RECORDED (never silent).
+      await recordJevDecision(post, changeId, { juncture: "fix-confidence", question, accepted: false, error: jevErrorReason(error) });
     }
   }
 
   // 6. Promote the integrated result into a local Git repository, but ONLY when
-  // the authoritative integration verdict is "verified". A failed (or
-  // cannot-pass) tree gets no switchyard/<id> branch at all: the run reports the
-  // refusal honestly instead of shipping a tree the gate rejected.
-  const sourceRepoDir = join(workRoot, "source");
-  await cloneProjectForPromotion(options.projectDir, sourceRepoDir);
-  const startPoint = await currentBranch(sourceRepoDir);
-  const integrationVerdict = evidence.integration.verdict;
-  let promotion: PromotionResult;
-  if (integrationVerdict !== "verified") {
-    const refusedReason =
-      `integration verdict was "${integrationVerdict}", not "verified": not promoting ` +
-      "(no delivery branch was created)";
-    promotion = {
-      changeId: options.change.id,
-      branch: defaultBranch(options.change.id),
-      commit: "",
-      deliveredPaths: [],
-      removedPaths: [],
-      committed: false,
-      refusedReason,
-    };
-    emit({ kind: "promotion-skipped", reason: refusedReason });
-  } else {
-    emit({ kind: "promoting", branch: defaultBranch(options.change.id) });
-    const delivery = new LocalGitDeliveryProvider({ workRoot: worktreeRoot });
-    promotion = await delivery.promote(
-      {
-        changeId: options.change.id,
-        objective: options.change.objective,
-        integrationGitUrl: integrationRef.gitUrl,
-        integrationBranch: integrationRef.defaultBranch,
-        // Guard gate-equals-deploy at the promote step: when a fix was expected
-        // (the change required a behavioral app gate, OR the integration reported
-        // landed fixes), the integrated tree the authoritative gate ran on must
-        // differ from the baseline, or promotion refuses to ship the baseline.
-        // Passing BOTH signals makes the guard effective on the LIVE path even
-        // when a failed/empty integration left integratedUnits at zero: a run that
-        // required an app gate always carries expectedFixes, so a baseline-identical
-        // integrated tree is a hard error rather than a silent baseline ship.
-        expectedIntegratedUnits: evidence.integration.integratedUnits.length,
-        ...(requiresIntegrationGate ? { expectedFixes: true } : {}),
-        // Defense in depth: the provider itself refuses a non-verified verdict.
-        verdict: integrationVerdict,
-      },
-      { repoDir: sourceRepoDir, startPoint, identity },
-    );
-  }
-
-  // 6b. Redeploy-in-place proof: the run NEVER deploys fresh. Deploy is a manual
-  // human step taken BEFORE the fix (so a watcher sees the break at a stable
-  // URL). On a verified fix, when a prior manual deployment already exists for
-  // this app, the run REDEPLOYS the fixed code to the app's STABLE worker name,
-  // updating that existing deployment in place at the SAME URL. When no manual
-  // deploy happened, the run deploys nothing: it still promotes to Git and
-  // completes normally, and the console simply shows no live URL. So the only way
-  // a deployment exists is a human Deploy; the run only refreshes it. The
-  // redeployer and the already-deployed lookup are injectable (wrangler + a
-  // per-app marker live, fakes in tests), so this is deterministic offline.
-  let deployment: { url: string; app: string } | undefined;
-  if (
-    options.deployAppDir &&
-    options.deployAppName &&
-    options.deployApp &&
-    options.appAlreadyDeployed
-  ) {
-    const verdict = evidence.integration.verdict;
-    const integratedCount = evidence.integration.integratedUnits.length;
-    // Only a verified run where at least one unit integrated has a real fix to
-    // refresh. A run where nothing integrated has no fix to redeploy even though
-    // an empty integration verifies vacuously; a failed fix is shown honestly.
-    const existingUrl = await options
-      .appAlreadyDeployed({ appName: options.deployAppName })
-      .catch(() => undefined);
-    if (!existingUrl) {
-      // No manual pre-deploy: the run does NOT deploy. It still promoted to Git.
-      emit({
-        kind: "deploy-skipped",
-        reason:
-          "app was not deployed before the run (no manual Deploy): not deploying; the fix was still promoted to Git",
-      });
-    } else if (verdict !== "verified" || integratedCount === 0) {
-      emit({
-        kind: "deploy-skipped",
-        reason:
-          verdict !== "verified"
-            ? `verification verdict was "${verdict}", not "verified": not redeploying a broken app`
-            : "no unit was integrated (no fix landed): not redeploying",
-      });
-    } else {
-      try {
-        // GATE-EQUALS-DEPLOY: deploy from a checkout of the PROMOTED commit, never
-        // from the original app directory (which still holds the unfixed
-        // baseline). The app's position inside the promoted tree is its position
-        // relative to the project directory the promotion was cloned from.
-        const promotedAppDir = await checkoutPromotedApp({
-          sourceRepoDir,
-          promotion,
-          projectDir: options.projectDir,
-          deployAppDir: options.deployAppDir,
-          targetDir: join(workRoot, "deploy-tree"),
-        });
-        // Redeploy the fixed code to the SAME stable worker name, so the
-        // existing deployment is updated in place at the same URL.
-        const { url } = await options.deployApp({
-          appDir: promotedAppDir,
-          appName: options.deployAppName,
-        });
-        deployment = { url, app: options.deployAppName };
-        await post(`/changes/${encodeURIComponent(changeId)}/deployment`, {
-          url,
-          app: options.deployAppName,
-        }).catch(() => {});
-        emit({ kind: "redeployed", url, app: options.deployAppName });
-      } catch (error) {
-        emit({ kind: "deploy-skipped", reason: `redeploy failed: ${failureReason(error)}` });
-      }
-    }
-  }
+  // the authoritative integration verdict is "verified" (see
+  // promoteVerifiedIntegration), then 6b. redeploy in place when a prior manual
+  // deployment exists and the fix verified (see redeployIfPreviouslyDeployed).
+  const { promotion, sourceRepoDir } = await promoteVerifiedIntegration({
+    change: options.change,
+    evidence,
+    integrationRef,
+    projectDir: options.projectDir,
+    workRoot,
+    worktreeRoot,
+    identity,
+    requiresIntegrationGate,
+    emit,
+  });
+  const deployment = await redeployIfPreviouslyDeployed({
+    evidence,
+    promotion,
+    sourceRepoDir,
+    projectDir: options.projectDir,
+    workRoot,
+    ...(options.deployAppDir ? { deployAppDir: options.deployAppDir } : {}),
+    ...(options.deployAppName ? { deployAppName: options.deployAppName } : {}),
+    ...(options.deployApp ? { deployApp: options.deployApp } : {}),
+    ...(options.appAlreadyDeployed ? { appAlreadyDeployed: options.appAlreadyDeployed } : {}),
+    recordDeployment: async (d) => {
+      await post(`/changes/${encodeURIComponent(changeId)}/deployment`, d).catch(() => {});
+    },
+    emit,
+  });
 
   // 7. Clean up the real Artifact repos the run created (and the local
   // integration repo). Only now, after the whole chain ran against them. In
@@ -1420,6 +1350,151 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     ...(tool ? { tool } : {}),
     ...(deployment ? { deployment } : {}),
   };
+}
+
+/**
+ * Promote the integrated result into a local Git repository, but ONLY when the
+ * authoritative integration verdict is "verified". A failed (or cannot-pass)
+ * tree gets no switchyard/<id> branch at all: the refusal is reported honestly
+ * instead of shipping a tree the gate rejected. The promoted tree is cloned from
+ * the integration workspace the gate ran on (gate-equals-deploy). Shared by the
+ * live run and the board run.
+ */
+export async function promoteVerifiedIntegration(input: {
+  readonly change: Pick<Change, "id" | "objective">;
+  readonly evidence: EvidenceSummary;
+  readonly integrationRef: import("@switchyard-change/artifact-workspace").WorkspaceRef;
+  readonly projectDir: string;
+  readonly workRoot: string;
+  readonly worktreeRoot: string;
+  readonly identity: GitIdentity;
+  readonly requiresIntegrationGate: boolean;
+  readonly emit: (event: FullLiveEvent) => void;
+}): Promise<{ readonly promotion: PromotionResult; readonly sourceRepoDir: string }> {
+  const { evidence, integrationRef, identity, requiresIntegrationGate, emit, worktreeRoot } = input;
+  const sourceRepoDir = join(input.workRoot, "source");
+  await cloneProjectForPromotion(input.projectDir, sourceRepoDir);
+  const startPoint = await currentBranch(sourceRepoDir);
+  const integrationVerdict = evidence.integration.verdict;
+  let promotion: PromotionResult;
+  if (integrationVerdict !== "verified") {
+    const refusedReason =
+      `integration verdict was "${integrationVerdict}", not "verified": not promoting ` +
+      "(no delivery branch was created)";
+    promotion = {
+      changeId: input.change.id,
+      branch: defaultBranch(input.change.id),
+      commit: "",
+      deliveredPaths: [],
+      removedPaths: [],
+      committed: false,
+      refusedReason,
+    };
+    emit({ kind: "promotion-skipped", reason: refusedReason });
+  } else {
+    emit({ kind: "promoting", branch: defaultBranch(input.change.id) });
+    const delivery = new LocalGitDeliveryProvider({ workRoot: worktreeRoot });
+    promotion = await delivery.promote(
+      {
+        changeId: input.change.id,
+        objective: input.change.objective,
+        integrationGitUrl: integrationRef.gitUrl,
+        integrationBranch: integrationRef.defaultBranch,
+        // Guard gate-equals-deploy at the promote step: when a fix was expected
+        // (the change required a behavioral app gate, OR the integration reported
+        // landed fixes), the integrated tree the authoritative gate ran on must
+        // differ from the baseline, or promotion refuses to ship the baseline.
+        expectedIntegratedUnits: evidence.integration.integratedUnits.length,
+        ...(requiresIntegrationGate ? { expectedFixes: true } : {}),
+        // Defense in depth: the provider itself refuses a non-verified verdict.
+        verdict: integrationVerdict,
+        // Gate-equals-deploy: promote exactly the commit the gate ran on, and
+        // refuse unless the promoted tree is that commit's tree.
+        ...(evidence.integration.commit ? { gatedCommit: evidence.integration.commit } : {}),
+      },
+      { repoDir: sourceRepoDir, startPoint, identity },
+    );
+  }
+  return { promotion, sourceRepoDir };
+}
+
+/**
+ * Redeploy-in-place proof: a run NEVER deploys fresh. Deploy is a manual human
+ * step taken BEFORE the fix (so a watcher sees the break at a stable URL). On a
+ * verified fix, when a prior manual deployment already exists for this app, the
+ * run REDEPLOYS the fixed code to the app's STABLE worker name from a checkout of
+ * the PROMOTED commit (never the original app directory), updating that
+ * deployment in place. When no manual deploy happened, or the verdict is not
+ * verified, or nothing integrated, it deploys nothing and says why. Shared by the
+ * live run and the board run.
+ */
+export async function redeployIfPreviouslyDeployed(input: {
+  readonly evidence: EvidenceSummary;
+  readonly promotion: PromotionResult;
+  readonly sourceRepoDir: string;
+  readonly projectDir: string;
+  readonly workRoot: string;
+  readonly deployAppDir?: string;
+  readonly deployAppName?: string;
+  readonly deployApp?: DeployApp;
+  readonly appAlreadyDeployed?: (input: { readonly appName: string }) => Promise<string | undefined>;
+  readonly recordDeployment: (deployment: { readonly url: string; readonly app: string }) => Promise<void>;
+  readonly emit: (event: FullLiveEvent) => void;
+}): Promise<{ url: string; app: string } | undefined> {
+  const { evidence, promotion, emit } = input;
+  let deployment: { url: string; app: string } | undefined;
+  if (input.deployAppDir && input.deployAppName && input.deployApp && input.appAlreadyDeployed) {
+    const verdict = evidence.integration.verdict;
+    const integratedCount = evidence.integration.integratedUnits.length;
+    // Only a verified run where at least one unit integrated has a real fix to
+    // refresh. A run where nothing integrated has no fix to redeploy even though
+    // an empty integration verifies vacuously; a failed fix is shown honestly.
+    const existingUrl = await input
+      .appAlreadyDeployed({ appName: input.deployAppName })
+      .catch(() => undefined);
+    if (!existingUrl) {
+      // No manual pre-deploy: the run does NOT deploy. It still promoted to Git.
+      emit({
+        kind: "deploy-skipped",
+        reason:
+          "app was not deployed before the run (no manual Deploy): not deploying; the fix was still promoted to Git",
+      });
+    } else if (verdict !== "verified" || integratedCount === 0) {
+      emit({
+        kind: "deploy-skipped",
+        reason:
+          verdict !== "verified"
+            ? `verification verdict was "${verdict}", not "verified": not redeploying a broken app`
+            : "no unit was integrated (no fix landed): not redeploying",
+      });
+    } else {
+      try {
+        // GATE-EQUALS-DEPLOY: deploy from a checkout of the PROMOTED commit, never
+        // from the original app directory (which still holds the unfixed
+        // baseline). The app's position inside the promoted tree is its position
+        // relative to the project directory the promotion was cloned from.
+        const promotedAppDir = await checkoutPromotedApp({
+          sourceRepoDir: input.sourceRepoDir,
+          promotion,
+          projectDir: input.projectDir,
+          deployAppDir: input.deployAppDir,
+          targetDir: join(input.workRoot, "deploy-tree"),
+        });
+        // Redeploy the fixed code to the SAME stable worker name, so the
+        // existing deployment is updated in place at the same URL.
+        const { url } = await input.deployApp({
+          appDir: promotedAppDir,
+          appName: input.deployAppName,
+        });
+        deployment = { url, app: input.deployAppName };
+        await input.recordDeployment(deployment);
+        emit({ kind: "redeployed", url, app: input.deployAppName });
+      } catch (error) {
+        emit({ kind: "deploy-skipped", reason: `redeploy failed: ${failureReason(error)}` });
+      }
+    }
+  }
+  return deployment;
 }
 
 /** One gated unit the change-level ladder may re-fan on a verify-fail. */
@@ -1708,7 +1783,12 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
         ].join("\n");
         try {
           const answers = await input.jev(state, {
-            attribution: { type: "choice", instructions: question, criteria: unitIds },
+            attribution: {
+              type: "choice",
+              instructions: question,
+              criteria: unitIds,
+              descriptions: Object.fromEntries(gatedUnits.map((u) => [u.unitId, u.objective.slice(0, 200)])),
+            },
           });
           const answer = answers["attribution"];
           const confident =
@@ -1770,8 +1850,10 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
               refanSource = "jev";
             }
           }
-        } catch {
-          // A decision-transport error leaves the parse+fallback result intact.
+        } catch (error) {
+          // A decision-transport error leaves the parse+fallback result intact,
+          // and is RECORDED (never silent).
+          await recordJevDecision(post, changeId, { juncture: "attribution", question, accepted: false, error: jevErrorReason(error) });
         }
       }
 
@@ -2240,12 +2322,31 @@ function unitCoversName(unit: GatedUnitInput, name: string): boolean {
  * Returns a deduplicated list; an empty list means nothing attributable.
  */
 function extractFailingFiles(evidence: string): readonly string[] {
-  const found = new Set<string>();
-  // Match path-shaped tokens: one or more segments separated by `/`, ending in a
-  // file with an extension. Strips surrounding punctuation and line/col suffixes.
-  const re = /([A-Za-z0-9_.-]+\/[A-Za-z0-9/_.-]+\.[A-Za-z0-9]+)/g;
+  // Command echoes name every file a script checks, failing or not: npm, yarn,
+  // and pnpm print each script's command line as `> <command>` after its
+  // `> <package>@<version> <script>` header, and shells print `$ <command>`.
+  // Those lines say nothing about what failed, so they are ignored.
+  const lines = evidence.split(/\r?\n/).filter((line) => !/^\s*[>$] /.test(line));
+  const text = lines.join("\n");
+  // Error LOCATIONS (`<path>:<line>`, as in a syntax error or a stack frame)
+  // name the file that failed; prefer them when there are any.
+  const located = new Set<string>();
+  const at = /((?:[A-Za-z]:)?[A-Za-z0-9_./-]*\/?[A-Za-z0-9_.-]+\.[A-Za-z0-9]+):\d+/g;
   let match: RegExpExecArray | null;
-  while ((match = re.exec(evidence)) !== null) {
+  while ((match = at.exec(text)) !== null) {
+    const raw = match[1]!.replace(/^file:\/\//, "");
+    if (!/^node:/.test(match[0]) && !raw.startsWith("node:") && raw.includes("/")) {
+      located.add(raw);
+    }
+  }
+  if (located.size > 0) {
+    return [...located];
+  }
+  const found = new Set<string>();
+  // Otherwise: path-shaped tokens, one or more segments separated by `/`,
+  // ending in a file with an extension.
+  const re = /([A-Za-z0-9_.-]+\/[A-Za-z0-9/_.-]+\.[A-Za-z0-9]+)/g;
+  while ((match = re.exec(text)) !== null) {
     const raw = match[1];
     if (raw) {
       found.add(raw);
@@ -2260,6 +2361,19 @@ function extractFailingFiles(evidence: string): readonly string[] {
  * and a simple `*`/`**` glob (as the example apps declare, e.g. `src/routes/**`).
  */
 function pathCovers(declared: string, file: string): boolean {
+  // A failing file is often reported by its ABSOLUTE path in the checkout the
+  // gate ran in (`/tmp/scf-integration-x/src/a.js`): it covers a declared path
+  // when any trailing part of it does.
+  const segments = file.replace(/^\.\//, "").split("/").filter((seg) => seg !== "");
+  for (let i = 0; i < segments.length; i += 1) {
+    if (pathCoversRelative(declared, segments.slice(i).join("/"))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function pathCoversRelative(declared: string, file: string): boolean {
   const d = declared.replace(/^\.\//, "").replace(/\/+$/, "");
   const f = file.replace(/^\.\//, "");
   if (d === f) {
@@ -2411,21 +2525,25 @@ async function recordJevDecision(
   decision: {
     readonly juncture: "plan-review" | "attribution" | "fix-confidence";
     readonly question: string;
-    readonly answer: JevAnswer;
+    /** The typed answer; absent when the call failed (`error`). */
+    readonly answer?: JevAnswer;
     readonly accepted: boolean;
+    /** A short, credential-free reason the decision call failed. */
+    readonly error?: string;
   },
 ): Promise<void> {
   const { answer } = decision;
   await post(`/changes/${encodeURIComponent(changeId)}/jev-decision`, {
     juncture: decision.juncture,
     question: decision.question,
-    answerType: answer.type,
-    ...(answer.noul !== undefined ? { noul: answer.noul } : {}),
-    ...(answer.choice !== undefined ? { choice: answer.choice } : {}),
-    ...(answer.score !== undefined ? { score: answer.score } : {}),
-    confidence: answer.confidence,
-    ...(answer.probabilities !== undefined ? { probabilities: answer.probabilities } : {}),
+    answerType: answer?.type ?? (decision.juncture === "attribution" ? "choice" : "noul"),
+    ...(answer?.noul !== undefined ? { noul: answer.noul } : {}),
+    ...(answer?.choice !== undefined ? { choice: answer.choice } : {}),
+    ...(answer?.score !== undefined ? { score: answer.score } : {}),
+    confidence: answer?.confidence ?? 0,
+    ...(answer?.probabilities !== undefined ? { probabilities: answer.probabilities } : {}),
     accepted: decision.accepted,
+    ...(decision.error !== undefined ? { error: decision.error } : {}),
   }).catch(() => {});
 }
 
@@ -2797,7 +2915,7 @@ function delay(ms: number): Promise<void> {
  * baseline. Integration/promotion are Node-side Git operations, so this uses the
  * local-filesystem provider regardless of where the unit repos live.
  */
-async function createIntegrationWorkspace(
+export async function createIntegrationWorkspace(
   workRoot: string,
   projectDir: string,
   changeId: string,
@@ -2867,7 +2985,7 @@ async function seedFromProject(
  * sibling directory, or a project directory with no parent (a repo-root target),
  * is a no-op: an app with no shared sibling simply needs nothing copied.
  */
-async function materializeSiblingGateDeps(projectDir: string, parentDir: string): Promise<void> {
+export async function materializeSiblingGateDeps(projectDir: string, parentDir: string): Promise<void> {
   const { readdir, copyFile } = await import("node:fs/promises");
   const { resolve, dirname, join: joinPath } = await import("node:path");
   const appDir = resolve(projectDir);
@@ -2900,7 +3018,7 @@ async function materializeSiblingGateDeps(projectDir: string, parentDir: string)
  * repo root is cloned directly; a plain directory is initialized into a repo so
  * the baseline always has a HEAD commit and the caller's tree is never touched.
  */
-async function cloneProjectForPromotion(projectDir: string, targetDir: string): Promise<void> {
+export async function cloneProjectForPromotion(projectDir: string, targetDir: string): Promise<void> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const { cp } = await import("node:fs/promises");
@@ -2994,7 +3112,7 @@ export async function checkoutPromotedApp(input: {
   return appRel === "" ? input.targetDir : join(input.targetDir, appRel);
 }
 
-async function currentBranch(dir: string): Promise<string> {
+export async function currentBranch(dir: string): Promise<string> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const run = promisify(execFile);

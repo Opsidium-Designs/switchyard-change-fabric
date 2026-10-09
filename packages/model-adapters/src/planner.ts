@@ -22,11 +22,8 @@
  * gateway token is held in the closure only and is never logged or returned.
  */
 
-import {
-  DEFAULT_WORKERS_AI_TIMEOUT_MS,
-  WorkersAiTimeoutError,
-  type WorkersAiMessage,
-} from "./workers-ai.ts";
+import { callGatewayJsonSchema } from "./gateway-json-schema.ts";
+import { DEFAULT_WORKERS_AI_TIMEOUT_MS, type WorkersAiMessage } from "./workers-ai.ts";
 
 /** The default plan model when the caller does not pass one. */
 export const DEFAULT_AI_GATEWAY_PLANNER_MODEL = "gpt-4o-mini";
@@ -171,77 +168,26 @@ export class PlannerResponseError extends Error {
  */
 export function createAiGatewayPlannerInvoke(options: AiGatewayPlannerOptions): PlannerInvoke {
   const fetchFn = options.fetchFn ?? fetch;
-  const base = options.gatewayUrl.replace(/\/$/, "");
   const timeoutMs = options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS;
   const maxTokens = options.maxTokens ?? DEFAULT_AI_GATEWAY_PLANNER_MAX_TOKENS;
   return async (request: PlannerRequest): Promise<PlannerPlan> => {
-    const url = `${base}/openai/chat/completions`;
-    const controller = timeoutMs > 0 ? new AbortController() : undefined;
-    const timer =
-      controller !== undefined ? setTimeout(() => controller.abort(), timeoutMs) : undefined;
-    let res: Response;
-    try {
-      res = await fetchFn(url, {
-        method: "POST",
-        headers: {
-          // The gateway credential, NOT a provider key. There is deliberately no
-          // provider `authorization` header: the gateway injects the stored
-          // provider key (BYOK), so the raw key never lives here.
-          "cf-aig-authorization": `Bearer ${options.gatewayToken}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          model: request.model,
-          messages: request.messages,
-          max_completion_tokens: maxTokens,
-          // The schema constraint. `strict: true` makes the gateway reject a
-          // reply that does not conform, so the content is a parseable plan.
-          response_format: {
-            type: "json_schema",
-            json_schema: {
-              name: PLANNER_PLAN_SCHEMA_NAME,
-              strict: true,
-              schema: PLANNER_PLAN_JSON_SCHEMA,
-            },
-          },
-        }),
-        ...(controller ? { signal: controller.signal } : {}),
-      });
-    } catch (error) {
-      if (controller?.signal.aborted) {
-        throw new WorkersAiTimeoutError(
-          `AI Gateway plan call for ${request.model} timed out after ${timeoutMs}ms`,
-        );
-      }
-      throw error instanceof Error ? error : new Error(String(error));
-    } finally {
-      if (timer !== undefined) {
-        clearTimeout(timer);
-      }
-    }
-    if (res.status >= 400) {
-      // Drain the body (do not include it in the error) and fail without leaking.
-      await res.text().catch(() => "");
-      throw new Error(`AI Gateway plan call failed for ${request.model} (HTTP ${res.status})`);
-    }
-    const text = await res.text();
-    let body: {
-      choices?: ReadonlyArray<{ message?: { content?: unknown } }>;
-    };
-    try {
-      body = JSON.parse(text) as typeof body;
-    } catch {
-      throw new PlannerResponseError(
-        `AI Gateway returned a non-JSON response for the plan call (${request.model})`,
-      );
-    }
-    const content = body.choices?.[0]?.message?.content;
-    if (typeof content !== "string" || content.trim() === "") {
-      throw new PlannerResponseError(
-        `AI Gateway plan reply had no message content for ${request.model}`,
-      );
-    }
-    return parsePlannerPlan(content);
+    // The shared schema-constrained call (see gateway-json-schema.ts): the same
+    // gateway header (no provider key), the strict json_schema response_format,
+    // the timeout, and the no-leak error drain the plan call always used.
+    const reply = await callGatewayJsonSchema({
+      gatewayUrl: options.gatewayUrl,
+      gatewayToken: options.gatewayToken,
+      model: request.model,
+      messages: request.messages,
+      schemaName: PLANNER_PLAN_SCHEMA_NAME,
+      schema: PLANNER_PLAN_JSON_SCHEMA,
+      maxTokens,
+      timeoutMs,
+      fetchFn,
+      label: "plan",
+      responseError: (message) => new PlannerResponseError(message),
+    });
+    return parsePlannerPlan(reply.content);
   };
 }
 

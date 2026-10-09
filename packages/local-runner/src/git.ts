@@ -3,14 +3,14 @@
  *
  * The runner clones a leased workspace, lets the executor edit it, then commits
  * and pushes back. For a real Cloudflare Artifacts HTTPS remote the scoped token
- * is supplied as the password of an HTTPS basic-auth credential. For the local
- * file:// fallback no credential is needed and the token is ignored.
+ * rides in the remote URL inside this process only: every git call goes
+ * through the hardened runGit, which strips it from the arguments and sends
+ * it as an `Authorization: Bearer` header (never on git's command line or in
+ * a config file). For the local file:// fallback no credential is needed and
+ * the token is ignored.
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const run = promisify(execFile);
+import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 
 /** A deterministic committer identity so commits are reproducible in tests. */
 export interface GitIdentity {
@@ -24,9 +24,10 @@ export const DEFAULT_IDENTITY: GitIdentity = {
 };
 
 /**
- * Build the authenticated clone/push URL. For an HTTPS Artifacts remote, inject
- * the scoped token as the basic-auth password (username "token" by convention
- * for a repo-scoped credential). For a file:// remote, return it unchanged.
+ * Build the authenticated clone/push URL. For an HTTPS Artifacts remote, the
+ * scoped token is carried as the URL's password (username "token"); the git
+ * helpers turn it into a Bearer header before git runs. For a file:// remote,
+ * return it unchanged.
  */
 export function authenticatedRemote(gitUrl: string, token: string): string {
   if (gitUrl.startsWith("file://")) {
@@ -40,14 +41,30 @@ export function authenticatedRemote(gitUrl: string, token: string): string {
   return gitUrl;
 }
 
-/** Clone a remote into a target directory. */
+/**
+ * The same URL without any userinfo (`https://token:secret@host/x` becomes
+ * `https://host/x`): what a checkout may keep in its `.git/config`.
+ */
+export function withoutCredentials(url: string): string {
+  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@\s]*@/i, "$1");
+}
+
+/**
+ * Clone a remote into a target directory WITHOUT persisting its credential: a
+ * token in the clone URL is sent as a header for the transfer only and
+ * `origin` is the tokenless URL, so code that later runs in the checkout (a
+ * gate, a test) can never read it from `.git/config`. Later pushes and fetches
+ * pass the authenticated URL explicitly (again turned into a header).
+ */
 export async function clone(remote: string, targetDir: string): Promise<void> {
-  await run("git", ["clone", remote, targetDir]);
+  // runGit takes the token out of the URL (it travels as a header), so the
+  // checkout's origin is the tokenless URL from the start.
+  await runGit(["clone", remote, targetDir]);
 }
 
 /** Run a git subcommand inside a worktree. */
 export async function git(worktreeDir: string, args: readonly string[]): Promise<string> {
-  const { stdout } = await run("git", ["-C", worktreeDir, ...args]);
+  const { stdout } = await runGit(["-C", worktreeDir, ...args]);
   return stdout;
 }
 

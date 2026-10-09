@@ -9,10 +9,10 @@
  */
 
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -20,8 +20,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 import type { WorkspaceRef } from "@switchyard-change/artifact-workspace";
 
-import { Integrator } from "../src/integrator.ts";
-import { FakeCommandRunner } from "./helpers.ts";
+import { advanceIntegrationBranch, Integrator, recordBaselineInventory, type VerifiedWorkspace } from "../src/integrator.ts";
+import { FakeCommandRunner, installRecordingGit } from "./helpers.ts";
 
 const run = promisify(execFile);
 const IDENTITY = ["-c", "user.name=Fixture", "-c", "user.email=fixture@switchyard.local"];
@@ -98,6 +98,10 @@ describe("Integrator", () => {
     expect(result.integratedUnits).toEqual(["u"]);
     const files = await trackedAt(ref.gitUrl, join(root, "check"));
     expect(files).toEqual(["keep.txt"]);
+    // The result names the commit of the tree the gate ran on: the pushed head.
+    const { stdout: head } = await run("git", ["-C", join(root, "check"), "rev-parse", "HEAD"]);
+    expect(result.commit).toBe(head.trim());
+    expect(result.commit).not.toBe(baseline);
   });
 
   it("does NOT push the integration commit when the authoritative gate fails", async () => {
@@ -122,6 +126,9 @@ describe("Integrator", () => {
 
     expect(result.verdict).toBe("failed");
     expect(result.integratedUnits).toEqual([]);
+    // The rejected tree's commit is still reported (what the gate refused).
+    expect(result.commit).toMatch(/^[0-9a-f]{40}$/);
+    expect(result.commit).not.toBe(baseline);
     // The failed tree never reached the integration workspace: it is still the
     // baseline seed, so nothing downstream can clone and ship it.
     const check = join(root, "check");
@@ -129,4 +136,424 @@ describe("Integrator", () => {
     const { stdout } = await run("git", ["-C", check, "rev-parse", "HEAD"]);
     expect(stdout.trim()).toBe(baseline);
   });
+
+  it("applies exactly the pinned commit, not a later branch head", async () => {
+    const unitDir = join(root, "unit");
+    const baseline = await unitThatDeletes(unitDir);
+    const pinned = (await run("git", ["-C", unitDir, "rev-parse", "HEAD"])).stdout.trim();
+    // An unannounced push after the pinned commit must never reach integration.
+    await writeFile(join(unitDir, "keep.txt"), "unannounced\n", "utf8");
+    await writeFile(join(unitDir, "extra.txt"), "unannounced\n", "utf8");
+    await commit(unitDir, "unannounced");
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+
+    const integrator = new Integrator(provider, { commandRunner: new FakeCommandRunner([]) });
+    const result = await integrator.integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline, commit: pinned }],
+      excludedUnits: [],
+      workRoot: root,
+    });
+    expect(result.verdict).toBe("verified");
+    const check = join(root, "check");
+    expect(await trackedAt(ref.gitUrl, check)).toEqual(["keep.txt"]);
+    const { stdout } = await run("git", ["-C", check, "show", "HEAD:keep.txt"]);
+    expect(stdout).toBe("fixed\n");
+
+    // A pinned commit the repo does not have is an error, never a silent fallback.
+    await expect(
+      integrator.integrate({
+        integrationRef: ref,
+        integrationToken: token,
+        verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline, commit: "0".repeat(40) }],
+        excludedUnits: [],
+        workRoot: root,
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("never applies paths a unit yields to another owner", async () => {
+    const unitDir = join(root, "unit");
+    await mkdir(unitDir, { recursive: true });
+    await run("git", ["-C", unitDir, "init", "--initial-branch=main"]);
+    await writeFile(join(unitDir, "base.txt"), "base\n", "utf8");
+    const baseline = await commit(unitDir, "baseline");
+    await mkdir(join(unitDir, "mine"), { recursive: true });
+    await mkdir(join(unitDir, "handed"), { recursive: true });
+    await writeFile(join(unitDir, "mine", "a.txt"), "mine\n", "utf8");
+    await writeFile(join(unitDir, "handed", "b.txt"), "stale\n", "utf8");
+    await commit(unitDir, "work");
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+    const result = await new Integrator(provider, { commandRunner: new FakeCommandRunner([]) }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline, yieldedScope: ["handed/**"] }],
+      excludedUnits: [],
+      workRoot: root,
+    });
+    expect(result.verdict).toBe("verified");
+    expect(await trackedAt(ref.gitUrl, join(root, "check"))).toEqual(["base.txt", "mine/a.txt"]);
+  });
+
+  it("restores protected (gate-defining) paths before the gate runs and fails the revision", async () => {
+    const unitDir = join(root, "unit");
+    await mkdir(join(unitDir, "gate"), { recursive: true });
+    await run("git", ["-C", unitDir, "init", "--initial-branch=main"]);
+    await writeFile(join(unitDir, "gate", "gate.test.mjs"), "assert(false)\n", "utf8");
+    await writeFile(join(unitDir, "app.js"), "broken\n", "utf8");
+    const baseline = await commit(unitDir, "baseline");
+    // The unit "fixes" the app by rewriting the gate, and adds a gate helper.
+    await writeFile(join(unitDir, "gate", "gate.test.mjs"), "assert(true)\n", "utf8");
+    await writeFile(join(unitDir, "gate", "helper.mjs"), "export {}\n", "utf8");
+    await writeFile(join(unitDir, "app.js"), "still broken\n", "utf8");
+    await commit(unitDir, "tamper");
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+
+    // The gate passes only if it sees the tampered gate file.
+    const seen: string[] = [];
+    const runner = {
+      async run(_argv: readonly string[], cwd: string) {
+        const { readFile } = await import("node:fs/promises");
+        const gate = await readFile(join(cwd, "gate", "gate.test.mjs"), "utf8");
+        seen.push(gate);
+        return { code: gate.includes("true") ? 0 : 1, stdout: "", stderr: gate.includes("true") ? "" : "gate failed" };
+      },
+    };
+    const result = await new Integrator(provider, { commandRunner: runner }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+      excludedUnits: [],
+      integrationGateCommand: ["npm", "run", "gate"],
+      requiresIntegrationGate: true,
+      protectedPaths: ["gate/**", "package.json"],
+      workRoot: root,
+    });
+    // The gate ran on the BASELINE gate file, never the rewritten one.
+    expect(seen).toEqual(["assert(false)\n"]);
+    expect(result.verdict).toBe("failed");
+    expect(result.protectedViolations).toEqual(["gate/gate.test.mjs", "gate/helper.mjs"]);
+    expect(result.finalCheck.summary).toMatch(/protected path\(s\) that define the gate/);
+    expect(result.commit).toMatch(/^[0-9a-f]{40}$/);
+    const check = join(root, "check");
+    await trackedAt(ref.gitUrl, check);
+    const { stdout } = await run("git", ["-C", check, "rev-parse", "HEAD"]);
+    expect(stdout.trim()).toBe(baseline); // a failed revision is never pushed
+  });
+
+  it("a deferred integration never moves the branch; the caller advances it after recording", async () => {
+    const unitDir = join(root, "unit");
+    const baseline = await unitThatDeletes(unitDir);
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+    const integrator = new Integrator(provider, { commandRunner: new FakeCommandRunner([]) });
+    const result = await integrator.integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+      excludedUnits: [],
+      deferBranchPush: true,
+      workRoot: root,
+    });
+    expect(result.verdict).toBe("verified");
+    const head = async () => {
+      const dir = await mkdtemp(join(root, "head-"));
+      await run("git", ["clone", "-q", ref.gitUrl, dir]);
+      return (await run("git", ["-C", dir, "rev-parse", "HEAD"])).stdout.trim();
+    };
+    expect(await head()).toBe(baseline); // a pass the caller never recorded leaves the branch alone
+    // A later integration based on the recorded base (still the baseline) never sees the unrecorded commit.
+    const again = await integrator.integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [],
+      excludedUnits: [],
+      baseCommit: baseline,
+      deferBranchPush: true,
+      workRoot: root,
+    });
+    expect(again.commit).toBe(baseline);
+    // Once recorded, the caller advances the branch to exactly the gated commit (based on the candidate ref).
+    await advanceIntegrationBranch(ref, token, result.commit!, root);
+    expect(await head()).toBe(result.commit);
+    const built = await integrator.integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [],
+      excludedUnits: [],
+      baseCommit: result.commit!,
+      workRoot: root,
+    });
+    expect(built.commit).toBe(result.commit);
+  });
+
+  it("restores protected JSON keys only, keeps released paths, and in restore mode keeps the gate's verdict", async () => {
+    const unitDir = join(root, "unit");
+    await mkdir(join(unitDir, "tests"), { recursive: true });
+    await run("git", ["-C", unitDir, "init", "--initial-branch=main"]);
+    await writeFile(join(unitDir, "package.json"), JSON.stringify({ name: "p", scripts: { gate: "node --test", other: "x" }, dependencies: {} }, null, 2) + "\n");
+    await writeFile(join(unitDir, "tests", "a.test.mjs"), "original a\n");
+    await writeFile(join(unitDir, "tests", "b.test.mjs"), "original b\n");
+    const baseline = await commit(unitDir, "baseline");
+    await writeFile(
+      join(unitDir, "package.json"),
+      JSON.stringify({ name: "p", scripts: { gate: "true", other: "y" }, dependencies: { left: "1.0.0" } }, null, 2) + "\n",
+    );
+    await writeFile(join(unitDir, "tests", "a.test.mjs"), "rewritten a\n");
+    await writeFile(join(unitDir, "tests", "b.test.mjs"), "accepted change to b\n");
+    await writeFile(join(unitDir, "tests", "new.test.mjs"), "a new test\n");
+    await commit(unitDir, "work");
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+    const result = await new Integrator(provider, { commandRunner: new FakeCommandRunner([]) }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline, releasedPaths: ["tests/b.test.mjs"] }],
+      excludedUnits: [],
+      integrationGateCommand: ["npm", "run", "gate"],
+      requiresIntegrationGate: true,
+      protectedPaths: ["tests/a.test.mjs", "tests/b.test.mjs", "**/vitest.config.*"],
+      protectedJsonKeys: [{ file: "package.json", keys: [["scripts", "gate"], ["packageManager"]] }],
+      onProtectedChange: "restore",
+      workRoot: root,
+    });
+    expect(result.verdict).toBe("verified");
+    expect(result.protectedViolations).toEqual(["tests/a.test.mjs", "package.json#scripts.gate"]);
+    const check = join(root, "check");
+    await trackedAt(ref.gitUrl, check);
+    const pkg = JSON.parse((await run("git", ["-C", check, "show", "HEAD:package.json"])).stdout);
+    expect(pkg).toEqual({ name: "p", scripts: { gate: "node --test", other: "y" }, dependencies: { left: "1.0.0" } });
+    expect((await run("git", ["-C", check, "show", "HEAD:tests/a.test.mjs"])).stdout).toBe("original a\n");
+    expect((await run("git", ["-C", check, "show", "HEAD:tests/b.test.mjs"])).stdout).toBe("accepted change to b\n");
+    expect((await run("git", ["-C", check, "show", "HEAD:tests/new.test.mjs"])).stdout).toBe("a new test\n");
+  });
+
+  it("fails a gate run that exits 0 without executing the baseline's tests (early exit)", async () => {
+    const unitDir = join(root, "unit");
+    const baseline = await unitThatDeletes(unitDir);
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+    const baselineRunner = new FakeCommandRunner([{ match: "gate", outcome: { code: 1, stdout: "not ok 1 - a\nok 2 - b\n", stderr: "" } }]);
+    const inventory = await recordBaselineInventory({ integrationRef: ref, integrationToken: token, gateCommand: ["npm", "run", "gate"], commandRunner: baselineRunner, workRoot: root });
+    expect(inventory).toEqual({ format: "tap", count: 2, names: ["a", "b"] });
+    // The unit's code exits early: the runner reports success with test "a" never run.
+    const early = new FakeCommandRunner([{ match: "gate", outcome: { code: 0, stdout: "ok 1 - b\n", stderr: "" } }]);
+    const result = await new Integrator(provider, { commandRunner: early }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+      excludedUnits: [],
+      integrationGateCommand: ["npm", "run", "gate"],
+      requiresIntegrationGate: true,
+      testInventory: inventory!,
+      workRoot: root,
+    });
+    expect(result.verdict).toBe("failed");
+    expect(result.finalCheck.summary).toBe("integration app-gate exited 0 but did not run its tests: test inventory: 1 of the 2 baseline test(s) did not execute");
+  });
+
+  it("applies a released protected path only for the unit it was released for; never symlinks or dependency trees", async () => {
+    const base = join(root, "base");
+    await mkdir(join(base, "tests"), { recursive: true });
+    await run("git", ["-C", base, "init", "--initial-branch=main"]);
+    await writeFile(join(base, "tests", "a.test.mjs"), "original\n");
+    await writeFile(join(base, "app.js"), "app\n");
+    const baselineSha = await commit(base, "baseline");
+    const unit = async (name: string, files: Record<string, string>, extra?: (dir: string) => Promise<void>) => {
+      const dir = join(root, name);
+      await run("git", ["clone", "-q", base, dir]);
+      for (const [rel, body] of Object.entries(files)) {
+        await mkdir(dirname(join(dir, rel)), { recursive: true });
+        await writeFile(join(dir, rel), body);
+      }
+      await extra?.(dir);
+      await commit(dir, name);
+      return dir;
+    };
+    const owner = await unit("owner", { "tests/a.test.mjs": "changed by the released owner\n" });
+    const other = await unit("other", { "app.js": "app 2\n", "node_modules/x/index.js": "evil\n" }, async (dir) => {
+      await symlink("/etc/passwd", join(dir, "link.txt"));
+    });
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, base, baselineSha);
+    const integrate = (verified: VerifiedWorkspace[]) =>
+      new Integrator(provider, { commandRunner: new FakeCommandRunner([]) }).integrate({
+        integrationRef: ref,
+        integrationToken: token,
+        verified,
+        excludedUnits: [],
+        protectedPaths: ["tests/a.test.mjs"],
+        onProtectedChange: "restore",
+        deferBranchPush: true,
+        workRoot: root,
+      });
+    const released = await integrate([
+      { unitId: "owner", gitUrl: pathToFileURL(owner).href, baselineRef: baselineSha, releasedPaths: ["tests/a.test.mjs"] },
+      { unitId: "other", gitUrl: pathToFileURL(other).href, baselineRef: baselineSha },
+    ]);
+    expect(released.protectedViolations).toEqual([
+      "link.txt (a symlink: never applied)",
+      "node_modules/x/index.js (dependency or tool tree: never applied from a unit)",
+    ]);
+    // The same write from a unit it was NOT released for is refused.
+    const notReleased = await integrate([{ unitId: "owner", gitUrl: pathToFileURL(owner).href, baselineRef: baselineSha }]);
+    expect(notReleased.protectedViolations).toEqual(["tests/a.test.mjs"]);
+  });
+
+  it("never writes through a baseline symlink, and creates no directory outside the checkout", async () => {
+    const outside = join(root, "outside");
+    await mkdir(outside, { recursive: true });
+    const base = join(root, "base-link");
+    await mkdir(base, { recursive: true });
+    await run("git", ["-C", base, "init", "--initial-branch=main"]);
+    await writeFile(join(base, "app.js"), "app\n");
+    await symlink(outside, join(base, "out"));
+    const baselineSha = await commit(base, "baseline with a symlinked dir");
+    const unitDir = join(root, "unit-link");
+    await run("git", ["clone", "-q", base, unitDir]);
+    await run("git", ["-C", unitDir, "rm", "-q", "out"]);
+    await mkdir(join(unitDir, "out", "deep"), { recursive: true });
+    await writeFile(join(unitDir, "out", "deep", "f.txt"), "escape\n");
+    await commit(unitDir, "replace the link with a directory");
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, base, baselineSha);
+    const result = await new Integrator(provider, { commandRunner: new FakeCommandRunner([]) }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baselineSha }],
+      excludedUnits: [],
+      onProtectedChange: "restore",
+      workRoot: root,
+    });
+    expect(result.protectedViolations).toEqual(expect.arrayContaining(["out/deep/f.txt (resolves outside the integration checkout)"]));
+    const { readdir } = await import("node:fs/promises");
+    expect(await readdir(outside)).toEqual([]); // nothing written or created outside
+  });
+
+  it("a hook or config the gate's code plants in the checkout never runs: the push comes from a trusted repo", async () => {
+    const unitDir = join(root, "unit");
+    const baseline = await unitThatDeletes(unitDir);
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+    const marker = join(root, "hook-ran");
+    const planting = {
+      async run(_argv: readonly string[], cwd: string) {
+        const hook = `#!/bin/sh\necho "$@" > ${marker}\nexit 0\n`;
+        for (const name of ["pre-push", "post-checkout", "reference-transaction", "fsmonitor-watchman"]) {
+          await writeFile(join(cwd, ".git", "hooks", name), hook, { mode: 0o755 });
+        }
+        await run("git", ["-C", cwd, "config", "core.hooksPath", join(cwd, ".git", "hooks")]);
+        await run("git", ["-C", cwd, "config", "core.fsmonitor", join(cwd, ".git", "hooks", "fsmonitor-watchman")]);
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const result = await new Integrator(provider, { commandRunner: planting }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+      excludedUnits: [],
+      integrationGateCommand: ["gate"],
+      requiresIntegrationGate: true,
+      workRoot: root,
+    });
+    expect(result.verdict).toBe("verified");
+    const check = join(root, "check");
+    await trackedAt(ref.gitUrl, check);
+    expect((await run("git", ["-C", check, "rev-parse", "HEAD"])).stdout.trim()).toBe(result.commit);
+    const { existsSync } = await import("node:fs");
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it("a pushInsteadOf the gate plants in ~/.gitconfig or the trusted repo cannot redirect the credentialed push; no token in git's argv", async () => {
+    const unitDir = join(root, "unit");
+    const baseline = await unitThatDeletes(unitDir);
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref } = await seededIntegration(provider, unitDir, baseline);
+    const evil = join(root, "evil.git");
+    await run("git", ["init", "-q", "--bare", evil]);
+    // The integration remote is an https Artifacts URL with a token; the
+    // recording wrapper maps it to the local bare repo (no network).
+    const token = "S3CRET-integration-token";
+    const httpsRef: WorkspaceRef = { ...ref, gitUrl: "https://artifacts.example/integration.git" };
+    const fake = await installRecordingGit(root, { "https://artifacts.example/integration.git": ref.gitUrl });
+    const savedHome = process.env.HOME;
+    const home = join(root, "home");
+    await mkdir(home);
+    process.env.HOME = home;
+    const redirect = `[url "${pathToFileURL(evil).href}"]\n\tpushInsteadOf = https://artifacts.example/\n`;
+    let plantedTrusted = 0;
+    const planting = {
+      async run() {
+        // Same-user code: plant a redirect in the user's git config and in
+        // every trusted repo it can find by path.
+        await writeFile(join(home, ".gitconfig"), redirect);
+        for (const name of await readdir(tmpdir())) {
+          if (name.startsWith("scf-trusted-")) {
+            await appendFile(join(tmpdir(), name, "repo.git", "config"), redirect).then(() => (plantedTrusted += 1), () => undefined);
+          }
+        }
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    try {
+      const result = await new Integrator(provider, { commandRunner: planting }).integrate({
+        integrationRef: httpsRef,
+        integrationToken: token,
+        verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+        excludedUnits: [],
+        integrationGateCommand: ["gate"],
+        requiresIntegrationGate: true,
+        workRoot: root,
+      });
+      expect(plantedTrusted).toBeGreaterThan(0);
+      expect(result.verdict).toBe("verified");
+      const real = (await run("git", ["-C", fileURLToPath(ref.gitUrl), "rev-parse", "refs/heads/main"])).stdout.trim();
+      expect(real).toBe(result.commit);
+      expect((await run("git", ["-C", evil, "for-each-ref"])).stdout.trim()).toBe("");
+      const calls = await fake.calls();
+      expect(calls.some((c) => c.argv.includes(" push "))).toBe(true);
+      for (const call of calls) {
+        expect(call.argv).not.toContain(token);
+      }
+    } finally {
+      fake.restore();
+      process.env.HOME = savedHome;
+    }
+  });
+
+  it("a commit the gate's code makes is never pushed or recorded; a changed tested tree fails the revision", async () => {
+    const unitDir = join(root, "unit");
+    const baseline = await unitThatDeletes(unitDir);
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+    let gatedHead = "";
+    const sneaky = {
+      async run(_argv: readonly string[], cwd: string) {
+        gatedHead = (await run("git", ["-C", cwd, "rev-parse", "HEAD"])).stdout.trim();
+        await writeFile(join(cwd, "keep.txt"), "rewritten while the tests ran\n");
+        await run("git", ["-C", cwd, "-c", "user.name=x", "-c", "user.email=x@x", "commit", "-qam", "sneak"]);
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const result = await new Integrator(provider, { commandRunner: sneaky }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+      excludedUnits: [],
+      integrationGateCommand: ["gate"],
+      requiresIntegrationGate: true,
+      workRoot: root,
+    });
+    expect(result.commit).toBe(gatedHead); // the commit captured before the gate, not the sneaked one
+    expect(result.verdict).toBe("failed");
+    expect(result.finalCheck.summary).toMatch(/the gate run changed tracked files of the gated tree \(keep\.txt\)/);
+    const check = join(root, "check");
+    await trackedAt(ref.gitUrl, check);
+    expect((await run("git", ["-C", check, "rev-parse", "HEAD"])).stdout.trim()).toBe(baseline); // nothing pushed
+  });
 });
+

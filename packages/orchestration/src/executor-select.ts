@@ -23,8 +23,10 @@
  * executor, so an offline run and `make check` never call the network.
  */
 
-import type { ExecutorProvider, PlannerPlan } from "@switchyard-change/model-adapters";
+import type { BoardDigest, BoardMessage } from "@switchyard-change/change-core";
+import type { AgentTurnTransport, ExecutorProvider, PlannerPlan } from "@switchyard-change/model-adapters";
 import {
+  createAiGatewayAgentTurnInvoke,
   createAiGatewayJevInvoke,
   createAiGatewayPlannerInvoke,
   createAiGatewayRestInvoke,
@@ -58,6 +60,7 @@ export interface ExecutorEnv {
   readonly CLOUDFLARE_API_TOKEN?: string;
   readonly AI_GATEWAY_MODEL?: string;
   readonly AI_GATEWAY_PLANNER_MODEL?: string;
+  readonly AI_GATEWAY_AGENT_MODEL?: string;
   readonly AI_GATEWAY_ESCALATION_MODEL?: string;
   readonly AI_GATEWAY_ESCALATION_MODELS?: string;
   readonly AI_GATEWAY_MAX_MODEL_RETRIES?: string;
@@ -177,7 +180,7 @@ export function selectExecutor(env: ExecutorEnv = process.env): SelectedExecutor
     // the prompt building, edit parsing, and bounded same-model retry are
     // identical, and the per-attempt context.model lets the ladder pass the
     // escalation model on a verify-fail retry.
-    const executor = new WorkersAiExecutor({ model, invoke });
+    const executor = new WorkersAiExecutor({ model, invoke, providerLabel: "AI Gateway" });
     return {
       executor,
       description: `ai-gateway (base ${model}, escalation ${escalationModels.join(" -> ")})`,
@@ -345,6 +348,51 @@ export function selectPlanner(env: ExecutorEnv = process.env): SelectedPlanner {
     plan,
     baseModel,
     escalationModels,
+  };
+}
+
+/** The outcome of selecting the board agents' turn transport. */
+export interface SelectedAgentTurn {
+  /** True when turns run on a model through the AI Gateway. */
+  readonly live: boolean;
+  /** A human-readable description (no secrets). */
+  readonly description: string;
+  /** The model each turn runs on (empty when not live). */
+  readonly model: string;
+  readonly transport?: AgentTurnTransport<BoardDigest, BoardMessage>;
+}
+
+/**
+ * Select the board agents' turn transport from the environment. Like the
+ * planner it is live ONLY for EXECUTOR=ai-gateway with gateway credentials: each
+ * turn is one strict json_schema call through the gateway (the planner's path),
+ * on AI_GATEWAY_AGENT_MODEL (falling back to AI_GATEWAY_MODEL, then the
+ * default). Otherwise it is not live and no transport is returned: a live board
+ * run then refuses to start rather than silently substituting the offline
+ * policy, which only `run-board --offline` (the demo and tests) uses.
+ */
+export function selectAgentTurn(env: ExecutorEnv = process.env): SelectedAgentTurn {
+  const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
+  const gatewayUrl = (env.CLOUDFLARE_AI_GATEWAY_URL ?? "").trim();
+  const gatewayToken = (env.CLOUDFLARE_AI_GATEWAY_TOKEN ?? "").trim();
+  if (choice !== "ai-gateway" || gatewayUrl === "" || gatewayToken === "") {
+    return {
+      live: false,
+      description:
+        choice !== "ai-gateway"
+          ? "no live turn model (EXECUTOR is not ai-gateway)"
+          : "no live turn model (gateway credentials absent)",
+      model: "",
+    };
+  }
+  const model =
+    (env.AI_GATEWAY_AGENT_MODEL ?? "").trim() || (env.AI_GATEWAY_MODEL ?? "").trim() || DEFAULT_AI_GATEWAY_MODEL;
+  const invoke = createAiGatewayAgentTurnInvoke({ gatewayUrl, gatewayToken, model });
+  return {
+    live: true,
+    description: `ai-gateway agent turns (model ${model})`,
+    model,
+    transport: (input) => invoke(input),
   };
 }
 

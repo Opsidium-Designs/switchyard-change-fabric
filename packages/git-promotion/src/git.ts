@@ -7,10 +7,7 @@
  * runner, the CLI, and tests), not inside a Cloudflare Worker.
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const run = promisify(execFile);
+import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 
 /** A deterministic committer identity so promotion commits are reproducible. */
 export interface GitIdentity {
@@ -25,13 +22,13 @@ export const DEFAULT_IDENTITY: GitIdentity = {
 
 /** Run a git subcommand inside a repository and return trimmed stdout. */
 export async function git(repoDir: string, args: readonly string[]): Promise<string> {
-  const { stdout } = await run("git", ["-C", repoDir, ...args]);
+  const { stdout } = await runGit(["-C", repoDir, ...args]);
   return stdout;
 }
 
 /** Clone a remote (file:// or https) into a target directory. */
 export async function clone(remote: string, targetDir: string): Promise<void> {
-  await run("git", ["clone", remote, targetDir]);
+  await runGit(["clone", remote, targetDir]);
 }
 
 /** The current branch name of a repository. */

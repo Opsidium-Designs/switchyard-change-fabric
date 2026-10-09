@@ -1616,6 +1616,29 @@ describe("H2: the Jev typed-decision junctures (offline, faked Jev, no network)"
     }
   });
 
+  it("a failed decision call is RECORDED (with its reason), never swallowed; the parse+fallback still drives the retry", async () => {
+    const jev = async (_state: string, questions: Readonly<Record<string, { readonly type: "noul" | "choice" | "score" }>>) => {
+      if ("attribution" in questions) {
+        throw new Error("AI Gateway decision call failed for typesafe/jev (HTTP 400): Invalid value at questions.attribution.criteria");
+      }
+      throw new Error("HTTP 500: upstream unavailable");
+    };
+    const { snapshot } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      alwaysPassingUnits: ["alpha"],
+      subdir: "jev-attribution-error",
+      jev: jev as never,
+      jevThreshold: 0.75,
+    });
+    const attribution = (snapshot.jevDecisions ?? []).find((d) => d.juncture === "attribution");
+    expect(attribution).toMatchObject({ accepted: false, error: "AI Gateway decision call failed for typesafe/jev (HTTP 400): Invalid value at questions.attribution.criteria" });
+    const fix = (snapshot.jevDecisions ?? []).find((d) => d.juncture === "fix-confidence");
+    expect(fix).toMatchObject({ accepted: false, error: "HTTP 500: upstream unavailable" });
+    expect(snapshot.retryAttempts?.[0]?.implicatedUnits).toContain("beta");
+  });
+
   it("JUNCTURE (b) attribution: a low-confidence Jev choice is recorded ESCALATED and the parse+fallback still re-fans", async () => {
     // Jev is unsure (below threshold), so its choice is NOT used; the string-parse
     // + re-fan-all fallback still drives the re-fan, so the change still settles.

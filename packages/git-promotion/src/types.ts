@@ -62,6 +62,15 @@ export interface PromotionInput {
    * caller), which keeps the previous behavior.
    */
   readonly verdict?: "verified" | "failed";
+  /**
+   * The commit of the integrated tree the authoritative gate ran on. When
+   * supplied, promotion reads exactly this commit from the integration
+   * workspace (never whatever its branch head is) and verifies, before
+   * committing, that the promoted tree is byte-identical to this commit's tree
+   * (gate-equals-deploy). A missing commit or a differing tree refuses the
+   * promotion and leaves no delivery commit.
+   */
+  readonly gatedCommit?: string;
 }
 
 /** Where and how to promote the result into the local source repository. */

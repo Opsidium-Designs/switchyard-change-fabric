@@ -191,4 +191,58 @@ describe("LocalChangeControl board routes (parity with the Worker)", () => {
     await runOn(localEndpoint(other), "escalation");
     expect(other.escalations(ID)[0]).toMatchObject({ status: "resolved", decision: "agent-b" });
   });
+
+  it("a join can provision the agent's own local repo with an explicit short TTL (mirrors the Worker)", async () => {
+    const c = control();
+    expect((await call(c, "POST", `/changes/${ID}/board/human`, { type: "goal.posted", payload: { objective: "o" } })).status).toBe(201);
+    const joined = await call<{ token?: string; workspace?: Record<string, unknown>; code?: string }>(
+      c,
+      "POST",
+      `/changes/${ID}/board/join`,
+      { agent: "w1", workspace: { ttlSeconds: 600 } },
+    );
+    expect(joined.status).toBe(201);
+    expect(joined.body.token).toMatch(/^sbt_/);
+    expect(joined.body.workspace).toMatchObject({
+      workspaceName: `${ID}--board-w1`,
+      backend: "local-filesystem",
+      fallback: true,
+      gitUrl: expect.stringMatching(/^file:\/\//),
+      token: expect.stringMatching(/^local-fallback-write-/),
+    });
+    // The write token lives exactly the requested TTL.
+    const expires = Date.parse(String(joined.body.workspace!.tokenExpiresAt));
+    expect(expires - Date.parse(AT)).toBe(600_000);
+    for (const workspace of [{ ttlSeconds: 5 }, { ttlSeconds: 7200 }, {}]) {
+      const bad = await call<{ code: string }>(c, "POST", `/changes/${ID}/board/join`, { agent: "w2", workspace });
+      expect([bad.status, bad.body.code]).toEqual([400, "BAD_PAYLOAD"]);
+    }
+    const dup = await call<{ code: string }>(c, "POST", `/changes/${ID}/board/join`, { agent: "w1", workspace: { ttlSeconds: 600 } });
+    expect([dup.status, dup.body.code]).toEqual([400, "DUPLICATE"]);
+
+    // The operator's read token for a joined agent's repo (mirrors the Worker).
+    const read = await call<{ workspaceName: string; token: string }>(c, "POST", `/changes/${ID}/board/read-token`, { agent: "w1", ttlSeconds: 120 });
+    expect(read.status).toBe(201);
+    expect(read.body).toMatchObject({ workspaceName: `${ID}--board-w1`, token: expect.stringMatching(/^local-fallback-read-/) });
+    expect((await call<{ code: string }>(c, "POST", `/changes/${ID}/board/read-token`, { agent: "ghost" })).body.code).toBe("UNKNOWN_AGENT");
+    expect((await call(c, "POST", `/changes/${ID}/board/join`, { agent: "lead", role: "lead" })).status).toBe(201);
+    expect((await call<{ code: string }>(c, "POST", `/changes/${ID}/board/read-token`, { agent: "lead" })).body.code).toBe("NOT_ALLOWED");
+    const tokenId = (read.body as unknown as { tokenId: string }).tokenId;
+    expect((await call(c, "POST", `/changes/${ID}/board/read-token/revoke`, { agent: "w1", tokenId })).status).toBe(200);
+    expect(c.revokedReadTokens).toEqual([tokenId]);
+  });
+
+  it("serves the planning-first create and stamps board messages with an injected clock", async () => {
+    let tick = 0;
+    const c = new LocalChangeControl(new LocalFilesystemWorkspaceProvider({ rootDir: join(tmpdir(), "scf-lc-board-unused") }), {
+      now: () => new Date(Date.UTC(2030, 0, 1) + 1000 * tick++),
+    });
+    const created = await call<{ id: string; status: string }>(c, "POST", "/changes/planning", { id: "p1", objective: "plan first" });
+    expect([created.status, created.body]).toEqual([201, { id: "p1", status: "planning" }]);
+    expect(c.state("p1").status).toBe("planning");
+    expect((await call(c, "POST", "/changes/planning", { objective: "no id" })).status).toBe(400);
+    c.postBoardAsHuman("p1", { type: "goal.posted", payload: { objective: "o" } });
+    c.joinBoard("p1", "a");
+    expect(c.board("p1").messages.map((m) => m.at)).toEqual(["2030-01-01T00:00:00.000Z", "2030-01-01T00:00:01.000Z"]);
+  });
 });

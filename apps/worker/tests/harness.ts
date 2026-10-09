@@ -71,14 +71,14 @@ export class MemoryStorage {
 
 /** A provisioner that records every issued and revoked token. */
 export class RecordingProvisioner implements WorkspaceProvisioner {
-  readonly issued: { workspaceName: string; tokenId: string }[] = [];
+  readonly issued: { workspaceName: string; tokenId: string; ttlSeconds?: number }[] = [];
   readonly revoked: { workspaceName: string; tokenId: string }[] = [];
   private counter = 0;
 
-  async provision(workspaceName: string): Promise<ProvisionedWorkspace> {
+  async provision(workspaceName: string, options: { ttlSeconds?: number } = {}): Promise<ProvisionedWorkspace> {
     this.counter += 1;
     const tokenId = `tok-${this.counter}`;
-    this.issued.push({ workspaceName, tokenId });
+    this.issued.push({ workspaceName, tokenId, ...(options.ttlSeconds !== undefined ? { ttlSeconds: options.ttlSeconds } : {}) });
     return {
       workspaceId: `ws-${workspaceName}`,
       workspaceName,
@@ -94,7 +94,15 @@ export class RecordingProvisioner implements WorkspaceProvisioner {
   async revoke(workspaceName: string, tokenId: string): Promise<void> {
     this.revoked.push({ workspaceName, tokenId });
   }
-  async archive(_workspaceName: string): Promise<void> {}
+  readonly archived: string[] = [];
+  async archive(workspaceName: string): Promise<void> {
+    this.archived.push(workspaceName);
+  }
+  readonly readTokens: { workspaceName: string; ttlSeconds: number }[] = [];
+  async issueReadToken(workspaceName: string, ttlSeconds: number): Promise<{ tokenId: string; token: string; tokenExpiresAt: string }> {
+    this.readTokens.push({ workspaceName, ttlSeconds });
+    return { tokenId: `read-${this.readTokens.length}`, token: `read-secret-${this.readTokens.length}`, tokenExpiresAt: "2099-01-01T00:00:00.000Z" };
+  }
 }
 
 export interface Harness {

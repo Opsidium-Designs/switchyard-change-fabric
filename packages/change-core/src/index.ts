@@ -124,6 +124,8 @@ export type {
   BoardErrorCode,
   BoardEscalationRecord,
   BoardEscalationRequest,
+  BoardFailingEvidence,
+  BoardTestInventory,
   BoardFinding,
   BoardHelpRequest,
   BoardIntegratedRev,
@@ -147,6 +149,7 @@ export type {
 } from "./board.ts";
 export {
   appendBoardMessage,
+  appendDecisionRecorded,
   appendIntegratedRev,
   applyBoardEscalations,
   applyBoardMessage,
@@ -157,11 +160,14 @@ export {
   BOARD_MESSAGE_TYPES,
   BoardError,
   boardContestClosures,
+  boardContractClosures,
+  boardContractDecision,
   boardDigest,
   boardErrorStatus,
   boardEscalationRequests,
   boardMessagesAfter,
   boardResolutionForDecision,
+  checkBoardJoin,
   checkBoardTransition,
   DEFAULT_BOARD_RULES,
   emptyBoard,
@@ -169,6 +175,7 @@ export {
   LEAD_ROLE,
   parseBoardDraft,
   reduceBoard,
+  releasedTargets,
   summarizeBoard,
   verifyBoard,
 } from "./board.ts";
@@ -176,6 +183,7 @@ export {
 export {
   entriesOverlap,
   entryWithin,
+  hasWildcard,
   intentPath,
   intentWithin,
   MAX_INTENT_ENTRY_LENGTH,
@@ -194,3 +202,11 @@ export type {
   ScriptedAgent,
 } from "./board-script.ts";
 export { contestResponder, endpointPoster, pureBoardEndpoint, runBoardScript } from "./board-script.ts";
+
+export type { BoardJoinWorkspaceRequest } from "./board-join.ts";
+export {
+  BOARD_AGENT_ID_PATTERN,
+  BOARD_WORKSPACE_TTL_BOUNDS,
+  boardAgentWorkspaceName,
+  parseBoardJoinWorkspace,
+} from "./board-join.ts";

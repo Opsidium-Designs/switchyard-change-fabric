@@ -30,6 +30,7 @@
  */
 
 import { execFile } from "node:child_process";
+import { gateEnvironment } from "@switchyard-change/verification";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -43,6 +44,7 @@ import {
   LocalFilesystemWorkspaceProvider,
 } from "@switchyard-change/artifact-workspace/local";
 import type { WorkspaceRef } from "@switchyard-change/artifact-workspace";
+import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { DEFAULT_IDENTITY as RUNNER_IDENTITY, type GitIdentity } from "@switchyard-change/local-runner";
 
 const run = promisify(execFile);
@@ -169,7 +171,7 @@ async function buildAndConsumeTool(
   const toolRelPath = `tools/${requirement.editKind}-codemod.mjs`;
   const scratch = await mkdtemp(join(options.workRoot, "tool-build-"));
   try {
-    await run("git", ["clone", ref.gitUrl, scratch]);
+    await runGit(["clone", ref.gitUrl, scratch]);
     const toolAbs = join(scratch, toolRelPath);
     await mkdir(join(scratch, "tools"), { recursive: true });
     await writeFile(toolAbs, codemodSource(requirement.editKind, stamp), "utf8");
@@ -190,7 +192,7 @@ async function buildAndConsumeTool(
   const consumptions: ToolConsumptionRecord[] = [];
   const toolRunScratch = await mkdtemp(join(options.workRoot, "tool-run-"));
   try {
-    await run("git", ["clone", ref.gitUrl, toolRunScratch]);
+    await runGit(["clone", ref.gitUrl, toolRunScratch]);
     const codemodAbs = join(toolRunScratch, toolRelPath);
     // Map each consumer to the concrete file it declares (the fan-out surface).
     for (const consumerId of consumerIds) {
@@ -205,7 +207,13 @@ async function buildAndConsumeTool(
       await mkdir(sampleDir, { recursive: true });
       const sampleAbs = join(sampleDir, "sample.mjs");
       await writeFile(sampleAbs, sampleSource(consumerId), "utf8");
-      const { stdout } = await run("node", [codemodAbs, sampleAbs]);
+      // A tool is code: it runs with the allowlisted environment, never credentials.
+      const { stdout } = await run("node", [codemodAbs, sampleAbs], {
+        cwd: sampleDir,
+        env: gateEnvironment(),
+        timeout: 60_000,
+        killSignal: "SIGKILL",
+      });
       const after = await readFile(sampleAbs, "utf8");
       const changed = after.includes(guardMarker(requirement.editKind)) && stdout.includes("codemod:");
       consumptions.push({
@@ -325,8 +333,8 @@ async function commitAndPush(
   identity: GitIdentity,
   message: string,
 ): Promise<void> {
-  await run("git", ["-C", worktreeDir, "add", "-A"]);
-  await run("git", [
+  await runGit(["-C", worktreeDir, "add", "-A"]);
+  await runGit([
     "-C",
     worktreeDir,
     "-c",
@@ -341,5 +349,5 @@ async function commitAndPush(
   // The local fallback uses a file:// remote that needs no credential; the token
   // is threaded through for parity with the live path, not required here.
   void token;
-  await run("git", ["-C", worktreeDir, "push", ref.gitUrl, `HEAD:${ref.defaultBranch}`]);
+  await runGit(["-C", worktreeDir, "push", ref.gitUrl, `HEAD:${ref.defaultBranch}`]);
 }

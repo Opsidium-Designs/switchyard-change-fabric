@@ -526,6 +526,29 @@ describe("JUNCTURE (a) PLAN REVIEW: accept-when-confident / escalate-when-unsure
     expect(result.change.work.length).toBeGreaterThan(0);
   });
 
+  it("records a failed decision call on the plan (never silent) and proceeds unreviewed", async () => {
+    const result = await decomposeGoal({
+      goal: "Add input validation and require auth on every resource",
+      projectDir,
+      planner: {
+        plan: fixedPlan,
+        baseModel: "gpt-4o-mini",
+        jev: async () => {
+          throw new Error("AI Gateway decision call failed for typesafe/jev (HTTP 400): Invalid value at questions.x\nmore");
+        },
+        jevThreshold: 0.75,
+      },
+      changeId: "change-service-jev-error",
+    });
+    expect(result.change.plan?.source).toBe("planner");
+    expect(result.change.plan?.jevReview).toMatchObject({
+      accepted: false,
+      error: "AI Gateway decision call failed for typesafe/jev (HTTP 400): Invalid value at questions.x",
+    });
+    const reloaded = parseChangeSpec(changeToSpecYaml(result.change));
+    expect(reloaded.plan?.jevReview?.error).toMatch(/HTTP 400/);
+  });
+
   it("escalates on a confident-NO plan-review (a confident no is not an accept)", async () => {
     const result = await decomposeGoal({
       goal: "Add input validation and require auth on every resource",

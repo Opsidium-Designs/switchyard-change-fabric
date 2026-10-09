@@ -40,8 +40,14 @@ import {
   projectHasGateScript,
   readAppDeployment,
   recordAppDeployment,
+  boardSeedFromChange,
+  formatBoardRunSummary,
+  formatBoardTranscript,
+  runBoard,
+  runBoardOffline,
   runChange,
   runDoctor,
+  selectAgentTurn,
   runFullLive,
   runRecruitment,
   runRecruitmentLive,
@@ -57,6 +63,8 @@ import {
   type RePlanTransport,
   type TeardownApp,
   redactSecrets,
+  ChildProcessCommandRunner,
+  runJevSmoke,
 } from "@switchyard-change/orchestration";
 import { DiscoveringExecutor } from "@switchyard-change/model-adapters";
 
@@ -93,6 +101,24 @@ function resolveProjectDir(specPath: string, args: string[]): string {
 }
 
 const commands: Command[] = [
+  {
+    name: "jev-smoke",
+    summary: "Live check: ask the decision model one noul, one choice, and one score question and print pass/fail (needs EXECUTOR=ai-gateway and credentials).",
+    usage: `${CLI_NAME} jev-smoke`,
+    async run() {
+      const jev = selectJev();
+      if (!jev.live || !jev.ask) {
+        console.error(`jev-smoke: the decision model is not configured (${jev.description})`);
+        return 1;
+      }
+      console.log(`jev-smoke: ${jev.description}`);
+      const results = await runJevSmoke(jev.ask);
+      for (const r of results) {
+        console.log(redactSecrets(`  ${r.ok ? "PASS" : "FAIL"} ${r.type}: ${r.detail}`));
+      }
+      return results.every((r) => r.ok) ? 0 : 1;
+    },
+  },
   {
     name: "doctor",
     summary: "Check local prerequisites and print a readiness report.",
@@ -776,6 +802,263 @@ const commands: Command[] = [
         console.log(`    make clean-live   (or: ${CLI_NAME} cleanup-live --change-id ${result.changeId} --worker ${result.workerUrl})`);
       }
       return result.promotion.committed && result.completed.length === change.work.length ? 0 : 1;
+    },
+  },
+  {
+    name: "run-board",
+    summary:
+      "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
+    usage:
+      `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--id <changeId>] ` +
+      `[--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--lockstep] [--gate|--no-gate] [--watch] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+    async run(args) {
+      const projectDir = requireProjectDir(args);
+      const goal = await resolveGoal(args);
+      if (!projectDir || goal === undefined || goal === "") {
+        console.error(
+          `Usage: ${CLI_NAME} run-board "<goal text>" --project <dir> [--offline] [--worker <url>]\n` +
+            `   or: ${CLI_NAME} run-board --goal-file <goal.txt> --project <dir> [--offline] [--worker <url>]`,
+        );
+        return 1;
+      }
+      const dial = dialFromArgs(args);
+      const intFlag = (flag: string): number | undefined => {
+        const raw = optionValue(args, flag);
+        if (raw === undefined) {
+          return undefined;
+        }
+        const value = Number(raw);
+        if (!Number.isInteger(value) || value < 1) {
+          throw new Error(`${flag} must be a positive integer`);
+        }
+        return value;
+      };
+      const budgets = {
+        ...(intFlag("--item-turns") !== undefined ? { maxTurnsPerItem: intFlag("--item-turns")! } : {}),
+        ...(intFlag("--max-turns") !== undefined ? { maxRunTurns: intFlag("--max-turns")! } : {}),
+        ...(intFlag("--timeout-ms") !== undefined ? { timeoutMs: intFlag("--timeout-ms")! } : {}),
+        ...(intFlag("--fix-attempts") !== undefined ? { maxFixAttemptsPerItem: intFlag("--fix-attempts")! } : {}),
+        ...(intFlag("--quiet-ms") !== undefined ? { quiescenceMs: intFlag("--quiet-ms")! } : {}),
+      };
+      const gateTimeoutRaw = optionValue(args, "--gate-timeout-ms");
+      const gateTimeoutMs = gateTimeoutRaw === undefined ? undefined : Number(gateTimeoutRaw);
+      if (gateTimeoutMs !== undefined && (!Number.isInteger(gateTimeoutMs) || gateTimeoutMs < 1000)) {
+        console.error("Error: --gate-timeout-ms must be an integer of at least 1000");
+        return 1;
+      }
+      const gateWiring = buildAppGateWiring({
+        projectHasGate: await projectHasGateScript(projectDir),
+        ...(gateTimeoutMs !== undefined ? { commandRunner: new ChildProcessCommandRunner({ timeoutMs: gateTimeoutMs }) } : {}),
+        ...(gateFlagFromArgs(args) !== undefined ? { gateFlag: gateFlagFromArgs(args)! } : {}),
+        executorLive: false,
+        escalationModel: "",
+        escalationModels: [],
+        baseModel: "",
+        maxModelRetries: 0,
+      });
+      const appGateCommand = gateWiring.enabled ? gateWiring.appGateCommandFor?.("") : undefined;
+      // A contract change to the original tests is a HUMAN decision. The
+      // operator gives it non-interactively with --decide-contracts (the
+      // run-board counterpart of run-live's --owner); without it each decision
+      // waits durably for the console or the escalation resolve route.
+      const decideFlag = optionValue(args, "--decide-contracts");
+      if (decideFlag !== undefined && decideFlag !== "accept" && decideFlag !== "reject") {
+        console.error("Error: --decide-contracts must be accept or reject");
+        return 1;
+      }
+      const contractOptions =
+        decideFlag !== undefined
+          ? {
+              resolveContract: async (request: { readonly contract: string; readonly path?: string }) => {
+                console.log(`  human decision (--decide-contracts): ${decideFlag} contract ${request.contract}${request.path ? ` on ${request.path}` : ""}`);
+                return decideFlag as "accept" | "reject";
+              },
+            }
+          : {};
+      const gateOptions = {
+        ...(appGateCommand && appGateCommand.length > 0 ? { appGateCommand } : {}),
+        ...(gateWiring.requireAppGate ? { requireAppGate: true } : {}),
+        ...(gateWiring.verifyCommandRunner ? { verifyCommandRunner: gateWiring.verifyCommandRunner } : {}),
+      };
+      const gateLine = appGateCommand
+        ? `per-app gate ON (${appGateCommand.join(" ")})`
+        : gateWiring.requireAppGate
+          ? "per-app gate REQUIRED but disabled by --no-gate: the verdict cannot pass"
+          : "per-app gate OFF (no gate script for this project)";
+
+      if (hasFlag(args, "--offline")) {
+        // The offline board run: no network, no credentials. The heuristic
+        // decomposition is the lead's planner and a deterministic, goal-agnostic
+        // policy takes every agent turn. Labelled as such, never a live run.
+        // --fixture-gate (only for a project without a gate of its own) wires the
+        // generic offline gate FIXTURE so the run shows the fix loop.
+        const fixtureGate = hasFlag(args, "--fixture-gate") && !appGateCommand && !gateWiring.requireAppGate;
+        console.log("Offline board run (no network, deterministic)");
+        console.log("  planner: heuristic decomposition (offline stub)");
+        console.log("  agent turns: generic deterministic policy (offline stand-in for the turn model)");
+        console.log("  executor: scoped deterministic noop; workspaces: local fallback repos");
+        console.log(
+          `  dial: min ${dial.minConcurrency}, max ${dial.maxConcurrency}; ` +
+            (fixtureGate
+              ? "gate: the generic offline gate FIXTURE (fails the first revision, naming a file it changed; passes once that file is fixed), not a project gate"
+              : gateLine),
+        );
+        console.log("");
+        const result = await runBoardOffline({
+          goal,
+          projectDir,
+          ...(optionValue(args, "--id") ? { changeId: optionValue(args, "--id")! } : {}),
+          dial,
+          budgets,
+          ...gateOptions,
+          ...contractOptions,
+          ...(fixtureGate ? { fixtureGate: true } : {}),
+        });
+        console.log("Board transcript:");
+        console.log(redactSecrets(formatBoardTranscript(result.log)));
+        console.log("");
+        console.log(redactSecrets(formatBoardRunSummary(result)));
+        return result.verdict === "verified" && result.incompleteItems.length === 0 ? 0 : 1;
+      }
+
+      // A live board run: the turn model, the planner, and the executor all run
+      // through the AI Gateway. Without a live turn model the run refuses; the
+      // offline policy is never a silent live substitute.
+      const turn = selectAgentTurn();
+      if (!turn.live || !turn.transport) {
+        console.error(
+          `Error: a live board run needs a live turn model, but none is available (${turn.description}). ` +
+            "Set EXECUTOR=ai-gateway with CLOUDFLARE_AI_GATEWAY_URL and CLOUDFLARE_AI_GATEWAY_TOKEN, or pass --offline.",
+        );
+        return 1;
+      }
+      let selected;
+      try {
+        selected = selectExecutor();
+      } catch (error) {
+        console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      }
+      if (!enforceLivePlanner(args)) {
+        return 1;
+      }
+      const planner = plannerInjectionFromEnv();
+      const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
+      const changeId = optionValue(args, "--id") ?? `change-board-${Date.now().toString(36)}`;
+      const deployAppDir = optionValue(args, "--deploy-app");
+      const deployAppBase = deployAppDir ? (deployAppDir.replace(/[/\\]+$/, "").split(/[/\\]/).pop() ?? "") : "";
+      const deployAppName =
+        optionValue(args, "--deploy-app-name") ?? (deployAppBase ? stableAppWorkerName(deployAppBase) : undefined);
+      const ttlRaw = optionValue(args, "--token-ttl");
+      console.log(`Board run for ${changeId} under dial min ${dial.minConcurrency}, max ${dial.maxConcurrency} against Worker ${workerUrl}`);
+      console.log(`  agent turns: ${turn.description}`);
+      console.log(`  executor: ${selected.description}`);
+      console.log(`  ${gateLine}`);
+      console.log("");
+      const result = await runBoard({
+        goal,
+        projectDir,
+        changeId,
+        workerUrl,
+        dial,
+        transport: turn.transport,
+        executor: selected.executor,
+        ...(selected.escalationModels.length > 0 ? { escalationModels: selected.escalationModels } : {}),
+        ...contractOptions,
+        ...(() => {
+          // The typed-decision layer, when live, only narrows failure
+          // attribution (advisory); it never decides a verdict.
+          const jev = selectJev();
+          return jev.live && jev.ask ? { jev: jev.ask, jevThreshold: jev.threshold } : {};
+        })(),
+        seed: async (text) => {
+          const decomposition = await decomposeGoal({ goal: text, projectDir, ...(planner ? { planner } : {}) });
+          if (decomposition.change.plan?.source === "heuristic-fallback") {
+            console.error(plannerFallbackBanner());
+          }
+          return boardSeedFromChange(decomposition.change);
+        },
+        schedule: hasFlag(args, "--lockstep") ? "lockstep" : "concurrent",
+        budgets,
+        ...(ttlRaw !== undefined ? { workspaceTtlSeconds: Number(ttlRaw) } : {}),
+        ...gateOptions,
+        ...(hasFlag(args, "--watch") ? { skipCleanup: true } : {}),
+        ...(deployAppDir ? { deployAppDir: resolve(deployAppDir) } : {}),
+        ...(deployAppName ? { deployAppName } : {}),
+        ...(deployAppDir ? { deployApp: (async ({ appDir }) => ({ url: await wranglerDeploy(appDir) })) as DeployApp } : {}),
+        ...(deployAppBase
+          ? { appAlreadyDeployed: async () => (await readAppDeployment(repoRoot(), deployAppBase))?.url }
+          : {}),
+        onEvent: (event) => {
+          switch (event.kind) {
+            case "change-created":
+              console.log(`Change ${event.changeId} created.`);
+              break;
+            case "goal-posted":
+              console.log(`  goal posted; contract (existing tests, gate configuration): ${event.protected.join(", ")}`);
+              console.log(`  baseline gate inventory: ${event.testInventory}`);
+              break;
+            case "contract-awaiting-human":
+              console.log(
+                `  contract ${event.contract}${event.path ? ` on ${event.path}` : ""} waits for a human decision: resolve escalation ${event.escalationId} in the console or POST /changes/${changeId}/escalations/${event.escalationId}/resolve {"decision":"accept"|"reject"}`,
+              );
+              break;
+            case "contract-decision":
+              console.log(`  contract ${event.contract}${event.path ? ` on ${event.path}` : ""}: ${event.decision} (human)`);
+              break;
+            case "seeded":
+              console.log(`  lead seeded ${event.items} item(s) (planner: ${event.source}${event.model ? `, ${event.model}` : ""})`);
+              break;
+            case "agent-joined":
+              console.log(`  ${event.agent} joined (${event.role})${event.workspace ? ` with repo ${event.workspace} (${event.backend})` : ""}`);
+              break;
+            case "turn": {
+              const r = event.record;
+              const what = r.action.type === "wait" ? `wait (${r.action.reason})` : r.action.type;
+              console.log(redactSecrets(`  [${r.agent}] turn ${r.turn}: ${what} -> ${r.outcome}${r.code ? ` ${r.code}: ${r.error ?? ""}` : ""}`));
+              break;
+            }
+            case "agent-stopped":
+              console.log(`  ${event.agent} stopped: ${event.stop.detail}`);
+              break;
+            case "agents-done":
+              console.log(`Agent phase ended: ${event.reason}${event.detail ? ` (${event.detail})` : ""}.`);
+              break;
+            case "integrated": {
+              const r = event.revision;
+              console.log(
+                `  integrated revision ${r.n}: gate ${r.gate}, merged ${r.merged.length} push(es)` +
+                  (r.implicated ? `; implicated (${r.implicated.source}) ${r.implicated.items.join(", ")}` : "") +
+                  (r.fixRequested && r.fixRequested.length > 0 ? `; fix requested from the owners of ${r.fixRequested.join(", ")}` : ""),
+              );
+              if (r.failure) {
+                console.log(redactSecrets(`    failure: ${r.failure}`));
+              }
+              break;
+            }
+            case "integration-not-recorded":
+              console.log(`  integration recorded no revision: ${event.reason}`);
+              break;
+            case "promotion-skipped":
+              console.log(`  promotion skipped: ${event.reason}`);
+              break;
+            case "redeployed":
+              console.log(`  redeployed in place: ${event.url}`);
+              break;
+            case "deploy-skipped":
+              console.log(`  deploy skipped: ${event.reason}`);
+              break;
+            default:
+              break;
+          }
+        },
+      });
+      console.log("");
+      console.log("Board transcript:");
+      console.log(redactSecrets(formatBoardTranscript(result.log)));
+      console.log("");
+      console.log(redactSecrets(formatBoardRunSummary(result)));
+      return result.verdict === "verified" && result.promotion?.committed && result.incompleteItems.length === 0 ? 0 : 1;
     },
   },
   {

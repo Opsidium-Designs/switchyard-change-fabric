@@ -8,11 +8,16 @@
  * clock, no randomness.
  *
  * Supported glob syntax (a small, predictable subset):
- *   - "**"  matches any number of path segments, including none
+ *   - "**"  matches any number of WHOLE path segments, including none:
+ *           "src/**" matches "src" and everything under it, "src/**\/x"
+ *           matches "src/x", "src/a/x", and "src/a/b/x" (never "srcx" or
+ *           "src/ax"), and a leading "**\/x" matches "x" at any depth
  *   - "*"   matches any run of characters within a single path segment
  *   - "?"   matches a single character within a path segment
  * Any other character matches literally. Paths are compared with forward
- * slashes.
+ * slashes. A "**" that shares a segment with other characters (for example
+ * "src/**x") is not a whole-segment wildcard and keeps its loose reading (any
+ * run of characters, across segments).
  */
 
 /** Returns true when `path` matches the glob `pattern`. */
@@ -47,9 +52,25 @@ export function partitionByScope(
   return { inScope, outOfScope };
 }
 
+/**
+ * Collapse runs of consecutive "**" segments ("a/**\/**" is "a/**", and a
+ * leading "**\/**\/" is "**\/"): they name the same paths, and collapsing them
+ * keeps the whole-segment translation below simple.
+ */
+function collapseDoubleStars(pattern: string): string {
+  let out = pattern;
+  for (;;) {
+    const next = out.replace(/\/\*\*\/\*\*(?=\/|$)/g, "/**").replace(/^\*\*\/\*\*(?=\/|$)/, "**");
+    if (next === out) {
+      return out;
+    }
+    out = next;
+  }
+}
+
 /** Translate a glob pattern into an anchored regular-expression source. */
 function globToRegExpSource(pattern: string): string {
-  const normalized = normalize(pattern);
+  const normalized = collapseDoubleStars(normalize(pattern));
   let out = "";
   for (let i = 0; i < normalized.length; i += 1) {
     const char = normalized[i] ?? "";
@@ -58,17 +79,28 @@ function globToRegExpSource(pattern: string): string {
     if (char === "/" && normalized[i + 1] === "*" && normalized[i + 2] === "*") {
       out += "(/.*)?";
       i += 2;
-      // Swallow a trailing slash after ** (for example "src/**/").
       if (normalized[i + 1] === "/") {
-        i += 1;
+        if (i + 2 >= normalized.length) {
+          // A trailing "/**/" is the same as "/**".
+          i += 1;
+        }
+        // Otherwise "/**/" keeps its closing slash as a literal, so the "**"
+        // spans whole segments only: "src/**/x" is "src(/.*)?/x".
       }
     } else if (char === "*") {
       if (normalized[i + 1] === "*") {
-        // A leading or standalone "**" matches across segment boundaries.
-        out += ".*";
-        i += 1;
-        if (normalized[i + 1] === "/") {
+        if (i === 0 && normalized[i + 2] === "/") {
+          // A leading "**/" is zero or more whole leading segments.
+          out += "(.*/)?";
+          i += 2;
+        } else {
+          // A "**" sharing its segment with other characters matches across
+          // segment boundaries (its loose reading).
+          out += ".*";
           i += 1;
+          if (normalized[i + 1] === "/") {
+            i += 1;
+          }
         }
       } else {
         // A single "*" matches within one segment (no slash).

@@ -311,6 +311,15 @@ describe("WorkersAiExecutor", () => {
     ).rejects.toThrow(UnusableModelOutputError);
   });
 
+  it("names the inference path it actually ran through in its failures", async () => {
+    const invoke: WorkersAiInvoke = async () => ({ text: JSON.stringify({ edits: [] }) });
+    const context = { worktreeDir: worktree, workUnitId: "x", objective: "add x", paths: ["src/x.ts"], baselineRef: "HEAD" };
+    await expect(new WorkersAiExecutor({ invoke, model: "gpt-4o", providerLabel: "AI Gateway" }).execute(context)).rejects.toThrow(
+      /^AI Gateway model gpt-4o returned no usable edit/,
+    );
+    await expect(new WorkersAiExecutor({ invoke, model: "m" }).execute(context)).rejects.toThrow(/^Workers AI model m returned no usable edit/);
+  });
+
   it("fails honestly when the model returns valid JSON with zero edits", async () => {
     const invoke: WorkersAiInvoke = async () => ({ text: JSON.stringify({ edits: [] }) });
     await expect(

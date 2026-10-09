@@ -35,8 +35,11 @@ export type {
   CommandOutcome,
   CommandRunner,
 } from "./command.ts";
+export type { ChildProcessCommandRunnerOptions } from "./command.ts";
 export {
   ChildProcessCommandRunner,
+  DEFAULT_COMMAND_TIMEOUT_MS,
+  gateEnvironment,
   MAX_CAPTURED_CHARS,
   boundOutput,
 } from "./command.ts";
@@ -44,6 +47,7 @@ export {
 export { matchesAny, matchesGlob, partitionByScope } from "./pathscope.ts";
 
 export type { GitIdentity } from "./git.ts";
+export { withoutCredentials } from "./git.ts";
 export { DEFAULT_IDENTITY } from "./git.ts";
 
 export type {
@@ -57,7 +61,9 @@ export type {
   IntegratorOptions,
   VerifiedWorkspace,
 } from "./integrator.ts";
-export { Integrator } from "./integrator.ts";
+export { advanceIntegrationBranch, GATED_REF_PREFIX, gatedRef, Integrator, recordBaselineInventory } from "./integrator.ts";
+export type { TestInventory } from "./test-inventory.ts";
+export { inventoryAfterContracts, inventoryShortfall, readStreamInventory, readTestInventory } from "./test-inventory.ts";
 
 export type {
   CompletedWorkUnit,

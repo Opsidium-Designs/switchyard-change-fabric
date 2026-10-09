@@ -126,6 +126,8 @@ export interface PlanReviewDecision {
   readonly confidence: number;
   readonly accepted: boolean;
   readonly probabilities?: Readonly<Record<string, number>>;
+  /** Set when the decision call failed: a short, credential-free reason (the plan proceeds unreviewed). */
+  readonly error?: string;
 }
 
 /** The recorded plan: the shape that drove the Change, plus its provenance. */
@@ -348,7 +350,9 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
       const withReview: PlanGoalResult = review
         ? attachJevReview(projected, review)
         : projected;
-      if (!review || review.accepted) {
+      // A failed decision call is recorded on the plan but never escalates it
+      // (the plan proceeds unreviewed, as before).
+      if (!review || review.accepted || review.error !== undefined) {
         return withReview;
       }
       // Escalated: remember this candidate and try the next model in the ladder.
@@ -407,12 +411,13 @@ async function reviewPlan(
   let answers: Awaited<ReturnType<JevTransport>>;
   try {
     answers = await jev(state, { "plan-review": { type: "noul", instructions: question } });
-  } catch {
-    return null;
+  } catch (error) {
+    // A failed call never fails the plan, but it is RECORDED (never silent).
+    return { question, noul: "unsure", confidence: 0, accepted: false, error: shortReason(error) };
   }
   const answer = answers["plan-review"];
   if (!answer || answer.type !== "noul" || answer.noul === undefined) {
-    return null;
+    return { question, noul: "unsure", confidence: 0, accepted: false, error: "the decision reply carried no plan-review answer" };
   }
   const confident = answer.confidence >= threshold;
   // Accepted only when the plan is a CONFIDENT YES. A confident "no", an
@@ -425,6 +430,13 @@ async function reviewPlan(
     accepted,
     ...(answer.probabilities !== undefined ? { probabilities: answer.probabilities } : {}),
   };
+}
+
+/** A short, credential-free reason for a failed decision call (first line, bounded). */
+function shortReason(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  const line = text.split(/\r?\n/).find((l) => l.trim() !== "") ?? "decision call failed";
+  return line.replace(/Bearer\s+\S+/gi, "Bearer [redacted]").replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1***@").slice(0, 200);
 }
 
 /** Carry a recorded plan-review decision onto a plan result's RecordedPlan. */

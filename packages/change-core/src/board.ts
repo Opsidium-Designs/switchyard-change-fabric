@@ -32,6 +32,7 @@
 
 import {
   entriesOverlap,
+  entryWithin,
   hasWildcard,
   intentPath,
   intentWithin,
@@ -59,9 +60,14 @@ export interface BoardRules {
   readonly maxContestTurns: number;
   /** Board messages a contest may sit with no party acting before it escalates. */
   readonly contestIdleMessages: number;
+  /**
+   * Fix requests a failing integrated revision may send for one item before the
+   * engine records the item's fix budget as exhausted instead.
+   */
+  readonly maxFixAttempts: number;
 }
 
-export const DEFAULT_BOARD_RULES: BoardRules = { maxContestTurns: 3, contestIdleMessages: 25 };
+export const DEFAULT_BOARD_RULES: BoardRules = { maxContestTurns: 3, contestIdleMessages: 25, maxFixAttempts: 2 };
 
 /** Hard bounds that keep a board's work and storage finite. */
 export const BOARD_LIMITS = {
@@ -80,6 +86,10 @@ export const BOARD_LIMITS = {
   maxObjective: 500,
   maxAcceptance: 20,
   maxRationale: 2000,
+  /** Failing gate output a failing integrated revision may carry, in characters. */
+  maxFailingOutput: 8192,
+  /** Repo-relative paths a goal may declare protected (never writable by an agent). */
+  maxProtected: 512,
   /** Largest request body a board route accepts, in bytes. */
   maxBodyBytes: 65536,
 } as const;
@@ -113,8 +123,46 @@ export interface BoardFinding {
 }
 
 /** The payload of each message type. */
+/** The baseline gate run's executed-test inventory, as posted with the goal. */
+export interface BoardTestInventory {
+  readonly status: "recorded" | "unavailable";
+  readonly format?: string;
+  /** How many tests the baseline run executed. (Names stay with the integrator, never on the board.) */
+  readonly count?: number;
+}
+
+/** The failing evidence a failing integrated revision carries. */
+export interface BoardFailingEvidence {
+  /** The gate's failing output, bounded and stripped of credentials by the integrator. */
+  readonly output: string;
+  /** The items the integrator's attribution implicated (all of the revision's items when it could not narrow). */
+  readonly items: readonly string[];
+}
+
 export interface BoardPayloads {
-  "goal.posted": { readonly objective: string; readonly rules: BoardRules };
+  "goal.posted": {
+    readonly objective: string;
+    readonly rules: BoardRules;
+    /**
+     * Paths and globs no agent may write: the files that define the gate (the
+     * gate's own test files and directory, the project manifest and lockfile).
+     * Posted with the goal so the protected set is visible on the board; claims
+     * overlapping it are refused and items cannot be scoped inside it.
+     */
+    readonly protected?: readonly string[];
+    /**
+     * Keys inside otherwise editable files that define the gate (for example
+     * the manifest's gate scripts), shown for visibility. Claims are not
+     * checked against them; the integrator restores them before the gate runs.
+     */
+    readonly protectedKeys?: readonly string[];
+    /**
+     * What the BASELINE gate run executed (recorded at goal time): every later
+     * revision must execute at least these tests. `unavailable` means the gate's
+     * output could not be read, so revisions fall back to the exit code.
+     */
+    readonly testInventory?: BoardTestInventory;
+  };
   "item.proposed": {
     readonly item: string;
     readonly objective: string;
@@ -157,6 +205,8 @@ export interface BoardPayloads {
     readonly objective: string;
     readonly reason: string;
     readonly parent?: string;
+    /** The paths a claim on the discovered item may write (claims must stay within). */
+    readonly scopeHint?: readonly string[];
   };
   "help.requested": { readonly request: string; readonly item: string; readonly need: string };
   "help.offered": { readonly request: string };
@@ -164,7 +214,16 @@ export interface BoardPayloads {
     readonly contract: string;
     readonly target: string;
     readonly kind: "add" | "modify" | "remove";
+    /**
+     * The item the change is for. An ACCEPTED contract whose target covers
+     * protected paths makes exactly those paths writable for this item (and the
+     * integrator stops restoring them): a changed existing test is a contract
+     * change the lead or a human decides, never an agent alone.
+     */
+    readonly item?: string;
   };
+  /** Engine: a contract on a protected path waits for a HUMAN decision (an escalation). */
+  "contract.escalated": { readonly contract: string; readonly item: string; readonly target: string; readonly kind: "add" | "modify" | "remove" };
   "contract.accepted": { readonly contract: string };
   "contract.rejected": { readonly contract: string };
   "push.announced": { readonly item: string; readonly commit: string; readonly paths: readonly string[] };
@@ -178,6 +237,8 @@ export interface BoardPayloads {
     readonly paths: readonly string[];
     /** Derived: the agents whose pushes were merged. */
     readonly contributors: readonly string[];
+    /** A failing revision's evidence: the bounded gate output and the implicated items. */
+    readonly failing?: BoardFailingEvidence;
   };
   "rebase.needed": { readonly agent: string; readonly n: number; readonly paths: readonly string[] };
   "review.requested": { readonly review: string; readonly item: string };
@@ -189,6 +250,16 @@ export interface BoardPayloads {
   };
   "done.proposed": { readonly item: string; readonly commit?: string };
   "item.completed": { readonly item: string; readonly n: number; readonly via: "integrated" | "children" };
+  /** Engine: a failing revision implicated this item; its owner is asked (`to`) for fix `attempt`. */
+  "fix.requested": { readonly item: string; readonly n: number; readonly attempt: number };
+  /** Engine: a failing revision implicated this item after its fix budget was spent. */
+  "fix.exhausted": { readonly item: string; readonly n: number; readonly attempts: number };
+  /**
+   * Engine: after its owner spent the fix budget the item is reopened for a
+   * DIFFERENT agent (fresh eyes), who starts from the previous owner's latest
+   * push (`commit`); the previous owner may not claim it again.
+   */
+  "item.reopened": { readonly item: string; readonly previousOwner: string; readonly commit?: string; readonly n: number };
   "tool.proposed": {
     readonly tool: string;
     readonly capability: string;
@@ -207,6 +278,19 @@ export interface BoardPayloads {
     readonly capability: string;
     readonly version: string;
     readonly changedFiles: readonly string[];
+  };
+  /**
+   * Engine: one ADVISORY typed decision (a plan review, a failure attribution,
+   * a fix-confidence check) and its outcome, recorded for visibility. It never
+   * affects arbitration, completion, or the verdict.
+   */
+  "decision.recorded": {
+    readonly juncture: "plan-review" | "attribution" | "fix-confidence";
+    readonly question: string;
+    readonly answer?: string;
+    readonly confidence?: number;
+    readonly accepted: boolean;
+    readonly error?: string;
   };
   "agent.joined": { readonly role?: string };
   "agent.left": Record<string, never>;
@@ -231,6 +315,7 @@ export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "help.requested",
   "help.offered",
   "contract.proposed",
+  "contract.escalated",
   "contract.accepted",
   "contract.rejected",
   "push.announced",
@@ -241,9 +326,13 @@ export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "handoff",
   "done.proposed",
   "item.completed",
+  "fix.requested",
+  "fix.exhausted",
+  "item.reopened",
   "tool.proposed",
   "tool.published",
   "tool.used",
+  "decision.recorded",
   "agent.joined",
   "agent.left",
 ];
@@ -300,6 +389,9 @@ export type BoardErrorCode =
   | "CONTEST_CLOSED"
   | "INTENT_OVERLAP"
   | "OUTSIDE_INTENT"
+  | "OUTSIDE_SCOPE"
+  | "PROTECTED"
+  | "CONTRACT_REJECTED"
   | "NOT_WITHIN"
   | "INVALID_STATE"
   | "LIMIT"
@@ -357,6 +449,20 @@ export interface BoardItem {
   doneProposed: boolean;
   lastPush?: BoardItemPush;
   completed?: { readonly n: number; readonly via: "integrated" | "children" };
+  /** Fix requests failing revisions sent for this item so far. */
+  fixAttempts?: number;
+  /** The failing revision whose fix request is still unanswered (cleared by the owner's next push). */
+  fixRequested?: number;
+  /** A failing revision implicated the item after its fix budget was spent. */
+  fixExhausted?: boolean;
+  /** Agents that spent this item's fix budget: they may not claim it again. */
+  exhaustedBy?: string[];
+  /** The previous owner's latest push a reopened item starts from. */
+  reopenedFrom?: { readonly agent: string; readonly commit?: string };
+  /** The seq at which a human last rejected a contract change for this item. */
+  contractRejectedSeq?: number;
+  /** The seq of the latest failing revision whose evidence implicated this item. */
+  implicatedSeq?: number;
 }
 
 export type BoardContestStatus = "open" | "escalated" | "resolved";
@@ -399,6 +505,9 @@ export interface BoardContract {
   readonly contract: string;
   readonly target: string;
   readonly kind: "add" | "modify" | "remove";
+  readonly item?: string;
+  /** The target is part of the gate's contract: only a human decides it. */
+  readonly guarded?: boolean;
   readonly proposedBy: string;
   status: "proposed" | "accepted" | "rejected";
   decidedBy?: string;
@@ -465,6 +574,16 @@ export interface BoardState {
   lastRevN: number;
   /** Every passing revision number, ascending. */
   passingRevs: number[];
+  /** Paths no agent may write, as posted with the goal. */
+  protected: string[];
+  /** Gate-defining keys inside editable files, as posted with the goal (display only). */
+  protectedKeys: string[];
+  /** The baseline gate run's test inventory, as posted with the goal. */
+  testInventory: BoardTestInventory | null;
+  /** Advisory typed decisions recorded: how many, accepted, and failed calls. */
+  decisions: { calls: number; accepted: number; errors: number };
+  /** The latest failing revision's evidence (bounded), or null. */
+  lastFailure: ({ readonly n: number } & BoardFailingEvidence) | null;
 }
 
 /** An empty board. */
@@ -484,6 +603,11 @@ export function emptyBoard(): BoardState {
     integrated: null,
     lastRevN: 0,
     passingRevs: [],
+    protected: [],
+    protectedKeys: [],
+    testInventory: null,
+    decisions: { calls: 0, accepted: 0, errors: 0 },
+    lastFailure: null,
   };
 }
 
@@ -676,7 +800,7 @@ function rules(raw: Raw): BoardRules {
     return { ...DEFAULT_BOARD_RULES };
   }
   if (!isRecord(value)) {
-    fail("BAD_PAYLOAD", "rules must be an object {maxContestTurns?, contestIdleMessages?}");
+    fail("BAD_PAYLOAD", "rules must be an object {maxContestTurns?, contestIdleMessages?, maxFixAttempts?}");
   }
   return {
     maxContestTurns:
@@ -685,6 +809,43 @@ function rules(raw: Raw): BoardRules {
       value.contestIdleMessages === undefined
         ? DEFAULT_BOARD_RULES.contestIdleMessages
         : positiveInt(value, "contestIdleMessages", 10000),
+    maxFixAttempts:
+      value.maxFixAttempts === undefined ? DEFAULT_BOARD_RULES.maxFixAttempts : positiveInt(value, "maxFixAttempts", 20),
+  };
+}
+
+/** Validate a failing revision's evidence: bounded output text and the implicated item ids. */
+function failingEvidence(value: unknown): BoardFailingEvidence {
+  if (!isRecord(value)) {
+    fail("BAD_PAYLOAD", "failing must be an object {output, items}");
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== "output" && key !== "items") {
+      fail("BAD_PAYLOAD", `failing has an unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  const output = value.output;
+  if (typeof output !== "string" || output.length > BOARD_LIMITS.maxFailingOutput) {
+    fail("BAD_PAYLOAD", `failing.output must be a string of at most ${BOARD_LIMITS.maxFailingOutput} characters`);
+  }
+  return { output, items: idList(value, "items", { max: BOARD_LIMITS.maxIntentEntries }) };
+}
+
+/** Validate a goal's test inventory: a status, and bounded format, count, and names. */
+function testInventory(value: unknown): BoardTestInventory {
+  if (!isRecord(value)) {
+    fail("BAD_PAYLOAD", "testInventory must be an object {status, format?, count?, names?}");
+  }
+  const status = oneOf(value, "status", ["recorded", "unavailable"] as const);
+  for (const key of Object.keys(value)) {
+    if (!["status", "format", "count"].includes(key)) {
+      fail("BAD_PAYLOAD", `testInventory has an unknown field ${JSON.stringify(key)} (only status, format, count are published)`);
+    }
+  }
+  return {
+    status,
+    ...(value.format !== undefined ? { format: text(value, "format", 64) } : {}),
+    ...(value.count !== undefined ? { count: nonNegativeInt(value, "count") } : {}),
   };
 }
 
@@ -692,8 +853,18 @@ function rules(raw: Raw): BoardRules {
 function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMessageType] {
   const L = BOARD_LIMITS;
   switch (type) {
-    case "goal.posted":
-      return { objective: text(raw, "objective", L.maxRationale), rules: rules(raw) };
+    case "goal.posted": {
+      const guarded = pathList(raw, "protected", { optional: true, max: L.maxProtected });
+      const keys = textList(raw, "protectedKeys", L.maxProtected, L.maxEntryLength);
+      const inventory = raw.testInventory === undefined ? undefined : testInventory(raw.testInventory);
+      return {
+        objective: text(raw, "objective", L.maxRationale),
+        rules: rules(raw),
+        ...(guarded.length > 0 ? { protected: guarded } : {}),
+        ...(keys.length > 0 ? { protectedKeys: keys } : {}),
+        ...(inventory !== undefined ? { testInventory: inventory } : {}),
+      };
+    }
     case "item.proposed":
       return {
         item: id(raw, "item"),
@@ -748,11 +919,13 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
       return { item: id(raw, "item"), children: children(raw) };
     case "item.discovered": {
       const parent = optionalId(raw, "parent");
+      const scopeHint = pathList(raw, "scopeHint", { optional: true, max: L.maxIntentEntries });
       return {
         item: id(raw, "item"),
         objective: text(raw, "objective", L.maxObjective),
         reason: text(raw, "reason", 200),
         ...(parent !== undefined ? { parent } : {}),
+        ...(scopeHint.length > 0 ? { scopeHint } : {}),
       };
     }
     case "help.requested":
@@ -761,8 +934,19 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
       return { request: id(raw, "request") };
     case "contract.proposed": {
       const [target] = pathList({ target: [raw.target] }, "target");
+      const item = optionalId(raw, "item");
       return {
         contract: id(raw, "contract"),
+        target: target!,
+        kind: oneOf(raw, "kind", ["add", "modify", "remove"] as const),
+        ...(item !== undefined ? { item } : {}),
+      };
+    }
+    case "contract.escalated": {
+      const [target] = pathList({ target: [raw.target] }, "target");
+      return {
+        contract: id(raw, "contract"),
+        item: id(raw, "item"),
         target: target!,
         kind: oneOf(raw, "kind", ["add", "modify", "remove"] as const),
       };
@@ -772,7 +956,8 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
       return { contract: id(raw, "contract") };
     case "push.announced":
       return { item: id(raw, "item"), commit: id(raw, "commit"), paths: pathList(raw, "paths", { concrete: true }) };
-    case "integrated.rev":
+    case "integrated.rev": {
+      const failing = raw.failing === undefined ? undefined : failingEvidence(raw.failing);
       return {
         n: positiveInt(raw, "n"),
         commit: id(raw, "commit"),
@@ -780,7 +965,9 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         merged: idList(raw, "merged", { max: L.maxIntentEntries }),
         paths: pathList(raw, "paths", { max: L.maxPaths * L.maxIntentEntries }),
         contributors: idList(raw, "contributors", { max: L.maxAgents }),
+        ...(failing !== undefined ? { failing } : {}),
       };
+    }
     case "rebase.needed":
       return { agent: id(raw, "agent"), n: positiveInt(raw, "n"), paths: pathList(raw, "paths", { max: L.maxPaths * L.maxIntentEntries }) };
     case "review.requested":
@@ -809,6 +996,14 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         n: positiveInt(raw, "n"),
         via: oneOf(raw, "via", ["integrated", "children"] as const),
       };
+    case "fix.requested":
+      return { item: id(raw, "item"), n: positiveInt(raw, "n"), attempt: positiveInt(raw, "attempt") };
+    case "fix.exhausted":
+      return { item: id(raw, "item"), n: positiveInt(raw, "n"), attempts: nonNegativeInt(raw, "attempts") };
+    case "item.reopened": {
+      const commit = optionalId(raw, "commit");
+      return { item: id(raw, "item"), previousOwner: id(raw, "previousOwner"), n: positiveInt(raw, "n"), ...(commit !== undefined ? { commit } : {}) };
+    }
     case "tool.proposed":
       return {
         tool: id(raw, "tool"),
@@ -835,6 +1030,28 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         version: id(raw, "version"),
         changedFiles: pathList(raw, "changedFiles", { concrete: true, optional: true }),
       };
+    case "decision.recorded": {
+      const answer = raw.answer === undefined ? undefined : text(raw, "answer", 200);
+      const error = raw.error === undefined ? undefined : text(raw, "error", 300);
+      let confidence: number | undefined;
+      if (raw.confidence !== undefined) {
+        if (typeof raw.confidence !== "number" || !Number.isFinite(raw.confidence) || raw.confidence < 0 || raw.confidence > 1) {
+          fail("BAD_PAYLOAD", "confidence must be a number in [0, 1]");
+        }
+        confidence = raw.confidence;
+      }
+      if (typeof raw.accepted !== "boolean") {
+        fail("BAD_PAYLOAD", "accepted must be a boolean");
+      }
+      return {
+        juncture: oneOf(raw, "juncture", ["plan-review", "attribution", "fix-confidence"] as const),
+        question: text(raw, "question", 500),
+        ...(answer !== undefined ? { answer } : {}),
+        ...(confidence !== undefined ? { confidence } : {}),
+        accepted: raw.accepted,
+        ...(error !== undefined ? { error } : {}),
+      };
+    }
     case "agent.joined": {
       const role = optionalId(raw, "role");
       return role !== undefined ? { role } : {};
@@ -918,6 +1135,7 @@ const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "help.requested": ["agent"],
   "help.offered": ["agent"],
   "contract.proposed": ["agent"],
+  "contract.escalated": ["engine"],
   "contract.accepted": ["lead", "human"],
   "contract.rejected": ["lead", "human"],
   "push.announced": ["agent"],
@@ -928,9 +1146,13 @@ const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   handoff: ["agent"],
   "done.proposed": ["agent"],
   "item.completed": ["engine"],
+  "fix.requested": ["engine"],
+  "fix.exhausted": ["engine"],
+  "item.reopened": ["engine"],
   "tool.proposed": ["agent"],
   "tool.published": ["agent"],
   "tool.used": ["agent"],
+  "decision.recorded": ["engine"],
   "agent.joined": ["agent"],
   "agent.left": ["agent"],
 };
@@ -984,6 +1206,16 @@ function liveClaims(state: BoardState, except: string, skipItem?: string): Board
   return Object.values(state.items)
     .filter((i) => i.status === "claimed" && i.owner !== undefined && i.owner !== except && i.intent && i.id !== skipItem)
     .sort((a, b) => (a.grantedSeq ?? 0) - (b.grantedSeq ?? 0));
+}
+
+/**
+ * The targets of ACCEPTED contracts for `item` (all items when omitted): the
+ * protected paths those contracts released for writing.
+ */
+export function releasedTargets(state: BoardState, item?: string): string[] {
+  return Object.values(state.contracts)
+    .filter((c) => c.status === "accepted" && c.item !== undefined && (item === undefined || c.item === item))
+    .map((c) => c.target);
 }
 
 /** The item whose latest, not yet integrated push has this commit. */
@@ -1069,8 +1301,39 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         const by = item.owner ?? item.claimant?.agent;
         fail("ITEM_NOT_OPEN", `item ${item.id} is ${item.status}${by ? ` (by ${by})` : ""} and cannot be claimed`);
       }
-      if (draft.payload.intent.write.length === 0) {
+      const write = draft.payload.intent.write;
+      if (write.length === 0) {
         fail("BAD_PAYLOAD", "a claim must declare at least one write intent");
+      }
+      if (item.exhaustedBy?.includes(draft.from)) {
+        fail("NOT_ALLOWED", `${draft.from} already spent item ${item.id}'s fix budget; it was reopened for another agent`);
+      }
+      // The contract (the original code's existing tests and the gate's own
+      // files) is never writable by an agent alone, however the claim is
+      // phrased: any write entry that could name a protected path is refused,
+      // unless an accepted contract for this item released that path.
+      const released = releasedTargets(state, item.id);
+      const hit = state.protected.filter((p) => write.some((w) => entriesOverlap(w, p)));
+      const locked = hit.filter((p) => !released.some((t) => entryWithin(p, t)));
+      if (locked.length > 0) {
+        const entries = overlappingEntries(write, locked);
+        fail(
+          "PROTECTED",
+          `write intent ${entries.join(", ")} overlaps protected path(s) ${locked.slice(0, 8).join(", ")}${locked.length > 8 ? ", ..." : ""}: ` +
+            "changing an existing test or the gate's configuration is a contract change; post contract.proposed " +
+            "{target, kind, item} and claim again once the lead or a human accepts it",
+        );
+      }
+      // A claim writes only inside the item's declared scope.
+      if (item.scopeHint.length === 0) {
+        fail("OUTSIDE_SCOPE", `item ${item.id} declares no scope hint, so no write intent can be claimed on it`);
+      }
+      const outside = write.filter((w) => !item.scopeHint.some((hint) => entryWithin(w, hint)));
+      if (outside.length > 0) {
+        fail(
+          "OUTSIDE_SCOPE",
+          `write intent ${outside.join(", ")} is outside item ${item.id}'s scope hint (${item.scopeHint.join(", ")})`,
+        );
       }
       return;
     }
@@ -1166,6 +1429,14 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         if (state.items[child.item]) {
           fail("DUPLICATE", `item ${child.item} already exists`);
         }
+        // A split narrows the work: no child may reach outside the parent's scope.
+        const outside = child.scopeHint.filter((entry) => !item.scopeHint.some((hint) => entryWithin(entry, hint)));
+        if (outside.length > 0) {
+          fail(
+            "OUTSIDE_SCOPE",
+            `child ${child.item}'s scope hint ${outside.join(", ")} is outside item ${item.id}'s scope hint (${item.scopeHint.join(", ")})`,
+          );
+        }
       }
       return;
     }
@@ -1189,6 +1460,36 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       if (state.contracts[draft.payload.contract]) {
         fail("DUPLICATE", `contract ${draft.payload.contract} already exists`);
       }
+      if (draft.payload.item !== undefined) {
+        requireItem(state, draft.payload.item);
+      }
+      if (state.protected.some((p) => entriesOverlap(draft.payload.target, p))) {
+        // A contract change to the original tests or the gate's configuration:
+        // bounded to one listed path, inside the item's own scope.
+        const target = draft.payload.target;
+        if (draft.payload.item === undefined) {
+          fail("NOT_ALLOWED", `a contract on the protected path ${target} must name the item it is for`);
+        }
+        if (hasWildcard(target) && !state.protected.includes(target)) {
+          fail("NOT_ALLOWED", `a contract on protected paths must name one concrete path from the contract (not ${target})`);
+        }
+        if (!state.protected.some((p) => p === target || entryWithin(target, p))) {
+          fail("NOT_ALLOWED", `${target} is not itself in the contract; name the protected path you need to change`);
+        }
+        const item = requireItem(state, draft.payload.item);
+        if (!item.scopeHint.some((hint) => entryWithin(target, hint))) {
+          fail("OUTSIDE_SCOPE", `${target} is outside item ${item.id}'s scope hint (${item.scopeHint.join(", ")})`);
+        }
+        // A human said no for this item: asking again is only legitimate once
+        // new evidence (a failing revision implicating the item) exists.
+        if (item.contractRejectedSeq !== undefined && !((item.implicatedSeq ?? 0) > item.contractRejectedSeq)) {
+          fail(
+            "CONTRACT_REJECTED",
+            `a human rejected a contract change for item ${item.id} (at seq ${item.contractRejectedSeq}); the original tests stay as they are. ` +
+              "Propose again only after a failing revision implicates this item. New test files may still be added (they never lower or replace the baseline tests the gate must run)",
+          );
+        }
+      }
       return;
     case "contract.accepted":
     case "contract.rejected": {
@@ -1196,14 +1497,30 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       if (contract.status !== "proposed") {
         fail("INVALID_STATE", `contract ${contract.contract} is already ${contract.status}`);
       }
+      if (contract.guarded && draft.from !== BOARD_HUMAN) {
+        fail("NOT_ALLOWED", `contract ${contract.contract} changes the original tests or the gate's configuration: only a human decides it`);
+      }
+      return;
+    }
+    case "contract.escalated": {
+      const contract = state.contracts[draft.payload.contract];
+      if (!contract || !contract.guarded || contract.status !== "proposed") {
+        fail("INVALID_STATE", `contract ${draft.payload.contract} is not a pending protected contract`);
+      }
       return;
     }
     case "push.announced": {
       const item = requireOwner(state, draft.payload.item, draft.from);
       const write = item.intent?.write ?? [];
-      const outside = draft.payload.paths.filter((p) => !write.some((w) => entriesOverlap(p, w)));
+      // Each announced path is a concrete file that must lie INSIDE the write
+      // intent (a symbol-scoped entry covers its file), not merely touch it.
+      const outside = draft.payload.paths.filter((p) => !write.some((w) => entryWithin(p, intentPath(w))));
       if (outside.length > 0) {
         fail("OUTSIDE_INTENT", `pushed paths outside the claim's write intent: ${outside.join(", ")}`);
+      }
+      const unsafe = draft.payload.paths.filter((p) => p.split("/").some((seg) => seg === "node_modules" || seg === ".git") || /(^|\/)(\.bin|vendor\/bin)\//.test(p));
+      if (unsafe.length > 0) {
+        fail("PROTECTED", `pushed paths inside dependency or tool trees are never integrated: ${unsafe.join(", ")}`);
       }
       const other = itemForPendingPush(state, draft.payload.commit);
       if (other && other.id !== item.id) {
@@ -1216,6 +1533,7 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         commit: draft.payload.commit,
         gate: draft.payload.gate,
         merged: draft.payload.merged,
+        ...(draft.payload.failing !== undefined ? { failing: draft.payload.failing } : {}),
       });
       if (!sameJson(expected, draft.payload)) {
         fail("LOG_MISMATCH", "integrated.rev does not match the pushes it claims to merge");
@@ -1287,6 +1605,26 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       return;
     }
+    case "fix.requested": {
+      const item = requireItem(state, draft.payload.item);
+      if (item.status !== "claimed" || item.owner === undefined) {
+        fail("INVALID_STATE", `item ${item.id} has no owner to ask for a fix`);
+      }
+      if (draft.payload.attempt !== (item.fixAttempts ?? 0) + 1 || draft.payload.attempt > state.rules.maxFixAttempts) {
+        fail("INVALID_STATE", `fix attempt ${draft.payload.attempt} is not the next attempt within the budget for ${item.id}`);
+      }
+      return;
+    }
+    case "fix.exhausted":
+      requireItem(state, draft.payload.item);
+      return;
+    case "item.reopened": {
+      const item = requireItem(state, draft.payload.item);
+      if (item.status !== "claimed" || item.owner !== draft.payload.previousOwner) {
+        fail("INVALID_STATE", `item ${item.id} is not held by ${draft.payload.previousOwner}`);
+      }
+      return;
+    }
     case "tool.proposed":
       if (state.tools.proposed[draft.payload.tool]) {
         fail("DUPLICATE", `tool ${draft.payload.tool} was already proposed`);
@@ -1351,6 +1689,9 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
     case "goal.posted":
       state.goal = { objective: message.payload.objective, seq: message.seq };
       state.rules = { ...message.payload.rules };
+      state.protected = [...(message.payload.protected ?? [])];
+      state.protectedKeys = [...(message.payload.protectedKeys ?? [])];
+      state.testInventory = message.payload.testInventory ?? null;
       break;
     case "item.proposed":
       state.items[message.payload.item] = {
@@ -1371,7 +1712,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         id: p.item,
         objective: p.objective,
         acceptance: [],
-        scopeHint: [],
+        scopeHint: p.scopeHint ?? [],
         status: "open",
         proposedBy: from,
         proposedSeq: message.seq,
@@ -1507,28 +1848,48 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         contract: message.payload.contract,
         target: message.payload.target,
         kind: message.payload.kind,
+        ...(message.payload.item !== undefined ? { item: message.payload.item } : {}),
+        ...(state.protected.some((p) => entriesOverlap(message.payload.target, p)) ? { guarded: true } : {}),
         proposedBy: from,
         status: "proposed",
       };
+      break;
+    case "contract.escalated":
+      // The decision is a human's: the escalation record carries it.
       break;
     case "contract.accepted":
     case "contract.rejected": {
       const contract = state.contracts[message.payload.contract]!;
       contract.status = message.type === "contract.accepted" ? "accepted" : "rejected";
       contract.decidedBy = from;
+      if (message.type === "contract.rejected" && contract.guarded && contract.item !== undefined && state.items[contract.item]) {
+        state.items[contract.item]!.contractRejectedSeq = message.seq;
+      }
       break;
     }
-    case "push.announced":
+    case "push.announced": {
       state.pushes += 1;
-      state.items[message.payload.item]!.lastPush = {
+      const item = state.items[message.payload.item]!;
+      item.lastPush = {
         seq: message.seq,
         commit: message.payload.commit,
         agent: from,
         paths: message.payload.paths,
       };
+      // The owner answered any outstanding fix request with this push.
+      delete item.fixRequested;
       break;
+    }
     case "integrated.rev":
       state.lastRevN = message.payload.n;
+      if (message.payload.gate === "fail" && message.payload.failing !== undefined) {
+        state.lastFailure = { n: message.payload.n, ...message.payload.failing };
+        for (const id of message.payload.failing.items) {
+          if (state.items[id]) {
+            state.items[id]!.implicatedSeq = message.seq;
+          }
+        }
+      }
       if (message.payload.gate === "pass") {
         state.integrated = { n: message.payload.n, commit: message.payload.commit, seq: message.seq };
         state.passingRevs.push(message.payload.n);
@@ -1571,6 +1932,29 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       item.status = "done";
       item.completed = { n: message.payload.n, via: message.payload.via };
       delete item.intent;
+      delete item.fixRequested;
+      break;
+    }
+    case "fix.requested": {
+      const item = state.items[message.payload.item]!;
+      item.fixAttempts = message.payload.attempt;
+      item.fixRequested = message.payload.n;
+      break;
+    }
+    case "fix.exhausted": {
+      const item = state.items[message.payload.item]!;
+      item.fixExhausted = true;
+      delete item.fixRequested;
+      break;
+    }
+    case "item.reopened": {
+      const item = state.items[message.payload.item]!;
+      item.exhaustedBy = [...(item.exhaustedBy ?? []), message.payload.previousOwner];
+      item.reopenedFrom = { agent: message.payload.previousOwner, ...(message.payload.commit !== undefined ? { commit: message.payload.commit } : {}) };
+      releaseClaim(item);
+      // The next owner gets its own fix budget.
+      item.fixAttempts = 0;
+      delete item.fixExhausted;
       break;
     }
     case "tool.proposed":
@@ -1603,6 +1987,15 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       }
       break;
     }
+    case "decision.recorded":
+      state.decisions.calls += 1;
+      if (message.payload.accepted) {
+        state.decisions.accepted += 1;
+      }
+      if (message.payload.error !== undefined) {
+        state.decisions.errors += 1;
+      }
+      break;
     case "agent.joined":
       state.agents[from] = {
         id: from,
@@ -1622,6 +2015,7 @@ function releaseClaim(item: BoardItem): void {
   delete item.owner;
   delete item.grantedSeq;
   delete item.lastPush;
+  delete item.fixRequested;
   item.doneProposed = false;
   item.status = "open";
 }
@@ -1847,6 +2241,17 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
     case "item.split":
       resolveWaitersOn(incoming.payload.item);
       break;
+    case "contract.proposed": {
+      const contract = work.contracts[incoming.payload.contract];
+      if (contract?.guarded && contract.item !== undefined) {
+        emit({
+          from: BOARD_ENGINE,
+          type: "contract.escalated",
+          payload: { contract: contract.contract, item: contract.item, target: contract.target, kind: contract.kind },
+        });
+      }
+      break;
+    }
     case "done.proposed":
       completeIfReady(incoming.payload.item);
       break;
@@ -1859,6 +2264,41 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
         }
         for (const draft of rebaseTargets(work, incoming.payload)) {
           emit(draft);
+        }
+      } else {
+        // A failing revision advances nothing. Each implicated item's owner is
+        // asked for a fix (addressed to it) while the item's fix budget lasts;
+        // past the budget the exhaustion is recorded instead.
+        for (const itemId of incoming.payload.failing?.items ?? []) {
+          const item = work.items[itemId];
+          if (!item || item.status !== "claimed" || item.owner === undefined || item.fixExhausted) {
+            continue;
+          }
+          const attempt = (item.fixAttempts ?? 0) + 1;
+          if (attempt <= rules.maxFixAttempts && activeAgent(work, item.owner)) {
+            emit({
+              from: BOARD_ENGINE,
+              type: "fix.requested",
+              payload: { item: item.id, n: incoming.payload.n, attempt },
+              to: [item.owner],
+            });
+          } else {
+            const owner = item.owner;
+            const commit = item.lastPush?.agent === owner ? item.lastPush?.commit : undefined;
+            emit({
+              from: BOARD_ENGINE,
+              type: "fix.exhausted",
+              payload: { item: item.id, n: incoming.payload.n, attempts: item.fixAttempts ?? 0 },
+            });
+            // A spent budget is not a dead end: the item reopens for fresh
+            // eyes, starting from the previous owner's latest push.
+            emit({
+              from: BOARD_ENGINE,
+              type: "item.reopened",
+              payload: { item: item.id, previousOwner: owner, n: incoming.payload.n, ...(commit !== undefined ? { commit } : {}) },
+            });
+            resolveWaitersOn(item.id);
+          }
         }
       }
       break;
@@ -1912,6 +2352,8 @@ export interface IntegratedRevInput {
   readonly gate: "pass" | "fail";
   /** The commits of announced, not yet integrated pushes this revision merged. */
   readonly merged: readonly string[];
+  /** A failing revision's bounded output and implicated items (only with gate "fail"). */
+  readonly failing?: BoardFailingEvidence;
 }
 
 /**
@@ -1922,11 +2364,13 @@ export interface IntegratedRevInput {
 function integratedRevPayload(state: BoardState, input: IntegratedRevInput): BoardPayloads["integrated.rev"] {
   const paths: string[] = [];
   const contributors: string[] = [];
+  const mergedItems: string[] = [];
   for (const commit of input.merged) {
     const item = itemForPendingPush(state, commit);
     if (!item?.lastPush) {
       fail("UNKNOWN_REF", `commit ${commit} is not the latest, unintegrated push of any item`);
     }
+    mergedItems.push(item.id);
     for (const path of item.lastPush.paths) {
       if (!paths.includes(path)) {
         paths.push(path);
@@ -1936,7 +2380,24 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
       contributors.push(item.lastPush.agent);
     }
   }
-  return { n: state.lastRevN + 1, commit: input.commit, gate: input.gate, merged: [...input.merged], paths, contributors };
+  if (input.failing !== undefined) {
+    if (input.gate !== "fail") {
+      fail("BAD_PAYLOAD", "only a failing revision carries failing evidence");
+    }
+    const strangers = input.failing.items.filter((item) => !mergedItems.includes(item));
+    if (strangers.length > 0) {
+      fail("UNKNOWN_REF", `implicated item(s) ${strangers.join(", ")} had no push in this revision`);
+    }
+  }
+  return {
+    n: state.lastRevN + 1,
+    commit: input.commit,
+    gate: input.gate,
+    merged: [...input.merged],
+    paths,
+    contributors,
+    ...(input.failing !== undefined ? { failing: { output: input.failing.output, items: [...input.failing.items] } } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1960,7 +2421,7 @@ export function reduceBoard(messages: readonly BoardMessage[]): BoardState {
     if (incoming.seq !== work.lastSeq + 1) {
       fail("LOG_MISMATCH", `board log is not contiguous at seq ${incoming.seq} (expected ${work.lastSeq + 1})`);
     }
-    if (incoming.from === BOARD_ENGINE && incoming.type !== "integrated.rev") {
+    if (incoming.from === BOARD_ENGINE && incoming.type !== "integrated.rev" && incoming.type !== "decision.recorded") {
       fail("LOG_MISMATCH", `engine ${incoming.type} at seq ${incoming.seq} was not produced by arbitration`);
     }
     const expected = arbitrateInPlace(work, incoming);
@@ -2071,10 +2532,17 @@ export function appendIntegratedRev(state: BoardState, input: unknown, at: strin
   if (!isRecord(input)) {
     fail("BAD_PAYLOAD", "an integration result must be an object {commit, gate, merged}");
   }
+  for (const key of Object.keys(input)) {
+    if (!["commit", "gate", "merged", "failing"].includes(key)) {
+      fail("BAD_PAYLOAD", `an integration result has an unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  const failing = input.failing === undefined ? undefined : failingEvidence(input.failing);
   const parsed: IntegratedRevInput = {
     commit: id(input, "commit"),
     gate: oneOf(input, "gate", ["pass", "fail"] as const),
     merged: idList(input, "merged", { max: BOARD_LIMITS.maxIntentEntries }),
+    ...(failing !== undefined ? { failing } : {}),
   };
   if (state.goal === null) {
     fail("NO_GOAL", "the board has no goal yet");
@@ -2084,6 +2552,47 @@ export function appendIntegratedRev(state: BoardState, input: unknown, at: strin
     { from: BOARD_ENGINE, type: "integrated.rev", payload: integratedRevPayload(state, parsed) },
     at,
   );
+}
+
+/**
+ * Check, without appending anything, that `agent` could join the board now
+ * (as the join route would append it). Throws the same BoardError a refused
+ * join would, so a substrate can refuse a join BEFORE provisioning anything
+ * for it (a workspace, a token).
+ */
+export function checkBoardJoin(state: BoardState, agent: string, body: { readonly role?: unknown; readonly rationale?: unknown } = {}): void {
+  appendBoardMessage(
+    state,
+    { kind: "join", agent },
+    {
+      type: "agent.joined",
+      payload: body.role !== undefined ? { role: body.role } : {},
+      ...(body.rationale !== undefined ? { rationale: body.rationale } : {}),
+    },
+    "1970-01-01T00:00:00.000Z",
+  );
+}
+
+/**
+ * Append the engine's advisory decision.recorded for a typed decision the
+ * operator side made (a plan review, an attribution, a fix-confidence check)
+ * and its outcome. Validated like any message; it changes nothing but the
+ * decision counts.
+ */
+export function appendDecisionRecorded(state: BoardState, input: unknown, at: string): BoardAppendResult {
+  if (state.goal === null) {
+    fail("NO_GOAL", "the board has no goal yet");
+  }
+  if (!isRecord(input)) {
+    fail("BAD_PAYLOAD", "a decision record must be an object");
+  }
+  for (const key of Object.keys(input)) {
+    if (!["juncture", "question", "answer", "confidence", "accepted", "error"].includes(key)) {
+      fail("BAD_PAYLOAD", `a decision record has an unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  const payload = parsePayload("decision.recorded", input) as BoardPayloads["decision.recorded"];
+  return appendChecked(state, { from: BOARD_ENGINE, type: "decision.recorded", payload }, at);
 }
 
 /** Messages with seq greater than `after`. */
@@ -2133,12 +2642,22 @@ export interface BoardDigest {
   readonly lastSeq: number;
   /** The messages below are those after this seq. */
   readonly after: number;
+  /**
+   * The last seq this page of the log covered (the next page starts after it).
+   * The messages below are filtered, so page by this, never by the last message.
+   */
+  readonly pageEnd: number;
   readonly claims: readonly {
     readonly item: string;
     readonly objective: string;
     readonly intent: BoardIntent;
     readonly doneProposed: boolean;
-    readonly lastPush?: { readonly commit: string; readonly integratedIn?: number };
+    /** The item's latest push; `agent` differs from the claimant after a handoff. */
+    readonly lastPush?: { readonly commit: string; readonly agent: string; readonly integratedIn?: number };
+    /** An unanswered fix request: the failing revision and the attempt number. */
+    readonly fix?: { readonly n: number; readonly attempt: number };
+    /** The item's fix budget is spent. */
+    readonly fixExhausted?: boolean;
   }[];
   readonly pending: readonly { readonly item: string; readonly contest: string }[];
   readonly contests: readonly BoardContest[];
@@ -2152,6 +2671,14 @@ export interface BoardDigest {
   readonly integrated: { readonly n: number; readonly commit: string } | null;
   /** The latest revision this agent was told to rebase onto, if any. */
   readonly rebaseTo: number | null;
+  /** The latest failing revision's evidence, when it asks this agent for a fix. */
+  readonly failure: ({ readonly n: number } & BoardFailingEvidence) | null;
+  /** Paths no agent may write (posted with the goal). */
+  readonly protected: readonly string[];
+  /** Gate-defining keys inside editable files (posted with the goal). */
+  readonly protectedKeys: readonly string[];
+  /** Protected paths accepted contracts released for this agent's items. */
+  readonly released: readonly string[];
   /** Messages after `after` addressed to this agent or touching its work. */
   readonly messages: readonly BoardMessage[];
 }
@@ -2166,6 +2693,7 @@ const BROADCAST_TYPES: ReadonlySet<BoardMessageType> = new Set([
   "contract.accepted",
   "contract.rejected",
   "tool.published",
+  "item.reopened",
 ]);
 
 const DIGEST_OPEN_ITEMS = 100;
@@ -2215,28 +2743,33 @@ export function boardDigest(
     }
     return m.type === "review.result" && myReviews.has(m.payload.review);
   };
+  const held = Object.values(state.items).filter((i) => i.status === "claimed" && i.owner === agent && i.intent);
+  const failure = state.lastFailure;
+  const askedToFix = failure !== null && held.some((i) => i.fixRequested === failure.n);
   return {
     agent,
     ...(record?.role !== undefined ? { role: record.role } : {}),
     active: record !== undefined && record.leftSeq === undefined,
     lastSeq: state.lastSeq,
     after,
-    claims: Object.values(state.items)
-      .filter((i) => i.status === "claimed" && i.owner === agent && i.intent)
-      .map((i) => ({
-        item: i.id,
-        objective: i.objective,
-        intent: i.intent!,
-        doneProposed: i.doneProposed,
-        ...(i.lastPush
-          ? {
-              lastPush: {
-                commit: i.lastPush.commit,
-                ...(i.lastPush.integratedIn !== undefined ? { integratedIn: i.lastPush.integratedIn } : {}),
-              },
-            }
-          : {}),
-      })),
+    pageEnd: messages.reduce((end, m) => Math.max(end, m.seq), after),
+    claims: held.map((i) => ({
+      item: i.id,
+      objective: i.objective,
+      intent: i.intent!,
+      doneProposed: i.doneProposed,
+      ...(i.lastPush
+        ? {
+            lastPush: {
+              commit: i.lastPush.commit,
+              agent: i.lastPush.agent,
+              ...(i.lastPush.integratedIn !== undefined ? { integratedIn: i.lastPush.integratedIn } : {}),
+            },
+          }
+        : {}),
+      ...(i.fixRequested !== undefined ? { fix: { n: i.fixRequested, attempt: i.fixAttempts ?? 1 } } : {}),
+      ...(i.fixExhausted ? { fixExhausted: true } : {}),
+    })),
     pending: Object.values(state.items)
       .filter((i) => i.claimant?.agent === agent)
       .map((i) => ({ item: i.id, contest: i.claimant!.contest })),
@@ -2255,6 +2788,10 @@ export function boardDigest(
       })),
     integrated: state.integrated ? { n: state.integrated.n, commit: state.integrated.commit } : null,
     rebaseTo: record?.rebaseTo ?? null,
+    failure: askedToFix ? failure : null,
+    protected: state.protected,
+    protectedKeys: state.protectedKeys,
+    released: [...new Set(held.flatMap((i) => releasedTargets(state, i.id)))],
     messages: messages.filter((m) => m.seq > after && relevant(m)),
   };
 }
@@ -2269,13 +2806,29 @@ export interface BoardEscalationRequest {
   readonly path?: string;
   readonly question: string;
   readonly options: readonly string[];
-  readonly boardContest: string;
+  /** The contest it decides (a claim.escalated), or */
+  readonly boardContest?: string;
+  /** the protected contract it decides (a contract.escalated). */
+  readonly boardContract?: string;
 }
 
 /** Escalation requests for every claim.escalated among `messages`. */
 export function boardEscalationRequests(messages: readonly BoardMessage[]): BoardEscalationRequest[] {
   const out: BoardEscalationRequest[] = [];
   for (const message of messages) {
+    if (message.type === "contract.escalated") {
+      const c = message.payload;
+      out.push({
+        kind: "decision",
+        path: c.target,
+        question:
+          `Board contract ${c.contract}: an agent asks to ${c.kind} ${c.target} for item ${c.item}. ` +
+          "It is part of the original code's tests or the gate's configuration (the contract). Accept or reject?",
+        options: ["accept", "reject"],
+        boardContract: c.contract,
+      });
+      continue;
+    }
     if (message.type !== "claim.escalated") {
       continue;
     }
@@ -2310,6 +2863,34 @@ export function boardContestClosures(messages: readonly BoardMessage[]): Map<str
   return out;
 }
 
+/** Contract id -> "accept" / "reject" for every contract decided among `messages`. */
+export function boardContractClosures(messages: readonly BoardMessage[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const message of messages) {
+    if (message.type === "contract.accepted" || message.type === "contract.rejected") {
+      out.set(message.payload.contract, message.type === "contract.accepted" ? "accept" : "reject");
+    }
+  }
+  return out;
+}
+
+/**
+ * The human contract.accepted / contract.rejected an escalation decision on a
+ * protected contract becomes. Undefined when it is already decided; throws when
+ * the decision is neither "accept" nor "reject".
+ */
+export function boardContractDecision(state: BoardState, contractId: string, decision: string): BoardDraft | undefined {
+  const contract = state.contracts[contractId] ?? fail("UNKNOWN_REF", `unknown contract ${contractId}`);
+  if (contract.status !== "proposed") {
+    return undefined;
+  }
+  const answer = decision.trim().toLowerCase();
+  if (answer !== "accept" && answer !== "reject") {
+    fail("BAD_PAYLOAD", `the decision for contract ${contractId} must be accept or reject`);
+  }
+  return { from: BOARD_HUMAN, type: answer === "accept" ? "contract.accepted" : "contract.rejected", payload: { contract: contractId } };
+}
+
 /**
  * The board message a human's escalation decision becomes: a claim.resolved
  * naming the winner, to append with the human origin. Returns undefined when
@@ -2342,6 +2923,7 @@ export interface BoardEscalationRecord {
   readonly unitId?: string;
   readonly path?: string;
   readonly boardContest?: string;
+  readonly boardContract?: string;
   readonly question: string;
   readonly options: readonly string[];
   readonly status: "pending" | "resolved";
@@ -2364,13 +2946,20 @@ export function applyBoardEscalations<E extends BoardEscalationRecord>(
 ): { readonly list: E[]; readonly raised: E[] } {
   const at = new Date(nowMs).toISOString();
   const settled = boardContestClosures(appended);
+  const decided = boardContractClosures(appended);
   const out = list.map((e): E => {
-    const decision = e.boardContest !== undefined ? settled.get(e.boardContest) : undefined;
+    const decision =
+      e.boardContest !== undefined ? settled.get(e.boardContest) : e.boardContract !== undefined ? decided.get(e.boardContract) : undefined;
     return e.status === "pending" && decision !== undefined ? { ...e, status: "resolved", decision, resolvedAt: at } : e;
   });
   const raised: E[] = [];
   for (const request of boardEscalationRequests(appended)) {
-    const existing = out.find((e) => e.status === "pending" && e.boardContest === request.boardContest);
+    const existing = out.find(
+      (e) =>
+        e.status === "pending" &&
+        ((request.boardContest !== undefined && e.boardContest === request.boardContest) ||
+          (request.boardContract !== undefined && e.boardContract === request.boardContract)),
+    );
     if (existing) {
       raised.push(existing);
       continue;
@@ -2379,7 +2968,8 @@ export function applyBoardEscalations<E extends BoardEscalationRecord>(
       id: `esc-${out.length + 1}-${nowMs.toString(36)}`,
       kind: request.kind,
       ...(request.path !== undefined ? { path: request.path } : {}),
-      boardContest: request.boardContest,
+      ...(request.boardContest !== undefined ? { boardContest: request.boardContest } : {}),
+      ...(request.boardContract !== undefined ? { boardContract: request.boardContract } : {}),
       question: request.question,
       options: [...request.options],
       status: "pending",

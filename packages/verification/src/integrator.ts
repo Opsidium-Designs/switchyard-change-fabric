@@ -15,11 +15,12 @@
  * is done over ordinary Git, so it runs in Node, not inside a Worker.
  */
 
-import { cp, lstat, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { cp, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, sep } from "node:path";
 
 import type { WorkspaceProvider, WorkspaceRef } from "@switchyard-change/artifact-workspace";
+import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 
 import {
   ChildProcessCommandRunner,
@@ -29,11 +30,14 @@ import {
 } from "./command.ts";
 import {
   changedPathsSinceBaseline,
+  checkoutCommit,
   clone,
   commitAll,
   git,
   type GitIdentity,
 } from "./git.ts";
+import { matchesAny } from "./pathscope.ts";
+import { inventoryShortfall, readStreamInventory, type TestInventory } from "./test-inventory.ts";
 import type { CheckResult, IntegrationResult, OutputRef, Verdict } from "./types.ts";
 
 /** One verified WorkUnit's workspace to feed into integration. */
@@ -50,6 +54,23 @@ export interface VerifiedWorkspace {
    * would-be silent merge collision into a coordinated, single-writer result.
    */
   readonly yieldedPaths?: readonly string[];
+  /**
+   * Globs this unit yields to other owners (for example an item it handed off):
+   * changed files matching them are never applied from this unit.
+   */
+  readonly yieldedScope?: readonly string[];
+  /**
+   * The exact commit to apply: the clone is checked out at this commit
+   * (detached) instead of the branch head, so what is integrated is exactly the
+   * announced commit. A commit missing from the repo fails the integration.
+   */
+  readonly commit?: string;
+  /**
+   * Protected paths an accepted contract released for THIS unit only: its
+   * version of them is applied and not restored. Other units' writes to them
+   * are refused like any protected change.
+   */
+  readonly releasedPaths?: readonly string[];
 }
 
 /** Inputs to integrate verified WorkUnits into one combined workspace. */
@@ -84,6 +105,51 @@ export interface IntegrateOptions {
    * what makes it impossible to green a tree that cannot be gated.
    */
   readonly requiresIntegrationGate?: boolean;
+  /**
+   * The CONTRACT: paths and globs whose baseline content defines the gate (the
+   * original code's existing tests, test-runner and package-manager configs,
+   * the files the gate command names). After the verified units are applied,
+   * every protected path that differs from the integration baseline is put
+   * back BEFORE the gate runs (a changed or deleted file is restored, an added
+   * one is removed), so a unit can never run a rewritten gate. The commit the
+   * gate ran on carries the restored files. See `onProtectedChange` for what a
+   * restore means for the verdict.
+   */
+  readonly protectedPaths?: readonly string[];
+  /**
+   * Keys inside otherwise editable JSON files that define the gate (for
+   * example a manifest's gate scripts), as dotted segment lists. A changed key
+   * is put back to its baseline value (an added one removed) before the gate
+   * runs; a file that no longer parses is restored whole.
+   */
+  readonly protectedJsonKeys?: readonly { readonly file: string; readonly keys: readonly (readonly string[])[] }[];
+  /**
+   * What a restore means for the verdict: "fail" (the default) fails the
+   * integration with the paths named, since a unit that touched the contract
+   * must not pass; "restore" keeps the gate's verdict on the restored tree (the
+   * tree that ships) and only records the paths in `protectedViolations`.
+   */
+  readonly onProtectedChange?: "fail" | "restore";
+  /**
+   * Build on exactly this commit of the integration workspace (the caller's
+   * last RECORDED passing revision) instead of whatever its branch head is.
+   */
+  readonly baseCommit?: string;
+  /**
+   * Do not advance the integration branch: on a verified verdict the gated
+   * commit is pushed to a candidate ref only (`gatedRef(commit)`), and the
+   * caller advances the branch with `advanceIntegrationBranch` once it has
+   * recorded the revision. A discarded result then never moves the branch.
+   */
+  readonly deferBranchPush?: boolean;
+  /**
+   * The BASELINE gate run's executed-test inventory. When given, the gate fails
+   * unless this run executed at least those tests (by name where the runner
+   * prints names, and never fewer by count), so code under test that exits
+   * early (`process.exit(0)` at import) cannot green the gate with tests that
+   * never ran. The gate command itself is unchanged; only its output is read.
+   */
+  readonly testInventory?: TestInventory;
   /** Root under which disposable worktrees are created. Defaults to OS temp. */
   readonly workRoot?: string;
   /** Deterministic committer identity for the integration commit. */
@@ -124,14 +190,53 @@ export class Integrator {
 
     const workRoot = options.workRoot ?? tmpdir();
     const integrationDir = await mkdtemp(join(workRoot, "scf-integration-"));
+    // A trusted bare repo OUTSIDE the checkout the gate runs in, under its own
+    // fresh private (0700) root outside workRoot: the gated commit is staged
+    // here before the gate runs, and every git operation after the gate
+    // (verifying the checkout, pushing) runs here, never in a directory agent
+    // code could have planted hooks or config into. Before it is used after the
+    // gate it is reset to known content (see resetTrustedRepo), since code
+    // running as the same user could still reach it by absolute path.
+    const trustedRoot = await mkdtemp(join(tmpdir(), "scf-trusted-"));
+    const trusted = join(trustedRoot, "repo.git");
 
     try {
       await clone(authenticated(integrationRef.gitUrl, options.integrationToken), integrationDir);
+      if (options.baseCommit !== undefined) {
+        // The base is the last RECORDED passing revision: candidate refs hold
+        // gated commits the branch has not (yet) been advanced to.
+        await git(integrationDir, [
+          "fetch",
+          "-q",
+          authenticated(integrationRef.gitUrl, options.integrationToken),
+          `+${gatedRef(options.baseCommit)}:${gatedRef(options.baseCommit)}`,
+        ]).catch(() => "");
+        await checkoutCommit(integrationDir, options.baseCommit);
+      }
 
       // Apply each verified WorkUnit's changed files on top of the baseline.
+      // Writes to the contract are applied only for the unit an accepted
+      // contract released them for; unsafe paths (symlinks, dependency trees,
+      // writes that would leave the checkout) are never applied.
+      const refused: string[] = [];
+      const appliedReleased: string[] = [];
       for (const unit of verified) {
-        await this.applyUnit(unit, integrationDir, workRoot);
+        await this.applyUnit(unit, integrationDir, workRoot, options.protectedPaths ?? [], refused, appliedReleased);
       }
+
+      // Defense in depth: the files that define the gate always come from the
+      // baseline. Anything a unit changed there is put back before the gate runs
+      // and fails the verdict below.
+      const protectedViolations = [
+        ...refused,
+        ...(await restoreProtected(
+          integrationDir,
+          options.protectedPaths ?? [],
+          options.protectedJsonKeys ?? [],
+          appliedReleased,
+        )),
+      ];
+      const failOnProtected = (options.onProtectedChange ?? "fail") === "fail" && protectedViolations.length > 0;
 
       let committed = false;
       // Commit the combined result when the integration workspace changed. The
@@ -155,7 +260,7 @@ export class Integrator {
       // expected no fix (no gate required, or no verified unit to apply) is
       // exempt: an unchanged integration there is a legitimate no-op.
       const fixesExpected = (requiresIntegrationGate ?? false) && verified.length > 0;
-      if (fixesExpected && !committed) {
+      if (fixesExpected && !committed && !failOnProtected) {
         throw new Error(
           `integration refused: ${verified.length} verified unit(s) were expected to land a fix ` +
             "but applying them produced no change, so the integrated tree is identical to the " +
@@ -174,23 +279,76 @@ export class Integrator {
       // an integration gate is configured it SETTLES the verdict; the optional
       // finalTestCommand remains only as a secondary check when no app gate is
       // configured (so existing non-app callers are unchanged).
-      const finalCheck = await this.runIntegrationGate(
+      // Capture the gated commit BEFORE the gate runs agent code, and stage it
+      // in the trusted repo (hooks disabled).
+      const gated = (await git(integrationDir, ["rev-parse", "HEAD"]).catch(() => "")).trim();
+      await runGit(["init", "-q", "--bare", trusted]);
+      if (gated !== "") {
+        await safeGit(trusted, ["fetch", "-q", integrationDir, `+HEAD:${gatedRef(gated)}`]);
+      }
+
+      const ranGate = await this.runIntegrationGate(
         integrationGateCommand,
         requiresIntegrationGate ?? false,
         finalTestCommand,
         integrationDir,
+        options.testInventory,
       );
+      // Gate-equals-deploy: the tracked files must be exactly the gated
+      // commit's after the gate ran (agent code could rewrite itself, or commit
+      // something else, while or after the tests ran). Checked from the trusted
+      // repo, never with the checkout's own .git.
+      if (gated !== "") {
+        await resetTrustedRepo(trusted, gated);
+      }
+      const drifted = gated !== "" && !ranGate.skipped ? await trackedDrift(trusted, gated, integrationDir) : [];
+      const gateCheck: CheckResult =
+        drifted.length === 0
+          ? ranGate
+          : {
+              ...ranGate,
+              passed: false,
+              summary:
+                `integration refused: the gate run changed tracked files of the gated tree (${drifted.slice(0, 10).join(", ")}${drifted.length > 10 ? ", ..." : ""}), ` +
+                `so what was tested is not what would ship. Gate: ${ranGate.summary}`,
+            };
+      // A unit that changed a protected path fails the integration honestly,
+      // whatever the (baseline) gate said: its edit to the gate's definition was
+      // discarded, so the tree it asked for is not the tree that was gated.
+      const finalCheck: CheckResult =
+        protectedViolations.length === 0
+          ? gateCheck
+          : !failOnProtected
+            ? {
+                ...gateCheck,
+                summary: `${gateCheck.summary}; protected path(s) the units changed were restored from the baseline before the gate ran: ${protectedViolations.join(", ")}`,
+              }
+            : {
+              ...gateCheck,
+              passed: false,
+              skipped: false,
+              summary:
+                `integration refused: the verified units changed protected path(s) that define the gate ` +
+                `(${protectedViolations.join(", ")}); they were restored from the baseline for the gate run ` +
+                `and the revision fails. Gate on the restored tree: ${gateCheck.summary}`,
+              outputs: [
+                { stream: "summary", text: `protected paths changed: ${protectedViolations.join(", ")}` },
+                ...gateCheck.outputs,
+              ],
+            };
       const verdict: Verdict = finalCheck.skipped || finalCheck.passed ? "verified" : "failed";
+      // The commit is the one captured BEFORE the gate, never re-read after it.
+      const commit = gated;
 
-      // Push the gated commit only on a verified verdict. The pushed commit is
-      // the exact HEAD the gate just ran on, so gated tree == pushed tree; a
-      // failed tree never reaches the integration workspace and so can never be
-      // cloned by promotion.
+      // Push the gated commit only on a verified verdict, from the trusted repo
+      // (hooks off, minimal environment), so gated tree == pushed tree and no
+      // hook or config the gate's code planted can see the credential.
       if (committed && verdict === "verified") {
-        await git(integrationDir, [
+        await safeGit(trusted, [
           "push",
+          "-q",
           authenticated(integrationRef.gitUrl, options.integrationToken),
-          `HEAD:${integrationRef.defaultBranch}`,
+          options.deferBranchPush ? `${commit}:${gatedRef(commit)}` : `${commit}:refs/heads/${integrationRef.defaultBranch}`,
         ]);
       }
 
@@ -203,9 +361,12 @@ export class Integrator {
         integratedUnits: verdict === "failed" ? [] : verified.map((u) => u.unitId),
         excludedUnits: [...excludedUnits],
         finalCheck,
+        ...(commit !== "" ? { commit } : {}),
+        ...(protectedViolations.length > 0 ? { protectedViolations } : {}),
       };
     } finally {
       await rm(integrationDir, { recursive: true, force: true });
+      await rm(trustedRoot, { recursive: true, force: true });
     }
   }
 
@@ -222,27 +383,73 @@ export class Integrator {
     unit: VerifiedWorkspace,
     integrationDir: string,
     workRoot: string,
+    protectedPaths: readonly string[],
+    refused: string[],
+    appliedReleased: string[],
   ): Promise<void> {
+    const released = unit.releasedPaths ?? [];
+    const root = await realpath(integrationDir);
     const yielded = new Set(unit.yieldedPaths ?? []);
+    const yieldedScope = unit.yieldedScope ?? [];
     const unitDir = await mkdtemp(join(workRoot, `scf-unit-${sanitize(unit.unitId)}-`));
     try {
       await clone(unit.gitUrl, unitDir);
+      if (unit.commit !== undefined) {
+        // Apply exactly the announced commit, never whatever the branch head is now.
+        await checkoutCommit(unitDir, unit.commit);
+      }
+      const unitRoot = await realpath(unitDir);
       const changed = await changedPathsSinceBaseline(unitDir, unit.baselineRef);
       for (const rel of changed) {
-        if (yielded.has(rel)) {
+        if (yielded.has(rel) || (yieldedScope.length > 0 && matchesAny(rel, yieldedScope))) {
           // This contested path belongs to another lease owner; skip it so the
           // single owner's version is the one that lands in the integration.
           continue;
         }
         const from = join(unitDir, rel);
         const to = join(integrationDir, rel);
+        if (rel.split("/").some((segment) => segment === "node_modules" || segment === ".git") || /(^|\/)(\.bin|vendor\/bin)\//.test(rel)) {
+          refused.push(`${rel} (dependency or tool tree: never applied from a unit)`);
+          continue;
+        }
+        if (protectedPaths.length > 0 && matchesAny(rel, protectedPaths)) {
+          if (released.length === 0 || !matchesAny(rel, released)) {
+            // Not this unit's to change: the baseline version stays (the
+            // restore below would put it back anyway; this keeps it from
+            // ever being written).
+            refused.push(rel);
+            continue;
+          }
+          appliedReleased.push(rel);
+        }
+        if ((await lstat(from).catch(() => undefined))?.isSymbolicLink()) {
+          refused.push(`${rel} (a symlink: never applied)`);
+          continue;
+        }
+        // Every read stays inside the unit's checkout (a symlinked parent
+        // directory could point anywhere) ...
+        const fromParent = await deepestRealpath(dirname(from));
+        if (!within(unitRoot, fromParent)) {
+          refused.push(`${rel} (its directory resolves outside the unit's checkout)`);
+          continue;
+        }
+        // ... and every write inside the integration checkout, checked BEFORE
+        // any directory is created, so nothing is ever made outside it.
+        if (!within(root, await deepestRealpath(dirname(to)))) {
+          refused.push(`${rel} (resolves outside the integration checkout)`);
+          continue;
+        }
+        await mkdir(dirname(to), { recursive: true });
+        if ((await lstat(to).catch(() => undefined))?.isSymbolicLink()) {
+          refused.push(`${rel} (would write through a symlink)`);
+          continue;
+        }
         if (!(await pathExists(from))) {
           // The unit deleted this file: carry the deletion into the integrated
           // tree so it matches the unit's verified result.
           await rm(to, { force: true });
           continue;
         }
-        await mkdir(dirname(to), { recursive: true });
         await cp(from, to, { recursive: true });
       }
     } finally {
@@ -269,6 +476,7 @@ export class Integrator {
     requiresGate: boolean,
     finalTestCommand: readonly string[] | undefined,
     integrationDir: string,
+    baselineInventory?: TestInventory,
   ): Promise<CheckResult> {
     if (gateArgv && gateArgv.length > 0) {
       let outcome: CommandOutcome;
@@ -291,14 +499,25 @@ export class Integrator {
       if (outcome.stderr.trim() !== "") {
         outputs.push({ stream: "stderr", text: boundOutput(outcome.stderr) });
       }
-      const ok = outcome.code === 0;
+      const exitOk = outcome.code === 0;
+      // The tests the baseline run executed must all have executed again: an
+      // early exit cannot green the gate by skipping them.
+      const shortfall =
+        baselineInventory !== undefined ? inventoryShortfall(baselineInventory, readStreamInventory(outcome.stdout, outcome.stderr)) : undefined;
+      const ok = exitOk && shortfall === undefined;
+      // The cause leads: a gate that exited non-zero failed on its own output
+      // (the inventory is secondary); the inventory is THE cause only when the
+      // gate exited 0, which is the early exit it protects against.
       return {
         kind: "app-gate",
         passed: ok,
         skipped: false,
         summary: ok
           ? "integration app-gate passed over the promoted tree (exit 0)"
-          : `integration app-gate failed over the promoted tree (exit ${outcome.code ?? "none"})`,
+          : !exitOk
+            ? `integration app-gate failed over the promoted tree (exit ${outcome.code ?? "none"})` +
+              (shortfall !== undefined ? `; also, test inventory: ${shortfall}` : "")
+            : `integration app-gate exited 0 but did not run its tests: test inventory: ${shortfall}`,
         outputs,
       };
     }
@@ -358,9 +577,10 @@ export class Integrator {
 }
 
 /**
- * Build an authenticated clone/push URL. For an HTTPS remote, inject the scoped
- * token as the basic-auth password. For a file:// remote, return it unchanged
- * (the local fallback needs no credential).
+ * Build an authenticated clone/push URL. For an HTTPS remote, the scoped token
+ * is carried as the URL's password inside this process; runGit sends it as a
+ * Bearer header and never puts it on git's command line. For a file:// remote,
+ * return it unchanged (the local fallback needs no credential).
  */
 function authenticated(gitUrl: string, token: string): string {
   if (gitUrl.startsWith("https://")) {
@@ -368,6 +588,267 @@ function authenticated(gitUrl: string, token: string): string {
     return `https://token:${encodeURIComponent(token)}@${rest}`;
   }
   return gitUrl;
+}
+
+/** Where a deferred push leaves a gated commit until the caller records it. */
+export const GATED_REF_PREFIX = "refs/switchyard/gated/";
+
+/** The candidate ref a deferred push uses for `commit`. */
+export function gatedRef(commit: string): string {
+  return `${GATED_REF_PREFIX}${commit}`;
+}
+
+/**
+ * Advance the integration branch to a gated commit a deferred integration left
+ * on its candidate ref (call this only after the revision was recorded).
+ */
+export async function advanceIntegrationBranch(
+  integrationRef: WorkspaceRef,
+  token: string,
+  commit: string,
+  workRoot: string = tmpdir(),
+): Promise<void> {
+  if (!/^[0-9a-f]{7,64}$/.test(commit)) {
+    throw new Error(`not a commit id: ${commit}`);
+  }
+  const remote = authenticated(integrationRef.gitUrl, token);
+  const dir = await mkdtemp(join(workRoot, "scf-advance-"));
+  try {
+    await git(dir, ["init", "-q", "--bare"]);
+    await git(dir, ["fetch", "-q", remote, `${gatedRef(commit)}:${gatedRef(commit)}`]).catch(async () => {
+      // Already on the branch (nothing was committed for it): fetch the branch.
+      await git(dir, ["fetch", "-q", remote, `+refs/heads/${integrationRef.defaultBranch}:refs/heads/${integrationRef.defaultBranch}`]);
+    });
+    // A fast-forward only: the branch must be an ancestor of the recorded
+    // commit (no force), so it can never be moved sideways.
+    await git(dir, ["push", "-q", remote, `${commit}:refs/heads/${integrationRef.defaultBranch}`]);
+    // Prune candidate refs: the recorded commit is on the branch now, and any
+    // other candidate was a discarded result.
+    const listed = await git(dir, ["ls-remote", remote, `${GATED_REF_PREFIX}*`]).catch(() => "");
+    for (const ref of listed.split("\n").map((l) => l.trim().split(/\s+/)[1]).filter((r): r is string => !!r)) {
+      await git(dir, ["push", "-q", remote, `:${ref}`]).catch(() => "");
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Run the gate once on the integration workspace's BASELINE (its branch head,
+ * or `commit`) and read the executed-test inventory from its output. Returns
+ * undefined when the gate's output shape is not recognized ("test inventory
+ * unavailable"); the caller records that and falls back to the exit code.
+ */
+export async function recordBaselineInventory(input: {
+  readonly integrationRef: WorkspaceRef;
+  readonly integrationToken: string;
+  readonly gateCommand: readonly string[];
+  readonly commandRunner?: CommandRunner;
+  /** Where the checkout is made (the gate's shared harness must resolve from here). */
+  readonly workRoot?: string;
+  readonly commit?: string;
+}): Promise<TestInventory | undefined> {
+  const dir = await mkdtemp(join(input.workRoot ?? tmpdir(), "scf-integration-baseline-"));
+  try {
+    await clone(authenticated(input.integrationRef.gitUrl, input.integrationToken), dir);
+    if (input.commit !== undefined) {
+      await checkoutCommit(dir, input.commit);
+    }
+    const runner = input.commandRunner ?? new ChildProcessCommandRunner();
+    const outcome = await runner.run(input.gateCommand, dir).catch(() => undefined);
+    return outcome ? readStreamInventory(outcome.stdout, outcome.stderr) : undefined;
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** The value at a key path (undefined when absent). */
+function getKey(value: unknown, keys: readonly string[]): unknown {
+  let cur: unknown = value;
+  for (const key of keys) {
+    if (typeof cur !== "object" || cur === null || Array.isArray(cur)) {
+      return undefined;
+    }
+    cur = (cur as Record<string, unknown>)[key];
+  }
+  return cur;
+}
+
+/** Set (or, for undefined, delete) the value at a key path, creating objects on the way. */
+function setKey(value: Record<string, unknown>, keys: readonly string[], next: unknown): void {
+  let cur = value;
+  for (const key of keys.slice(0, -1)) {
+    const child = cur[key];
+    if (typeof child !== "object" || child === null || Array.isArray(child)) {
+      if (next === undefined) {
+        return;
+      }
+      cur[key] = {};
+    }
+    cur = cur[key] as Record<string, unknown>;
+  }
+  const last = keys.at(-1)!;
+  if (next === undefined) {
+    delete cur[last];
+  } else {
+    cur[last] = next;
+  }
+}
+
+/**
+ * Put every protected path back to the integration baseline (the checkout's
+ * HEAD) and return what had changed. A protected file the units modified or
+ * deleted is restored; one they added is removed. Protected JSON keys are
+ * restored key by key (the rest of the file keeps the units' edits). Released
+ * paths are left alone.
+ */
+async function restoreProtected(
+  dir: string,
+  patterns: readonly string[],
+  jsonKeys: readonly { readonly file: string; readonly keys: readonly (readonly string[])[] }[],
+  released: readonly string[],
+): Promise<string[]> {
+  if (patterns.length === 0 && jsonKeys.length === 0) {
+    return [];
+  }
+  await git(dir, ["add", "-A"]);
+  const changed = (await git(dir, ["diff", "--cached", "--name-only", "--no-renames", "HEAD"]))
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  const free = (path: string) => released.length > 0 && matchesAny(path, released);
+  const restoreWhole = async (path: string): Promise<void> => {
+    const inBaseline = (await git(dir, ["ls-tree", "--name-only", "HEAD", "--", path])).trim() !== "";
+    if (inBaseline) {
+      await git(dir, ["checkout", "HEAD", "--", path]);
+    } else {
+      await git(dir, ["rm", "-q", "-f", "--cached", "--", path]);
+      await rm(join(dir, path), { force: true });
+    }
+  };
+  const touched: string[] = [];
+  for (const path of changed.filter((p) => matchesAny(p, patterns) && !free(p)).sort()) {
+    await restoreWhole(path);
+    touched.push(path);
+  }
+  for (const { file, keys } of jsonKeys) {
+    if (!changed.includes(file) || touched.includes(file) || free(file)) {
+      continue;
+    }
+    const baseText = await git(dir, ["show", `HEAD:${file}`]).catch(() => undefined);
+    const workText = await readFile(join(dir, file), "utf8").catch(() => undefined);
+    let base: unknown;
+    let work: unknown;
+    try {
+      base = baseText === undefined ? {} : JSON.parse(baseText);
+      work = workText === undefined ? undefined : JSON.parse(workText);
+    } catch {
+      work = undefined;
+    }
+    if (typeof work !== "object" || work === null || Array.isArray(work)) {
+      // Deleted or no longer valid JSON: the keys cannot be checked, so the
+      // whole file goes back.
+      await restoreWhole(file);
+      touched.push(file);
+      continue;
+    }
+    const differ = keys.filter((k) => JSON.stringify(getKey(base, k)) !== JSON.stringify(getKey(work, k)));
+    if (differ.length === 0) {
+      continue;
+    }
+    for (const k of differ) {
+      setKey(work as Record<string, unknown>, k, getKey(base, k));
+      touched.push(`${file}#${k.join(".")}`);
+    }
+    const indent = /\n([ \t]+)"/.exec(workText ?? "")?.[1] ?? "  ";
+    await writeFile(join(dir, file), `${JSON.stringify(work, null, indent)}${(workText ?? "").endsWith("\n") ? "\n" : ""}`);
+  }
+  if (touched.length > 0) {
+    await git(dir, ["add", "-A"]);
+  }
+  return touched;
+}
+
+/**
+ * Run git in a repo the orchestrator controls, hardened (no global or system
+ * config, private empty HOME, hooks and fsmonitor off, any token sent as a
+ * header and never on the command line; see runGit).
+ */
+async function safeGit(dir: string, args: readonly string[], extraEnv: Readonly<Record<string, string>> = {}): Promise<string> {
+  const { stdout } = await runGit(["-C", dir, ...args], { env: extraEnv, maxBuffer: 16 * 1024 * 1024 });
+  return stdout;
+}
+
+/** The only configuration the trusted repo may have when it is used after the gate. */
+const TRUSTED_CONFIG = "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n";
+
+/**
+ * Put the trusted repo back to known content after the gate ran: its config is
+ * rewritten, hooks/, info/ and any object alternates are removed, and the
+ * gated commit must still be present. Code the gate ran as the same user could
+ * have reached it by absolute path; after this nothing it planted there (a
+ * pushInsteadOf, a hook, an alternate object store) is read by the push.
+ */
+async function resetTrustedRepo(trusted: string, commit: string): Promise<void> {
+  const info = await lstat(trusted).catch(() => undefined);
+  if (!info || !info.isDirectory() || info.isSymbolicLink()) {
+    throw new Error("integration refused: the trusted repository was replaced while the gate ran");
+  }
+  await rm(join(trusted, "hooks"), { recursive: true, force: true });
+  await rm(join(trusted, "info"), { recursive: true, force: true });
+  await rm(join(trusted, "objects", "info", "alternates"), { force: true });
+  await rm(join(trusted, "objects", "info", "http-alternates"), { force: true });
+  await rm(join(trusted, "config"), { force: true });
+  await writeFile(join(trusted, "config"), TRUSTED_CONFIG, { mode: 0o600 });
+  const found = (await safeGit(trusted, ["rev-parse", "--verify", "-q", `${commit}^{commit}`]).catch(() => "")).trim();
+  if (found !== commit) {
+    throw new Error("integration refused: the gated commit is missing from the trusted repository after the gate ran");
+  }
+}
+
+/**
+ * The tracked files of `commit` whose content in `worktree` differs (or that
+ * are gone), read through the TRUSTED repo with a throwaway index: the
+ * worktree's own .git (which agent code may have changed) is never consulted.
+ */
+async function trackedDrift(trusted: string, commit: string, worktree: string): Promise<string[]> {
+  const index = join(trusted, "drift-index");
+  const env = { GIT_INDEX_FILE: index, GIT_WORK_TREE: worktree };
+  const base = ["--work-tree", worktree];
+  await safeGit(trusted, [...base, "read-tree", commit], env);
+  await safeGit(trusted, [...base, "update-index", "-q", "--refresh"], env).catch(() => "");
+  const out = await safeGit(trusted, [...base, "diff-files", "--name-only"], env);
+  return out
+    .split("\n")
+    .map((l) => l.trim())
+    .filter((l) => l !== "");
+}
+
+/** Is `path` the root or inside it (both already real paths)? */
+function within(root: string, path: string): boolean {
+  return path === root || path.startsWith(`${root}${sep}`);
+}
+
+/**
+ * The real path of `path`'s deepest EXISTING ancestor (itself when it exists),
+ * with the missing tail appended: where a write to `path` would really land,
+ * computed without creating anything.
+ */
+async function deepestRealpath(path: string): Promise<string> {
+  const tail: string[] = [];
+  let current = path;
+  for (;;) {
+    try {
+      return join(await realpath(current), ...tail.reverse());
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) {
+        return path;
+      }
+      tail.push(current.slice(parent.length + 1));
+      current = parent;
+    }
+  }
 }
 
 /** True when a path exists (a symlink counts, even a dangling one). */

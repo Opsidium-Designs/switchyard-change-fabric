@@ -76,6 +76,20 @@ export class LocalGitDeliveryProvider implements DeliveryProvider {
       if (input.integrationBranch) {
         await checkout(integrationDir, input.integrationBranch);
       }
+      if (input.gatedCommit !== undefined) {
+        // Read exactly the tree the gate ran on, never a later branch head.
+        if (!/^[0-9a-f]{7,64}$/.test(input.gatedCommit)) {
+          throw new Error(`promotion refused: ${JSON.stringify(input.gatedCommit)} is not a commit id`);
+        }
+        try {
+          await git(integrationDir, ["-c", "advice.detachedHead=false", "checkout", "-q", "--detach", `${input.gatedCommit}^{commit}`]);
+        } catch {
+          throw new Error(
+            `promotion refused: the gated commit ${input.gatedCommit} is not in the integration workspace ` +
+              "(only a tree the gate passed is ever pushed there)",
+          );
+        }
+      }
       const integratedFiles = await listTrackedFiles(integrationDir);
 
       // 2. Create or reset the delivery branch in the source repository.
@@ -146,6 +160,22 @@ export class LocalGitDeliveryProvider implements DeliveryProvider {
         if (!integratedSet.has(rel)) {
           await git(target.repoDir, ["rm", "-f", "--", rel]);
           removedPaths.push(rel);
+        }
+      }
+
+      // 3c. Gate-equals-deploy: the staged delivery tree must be exactly the
+      //     tree the authoritative gate ran on. Refuse (and reset the branch)
+      //     rather than commit anything else.
+      if (input.gatedCommit !== undefined) {
+        await git(target.repoDir, ["add", "-A"]);
+        const staged = (await git(target.repoDir, ["write-tree"])).trim();
+        const gated = await treeHash(integrationDir, "HEAD");
+        if (staged !== gated) {
+          await git(target.repoDir, ["reset", "-q", "--hard", startPoint]);
+          throw new Error(
+            `promotion refused: the promoted tree ${staged} differs from the gated tree ${gated} ` +
+              `(commit ${input.gatedCommit}); the gated tree and the promoted tree must be the same tree`,
+          );
         }
       }
 

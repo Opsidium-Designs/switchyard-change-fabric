@@ -8,7 +8,10 @@
 #   make dev-all   run the Worker and the console together
 #   make cli ARGS="doctor"   run the switchyard-change CLI
 #   make doctor    run the readiness check (switchyard-change doctor)
+#   make jev-smoke live check of the decision model's question types (needs .env; not in check)
 #   make demo      run the example audit-logging Change end to end (offline)
+#   make demo-board  agents form around a goal on the Change board (offline, deterministic)
+#   make run-board   live board run against a running Worker (needs the AI Gateway in .env)
 #   make run-live-watch  watchable live run: stable id, escalation fires, repos left up
 #   make run-live-service  live run of the MODULAR service-api app (carries the blueprint)
 #   make demo-live   one-command watchable live demo (needs `make dev-all` running)
@@ -27,7 +30,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: install dev console dev-all dev-all-lan cli doctor demo decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: jev-smoke install dev console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -102,6 +105,31 @@ demo:
 	  --goal-file $(CURDIR)/examples/goals/add-input-validation.goal.txt \
 	  --project $(CURDIR)/examples/calc-project
 
+# Agents that FORM around a goal on the Change board, offline and deterministic:
+# the lead's first turn decomposes the goal (the heuristic offline stub) into
+# proposed items, workers join under the min/max dial and claim them, an
+# overlapping claim is contested and resolved by narrowing, a worker asks the
+# other party a question (a `to`-addressed message) and gets a reply, each
+# worker edits in its own repo (the deterministic scoped executor) and announces
+# its push, and the continuous integrator builds a revision as pushes land. The
+# demo project has no gate of its own, so the generic offline gate FIXTURE
+# stands in: it fails the first revision (naming a file it changed), the board
+# asks that item's owner for a fix, the owner pushes again, the next revision
+# passes, the board derives each item's completion, and the last (passing)
+# revision is promoted to local Git. Every agent turn is taken by a generic,
+# goal-agnostic policy standing in for the turn model, so the printed board
+# transcript is identical run to run. No credentials, no network.
+BOARD_GOAL = $(CURDIR)/examples/goals/audit-logging.goal.txt
+BOARD_PROJECT = $(CURDIR)/examples/demo-project
+
+# The human's answer to contract changes on the original tests during the demo
+# (accept or reject); the demo rejects, so the tests item adds a NEW test file.
+DECIDE_CONTRACTS ?= reject
+
+demo-board:
+	npm -w apps/cli run dev -- run-board --offline --fixture-gate --decide-contracts $(DECIDE_CONTRACTS) --goal-file "$(BOARD_GOAL)" --project "$(BOARD_PROJECT)" \
+	  --min $(MIN) --max $(MAX)
+
 # Decompose a goal against a target project into a WorkGraph and print the plan
 # plus schedule, deterministically and offline (the heuristic analyzer, no live
 # inference). Defaults to the second seeded goal (add input validation to every
@@ -169,6 +197,16 @@ run-live:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- run-live "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" \
 	  --min $(MIN) --max $(MAX) $(if $(OWNER),--owner $(OWNER),)
+
+# A LIVE board run against a running Worker (start it with `make dev`): the
+# planner, every agent turn, and the executor run through the AI Gateway
+# (EXECUTOR=ai-gateway plus the gateway URL/token in .env); without a live turn
+# model the command refuses. Each worker joins with its own Artifact repo and a
+# short-lived write token. Override GOAL / PROJECT / MIN / MAX as needed.
+run-board:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	npm -w apps/cli run dev -- run-board "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" \
+	  --min $(MIN) --max $(MAX)
 
 # The live run against the MODULAR service-api app. `make run-live` defaults to
 # the flat calc-project, whose decomposition is a wide, flat fan-out with no
@@ -315,6 +353,14 @@ delete-app:
 	  grep -qE '"success"[[:space:]]*:[[:space:]]*true|does not exist' \
 	  && echo "Teardown complete: $$name is not deployed." \
 	  || { echo "Teardown may have failed; check the account."; exit 1; }
+
+# Opt-in LIVE check of the decision model (never part of make check): one call
+# per question type (noul, choice, score), printing PASS/FAIL, so an API drift
+# is caught at once instead of surfacing as silently skipped decisions. Needs
+# EXECUTOR=ai-gateway with the gateway and account credentials in .env.
+jev-smoke:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	npm -w apps/cli run dev -- jev-smoke
 
 build:
 	npm run build

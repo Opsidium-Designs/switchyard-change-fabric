@@ -98,6 +98,27 @@ describe("VerificationProvider failing cases", () => {
     expect(scope?.summary).toMatch(/package\.json/);
   });
 
+  it("leaves paths the unit yields to another owner out of its scope check", async () => {
+    const checkout = join(dir, "yielded");
+    await makeCheckout(checkout, BASELINE, [
+      { path: "src/alpha/alpha.done", content: "done\n" },
+      { path: "src/handed/off.ts", content: "stale\n" },
+    ]);
+    const provider = new VerificationProvider({ commandRunner: new FakeCommandRunner([]) });
+    const yielded = await provider.verify({
+      worktreeDir: checkout,
+      baselineRef: "baseline",
+      contract: { unitId: "alpha", paths: ["src/alpha/**"], yieldedScope: ["src/handed/**"] },
+    });
+    expect(yielded.verdict).toBe("verified");
+    const strict = await provider.verify({
+      worktreeDir: checkout,
+      baselineRef: "baseline",
+      contract: { unitId: "alpha", paths: ["src/alpha/**"] },
+    });
+    expect(strict.verdict).toBe("failed");
+  });
+
   it("fails a WorkUnit whose test command exits non-zero", async () => {
     const checkout = join(dir, "failing-test");
     await makeCheckout(checkout, BASELINE, [

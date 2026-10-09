@@ -1,0 +1,1778 @@
+/**
+ * run-board: a Change driven by agents that FORM around a goal on the board,
+ * integrated continuously.
+ *
+ * This is a separate run mode next to run-live; it shares that run's planner,
+ * executor, gate, integrator, attribution, promotion, and redeploy, and changes
+ * only how work is distributed. Instead of the engine assigning WorkUnits, the
+ * lead proposes open items and workers claim them:
+ *
+ *   1. create the Change (the planning-first placeholder), derive the PROTECTED
+ *      set from the project (the files that define the gate), and post the goal
+ *      with it as the human, so it is visible on the board;
+ *   2. the lead joins; its first turn is the planner, whose units become
+ *      `item.proposed` messages (scoped away from protected paths);
+ *   3. workers join under the min/max dial (another joins while open items
+ *      outnumber the workers in flight, up to max), each with its own repo, and
+ *      take turns: claim, contest, narrow, ask, edit, push, propose done;
+ *   4. CONTINUOUS INTEGRATION: whenever announced pushes are pending, the
+ *      integrator builds the next integrated revision from the latest passing
+ *      revision plus every pending push (each pinned to its announced commit),
+ *      runs the gate on it (with the gate's own files from the baseline), and
+ *      records it on the board. Revisions are serialized; pushes that land while
+ *      one runs are coalesced into the next. A failing revision carries its
+ *      bounded, credential-free output and the items attribution implicated; the
+ *      board asks those owners for a fix (addressed to them), they rebase onto
+ *      the latest passing revision, edit with the failing output (on the next
+ *      model of the escalation ladder per attempt), and push again, which
+ *      triggers the next revision;
+ *   5. the agent phase ends when every item is completed (the board derives
+ *      completion from a passing revision), or a budget, quiescence, or the
+ *      timeout ends it; the authoritative verdict is the LAST revision's gate,
+ *      and only that revision, when it passed, is promoted (and redeployed in
+ *      place): the promoted tree is the gated tree.
+ *
+ * Two schedules: `lockstep` steps every agent in a fixed order each round and
+ * integrates between rounds, so the board log is identical run to run (offline
+ * demo, tests); `concurrent` runs each agent's own loop (live runs).
+ */
+
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  BOARD_LIMITS,
+  entriesOverlap,
+  entryWithin,
+  intentPath,
+  releasedTargets,
+  type BoardDigest,
+  type BoardItem,
+  type BoardMessage,
+  type BoardRules,
+  type BoardState,
+  type Change,
+  type ConcurrencyDial,
+} from "@switchyard-change/change-core";
+import type { AgentTurnTransport, AskJev, ExecutorProvider } from "@switchyard-change/model-adapters";
+import { jevErrorReason, ScopedNoopExecutor } from "@switchyard-change/model-adapters";
+import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
+import { authenticatedRemote, type GitIdentity } from "@switchyard-change/local-runner";
+import type { PromotionResult } from "@switchyard-change/git-promotion";
+import {
+  advanceIntegrationBranch,
+  ChangeVerification,
+  inventoryAfterContracts,
+  recordBaselineInventory,
+  GATED_REF_PREFIX,
+  type CommandRunner as VerificationCommandRunner,
+  type CompletedWorkUnit,
+  type EvidenceSummary,
+} from "@switchyard-change/verification";
+
+import { BoardAgent, RunTurnBudget, type AgentStop, type AgentTurnRecord, type BoardSeedItem } from "./board-agent.ts";
+import { BoardOperatorClient, type JoinedWorkspace } from "./board-client.ts";
+import { deriveProtectedPaths, type ProtectedPaths } from "./protected-paths.ts";
+import type { TestInventory } from "@switchyard-change/verification";
+import { redactSecrets } from "./redact.ts";
+import {
+  attributeImplicatedUnits,
+  createIntegrationWorkspace,
+  createPlanningChange,
+  failPlanningChange,
+  materializeSiblingGateDeps,
+  promoteVerifiedIntegration,
+  redeployIfPreviouslyDeployed,
+  type DeployApp,
+  type FullLiveEvent,
+  type GatedUnitInput,
+} from "./run-live.ts";
+import { withWorkerAuth } from "./worker-auth.ts";
+
+
+/** An advisory typed decision and its outcome, as recorded on the board. */
+export interface BoardDecisionRecord {
+  readonly juncture: "plan-review" | "attribution" | "fix-confidence";
+  readonly question: string;
+  readonly answer?: string;
+  readonly confidence?: number;
+  readonly accepted: boolean;
+  readonly error?: string;
+}
+
+/** What the lead's planner produced. */
+export interface BoardSeed {
+  readonly items: readonly BoardSeedItem[];
+  /** The planner's plan-review decision (or its failure), when a decision model reviewed the plan. */
+  readonly review?: { readonly question: string; readonly noul: string; readonly confidence: number; readonly accepted: boolean; readonly error?: string };
+  /** How the plan was made ("planner", "heuristic-fallback", or "heuristic"). */
+  readonly source: string;
+  readonly model?: string;
+}
+
+/** Budgets and limits for a board run. */
+export interface BoardRunBudgets {
+  /** Turns one agent may spend on one item (default 8). */
+  readonly maxTurnsPerItem?: number;
+  /** Turns across every agent in the run (default 200). */
+  readonly maxRunTurns?: number;
+  /** Lockstep rounds before the run stops (default 200). */
+  readonly maxRounds?: number;
+  /** Wall-clock limit for the agent phase, in ms (default 30 minutes). */
+  readonly timeoutMs?: number;
+  /** Fix requests a failing revision may send for one item (the board rule; default 2). */
+  readonly maxFixAttemptsPerItem?: number;
+  /**
+   * Concurrent schedule: how long every agent may sit idle with no new board
+   * message and no integration pending before the agent phase ends as
+   * quiescent, in ms (default 2 minutes).
+   */
+  readonly quiescenceMs?: number;
+}
+
+/** A progress event of a board run. */
+export type BoardRunEvent =
+  | { readonly kind: "change-created"; readonly changeId: string }
+  | { readonly kind: "goal-posted"; readonly protected: readonly string[]; readonly testInventory: string }
+  | { readonly kind: "contract-decision"; readonly contract: string; readonly decision: string; readonly path?: string }
+  | { readonly kind: "contract-awaiting-human"; readonly contract: string; readonly escalationId: string; readonly path?: string }
+  | { readonly kind: "seeded"; readonly source: string; readonly model?: string; readonly items: number }
+  | { readonly kind: "agent-joined"; readonly agent: string; readonly role: string; readonly workspace?: string; readonly backend?: string }
+  | { readonly kind: "turn"; readonly record: AgentTurnRecord }
+  | { readonly kind: "agents-done"; readonly reason: BoardStopReason; readonly detail?: string }
+  | { readonly kind: "agent-stopped"; readonly agent: string; readonly stop: AgentStop }
+  | { readonly kind: "integrated"; readonly revision: BoardRevision }
+  | { readonly kind: "integration-not-recorded"; readonly reason: string }
+  | { readonly kind: "nothing-to-integrate" }
+  | FullLiveEvent;
+
+/** Why the agent phase ended. */
+export type BoardStopReason =
+  | "all-items-done"
+  | "fix-budget"
+  | "run-budget"
+  | "quiescent"
+  | "max-rounds"
+  | "timeout"
+  | "all-agents-stopped";
+
+/** An integration recorded as a board revision. */
+export interface BoardRevision {
+  readonly n: number;
+  readonly gate: "pass" | "fail";
+  /** The commit of the exact tree the gate ran on. */
+  readonly commit: string;
+  /** The announced push commits this revision merged (each contained in the gated tree). */
+  readonly merged: readonly string[];
+  /** Items whose latest push this revision merged. */
+  readonly integratedItems: readonly string[];
+  /** Items with a pending push this revision did not merge. */
+  readonly excludedItems: readonly string[];
+  /** Agents left out, and why (credential-free). */
+  readonly excludedAgents: readonly { readonly agent: string; readonly reason: string }[];
+  /** Items the board completed from this revision. */
+  readonly completedItems: readonly string[];
+  /** A failing revision's implicated items and how attribution chose them. */
+  readonly implicated?: { readonly items: readonly string[]; readonly source: "parse" | "jev" | "all" };
+  /** A failing revision's reason: its first line(s), bounded (the full evidence is on the board). */
+  readonly failure?: string;
+  /** Set when accepted contract changes relaxed the test inventory for this revision. */
+  readonly inventoryNote?: string;
+  /** Items whose fix request the board sent (or whose fix budget it recorded as spent). */
+  readonly fixRequested?: readonly string[];
+  readonly fixExhausted?: readonly string[];
+}
+
+/** A contract decision the board escalated to the human. */
+export interface BoardContractDecisionRequest {
+  readonly escalationId: string;
+  readonly contract: string;
+  readonly path?: string;
+  readonly question: string;
+}
+
+/** Options for a board run. */
+export interface RunBoardOptions {
+  readonly goal: string;
+  readonly projectDir: string;
+  readonly changeId: string;
+  /** The Worker base URL (or the local control's stand-in base). */
+  readonly workerUrl: string;
+  readonly fetchFn?: typeof fetch;
+  readonly dial: ConcurrencyDial;
+  readonly transport: AgentTurnTransport<BoardDigest, BoardMessage>;
+  /** The lead's first turn: the planner's decomposition. */
+  readonly seed: (goal: string) => Promise<BoardSeed>;
+  /** The executor each worker's edit runs (default: the scoped deterministic noop). */
+  readonly executor?: ExecutorProvider;
+  /** The ordered escalation models a fix attempt climbs (attempt k uses entry k - 1). */
+  readonly escalationModels?: readonly string[];
+  readonly schedule?: "lockstep" | "concurrent";
+  readonly budgets?: BoardRunBudgets;
+  /**
+   * The explicit, short write-token lifetime each worker's join asks for
+   * (default 1800 s). Agents' tokens are not refreshed, so the run refuses an
+   * agent-phase timeout longer than this; the integrator never uses them (it
+   * reads with fresh operator read tokens).
+   */
+  readonly workspaceTtlSeconds?: number;
+  /** The lifetime of the read tokens the integrator asks for per revision (default 600 s). */
+  readonly readTokenTtlSeconds?: number;
+  readonly rules?: Partial<BoardRules>;
+  readonly workRoot?: string;
+  readonly identity?: GitIdentity;
+  /** The per-app gate run on the integrated tree, as argv. */
+  readonly appGateCommand?: readonly string[];
+  /** The project declares a gate: without a command the verdict is cannot-pass. */
+  readonly requireAppGate?: boolean;
+  readonly verifyCommandRunner?: VerificationCommandRunner;
+  /**
+   * The HUMAN's answer to a contract change on the original tests or the
+   * gate's configuration (an escalation the board raised). Without it the
+   * decision waits durably for the console or the escalation resolve route.
+   */
+  readonly resolveContract?: (request: BoardContractDecisionRequest) => Promise<"accept" | "reject">;
+  /** Optional typed-decision caller for failure attribution (advisory; a confident choice narrows). */
+  readonly jev?: AskJev;
+  readonly jevThreshold?: number;
+  readonly deployAppDir?: string;
+  readonly deployAppName?: string;
+  readonly deployApp?: DeployApp;
+  readonly appAlreadyDeployed?: (input: { readonly appName: string }) => Promise<string | undefined>;
+  /** Leave the agents' repos in place at the end. */
+  readonly skipCleanup?: boolean;
+  /** Concurrent schedule: how often the driver checks the board (default 500 ms). */
+  readonly pollMs?: number;
+  readonly onEvent?: (event: BoardRunEvent) => void;
+}
+
+/** The outcome of a board run. */
+export interface RunBoardResult {
+  readonly changeId: string;
+  readonly stopReason: BoardStopReason;
+  /** The whole board log and its reduced state, read back from the board. */
+  readonly log: readonly BoardMessage[];
+  readonly state: BoardState;
+  readonly turns: readonly AgentTurnRecord[];
+  readonly agents: readonly { readonly id: string; readonly role: string; readonly workspace?: string; readonly stop?: AgentStop }[];
+  readonly seed: BoardSeed;
+  /** The protected set posted with the goal. */
+  readonly protected: readonly string[];
+  /** The gate-defining keys posted with the goal (restored by the integrator). */
+  readonly protectedKeys: readonly string[];
+  /** Every integrated revision recorded on the board, in order. */
+  readonly revisions: readonly BoardRevision[];
+  /** The LAST revision: its gate is the run's verdict. */
+  readonly revision?: BoardRevision;
+  /** Integrations that recorded no revision, and why (credential-free). */
+  readonly integrationFailures: readonly string[];
+  readonly verdict: "verified" | "failed";
+  /** Set when the last revision passed but pushes were left ungated: why the verdict is failed. */
+  readonly partial?: string;
+  /**
+   * Items not completed when the run ended (no done proposal, no push, or a
+   * push no passing revision merged). A verified verdict with any of these is a
+   * PARTIAL result: the gate passed, but the Change is not complete.
+   */
+  readonly incompleteItems: readonly string[];
+  /** The test inventory the baseline gate run recorded, as a readable line. */
+  readonly testInventory: string;
+  /** The last revision's evidence. */
+  readonly evidence?: EvidenceSummary;
+  readonly promotion?: PromotionResult;
+  readonly sourceRepoDir?: string;
+  readonly deployment?: { readonly url: string; readonly app: string };
+  readonly workRoot: string;
+  readonly cleanedUp: readonly string[];
+}
+
+/** The repo of one agent the integrator reads (no credential: it reads with fresh operator tokens). */
+export interface BoardAgentRepo {
+  readonly gitUrl: string;
+  readonly defaultBranch: string;
+}
+
+/** Inputs to one integration of the board's announced pushes. */
+export interface IntegrateBoardOptions {
+  readonly operator: BoardOperatorClient;
+  readonly change: Pick<Change, "id" | "objective">;
+  readonly agentRepos: ReadonlyMap<string, BoardAgentRepo>;
+  /**
+   * The clone remote for an agent's repo, with a FRESH operator read credential
+   * (the Worker issues it at integration time). Never an agent's write token.
+   */
+  readonly readRemote: (agent: string) => Promise<string>;
+  readonly integration: Awaited<ReturnType<typeof createIntegrationWorkspace>>;
+  readonly worktreeRoot: string;
+  readonly identity: GitIdentity;
+  readonly appGateCommand?: readonly string[];
+  readonly requireAppGate?: boolean;
+  readonly verifyCommandRunner?: VerificationCommandRunner;
+  /**
+   * The gate's contract (see protected-paths.ts): restored from the baseline
+   * before the gate runs, except paths an accepted contract released (read from
+   * board state); a change to an unreleased protected path fails the revision.
+   */
+  readonly contract?: Pick<ProtectedPaths, "restore" | "jsonKeys">;
+  /**
+   * Agents whose pushes this attempt leaves out (they kept being superseded
+   * while the gate ran): integration runs without their units, so the
+   * recorded tree never contains content `merged` does not list. Their newer
+   * pushes stay pending for a later revision.
+   */
+  readonly holdBack?: readonly string[];
+  /** The baseline gate run's test inventory (see IntegrateOptions.testInventory). */
+  readonly testInventory?: TestInventory;
+  readonly jev?: AskJev;
+  readonly jevThreshold?: number;
+  /** Strip credentials from any text that leaves the integrator (default: redactSecrets). */
+  readonly scrub?: (text: string) => string;
+  /** Record an advisory typed decision's outcome (attribution) on the board. */
+  readonly recordDecision?: (decision: BoardDecisionRecord) => Promise<void>;
+}
+
+/** The result of one integration attempt. */
+export interface IntegrateBoardResult {
+  /** The revision recorded on the board (absent when nothing was recorded). */
+  readonly revision?: BoardRevision;
+  readonly evidence?: EvidenceSummary;
+  readonly requiresIntegrationGate: boolean;
+  /**
+   * Why no revision was recorded: nothing the gate actually ran on could be
+   * recorded honestly (every pending push was excluded, the integrator refused,
+   * or the pushes changed while the gate ran: `stale`).
+   */
+  readonly failure?: string;
+  /** The pushes it integrated were superseded while the gate ran: run again. */
+  readonly stale?: boolean;
+  /** The pending-push set this attempt read (see pendingPushKey). */
+  readonly key?: string;
+  /** The failure may pass on retry (an unreachable repo or board), not a deterministic refusal. */
+  readonly transient?: boolean;
+  /** With `stale`: the agents whose pushes were superseded while the gate ran. */
+  readonly supersededAgents?: readonly string[];
+}
+
+/** An item's announced, not yet integrated push, still held by the agent that pushed it. */
+function pendingPushItems(state: BoardState): BoardItem[] {
+  return Object.values(state.items).filter(
+    (i) =>
+      i.lastPush !== undefined &&
+      i.lastPush.integratedIn === undefined &&
+      i.status === "claimed" &&
+      i.owner === i.lastPush.agent,
+  );
+}
+
+/** A stable key for the set of pending pushes (what one integration would merge). */
+export function pendingPushKey(state: BoardState): string {
+  return pendingPushItems(state)
+    .map((i) => i.lastPush!.commit)
+    .sort()
+    .join(",");
+}
+
+/**
+ * The most telling line of a gate's output: an error (`SyntaxError: ...`,
+ * `AssertionError ...`), a failing test line, else undefined. npm/yarn/pnpm
+ * command echoes (`> ...`) are never it.
+ */
+export function gateFailureLine(output: string): string | undefined {
+  const lines = output
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l !== "" && !/^[>$] /.test(l) && !/^npm (error|ERR!)/.test(l));
+  return (
+    lines.find((l) => /^\w*(Error|Exception)\b(\s*\[[A-Z_]+\])?:/.test(l)) ??
+    lines.find((l) => /^(not ok\b|\u2716|FAIL\b|--- FAIL)/.test(l) && !/^\u2716 failing tests:/.test(l)) ??
+    lines.find((l) => /\b(Error|Exception):/.test(l))
+  );
+}
+
+/**
+ * A failing revision's reason for summaries: when the gate exited non-zero,
+ * its own failing line leads (the integrator's summary follows); otherwise the
+ * integrator's summary (for example an inventory shortfall) is the reason.
+ */
+function revisionFailure(check: { readonly summary: string; readonly outputs: readonly { readonly text: string }[] }): string {
+  const key = /exited 0 but/.test(check.summary) ? undefined : gateFailureLine(check.outputs.map((o) => o.text).join("\n"));
+  return firstLines(key !== undefined ? `${key}\n${check.summary}` : check.summary, 300);
+}
+
+/**
+ * The first full line(s) of a reason, at most `max` characters, cut at a word
+ * boundary when it must be cut (never mid-word).
+ */
+export function firstLines(text: string, max: number): string {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== "");
+  let out = "";
+  for (const line of lines) {
+    const next = out === "" ? line : `${out} ${line}`;
+    if (next.length > max) {
+      if (out === "") {
+        const cut = line.slice(0, max - 3);
+        const space = cut.lastIndexOf(" ");
+        return `${space > max / 2 ? cut.slice(0, space) : cut}...`;
+      }
+      break;
+    }
+    out = next;
+  }
+  return out;
+}
+
+/** The first `max` characters of text (a bounded excerpt, cut on a line when possible). */
+function head(text: string, max: number): string {
+  if (text.length <= max) {
+    return text;
+  }
+  const cut = text.slice(0, max - 40);
+  const line = cut.lastIndexOf("\n");
+  return `${line > max / 2 ? cut.slice(0, line) : cut}\n... (output truncated)`;
+}
+
+/**
+ * Decide which items a failing revision implicates: the existing run-live
+ * attribution (parse the failing output for the files and names it reports and
+ * map them to the items' write intents), then a CONFIDENT typed-decision choice
+ * when one is configured (advisory narrowing, never a verdict), else every item
+ * the revision merged.
+ */
+export async function attributeRevisionFailure(input: {
+  readonly items: readonly { readonly id: string; readonly objective: string; readonly paths: readonly string[] }[];
+  readonly output: string;
+  readonly changeId: string;
+  readonly jev?: AskJev;
+  readonly jevThreshold?: number;
+  /** Record the typed decision's outcome (accepted, low-confidence, or an error): never silent. */
+  readonly onDecision?: (decision: BoardDecisionRecord) => Promise<void>;
+}): Promise<{ readonly items: readonly string[]; readonly source: "parse" | "jev" | "all" }> {
+  const units: GatedUnitInput[] = input.items.map((i) => ({
+    unitId: i.id,
+    objective: i.objective,
+    paths: i.paths,
+    authRemote: "",
+    gateCommand: [],
+    requiredExports: [],
+  }));
+  const parsed = attributeImplicatedUnits(units, input.output);
+  let implicated = parsed.units.map((u) => u.unitId);
+  let source: "parse" | "jev" | "all" = parsed.attributed ? "parse" : "all";
+  if (input.jev && units.length > 1) {
+    const ids = units.map((u) => u.unitId);
+    const question = "Which item does this failure implicate?";
+    try {
+      const answers = await input.jev(
+        [`Change: ${input.changeId}`, `Items in the failing revision: ${ids.join(", ")}`, "Failing gate evidence:", input.output.slice(0, 2000)].join("\n"),
+        {
+          attribution: {
+            type: "choice",
+            instructions: question,
+            criteria: ids,
+            descriptions: Object.fromEntries(input.items.map((i) => [i.id, i.objective.slice(0, 200)])),
+          },
+        },
+      );
+      const answer = answers["attribution"];
+      const confident =
+        answer !== undefined &&
+        answer.type === "choice" &&
+        typeof answer.choice === "string" &&
+        ids.includes(answer.choice) &&
+        answer.confidence >= (input.jevThreshold ?? 0.75);
+      await input.onDecision?.({
+        juncture: "attribution",
+        question,
+        ...(answer?.choice !== undefined ? { answer: answer.choice } : {}),
+        ...(answer !== undefined ? { confidence: answer.confidence } : {}),
+        accepted: confident,
+        ...(answer === undefined ? { error: "the decision reply carried no attribution answer" } : {}),
+      });
+      if (confident) {
+        implicated = parsed.attributed ? [...new Set([...implicated, answer!.choice!])] : [answer!.choice!];
+        source = "jev";
+      }
+    } catch (error) {
+      // Advisory only: a decision-transport error leaves the parse result, and
+      // is RECORDED (never silent).
+      await input.onDecision?.({ juncture: "attribution", question, accepted: false, error: jevErrorReason(error) });
+    }
+  }
+  return { items: inOrder(implicated, input.items), source };
+}
+
+/** Keep `chosen` in the items' order. */
+function inOrder(chosen: readonly string[], items: readonly { readonly id: string }[]): string[] {
+  return items.map((i) => i.id).filter((id) => chosen.includes(id));
+}
+
+/**
+ * Integrate every announced, not yet integrated push on the board as ONE
+ * integrated revision: a function of board state, so a per-push driver (or a
+ * future queue-triggered workflow) can call it.
+ *
+ * The input is synthesized from the board, never from the agents' say-so: one
+ * unit per agent with pending pushes on items it still holds,
+ *   - PINNED to the agent's latest pending announced commit (the clone checks
+ *     out exactly that commit), with every other merged commit of the agent
+ *     required to be in that commit's history;
+ *   - diffed against the agent's last commit a passing revision already merged
+ *     (so earlier, already integrated work is not re-applied);
+ *   - scoped to the WRITE INTENTS of the items it integrates (announced paths
+ *     never widen scope), with the files of items it handed off yielded (never
+ *     applied from it, never failing it);
+ *   - read with a fresh operator read token.
+ * The existing verifier and integrator compose the verified units onto the
+ * latest passing revision, restore the gate's own files from the baseline, and
+ * run the gate; the revision (the gated commit, the gate, the merged commits,
+ * and for a fail the bounded, credential-free output and implicated items) is
+ * recorded through the integration revision route. When nothing the gate ran on
+ * can be recorded honestly, no revision is recorded and the reason is returned.
+ */
+export async function integrateBoardRevision(options: IntegrateBoardOptions): Promise<IntegrateBoardResult> {
+  const scrub = options.scrub ?? redactSecrets;
+  const requiresIntegrationGate = Boolean(options.appGateCommand && options.appGateCommand.length > 0) || options.requireAppGate === true;
+  const board = await options.operator.log();
+  const state = board.state;
+  const key = pendingPushKey(state);
+  const pending = pendingPushItems(state);
+  if (pending.length === 0) {
+    return { requiresIntegrationGate, key, failure: "nothing is pending" };
+  }
+
+  // Facts from the log: each agent's announced commits, the commits passing
+  // revisions merged, and the items each agent handed off.
+  const announced = new Map<string, { commit: string; seq: number }[]>();
+  const passingMerged = new Set<string>();
+  const handedOff = new Map<string, Set<string>>();
+  for (const m of board.messages) {
+    if (m.type === "push.announced") {
+      announced.set(m.from, [...(announced.get(m.from) ?? []), { commit: m.payload.commit, seq: m.seq }]);
+    } else if (m.type === "integrated.rev" && m.payload.gate === "pass") {
+      for (const c of m.payload.merged) {
+        passingMerged.add(c);
+      }
+    } else if (m.type === "handoff") {
+      handedOff.set(m.from, new Set([...(handedOff.get(m.from) ?? []), m.payload.item]));
+    } else if (m.type === "item.reopened") {
+      // A reopened item is no longer its previous owner's to apply.
+      handedOff.set(m.payload.previousOwner, new Set([...(handedOff.get(m.payload.previousOwner) ?? []), m.payload.item]));
+    }
+  }
+
+  const agents = [...new Set(pending.map((i) => i.lastPush!.agent))].sort();
+  const excludedAgents: { agent: string; reason: string }[] = [];
+  const units: { id: string; objective: string; dependsOn: string[]; paths: string[] }[] = [];
+  const completed: CompletedWorkUnit[] = [];
+  const itemsByAgent = new Map<string, BoardItem[]>();
+  for (const agent of agents) {
+    const mine = pending.filter((i) => i.lastPush!.agent === agent).sort((a, b) => a.lastPush!.seq - b.lastPush!.seq);
+    itemsByAgent.set(agent, mine);
+    const repo = options.agentRepos.get(agent);
+    if (!repo) {
+      excludedAgents.push({ agent, reason: "no repo is known for this agent" });
+      continue;
+    }
+    if (options.holdBack?.includes(agent)) {
+      excludedAgents.push({ agent, reason: "held back: its pushes kept being superseded while the gate ran; they stay pending" });
+      continue;
+    }
+    const pin = mine.at(-1)!.lastPush!;
+    const base = (announced.get(agent) ?? []).filter((p) => p.seq < pin.seq && passingMerged.has(p.commit)).at(-1)?.commit;
+    const scope = [...new Set(mine.flatMap((i) => (i.intent?.write ?? []).map(intentPath)))].sort();
+    // Items this agent handed to someone else: their files are not its to apply.
+    const yieldedScope = [...(handedOff.get(agent) ?? [])]
+      .map((id) => state.items[id])
+      .flatMap((item) => (item ? [...(item.intent?.write ?? []).map(intentPath), ...(item.lastPush?.paths ?? [])] : []))
+      .filter((entry) => !scope.some((own) => entriesOverlap(entry, own)));
+    let remote: string;
+    try {
+      remote = await options.readRemote(agent);
+    } catch (error) {
+      excludedAgents.push({ agent, reason: scrub(`could not read its repo: ${error instanceof Error ? error.message : String(error)}`) });
+      continue;
+    }
+    units.push({ id: agent, objective: `the announced pushes of ${agent} (items ${mine.map((i) => i.id).join(", ")})`, dependsOn: [], paths: scope });
+    completed.push({
+      unitId: agent,
+      gitUrl: remote,
+      baselineRef: base ?? "HEAD",
+      commit: pin.commit,
+      includes: mine.slice(0, -1).map((i) => i.lastPush!.commit),
+      ...(yieldedScope.length > 0 ? { yieldedScope: [...new Set(yieldedScope)].sort() } : {}),
+      // Contract paths a HUMAN released for these items, for this unit only.
+      ...(() => {
+        const released = [...new Set(mine.flatMap((i) => releasedTargets(state, i.id)))].sort();
+        return released.length > 0 ? { releasedPaths: released } : {};
+      })(),
+    });
+  }
+  if (completed.length === 0) {
+    return {
+      requiresIntegrationGate,
+      key,
+      transient: true,
+      failure: `no pending push could be read: ${excludedAgents.map((e) => `${e.agent}: ${e.reason}`).join("; ")}`,
+    };
+  }
+
+  const change: Change = { id: options.change.id, objective: options.change.objective, baseline: "HEAD", budgetUsd: 0, assurance: "standard", work: units };
+  // The baseline test inventory, adjusted for contract changes a human accepted
+  // (a changed or removed test may rename or drop tests), read from board state.
+  const acceptedTargets = [...new Set(Object.values(state.contracts).filter((c) => c.status === "accepted" && c.guarded).map((c) => c.target))].sort();
+  const adjusted = options.testInventory ? inventoryAfterContracts(options.testInventory, acceptedTargets) : {};
+  const inventoryNow = adjusted.inventory;
+  const verification = new ChangeVerification(
+    options.integration.workspaces,
+    options.verifyCommandRunner ? { commandRunner: options.verifyCommandRunner } : {},
+  );
+  let evidence: EvidenceSummary;
+  try {
+    evidence = await verification.verifyAndIntegrate({
+      change,
+      completed,
+      integrationRef: options.integration.integrationRef,
+      integrationToken: options.integration.integrationToken,
+      ...(requiresIntegrationGate
+        ? {
+            ...(options.appGateCommand && options.appGateCommand.length > 0 ? { integrationGateCommand: options.appGateCommand } : {}),
+            requiresIntegrationGate,
+          }
+        : {}),
+      ...(options.contract
+        ? {
+            protectedPaths: options.contract.restore,
+            protectedJsonKeys: options.contract.jsonKeys,
+            onProtectedChange: "fail" as const,
+          }
+        : {}),
+      ...(inventoryNow ? { testInventory: inventoryNow } : {}),
+      // Build on the last RECORDED passing revision, and advance the branch
+      // only after the board recorded this one (below).
+      ...(state.integrated ? { integrationBaseCommit: state.integrated.commit } : {}),
+      deferIntegrationPush: true,
+      workRoot: options.worktreeRoot,
+      identity: options.identity,
+    });
+  } catch (error) {
+    // The integrator refused (for example a fix was expected but nothing
+    // changed). No gate ran on any recordable tree, so no revision is posted.
+    return { requiresIntegrationGate, key, failure: scrub(`the integrator refused: ${error instanceof Error ? error.message : String(error)}`) };
+  }
+  for (const u of evidence.units) {
+    if (u.verdict !== "verified") {
+      const failed = u.checks.filter((c) => !c.passed && !c.skipped).map((c) => `${c.kind}: ${c.summary}`);
+      excludedAgents.push({ agent: u.unitId, reason: scrub(`failed verification (${failed.join("; ") || "verdict failed"})`) });
+    }
+  }
+  const mergedAgents = evidence.units.filter((u) => u.verdict === "verified").map((u) => u.unitId);
+  const commit = evidence.integration.commit;
+  if (mergedAgents.length === 0 || commit === undefined) {
+    return {
+      requiresIntegrationGate,
+      key,
+      evidence,
+      failure:
+        mergedAgents.length === 0
+          ? `every pending push was excluded: ${excludedAgents.map((e) => `${e.agent}: ${e.reason}`).join("; ")}`
+          : "the integrator reported no commit for the gated tree",
+    };
+  }
+  const mergedItems = mergedAgents.flatMap((a) => itemsByAgent.get(a) ?? []);
+
+  // The pushes must still be the items' latest: a push that landed while the
+  // gate ran supersedes what was gated, so nothing is recorded and the caller
+  // runs again (the new revision includes the newer push, or, after a bounded
+  // number of such runs, leaves the superseded agents' units out entirely).
+  const now = new Set(pendingPushItems((await options.operator.page(0, 1)).state).map((i) => i.lastPush!.commit));
+  const superseded = mergedItems.filter((i) => !now.has(i.lastPush!.commit));
+  if (superseded.length > 0) {
+    return {
+      requiresIntegrationGate,
+      key,
+      evidence,
+      stale: true,
+      supersededAgents: [...new Set(superseded.map((i) => i.lastPush!.agent))].sort(),
+      failure: "a merged push was superseded while the gate ran",
+    };
+  }
+  const merged = mergedItems.map((i) => i.lastPush!.commit);
+
+  const gate: "pass" | "fail" = evidence.integration.verdict === "verified" ? "pass" : "fail";
+  let failing: { output: string; items: string[] } | undefined;
+  let implicated: BoardRevision["implicated"];
+  if (gate === "fail") {
+    const check = evidence.integration.finalCheck;
+    // Lead with the gate's own failing line (a SyntaxError, a failing test),
+    // then its output, then the integrator's summary.
+    const key = gateFailureLine(check.outputs.map((o) => o.text).join("\n"));
+    const raw = scrub([...(key !== undefined ? [key] : []), ...check.outputs.map((o) => o.text), check.summary].join("\n"));
+    // A failure that names only files of already COMPLETED items is a
+    // regression this revision's pushes caused (the tree passed before them),
+    // so their owners are asked to fix it; the evidence says which completed
+    // items regressed.
+    const regressed = Object.values(state.items).filter(
+      (i) => i.status === "done" && i.lastPush !== undefined && i.lastPush.paths.some((p) => raw.includes(p)),
+    );
+    const attribution = await attributeRevisionFailure({
+      items: mergedItems.map((i) => ({ id: i.id, objective: i.objective, paths: (i.intent?.write ?? []).map(intentPath) })),
+      output: raw,
+      changeId: options.change.id,
+      ...(options.jev ? { jev: options.jev } : {}),
+      ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
+      ...(options.recordDecision ? { onDecision: options.recordDecision } : {}),
+    });
+    implicated = attribution;
+    const note =
+      regressed.length > 0
+        ? `regressed completed item(s): ${regressed.map((i) => i.id).join(", ")} (their files fail after this revision's pushes)\n`
+        : "";
+    failing = { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: [...attribution.items] };
+  }
+  const recorded = await options.operator.recordRevision({ commit, gate, merged, ...(failing ? { failing } : {}) });
+  if (!recorded.ok) {
+    if (recorded.code === "UNKNOWN_REF") {
+      return { requiresIntegrationGate, key, evidence, stale: true, failure: scrub(`the board refused the revision: ${recorded.error}`) };
+    }
+    return { requiresIntegrationGate, key, evidence, failure: scrub(`the board refused the revision (${recorded.code}): ${recorded.error}`) };
+  }
+  if (gate === "pass") {
+    // Only now, with the revision recorded, does the integration branch move.
+    try {
+      await advanceIntegrationBranch(options.integration.integrationRef, options.integration.integrationToken, commit, options.worktreeRoot);
+    } catch (error) {
+      excludedAgents.push({
+        agent: "(integration)",
+        reason: scrub(`recorded, but the integration branch could not be advanced: ${error instanceof Error ? error.message : String(error)}`),
+      });
+    }
+  }
+  const rev = recorded.appended.find((m) => m.type === "integrated.rev");
+  const n = rev && rev.type === "integrated.rev" ? rev.payload.n : state.lastRevN + 1;
+  const revision: BoardRevision = {
+    n,
+    gate,
+    commit,
+    merged,
+    integratedItems: mergedItems.map((i) => i.id),
+    excludedItems: pending.filter((i) => !mergedItems.includes(i)).map((i) => i.id),
+    excludedAgents,
+    completedItems: recorded.appended.flatMap((m) => (m.type === "item.completed" ? [m.payload.item] : [])),
+    ...(implicated ? { implicated } : {}),
+    ...(gate === "fail" ? { failure: scrub(revisionFailure(evidence.integration.finalCheck)) } : {}),
+    ...(adjusted.relaxed !== undefined ? { inventoryNote: adjusted.relaxed } : {}),
+    ...(gate === "fail"
+      ? {
+          fixRequested: recorded.appended.flatMap((m) => (m.type === "fix.requested" ? [m.payload.item] : [])),
+          fixExhausted: recorded.appended.flatMap((m) => (m.type === "fix.exhausted" ? [m.payload.item] : [])),
+        }
+      : {}),
+  };
+  return { revision, evidence, requiresIntegrationGate, key };
+}
+
+/**
+ * The continuous integrator: integrates pending pushes one revision at a time,
+ * coalescing pushes that land while a revision runs into the next one.
+ * `kick()` is what an observer of `push.announced` calls (the driver today; a
+ * queue-triggered workflow later).
+ */
+export class ContinuousBoardIntegrator {
+  readonly revisions: BoardRevision[] = [];
+  readonly failures: string[] = [];
+  /** The evidence of the last recorded revision (its gate is the run's verdict). */
+  lastEvidence: EvidenceSummary | undefined;
+  lastRequiresGate = false;
+  private running: Promise<void> | undefined;
+  private requested = false;
+  /** Pending-push sets already integrated, or deterministically refused (not retried until something changes). */
+  private readonly attempted = new Set<string>();
+  /** Transient-failure retries per pending-push set. */
+  private readonly retries = new Map<string, number>();
+  /** Consecutive superseded-while-gating results. */
+  private staleRuns = 0;
+  /** Agents left out of the next attempts because their pushes kept being superseded. */
+  private holdBack = new Set<string>();
+
+  constructor(
+    private readonly options: IntegrateBoardOptions & {
+      readonly onRevision?: (revision: BoardRevision) => void;
+      readonly onFailure?: (reason: string) => void;
+      /** Called after every attempt (for example to revoke the read tokens it used). */
+      readonly onSettled?: () => Promise<void>;
+      /** Retries of a transient failure per pending-push set (default 3). */
+      readonly maxRetries?: number;
+      /** Backoff before the first retry, doubled each time (default 250 ms). */
+      readonly retryBackoffMs?: number;
+      /** Superseded re-runs before the superseded agents are held back (default 3). */
+      readonly maxStaleRuns?: number;
+    },
+  ) {}
+
+  /** True while a revision is being built. */
+  get busy(): boolean {
+    return this.running !== undefined;
+  }
+
+  /** Is there a pending-push set this integrator has not tried yet? */
+  wants(state: BoardState): boolean {
+    const key = pendingPushKey(state);
+    return key !== "" && !this.attempted.has(key);
+  }
+
+  /** Start a revision now, or (when one is running) coalesce into the next. */
+  kick(): void {
+    // Set the request first: a running loop always re-checks it after its
+    // current attempt, so a kick can never be lost between the loop's last
+    // check and its exit (both happen with no await in between).
+    this.requested = true;
+    this.running ??= this.loop();
+  }
+
+  /** Wait until no revision is running and none is requested. */
+  async idle(): Promise<void> {
+    while (this.running) {
+      await this.running;
+    }
+  }
+
+  private async loop(): Promise<void> {
+    try {
+      while (this.requested) {
+        this.requested = false;
+        await this.once();
+      }
+    } finally {
+      this.running = undefined;
+    }
+  }
+
+  private async once(): Promise<void> {
+    const state = (await this.options.operator.page(0, 1)).state;
+    const key = pendingPushKey(state);
+    if (key === "" || this.attempted.has(key)) {
+      return;
+    }
+    let result: IntegrateBoardResult;
+    try {
+      result = await integrateBoardRevision({ ...this.options, ...(this.holdBack.size > 0 ? { holdBack: [...this.holdBack] } : {}) });
+    } catch (error) {
+      // A thrown attempt (the board or a repo unreachable) is transient.
+      result = {
+        requiresIntegrationGate: false,
+        key,
+        transient: true,
+        failure: (this.options.scrub ?? redactSecrets)(`integration failed: ${error instanceof Error ? error.message : String(error)}`),
+      };
+    } finally {
+      await this.options.onSettled?.().catch(() => undefined);
+    }
+    // Mark the set the attempt actually read (it may have moved since `key`).
+    const tried = result.key ?? key;
+    this.staleRuns = result.stale ? this.staleRuns + 1 : 0;
+    if (result.stale && this.staleRuns >= (this.options.maxStaleRuns ?? 3)) {
+      // Bounded re-gating: leave the agents whose pushes keep moving out of the
+      // next attempt (never record a tree with content `merged` omits).
+      for (const agent of result.supersededAgents ?? []) {
+        this.holdBack.add(agent);
+      }
+    }
+    if (result.revision) {
+      this.holdBack.clear();
+    }
+    if (result.transient && !result.revision) {
+      const used = this.retries.get(tried) ?? 0;
+      if (used < (this.options.maxRetries ?? 3)) {
+        this.retries.set(tried, used + 1);
+        await new Promise((resolve) => setTimeout(resolve, (this.options.retryBackoffMs ?? 250) * 2 ** used));
+        this.requested = true;
+        return;
+      }
+    }
+    if (result.revision) {
+      // One revision per pending-push set: the same set is never gated twice
+      // (the next revision needs a new push).
+      this.attempted.add(tried);
+      this.revisions.push(result.revision);
+      this.lastEvidence = result.evidence;
+      this.lastRequiresGate = result.requiresIntegrationGate;
+      this.options.onRevision?.(result.revision);
+      return;
+    }
+    if (result.stale) {
+      // The pushes moved while the gate ran: integrate the newer set next.
+      this.requested = true;
+      return;
+    }
+    this.attempted.add(tried);
+    if (result.failure !== undefined && result.failure !== "nothing is pending") {
+      this.failures.push(result.failure);
+      this.options.onFailure?.(result.failure);
+    }
+  }
+}
+
+/** Items still owed work: neither split (its children carry it) nor done. */
+function outstanding(state: BoardState): BoardItem[] {
+  return Object.values(state.items).filter((i) => i.status !== "split" && i.status !== "done");
+}
+
+/** Drive a board run end to end. */
+export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult> {
+  const emit = options.onEvent ?? (() => {});
+  const rawFetch = options.fetchFn ?? fetch;
+  const base = options.workerUrl.replace(/\/$/, "");
+  const changeId = options.changeId;
+  const budgets = {
+    maxTurnsPerItem: options.budgets?.maxTurnsPerItem ?? 8,
+    maxRunTurns: options.budgets?.maxRunTurns ?? 200,
+    maxRounds: options.budgets?.maxRounds ?? 200,
+    timeoutMs: options.budgets?.timeoutMs ?? 30 * 60 * 1000,
+    maxFixAttemptsPerItem: options.budgets?.maxFixAttemptsPerItem ?? 3,
+    quiescenceMs: options.budgets?.quiescenceMs ?? 2 * 60 * 1000,
+  };
+  const ttl = options.workspaceTtlSeconds ?? 1800;
+  if (budgets.timeoutMs > ttl * 1000) {
+    // Agents push with their own short write tokens, which are not refreshed:
+    // an agent phase longer than their lifetime would fail pushes mid-run.
+    throw new Error(
+      `the agent-phase timeout (${Math.round(budgets.timeoutMs / 1000)} s) exceeds the agents' write-token lifetime ` +
+        `(${ttl} s); raise --token-ttl or lower --timeout-ms`,
+    );
+  }
+  const readTtl = options.readTokenTtlSeconds ?? 600;
+  const executor = options.executor ?? new ScopedNoopExecutor();
+  const workRoot = options.workRoot ?? (await mkdtemp(join(tmpdir(), "scf-board-")));
+  await mkdir(workRoot, { recursive: true });
+  const worktreeRoot = join(workRoot, "worktrees");
+  await mkdir(worktreeRoot, { recursive: true });
+  // An app's gate may import a shared harness beside the app directory.
+  await materializeSiblingGateDeps(options.projectDir, worktreeRoot);
+  const identity: GitIdentity = options.identity ?? { name: "Switchyard Integrator", email: "integrator@switchyard.local" };
+  const operator = new BoardOperatorClient(rawFetch, base, changeId);
+  const objective = options.goal.trim().slice(0, 2000);
+
+  // Every credential the run handles, so any text that leaves it is scrubbed.
+  const secrets = new Set<string>();
+  const scrub = (text: string): string => {
+    let out = text;
+    for (const secret of secrets) {
+      if (secret.length >= 6) {
+        out = out.split(secret).join("[redacted]").split(encodeURIComponent(secret)).join("[redacted]");
+      }
+    }
+    return redactSecrets(out);
+  };
+
+  // 1. The planning-first Change, then the goal (with the contract and the
+  //    baseline gate's test inventory), posted by the human.
+  const guarded = await deriveProtectedPaths(options.projectDir, options.appGateCommand);
+  // The integration workspace: seeded from the project baseline; only gated,
+  // passing, RECORDED revisions ever advance its branch.
+  const integration = await createIntegrationWorkspace(workRoot, options.projectDir, changeId, identity);
+  // Run the gate once on the baseline and record which tests it executed, so a
+  // later run that exits early (tests never run) cannot pass.
+  const inventory =
+    options.appGateCommand && options.appGateCommand.length > 0
+      ? await recordBaselineInventory({
+          integrationRef: integration.integrationRef,
+          integrationToken: integration.integrationToken,
+          gateCommand: options.appGateCommand,
+          ...(options.verifyCommandRunner ? { commandRunner: options.verifyCommandRunner } : {}),
+          workRoot: worktreeRoot,
+        }).catch(() => undefined)
+      : undefined;
+  const inventoryLabel = !options.appGateCommand
+    ? "no gate"
+    : inventory
+      ? `${inventory.count} test(s) (${inventory.format})`
+      : "test inventory unavailable: the gate's output does not show which tests ran; revisions fall back to its exit code";
+  const created = await createPlanningChange({
+    workerUrl: base,
+    header: { id: changeId, objective, baseline: "HEAD", budgetUsd: 0, assurance: "standard" },
+    fetchFn: rawFetch,
+  });
+  if (!created) {
+    throw new Error(`could not create Change ${changeId} on ${base}`);
+  }
+  emit({ kind: "change-created", changeId });
+  const goal = await operator.postAsHuman({
+    type: "goal.posted",
+    payload: {
+      objective,
+      rules: { ...(options.rules ?? {}), maxFixAttempts: options.rules?.maxFixAttempts ?? budgets.maxFixAttemptsPerItem },
+      protected: guarded.paths,
+      ...(guarded.keyLabels.length > 0 ? { protectedKeys: guarded.keyLabels } : {}),
+      ...(options.appGateCommand && options.appGateCommand.length > 0
+        ? {
+            testInventory: inventory
+              ? // Count and format only: the names stay with the integrator, so
+                // code under test cannot read from the board what to print.
+                { status: "recorded", format: inventory.format, count: inventory.count }
+              : { status: "unavailable" },
+          }
+        : {}),
+    },
+  });
+  if (!goal.ok) {
+    throw new Error(`the board refused the goal (${goal.code}): ${goal.error}`);
+  }
+  emit({ kind: "goal-posted", protected: guarded.paths, testInventory: inventoryLabel });
+
+  const turns: AgentTurnRecord[] = [];
+  const runBudget = new RunTurnBudget(budgets.maxRunTurns);
+  let seed: BoardSeed | undefined;
+  const joinAgent = operator.join.bind(operator);
+  const workers: BoardAgent[] = [];
+  const agentRepos = new Map<string, BoardAgentRepo>();
+  // Every advisory typed decision (and every failed call) is recorded on the
+  // board as decision.recorded: visible, never affecting arbitration or verdict.
+  const recordDecision = async (decision: BoardDecisionRecord): Promise<void> => {
+    await operator
+      .recordDecision({
+        ...decision,
+        question: decision.question.slice(0, 500),
+        ...(decision.answer !== undefined ? { answer: decision.answer.slice(0, 200) } : {}),
+        ...(decision.error !== undefined ? { error: scrub(decision.error).slice(0, 300) } : {}),
+      })
+      .catch(() => undefined);
+  };
+
+  // Read tokens the integrator was issued, revoked as soon as it is done with them.
+  const issuedReadTokens: { agent: string; tokenId: string }[] = [];
+  const revokeReadTokens = async (): Promise<void> => {
+    for (const issued of issuedReadTokens.splice(0)) {
+      await operator.revokeReadToken(issued.agent, issued.tokenId).catch(() => undefined);
+    }
+  };
+  const readRemote = async (agent: string): Promise<string> => {
+    const repo = agentRepos.get(agent);
+    if (!repo) {
+      throw new Error(`no repo is known for ${agent}`);
+    }
+    // A transient refusal (5xx, the network) is retried a bounded number of times.
+    let issued: Awaited<ReturnType<BoardOperatorClient["readToken"]>> | undefined;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        issued = await operator.readToken(agent, readTtl);
+      } catch (error) {
+        issued = { ok: false, code: "NETWORK", error: error instanceof Error ? error.message : String(error), status: 0 };
+      }
+      if (issued.ok || (issued.status >= 400 && issued.status < 500)) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200 * 2 ** attempt));
+    }
+    if (!issued || !issued.ok) {
+      throw new Error(`no read token for ${agent} (${issued?.code ?? "?"}): ${issued?.error ?? "unknown"}`);
+    }
+    secrets.add(issued.token);
+    issuedReadTokens.push({ agent, tokenId: issued.tokenId });
+    return authenticatedRemote(repo.gitUrl, issued.token);
+  };
+
+  secrets.add(integration.integrationToken);
+  const revisionDirs = new Map<string, Promise<string | undefined>>();
+  // A passing revision's tree, materialized once for any agent that rebases.
+  const fetchRevision = (n: number, commit: string): Promise<string | undefined> => {
+    let found = revisionDirs.get(commit);
+    if (!found) {
+      found = (async () => {
+        const dir = join(workRoot, "revisions", `rev-${n}`);
+        try {
+          await rm(dir, { recursive: true, force: true });
+          // The integration remote is private: authenticate the clone and the
+          // gated-ref fetch. runGit sends the token as a scoped header, so the
+          // checkout's origin stays tokenless.
+          const remote = authenticatedRemote(integration.integrationRef.gitUrl, integration.integrationToken);
+          await runGit(["clone", "-q", remote, dir]);
+          await runGit(["-C", dir, "fetch", "-q", remote, `+${GATED_REF_PREFIX}*:${GATED_REF_PREFIX}*`]).catch(() => undefined);
+          await runGit(["-C", dir, "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", commit]);
+          return dir;
+        } catch {
+          return undefined;
+        }
+      })();
+      revisionDirs.set(commit, found);
+    }
+    return found;
+  };
+  // Another agent's announced push, read with an operator read token (handoffs).
+  const pushDirs = new Map<string, Promise<string | undefined>>();
+  const fetchPush = (agent: string, commit: string): Promise<string | undefined> => {
+    const key = `${agent}@${commit}`;
+    let found = pushDirs.get(key);
+    if (!found) {
+      found = (async () => {
+        const dir = join(workRoot, "pushes", `${agent.replace(/[^A-Za-z0-9._-]+/g, "-")}-${commit.slice(0, 12)}`);
+        try {
+          await rm(dir, { recursive: true, force: true });
+          const remote = await readRemote(agent);
+          // runGit sends the read token as a header: the checkout's origin is
+          // the tokenless URL, so the token is never left in its config.
+          await runGit(["clone", "-q", remote, dir]);
+          await runGit(["-C", dir, "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", commit]);
+          return dir;
+        } catch {
+          return undefined;
+        } finally {
+          await revokeReadTokens();
+        }
+      })();
+      pushDirs.set(key, found);
+    }
+    return found;
+  };
+  const runningAgents = () => workers.filter((w) => !w.stopped).map((w) => w.id);
+  const makeAgent = (id: string, role: "worker" | "lead") =>
+    new BoardAgent({
+      id,
+      role,
+      goal: objective,
+      changeId,
+      baseUrl: base,
+      fetchFn: rawFetch,
+      join: joinAgent,
+      transport: options.transport,
+      executor,
+      projectDir: options.projectDir,
+      workRoot,
+      ...(options.identity ? { identity: options.identity } : {}),
+      workspaceTtlSeconds: ttl,
+      maxTurnsPerItem: budgets.maxTurnsPerItem,
+      runBudget,
+      fetchRevision,
+      fetchPush,
+      runningAgents,
+      ...(options.escalationModels ? { escalationModels: options.escalationModels } : {}),
+      ...(role === "lead"
+        ? {
+            seed: async () => {
+              seed = await options.seed(objective);
+              emit({ kind: "seeded", source: seed.source, ...(seed.model ? { model: seed.model } : {}), items: seed.items.length });
+              if (seed.review) {
+                await recordDecision({
+                  juncture: "plan-review",
+                  question: seed.review.question,
+                  ...(seed.review.error === undefined ? { answer: seed.review.noul, confidence: seed.review.confidence } : {}),
+                  accepted: seed.review.accepted,
+                  ...(seed.review.error !== undefined ? { error: seed.review.error } : {}),
+                });
+              }
+              return seed.items;
+            },
+          }
+        : {}),
+      onTurn: (record) => {
+        turns.push(record);
+        emit({ kind: "turn", record });
+      },
+    });
+
+  const integrator = new ContinuousBoardIntegrator({
+    operator,
+    change: { id: changeId, objective },
+    agentRepos,
+    readRemote,
+    integration,
+    worktreeRoot,
+    identity,
+    ...(options.appGateCommand ? { appGateCommand: options.appGateCommand } : {}),
+    ...(options.requireAppGate ? { requireAppGate: true } : {}),
+    ...(options.verifyCommandRunner ? { verifyCommandRunner: options.verifyCommandRunner } : {}),
+    contract: guarded,
+    ...(inventory ? { testInventory: inventory } : {}),
+    onSettled: revokeReadTokens,
+    ...(options.jev ? { jev: options.jev } : {}),
+    ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
+    scrub,
+    recordDecision,
+    onRevision: (revision) => emit({ kind: "integrated", revision }),
+    onFailure: (reason) => emit({ kind: "integration-not-recorded", reason }),
+  });
+
+  // Contract changes on the original tests wait for a HUMAN: hand each pending
+  // one to the resolver once (a durable wait for the console otherwise).
+  const asked = new Set<string>();
+  const authed = withWorkerAuth(rawFetch);
+  const settleContracts = async (): Promise<boolean> => {
+    let decided = false;
+    const res = await authed(`${base}/changes/${encodeURIComponent(changeId)}/escalations`).catch(() => undefined);
+    const body = res && res.status < 400 ? ((await res.json()) as { escalations?: { id: string; status: string; boardContract?: string; path?: string; question: string }[] }) : {};
+    for (const e of body.escalations ?? []) {
+      if (e.status !== "pending" || e.boardContract === undefined || asked.has(e.id)) {
+        continue;
+      }
+      asked.add(e.id);
+      if (!options.resolveContract) {
+        emit({ kind: "contract-awaiting-human", contract: e.boardContract, escalationId: e.id, ...(e.path ? { path: e.path } : {}) });
+        continue;
+      }
+      const decision = await options.resolveContract({ escalationId: e.id, contract: e.boardContract, ...(e.path ? { path: e.path } : {}), question: e.question });
+      const posted = await authed(`${base}/changes/${encodeURIComponent(changeId)}/escalations/${encodeURIComponent(e.id)}/resolve`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ decision }),
+      });
+      if (posted.status < 400) {
+        decided = true;
+        emit({ kind: "contract-decision", contract: e.boardContract, decision, ...(e.path ? { path: e.path } : {}) });
+      }
+    }
+    return decided;
+  };
+
+  const lead = makeAgent("lead", "lead");
+  const controller = new AbortController();
+  const loops: Promise<void>[] = [];
+  let stopReason: BoardStopReason | undefined;
+  let stopDetail: string | undefined;
+  const cleanedUp: string[] = [];
+  let failure: unknown;
+  let planningMarked = false;
+
+  const cleanupRepos = async (): Promise<void> => {
+    if (options.skipCleanup) {
+      return;
+    }
+    const authed = withWorkerAuth(rawFetch);
+    for (const worker of workers) {
+      const name = worker.joinedWorkspace?.workspaceName;
+      if (!name || cleanedUp.includes(name)) {
+        continue;
+      }
+      try {
+        const res = await authed(`${base}/workspaces/${encodeURIComponent(name)}`, { method: "DELETE" });
+        if (res.status < 400) {
+          cleanedUp.push(name);
+        }
+      } catch {
+        // Best-effort.
+      }
+    }
+    emit({ kind: "cleaned-up", archived: cleanedUp });
+  };
+
+  try {
+    // 2. The lead joins; its first step is the planner.
+    await lead.join("the lead seeds the goal's open items and arbitrates contracts");
+    emit({ kind: "agent-joined", agent: lead.id, role: "lead" });
+    try {
+      await lead.step();
+    } catch (error) {
+      planningMarked = true;
+      await failPlanningChange({
+        workerUrl: base,
+        changeId,
+        reason: scrub(`planning failed: ${error instanceof Error ? error.message : String(error)}`),
+        fetchFn: rawFetch,
+      });
+      throw error;
+    }
+
+    // 3. Recruit under the dial and let the agents work; integrate as pushes land.
+    const recruit = async (state: BoardState): Promise<number> => {
+      let joined = 0;
+      const inFlight = () => workers.filter((w) => !w.stopped).length;
+      const open = Object.values(state.items).filter((i) => i.status === "open").length;
+      while (workers.length < options.dial.maxConcurrency && (inFlight() < options.dial.minConcurrency || open > inFlight())) {
+        const worker = makeAgent(`agent-${workers.length + 1}`, "worker");
+        await worker.join(open > 0 ? `${open} open item(s) outnumber the ${inFlight()} agent(s) in flight` : "the dial's minimum");
+        workers.push(worker);
+        joined += 1;
+        if (worker.joinedWorkspace) {
+          secrets.add(worker.joinedWorkspace.token);
+          agentRepos.set(worker.id, { gitUrl: worker.joinedWorkspace.gitUrl, defaultBranch: worker.joinedWorkspace.defaultBranch });
+        }
+        emit({
+          kind: "agent-joined",
+          agent: worker.id,
+          role: "worker",
+          ...(worker.joinedWorkspace ? { workspace: worker.joinedWorkspace.workspaceName, backend: worker.joinedWorkspace.backend } : {}),
+        });
+      }
+      return joined;
+    };
+    const reported = new Set<string>();
+    const reportStops = () => {
+      for (const agent of [lead, ...workers]) {
+        if (agent.stopped && !reported.has(agent.id) && agent.stopped.reason !== "stopped") {
+          reported.add(agent.id);
+          emit({ kind: "agent-stopped", agent: agent.id, stop: agent.stopped });
+        }
+      }
+    };
+    const started = Date.now();
+    const check = (state: BoardState): BoardStopReason | undefined => {
+      const owed = outstanding(state);
+      if (Object.keys(state.items).length > 0 && owed.length === 0) {
+        return "all-items-done";
+      }
+      // Every outstanding item was spent by every agent still running: nobody
+      // can take it again (reopening only hands it to fresh eyes).
+      const running = workers.filter((w) => !w.stopped).map((w) => w.id);
+      if (
+        owed.length > 0 &&
+        owed.every((i) => i.status === "open" && (i.exhaustedBy?.length ?? 0) > 0 && running.every((w) => i.exhaustedBy!.includes(w))) &&
+        !integrator.wants(state)
+      ) {
+        return "fix-budget";
+      }
+      if (runBudget.exhausted) {
+        return "run-budget";
+      }
+      if (Date.now() - started > budgets.timeoutMs) {
+        return "timeout";
+      }
+      if (workers.length > 0 && workers.every((w) => w.stopped)) {
+        return "all-agents-stopped";
+      }
+      return undefined;
+    };
+
+    if ((options.schedule ?? "lockstep") === "lockstep") {
+      for (let round = 1; round <= budgets.maxRounds && stopReason === undefined; round += 1) {
+        const state = (await operator.page(0, 1)).state;
+        stopReason = check(state);
+        if (stopReason) {
+          break;
+        }
+        const joined = await recruit(state);
+        let acted = false;
+        for (const agent of [lead, ...workers]) {
+          if ((await agent.step()) === "acted") {
+            acted = true;
+          }
+        }
+        reportStops();
+        // Integrate between rounds: every push announced this round is
+        // coalesced into the next revision, deterministically.
+        const before = integrator.revisions.length;
+        if (integrator.wants((await operator.page(0, 1)).state)) {
+          integrator.kick();
+          await integrator.idle();
+        }
+        const integrated = integrator.revisions.length > before;
+        const decided = await settleContracts();
+        if (!acted && joined === 0 && !integrated && !decided) {
+          stopReason = check((await operator.page(0, 1)).state) ?? "quiescent";
+          stopDetail = "no agent had anything to do and no integration was pending";
+        }
+      }
+      stopReason ??= check((await operator.page(0, 1)).state) ?? "max-rounds";
+    } else {
+      loops.push(lead.run({ signal: controller.signal }));
+      const pollMs = options.pollMs ?? 500;
+      let lastSeq = -1;
+      let quietSince = Date.now();
+      while (stopReason === undefined) {
+        const state = (await operator.page(0, 1)).state;
+        stopReason = check(state);
+        if (stopReason) {
+          break;
+        }
+        const before = workers.length;
+        await recruit(state);
+        for (const worker of workers.slice(before)) {
+          loops.push(worker.run({ signal: controller.signal }));
+        }
+        reportStops();
+        if (integrator.wants(state)) {
+          integrator.kick();
+        }
+        await settleContracts();
+        // Quiescence: every agent idle, nothing integrating or pending, and no
+        // board message for the bounded period.
+        const anyBusy = [lead, ...workers].some((a) => a.busy) || integrator.busy || integrator.wants(state);
+        if (state.lastSeq !== lastSeq || anyBusy) {
+          lastSeq = state.lastSeq;
+          quietSince = Date.now();
+        } else if (Date.now() - quietSince >= budgets.quiescenceMs) {
+          stopReason = "quiescent";
+          stopDetail = `every agent was idle and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s`;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+      }
+    }
+  } catch (error) {
+    failure = error;
+    throw error;
+  } finally {
+    // Whatever ended the agent phase (a stop condition or a throw), every agent
+    // loop is aborted and awaited before anything else happens.
+    controller.abort();
+    await Promise.allSettled(loops);
+    for (const agent of [lead, ...workers]) {
+      agent.halt();
+    }
+    if (failure !== undefined) {
+      // A throw (a refused join, an unreachable board) marks the Change failed
+      // and cleans up every repo the run created before the error propagates.
+      await integrator.idle().catch(() => undefined);
+      if (!planningMarked) {
+        await failPlanningChange({
+          workerUrl: base,
+          changeId,
+          reason: scrub(`the board run failed: ${failure instanceof Error ? failure.message : String(failure)}`),
+          fetchFn: rawFetch,
+        }).catch(() => false);
+      }
+      await cleanupRepos();
+    }
+  }
+  emit({ kind: "agents-done", reason: stopReason!, ...(stopDetail ? { detail: stopDetail } : {}) });
+
+  let promotion: PromotionResult | undefined;
+  let sourceRepoDir: string | undefined;
+  let deployment: { url: string; app: string } | undefined;
+  let verdict: "verified" | "failed" = "failed";
+  let partial: string | undefined;
+  let incompleteItems: string[] = [];
+  let evidence: EvidenceSummary | undefined;
+  try {
+    // 4. The last integration: anything still pending is integrated once more,
+    // so the final verdict is the gate of the revision that includes it.
+    await integrator.idle();
+    if (integrator.wants((await operator.page(0, 1)).state)) {
+      integrator.kick();
+      await integrator.idle();
+    }
+    if (integrator.revisions.length === 0) {
+      emit({ kind: "nothing-to-integrate" });
+    }
+
+    // 5. The authoritative verdict is the LAST revision's gate; only that
+    // revision, when it passed, is promoted (its commit is the gated tree).
+    const last = integrator.revisions.at(-1);
+    evidence = last ? integrator.lastEvidence : undefined;
+    verdict = last && last.gate === "pass" && evidence?.integration.verdict === "verified" ? "verified" : "failed";
+    const finalState = (await operator.page(0, 1)).state;
+    // A passing last revision that left announced pushes ungated (excluded,
+    // refused, unreadable) is a PARTIAL result: never reported or promoted as
+    // verified.
+    incompleteItems = outstanding(finalState).map((i) => i.id);
+    const ungated = pendingPushItems(finalState);
+    if (verdict === "verified" && ungated.length > 0) {
+      verdict = "failed";
+      partial = `the last revision passed, but ${ungated.length} announced push(es) were never gated (items ${ungated.map((i) => i.id).join(", ")}): a partial result is not verified`;
+      emit({ kind: "promotion-skipped", reason: partial });
+    }
+    const integratedItems = verdict === "verified" ? Object.values(finalState.items).filter((i) => i.lastPush?.integratedIn !== undefined).map((i) => i.id) : [];
+    const excludedItems = Object.keys(finalState.items).filter((i) => !integratedItems.includes(i));
+    const recorded = await withWorkerAuth(rawFetch)(`${base}/changes/${encodeURIComponent(changeId)}/integration`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ verdict, integratedUnits: integratedItems, excludedUnits: excludedItems }),
+    }).catch((error: unknown) => error);
+    if (!(recorded instanceof Response) || recorded.status >= 400) {
+      // Never promote a verdict the control plane did not record.
+      const why = recorded instanceof Response ? `HTTP ${recorded.status}` : scrub(String(recorded));
+      throw new Error(`the integration verdict could not be recorded (${why}); not promoting`);
+    }
+    emit({ kind: "integration-verdict", verdict, integratedUnits: integratedItems });
+
+    // An ADVISORY fix-confidence decision on the final passing revision:
+    // recorded only, it never gates promotion or the deploy.
+    if (verdict === "verified" && last && options.jev) {
+      const question = "Is this fix acceptable?";
+      try {
+        const answers = await options.jev(
+          [`Change: ${changeId}`, `Objective: ${objective}`, `Mechanical gate verdict (authoritative): ${verdict}`, `Integrated items: ${incompleteItems.length === 0 ? "all" : `all but ${incompleteItems.join(", ")}`}`].join("\n"),
+          { "fix-confidence": { type: "noul", instructions: question } },
+        );
+        const answer = answers["fix-confidence"];
+        await recordDecision({
+          juncture: "fix-confidence",
+          question,
+          ...(answer?.noul !== undefined ? { answer: answer.noul, confidence: answer.confidence } : {}),
+          accepted: answer?.type === "noul" && answer.noul === "yes" && answer.confidence >= (options.jevThreshold ?? 0.75),
+          ...(answer?.noul === undefined ? { error: "the decision reply carried no fix-confidence answer" } : {}),
+        });
+      } catch (error) {
+        await recordDecision({ juncture: "fix-confidence", question, accepted: false, error: jevErrorReason(error) });
+      }
+    }
+
+    if (last && evidence && partial === undefined) {
+      // The promote step reads the verdict from the last revision's evidence
+      // (the same gate result the board recorded) and refuses anything else.
+      const promoted = await promoteVerifiedIntegration({
+        change: { id: changeId, objective },
+        evidence,
+        integrationRef: integration.integrationRef,
+        projectDir: options.projectDir,
+        workRoot,
+        worktreeRoot,
+        identity,
+        requiresIntegrationGate: integrator.lastRequiresGate,
+        emit,
+      });
+      promotion = promoted.promotion;
+      sourceRepoDir = promoted.sourceRepoDir;
+      deployment = await redeployIfPreviouslyDeployed({
+        evidence,
+        promotion,
+        sourceRepoDir,
+        projectDir: options.projectDir,
+        workRoot,
+        ...(options.deployAppDir ? { deployAppDir: options.deployAppDir } : {}),
+        ...(options.deployAppName ? { deployAppName: options.deployAppName } : {}),
+        ...(options.deployApp ? { deployApp: options.deployApp } : {}),
+        ...(options.appAlreadyDeployed ? { appAlreadyDeployed: options.appAlreadyDeployed } : {}),
+        recordDeployment: async (d) => {
+          await withWorkerAuth(rawFetch)(`${base}/changes/${encodeURIComponent(changeId)}/deployment`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(d),
+          }).catch(() => undefined);
+        },
+        emit,
+      });
+    } else {
+      emit({ kind: "promotion-skipped", reason: "nothing was integrated: not promoting (no delivery branch was created)" });
+    }
+
+    // Agents that hold nothing leave the board (the log records the end of the formation).
+    for (const agent of [...workers, lead]) {
+      await agent.leave("the run is over").catch(() => undefined);
+    }
+  } finally {
+    await cleanupRepos();
+  }
+
+  const final = await operator.log();
+  const last = integrator.revisions.at(-1);
+  return {
+    changeId,
+    stopReason: stopReason!,
+    log: final.messages,
+    state: final.state,
+    turns,
+    agents: [lead, ...workers].map((a) => ({
+      id: a.id,
+      role: a.role,
+      ...(a.joinedWorkspace ? { workspace: a.joinedWorkspace.workspaceName } : {}),
+      ...(a.stopped && a.stopped.reason !== "stopped" ? { stop: a.stopped } : {}),
+    })),
+    seed: seed ?? { items: [], source: "none" },
+    protected: guarded.paths,
+    protectedKeys: guarded.keyLabels,
+    revisions: [...integrator.revisions],
+    ...(last ? { revision: last } : {}),
+    integrationFailures: [...integrator.failures],
+    verdict,
+    ...(partial !== undefined ? { partial } : {}),
+    incompleteItems,
+    testInventory: inventoryLabel,
+    ...(evidence ? { evidence } : {}),
+    ...(promotion ? { promotion } : {}),
+    ...(sourceRepoDir ? { sourceRepoDir } : {}),
+    ...(deployment ? { deployment } : {}),
+    workRoot,
+    cleanedUp,
+  };
+}
+
+/**
+ * The lead's seed from a decomposed Change: each planned unit becomes one open
+ * item (its objective, its paths as the scope hint), proposed, never assigned.
+ * The plan's source says whether a model planned it.
+ */
+export function boardSeedFromChange(change: Change): BoardSeed {
+  const items = change.work.map((unit) => ({
+    item: unit.id.replace(/[^A-Za-z0-9._:-]+/g, "-").replace(/^[^A-Za-z0-9]+/, "") || "item",
+    objective: unit.objective.slice(0, 500),
+    acceptance: [
+      "the change gate passes on an integrated revision that merges this item's push",
+      ...(unit.dependsOn.length > 0 ? [`consistent with items ${unit.dependsOn.join(", ")}`] : []),
+    ],
+    scopeHint: [...unit.paths],
+  }));
+  const review = change.plan?.jevReview;
+  return {
+    items,
+    source: change.plan?.source ?? "heuristic",
+    ...(change.plan?.model ? { model: change.plan.model } : {}),
+    ...(review
+      ? {
+          review: {
+            question: review.question,
+            noul: review.noul,
+            confidence: review.confidence,
+            accepted: review.accepted,
+            ...(review.error !== undefined ? { error: review.error } : {}),
+          },
+        }
+      : {}),
+  };
+}
+
+/** Workspace identity in a JoinedWorkspace, minus the token (for display). */
+export function describeWorkspace(w: JoinedWorkspace): string {
+  return `${w.workspaceName} (${w.backend}${w.fallback ? ", local fallback" : ""})`;
+}
+
+function payloadSummary(m: BoardMessage): string {
+  const p = m.payload as Record<string, unknown>;
+  const list = (v: unknown) => (Array.isArray(v) ? v.join(", ") : "");
+  switch (m.type) {
+    case "goal.posted":
+      return `"${String(p.objective).slice(0, 90)}"`;
+    case "agent.joined":
+      return p.role ? `role ${String(p.role)}` : "";
+    case "agent.left":
+      return "";
+    case "item.proposed":
+      return `${String(p.item)}: ${String(p.objective).slice(0, 70)} [scope ${list(p.scopeHint)}]`;
+    case "item.claimed":
+      return `${String(p.item)} write ${list((p.intent as { write: string[] }).write)}`;
+    case "claim.granted":
+      return `${String(p.item)} -> ${String(p.agent)} (write ${list((p.intent as { write: string[] }).write)})`;
+    case "claim.contested":
+      return `${String(p.contest)}: ${String(p.claimant)} (${String(p.item)}) vs owner ${String(p.owner)} (${String(p.ownerItem)}) on ${list(p.overlap)}`;
+    case "claim.narrowed":
+      return `${String(p.contest)} to ${list(p.write)}`;
+    case "claim.kept":
+    case "claim.ceded":
+      return String(p.contest);
+    case "claim.resolved":
+      return `${String(p.contest)} ${String(p.how)}${p.winner ? ` (winner ${String(p.winner)})` : ""}`;
+    case "claim.escalated":
+      return `${String(p.contest)} after ${String(p.turns)} turn(s) (${String(p.reason)})`;
+    case "help.requested":
+      return `${String(p.request)} on ${String(p.item)} (need ${String(p.need)})`;
+    case "help.offered":
+      return String(p.request);
+    case "push.announced":
+      return `${String(p.item)} commit ${String(p.commit).slice(0, 10)} paths ${list(p.paths)}`;
+    case "done.proposed":
+      return String(p.item);
+    case "decision.recorded":
+      return `${String(p.juncture)}: ${p.error ? `error: ${String(p.error).slice(0, 120)}` : `${String(p.answer ?? "no answer")}${typeof p.confidence === "number" ? ` (confidence ${p.confidence.toFixed(2)})` : ""}, ${p.accepted ? "accepted" : "not accepted"}`} (advisory)`;
+    case "integrated.rev": {
+      const failing = p.failing as { output: string; items: string[] } | undefined;
+      // The most telling line of the failing output: a failing test line when
+      // there is one, else the first line.
+      const lines = failing ? failing.output.split("\n").map((l) => l.trim()).filter((l) => l !== "") : [];
+      const firstLine = firstLines(lines.find((l) => /^not ok\b|\bFAIL|\u2716/.test(l)) ?? lines[0] ?? "", 300);
+      return (
+        `rev ${String(p.n)} gate ${String(p.gate)} commit ${String(p.commit).slice(0, 10)} merged ${(p.merged as string[]).length} push(es) from ${list(p.contributors)}` +
+        (failing ? `; implicated ${failing.items.join(", ") || "none"}: "${firstLine}"` : "")
+      );
+    }
+    case "contract.proposed":
+      return `${String(p.contract)}: ${String(p.kind)} ${String(p.target)}${p.item ? ` for item ${String(p.item)}` : ""}`;
+    case "contract.escalated":
+      return `${String(p.contract)}: ${String(p.kind)} ${String(p.target)} for item ${String(p.item)} waits for a human decision`;
+    case "contract.accepted":
+    case "contract.rejected":
+      return String(p.contract);
+    case "fix.requested":
+      return `${String(p.item)} (rev ${String(p.n)}, attempt ${String(p.attempt)})`;
+    case "fix.exhausted":
+      return `${String(p.item)} (rev ${String(p.n)}, after ${String(p.attempts)} attempt(s))`;
+    case "item.reopened":
+      return `${String(p.item)} for another agent (was ${String(p.previousOwner)}${p.commit ? `, starting from ${String(p.commit).slice(0, 10)}` : ""})`;
+    case "rebase.needed":
+      return `${String(p.agent)} onto rev ${String(p.n)}`;
+    case "item.completed":
+      return `${String(p.item)} via rev ${String(p.n)}`;
+    case "handoff":
+      return `${String(p.item)} -> ${String(p.to)}`;
+    default:
+      return JSON.stringify(p).slice(0, 100);
+  }
+}
+
+/** A readable transcript of a board log, one line per message. */
+export function formatBoardTranscript(log: readonly BoardMessage[]): string {
+  const width = Math.max(2, String(log.at(-1)?.seq ?? 0).length);
+  return log
+    .map((m) => {
+      const to = m.to && m.to.length > 0 ? ` -> ${m.to.join(", ")}` : "";
+      const reply = m.inReplyTo !== undefined ? ` (re #${m.inReplyTo})` : "";
+      const why = m.rationale ? `  -- ${m.rationale.slice(0, 120)}` : "";
+      return `#${String(m.seq).padStart(width)} ${m.from.padEnd(8)} ${m.type.padEnd(16)} ${payloadSummary(m)}${to}${reply}${why}`;
+    })
+    .join("\n");
+}
+
+/** A readable summary of a board run. */
+export function formatBoardRunSummary(result: RunBoardResult): string {
+  const items = Object.values(result.state.items);
+  const done = items.filter((i) => i.status === "done").length;
+  const waits = result.turns.filter((t) => t.action.type === "wait").length;
+  const invalid = result.turns.filter((t) => t.invalid !== undefined).length;
+  const rejected = result.turns.filter((t) => t.outcome === "rejected" || t.outcome === "local").filter((t) => t.code !== undefined);
+  const lines = [
+    `Board run for ${result.changeId}`,
+    `  planner: ${result.seed.source}${result.seed.model ? ` (${result.seed.model})` : ""}, ${result.seed.items.length} item(s) proposed`,
+    `  agents: ${result.agents.map((a) => `${a.id}${a.role === "lead" ? " (lead)" : ""}${a.stop ? ` [stopped: ${a.stop.detail}]` : ""}`).join(", ")}`,
+    `  turns: ${result.turns.length} (${waits} wait(s), ${invalid} invalid model output(s), ${rejected.length} refused action(s))`,
+    `  agent phase ended: ${result.stopReason}`,
+    `  baseline gate inventory: ${result.testInventory}`,
+    `  contract (existing tests and gate configuration; changing one needs an accepted contract): ${result.protected.join(", ") || "none"}`,
+    ...(result.protectedKeys.length > 0 ? [`  contract keys (restored before every gate run): ${result.protectedKeys.join(", ")}`] : []),
+  ];
+  for (const r of rejected) {
+    lines.push(`    refused: ${r.agent} turn ${r.turn} ${r.action.type}: ${r.code} ${r.error ?? ""}`.trimEnd());
+  }
+  if (result.revisions.length > 0) {
+    for (const rev of result.revisions) {
+      lines.push(
+        `  integrated revision ${rev.n}: gate ${rev.gate}, commit ${rev.commit.slice(0, 12)}, merged ${rev.merged.length} push(es) (items ${rev.integratedItems.join(", ") || "none"})`,
+      );
+      if (rev.failure) {
+        lines.push(`    failure: ${rev.failure}`);
+      }
+      if (rev.inventoryNote) {
+        lines.push(`    test inventory: ${rev.inventoryNote}`);
+      }
+      if (rev.implicated) {
+        lines.push(`    implicated (${rev.implicated.source}): ${rev.implicated.items.join(", ") || "none"}`);
+      }
+      if (rev.fixRequested && rev.fixRequested.length > 0) {
+        lines.push(`    fix requested: ${rev.fixRequested.join(", ")}`);
+      }
+      if (rev.fixExhausted && rev.fixExhausted.length > 0) {
+        lines.push(`    fix budget spent (reopened for another agent): ${rev.fixExhausted.join(", ")}`);
+      }
+      for (const ex of rev.excludedAgents) {
+        lines.push(`    excluded ${ex.agent}: ${ex.reason}`);
+      }
+    }
+  } else {
+    lines.push("  integrated revision: none (nothing was pushed)");
+  }
+  for (const reason of result.integrationFailures) {
+    lines.push(`  integration not recorded: ${reason}`);
+  }
+  const decisions = result.state.decisions;
+  if (decisions && decisions.calls > 0) {
+    lines.push(`  jev: ${decisions.calls} call(s), ${decisions.accepted} accepted, ${decisions.errors} error(s)`);
+  }
+  lines.push(`  items completed: ${done} of ${items.length}`);
+  const incomplete =
+    result.verdict === "verified" && result.incompleteItems.length > 0
+      ? ` (partial: ${result.incompleteItems.length} item(s) not completed: ${result.incompleteItems.join(", ")}; the Change is not complete)`
+      : "";
+  lines.push(`  verdict: ${result.verdict}${incomplete}${result.revision ? ` (the gate of the last revision, ${result.revision.n})` : ""}`);
+  if (result.partial) {
+    lines.push(`    partial: ${result.partial}`);
+  }
+  if (result.promotion) {
+    lines.push(
+      result.promotion.committed
+        ? `  promoted: branch ${result.promotion.branch} commit ${result.promotion.commit.slice(0, 12)}${result.sourceRepoDir ? `\n  repo: ${result.sourceRepoDir}` : ""}`
+        : `  not promoted: ${result.promotion.refusedReason ?? "nothing to commit"}`,
+    );
+  } else {
+    lines.push("  not promoted: nothing was integrated");
+  }
+  if (result.deployment) {
+    lines.push(`  redeployed: ${result.deployment.url}`);
+  }
+  return lines.join("\n");
+}

@@ -4,7 +4,10 @@ import { describe, expect, it } from "vitest";
 
 import {
   appendBoardMessage,
+  appendDecisionRecorded,
   appendIntegratedRev,
+  applyBoardEscalations,
+  boardContractDecision,
   BOARD_LIMITS,
   BOARD_MESSAGE_TYPES,
   BoardError,
@@ -49,7 +52,9 @@ class TestBoard {
   private run(draft: Record<string, unknown>): BoardAppendResult {
     const { from, ...body } = draft;
     if (from === "engine") {
-      return appendIntegratedRev(this.state, (draft.payload ?? {}) as unknown, AT);
+      return draft.type === "decision.recorded"
+        ? appendDecisionRecorded(this.state, (draft.payload ?? {}) as unknown, AT)
+        : appendIntegratedRev(this.state, (draft.payload ?? {}) as unknown, AT);
     }
     const origin: BoardOrigin =
       from === "human"
@@ -108,7 +113,7 @@ function seeded(rules?: Record<string, number>): TestBoard {
   }
   board.post(msg("lead", "agent.joined", { role: "lead" }));
   for (const item of ["one", "two", "three"]) {
-    board.post(msg("lead", "item.proposed", { item, objective: `do ${item}`, acceptance: ["it works"] }));
+    board.post(msg("lead", "item.proposed", { item, objective: `do ${item}`, acceptance: ["it works"], scopeHint: ["**"] }));
   }
   return board;
 }
@@ -146,6 +151,7 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
   "help.requested": { from: "a", payload: { request: "r", item: "i", need: "tool" } },
   "help.offered": { from: "b", payload: { request: "r" } },
   "contract.proposed": { from: "a", payload: { contract: "k", target: "src/api.ts#handler", kind: "modify" } },
+  "contract.escalated": { from: "engine", payload: { contract: "k", item: "i", target: "tests/a.test.ts", kind: "modify" } },
   "contract.accepted": { from: "lead", payload: { contract: "k" } },
   "contract.rejected": { from: "human", payload: { contract: "k" } },
   "push.announced": { from: "a", payload: { item: "i", commit: "abc123", paths: ["src/a.ts"] } },
@@ -156,9 +162,13 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
   handoff: { from: "a", payload: { item: "i", to: "b", capsule: { repo: "repo-a", commit: "abc" } } },
   "done.proposed": { from: "a", payload: { item: "i" } },
   "item.completed": { from: "engine", payload: { item: "i", n: 1, via: "integrated" } },
+  "fix.requested": { from: "engine", payload: { item: "i", n: 2, attempt: 1 } },
+  "fix.exhausted": { from: "engine", payload: { item: "i", n: 3, attempts: 2 } },
+  "item.reopened": { from: "engine", payload: { item: "i", previousOwner: "a", commit: "c1", n: 3 } },
   "tool.proposed": { from: "a", payload: { tool: "t", capability: "scan", inputs: ["files"], outputs: ["items"] } },
   "tool.published": { from: "a", payload: { tool: "t", capability: "scan", version: "1", repo: "tools", commit: "abc", verified: true } },
   "tool.used": { from: "b", payload: { capability: "scan", version: "1", changedFiles: ["src/a.ts"] } },
+  "decision.recorded": { from: "engine", payload: { juncture: "attribution", question: "which?", answer: "i", confidence: 0.9, accepted: true } },
   "agent.joined": { from: "a", payload: { role: "builder" } },
   "agent.left": { from: "a", payload: {} },
 };
@@ -180,6 +190,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "help.requested": { request: "r", item: "i" },
   "help.offered": {},
   "contract.proposed": { contract: "k", target: "src/a.ts", kind: "rewrite" },
+  "contract.escalated": { contract: "k", item: "i", target: "../x", kind: "modify" },
   "contract.accepted": {},
   "contract.rejected": { contract: "" },
   "push.announced": { item: "i", commit: "abc", paths: ["src/**"] },
@@ -190,9 +201,13 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   handoff: { item: "i", to: "b" },
   "done.proposed": { item: 1 },
   "item.completed": { item: "i", n: 1, via: "vibes" },
+  "fix.requested": { item: "i", n: 0, attempt: 1 },
+  "fix.exhausted": { item: "i", n: 1, attempts: -1 },
+  "item.reopened": { item: "i", previousOwner: "a" },
   "tool.proposed": { tool: "t" },
   "tool.published": { tool: "t", capability: "scan", version: "1", repo: "tools", commit: "abc", verified: false },
   "tool.used": { capability: "scan" },
+  "decision.recorded": { juncture: "guess", question: "q", accepted: true },
   "agent.joined": { role: "has spaces" },
   "agent.left": { extra: "ignored" },
 };
@@ -200,7 +215,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(30);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(35);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -219,11 +234,11 @@ describe("board vocabulary: per-type payload validation", () => {
   it("goal.posted records the arbitration rules, filling defaults", () => {
     expect(parseBoardDraft({ type: "goal.posted", payload: { objective: "o" } }, "human").payload).toEqual({
       objective: "o",
-      rules: { maxContestTurns: 3, contestIdleMessages: 25 },
+      rules: { maxContestTurns: 3, contestIdleMessages: 25, maxFixAttempts: 2 },
     });
     expect(
       parseBoardDraft({ type: "goal.posted", payload: { objective: "o", rules: { maxContestTurns: 1 } } }, "human").payload,
-    ).toEqual({ objective: "o", rules: { maxContestTurns: 1, contestIdleMessages: 25 } });
+    ).toEqual({ objective: "o", rules: { maxContestTurns: 1, contestIdleMessages: 25, maxFixAttempts: 2 } });
   });
 
   it("agent.left carries no payload fields (unknown fields are dropped, not stored)", () => {
@@ -482,7 +497,7 @@ describe("board arbitration", () => {
     board.post(claim("b", "two", ["src/a/x.ts"]));
     const contest = lastContest(board);
     board.reject(msg("a", "claim.narrowed", { contest, write: ["lib/**"] }), /stay within the previous one/, "NOT_WITHIN");
-    board.reject(msg("a", "claim.narrowed", { contest, write: ["src/**x"] }), /stay within the previous one/, "NOT_WITHIN");
+    board.reject(msg("a", "claim.narrowed", { contest, write: ["src/**x"] }), /invalid path/, "BAD_PAYLOAD");
     board.reject(msg("c", "claim.narrowed", { contest, write: ["src/a/y.ts"] }), /not a party/, "NOT_ALLOWED");
     expect(board.types(msg("a", "claim.narrowed", { contest, write: ["src/a/y.ts"] }))).toEqual([
       "claim.narrowed",
@@ -682,7 +697,15 @@ describe("completion is derived from a passing revision", () => {
   it("a split item opens its children and completes when they all complete", () => {
     const board = seeded();
     board.post(claim("a", "one", ["src/a/**"]));
-    board.post(msg("a", "item.split", { item: "one", children: [{ item: "one-x", objective: "x" }, { item: "one-y", objective: "y" }] }));
+    board.post(
+      msg("a", "item.split", {
+        item: "one",
+        children: [
+          { item: "one-x", objective: "x", scopeHint: ["src/a/x.ts"] },
+          { item: "one-y", objective: "y", scopeHint: ["src/a/y.ts"] },
+        ],
+      }),
+    );
     expect(board.state.items.one).toMatchObject({ status: "split", owner: "a", children: ["one-x", "one-y"] });
     board.post(claim("b", "one-x", ["src/a/x.ts"]));
     board.post(claim("c", "one-y", ["src/a/y.ts"]));
@@ -711,6 +734,232 @@ describe("completion is derived from a passing revision", () => {
     expect(board.state.items.one?.lastPush).toMatchObject({ commit: "c2" });
     expect(board.state.tools.published[0]?.uses).toBe(2);
     expect(Object.keys(board.state)).not.toContain("toolUses");
+  });
+});
+
+describe("scope, protected paths, and push containment", () => {
+  /** A board whose goal protects the gate's files, with items scoped to src/. */
+  function guarded(): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["package.json", "gate/", "gate/gate.test.mjs"] }));
+    for (const agent of ["a", "b"]) {
+      board.post(msg(agent, "agent.joined"));
+    }
+    board.post(msg("human", "item.proposed", { item: "one", objective: "fix a", scopeHint: ["src/a/**"] }));
+    board.post(msg("human", "item.proposed", { item: "wide", objective: "anything", scopeHint: ["**"] }));
+    board.post(msg("human", "item.proposed", { item: "bare", objective: "no scope" }));
+    return board;
+  }
+
+  it("records the protected set from goal.posted and shows it in every digest", () => {
+    const board = guarded();
+    expect(board.state.protected).toEqual(["package.json", "gate/**", "gate/gate.test.mjs"]);
+    expect(boardDigest(board.state, board.log, "a", 0).protected).toEqual(board.state.protected);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("refuses a write intent outside the item's scope hint, and any claim on an unscoped item", () => {
+    const board = guarded();
+    board.reject(claim("a", "one", ["src/b/x.ts"]), /outside item one's scope hint/, "OUTSIDE_SCOPE");
+    board.reject(claim("a", "one", ["src/**"]), /outside item one's scope hint/, "OUTSIDE_SCOPE");
+    board.reject(claim("a", "bare", ["src/a/x.ts"]), /declares no scope hint/, "OUTSIDE_SCOPE");
+    expect(board.types(claim("a", "one", ["src/a/x.ts"], ["gate/gate.test.mjs"]))).toEqual(["item.claimed", "claim.granted"]);
+  });
+
+  it("refuses any write intent that could name a protected path, even inside a wide scope", () => {
+    const board = guarded();
+    board.reject(claim("b", "wide", ["gate/gate.test.mjs"]), /overlaps protected path\(s\).*contract change/, "PROTECTED");
+    board.reject(claim("b", "wide", ["package.json"]), /protected path/, "PROTECTED");
+    board.reject(claim("b", "wide", ["**"]), /protected path/, "PROTECTED");
+    board.reject(claim("b", "wide", ["*.json"]), /protected path/, "PROTECTED");
+    expect(board.types(claim("b", "wide", ["lib/**"]))).toEqual(["item.claimed", "claim.granted"]);
+  });
+
+  it("items may be scoped over protected paths (claims enforce them); split children stay inside the parent", () => {
+    const board = guarded();
+    expect(board.types(msg("a", "item.proposed", { item: "g", objective: "o", scopeHint: ["gate/**"] }))).toEqual(["item.proposed"]);
+    board.reject(claim("a", "g", ["gate/**"]), /contract change/, "PROTECTED");
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.reject(
+      msg("a", "item.split", { item: "one", children: [{ item: "c1", objective: "o", scopeHint: ["src/b/**"] }] }),
+      /outside item one's scope hint/,
+      "OUTSIDE_SCOPE",
+    );
+    expect(
+      board.types(msg("a", "item.split", { item: "one", children: [{ item: "c1", objective: "o", scopeHint: ["src/a/x.ts"] }] })),
+    ).toEqual(["item.split"]);
+  });
+
+  it("a contract on the original tests is bounded, escalated to a HUMAN, and releases only its path for its item", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["package.json", "gate/gate.test.mjs", "gate/other.test.mjs"] }));
+    board.post(msg("a", "agent.joined"));
+    board.post(msg("b", "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("human", "item.proposed", { item: "g", objective: "update the gate test", scopeHint: ["gate/**"] }));
+    board.post(msg("human", "item.proposed", { item: "h", objective: "other", scopeHint: ["gate/**"] }));
+    board.post(msg("human", "item.proposed", { item: "s", objective: "src only", scopeHint: ["src/**"] }));
+    board.reject(claim("a", "g", ["gate/gate.test.mjs"]), /contract change/, "PROTECTED");
+    // Bounded: one concrete contract path, named for an item whose scope holds it.
+    board.reject(msg("a", "contract.proposed", { contract: "k0", target: "gate/**", kind: "modify", item: "g" }), /one concrete path/, "NOT_ALLOWED");
+    board.reject(msg("a", "contract.proposed", { contract: "k0", target: "gate/gate.test.mjs", kind: "modify" }), /must name the item/, "NOT_ALLOWED");
+    board.reject(msg("a", "contract.proposed", { contract: "k0", target: "gate/gate.test.mjs", kind: "modify", item: "s" }), /outside item s's scope/, "OUTSIDE_SCOPE");
+    const proposed = board.post(msg("a", "contract.proposed", { contract: "k1", target: "gate/gate.test.mjs", kind: "modify", item: "g" }));
+    expect(proposed.map((m) => m.type)).toEqual(["contract.proposed", "contract.escalated"]);
+    const [request] = boardEscalationRequests(proposed);
+    expect(request).toMatchObject({ kind: "decision", path: "gate/gate.test.mjs", options: ["accept", "reject"], boardContract: "k1" });
+    // The lead cannot decide it, however it is asked.
+    board.reject(msg("lead", "contract.accepted", { contract: "k1" }), /only a human decides it/, "NOT_ALLOWED");
+    expect(() => boardContractDecision(board.state, "k1", "maybe")).toThrow(/accept or reject/);
+    board.post(boardContractDecision(board.state, "k1", " Accept ")!);
+    expect(boardContractDecision(board.state, "k1", "accept")).toBeUndefined();
+    board.reject(claim("b", "h", ["gate/gate.test.mjs"]), /contract change/, "PROTECTED"); // another item
+    board.reject(claim("a", "g", ["gate/**"]), /gate\/other\.test\.mjs/, "PROTECTED"); // wider than released
+    expect(board.types(claim("a", "g", ["gate/gate.test.mjs"]))).toEqual(["item.claimed", "claim.granted"]);
+    expect(boardDigest(board.state, board.log, "a", 0).released).toEqual(["gate/gate.test.mjs"]);
+    // A contract on a non-protected path stays the lead's to decide.
+    board.post(msg("b", "contract.proposed", { contract: "k2", target: "src/api.ts", kind: "modify" }));
+    expect(board.types(msg("lead", "contract.accepted", { contract: "k2" }))).toEqual(["contract.accepted"]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("after a human rejects a contract for an item, asking again is refused until a failing revision implicates it", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["tests/a.test.ts", "tests/b.test.ts"] }));
+    board.post(msg("a", "agent.joined"));
+    board.post(msg("b", "agent.joined"));
+    board.post(msg("human", "item.proposed", { item: "t", objective: "o", scopeHint: ["tests/**"] }));
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/a.test.ts", kind: "modify", item: "t" }));
+    board.post(msg("human", "contract.rejected", { contract: "k1" }));
+    board.reject(msg("b", "contract.proposed", { contract: "k2", target: "tests/b.test.ts", kind: "modify", item: "t" }), /human rejected a contract change for item t/, "CONTRACT_REJECTED");
+    // New evidence: a failing revision implicates the item.
+    board.post(claim("a", "t", ["tests/new.test.ts"]));
+    board.post(push("a", "t", "c1", ["tests/new.test.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1"], failing: { output: "x", items: ["t"] } }));
+    expect(board.types(msg("b", "contract.proposed", { contract: "k2", target: "tests/b.test.ts", kind: "modify", item: "t" }))).toEqual([
+      "contract.proposed",
+      "contract.escalated",
+    ]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("closes a contract escalation when the contract is decided", () => {
+    const appended = [
+      { seq: 1, at: AT, from: "engine", type: "contract.escalated", payload: { contract: "k1", item: "g", target: "t.test.ts", kind: "modify" } },
+    ] as BoardMessage[];
+    const raised = applyBoardEscalations([], appended, 0);
+    expect(raised.list).toMatchObject([{ status: "pending", boardContract: "k1" }]);
+    const closed = applyBoardEscalations(raised.list, [{ seq: 2, at: AT, from: "human", type: "contract.rejected", payload: { contract: "k1" } }] as BoardMessage[], 1);
+    expect(closed.list).toMatchObject([{ status: "resolved", decision: "reject" }]);
+  });
+
+  it("refuses pushes into dependency or tool trees, and records the goal's test inventory", () => {
+    const board = new TestBoard();
+    board.reject(msg("human", "goal.posted", { objective: "o", testInventory: { status: "recorded", count: 2, names: ["a"] } }), /only status, format, count/, "BAD_PAYLOAD");
+    board.post(msg("human", "goal.posted", { objective: "o", testInventory: { status: "recorded", format: "tap", count: 2 } }));
+    expect(board.state.testInventory).toEqual({ status: "recorded", format: "tap", count: 2 });
+    board.post(msg("a", "agent.joined"));
+    board.post(msg("human", "item.proposed", { item: "x", objective: "o", scopeHint: ["**"] }));
+    board.post(claim("a", "x", ["**"]));
+    board.reject(push("a", "x", "c1", ["node_modules/x/index.js"]), /dependency or tool trees/, "PROTECTED");
+    board.reject(push("a", "x", "c1", ["tools/.bin/run"]), /dependency or tool trees/, "PROTECTED");
+    expect(board.types(push("a", "x", "c1", ["src/a.ts"]))).toEqual(["push.announced"]);
+  });
+
+  it("records the gate's protected keys with the goal for display", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protectedKeys: ['package.json scripts["gate"]'] }));
+    expect(board.state.protectedKeys).toEqual(['package.json scripts["gate"]']);
+  });
+
+  it("a pushed path must be a concrete file inside the write intent", () => {
+    const board = guarded();
+    board.post(claim("a", "one", ["src/a/x.ts#run", "src/a/y/*.ts"]));
+    board.reject(push("a", "one", "c1", ["src/a/*.ts"]), /concrete file paths/, "BAD_PAYLOAD");
+    board.reject(push("a", "one", "c1", ["src/a/y/deep/z.ts"]), /outside the claim's write intent/, "OUTSIDE_INTENT");
+    board.reject(push("a", "one", "c1", ["gate/gate.test.mjs"]), /outside the claim's write intent/, "OUTSIDE_INTENT");
+    expect(board.types(push("a", "one", "c1", ["src/a/x.ts", "src/a/y/z.ts"]))).toEqual(["push.announced"]);
+  });
+});
+
+describe("the fix loop: failing evidence and fix requests", () => {
+  const failing = (merged: string[], items: string[], output = "FAIL src/a/x.ts", commit = "rev") =>
+    msg("engine", "integrated.rev", { commit, gate: "fail", merged, failing: { output, items } });
+
+  it("a failing revision carries bounded evidence and asks the implicated owner (to) for a fix", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(claim("b", "two", ["src/b/**"]));
+    board.post(push("a", "one", "c1", ["src/a/x.ts"]));
+    board.post(push("b", "two", "c2", ["src/b/y.ts"]));
+    const appended = board.post(failing(["c1", "c2"], ["one"], "FAIL src/a/x.ts", "r1"));
+    expect(appended.map((m) => m.type)).toEqual(["integrated.rev", "fix.requested"]);
+    expect(appended[1]).toMatchObject({ from: "engine", to: ["a"], payload: { item: "one", n: 1, attempt: 1 } });
+    expect(board.state.lastFailure).toEqual({ n: 1, output: "FAIL src/a/x.ts", items: ["one"] });
+    expect(board.state.items.one).toMatchObject({ fixAttempts: 1, fixRequested: 1 });
+    // Only the implicated owner's digest carries the failure.
+    const digestA = boardDigest(board.state, board.log, "a", 0);
+    expect(digestA.failure).toEqual({ n: 1, output: "FAIL src/a/x.ts", items: ["one"] });
+    expect(digestA.claims[0]).toMatchObject({ item: "one", fix: { n: 1, attempt: 1 } });
+    expect(boardDigest(board.state, board.log, "b", 0).failure).toBeNull();
+    // The owner's next push answers the request; nothing completes on a fail.
+    board.post(push("a", "one", "c3", ["src/a/x.ts"]));
+    expect(board.state.items.one?.fixRequested).toBeUndefined();
+    expect(board.state.passingRevs).toEqual([]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("counts attempts per item; past the budget it records exhaustion and reopens the item for ANOTHER agent", () => {
+    const board = seeded({ maxFixAttempts: 1 });
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(push("a", "one", "c1", ["src/a/x.ts"]));
+    expect(board.post(failing(["c1"], ["one"], "x", "r1")).map((m) => m.type)).toEqual(["integrated.rev", "fix.requested"]);
+    board.post(push("a", "one", "c2", ["src/a/x.ts"]));
+    const second = board.post(failing(["c2"], ["one"], "x", "r2"));
+    expect(second.map((m) => m.type)).toEqual(["integrated.rev", "fix.exhausted", "item.reopened"]);
+    expect(second[1]?.payload).toEqual({ item: "one", n: 2, attempts: 1 });
+    expect(second[2]?.payload).toEqual({ item: "one", previousOwner: "a", commit: "c2", n: 2 });
+    expect(board.state.items.one).toMatchObject({ status: "open", exhaustedBy: ["a"], reopenedFrom: { agent: "a", commit: "c2" }, fixAttempts: 0 });
+    expect(board.state.items.one?.owner).toBeUndefined();
+    // The agent that spent the budget cannot take it back; a fresh one can.
+    board.reject(claim("a", "one", ["src/a/**"]), /already spent item one's fix budget/, "NOT_ALLOWED");
+    expect(board.types(claim("b", "one", ["src/a/**"]))).toEqual(["item.claimed", "claim.granted"]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("refuses evidence on a passing revision, implicated items the revision did not merge, and oversized output", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(push("a", "one", "c1", ["src/a/x.ts"]));
+    board.reject(msg("engine", "integrated.rev", { commit: "r", gate: "pass", merged: ["c1"], failing: { output: "", items: [] } }), /only a failing revision/, "BAD_PAYLOAD");
+    board.reject(failing(["c1"], ["two"]), /had no push in this revision/, "UNKNOWN_REF");
+    board.reject(failing(["c1"], ["one"], "x".repeat(BOARD_LIMITS.maxFailingOutput + 1)), /at most 8192/, "BAD_PAYLOAD");
+    board.reject(msg("engine", "integrated.rev", { commit: "r", gate: "fail", merged: ["c1"], extra: 1 }), /unknown field/, "BAD_PAYLOAD");
+  });
+
+  it("replay rejects a forged fix request (only arbitration produces one)", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(push("a", "one", "c1", ["src/a/x.ts"]));
+    board.post(failing(["c1"], ["one"]));
+    const forged = board.log.map((m) =>
+      m.type === "fix.requested" ? ({ ...m, payload: { ...m.payload, attempt: 2 } } as BoardMessage) : m,
+    );
+    expect(() => reduceBoard(forged)).toThrow(/does not match arbitration/);
+  });
+});
+
+describe("advisory decisions", () => {
+  it("records each typed decision and its outcome (an error too) without touching arbitration", () => {
+    const board = seeded();
+    const before = JSON.stringify({ ...board.state, lastSeq: 0, decisions: null });
+    board.post(msg("engine", "decision.recorded", { juncture: "plan-review", question: "covers the goal?", answer: "yes", confidence: 0.9, accepted: true }));
+    board.post(msg("engine", "decision.recorded", { juncture: "attribution", question: "which item?", accepted: false, error: "HTTP 400: expected record, received array" }));
+    expect(board.state.decisions).toEqual({ calls: 2, accepted: 1, errors: 1 });
+    expect(JSON.stringify({ ...board.state, lastSeq: 0, decisions: null })).toBe(before);
+    board.reject(msg("engine", "decision.recorded", { juncture: "plan-review", question: "q", accepted: true, extra: 1 }), /unknown field/, "BAD_PAYLOAD");
+    board.reject(msg("a", "decision.recorded", { juncture: "plan-review", question: "q", accepted: true }), /cannot be sent by an agent/, "NOT_ALLOWED");
+    expect(reduceBoard(board.log)).toEqual(board.state);
   });
 });
 
@@ -776,7 +1025,7 @@ describe("replay, fold, and verification", () => {
     expect(() => reduceBoard([...log.slice(0, 8), { ...log[9]!, seq: 9 }])).toThrow(/was not produced by arbitration/);
     // Changing the recorded rules changes what arbitration decides.
     const rewritten = log.map((m) =>
-      m.type === "goal.posted" ? ({ ...m, payload: { ...m.payload, rules: { maxContestTurns: 1, contestIdleMessages: 25 } } } as BoardMessage) : m,
+      m.type === "goal.posted" ? ({ ...m, payload: { ...m.payload, rules: { maxContestTurns: 1, contestIdleMessages: 25, maxFixAttempts: 2 } } } as BoardMessage) : m,
     );
     expect(() => reduceBoard(rewritten)).toThrow(/does not match arbitration/);
   });
@@ -835,7 +1084,7 @@ describe("per-agent digest", () => {
     board.post(msg("a", "help.requested", { request: "h1", item: "one", need: "review" }, { to: ["c"] }));
     const digestA = boardDigest(board.state, board.log, "a", 0);
     expect(digestA.claims.map((c) => c.item)).toEqual(["one"]);
-    expect(digestA.claims[0]?.lastPush).toEqual({ commit: "c1", integratedIn: 1 });
+    expect(digestA.claims[0]?.lastPush).toEqual({ commit: "c1", agent: "a", integratedIn: 1 });
     expect(digestA.contests.map((c) => c.claimant)).toEqual(["c"]);
     expect(digestA.messages.every((m) => m.from !== "a")).toBe(true);
     expect(digestA.messages.map((m) => m.type)).toContain("claim.contested");

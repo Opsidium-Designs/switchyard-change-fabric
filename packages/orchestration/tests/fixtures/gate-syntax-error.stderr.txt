@@ -1,0 +1,8 @@
+/work/scf-integration-7Qk2/src/resources/users.js:20
+  const authResponse = null;
+        ^
+
+SyntaxError: Identifier 'authResponse' has already been declared
+    at checkSyntax (node:internal/main/check_syntax:84:5)
+
+Node.js v24.21.0

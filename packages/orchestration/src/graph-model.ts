@@ -342,6 +342,8 @@ export interface JevDecisionSnapshot {
   readonly confidence: number;
   readonly probabilities?: Readonly<Record<string, number>>;
   readonly accepted: boolean;
+  /** Set when the decision call failed (a short, credential-free reason). */
+  readonly error?: string;
   readonly at?: string;
 }
 

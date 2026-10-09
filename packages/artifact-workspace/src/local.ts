@@ -17,12 +17,10 @@
  * local runner, the CLI, and tests, not inside a Cloudflare Worker.
  */
 
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { promisify } from "node:util";
 
 import {
   DEFAULT_TOKEN_TTL_SECONDS,
@@ -33,8 +31,8 @@ import {
   type WorkspaceProvider,
   type WorkspaceRef,
 } from "./types.ts";
+import { runGit } from "./git-transport.ts";
 
-const run = promisify(execFile);
 
 interface LocalRepoRecord {
   readonly ref: WorkspaceRef;
@@ -73,7 +71,7 @@ export class LocalFilesystemWorkspaceProvider implements WorkspaceProvider {
     const defaultBranch = opts?.defaultBranch ?? "main";
     const repoDir = join(this.rootDir, `${sanitize(name)}.git`);
     mkdirSync(repoDir, { recursive: true });
-    await run("git", ["init", "--bare", `--initial-branch=${defaultBranch}`, repoDir]);
+    await runGit(["init", "--bare", `--initial-branch=${defaultBranch}`, repoDir]);
     const ref: WorkspaceRef = {
       id: this.newId(),
       name,
@@ -91,7 +89,7 @@ export class LocalFilesystemWorkspaceProvider implements WorkspaceProvider {
     // file:// or https baseline both work with the git CLI. If the baseline is
     // unreachable, the caller falls back to the runner's first push.
     const record = this.require(ref.name);
-    await run("git", ["-C", record.repoDir, "fetch", baselineRemote, "+refs/heads/*:refs/heads/*"]);
+    await runGit(["-C", record.repoDir, "fetch", baselineRemote, "+refs/heads/*:refs/heads/*"]);
   }
 
   async issueReadToken(ref: WorkspaceRef, ttlSeconds = DEFAULT_TOKEN_TTL_SECONDS): Promise<ScopedToken> {
@@ -117,7 +115,7 @@ export class LocalFilesystemWorkspaceProvider implements WorkspaceProvider {
     const record = this.require(ref.name);
     let lastPushAt: string | null = null;
     try {
-      const { stdout } = await run("git", [
+      const { stdout } = await runGit([
         "-C",
         record.repoDir,
         "log",

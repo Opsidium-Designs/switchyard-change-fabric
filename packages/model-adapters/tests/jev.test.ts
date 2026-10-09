@@ -19,6 +19,8 @@ import {
   gatewaySlugFromUrl,
   JevResponseError,
   parseJevAnswers,
+  jevErrorReason,
+  serializeJevQuestion,
 } from "../src/index.ts";
 
 /** Nest an answers map in the native account run response shape. */
@@ -145,12 +147,13 @@ describe("createAiGatewayJevInvoke (native /ai/run + cf-aig-gateway-id, offline 
       },
     });
     // The request body carries the questions object-keyed, with a choice
-    // question's allowed options under `criteria`.
+    // question's allowed options under `criteria` as a RECORD option -> description
+    // (the decision API rejects an array there).
     const body = JSON.parse(seenBody);
     expect(body.input.questions.attribution).toEqual({
       type: "choice",
       instructions: "which?",
-      criteria: ["users", "orders"],
+      criteria: { users: "users", orders: "orders" },
     });
     expect(body.input.questions.quality).toEqual({ type: "score", instructions: "how good?" });
     // The answers come back object-keyed by the same question names.
@@ -248,3 +251,47 @@ describe("gatewaySlugFromUrl", () => {
     expect(gatewaySlugFromUrl("https://host/some/path/gw")).toBe("gw");
   });
 });
+
+describe("the decision API's wire shapes (from live replies of the current model)", () => {
+  it("serializes criteria per question type: choice as a record, score as an array, noul without", () => {
+    expect(serializeJevQuestion({ type: "choice", instructions: "which?", criteria: ["unit-a", "unit-b"], descriptions: { "unit-a": "the users module" } })).toEqual({
+      type: "choice",
+      instructions: "which?",
+      criteria: { "unit-a": "the users module", "unit-b": "unit-b" },
+    });
+    expect(serializeJevQuestion({ type: "score", instructions: "how good?", criteria: ["correctness", "scope"] })).toEqual({
+      type: "score",
+      instructions: "how good?",
+      criteria: ["correctness", "scope"],
+    });
+    expect(serializeJevQuestion({ type: "noul", instructions: "ok?", criteria: ["x"] })).toEqual({ type: "noul", instructions: "ok?" });
+  });
+
+  it("parses the live reply shapes: choice with confidence, noul as a number, score with a legend (type optional)", () => {
+    const answers = parseJevAnswers(
+      {
+        answers: {
+          attribution: { type: "choice", choice: "unit-b", probabilities: { "unit-a": 0, "unit-b": 1 }, confidence: 1 },
+          review: { type: "noul", noul: 0.92 },
+          quality: { score: 1, legend: { "0": "poor", "1": "good" }, probabilities: { "0": 0.1, "1": 0.9 }, confidence: 0.9 },
+        },
+      },
+      { attribution: "choice", review: "noul", quality: "score" },
+    );
+    expect(answers.attribution).toEqual({ type: "choice", choice: "unit-b", confidence: 1, probabilities: { "unit-a": 0, "unit-b": 1 } });
+    expect(answers.review).toMatchObject({ type: "noul", noul: "yes", confidence: 0.92 });
+    expect(answers.quality).toEqual({ type: "score", score: 1, confidence: 0.9, probabilities: { "0": 0.1, "1": 0.9 }, legend: { "0": "poor", "1": "good" } });
+  });
+
+  it("an API error carries the body's message (first line), never headers or tokens", async () => {
+    const fakeFetch = (async () =>
+      new Response(JSON.stringify({ errors: [{ message: "Invalid value at questions.attribution.criteria: expected record, received array\nmore" }] }), { status: 400 })) as unknown as typeof fetch;
+    const invoke = createAiGatewayJevInvoke({ accountId: "acct", apiToken: "SECRET-TOKEN", gatewayId: "g", fetchFn: fakeFetch });
+    const failure = await invoke({ state: "s", questions: { a: { type: "choice", instructions: "x", criteria: ["a"] } } }).catch((e: unknown) => e);
+    expect(jevErrorReason(failure)).toBe(
+      `AI Gateway decision call failed for ${DEFAULT_JEV_MODEL} (HTTP 400): Invalid value at questions.attribution.criteria: expected record, received array`,
+    );
+    expect(jevErrorReason(new Error("Authorization: Bearer abc.def failed"))).toBe("Authorization: Bearer [redacted] failed");
+  });
+});
+

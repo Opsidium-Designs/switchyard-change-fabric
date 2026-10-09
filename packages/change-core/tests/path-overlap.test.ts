@@ -40,13 +40,19 @@ describe("entriesOverlap", () => {
 });
 
 describe("normalizeIntentEntry", () => {
+  it("accepts a ** that fills a whole segment", () => {
+    expect(normalizeIntentEntry("**")).toBe("**");
+    expect(normalizeIntentEntry("**/x.ts")).toBe("**/x.ts");
+    expect(normalizeIntentEntry("src/**/x.ts")).toBe("src/**/x.ts");
+  });
+
   it("normalizes separators and leading ./", () => {
     expect(normalizeIntentEntry("./src\\a.ts")).toBe("src/a.ts");
     expect(normalizeIntentEntry("src//a/")).toBe("src/a/**");
     expect(normalizeIntentEntry("src/a.ts#parse")).toBe("src/a.ts#parse");
   });
 
-  it.each(["", "/etc/passwd", "../outside", "src/../x", "src/./x", "C:/x", "src/a.ts#", "src/*.ts#f", "src/a.ts#1x"])(
+  it.each(["", "/etc/passwd", "../outside", "src/../x", "src/./x", "C:/x", "src/a.ts#", "src/*.ts#f", "src/a.ts#1x", "src/**x", "a**", "**b/c", "src/x**/y"])(
     "rejects %j",
     (entry) => {
       expect(normalizeIntentEntry(entry)).toBeUndefined();
@@ -78,9 +84,9 @@ describe("regressions", () => {
   it("a glob with ** followed by more characters in a segment is not within dir/**", () => {
     // "src/**x" also matches "srcx", which "src/**" does not.
     expect(entryWithin("src/**x", "src/**")).toBe(false);
-    // The glob semantics mirror the path-scope matcher, where "src/**/x" reads
-    // as "src(/.*)?x" and so also names "srcx": not within "src/**" either.
-    expect(entryWithin("src/**/x", "src/**")).toBe(false);
+    // "**" spans whole segments, so "src/**/x" names only paths under src:
+    // it is within "src/**" (it used to read as "src(/.*)?x" and name "srcx").
+    expect(entryWithin("src/**/x", "src/**")).toBe(true);
     expect(entryWithin("src/a/**/x.ts", "src/**")).toBe(true);
     expect(entryWithin("src/*.ts", "src/**")).toBe(true);
     expect(entryWithin("src/**", "src/*")).toBe(false);
@@ -103,5 +109,35 @@ describe("regressions", () => {
     entriesOverlap(nasty, other);
     entryWithin(other.slice(0, 200), nasty);
     expect(Date.now() - started).toBeLessThan(2000);
+  });
+});
+
+describe("whole-segment double star", () => {
+  it.each([
+    ["src/**/x", "src/x", true],
+    ["src/**/x", "src/a/x", true],
+    ["src/**/x", "src/a/b/x", true],
+    ["src/**/x", "srcx", false],
+    ["src/**/x", "src/ax", false],
+    ["src/**/x", "src/a/bx", false],
+    ["**/x", "x", true],
+    ["**/x", "a/b/x", true],
+    ["**/x", "ax", false],
+    ["src/**/**/x", "src/x", true],
+    ["src/**/**/x", "srcx", false],
+    ["src/**/", "src/a/b", true],
+  ])("%s overlaps the path %s -> %s", (glob, path, expected) => {
+    expect(entriesOverlap(glob, path)).toBe(expected);
+    expect(entriesOverlap(path, glob)).toBe(expected);
+  });
+
+  it("decides containment with whole segments", () => {
+    expect(entryWithin("src/x", "src/**/x")).toBe(true);
+    expect(entryWithin("src/a/b/x", "src/**/x")).toBe(true);
+    expect(entryWithin("srcx", "src/**/x")).toBe(false);
+    expect(entryWithin("src/**/x", "src/**/*")).toBe(true);
+    expect(entryWithin("x", "**/x")).toBe(true);
+    expect(entryWithin("ax", "**/x")).toBe(false);
+    expect(entriesOverlap("src/**/x", "srcx/**")).toBe(false);
   });
 });

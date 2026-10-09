@@ -33,6 +33,29 @@ describe("matchesGlob", () => {
   });
 });
 
+describe("matchesGlob: ** spans whole path segments", () => {
+  it.each([
+    ["src/x", "src/**/x", true],
+    ["src/a/x", "src/**/x", true],
+    ["src/a/b/x", "src/**/x", true],
+    ["srcx", "src/**/x", false],
+    ["src/ax", "src/**/x", false],
+    ["src/a/bx", "src/**/x", false],
+    ["x", "**/x", true],
+    ["a/b/x", "**/x", true],
+    ["ax", "**/x", false],
+    ["lib/deep/x.ts", "**/*.ts", true],
+    ["x.ts", "**/*.ts", true],
+    ["src/x", "src/**/**/x", true],
+    ["srcx", "src/**/**/x", false],
+    ["src/a/b", "src/**/**", true],
+    ["src/a/b", "src/**/", true],
+    ["srcx", "src/**", false],
+  ])("%s against %s -> %s", (path, glob, expected) => {
+    expect(matchesGlob(path, glob)).toBe(expected);
+  });
+});
+
 describe("partitionByScope", () => {
   it("splits changed paths into in-scope and out-of-scope, preserving order", () => {
     const changed = ["src/alpha/one.ts", "package.json", "src/alpha/two.ts", "src/beta/x.ts"];

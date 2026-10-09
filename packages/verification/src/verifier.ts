@@ -28,7 +28,7 @@ import {
   type CommandRunner,
 } from "./command.ts";
 import { changedPathsSinceBaseline, hasChanges } from "./git.ts";
-import { partitionByScope } from "./pathscope.ts";
+import { matchesAny, partitionByScope } from "./pathscope.ts";
 import type {
   CheckKind,
   CheckResult,
@@ -139,7 +139,11 @@ export class VerificationProvider {
       }
     }
 
-    const { inScope, outOfScope } = partitionByScope(changed, contract.paths);
+    // Paths this unit yields to other owners are never applied from it, so they
+    // are not this unit's to account for.
+    const yielded = contract.yieldedScope ?? [];
+    const own = yielded.length > 0 ? changed.filter((p) => !matchesAny(p, yielded)) : changed;
+    const { inScope, outOfScope } = partitionByScope(own, contract.paths);
     if (outOfScope.length > 0) {
       return failed(
         "path-scope",

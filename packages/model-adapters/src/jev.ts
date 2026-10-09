@@ -55,8 +55,47 @@ export interface JevQuestion {
   readonly type: JevAnswerType;
   /** The human-readable instructions describing what to decide. */
   readonly instructions: string;
-  /** For a choice question, the allowed option ids the model must pick among. */
+  /**
+   * For a choice question, the allowed option ids the model must pick among;
+   * for a score question, the scoring criteria. (The wire shapes differ: the
+   * transport sends a choice's options as a record option -> description and a
+   * score's criteria as an array; a noul sends none.)
+   */
   readonly criteria?: readonly string[];
+  /** For a choice question, an optional short description per option id. */
+  readonly descriptions?: Readonly<Record<string, string>>;
+}
+
+/**
+ * The question as the decision model's API expects it on the wire: a choice's
+ * criteria is a RECORD option -> description, a score's criteria an ARRAY of
+ * strings, and a noul carries no criteria.
+ */
+export function serializeJevQuestion(question: JevQuestion): Record<string, unknown> {
+  const base = { type: question.type, instructions: question.instructions };
+  if (question.type === "choice" && question.criteria && question.criteria.length > 0) {
+    return {
+      ...base,
+      criteria: Object.fromEntries(question.criteria.map((option) => [option, question.descriptions?.[option] ?? option])),
+    };
+  }
+  if (question.type === "score" && question.criteria && question.criteria.length > 0) {
+    return { ...base, criteria: [...question.criteria] };
+  }
+  return base;
+}
+
+/**
+ * A short, credential-free reason for a failed decision call: the first line of
+ * its message, bounded (callers record it; nothing here carries headers).
+ */
+export function jevErrorReason(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  const line = text.split(/\r?\n/).find((l) => l.trim() !== "") ?? "decision call failed";
+  return line
+    .replace(/Bearer\s+\S+/gi, "Bearer [redacted]")
+    .replace(/(\b[a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi, "$1***@")
+    .slice(0, 200);
 }
 
 /**
@@ -85,6 +124,8 @@ export interface JevAnswer {
   readonly confidence: number;
   /** Optional per-outcome probabilities, keyed by outcome/option id. */
   readonly probabilities?: Readonly<Record<string, number>>;
+  /** For a score answer: what each score value means. */
+  readonly legend?: Readonly<Record<string, string>>;
 }
 
 /** What the caller hands the decision transport: the state summary + questions. */
@@ -215,14 +256,7 @@ export function createAiGatewayJevInvoke(options: AiGatewayJevOptions): JevInvok
             // shape the reply's answers come back in, so there is no positional
             // array and each answer maps straight back to its question name.
             questions: Object.fromEntries(
-              Object.entries(request.questions).map(([name, question]) => [
-                name,
-                {
-                  type: question.type,
-                  instructions: question.instructions,
-                  ...(question.criteria ? { criteria: [...question.criteria] } : {}),
-                },
-              ]),
+              Object.entries(request.questions).map(([name, question]) => [name, serializeJevQuestion(question)]),
             ),
           },
           ...(maxTokens > 0 ? { max_tokens: maxTokens } : {}),
@@ -242,11 +276,10 @@ export function createAiGatewayJevInvoke(options: AiGatewayJevOptions): JevInvok
       }
     }
     if (res.status >= 400) {
-      // Drain the body (do not include it in the error) and fail without leaking.
-      await res.text().catch(() => "");
-      throw new Error(
-        `AI Gateway decision call failed for ${DEFAULT_JEV_MODEL} (HTTP ${res.status})`,
-      );
+      // Read the error MESSAGE from the body (never headers or the request), so
+      // the caller can record why the call failed.
+      const errorText = await res.text().catch(() => "");
+      throw new Error(`AI Gateway decision call failed for ${DEFAULT_JEV_MODEL} (HTTP ${res.status}): ${errorMessageOf(errorText)}`);
     }
     const text = await res.text();
     let body: unknown;
@@ -261,8 +294,24 @@ export function createAiGatewayJevInvoke(options: AiGatewayJevOptions): JevInvok
     // `{ result: { state, result: { answers: { <name>: {...} } } } }`. Unwrap to
     // the inner run result before parsing; tolerate a flatter `{ result: {...} }`
     // or a bare body for the fake/offline path.
-    return parseJevAnswers(unwrapRunResult(body));
+    return parseJevAnswers(
+      unwrapRunResult(body),
+      Object.fromEntries(Object.entries(request.questions).map(([name, q]) => [name, q.type])),
+    );
   };
+}
+
+/** The first meaningful message line of an API error body (JSON `errors[].message` / `error` / `message`, else text). */
+function errorMessageOf(text: string): string {
+  let message = text;
+  try {
+    const parsed = JSON.parse(text) as { errors?: { message?: unknown }[]; error?: unknown; message?: unknown };
+    const first = Array.isArray(parsed.errors) ? parsed.errors.find((e) => typeof e?.message === "string")?.message : undefined;
+    message = String(first ?? (typeof parsed.error === "string" ? parsed.error : undefined) ?? parsed.message ?? text);
+  } catch {
+    // Not JSON: use the text.
+  }
+  return (message.split(/\r?\n/).find((l) => l.trim() !== "") ?? "").trim().slice(0, 200);
 }
 
 /**
@@ -291,7 +340,10 @@ function unwrapRunResult(body: unknown): unknown {
  * decision. The reply may also be the bare `{ <key>: {...} }` map (no `answers`
  * wrapper), so both shapes are accepted.
  */
-export function parseJevAnswers(reply: unknown): Readonly<Record<string, JevAnswer>> {
+export function parseJevAnswers(
+  reply: unknown,
+  expected: Readonly<Record<string, JevAnswerType>> = {},
+): Readonly<Record<string, JevAnswer>> {
   if (!isRecord(reply)) {
     throw new JevResponseError("decision reply must be a JSON object");
   }
@@ -301,7 +353,9 @@ export function parseJevAnswers(reply: unknown): Readonly<Record<string, JevAnsw
   }
   const out: Record<string, JevAnswer> = {};
   for (const [key, value] of Object.entries(rawAnswers)) {
-    out[key] = parseOneAnswer(value, `answers.${key}`);
+    // A reply may omit `type`; the question's declared type stands in.
+    const typed = isRecord(value) && value["type"] === undefined && expected[key] !== undefined ? { ...value, type: expected[key] } : value;
+    out[key] = parseOneAnswer(typed, `answers.${key}`);
   }
   return out;
 }
@@ -384,11 +438,17 @@ function parseOneAnswer(value: unknown, where: string): JevAnswer {
     throw new JevResponseError(`${where}.score must be a finite number`);
   }
   const confidence = optionalUnitInterval(value["confidence"], `${where}.confidence`) ?? 1;
+  // The score's legend maps score values to their meaning ({"0": ..., "1": ...}).
+  const rawLegend = value["legend"];
+  const legend = isRecord(rawLegend)
+    ? Object.fromEntries(Object.entries(rawLegend).filter((e): e is [string, string] => typeof e[1] === "string"))
+    : undefined;
   return {
     type,
     score,
     confidence,
     ...(probabilities !== undefined ? { probabilities } : {}),
+    ...(legend !== undefined && Object.keys(legend).length > 0 ? { legend } : {}),
   };
 }
 

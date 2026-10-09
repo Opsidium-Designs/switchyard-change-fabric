@@ -23,9 +23,10 @@ import type { WorkspaceProvider, WorkspaceRef } from "@switchyard-change/artifac
 
 import { Integrator, type VerifiedWorkspace } from "./integrator.ts";
 import type { GitIdentity } from "./git.ts";
+import type { TestInventory } from "./test-inventory.ts";
 import { VerificationProvider } from "./verifier.ts";
 import type { CommandRunner } from "./command.ts";
-import { clone } from "./git.ts";
+import { checkoutCommit, clone, isAncestor } from "./git.ts";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,6 +53,27 @@ export interface CompletedWorkUnit {
   readonly testCommand?: readonly string[];
   /** The per-unit lint command, as argv (optional). */
   readonly lintCommand?: readonly string[];
+  /**
+   * Pin the unit to this exact commit: after cloning, verification and
+   * integration check out this commit (detached), never the branch head, so what
+   * is verified and integrated is exactly what was announced. A commit that is
+   * not in the repo fails the unit.
+   */
+  readonly commit?: string;
+  /**
+   * Commits that must be contained in `commit` (ancestors of it, or equal):
+   * the earlier announced pushes a caller reports as merged by integrating
+   * this unit. A listed commit that is not in `commit`'s history fails the unit,
+   * so what a caller records as merged is provably what was integrated.
+   */
+  readonly includes?: readonly string[];
+  /**
+   * Globs the unit yields to other owners (see VerificationContract.yieldedScope):
+   * excluded from the scope check and never applied from this unit.
+   */
+  readonly yieldedScope?: readonly string[];
+  /** Protected paths an accepted contract released for this unit only. */
+  readonly releasedPaths?: readonly string[];
   /**
    * The per-app behavioral gate command, as argv (optional). When supplied, the
    * verifier runs it as the real mechanical check that the planted bug is fixed.
@@ -102,6 +124,22 @@ export interface VerifyAndIntegrateOptions {
    * the reason recorded in the coordination evidence.
    */
   readonly leaseOwnerOverrides?: Readonly<Record<string, string>>;
+  /**
+   * Globs that define the gate (its test files, the project manifest): the
+   * integrator restores them from the baseline before the gate runs, and a unit
+   * that changed one fails the integration verdict (see IntegrateOptions).
+   */
+  readonly protectedPaths?: readonly string[];
+  /** See IntegrateOptions.protectedJsonKeys. */
+  readonly protectedJsonKeys?: readonly { readonly file: string; readonly keys: readonly (readonly string[])[] }[];
+  /** See IntegrateOptions.onProtectedChange. */
+  readonly onProtectedChange?: "fail" | "restore";
+  /** See IntegrateOptions.baseCommit. */
+  readonly integrationBaseCommit?: string;
+  /** See IntegrateOptions.deferBranchPush. */
+  readonly deferIntegrationPush?: boolean;
+  /** See IntegrateOptions.testInventory. */
+  readonly testInventory?: TestInventory;
   readonly workRoot?: string;
   readonly identity?: GitIdentity;
 }
@@ -206,6 +244,9 @@ export class ChangeVerification {
           unitId: done.unitId,
           gitUrl: done.gitUrl,
           baselineRef: done.baselineRef,
+          ...(done.commit !== undefined ? { commit: done.commit } : {}),
+          ...(done.yieldedScope !== undefined ? { yieldedScope: done.yieldedScope } : {}),
+          ...(done.releasedPaths !== undefined ? { releasedPaths: done.releasedPaths } : {}),
           // Keep this unit's yielded contested paths out of integration so the
           // single lease owner is the only contributor of that path.
           yieldedPaths: leaseViews.get(done.unitId)?.yields ?? [],
@@ -239,6 +280,12 @@ export class ChangeVerification {
         ? { integrationGateCommand }
         : {}),
       requiresIntegrationGate,
+      ...(options.protectedPaths && options.protectedPaths.length > 0 ? { protectedPaths: options.protectedPaths } : {}),
+      ...(options.protectedJsonKeys && options.protectedJsonKeys.length > 0 ? { protectedJsonKeys: options.protectedJsonKeys } : {}),
+      ...(options.onProtectedChange ? { onProtectedChange: options.onProtectedChange } : {}),
+      ...(options.integrationBaseCommit ? { baseCommit: options.integrationBaseCommit } : {}),
+      ...(options.deferIntegrationPush ? { deferBranchPush: true } : {}),
+      ...(options.testInventory ? { testInventory: options.testInventory } : {}),
       workRoot,
       identity: options.identity,
     });
@@ -259,6 +306,7 @@ export class ChangeVerification {
       appGateCommand: done.appGateCommand,
       requiresAppGate: done.requiresAppGate,
       changedPaths: done.changedPaths,
+      ...(done.yieldedScope !== undefined ? { yieldedScope: done.yieldedScope } : {}),
     };
   }
 
@@ -271,6 +319,23 @@ export class ChangeVerification {
     const worktreeDir = await mkdtemp(join(workRoot, `scf-verify-${sanitize(done.unitId)}-`));
     try {
       await clone(done.gitUrl, worktreeDir);
+      if (done.commit !== undefined) {
+        const refuse = (summary: string): WorkUnitVerification => ({
+          unitId: done.unitId,
+          verdict: "failed",
+          checks: [{ kind: "clean-state", passed: false, skipped: false, summary, outputs: [{ stream: "summary", text: summary }] }],
+        });
+        try {
+          await checkoutCommit(worktreeDir, done.commit);
+        } catch {
+          return refuse(`the pinned commit ${done.commit} is not in the unit's repo`);
+        }
+        for (const earlier of done.includes ?? []) {
+          if (!(await isAncestor(worktreeDir, earlier, done.commit))) {
+            return refuse(`commit ${earlier} is not in the history of the pinned commit ${done.commit}`);
+          }
+        }
+      }
       return await this.verifier.verify({
         worktreeDir,
         baselineRef: done.baselineRef,

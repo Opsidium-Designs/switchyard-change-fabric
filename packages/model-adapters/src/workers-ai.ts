@@ -163,6 +163,12 @@ export interface WorkersAiExecutorOptions {
   /** The transport that performs the real Workers AI call (holds any credential). */
   readonly invoke: WorkersAiInvoke;
   /**
+   * The name of the inference path the transport goes through, used in this
+   * executor's error messages (default "Workers AI"; the AI Gateway executor
+   * passes "AI Gateway"), so a failure names the real path.
+   */
+  readonly providerLabel?: string;
+  /**
    * The maximum number of in-scope files to read and send to the model, to keep
    * the prompt (and the cost) bounded. Defaults to a small number so inference
    * stays cheap on the seeded demo project.
@@ -405,7 +411,7 @@ export class WorkersAiExecutor implements ExecutorProvider {
     const parsed = parseEdits(result.text);
     if (parsed.edits.length === 0) {
       throw new UnusableModelOutputError(
-        `Workers AI model ${usedModel} returned no usable edit for WorkUnit ${context.workUnitId}`,
+        `${this.options.providerLabel ?? "Workers AI"} model ${usedModel} returned no usable edit for WorkUnit ${context.workUnitId}`,
       );
     }
 
@@ -444,11 +450,11 @@ export class WorkersAiExecutor implements ExecutorProvider {
       const current = await readCurrent(edit.path);
       if (current === null) {
         throw new UnusableModelOutputError(
-          `Workers AI model ${usedModel} edit for WorkUnit ${context.workUnitId} targets a file ` +
+          `${this.options.providerLabel ?? "Workers AI"} model ${usedModel} edit for WorkUnit ${context.workUnitId} targets a file ` +
             `that does not exist and cannot be anchored: ${edit.path}`,
         );
       }
-      const applied = applyAnchoredEdit(current, edit, usedModel, context.workUnitId);
+      const applied = applyAnchoredEdit(current, edit, usedModel, context.workUnitId, this.options.providerLabel ?? "Workers AI");
       working.set(edit.path, applied);
       if (!changedPaths.includes(edit.path)) {
         changedPaths.push(edit.path);
@@ -710,18 +716,19 @@ function applyAnchoredEdit(
   edit: WorkersAiEdit,
   usedModel: string,
   workUnitId: string,
+  label = "Workers AI",
 ): string {
   const first = current.indexOf(edit.search);
   if (first === -1) {
     throw new UnusableModelOutputError(
-      `Workers AI model ${usedModel} edit for WorkUnit ${workUnitId} did not match: its \`search\` ` +
+      `${label} model ${usedModel} edit for WorkUnit ${workUnitId} did not match: its \`search\` ` +
         `snippet was not found verbatim in ${edit.path}`,
     );
   }
   const second = current.indexOf(edit.search, first + edit.search.length);
   if (second !== -1) {
     throw new UnusableModelOutputError(
-      `Workers AI model ${usedModel} edit for WorkUnit ${workUnitId} is ambiguous: its \`search\` ` +
+      `${label} model ${usedModel} edit for WorkUnit ${workUnitId} is ambiguous: its \`search\` ` +
         `snippet occurs more than once in ${edit.path}; quote a longer unique snippet`,
     );
   }

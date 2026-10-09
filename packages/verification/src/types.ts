@@ -77,6 +77,13 @@ export interface VerificationContract {
    * caller does not provide this, the provider derives changed paths from Git.
    */
   readonly changedPaths?: readonly string[];
+  /**
+   * Globs this WorkUnit's repo may have changed but YIELDS to other owners (for
+   * example the files of an item it handed off). Changed paths matching them are
+   * left out of the scope check, and the integrator never applies them from this
+   * unit, so a handed-off file cannot fail (or leak into) this unit.
+   */
+  readonly yieldedScope?: readonly string[];
 }
 
 /** A captured reference to a check's output (kept small and inlined here). */
@@ -117,6 +124,20 @@ export interface IntegrationResult {
   readonly excludedUnits: readonly string[];
   /** The final-suite check run over the combined workspace. */
   readonly finalCheck: CheckResult;
+  /**
+   * The commit of the exact integrated tree the final check ran on (the
+   * integration checkout's HEAD after applying the verified units). It is
+   * pushed to the integration workspace only when the verdict is verified, so a
+   * failed tree's commit is a record of what the gate rejected, not a ref that
+   * can be fetched later. Absent only when the commit could not be read.
+   */
+  readonly commit?: string;
+  /**
+   * Protected paths (the files that define the gate) the verified units tried to
+   * change. They were restored from the baseline before the gate ran, and their
+   * presence fails the integration verdict. Absent when nothing protected changed.
+   */
+  readonly protectedViolations?: readonly string[];
 }
 
 /**

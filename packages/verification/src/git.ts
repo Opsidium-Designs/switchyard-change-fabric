@@ -11,10 +11,7 @@
  * tests), not inside a Cloudflare Worker.
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const run = promisify(execFile);
+import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 
 /** A deterministic committer identity so integration commits are reproducible. */
 export interface GitIdentity {
@@ -27,14 +24,54 @@ export const DEFAULT_IDENTITY: GitIdentity = {
   email: "integrator@switchyard.local",
 };
 
-/** Clone a remote into a target directory. */
+/**
+ * The same URL without any userinfo (`https://token:secret@host/x` becomes
+ * `https://host/x`): what a checkout may keep in its `.git/config`.
+ */
+export function withoutCredentials(url: string): string {
+  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@\s]*@/i, "$1");
+}
+
+/**
+ * Clone a remote into a target directory WITHOUT persisting its credential: a
+ * token in the clone URL is sent as a header for the transfer only and
+ * `origin` is the tokenless URL, so code that later runs in the checkout (a
+ * gate, a test) can never read it from `.git/config`. Later pushes and fetches
+ * pass the authenticated URL explicitly (again turned into a header).
+ */
 export async function clone(remote: string, targetDir: string): Promise<void> {
-  await run("git", ["clone", remote, targetDir]);
+  // runGit takes the token out of the URL (it travels as a header), so the
+  // checkout's origin is the tokenless URL from the start.
+  await runGit(["clone", remote, targetDir]);
+}
+
+/**
+ * Check out exactly `commit` (detached). Only a full or abbreviated hex object
+ * id is accepted, so a ref name can never stand in for the pinned commit.
+ */
+export async function checkoutCommit(worktreeDir: string, commit: string): Promise<void> {
+  if (!/^[0-9a-f]{7,64}$/.test(commit)) {
+    throw new Error(`not a commit id: ${commit}`);
+  }
+  await git(worktreeDir, ["-c", "advice.detachedHead=false", "checkout", "-q", "--detach", `${commit}^{commit}`]);
+}
+
+/** Is `ancestor` contained in `commit`'s history (or the same commit)? */
+export async function isAncestor(worktreeDir: string, ancestor: string, commit: string): Promise<boolean> {
+  if (!/^[0-9a-f]{7,64}$/.test(ancestor) || !/^[0-9a-f]{7,64}$/.test(commit)) {
+    return false;
+  }
+  try {
+    await git(worktreeDir, ["merge-base", "--is-ancestor", ancestor, commit]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Run a git subcommand inside a worktree and return trimmed stdout. */
 export async function git(worktreeDir: string, args: readonly string[]): Promise<string> {
-  const { stdout } = await run("git", ["-C", worktreeDir, ...args]);
+  const { stdout } = await runGit(["-C", worktreeDir, ...args]);
   return stdout;
 }
 

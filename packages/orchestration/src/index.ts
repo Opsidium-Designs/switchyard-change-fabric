@@ -162,7 +162,7 @@ export { assertBacked, buildWorkGraphModel, goalNodeId, plannerNodeId, replanNod
 export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor.ts";
 export { formatDoctorReport, runDoctor } from "./doctor.ts";
 
-export type { ExecutorEnv, SelectedExecutor, SelectedPlanner, PlanTransport } from "./executor-select.ts";
+export type { ExecutorEnv, SelectedAgentTurn, SelectedExecutor, SelectedPlanner, PlanTransport } from "./executor-select.ts";
 export type { LivePlannerDecision } from "./executor-select.ts";
 export {
   ALLOW_HEURISTIC_PLANNER_FLAG,
@@ -170,6 +170,7 @@ export {
   decideLivePlanner,
   plannerFallbackBanner,
   selectExecutor,
+  selectAgentTurn,
   selectPlanner,
   SUPPORTED_EXECUTORS,
 } from "./executor-select.ts";
@@ -186,3 +187,60 @@ export {
   buildAppGateWiring,
   projectHasGateScript,
 } from "./app-gate-wiring.ts";
+
+export type {
+  BoardAccepted,
+  BoardJoined,
+  BoardPage,
+  BoardPostOutcome,
+  BoardRejection,
+  JoinedWorkspace,
+} from "./board-client.ts";
+export { BOARD_AGENT_TOKEN_HEADER, BoardAgentClient, BoardOperatorClient, readBoardLog, readBoardPage } from "./board-client.ts";
+
+export type {
+  AgentStepResult,
+  AgentStop,
+  AgentTurnRecord,
+  BoardAgentOptions,
+  BoardJoiner,
+  BoardSeedItem,
+} from "./board-agent.ts";
+export { BoardAgent, listRepoFiles, resolveIntentFiles, RunTurnBudget } from "./board-agent.ts";
+
+export { createGenericBoardPolicy } from "./board-policy.ts";
+
+export type {
+  BoardAgentRepo,
+  BoardRevision,
+  BoardRunBudgets,
+  BoardRunEvent,
+  BoardSeed,
+  BoardStopReason,
+  IntegrateBoardOptions,
+  IntegrateBoardResult,
+  RunBoardOptions,
+  RunBoardResult,
+} from "./run-board.ts";
+export {
+  attributeRevisionFailure,
+  boardSeedFromChange,
+  ContinuousBoardIntegrator,
+  describeWorkspace,
+  formatBoardRunSummary,
+  formatBoardTranscript,
+  integrateBoardRevision,
+  pendingPushKey,
+  runBoard,
+} from "./run-board.ts";
+export type { ProtectedPaths } from "./protected-paths.ts";
+export { deriveProtectedPaths, isRunnerConfig, isTestShaped, RUNNER_CONFIG_FILES } from "./protected-paths.ts";
+export { promoteVerifiedIntegration, redeployIfPreviouslyDeployed } from "./run-live.ts";
+export type { LocalChangeControlOptions } from "./local-control.ts";
+export type { RunBoardOfflineOptions } from "./run-board-offline.ts";
+export { FirstAttemptFailingGate, OFFLINE_BOARD_EPOCH, OFFLINE_GATE_FIXTURE_COMMAND, runBoardOffline } from "./run-board-offline.ts";
+
+export { ChildProcessCommandRunner } from "@switchyard-change/verification";
+
+export type { JevSmokeResult } from "./jev-smoke.ts";
+export { runJevSmoke } from "./jev-smoke.ts";

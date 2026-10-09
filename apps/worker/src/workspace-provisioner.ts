@@ -36,11 +36,35 @@ export interface ProvisionedWorkspace {
   readonly tokenExpiresAt: string;
 }
 
+/** Options for one provisioning. */
+export interface ProvisionOptions {
+  /**
+   * The write token's lifetime in seconds. A caller that knows how long its
+   * agent needs the token (the board join) passes an explicit short value;
+   * omitted keeps the default lifetime the lease routes always used.
+   */
+  readonly ttlSeconds?: number;
+}
+
+/** A short-lived read token for an existing workspace (plaintext returned once). */
+export interface IssuedReadToken {
+  readonly tokenId: string;
+  readonly token: string;
+  readonly tokenExpiresAt: string;
+}
+
 /** Injectable workspace provisioner, so Node callers can supply a real-git one. */
 export interface WorkspaceProvisioner {
-  provision(workspaceName: string): Promise<ProvisionedWorkspace>;
+  provision(workspaceName: string, options?: ProvisionOptions): Promise<ProvisionedWorkspace>;
   revoke(workspaceName: string, tokenId: string): Promise<void>;
   archive(workspaceName: string): Promise<void>;
+  /**
+   * Issue a short-lived, repo-scoped READ token for an existing workspace (the
+   * integrator reads agents' repos with operator credentials at integration
+   * time, never with an agent's write token). Optional: a provisioner without it
+   * cannot serve the read-token route.
+   */
+  issueReadToken?(workspaceName: string, ttlSeconds: number): Promise<IssuedReadToken>;
 }
 
 /**
@@ -75,10 +99,10 @@ class CloudflareProvisioner implements WorkspaceProvisioner {
     this.provider = new CloudflareArtifactWorkspaceProvider(binding);
   }
 
-  async provision(workspaceName: string): Promise<ProvisionedWorkspace> {
+  async provision(workspaceName: string, options: ProvisionOptions = {}): Promise<ProvisionedWorkspace> {
     try {
       const ref = await this.provider.create(workspaceName);
-      const token = await this.provider.issueWriteToken(ref, DEFAULT_TOKEN_TTL_SECONDS);
+      const token = await this.provider.issueWriteToken(ref, options.ttlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS);
       this.refs.set(workspaceName, { name: ref.name });
       return {
         workspaceId: ref.id,
@@ -93,7 +117,19 @@ class CloudflareProvisioner implements WorkspaceProvisioner {
       };
     } catch (error) {
       if (error instanceof BindingUnavailableError) {
-        return this.fallback.provision(workspaceName);
+        return this.fallback.provision(workspaceName, options);
+      }
+      throw error;
+    }
+  }
+
+  async issueReadToken(workspaceName: string, ttlSeconds: number): Promise<IssuedReadToken> {
+    try {
+      const token = await this.provider.issueReadToken(this.refByName(workspaceName), ttlSeconds);
+      return { tokenId: token.id, token: token.token, tokenExpiresAt: token.expiresAt };
+    } catch (error) {
+      if (error instanceof BindingUnavailableError) {
+        return this.fallback.issueReadToken(workspaceName, ttlSeconds);
       }
       throw error;
     }
@@ -144,7 +180,7 @@ class CloudflareProvisioner implements WorkspaceProvisioner {
 class WorkerMemoryProvisioner implements WorkspaceProvisioner {
   private counter = 0;
 
-  async provision(workspaceName: string): Promise<ProvisionedWorkspace> {
+  async provision(workspaceName: string, options: ProvisionOptions = {}): Promise<ProvisionedWorkspace> {
     this.counter += 1;
     const tokenId = `mem-${this.counter}`;
     return {
@@ -156,7 +192,17 @@ class WorkerMemoryProvisioner implements WorkspaceProvisioner {
       fallback: true,
       tokenId,
       token: `worker-memory-fallback-token-${tokenId}`,
-      tokenExpiresAt: new Date(Date.now() + DEFAULT_TOKEN_TTL_SECONDS * 1000).toISOString(),
+      tokenExpiresAt: new Date(Date.now() + (options.ttlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS) * 1000).toISOString(),
+    };
+  }
+
+  async issueReadToken(_workspaceName: string, ttlSeconds: number): Promise<IssuedReadToken> {
+    this.counter += 1;
+    const tokenId = `mem-read-${this.counter}`;
+    return {
+      tokenId,
+      token: `worker-memory-fallback-read-token-${tokenId}`,
+      tokenExpiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
     };
   }
 

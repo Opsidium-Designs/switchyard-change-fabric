@@ -10,8 +10,12 @@
  * The glob syntax and meaning mirror the verification package's path-scope
  * matcher (which change-core cannot import, since verification depends on
  * change-core):
- *   - "**"  matches any number of path segments, including none
- *     ("src/**" also matches "src" itself)
+ *   - "**"  matches any number of WHOLE path segments, including none
+ *     ("src/**" also matches "src" itself; "src/**\/x" matches "src/x" and
+ *     "src/a/b/x" but never "srcx" or "src/ax"; a leading "**\/x" matches "x"
+ *     at any depth). A "**" must fill a whole segment: an intent entry such as
+ *     "src/**x" or "a**" is rejected by `normalizeIntentEntry`, so every
+ *     accepted intent uses only the whole-segment reading.
  *   - "*"   matches any run of characters within one path segment
  *   - "?"   matches a single character within one path segment
  * Any other character matches literally.
@@ -58,8 +62,9 @@ export const MAX_INTENT_ENTRY_LENGTH = 512;
 /**
  * Normalize an intent entry: forward slashes, no leading "./". A trailing "/"
  * names a directory, so "src/" becomes "src/**" (everything under it).
- * Returns undefined for an entry that is empty, absolute, or escapes the repo
- * with a ".." segment, so callers can reject it with a clear error.
+ * Returns undefined for an entry that is empty, absolute, escapes the repo with
+ * a ".." segment, or uses "**" without it filling a whole segment ("src/**x"),
+ * so callers can reject it with a clear error.
  */
 export function normalizeIntentEntry(entry: string): string | undefined {
   if (typeof entry !== "string" || entry.length > MAX_INTENT_ENTRY_LENGTH) {
@@ -80,6 +85,11 @@ export function normalizeIntentEntry(entry: string): string | undefined {
     return undefined;
   }
   if (path.split("/").some((segment) => segment === ".." || segment === ".")) {
+    return undefined;
+  }
+  // "**" means whole segments only: a "**" sharing its segment with other
+  // characters ("src/**x", "a**") is ambiguous, so it is rejected outright.
+  if (path.split("/").some((segment) => segment.includes("**") && segment !== "**")) {
     return undefined;
   }
   if (symbol !== undefined) {
@@ -138,8 +148,24 @@ export function intentWithin(inner: readonly string[], outer: readonly string[])
   return inner.every((entry) => outer.some((o) => entryWithin(entry, o)));
 }
 
+/**
+ * Collapse runs of consecutive "**" segments (mirrors the path-scope matcher):
+ * "a/**\/**" names the same paths as "a/**".
+ */
+function collapseDoubleStars(pattern: string): string {
+  let out = pattern;
+  for (;;) {
+    const next = out.replace(/\/\*\*\/\*\*(?=\/|$)/g, "/**").replace(/^\*\*\/\*\*(?=\/|$)/, "**");
+    if (next === out) {
+      return out;
+    }
+    out = next;
+  }
+}
+
 /** Compile a glob into an automaton mirroring the path-scope regex translation. */
-function compile(pattern: string): Automaton {
+function compile(raw: string): Automaton {
+  const pattern = collapseDoubleStars(raw);
   const states: State[] = [];
   const add = (): number => {
     states.push({ eps: [], moves: [] });
@@ -159,11 +185,24 @@ function compile(pattern: string): Automaton {
       states[inside]!.eps.push(end);
       cur = end;
       i += 2;
-      if (pattern[i + 1] === "/") {
+      // A trailing "/**/" is "/**". Otherwise the closing slash of "/**/" stays
+      // a literal, so "**" spans whole segments: "src/**/x" is "src(/.*)?/x".
+      if (pattern[i + 1] === "/" && i + 2 >= pattern.length) {
         i += 1;
       }
+    } else if (ch === "*" && pattern[i + 1] === "*" && i === 0 && pattern[i + 2] === "/") {
+      // A leading "**/" is "(.*/)?": zero or more whole leading segments.
+      const loop = add();
+      const end = add();
+      states[cur]!.eps.push(end);
+      states[cur]!.eps.push(loop);
+      states[loop]!.moves.push({ label: { kind: "any" }, to: loop });
+      states[loop]!.moves.push({ label: { kind: "lit", ch: "/" }, to: end });
+      cur = end;
+      i += 2;
     } else if (ch === "*" && pattern[i + 1] === "*") {
-      // A leading or standalone "**" matches across segment boundaries.
+      // A "**" sharing its segment with other characters matches across
+      // segment boundaries (its loose reading).
       const loop = add();
       states[cur]!.eps.push(loop);
       states[loop]!.moves.push({ label: { kind: "any" }, to: loop });

@@ -180,6 +180,133 @@ describe("Worker board routes", () => {
     expect((await h.json<{ ok: boolean }>("GET", `/changes/${ID}/board/verify`)).body.ok).toBe(true);
   });
 
+  it("provisions the joining agent's own workspace with the explicit short TTL", async () => {
+    const h = await created();
+    const endpoint = httpEndpoint(h);
+    expect((await endpoint.postAsHuman({ type: "goal.posted", payload: { objective: "o" } })).ok).toBe(true);
+    const join = (body: Record<string, unknown>) =>
+      h.json<{ token?: string; code?: string; workspace?: Record<string, unknown> }>("POST", `/changes/${ID}/board/join`, body);
+
+    const joined = await join({ agent: "w1", workspace: { ttlSeconds: 900 } });
+    expect(joined.status).toBe(201);
+    expect(joined.body.token).toMatch(/^sbt_/);
+    expect(joined.body.workspace).toMatchObject({
+      workspaceName: `${ID}--board-w1`,
+      gitUrl: `memory://test/${ID}--board-w1`,
+      token: expect.stringMatching(/^secret-tok-/),
+    });
+    expect(h.provisioner.issued.at(-1)).toEqual({ workspaceName: `${ID}--board-w1`, tokenId: "tok-1", ttlSeconds: 900 });
+
+    // A missing or out-of-bounds TTL is refused before anything is provisioned.
+    for (const workspace of [{}, { ttlSeconds: 30 }, { ttlSeconds: 86400 }, { ttlSeconds: 90, extra: true }, "yes"]) {
+      const res = await join({ agent: "w2", workspace });
+      expect([res.status, res.body.code]).toEqual([400, "BAD_PAYLOAD"]);
+    }
+    expect(h.provisioner.issued).toHaveLength(1);
+
+    // A join the board would refuse is refused BEFORE anything is provisioned.
+    const again = await join({ agent: "w1", workspace: { ttlSeconds: 900 } });
+    expect([again.status, again.body.code]).toEqual([400, "DUPLICATE"]);
+    expect(h.provisioner.issued).toHaveLength(1);
+    expect(h.provisioner.revoked).toEqual([]);
+    expect(h.provisioner.archived).toEqual([]);
+    // A plain join (no workspace) is unchanged.
+    const plain = await join({ agent: "w3" });
+    expect(plain.status).toBe(201);
+    expect(plain.body.workspace).toBeUndefined();
+  });
+
+  it("a join that fails after provisioning revokes the token AND archives the repo", async () => {
+    const h = await created();
+    expect((await httpEndpoint(h).postAsHuman({ type: "goal.posted", payload: { objective: "o" } })).ok).toBe(true);
+    const join = (body: Record<string, unknown>) => h.json<{ code?: string }>("POST", `/changes/${ID}/board/join`, body);
+    const original = ChangeState.prototype.joinBoard;
+    ChangeState.prototype.joinBoard = async function () {
+      throw new Error("storage unavailable");
+    };
+    try {
+      const failed = await join({ agent: "w1", workspace: { ttlSeconds: 900 } });
+      expect([failed.status, failed.body.code]).toEqual([500, "INVALID_STATE"]);
+    } finally {
+      ChangeState.prototype.joinBoard = original;
+    }
+    expect(h.provisioner.revoked).toEqual([{ workspaceName: `${ID}--board-w1`, tokenId: "tok-1" }]);
+    expect(h.provisioner.archived).toEqual([`${ID}--board-w1`]);
+    // A refused join after provisioning (a race the precheck cannot see) undoes both too.
+    ChangeState.prototype.joinBoard = async function () {
+      return { ok: false, code: "DUPLICATE", error: "raced" };
+    };
+    try {
+      expect((await join({ agent: "w2", workspace: { ttlSeconds: 900 } })).status).toBe(400);
+    } finally {
+      ChangeState.prototype.joinBoard = original;
+    }
+    expect(h.provisioner.archived).toEqual([`${ID}--board-w1`, `${ID}--board-w2`]);
+  });
+
+  it("issues the operator a short-lived read token for a joined agent's repo (bearer only)", async () => {
+    const h = createHarness({ apiToken: "op-secret" });
+    const auth = { authorization: "Bearer op-secret" };
+    expect((await h.request("POST", "/changes", specYaml(ID), auth)).status).toBe(201);
+    expect((await h.json("POST", `/changes/${ID}/board/human`, { type: "goal.posted", payload: { objective: "o" } }, auth)).status).toBe(201);
+    expect((await h.json("POST", `/changes/${ID}/board/join`, { agent: "w1", workspace: { ttlSeconds: 900 } }, auth)).status).toBe(201);
+    const path = `/changes/${ID}/board/read-token`;
+    expect((await h.json("POST", path, { agent: "w1" })).status).toBe(401);
+    const issued = await h.json<{ workspaceName: string; token: string }>("POST", path, { agent: "w1", ttlSeconds: 300 }, auth);
+    expect(issued.status).toBe(201);
+    expect(issued.body).toMatchObject({ workspaceName: `${ID}--board-w1`, token: "read-secret-1" });
+    expect(h.provisioner.readTokens).toEqual([{ workspaceName: `${ID}--board-w1`, ttlSeconds: 300 }]);
+    expect((await h.json<{ code: string }>("POST", path, { agent: "nobody" }, auth)).body.code).toBe("UNKNOWN_AGENT");
+    expect((await h.json<{ code: string }>("POST", path, { agent: "w1", ttlSeconds: 5 }, auth)).body.code).toBe("BAD_PAYLOAD");
+    // The lead and an agent that joined without a workspace have no repo to read.
+    expect((await h.json("POST", `/changes/${ID}/board/join`, { agent: "lead", role: "lead" }, auth)).status).toBe(201);
+    expect((await h.json("POST", `/changes/${ID}/board/join`, { agent: "plain" }, auth)).status).toBe(201);
+    for (const agent of ["lead", "plain"]) {
+      const refused = await h.json<{ code: string }>("POST", path, { agent }, auth);
+      expect([refused.status, refused.body.code]).toEqual([400, "NOT_ALLOWED"]);
+    }
+    expect(h.provisioner.readTokens).toHaveLength(1);
+    // The operator revokes a read token it is done with.
+    const revoke = `/changes/${ID}/board/read-token/revoke`;
+    expect((await h.json("POST", revoke, { agent: "w1", tokenId: "read-1" })).status).toBe(401);
+    expect((await h.json("POST", revoke, { agent: "w1", tokenId: "read-1" }, auth)).status).toBe(200);
+    expect(h.provisioner.revoked).toContainEqual({ workspaceName: `${ID}--board-w1`, tokenId: "read-1" });
+  });
+
+  it("escalates a contract on the original tests to a human and posts the decision on the board", async () => {
+    const h = await created();
+    const endpoint = httpEndpoint(h);
+    expect((await endpoint.postAsHuman({ type: "goal.posted", payload: { objective: "o", protected: ["tests/a.test.ts"] } })).ok).toBe(true);
+    expect((await endpoint.postAsHuman({ type: "item.proposed", payload: { item: "t", objective: "o", scopeHint: ["tests/**"] } })).ok).toBe(true);
+    const joined = await h.json<{ token: string }>("POST", `/changes/${ID}/board/join`, { agent: "a" });
+    const post = (draft: unknown) => h.json<{ appended?: BoardMessage[] }>("POST", `/changes/${ID}/board`, draft, { [TOKEN_HEADER]: joined.body.token });
+    const proposed = await post({ type: "contract.proposed", payload: { contract: "k1", target: "tests/a.test.ts", kind: "modify", item: "t" } });
+    expect(proposed.body.appended!.map((m) => m.type)).toEqual(["contract.proposed", "contract.escalated"]);
+    const listed = await h.json<{ escalations: { id: string; status: string; boardContract?: string; options: string[] }[] }>("GET", `/changes/${ID}/escalations`);
+    const escalation = listed.body.escalations.find((e) => e.boardContract === "k1")!;
+    expect(escalation).toMatchObject({ status: "pending", options: ["accept", "reject"] });
+    expect((await h.json("POST", `/changes/${ID}/escalations/${escalation.id}/resolve`, { decision: "maybe" })).status).toBe(400);
+    expect((await h.json("POST", `/changes/${ID}/escalations/${escalation.id}/resolve`, { decision: "accept" })).status).toBe(200);
+    const board = await h.json<BoardBody>("GET", `/changes/${ID}/board?after=0&limit=100`);
+    expect(board.body.messages.at(-1)).toMatchObject({ from: "human", type: "contract.accepted", payload: { contract: "k1" } });
+    expect(board.body.state.contracts.k1).toMatchObject({ status: "accepted", guarded: true });
+  });
+
+  it("records an advisory decision (with a failed call's reason) only through the bearer decision route", async () => {
+    const h = createHarness({ apiToken: "op-secret" });
+    const auth = { authorization: "Bearer op-secret" };
+    expect((await h.request("POST", "/changes", specYaml(ID), auth)).status).toBe(201);
+    expect((await h.json("POST", `/changes/${ID}/board/human`, { type: "goal.posted", payload: { objective: "o" } }, auth)).status).toBe(201);
+    const decision = { juncture: "attribution", question: "which item?", accepted: false, error: "AI Gateway decision call failed (HTTP 400): expected record, received array" };
+    expect((await h.json("POST", `/changes/${ID}/board/decision`, decision)).status).toBe(401);
+    const recorded = await h.json<{ appended: BoardMessage[] }>("POST", `/changes/${ID}/board/decision`, decision, auth);
+    expect(recorded.status).toBe(201);
+    expect(recorded.body.appended[0]).toMatchObject({ from: "engine", type: "decision.recorded", payload: decision });
+    const board = await h.json<BoardBody>("GET", `/changes/${ID}/board?after=0&limit=10`);
+    expect(board.body.state.decisions).toEqual({ calls: 1, accepted: 0, errors: 1 });
+    expect((await h.json<{ ok: boolean }>("GET", `/changes/${ID}/board/verify`)).body.ok).toBe(true);
+  });
+
   it("returns machine-readable rejection codes and 404 for an unknown Change", async () => {
     const h = await created();
     const early = await h.json<{ code: string; error: string }>("POST", `/changes/${ID}/board/join`, { agent: "a" });

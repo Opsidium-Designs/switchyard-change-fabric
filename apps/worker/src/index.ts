@@ -1,4 +1,13 @@
-import { BOARD_LIMITS, boardErrorStatus, parseChangeSpec, type BoardErrorCode } from "@switchyard-change/change-core";
+import {
+  BOARD_AGENT_ID_PATTERN,
+  BOARD_LIMITS,
+  BOARD_WORKSPACE_TTL_BOUNDS,
+  boardAgentWorkspaceName,
+  boardErrorStatus,
+  parseBoardJoinWorkspace,
+  parseChangeSpec,
+  type BoardErrorCode,
+} from "@switchyard-change/change-core";
 import type { DiscoveredWorkUnit } from "@switchyard-change/change-core";
 
 import { configuredApiToken, hasValidBearer, requiresAuth } from "./auth.ts";
@@ -699,6 +708,7 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         confidence: numberOr(body.confidence, 0),
         ...(body.probabilities ? { probabilities: body.probabilities } : {}),
         accepted: body.accepted === true,
+        ...(typeof body.error === "string" ? { error: body.error } : {}),
       });
       return json({ jevDecision: decision }, 201);
     } catch (error) {
@@ -1004,7 +1014,7 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
   //   GET  /changes/:id/board?for=<agent>    that agent's digest (agent board token)
   //   GET  /changes/:id/board/verify         re-verify the stored log against the state
   // The engine's own messages are never accepted from any route.
-  const boardRoute = url.pathname.match(/^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|integration\/revision)$/);
+  const boardRoute = url.pathname.match(/^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|integration\/revision)$/);
   if (boardRoute) {
     const changeId = decodeURIComponent(boardRoute[1] ?? "");
     const kind = boardRoute[2];
@@ -1023,11 +1033,60 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         if (typeof join.agent !== "string") {
           return json({ code: "BAD_PAYLOAD", error: "a join requires an agent id" }, 400);
         }
-        outcome = await stub.joinBoard(join.agent, { role: join.role, rationale: join.rationale });
+        // An agent that will do work can ask for its own workspace in the same
+        // join: the Worker provisions the agent's repo and a repo-scoped write
+        // token with the explicit short TTL the caller asked for, then joins.
+        // The plaintext token is returned once and never stored; a join the
+        // board refuses revokes the just-issued token.
+        const wanted = parseBoardJoinWorkspace(join.workspace);
+        if (!wanted.ok) {
+          return json({ code: "BAD_PAYLOAD", error: wanted.error }, 400);
+        }
+        if (!wanted.request) {
+          outcome = await stub.joinBoard(join.agent, { role: join.role, rationale: join.rationale });
+        } else {
+          if (!BOARD_AGENT_ID_PATTERN.test(join.agent)) {
+            return json({ code: "BAD_PAYLOAD", error: "agent must be an id (letters, digits, . _ : -)" }, 400);
+          }
+          // Validate the join FIRST, so a join the board would refuse never
+          // provisions a repo or a token.
+          const precheck = await stub.checkBoardJoin(join.agent, { role: join.role, rationale: join.rationale });
+          if (!precheck.ok) {
+            return json({ code: precheck.code, error: precheck.error }, boardErrorStatus(precheck.code as BoardErrorCode));
+          }
+          const provisioner = selectProvisioner(env);
+          let provisioned;
+          try {
+            provisioned = await provisioner.provision(boardAgentWorkspaceName(changeId, join.agent), {
+              ttlSeconds: wanted.request.ttlSeconds,
+            });
+          } catch (error) {
+            return json({ code: "INVALID_STATE", error: `could not provision the agent workspace: ${errorMessage(error)}` }, 502);
+          }
+          // A join refused (or failing) after provisioning leaves nothing
+          // behind: the token is revoked AND the repo is archived.
+          const undo = async () => {
+            await provisioner.revoke(provisioned.workspaceName, provisioned.tokenId).catch(() => {});
+            await provisioner.archive(provisioned.workspaceName).catch(() => {});
+          };
+          try {
+            outcome = await stub.joinBoard(join.agent, { role: join.role, rationale: join.rationale }, { withWorkspace: true });
+          } catch (error) {
+            await undo();
+            return json({ code: "INVALID_STATE", error: `the join failed: ${errorMessage(error)}` }, 500);
+          }
+          if (!outcome.ok) {
+            await undo();
+          } else {
+            return json({ ...outcome, workspace: provisioned }, 201);
+          }
+        }
       } else if (kind === "board/human") {
         outcome = await stub.postBoardAsHuman(body.value);
       } else if (kind === "integration/revision") {
         outcome = await stub.recordBoardIntegration(body.value);
+      } else if (kind === "board/decision") {
+        outcome = await stub.recordBoardDecision(body.value);
       } else {
         const token = request.headers.get(BOARD_TOKEN_HEADER);
         if (!token) {
@@ -1062,6 +1121,69 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         return digest.ok ? json(digest) : json({ code: digest.code, error: digest.error }, 401);
       }
       return json(await stub.getBoard(after, limit));
+    }
+  }
+
+  // A short-lived READ token for a joined board agent's workspace (bearer). The
+  // integrator reads each agent's repo with these operator credentials at
+  // integration time, so an agent's own (short) write token expiring never
+  // blocks integration, and the integrator never holds an agent's credential.
+  //   POST /changes/:id/board/read-token  {agent, ttlSeconds?}  -> {workspaceName, tokenId, token, tokenExpiresAt}
+  // Revoke a read token the operator is done with (bearer):
+  //   POST /changes/:id/board/read-token/revoke  {agent, tokenId}
+  const revokeReadMatch = url.pathname.match(/^\/changes\/([^/]+)\/board\/read-token\/revoke$/);
+  if (request.method === "POST" && revokeReadMatch) {
+    const changeId = decodeURIComponent(revokeReadMatch[1] ?? "");
+    const body = await readBoardBody(request);
+    if (!body.ok) {
+      return json({ code: body.code, error: body.error }, body.status);
+    }
+    const wanted = isPlainObject(body.value) ? body.value : {};
+    if (typeof wanted.agent !== "string" || !BOARD_AGENT_ID_PATTERN.test(wanted.agent) || typeof wanted.tokenId !== "string" || wanted.tokenId === "") {
+      return json({ code: "BAD_PAYLOAD", error: "a revoke names a board agent id and a tokenId" }, 400);
+    }
+    try {
+      await selectProvisioner(env).revoke(boardAgentWorkspaceName(changeId, wanted.agent), wanted.tokenId);
+      return json({ revoked: wanted.tokenId });
+    } catch (error) {
+      return json({ code: "INVALID_STATE", error: `could not revoke the read token: ${errorMessage(error)}` }, 502);
+    }
+  }
+
+  const readTokenMatch = url.pathname.match(/^\/changes\/([^/]+)\/board\/read-token$/);
+  if (request.method === "POST" && readTokenMatch) {
+    const changeId = decodeURIComponent(readTokenMatch[1] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
+    }
+    const body = await readBoardBody(request);
+    if (!body.ok) {
+      return json({ code: body.code, error: body.error }, body.status);
+    }
+    const wanted = isPlainObject(body.value) ? body.value : {};
+    const agent = wanted.agent;
+    if (typeof agent !== "string" || !BOARD_AGENT_ID_PATTERN.test(agent)) {
+      return json({ code: "BAD_PAYLOAD", error: "a read token names a board agent id" }, 400);
+    }
+    const ttl = wanted.ttlSeconds === undefined ? 600 : wanted.ttlSeconds;
+    const { min, max } = BOARD_WORKSPACE_TTL_BOUNDS;
+    if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < min || ttl > max) {
+      return json({ code: "BAD_PAYLOAD", error: `ttlSeconds must be an integer from ${min} to ${max}` }, 400);
+    }
+    const allowed = await stub.checkBoardRepoAgent(agent);
+    if (!allowed.ok) {
+      return json({ code: allowed.code, error: allowed.error }, 400);
+    }
+    const provisioner = selectProvisioner(env);
+    if (!provisioner.issueReadToken) {
+      return json({ code: "INVALID_STATE", error: "this Worker cannot issue read tokens" }, 501);
+    }
+    const workspaceName = boardAgentWorkspaceName(changeId, agent);
+    try {
+      return json({ workspaceName, ...(await provisioner.issueReadToken(workspaceName, ttl)) }, 201);
+    } catch (error) {
+      return json({ code: "INVALID_STATE", error: `could not issue a read token: ${errorMessage(error)}` }, 502);
     }
   }
 
@@ -1414,6 +1536,7 @@ interface JevDecisionBody {
   readonly confidence?: number;
   readonly probabilities?: Readonly<Record<string, number>>;
   readonly accepted?: boolean;
+  readonly error?: string;
 }
 
 /** Body of POST /changes/:id/dial. Accepts min/max under either spelling. */

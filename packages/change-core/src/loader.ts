@@ -203,7 +203,8 @@ function parsePlanReview(value: unknown): ChangePlanReview | undefined {
   }
   const question = optionalString(value, "question") ?? "Does this plan cover the goal?";
   const accepted = value["accepted"] === true;
-  return { question, noul, confidence, accepted };
+  const error = optionalString(value, "error");
+  return { question, noul, confidence, accepted, ...(error !== undefined ? { error: error.slice(0, 300) } : {}) };
 }
 
 function parsePlanUnits(
