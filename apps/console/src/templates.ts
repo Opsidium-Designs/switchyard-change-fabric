@@ -74,6 +74,12 @@ export interface Template {
    * script). Absent for a template whose graph does not grow.
    */
   readonly discoverMarker?: string;
+  /**
+   * The repo-relative goal file a BOARD run posts, for a template whose run-live
+   * source is a Change spec (run-board takes a goal, not a spec). A goal-sourced
+   * template uses its own goal file and needs none.
+   */
+  readonly boardGoalFile?: string;
 }
 
 /**
@@ -101,6 +107,7 @@ export const TEMPLATES: readonly Template[] = [
     escalates: true,
     source: { kind: "change", changeFile: "examples/changes/audit-logging.change.yaml" },
     projectDir: "examples/demo-project",
+    boardGoalFile: "examples/goals/audit-logging.goal.txt",
   },
   {
     id: "service-api",
@@ -122,3 +129,27 @@ export const TEMPLATES: readonly Template[] = [
 export function templateById(id: string): Template | undefined {
   return TEMPLATES.find((template) => template.id === id);
 }
+
+/**
+ * Whether a template can run with agents on the board (`run-board`). The board
+ * run takes a goal (it has no Change-spec input), so a template can when it is
+ * goal-sourced or names a `boardGoalFile`; the project and gate are the same.
+ */
+export function boardCapable(template: Template): boolean {
+  return boardGoalFileOf(template) !== undefined;
+}
+
+/** The goal file a board run of this template posts, or undefined when it has none. */
+export function boardGoalFileOf(template: Template): string | undefined {
+  return template.source.kind === "goal" ? template.source.goalFile : template.boardGoalFile;
+}
+
+/** How a launch runs: the existing run-live driver, or agents on the board. */
+export type LaunchMode = "live" | "board";
+
+/**
+ * Who answers a board run's contract decisions: the human in the console
+ * (escalations wait durably), or an automatic policy passed to the CLI as
+ * `--decide-contracts accept|reject`.
+ */
+export type ContractPolicy = "console" | "accept" | "reject";

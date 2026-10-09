@@ -8,7 +8,9 @@
  * the browser calls:
  *
  *   GET  /api/templates          the shipped template gallery descriptors
- *   POST /api/launch {templateId} start a live run with a FRESH UNIQUE Change id
+ *   POST /api/launch {templateId, min, max, mode?, decideContracts?}
+ *                                  start a live run (run-live, or run-board for
+ *                                  mode "board") with a FRESH UNIQUE Change id
  *                                  and return that id for the UI to follow
  *   POST /api/deploy-app {templateId|app}  MANUALLY deploy that app in its
  *                                  CURRENT (broken) state to its STABLE live URL,
@@ -26,7 +28,9 @@
  *                                  process's environment, adds the bearer header
  *                                  server-side (see proxyWorkerPost)
  *
- * A launch spawns the existing `switchyard-change run-live` CLI (so the live run
+ * A launch spawns the existing `switchyard-change run-live` CLI, or, when the
+ * human picks "agents on the board" for a goal template, `run-board` with the
+ * same template's goal, project, and gate (so the live run
  * driver and the CLI commands stay the single underlying implementation; the
  * console does not reimplement them). The browser then follows the run by
  * polling the Worker's own `GET /changes/:id` exactly as before. For an
@@ -51,7 +55,7 @@ import { dirname, join, resolve } from "node:path";
 
 import type { Connect, Plugin } from "vite";
 
-import { TEMPLATES, templateById, type Template } from "./src/templates";
+import { boardCapable, boardGoalFileOf, TEMPLATES, templateById, type ContractPolicy, type LaunchMode, type Template } from "./src/templates";
 
 /** The repo root, two levels up from apps/console. */
 const CONSOLE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -69,6 +73,8 @@ interface LaunchedRun {
   exitCode: number | null;
   /** The concurrency dial this run was launched with (its locked launch config). */
   readonly dial: LaunchDial;
+  /** run-live, or agents on the board (run-board). */
+  readonly mode: LaunchMode;
   /** The last lines of CLI output, kept small for an honest status read. */
   readonly log: string[];
 }
@@ -114,7 +120,7 @@ function freshChangeId(template: Template): string {
  * console locks the dial once a run is active), so a run keeps the dial it was
  * launched with.
  */
-interface LaunchDial {
+export interface LaunchDial {
   readonly min: number;
   readonly max: number;
 }
@@ -146,7 +152,7 @@ function dialFromBody(body: Record<string, unknown>): LaunchDial {
 }
 
 /** Build the run-live CLI args for a template, a generated unique id, and a dial. */
-function runLiveArgs(template: Template, changeId: string, dial: LaunchDial): string[] {
+export function runLiveArgs(template: Template, changeId: string, dial: LaunchDial): string[] {
   const args = ["-w", "apps/cli", "run", "dev", "--", "run-live"];
   if (template.source.kind === "change") {
     args.push("--change", resolve(REPO_ROOT, template.source.changeFile));
@@ -196,6 +202,75 @@ function runLiveArgs(template: Template, changeId: string, dial: LaunchDial): st
     args.push("--await-escalation");
   }
   return args;
+}
+
+/** The launch options a browser body may choose (validated, never trusted). */
+export interface LaunchOptions {
+  readonly mode: LaunchMode;
+  readonly contractPolicy: ContractPolicy;
+}
+
+/**
+ * Validate the launch mode and contract policy from a launch body. Anything
+ * unknown is refused; a board launch is only allowed for a goal template.
+ */
+export function launchOptionsFromBody(
+  body: Record<string, unknown>,
+  template: Template,
+): { readonly ok: true; readonly options: LaunchOptions } | { readonly ok: false; readonly error: string } {
+  const mode = body.mode === undefined ? "live" : body.mode;
+  if (mode !== "live" && mode !== "board") {
+    return { ok: false, error: "mode must be live or board" };
+  }
+  const policy = body.decideContracts === undefined ? "console" : body.decideContracts;
+  if (policy !== "console" && policy !== "accept" && policy !== "reject") {
+    return { ok: false, error: "decideContracts must be console, accept, or reject" };
+  }
+  if (mode === "board" && !boardCapable(template)) {
+    return { ok: false, error: `${template.name} has no goal to post, so it cannot run on the board` };
+  }
+  if (mode === "live" && policy !== "console") {
+    return { ok: false, error: "decideContracts applies only to a board run" };
+  }
+  return { ok: true, options: { mode, contractPolicy: policy } };
+}
+
+/**
+ * Build the run-board CLI args for a goal template: the same goal, project,
+ * dial, app, and gate as its run-live launch. `--decide-contracts` is passed
+ * ONLY for an automatic policy; otherwise each contract decision waits for the
+ * human's answer in the console.
+ */
+export function runBoardArgs(template: Template, changeId: string, dial: LaunchDial, policy: ContractPolicy): string[] {
+  const goalFile = boardGoalFileOf(template);
+  if (goalFile === undefined) {
+    throw new Error(`${template.id} has no goal to post on the board`);
+  }
+  const args = ["-w", "apps/cli", "run", "dev", "--", "run-board"];
+  args.push("--goal-file", resolve(REPO_ROOT, goalFile));
+  args.push("--project", resolve(REPO_ROOT, template.projectDir));
+  args.push("--worker", WORKER_URL);
+  args.push("--min", String(dial.min), "--max", String(dial.max));
+  if (template.app) {
+    args.push("--deploy-app", resolve(REPO_ROOT, "examples/apps", template.app));
+    args.push("--deploy-app-name", `switchyard-change-fabric-${template.app}`);
+  }
+  // A board run is always held to the project's declared gate: both board
+  // templates' projects declare one. A project without one then reads "gate
+  // REQUIRED but missing" and cannot pass, rather than passing unchecked.
+  args.push("--gate");
+  args.push("--id", changeId, "--watch");
+  if (policy !== "console") {
+    args.push("--decide-contracts", policy);
+  }
+  return args;
+}
+
+/** The CLI args for a launch, by mode. Exported for tests. */
+export function launchArgs(template: Template, changeId: string, dial: LaunchDial, options: LaunchOptions): string[] {
+  return options.mode === "board"
+    ? runBoardArgs(template, changeId, dial, options.contractPolicy)
+    : runLiveArgs(template, changeId, dial);
 }
 
 /** Read a small JSON body from a Connect request. */
@@ -353,9 +428,9 @@ export async function readDeployedUrls(
 }
 
 /** Spawn a run-live child for a template under a chosen dial and track it. */
-function launch(template: Template, dial: LaunchDial): LaunchedRun {
+function launch(template: Template, dial: LaunchDial, options: LaunchOptions): LaunchedRun {
   const changeId = freshChangeId(template);
-  const args = runLiveArgs(template, changeId, dial);
+  const args = launchArgs(template, changeId, dial, options);
   // Inherit the dev process environment (already sourced from .env by the make
   // target), so the Workers AI executor and the Artifacts token are present
   // without the launcher ever reading or forwarding the secret itself.
@@ -371,6 +446,7 @@ function launch(template: Template, dial: LaunchDial): LaunchedRun {
     status: "running",
     exitCode: null,
     dial,
+    mode: options.mode,
     log: [],
   };
   child.stdout?.on("data", (data: Buffer) => pushLog(run, data.toString("utf8")));
@@ -427,12 +503,18 @@ export function launcherPlugin(): Plugin {
           // The dial the human set before launching is captured as this run's
           // launch config and passed through to the run-live CLI as --min/--max.
           const dial = dialFromBody(body);
-          const run = launch(template, dial);
+          const chosen = launchOptionsFromBody(body, template);
+          if (!chosen.ok) {
+            sendJson(res, 400, { error: chosen.error });
+            return;
+          }
+          const run = launch(template, dial, chosen.options);
           sendJson(res, 201, {
             changeId: run.changeId,
             templateId: run.templateId,
             escalates: template.escalates,
             dial: run.dial,
+            mode: run.mode,
           });
         });
       });
@@ -501,6 +583,7 @@ export function launcherPlugin(): Plugin {
           status: run.status,
           exitCode: run.exitCode,
           dial: run.dial,
+          mode: run.mode,
           log: run.log,
         });
       });

@@ -3,7 +3,9 @@
   "name": "switchyard-change-fabric",
   "main": "src/index.ts",
   "compatibility_date": "2025-09-23",
-  "compatibility_flags": ["nodejs_compat"],
+  // enable_ctx_exports: the GateRunner registers the GateEgress entrypoint as
+  // the gate container's outbound HTTPS handler through ctx.exports.
+  "compatibility_flags": ["nodejs_compat", "enable_ctx_exports"],
   "observability": {
     "enabled": true
   },
@@ -24,6 +26,11 @@
       {
         "name": "CHANGE_STATE",
         "class_name": "ChangeState"
+      },
+      // Integration on Cloudflare: owns one gate container per Change.
+      {
+        "name": "GATE_RUNNER",
+        "class_name": "GateRunner"
       }
     ]
   },
@@ -33,6 +40,10 @@
     {
       "tag": "v1",
       "new_sqlite_classes": ["ChangeState"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["GateRunner"]
     }
   ],
 
@@ -42,6 +53,29 @@
       "name": "change-workflow",
       "binding": "CHANGE_WORKFLOW",
       "class_name": "ChangeWorkflow"
+    },
+    // Integration on Cloudflare: integrates a board's announced pushes, one
+    // revision at a time per Change (see docs/BOARD.md).
+    {
+      "name": "integration-workflow",
+      "binding": "INTEGRATION_WORKFLOW",
+      "class_name": "IntegrationWorkflow"
+    }
+  ],
+
+  // The integration gate container (Cloudflare Containers): node, git, and the
+  // repo's verification package, driven over exec by the GateRunner. Built from
+  // the repo root (the root .dockerignore admits only what the image copies).
+  // It starts with internet access off; the GateRunner's egress handler relays
+  // only what the job's current phase allows. Local `wrangler dev` builds it
+  // with Docker; `make dev` turns containers off (see "dev" below).
+  "containers": [
+    {
+      "class_name": "GateRunner",
+      "image": "./containers/gate/Dockerfile",
+      "image_build_context": "../..",
+      "instance_type": "basic",
+      "max_instances": 4
     }
   ],
 

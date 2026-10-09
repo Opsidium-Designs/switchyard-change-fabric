@@ -41,6 +41,24 @@ import {
   type WorkUnitStatus,
 } from "@switchyard-change/change-core";
 
+import type { IntegrateJobResult } from "@switchyard-change/verification/integrate-job";
+
+import {
+  attributionRequestFor,
+  decideCloudRevision,
+  jobDeadlineMs,
+  parseCloudIntegrationConfig,
+  planCloudJob,
+  publicConfig,
+  type AttributionRequest,
+  type BoardRepoRecord,
+  type CloudIntegrationConfig,
+  type DriverAttribution,
+  type CloudJobPlan,
+  type CloudPlanOutcome,
+  type CloudRevisionRecord,
+} from "./cloud-integration.ts";
+import type { DrivenPhase } from "./integration-driver.ts";
 import type { Env } from "./env.ts";
 
 /**
@@ -642,6 +660,43 @@ export interface BoardFailure {
   readonly error: string;
 }
 
+/** How many integration attempts a Change keeps (the board keeps every revision). */
+const CLOUD_REVISIONS_KEPT = 64;
+
+/** The integration Workflow bookkeeping. */
+interface CloudIntegrationRun {
+  readonly active?: { readonly instanceId: string; readonly startedAt: string };
+  /** A push landed (or the run kicked) while the active Workflow ran: look again before finishing. */
+  readonly kicked: boolean;
+  readonly counter: number;
+}
+
+/** The answer to a request for integration. */
+export interface CloudIntegrationRequest {
+  readonly start: boolean;
+  readonly instanceId?: string;
+  readonly coalesced?: boolean;
+  readonly activeInstance?: string;
+  readonly reason?: string;
+}
+
+/** A failing revision waiting for the run's advisory attribution. */
+interface PendingAttribution {
+  readonly request: AttributionRequest;
+  readonly answer?: readonly string[];
+}
+
+/** The open view of integration on Cloudflare. */
+export interface CloudIntegrationView {
+  readonly configured: boolean;
+  readonly config?: Record<string, unknown>;
+  readonly active?: { readonly instanceId: string; readonly startedAt: string };
+  readonly kicked: boolean;
+  /** A failing revision the Workflow holds for the run's advisory attribution. */
+  readonly pendingAttribution?: AttributionRequest;
+  readonly revisions: readonly CloudRevisionRecord[];
+}
+
 /** The result of appending one message to the Change board. */
 export type BoardAppendResponse =
   | {
@@ -1016,6 +1071,9 @@ export class ChangeState extends DurableObject<Env> {
     await this.ctx.storage.put("boardSeq", 0);
     await this.ctx.storage.put("boardState", emptyBoard());
     await this.ctx.storage.put("boardTokens", {} as Record<string, string>);
+    // Integration on Cloudflare (per run): its configuration, the Workflow
+    // bookkeeping, every revision attempt, and the agents' repo identities.
+    await this.ctx.storage.delete(["cloudIntegrationConfig", "cloudIntegrationRun", "cloudRevisions", "cloudAttribution", "boardRepos"]);
     return superseded;
   }
 
@@ -1099,7 +1157,7 @@ export class ChangeState extends DurableObject<Env> {
   async joinBoard(
     agent: string,
     body: { readonly role?: unknown; readonly rationale?: unknown },
-    options: { readonly withWorkspace?: boolean } = {},
+    options: { readonly withWorkspace?: boolean; readonly repo?: BoardRepoRecord } = {},
   ): Promise<BoardAppendResponse> {
     const token = newBoardToken();
     const hash = await hashBoardToken(token);
@@ -1125,6 +1183,11 @@ export class ChangeState extends DurableObject<Env> {
       // Which agents have a repo of their own (the operator's read tokens are only for these).
       const withRepo = (await this.ctx.storage.get<string[]>("boardRepoAgents")) ?? [];
       await this.ctx.storage.put("boardRepoAgents", [...withRepo, agent]);
+      if (options.repo) {
+        // The repo's identity (never a token): what the integration Workflow reads.
+        const repos = (await this.ctx.storage.get<Record<string, BoardRepoRecord>>("boardRepos")) ?? {};
+        await this.ctx.storage.put("boardRepos", { ...repos, [agent]: options.repo });
+      }
     }
     return outcome;
   }
@@ -1205,6 +1268,280 @@ export class ChangeState extends DurableObject<Env> {
   async recordBoardDecision(input: unknown): Promise<BoardAppendResponse> {
     return this.boardOutcome(() =>
       this.appendToBoard((state) => appendDecisionRecorded(state, input, new Date().toISOString())),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Integration on Cloudflare: the configuration a run posts, the Workflow's
+  // bookkeeping (one Workflow at a time per Change; pushes that land while it
+  // runs are coalesced into its next iteration), and every revision attempt.
+  // -------------------------------------------------------------------------
+
+  /**
+   * Configure integration on Cloudflare for this Change (the run's bearer
+   * route). The configuration carries the gate command, the contract, and the
+   * baseline test inventory, so it is part of the goal-time record: it is
+   * accepted once, BEFORE the goal is posted, and fixed from then on (a later
+   * change, for example a gate command of `true`, is refused).
+   */
+  async configureCloudIntegration(raw: unknown): Promise<{ readonly ok: true; readonly config: Record<string, unknown> } | BoardFailure> {
+    const parsed = parseCloudIntegrationConfig(raw, new Date().toISOString());
+    if (!parsed.ok) {
+      return { ok: false, code: "BAD_PAYLOAD", error: parsed.error };
+    }
+    return this.ctx.storage.transaction(async (txn) => {
+      if ((await txn.get<CloudIntegrationConfig>("cloudIntegrationConfig")) !== undefined) {
+        return { ok: false as const, code: "INVALID_STATE", error: "the integration configuration is fixed once set (it is part of the goal-time record)" };
+      }
+      if (((await txn.get<BoardState>("boardState")) ?? emptyBoard()).goal !== null) {
+        return { ok: false as const, code: "INVALID_STATE", error: "the integration configuration must be set before the goal is posted; it is fixed at goal time" };
+      }
+      await txn.put("cloudIntegrationConfig", parsed.value);
+      return { ok: true as const, config: publicConfig(parsed.value) };
+    });
+  }
+
+  /** The configured integration repo (for the token routes), if any. */
+  async getCloudIntegrationRepo(): Promise<BoardRepoRecord | undefined> {
+    return (await this.ctx.storage.get<CloudIntegrationConfig>("cloudIntegrationConfig"))?.integration;
+  }
+
+  /** The open view: configuration (no inventory names), the Workflow, every attempt. */
+  async getCloudIntegration(): Promise<CloudIntegrationView> {
+    const config = await this.ctx.storage.get<CloudIntegrationConfig>("cloudIntegrationConfig");
+    const run = (await this.ctx.storage.get<CloudIntegrationRun>("cloudIntegrationRun")) ?? { kicked: false, counter: 0 };
+    const revisions = (await this.ctx.storage.get<CloudRevisionRecord[]>("cloudRevisions")) ?? [];
+    return {
+      configured: config !== undefined,
+      ...(config ? { config: publicConfig(config) } : {}),
+      ...(run.active ? { active: run.active } : {}),
+      kicked: run.kicked,
+      ...(await this.pendingAttribution().then((p) => (p && !p.answer ? { pendingAttribution: p.request } : {}))),
+      revisions,
+    };
+  }
+
+  /**
+   * Ask for an integration (a push was announced, or the run kicked): start a
+   * Workflow when none is active, else mark the active one to look again.
+   */
+  async requestCloudIntegration(): Promise<CloudIntegrationRequest> {
+    if ((await this.ctx.storage.get<CloudIntegrationConfig>("cloudIntegrationConfig")) === undefined) {
+      return { start: false, reason: "integration on Cloudflare is not configured for this Change" };
+    }
+    return this.ctx.storage.transaction(async (txn) => {
+      const run = (await txn.get<CloudIntegrationRun>("cloudIntegrationRun")) ?? { kicked: false, counter: 0 };
+      if (run.active) {
+        await txn.put("cloudIntegrationRun", { ...run, kicked: true });
+        return { start: false, coalesced: true, activeInstance: run.active.instanceId };
+      }
+      const counter = run.counter + 1;
+      const change = await txn.get<Change>("change");
+      const base = (change?.id ?? "change").replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 60);
+      const instanceId = `${base}-int-${counter}-${Date.now().toString(36)}`;
+      await txn.put("cloudIntegrationRun", { active: { instanceId, startedAt: new Date().toISOString() }, kicked: false, counter });
+      return { start: true, instanceId };
+    });
+  }
+
+  /** Forget an active Workflow that never started or has ended without finishing. */
+  async clearCloudIntegration(instanceId: string): Promise<void> {
+    const run = (await this.ctx.storage.get<CloudIntegrationRun>("cloudIntegrationRun")) ?? { kicked: false, counter: 0 };
+    if (run.active?.instanceId === instanceId) {
+      const { active: _gone, ...rest } = run;
+      await this.ctx.storage.put("cloudIntegrationRun", rest);
+    }
+  }
+
+  /** The Workflow is out of work: done (clear it), or again when a push landed meanwhile. */
+  async finishCloudIntegration(instanceId: string, options: { readonly force?: boolean } = {}): Promise<{ readonly again: boolean }> {
+    return this.ctx.storage.transaction(async (txn) => {
+      const run = (await txn.get<CloudIntegrationRun>("cloudIntegrationRun")) ?? { kicked: false, counter: 0 };
+      if (run.active?.instanceId !== instanceId) {
+        return { again: false };
+      }
+      if (run.kicked && !options.force) {
+        await txn.put("cloudIntegrationRun", { ...run, kicked: false });
+        return { again: true };
+      }
+      const { active: _done, ...rest } = run;
+      await txn.put("cloudIntegrationRun", rest);
+      return { again: false };
+    });
+  }
+
+  /** Plan the next revision's job from the board (idle when nothing new is pending). */
+  async planCloudIntegration(): Promise<CloudPlanOutcome & { readonly deadlineMs?: number; readonly registryHost?: string; readonly integration?: BoardRepoRecord }> {
+    const config = await this.ctx.storage.get<CloudIntegrationConfig>("cloudIntegrationConfig");
+    if (config === undefined) {
+      return { kind: "idle", reason: "integration on Cloudflare is not configured for this Change", pendingKey: "" };
+    }
+    const lastSeq = (await this.ctx.storage.get<number>("boardSeq")) ?? 0;
+    const messages = await this.readBoardMessages(0, Number.MAX_SAFE_INTEGER, lastSeq);
+    const state = await this.loadBoardState();
+    if (state.goal === null) {
+      return { kind: "idle", reason: "the board has no goal yet", pendingKey: "" };
+    }
+    const change = await this.ctx.storage.get<Change>("change");
+    const revisions = (await this.ctx.storage.get<CloudRevisionRecord[]>("cloudRevisions")) ?? [];
+    const outcome = await planCloudJob({
+      changeId: change?.id ?? "change",
+      objective: state.goal?.objective ?? change?.objective ?? "",
+      config,
+      messages,
+      state,
+      repos: (await this.ctx.storage.get<Record<string, BoardRepoRecord>>("boardRepos")) ?? {},
+      // A transient failure does not count: the same pushes may be tried again.
+      attempted: (key) => revisions.some((r) => r.key === key && !r.transient),
+    });
+    return outcome.kind === "job"
+      ? { ...outcome, deadlineMs: jobDeadlineMs(config), registryHost: config.registryHost, integration: config.integration }
+      : outcome;
+  }
+
+  /**
+   * Record a job's outcome: on the board through the same append path as the
+   * integration revision route (appendIntegratedRev), and in the attempts.
+   * Idempotent by the job key (a Workflow step that re-runs gets the record).
+   */
+  async recordCloudRevision(input: {
+    readonly plan: CloudJobPlan;
+    readonly result?: IntegrateJobResult;
+    readonly error?: string;
+    readonly phases: readonly DrivenPhase[];
+    readonly transient?: boolean;
+  }): Promise<CloudRevisionRecord> {
+    const revisions = (await this.ctx.storage.get<CloudRevisionRecord[]>("cloudRevisions")) ?? [];
+    const prior = revisions.find((r) => r.key === input.plan.key && !r.transient);
+    if (prior) {
+      return prior;
+    }
+    const at = new Date().toISOString();
+    const base = { key: input.plan.key, pendingKey: input.plan.pendingKey, at, phases: input.phases };
+    let record: CloudRevisionRecord;
+    if (input.result === undefined || input.transient) {
+      record = { ...base, recorded: false, transient: true, reason: input.error ?? "the job did not run", excludedAgents: input.plan.excludedAgents };
+    } else {
+      const result = input.result;
+      const extras = {
+        ...(result.install ? { install: result.install } : {}),
+        ...(result.inventory ? { inventory: result.inventory } : {}),
+        ...(result.inventoryNote ? { inventoryNote: result.inventoryNote } : {}),
+        ...(result.sandboxReaped ? { sandboxReaped: result.sandboxReaped } : {}),
+        ...(result.evidence ? { evidence: result.evidence } : {}),
+      };
+      const pending = await this.pendingAttribution();
+      const driver: DriverAttribution | undefined = pending?.request.key === input.plan.key && pending.answer ? { key: pending.request.key, items: pending.answer } : undefined;
+      const decision = decideCloudRevision(input.plan, result, await this.loadBoardState(), driver);
+      if (decision.kind === "refuse") {
+        record = { ...base, ...extras, recorded: false, reason: decision.reason, ...(decision.stale ? { stale: true } : {}), excludedAgents: decision.excludedAgents };
+      } else {
+        // A lost response: the board may already hold this exact revision.
+        const lastSeq = (await this.ctx.storage.get<number>("boardSeq")) ?? 0;
+        const already = (await this.readBoardMessages(0, Number.MAX_SAFE_INTEGER, lastSeq)).find(
+          (m) => m.type === "integrated.rev" && m.payload.commit === decision.input.commit && m.payload.merged.join(",") === decision.input.merged.join(","),
+        );
+        let appended: readonly BoardMessage[] = already ? [already] : [];
+        let refusal: string | undefined;
+        if (!already) {
+          const outcome = await this.recordBoardIntegration(decision.input);
+          if (outcome.ok) {
+            appended = outcome.appended;
+          } else {
+            refusal = `the board refused the revision (${outcome.code}): ${outcome.error}`;
+          }
+        }
+        const rev = appended.find((m) => m.type === "integrated.rev");
+        record =
+          refusal !== undefined || !rev || rev.type !== "integrated.rev"
+            ? { ...base, ...extras, recorded: false, reason: refusal ?? "the board recorded no revision", excludedAgents: decision.excludedAgents }
+            : {
+                ...base,
+                ...extras,
+                recorded: true,
+                n: rev.payload.n,
+                gate: decision.input.gate,
+                gated: decision.input.gated !== false,
+                commit: decision.input.commit,
+                merged: decision.input.merged,
+                integratedItems: decision.integratedItems,
+                excludedItems: decision.excludedItems,
+                excludedAgents: decision.excludedAgents,
+                completedItems: appended.flatMap((m) => (m.type === "item.completed" ? [m.payload.item] : [])),
+                ...(decision.implicated ? { implicated: decision.implicated } : {}),
+                ...(decision.parsed ? { parsed: decision.parsed } : {}),
+                ...(decision.failure !== undefined ? { failure: decision.failure } : {}),
+                ...(decision.input.gate === "fail"
+                  ? {
+                      fixRequested: appended.flatMap((m) => (m.type === "fix.requested" ? [m.payload.item] : [])),
+                      fixExhausted: appended.flatMap((m) => (m.type === "fix.exhausted" ? [m.payload.item] : [])),
+                    }
+                  : {}),
+              };
+      }
+    }
+    // Keep the attempts bounded (the board keeps the revisions themselves).
+    const kept = [...revisions.filter((r) => r.key !== record.key || !r.transient), record].slice(-CLOUD_REVISIONS_KEPT);
+    await this.ctx.storage.put("cloudRevisions", kept);
+    return record;
+  }
+
+  /**
+   * A failing result is about to be recorded: when the run attributes
+   * (`attribution: "driver"`), store what it is asked and tell the Workflow
+   * to wait (bounded) for its answer. Idempotent by the job key.
+   */
+  async requestCloudAttribution(plan: CloudJobPlan, result: IntegrateJobResult): Promise<{ readonly waiting: boolean }> {
+    const config = await this.ctx.storage.get<CloudIntegrationConfig>("cloudIntegrationConfig");
+    if (config?.attribution !== "driver") {
+      return { waiting: false };
+    }
+    const prior = await this.pendingAttribution();
+    if (prior?.request.key === plan.key) {
+      return { waiting: prior.answer === undefined };
+    }
+    const request = attributionRequestFor(plan, result, new Date().toISOString());
+    if (!request) {
+      return { waiting: false };
+    }
+    await this.ctx.storage.put("cloudAttribution", { request } satisfies PendingAttribution);
+    return { waiting: true };
+  }
+
+  /**
+   * The run's advisory attribution for the pending failing revision: the items
+   * it implicates (each must be one the revision merged; none = no confident
+   * choice, record with the parse alone). Returns the active Workflow instance
+   * to wake.
+   */
+  async answerCloudAttribution(raw: unknown): Promise<{ readonly ok: true; readonly instanceId?: string } | BoardFailure> {
+    const body = typeof raw === "object" && raw !== null ? (raw as Record<string, unknown>) : {};
+    const pending = await this.pendingAttribution();
+    if (!pending || typeof body.key !== "string" || body.key !== pending.request.key) {
+      return { ok: false, code: "UNKNOWN_REF", error: "no attribution is pending for that key" };
+    }
+    if (pending.answer !== undefined) {
+      return { ok: false, code: "DUPLICATE", error: "this attribution was already answered" };
+    }
+    const ids = pending.request.items.map((i) => i.id);
+    if (!Array.isArray(body.items) || !body.items.every((i) => typeof i === "string" && ids.includes(i))) {
+      return { ok: false, code: "BAD_PAYLOAD", error: "items must name items the failing revision merged" };
+    }
+    await this.ctx.storage.put("cloudAttribution", { ...pending, answer: [...new Set(body.items as string[])] } satisfies PendingAttribution);
+    const run = await this.ctx.storage.get<CloudIntegrationRun>("cloudIntegrationRun");
+    return { ok: true, ...(run?.active ? { instanceId: run.active.instanceId } : {}) };
+  }
+
+  private async pendingAttribution(): Promise<PendingAttribution | undefined> {
+    return this.ctx.storage.get<PendingAttribution>("cloudAttribution");
+  }
+
+  /** Record whether the integration branch was advanced to a recorded passing revision. */
+  async recordCloudAdvance(key: string, outcome: { readonly advanced: boolean; readonly error?: string }): Promise<void> {
+    const revisions = (await this.ctx.storage.get<CloudRevisionRecord[]>("cloudRevisions")) ?? [];
+    await this.ctx.storage.put(
+      "cloudRevisions",
+      revisions.map((r) => (r.key === key && r.recorded ? { ...r, advanced: outcome.advanced, ...(outcome.error ? { advanceError: outcome.error } : {}) } : r)),
     );
   }
 

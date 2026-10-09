@@ -44,13 +44,14 @@ import { join } from "node:path";
 import {
   BOARD_LIMITS,
   boardAttributionTally,
+  pendingPushItems,
+  pendingPushKey,
+  planBoardIntegration,
   contractTriageRecommendation,
   withContractTriage,
-  entriesOverlap,
   entryWithin,
   formatAttributionTally,
   intentPath,
-  releasedTargets,
   type BoardDecisionJuncture,
   type BoardDigest,
   type BoardItem,
@@ -69,7 +70,10 @@ import {
   advanceIntegrationBranch,
   ChangeVerification,
   ChildProcessCommandRunner,
+  DEFAULT_COMMAND_TIMEOUT_MS,
+  DEFAULT_INSTALL_TIMEOUT_MS,
   formatDependencyInstall,
+  gateFailureLine,
   InstallingCommandRunner,
   LockfileDependencyInstaller,
   type DependencyInstaller,
@@ -83,6 +87,15 @@ import {
 } from "@switchyard-change/verification";
 
 import { BoardAgent, RunTurnBudget, type AgentStop, type AgentTurnRecord, type BoardSeedItem } from "./board-agent.ts";
+import {
+  CloudBoardIntegrator,
+  configureCloudIntegration,
+  createCloudIntegrationWorkspace,
+  gateSupportFilesFor,
+  integrationRepoToken,
+  type BoardIntegratorLike,
+  type CloudIntegrationWorkspace,
+} from "./cloud-board-integrator.ts";
 import { BoardOperatorClient, type JoinedWorkspace } from "./board-client.ts";
 import { readTargetExcerpt, triageContract } from "./contract-triage.ts";
 import { deriveProtectedPaths, type ProtectedPaths } from "./protected-paths.ts";
@@ -302,6 +315,19 @@ export interface RunBoardOptions {
   readonly skipCleanup?: boolean;
   /** Concurrent schedule: how often the driver checks the board (default 500 ms). */
   readonly pollMs?: number;
+  /**
+   * Who integrates: "local" (default) runs the integrator in this process;
+   * "cloud" leaves it to the Worker's integration Workflow (the gate runs in a
+   * Cloudflare Container): this process provisions the integration repo as an
+   * Artifact repo, configures the Workflow, follows the revisions it records,
+   * and promotes as usual. Needs a Worker with the Artifacts binding and the
+   * gate container.
+   */
+  readonly integrator?: "local" | "cloud";
+  /** Cloud integrator: the gate's limit inside the container, in ms (default 10 minutes). */
+  readonly cloudGateTimeoutMs?: number;
+  /** Cloud integrator: how long to wait for the Workflow to settle at the end, in ms (default 30 minutes). */
+  readonly cloudSettleTimeoutMs?: number;
   readonly onEvent?: (event: BoardRunEvent) => void;
 }
 
@@ -420,43 +446,10 @@ export interface IntegrateBoardResult {
   readonly supersededAgents?: readonly string[];
 }
 
-/** An item's announced, not yet integrated push, still held by the agent that pushed it. */
-function pendingPushItems(state: BoardState): BoardItem[] {
-  return Object.values(state.items).filter(
-    (i) =>
-      i.lastPush !== undefined &&
-      i.lastPush.integratedIn === undefined &&
-      i.status === "claimed" &&
-      i.owner === i.lastPush.agent,
-  );
-}
-
 /** A stable key for the set of pending pushes (what one integration would merge). */
-export function pendingPushKey(state: BoardState): string {
-  return pendingPushItems(state)
-    .map((i) => i.lastPush!.commit)
-    .sort()
-    .join(",");
-}
+export { pendingPushKey };
 
-/**
- * The most telling line of a gate's output: an error (`SyntaxError: ...`,
- * `AssertionError ...`), a failing test line, else undefined. npm/yarn/pnpm
- * command echoes (`> ...`) are never it.
- */
-export function gateFailureLine(output: string): string | undefined {
-  const lines = output
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l !== "" && !/^[>$] /.test(l) && !/^npm (error|ERR!)/.test(l));
-  return (
-    // An install that failed means the gate never ran: that is the reason.
-    lines.find((l) => /^dependency install failed:/.test(l)) ??
-    lines.find((l) => /^\w*(Error|Exception)\b(\s*\[[A-Z_]+\])?:/.test(l)) ??
-    lines.find((l) => /^(not ok\b|\u2716|FAIL\b|--- FAIL)/.test(l) && !/^\u2716 failing tests:/.test(l)) ??
-    lines.find((l) => /\b(Error|Exception):/.test(l))
-  );
-}
+export { gateFailureLine };
 
 /**
  * A failing revision's reason for summaries: when the gate exited non-zero,
@@ -606,39 +599,22 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   const requiresIntegrationGate = Boolean(options.appGateCommand && options.appGateCommand.length > 0) || options.requireAppGate === true;
   const board = await options.operator.log();
   const state = board.state;
-  const key = pendingPushKey(state);
-  const pending = pendingPushItems(state);
+  // What the next revision merges, synthesized from the board (shared with the
+  // integration Workflow on Cloudflare).
+  const plan = planBoardIntegration(board.messages, state);
+  const key = plan.key;
+  const pending = [...plan.pending];
   if (pending.length === 0) {
     return { requiresIntegrationGate, key, failure: "nothing is pending" };
   }
 
-  // Facts from the log: each agent's announced commits, the commits passing
-  // revisions merged, and the items each agent handed off.
-  const announced = new Map<string, { commit: string; seq: number }[]>();
-  const passingMerged = new Set<string>();
-  const handedOff = new Map<string, Set<string>>();
-  for (const m of board.messages) {
-    if (m.type === "push.announced") {
-      announced.set(m.from, [...(announced.get(m.from) ?? []), { commit: m.payload.commit, seq: m.seq }]);
-    } else if (m.type === "integrated.rev" && m.payload.gate === "pass") {
-      for (const c of m.payload.merged) {
-        passingMerged.add(c);
-      }
-    } else if (m.type === "handoff") {
-      handedOff.set(m.from, new Set([...(handedOff.get(m.from) ?? []), m.payload.item]));
-    } else if (m.type === "item.reopened") {
-      // A reopened item is no longer its previous owner's to apply.
-      handedOff.set(m.payload.previousOwner, new Set([...(handedOff.get(m.payload.previousOwner) ?? []), m.payload.item]));
-    }
-  }
-
-  const agents = [...new Set(pending.map((i) => i.lastPush!.agent))].sort();
   const excludedAgents: { agent: string; reason: string }[] = [];
   const units: { id: string; objective: string; dependsOn: string[]; paths: string[] }[] = [];
   const completed: CompletedWorkUnit[] = [];
   const itemsByAgent = new Map<string, BoardItem[]>();
-  for (const agent of agents) {
-    const mine = pending.filter((i) => i.lastPush!.agent === agent).sort((a, b) => a.lastPush!.seq - b.lastPush!.seq);
+  for (const unit of plan.units) {
+    const agent = unit.agent;
+    const mine = [...unit.items];
     itemsByAgent.set(agent, mine);
     const repo = options.agentRepos.get(agent);
     if (!repo) {
@@ -649,14 +625,6 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
       excludedAgents.push({ agent, reason: "held back: its pushes kept being superseded while the gate ran; they stay pending" });
       continue;
     }
-    const pin = mine.at(-1)!.lastPush!;
-    const base = (announced.get(agent) ?? []).filter((p) => p.seq < pin.seq && passingMerged.has(p.commit)).at(-1)?.commit;
-    const scope = [...new Set(mine.flatMap((i) => (i.intent?.write ?? []).map(intentPath)))].sort();
-    // Items this agent handed to someone else: their files are not its to apply.
-    const yieldedScope = [...(handedOff.get(agent) ?? [])]
-      .map((id) => state.items[id])
-      .flatMap((item) => (item ? [...(item.intent?.write ?? []).map(intentPath), ...(item.lastPush?.paths ?? [])] : []))
-      .filter((entry) => !scope.some((own) => entriesOverlap(entry, own)));
     let remote: string;
     try {
       remote = await options.readRemote(agent);
@@ -664,19 +632,16 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
       excludedAgents.push({ agent, reason: scrub(`could not read its repo: ${error instanceof Error ? error.message : String(error)}`) });
       continue;
     }
-    units.push({ id: agent, objective: `the announced pushes of ${agent} (items ${mine.map((i) => i.id).join(", ")})`, dependsOn: [], paths: scope });
+    units.push({ id: agent, objective: `the announced pushes of ${agent} (items ${mine.map((i) => i.id).join(", ")})`, dependsOn: [], paths: [...unit.scope] });
     completed.push({
       unitId: agent,
       gitUrl: remote,
-      baselineRef: base ?? "HEAD",
-      commit: pin.commit,
-      includes: mine.slice(0, -1).map((i) => i.lastPush!.commit),
-      ...(yieldedScope.length > 0 ? { yieldedScope: [...new Set(yieldedScope)].sort() } : {}),
+      baselineRef: unit.baselineRef,
+      commit: unit.commit,
+      includes: [...unit.includes],
+      ...(unit.yieldedScope ? { yieldedScope: [...unit.yieldedScope] } : {}),
       // Contract paths a HUMAN released for these items, for this unit only.
-      ...(() => {
-        const released = [...new Set(mine.flatMap((i) => releasedTargets(state, i.id)))].sort();
-        return released.length > 0 ? { releasedPaths: released } : {};
-      })(),
+      ...(unit.releasedPaths ? { releasedPaths: [...unit.releasedPaths] } : {}),
     });
   }
   if (completed.length === 0) {
@@ -1110,9 +1075,16 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   // 1. The planning-first Change, then the goal (with the contract and the
   //    baseline gate's test inventory), posted by the human.
   const guarded = await deriveProtectedPaths(options.projectDir, options.appGateCommand);
+  const cloud = options.integrator === "cloud";
   // The integration workspace: seeded from the project baseline; only gated,
-  // passing, RECORDED revisions ever advance its branch.
-  const integration = await createIntegrationWorkspace(workRoot, options.projectDir, changeId, identity);
+  // passing, RECORDED revisions ever advance its branch. With the cloud
+  // integrator it is an Artifact repo the integration Workflow can reach.
+  const cloudWorkspace: CloudIntegrationWorkspace | undefined = cloud
+    ? await createCloudIntegrationWorkspace({ fetchFn: rawFetch, base, changeId, projectDir: options.projectDir, workRoot, ttlSeconds: Math.min(3600, ttl), identity })
+    : undefined;
+  const integration = cloudWorkspace
+    ? { integrationRef: cloudWorkspace.integrationRef, integrationToken: cloudWorkspace.integrationToken }
+    : await createIntegrationWorkspace(workRoot, options.projectDir, changeId, identity);
   // Run the gate once on the baseline and record which tests it executed, so a
   // later run that exits early (tests never run) cannot pass.
   const inventory =
@@ -1142,6 +1114,27 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     throw new Error(`could not create Change ${changeId} on ${base}`);
   }
   emit({ kind: "change-created", changeId });
+  if (cloudWorkspace) {
+    // Integration on Cloudflare: the Workflow integrates every announced push
+    // with this configuration (the gate, the contract, the baseline inventory).
+    await configureCloudIntegration({
+      fetchFn: rawFetch,
+      base,
+      changeId,
+      workspace: cloudWorkspace,
+      ...(options.appGateCommand && options.appGateCommand.length > 0 ? { gateCommand: options.appGateCommand } : {}),
+      requireGate: options.requireAppGate === true,
+      protectedPaths: guarded.restore,
+      protectedJsonKeys: guarded.jsonKeys,
+      ...(inventory ? { testInventory: inventory } : {}),
+      gateSupportFiles: await gateSupportFilesFor(options.projectDir),
+      timeouts: { installMs: options.installTimeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS, gateMs: options.cloudGateTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS },
+      identity,
+      // With a decision model, the Workflow holds each failing revision for
+      // this run's advisory attribution (the parse alone otherwise).
+      attribution: options.jev ? "driver" : "engine",
+    });
+  }
   const goal = await operator.postAsHuman({
     type: "goal.posted",
     payload: {
@@ -1317,12 +1310,42 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       },
     });
 
-  const integrator = new ContinuousBoardIntegrator({
+  const integrator: BoardIntegratorLike = cloud
+    ? new CloudBoardIntegrator({
+        fetchFn: rawFetch,
+        base,
+        changeId,
+        requiresGate: Boolean(options.appGateCommand && options.appGateCommand.length > 0) || options.requireAppGate === true,
+        readState: async () => (await operator.page(0, 1)).state,
+        scrub,
+        ...(options.pollMs !== undefined ? { pollMs: Math.max(options.pollMs, 250) } : {}),
+        ...(options.cloudSettleTimeoutMs !== undefined ? { settleTimeoutMs: options.cloudSettleTimeoutMs } : {}),
+        onRevision: (revision) => emit({ kind: "integrated", revision }),
+        onFailure: (reason) => emit({ kind: "integration-not-recorded", reason }),
+        ...(options.jev
+          ? {
+              attribute: async (request) => {
+                const decisions: BoardDecisionRecord[] = [];
+                const result = await attributeRevisionFailure({
+                  items: request.items,
+                  output: request.output,
+                  changeId,
+                  jev: options.jev!,
+                  ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
+                  onDecision: async (decision) => void decisions.push(decision),
+                });
+                return { items: result.items, source: result.source, decisions };
+              },
+              recordDecision,
+            }
+          : {}),
+      })
+    : new ContinuousBoardIntegrator({
     operator,
     change: { id: changeId, objective },
     agentRepos,
     readRemote,
-    integration,
+    integration: integration as Awaited<ReturnType<typeof createIntegrationWorkspace>>,
     worktreeRoot,
     identity,
     ...(options.appGateCommand ? { appGateCommand: options.appGateCommand } : {}),
@@ -1431,6 +1454,17 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       return;
     }
     const authed = withWorkerAuth(rawFetch);
+    if (cloudWorkspace && !cleanedUp.includes(cloudWorkspace.workspaceName)) {
+      // The integration repo of the cloud integrator (its tokens go with it).
+      try {
+        const res = await authed(`${base}/workspaces/${encodeURIComponent(cloudWorkspace.workspaceName)}`, { method: "DELETE" });
+        if (res.status < 400) {
+          cleanedUp.push(cloudWorkspace.workspaceName);
+        }
+      } catch {
+        // Best-effort.
+      }
+    }
     for (const worker of workers) {
       const name = worker.joinedWorkspace?.workspaceName;
       if (!name || cleanedUp.includes(name)) {
@@ -1695,17 +1729,27 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     if (last && evidence && partial === undefined) {
       // The promote step reads the verdict from the last revision's evidence
       // (the same gate result the board recorded) and refuses anything else.
+      // The cloud integrator's repo is an Artifact repo: promotion reads it with
+      // a fresh short-lived token (sent as a header, never stored).
+      const promotionToken = cloudWorkspace
+        ? await integrationRepoToken({ fetchFn: rawFetch, base, changeId, scope: "read", ttlSeconds: 600 })
+        : undefined;
+      if (promotionToken) {
+        secrets.add(promotionToken.token);
+      }
       const promoted = await promoteVerifiedIntegration({
         change: { id: changeId, objective },
         evidence,
-        integrationRef: integration.integrationRef,
+        integrationRef: promotionToken
+          ? { ...integration.integrationRef, gitUrl: authenticatedRemote(integration.integrationRef.gitUrl, promotionToken.token) }
+          : integration.integrationRef,
         projectDir: options.projectDir,
         workRoot,
         worktreeRoot,
         identity,
         requiresIntegrationGate: integrator.lastRequiresGate,
         emit,
-      });
+      }).finally(() => promotionToken?.revoke());
       promotion = promoted.promotion;
       sourceRepoDir = promoted.sourceRepoDir;
       deployment = await redeployIfPreviouslyDeployed({

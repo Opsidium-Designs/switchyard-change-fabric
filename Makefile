@@ -3,7 +3,8 @@
 # Run tasks manually; there is no CI pipeline. Requires Node.js and npm.
 #
 #   make install   install all workspace dependencies
-#   make dev       run the Worker locally (wrangler dev)
+#   make dev       run the Worker locally (wrangler dev; the gate container off)
+#   make dev-containers  run the Worker locally WITH the integration gate container (needs Docker)
 #   make console   run the local console (Vite)
 #   make dev-all   run the Worker and the console together
 #   make cli ARGS="doctor"   run the switchyard-change CLI
@@ -30,7 +31,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: jev-smoke install dev console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: jev-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -43,6 +44,14 @@ install:
 dev:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/worker run dev
+
+# Run the Worker locally WITH the integration gate container (Cloudflare
+# Containers under wrangler dev build the image with Docker): what
+# `run-board --integrator cloud` needs. `make dev` runs without it (no Docker
+# needed); integration then stays with the local driver.
+dev-containers:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	WRANGLER_ENABLE_CONTAINERS=true npm -w apps/worker run dev
 
 # Run the local console (Vite dev server).
 console:
@@ -208,7 +217,7 @@ run-live:
 run-board:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- run-board "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" \
-	  --min $(MIN) --max $(MAX)
+	  --min $(MIN) --max $(MAX) $(if $(INTEGRATOR),--integrator $(INTEGRATOR),)
 
 # The live run against the MODULAR service-api app. `make run-live` defaults to
 # the flat calc-project, whose decomposition is a wide, flat fan-out with no

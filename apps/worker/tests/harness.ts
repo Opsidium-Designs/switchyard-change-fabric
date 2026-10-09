@@ -107,16 +107,28 @@ export class RecordingProvisioner implements WorkspaceProvisioner {
 
 export interface Harness {
   readonly provisioner: RecordingProvisioner;
+  /** The env the handler runs with (tests can read the bindings they injected). */
+  readonly env: EnvWithProvisioner;
+  /** The ChangeState instance of a Change (created on first use). */
+  state(changeId: string): ChangeState;
   request(method: string, path: string, body?: unknown, headers?: Record<string, string>): Promise<Response>;
   json<T = Record<string, unknown>>(method: string, path: string, body?: unknown, headers?: Record<string, string>): Promise<{ status: number; body: T }>;
 }
 
-export function createHarness(options: { readonly apiToken?: string } = {}): Harness {
-  const provisioner = new RecordingProvisioner();
+export function createHarness(
+  options: {
+    readonly apiToken?: string;
+    readonly provisioner?: RecordingProvisioner;
+    /** Extra bindings (for example a fake INTEGRATION_WORKFLOW). */
+    readonly env?: Record<string, unknown>;
+  } = {},
+): Harness {
+  const provisioner = options.provisioner ?? new RecordingProvisioner();
   const objects = new Map<string, ChangeState>();
   const env = {
     ...(options.apiToken !== undefined ? { SWITCHYARD_API_TOKEN: options.apiToken } : {}),
     WORKSPACE_PROVISIONER: provisioner,
+    ...(options.env ?? {}),
   } as Record<string, unknown>;
   env.CHANGE_STATE = {
     idFromName: (name: string) => name,
@@ -143,6 +155,8 @@ export function createHarness(options: { readonly apiToken?: string } = {}): Har
 
   return {
     provisioner,
+    env: typedEnv,
+    state: (changeId: string) => (env.CHANGE_STATE as { get(id: string): ChangeState }).get(changeId),
     request,
     async json(method, path, body, headers) {
       const res = await request(method, path, body, headers);

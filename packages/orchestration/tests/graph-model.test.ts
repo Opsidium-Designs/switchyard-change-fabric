@@ -1192,6 +1192,24 @@ describe("the goal node follows the authoritative integration verdict over the l
     expect(() => assertBacked(goal, snapshot)).not.toThrow();
   });
 
+  it("integration verified with NO gate (gated: false) is unverified: never green, labeled as such", () => {
+    const snapshot: ChangeStateSnapshot = {
+      ...passingLadder(),
+      integration: { verdict: "verified", integratedUnits: ["fix"], excludedUnits: [], gated: false },
+    };
+    const goal = buildWorkGraphModel(snapshot).nodes.find((n) => n.kind === "goal")!;
+    expect(goal.verified).toBe(false);
+    expect(goal.status).toBe("integrated");
+    expect(goal.warning).toBe("unverified: no gate (nothing checked)");
+    expect(goal.backing).toMatchObject({ integrationVerdict: "verified", gated: false });
+    expect(() => assertBacked(goal, snapshot)).not.toThrow();
+    // A green goal over an ungated integration, or a "no gate" claim over a gated one, is unbacked.
+    expect(() => assertBacked({ ...goal, verified: true }, snapshot)).toThrow(/ran no gate/);
+    expect(() =>
+      assertBacked(goal, { ...snapshot, integration: { verdict: "verified", integratedUnits: ["fix"], excludedUnits: [] } }),
+    ).toThrow(/gated integration/);
+  });
+
   it("rejects a goal that claims a verdict the state does not record, or a green goal with no verdict", () => {
     const snapshot: ChangeStateSnapshot = { ...passingLadder(), integration: null };
     const greenWithoutVerdict: GraphNode = {

@@ -374,6 +374,12 @@ export interface IntegrationSnapshot {
   /** The unit ids the final integration excluded. */
   readonly excludedUnits: readonly string[];
   readonly at?: string;
+  /**
+   * False when NO gate ran on the integrated tree (the project has none): the
+   * "verified" verdict then checked nothing, so the goal must read
+   * "unverified: no gate", never verified. Absent when a gate ran.
+   */
+  readonly gated?: false;
 }
 
 /**
@@ -629,6 +635,8 @@ export type NodeBacking =
       readonly kind: "change";
       readonly changeId: string;
       readonly integrationVerdict?: "verified" | "failed";
+      /** False when the recorded integration ran no gate (its pass checked nothing). */
+      readonly gated?: false;
       /** The recorded planning-failure reason, when the goal is red because planning failed. */
       readonly planningFailure?: string;
     }
@@ -966,6 +974,12 @@ export function assertBacked(node: GraphNode, snapshot: ChangeStateSnapshot): Gr
             }`,
           );
         }
+        if (backing.gated === false && snapshot.integration.gated !== false) {
+          throw new Error(`unbacked node ${node.id}: goal claims no gate ran but the state records a gated integration`);
+        }
+        if (node.verified && snapshot.integration.gated === false) {
+          throw new Error(`unbacked node ${node.id}: goal is verified but the recorded integration ran no gate`);
+        }
       } else if (snapshot.integration === null && (node.verified || node.status === "failed")) {
         // The state tracks the authoritative verdict but has none yet: a goal
         // that is green or red without it is exactly the unbacked verdict the
@@ -1256,12 +1270,19 @@ function isRoundAgentSpawned(agent: RoundAgentSnapshot | undefined): boolean {
   );
 }
 
+/** The goal's warning when the integration ran no gate: its pass checked nothing. */
+export const NO_GATE_GOAL_WARNING = "unverified: no gate (nothing checked)";
+
 /** The goal node's status + green flag, derived from the whole-change verdict. */
 interface GoalOutcome {
   readonly status: WorkUnitStatus;
   readonly verified: boolean;
   /** The integration verdict the outcome came from, when it came from one. */
   readonly integrationVerdict?: "verified" | "failed";
+  /** False when the recorded integration ran no gate (nothing was checked). */
+  readonly gated?: false;
+  /** The warning the goal carries (an ungated pass reads "unverified: no gate"). */
+  readonly warning?: string;
   /** The recorded planning-failure reason, when the outcome came from it. */
   readonly planningFailure?: string;
 }
@@ -1306,6 +1327,17 @@ interface GoalOutcome {
 function goalOutcome(snapshot: ChangeStateSnapshot): GoalOutcome {
   const integration = snapshot.integration;
   if (integration) {
+    if (integration.verdict === "verified" && integration.gated === false) {
+      // No gate ran: the pass checked nothing, so the goal is integrated but
+      // NOT verified, and says so (never the healthy green).
+      return {
+        status: "integrated",
+        verified: false,
+        integrationVerdict: "verified",
+        gated: false,
+        warning: NO_GATE_GOAL_WARNING,
+      };
+    }
     return integration.verdict === "verified"
       ? { status: "integrated", verified: true, integrationVerdict: "verified" }
       : { status: "failed", verified: false, integrationVerdict: "failed" };
@@ -1453,12 +1485,14 @@ export function buildWorkGraphModel(snapshot: ChangeStateSnapshot): WorkGraphMod
         status: goal.status,
         verified: goal.verified,
         escalated: goalEscalated,
+        ...(goal.warning !== undefined ? { warning: goal.warning } : {}),
         backing: {
           kind: "change",
           changeId: snapshot.id,
           ...(goal.integrationVerdict !== undefined
             ? { integrationVerdict: goal.integrationVerdict }
             : {}),
+          ...(goal.gated === false ? { gated: false as const } : {}),
           ...(goal.planningFailure !== undefined ? { planningFailure: goal.planningFailure } : {}),
         },
       },

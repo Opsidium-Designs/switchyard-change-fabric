@@ -160,3 +160,132 @@ launcher's `/api/worker/changes/...` proxy, which reads `SWITCHYARD_API_TOKEN`
 from the dev process environment (`make dev-all` sources the root `.env`) and
 adds the bearer server-side. It falls back to posting the Worker directly only
 when no such proxy answers (which only works while the Worker's auth is off).
+
+## Integration on Cloudflare
+
+A board run can leave integration to the control-plane Worker instead of the
+driver process: `run-board --integrator cloud` (or `make run-board
+INTEGRATOR=cloud`). The full flow, the routes, and the job format are in
+[`docs/BOARD.md`](BOARD.md) ("Integration on Cloudflare"); this section is the
+operator's view.
+
+### How it works
+
+- Every `push.announced` on the board starts (or coalesces into) the Change's
+  `IntegrationWorkflow`. Its steps plan the next revision from the board, mint
+  short-lived Artifact tokens Worker-side, run the integration job in a
+  Cloudflare Container owned by the `GateRunner` Durable Object (one per
+  Change), revoke the tokens, record the revision through the board's own
+  integration path, and fast-forward the integration branch after a pass.
+- The container image (`apps/worker/containers/gate/Dockerfile`) is
+  `node:24.21.0-bookworm-slim` with git, CA certificates, util-linux and
+  coreutils, plus the repo's `verification`, `artifact-workspace`, and
+  `change-core` sources run directly with Node's type stripping (no bundler).
+  It is built from the repository root; the root `.dockerignore` admits only
+  those sources and `node_modules/yaml`.
+- Every job runs in a fresh container (destroyed afterwards, success or
+  failure; a job refuses to start in a container that is not clean). The
+  install and the gate run as an unprivileged user capped at 512 processes,
+  with a per-job HOME and temp dir; every process of that user is killed
+  (`kill(-1)` as that user) after the install and after the gate, and the job
+  refuses (transient, no verdict, no push) if one survives. Before any
+  credentialed phase both sides check that no such process is alive.
+- The gate command, the contract, and the baseline inventory are fixed at
+  goal time: the configuration is accepted once, before the goal is posted,
+  and a later change is refused.
+- The container never holds a credential. It starts with internet access off;
+  the GateRunner registers its `GateEgress` entrypoint (through `ctx.exports`,
+  the `enable_ctx_exports` compatibility flag) as the HTTPS handler for the
+  Artifacts host and the package registry, and the handler adds the
+  repo-scoped token to the requests the current phase allows. The container
+  trusts Cloudflare's egress CA (`/etc/cloudflare/certs/cloudflare-containers-ca.crt`)
+  once interception is registered.
+
+### Egress phases
+
+| Phase | Reachable from the container |
+|---|---|
+| `fetch` | the Artifacts host, only the job's repos (token added by the handler) |
+| `deps` | the package registry only (GET/HEAD, no credential); `npm ci --ignore-scripts` as an unprivileged user |
+| `gate` | nothing; the gate runs as the unprivileged user |
+| `push` | the Artifacts host again, after every process of the unprivileged user was killed: the gated commit is pushed to its candidate ref |
+| `closed` | nothing (between jobs) |
+
+Each revision attempt records the phases it ran under (`GET
+/changes/:id/integration/cloud`).
+
+### Local development (Docker)
+
+`make dev` runs the Worker WITHOUT the gate container (no Docker needed; the
+cloud integrator then reports that the container is unavailable, and the local
+integrator is unaffected). `make dev-containers` runs `wrangler dev` with
+containers enabled: wrangler builds the image with Docker on start and runs
+the container locally, with the same interception and egress handler. The
+Artifacts binding stays `remote: true`, so the repos are real Artifact repos
+(authenticate with the `.env` token as for `make dev`).
+
+Measured locally (wrangler 4.149.0, Docker): two agents with one pinned push
+each, a fixture whose gate needs a lockfile dependency and probes the network.
+The first push started the Workflow and the second coalesced; revision 1
+(the first push alone) failed and asked for a fix, revision 2 (both pushes)
+passed and the integration branch was advanced to its gated commit. From the
+fetch phase to the recorded revision each job took 9 to 13 s (the fetch phase
+3.6 to 5.6 s, the deps phase about 2.3 s of which `npm ci` was 0.9 s, the gate
+phase about 2 s, the push under 1 s); the whole run, from the first push to
+the advanced branch, took 34 s on a warm image. During the gate: `example.com` did not resolve, the registry and the
+Artifacts host answered 403 from the egress handler, a raw IP connection
+failed. The gate ran as the sandbox user and saw no credential in its
+environment, `.git/config`, or any readable `/proc/*/environ`. The driver's
+promotion pinned the gated commit from the Artifact repo and verified the
+tree.
+
+Adversarial checks, measured the same way (sandbox uid 64321, a fresh
+container per job):
+- a gate that leaves a detached, respawning child behind: every revision was
+  still recorded normally, with the leftover sandbox processes killed before
+  the push phase (2 per job on a fast gate, 374 on a gate that ran 20 s; the
+  process cap held the respawner below 512);
+- a gate that hangs past its timeout (20 s): killed, the revision recorded as a
+  failing gate ("exit none", with the inventory shortfall named), and the next
+  job's container passed the clean check;
+- a gate that plants `~/.npmrc` (`node-options=--require ...`) and files in
+  `/tmp`, `/var/tmp`, `/dev/shm`: the next job found none of them (its HOME and
+  temp dir are inside its own job root, and it runs in a fresh container);
+- changing the gate command to `true` after the goal: refused with `409`;
+- after every job the container was gone (destroyed), and after `wrangler
+  dev` stopped no container or sidecar was left.
+
+Local `wrangler dev` runs the gate container in the HOST's PID namespace
+(observed: `PidMode: host`). That is why the sandbox has a dedicated uid
+(64321) that no host account uses: with a uid the host also uses, the sandbox
+checks would count, and its `kill(-1)` would target, the host user's processes
+(Docker's AppArmor profile blocks such signals, but nothing should depend on
+it). It also means a gate run under local dev can list host processes and
+their command lines; deployed containers have their own PID namespace.
+
+### Limits and what stays local
+
+- Deployed behavior is not verified yet: everything above ran under `wrangler
+  dev` (the Workflow, the Durable Object, the egress interception, and the
+  container all local; only Artifacts was remote). Deploying needs the
+  container image pushed to Cloudflare's registry (`wrangler deploy` builds
+  and pushes it) and a plan with Containers.
+- Only the npm registry is reachable in the deps phase (pnpm and yarn
+  lockfiles resolve there too); a gate that needs other registries, Python or
+  Go modules fails honestly under the deny policy.
+- One container per Change (`max_instances` caps concurrent Changes); a
+  Durable Object reset or a hot reload kills the container and the step is
+  retried (every step is idempotent by the job key).
+- Attribution: the same parse as the local integrator runs in the Workflow;
+  with a decision model the run's advisory typed-decision choice narrows it
+  (the Workflow waits up to 3 minutes for it, then records with the parse).
+- No PID namespace: `unshare --pid` is not permitted in the container, so the
+  sandbox is contained by its own uid, the process cap, `kill(-1)`, the
+  survivor checks, and a fresh container per job.
+- With `SWITCHYARD_API_TOKEN` unset, anyone who can reach the Worker can use
+  these routes: keep it on localhost, or set the token before `make
+  dev-all-lan` or a deploy (see "Protecting the control-plane Worker").
+- What stays local: the planner, the agents' turns and edits, the baseline
+  test inventory (the driver runs the gate once on the baseline and posts the
+  inventory with the configuration), the final verdict post, promotion (pin
+  and verify the gated commit), and any redeploy.

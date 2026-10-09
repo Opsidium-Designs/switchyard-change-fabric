@@ -13,8 +13,12 @@ import {
   type WorkGraphModel,
 } from "@switchyard-change/orchestration/graph-model";
 
+import type { BoardMessage } from "@switchyard-change/orchestration/board-graph";
+
+import { pullBoard, resolveEscalation } from "./board-data";
 import { GraphView, changeHasPassed } from "./graph-view";
-import { TEMPLATES, type Template } from "./templates";
+import { MissionControl, type BoardEscalationRecord } from "./mission-control";
+import { boardCapable, TEMPLATES, type ContractPolicy, type LaunchMode, type Template } from "./templates";
 import { postToWorker } from "./worker-post";
 
 /**
@@ -121,6 +125,18 @@ export function formatCost(detail: {
   return detail.usd !== undefined ? "0" : null;
 }
 
+/**
+ * Whether a Change is a BOARD run: launched as one, or its snapshot reports a
+ * board with messages (a run-live Change's board stays empty).
+ */
+export function isBoardRun(runMode: LaunchMode | null, snapshot: unknown): boolean {
+  if (runMode === "board") {
+    return true;
+  }
+  const board = (snapshot as { board?: { messages?: unknown } } | null)?.board;
+  return typeof board?.messages === "number" && board.messages > 0;
+}
+
 export function App() {
   // No change-id box and no ?change= reliance: the console follows the UNIQUE id
   // the launcher hands back when a template is launched. Null means no run yet.
@@ -152,6 +168,17 @@ export function App() {
   // The template gallery collapses to a one-line strip while a run is active so
   // the graph sits near the top of the page.
   const [galleryOpen, setGalleryOpen] = useState(true);
+  // The launch mode for the NEXT launch (run-live, or agents on the board) and,
+  // for a board run, who answers contract decisions. The active run's mode is
+  // kept separately so the view follows what was actually launched.
+  const [launchMode, setLaunchMode] = useState<LaunchMode>("live");
+  const [contractPolicy, setContractPolicy] = useState<ContractPolicy>("console");
+  const [runMode, setRunMode] = useState<LaunchMode | null>(null);
+  // The full board log of a board run, pulled incrementally (after the last seq).
+  const [boardLog, setBoardLog] = useState<readonly BoardMessage[]>([]);
+  const boardLogRef = useRef<readonly BoardMessage[]>([]);
+  const boardPullInFlight = useRef(false);
+  const [boardError, setBoardError] = useState<string | null>(null);
 
   // Restore the per-app deployments the launcher already knows about (its
   // .deployments markers), so a reload does not forget a prior manual Deploy.
@@ -261,6 +288,49 @@ export function App() {
     };
   }, [changeId]);
 
+  const boardMode = Boolean(changeId) && isBoardRun(runMode, snapshot);
+
+  // Poll the board log for a board run: only what is new after the last seq,
+  // paging while the Worker says there is more. The snapshot polling above
+  // continues for the run's status and its pending escalations.
+  useEffect(() => {
+    if (!changeId || !boardMode) {
+      return;
+    }
+    let cancelled = false;
+    const pull = async () => {
+      if (boardPullInFlight.current) {
+        return;
+      }
+      boardPullInFlight.current = true;
+      try {
+        const result = await pullBoard(fetch, WORKER_BASE, changeId, boardLogRef.current);
+        if (cancelled) {
+          return;
+        }
+        if (result.log !== boardLogRef.current) {
+          boardLogRef.current = result.log;
+          setBoardLog(result.log);
+        }
+        setBoardError(result.status === "error" ? (result.error ?? "board request failed") : null);
+      } finally {
+        boardPullInFlight.current = false;
+      }
+    };
+    void pull();
+    const timer = setInterval(() => void pull(), POLL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [changeId, boardMode]);
+
+  const resetBoard = useCallback(() => {
+    boardLogRef.current = [];
+    setBoardLog([]);
+    setBoardError(null);
+  }, []);
+
   // Build the graph model from the live snapshot. If the snapshot ever fails the
   // backing guard (an unbacked node), surface it loudly rather than drawing a
   // dishonest graph: the no-unbacked-node rule is enforced here too, at render.
@@ -337,7 +407,12 @@ export function App() {
       const res = await fetch("/api/launch", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ templateId: template.id, min, max }),
+        body: JSON.stringify({
+          templateId: template.id,
+          min,
+          max,
+          ...(launchMode === "board" ? { mode: "board", decideContracts: contractPolicy } : {}),
+        }),
       });
       if (!res.ok) {
         const parsed = (await res.json().catch(() => ({}))) as { error?: string };
@@ -345,8 +420,10 @@ export function App() {
         setBusy(false);
         return;
       }
-      const body = (await res.json()) as { changeId: string };
+      const body = (await res.json()) as { changeId: string; mode?: LaunchMode };
       // Follow the unique id the launcher generated. Reset the view for the run.
+      setRunMode(body.mode ?? launchMode);
+      resetBoard();
       setSnapshot(null);
       setSelectedId(null);
       setLaunchStatus(null);
@@ -359,15 +436,21 @@ export function App() {
       setChangeId(body.changeId);
       setGalleryOpen(false);
       setNotice(
-        template.escalates
-          ? `launched ${template.name} as ${body.changeId}. It will pause for your decision when it hits the shared path.`
-          : `launched ${template.name} as ${body.changeId}. It runs to completion with no human step.`,
+        launchMode === "board"
+          ? `launched ${template.name} with agents on the board as ${body.changeId}. ${
+              contractPolicy === "console"
+                ? "Contract decisions wait for your answer here."
+                : `Contract decisions are answered automatically (${contractPolicy}).`
+            }`
+          : template.escalates
+            ? `launched ${template.name} as ${body.changeId}. It will pause for your decision when it hits the shared path.`
+            : `launched ${template.name} as ${body.changeId}. It runs to completion with no human step.`,
       );
     } catch {
       setNotice("cannot reach the launcher. Is `make dev-all` running?");
     }
     setBusy(false);
-  }, [min, max]);
+  }, [min, max, launchMode, contractPolicy, resetBoard]);
 
   // Manual Deploy (BEFORE a fix): deploy an app template's app in its CURRENT
   // (broken) state to its STABLE workers.dev URL, so the watcher sees the break
@@ -429,6 +512,8 @@ export function App() {
         setChangeId(null);
         setActiveTemplate(null);
         setLaunchStatus(null);
+        setRunMode(null);
+        resetBoard();
         setGalleryOpen(true);
         if (teardownApp) {
           setDeployedUrls((prev) => {
@@ -444,10 +529,35 @@ export function App() {
       setNotice("cannot reach the launcher to clean up. Is `make dev-all` running?");
     }
     setBusy(false);
-  }, [changeId, activeTemplate]);
+  }, [changeId, activeTemplate, resetBoard]);
+
+  // Answer a board escalation (a contest or a protected contract) through the
+  // existing resolve route, proxied by the launcher when it can.
+  const resolveBoardEscalation = useCallback(
+    async (id: string, decision: string) => {
+      if (!changeId) {
+        return;
+      }
+      setBusy(true);
+      try {
+        const res = await resolveEscalation(fetch, WORKER_BASE, changeId, id, decision);
+        if (res.ok) {
+          setNotice(`escalation ${id} resolved: ${decision}. The board continues.`);
+          await load(changeId);
+        } else {
+          const parsed = (await res.json().catch(() => ({}))) as { error?: string };
+          setNotice(parsed.error ?? `request failed (${res.status})`);
+        }
+      } catch {
+        setNotice(`cannot reach the Worker at ${WORKER_BASE}`);
+      }
+      setBusy(false);
+    },
+    [changeId, load],
+  );
 
   return (
-    <main className="app-shell">
+    <main className={`app-shell${boardMode ? " is-wide" : ""}`}>
       <header className="app-header">
         <h1>Switchyard Change Fabric</h1>
         <p className="tagline">A living work graph, every node backed by real state</p>
@@ -462,6 +572,7 @@ export function App() {
         onToggle={() => setGalleryOpen((open) => !open)}
         onLaunch={launchTemplate}
         onDeploy={deployApp}
+        launchMode={launchMode}
       >
         <DialControl
           min={min}
@@ -469,6 +580,13 @@ export function App() {
           locked={Boolean(changeId)}
           onMin={setMin}
           onMax={setMax}
+        />
+        <RunModeControl
+          mode={launchMode}
+          policy={contractPolicy}
+          locked={Boolean(changeId)}
+          onMode={setLaunchMode}
+          onPolicy={setContractPolicy}
         />
       </TemplateGallery>
 
@@ -518,7 +636,25 @@ export function App() {
         </section>
       ) : null}
 
-      {snapshot && changeId && (snapshot.escalations?.length ?? 0) > 0 ? (
+      {boardMode ? (
+        <>
+          {boardError ? <p className="error">{boardError}</p> : null}
+          {boardLog.length > 0 ? (
+            <MissionControl
+              log={boardLog}
+              escalations={(snapshot?.escalations ?? []) as readonly BoardEscalationRecord[]}
+              busy={busy}
+              onResolve={resolveBoardEscalation}
+            />
+          ) : (
+            <section className="app-panel">
+              <p className="muted">Waiting for the board: the goal has not been posted yet.</p>
+            </section>
+          )}
+        </>
+      ) : null}
+
+      {!boardMode && snapshot && changeId && (snapshot.escalations?.length ?? 0) > 0 ? (
         <EscalationPanel
           escalations={snapshot.escalations ?? []}
           busy={busy}
@@ -537,14 +673,14 @@ export function App() {
         />
       ) : null}
 
-      {model ? (
+      {!boardMode && model ? (
         <section className="app-panel graph-panel" aria-label="Living work graph">
           <GraphView model={model} selectedId={selectedId} onSelect={setSelectedId} />
           <Legend />
         </section>
       ) : null}
 
-      {selectedNode ? (
+      {!boardMode && selectedNode ? (
         <NodeDetail
           node={selectedNode}
           changePassed={model ? changeHasPassed(model) : false}
@@ -571,6 +707,7 @@ function TemplateGallery({
   onToggle,
   onLaunch,
   onDeploy,
+  launchMode = "live",
   children,
 }: {
   templates: readonly Template[];
@@ -581,6 +718,7 @@ function TemplateGallery({
   onToggle: () => void;
   onLaunch: (template: Template) => void | Promise<void>;
   onDeploy: (template: Template) => void | Promise<void>;
+  launchMode?: LaunchMode;
   children?: ReactNode;
 }) {
   if (collapsed) {
@@ -614,6 +752,7 @@ function TemplateGallery({
       <ul className="template-list">
         {templates.map((template) => {
           const deployedUrl = template.app ? deployedUrls[template.app] : undefined;
+          const canLaunch = launchMode === "live" || boardCapable(template);
           return (
             <li
               key={template.id}
@@ -652,15 +791,64 @@ function TemplateGallery({
                     {deployedUrl ? "Redeploy current state" : "Deploy app (see it broken)"}
                   </button>
                 ) : null}
-                <button type="button" onClick={() => void onLaunch(template)} disabled={busy}>
-                  Launch {template.name}
+                <button type="button" onClick={() => void onLaunch(template)} disabled={busy || !canLaunch}>
+                  {launchMode === "board" ? `Launch ${template.name} on the board` : `Launch ${template.name}`}
                 </button>
+                {!canLaunch ? (
+                  <span className="muted">This template has no goal file for the board: it runs with run-live only.</span>
+                ) : null}
               </div>
             </li>
           );
         })}
       </ul>
     </section>
+  );
+}
+
+/**
+ * The run mode for the next launch: the existing run-live driver, or agents
+ * that form around the goal on the board (run-board with the same template's
+ * goal, project, and gate). For a board run, contract decisions (a change to an
+ * existing test) wait for the human in the console unless an automatic policy
+ * is picked, which the launcher passes as --decide-contracts.
+ */
+export function RunModeControl({
+  mode,
+  policy,
+  locked,
+  onMode,
+  onPolicy,
+}: {
+  mode: LaunchMode;
+  policy: ContractPolicy;
+  locked: boolean;
+  onMode: (mode: LaunchMode) => void;
+  onPolicy: (policy: ContractPolicy) => void;
+}) {
+  return (
+    <div className="dial-panel run-mode" aria-label="Run mode">
+      <div className="dial-row">
+        <strong>Run mode</strong>
+        <label>
+          <input type="radio" name="run-mode" checked={mode === "live"} disabled={locked} onChange={() => onMode("live")} /> run-live
+        </label>
+        <label>
+          <input type="radio" name="run-mode" checked={mode === "board"} disabled={locked} onChange={() => onMode("board")} /> agents on the
+          board
+        </label>
+        {mode === "board" ? (
+          <label>
+            contract decisions{" "}
+            <select value={policy} disabled={locked} onChange={(event) => onPolicy(event.target.value as ContractPolicy)}>
+              <option value="console">wait for me in the console</option>
+              <option value="accept">auto accept</option>
+              <option value="reject">auto reject</option>
+            </select>
+          </label>
+        ) : null}
+      </div>
+    </div>
   );
 }
 
@@ -949,7 +1137,13 @@ export function NodeDetail({
         </div>
         <div>
           <dt>Verified</dt>
-          <dd>{node.verified ? "yes" : "no"}</dd>
+          <dd>
+            {node.verified
+              ? "yes"
+              : backing.kind === "change" && backing.gated === false
+                ? "no (no gate ran: nothing checked)"
+                : "no"}
+          </dd>
         </div>
         <div>
           <dt>Backing kind</dt>
@@ -977,7 +1171,12 @@ export function NodeDetail({
 
       {backing.kind === "change" && backing.integrationVerdict !== undefined ? (
         <p className="detail-note muted">
-          Authoritative integration verdict: <strong>{backing.integrationVerdict}</strong>{" "}
+          Authoritative integration verdict:{" "}
+          <strong>
+            {backing.gated === false && backing.integrationVerdict === "verified"
+              ? "unverified: no gate (nothing checked)"
+              : backing.integrationVerdict}
+          </strong>{" "}
           (the final integration gate on the integrated tree decides the goal; ladder
           rounds are advisory).
         </p>

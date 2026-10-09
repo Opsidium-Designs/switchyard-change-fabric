@@ -63,6 +63,7 @@ export {
 } from "./dependency-install.ts";
 
 export { matchesAny, matchesGlob, partitionByScope } from "./pathscope.ts";
+export { gateFailureLine } from "./gate-failure.ts";
 
 export type { GitIdentity } from "./git.ts";
 export { withoutCredentials } from "./git.ts";
@@ -88,3 +89,45 @@ export type {
   VerifyAndIntegrateOptions,
 } from "./change-verification.ts";
 export { ChangeVerification } from "./change-verification.ts";
+
+export type {
+  AdvanceJob,
+  AdvanceJobResult,
+  EgressPhase,
+  GateJob,
+  GateJobResult,
+  IntegrateJob,
+  IntegrateJobResult,
+  IntegrateJobUnit,
+  JobInstallOutcome,
+  JobPhaseRecord,
+  JobProtectedJsonKeys,
+} from "./integrate-job.ts";
+export {
+  ackLine,
+  EGRESS_PHASES,
+  INTEGRATE_JOB_VERSION,
+  integrationJobKey,
+  integrationJobKeyMaterial,
+  JOB_LIMITS,
+  JOB_PROTOCOL,
+  parseGateJob,
+  parseGateJobResult,
+  parseProtocolLine,
+  phaseLine,
+  phaseTransitionAllowed,
+  resultLine,
+  scrubJobText,
+  serializeGateJob,
+} from "./integrate-job.ts";
+export type { GateContainment, GateJobHooks, GateSandbox, RunGateJobOptions } from "./integrate-run.ts";
+export {
+  reapSandbox,
+  runAdvanceJob,
+  runGateJob,
+  runIntegrateJob,
+  SANDBOX_MAX_PROCESSES,
+  SandboxedCommandRunner,
+  sandboxContainment,
+  userProcesses,
+} from "./integrate-run.ts";

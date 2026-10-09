@@ -65,6 +65,12 @@ export interface WorkspaceProvisioner {
    * cannot serve the read-token route.
    */
   issueReadToken?(workspaceName: string, ttlSeconds: number): Promise<IssuedReadToken>;
+  /**
+   * Issue a short-lived, repo-scoped WRITE token for an existing workspace (the
+   * integration Workflow pushes gated commits to the integration repo with one).
+   * Optional, like issueReadToken.
+   */
+  issueWriteToken?(workspaceName: string, ttlSeconds: number): Promise<IssuedReadToken>;
 }
 
 /**
@@ -130,6 +136,18 @@ class CloudflareProvisioner implements WorkspaceProvisioner {
     } catch (error) {
       if (error instanceof BindingUnavailableError) {
         return this.fallback.issueReadToken(workspaceName, ttlSeconds);
+      }
+      throw error;
+    }
+  }
+
+  async issueWriteToken(workspaceName: string, ttlSeconds: number): Promise<IssuedReadToken> {
+    try {
+      const token = await this.provider.issueWriteToken(this.refByName(workspaceName), ttlSeconds);
+      return { tokenId: token.id, token: token.token, tokenExpiresAt: token.expiresAt };
+    } catch (error) {
+      if (error instanceof BindingUnavailableError) {
+        return this.fallback.issueWriteToken(workspaceName, ttlSeconds);
       }
       throw error;
     }
@@ -202,6 +220,16 @@ class WorkerMemoryProvisioner implements WorkspaceProvisioner {
     return {
       tokenId,
       token: `worker-memory-fallback-read-token-${tokenId}`,
+      tokenExpiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
+    };
+  }
+
+  async issueWriteToken(_workspaceName: string, ttlSeconds: number): Promise<IssuedReadToken> {
+    this.counter += 1;
+    const tokenId = `mem-write-${this.counter}`;
+    return {
+      tokenId,
+      token: `worker-memory-fallback-write-token-${tokenId}`,
       tokenExpiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString(),
     };
   }

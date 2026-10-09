@@ -1,0 +1,195 @@
+/**
+ * A deterministic board log for the mission-control graph tests and the
+ * console's offline screenshots, built through the PURE board API (the same
+ * append functions the Worker and the local control call), so every message
+ * in it is one the board itself accepted: agents join and claim, a contest
+ * escalates to a human, a protected contract waits for a human with an
+ * advisory triage, a failing revision asks for a fix, an advisory attribution
+ * is resolved by the next passing revision, rebases are targeted, a tool is
+ * published and reused, and items complete.
+ */
+import {
+  appendBoardMessage,
+  appendDecisionRecorded,
+  appendIntegratedRev,
+  emptyBoard,
+  type BoardAppendResult,
+  type BoardMessage,
+  type BoardState,
+} from "@switchyard-change/change-core";
+
+const AT = "2026-10-09T12:00:00.000Z";
+
+/** A tiny in-memory board that throws on any refused post. */
+export class FixtureBoard {
+  state: BoardState = emptyBoard();
+  readonly log: BoardMessage[] = [];
+
+  private take(result: BoardAppendResult): readonly BoardMessage[] {
+    this.state = result.state;
+    this.log.push(...result.appended);
+    return result.appended;
+  }
+
+  human(draft: Record<string, unknown>): readonly BoardMessage[] {
+    return this.take(appendBoardMessage(this.state, { kind: "human" }, draft, AT));
+  }
+
+  join(agent: string, role?: string, rationale?: string): readonly BoardMessage[] {
+    return this.take(
+      appendBoardMessage(
+        this.state,
+        { kind: "join", agent },
+        { type: "agent.joined", payload: role !== undefined ? { role } : {}, ...(rationale ? { rationale } : {}) },
+        AT,
+      ),
+    );
+  }
+
+  agent(agent: string, draft: Record<string, unknown>): readonly BoardMessage[] {
+    return this.take(appendBoardMessage(this.state, { kind: "agent", agent }, draft, AT));
+  }
+
+  rev(input: Record<string, unknown>): readonly BoardMessage[] {
+    return this.take(appendIntegratedRev(this.state, input, AT));
+  }
+
+  decision(input: Record<string, unknown>): readonly BoardMessage[] {
+    return this.take(appendDecisionRecorded(this.state, input, AT));
+  }
+
+  lastSeqOf(type: string): number {
+    const found = [...this.log].reverse().find((m) => m.type === type);
+    if (!found) throw new Error(`no ${type} on the fixture board`);
+    return found.seq;
+  }
+}
+
+/** The mission-control fixture: a mid-run board with a pending contest escalation and a pending contract. */
+export function missionControlLog(): BoardMessage[] {
+  const b = new FixtureBoard();
+  b.human({
+    type: "goal.posted",
+    payload: {
+      objective: "Reject unauthenticated and invalid requests on every resource",
+      rules: { maxContestTurns: 2, contestIdleMessages: 25, maxFixAttempts: 2 },
+      protected: ["test/users.test.js"],
+      testInventory: { status: "recorded", format: "node-test", count: 18 },
+    },
+  });
+  b.join("lead", "lead", "reads the goal and the repo");
+  b.decision({ juncture: "plan-review", question: "Does this plan cover the goal?", answer: "yes", confidence: 0.91, accepted: true });
+  const items: [string, string, string[]][] = [
+    ["users", "validate and guard /users", ["src/users.js"]],
+    ["orders", "validate and guard /orders", ["src/orders.js"]],
+    ["auth", "require auth on shared routes", ["src/auth.js", "src/shared/"]],
+    ["products", "validate and guard /products", ["src/products.js"]],
+    ["search", "guard /search", ["src/search.js", "src/shared/"]],
+    ["tests", "cover the new checks", ["test/"]],
+  ];
+  for (const [item, objective, scopeHint] of items) {
+    b.agent("lead", {
+      type: "item.proposed",
+      payload: { item, objective, acceptance: [`${item} rejects bad input with 400 and no auth with 401`], scopeHint },
+      rationale: `one item per concern: ${item}`,
+    });
+  }
+  for (const agent of ["ag-1", "ag-2", "ag-3", "ag-4", "ag-5", "ag-6"]) {
+    b.join(agent, "worker");
+  }
+  b.agent("ag-1", { type: "item.claimed", payload: { item: "users", intent: { read: ["src/shared/**"], write: ["src/users.js"] } }, rationale: "users first" });
+  b.agent("ag-2", { type: "item.claimed", payload: { item: "orders", intent: { read: [], write: ["src/orders.js"] } } });
+  b.agent("ag-3", {
+    type: "item.claimed",
+    payload: { item: "auth", intent: { read: ["src/users.js"], write: ["src/auth.js", "src/shared/http.js"] } },
+    rationale: "auth helpers live in shared/http",
+  });
+  b.agent("ag-4", { type: "item.claimed", payload: { item: "products", intent: { read: [], write: ["src/products.js"] } } });
+  b.agent("ag-6", { type: "item.claimed", payload: { item: "tests", intent: { read: ["src/**"], write: ["test/validation.test.js"] } } });
+  // A help request addressed to another agent, and its reply.
+  const help = b.agent("ag-1", {
+    type: "help.requested",
+    payload: { request: "h1", item: "users", need: "auth-contract" },
+    to: ["ag-3"],
+    rationale: "need the auth contract before I guard users",
+  });
+  b.agent("ag-3", { type: "help.offered", payload: { request: "h1" }, to: ["ag-1"], inReplyTo: help[0]!.seq, rationale: "401 with a problem body" });
+  // A contest on the shared helper: both keep, so it escalates to a human.
+  b.agent("ag-5", {
+    type: "item.claimed",
+    payload: { item: "search", intent: { read: [], write: ["src/search.js", "src/shared/http.js"] } },
+    rationale: "search needs the same helper",
+  });
+  const contest = String((b.state.items.search?.claimant?.contest) ?? "");
+  b.agent("ag-3", { type: "claim.kept", payload: { contest }, rationale: "I am mid-edit on http.js" });
+  b.agent("ag-5", { type: "claim.kept", payload: { contest }, rationale: "search cannot ship without it" });
+  // Pushes, a failing revision, a fix request, and an advisory attribution.
+  b.agent("ag-1", { type: "push.announced", payload: { item: "users", commit: "a1a1a1a", paths: ["src/users.js"] } });
+  b.agent("ag-2", { type: "push.announced", payload: { item: "orders", commit: "b1b1b1b", paths: ["src/orders.js"] } });
+  b.agent("ag-4", { type: "push.announced", payload: { item: "products", commit: "d1d1d1d", paths: ["src/products.js"] } });
+  b.rev({
+    commit: "rev1rev",
+    gate: "fail",
+    merged: ["a1a1a1a", "b1b1b1b", "d1d1d1d"],
+    failing: { output: "not ok 7 - POST /orders without auth returns 401\n  expected 401, got 201", items: ["orders"] },
+  });
+  b.decision({
+    juncture: "attribution",
+    question: "Which item does this failure implicate?",
+    answer: "orders",
+    confidence: 0.82,
+    accepted: true,
+    rev: 1,
+    parsed: ["orders"],
+  });
+  // Tools: a scanner is proposed, passes its own gate, and is reused.
+  b.agent("ag-4", {
+    type: "tool.proposed",
+    payload: { tool: "route-scan", capability: "scan-unguarded-routes", inputs: ["source-tree"], outputs: ["route-list"] },
+    rationale: "every resource repeats the same check",
+  });
+  b.agent("ag-4", {
+    type: "tool.published",
+    payload: { tool: "route-scan", capability: "scan-unguarded-routes", version: "1.0.0", repo: "tools", commit: "t00l001", verified: true },
+  });
+  for (const user of ["ag-1", "ag-2", "ag-2"]) {
+    b.agent(user, { type: "tool.used", payload: { capability: "scan-unguarded-routes", version: "1.0.0", changedFiles: [] } });
+  }
+  b.agent("ag-2", { type: "push.announced", payload: { item: "orders", commit: "b2b2b2b", paths: ["src/orders.js"] }, rationale: "requireAuth before the body check" });
+  // auth pushes and proposes done, but the next revision does not merge it: a hollow check.
+  b.agent("ag-3", { type: "push.announced", payload: { item: "auth", commit: "c1c1c1c", paths: ["src/auth.js"] } });
+  b.agent("ag-3", { type: "done.proposed", payload: { item: "auth" }, rationale: "requireAuth is exported" });
+  b.agent("ag-1", { type: "done.proposed", payload: { item: "users" } });
+  b.agent("ag-4", { type: "done.proposed", payload: { item: "products" } });
+  b.rev({ commit: "rev2rev", gate: "pass", merged: ["a1a1a1a", "b2b2b2b", "d1d1d1d"] });
+  b.agent("ag-2", { type: "done.proposed", payload: { item: "orders" } });
+  // A protected contract: escalated to a human, with an advisory triage.
+  b.agent("ag-6", {
+    type: "contract.proposed",
+    payload: { contract: "k1", target: "test/users.test.js", kind: "modify", item: "tests" },
+    rationale: "the old test expects 201 for an anonymous POST",
+  });
+  b.decision({
+    juncture: "contract-triage",
+    question: "Is changing this existing test needed to achieve the goal (rather than weakening the check)?",
+    answer: "accept",
+    confidence: 0.86,
+    accepted: true,
+    contract: "k1",
+  });
+  return b.log;
+}
+
+/** A tiny board whose only revision ran NO gate (gated: false). */
+export function ungatedLog(): BoardMessage[] {
+  const b = new FixtureBoard();
+  b.human({ type: "goal.posted", payload: { objective: "add a footer", rules: { maxContestTurns: 3, contestIdleMessages: 25 } } });
+  b.join("lead", "lead");
+  b.agent("lead", { type: "item.proposed", payload: { item: "footer", objective: "add a footer", acceptance: [], scopeHint: ["src/"] } });
+  b.join("ag-1");
+  b.agent("ag-1", { type: "item.claimed", payload: { item: "footer", intent: { read: [], write: ["src/footer.js"] } } });
+  b.agent("ag-1", { type: "push.announced", payload: { item: "footer", commit: "f00f00f", paths: ["src/footer.js"] } });
+  b.agent("ag-1", { type: "done.proposed", payload: { item: "footer" } });
+  b.rev({ commit: "rev1rev", gate: "pass", merged: ["f00f00f"], gated: false });
+  return b.log;
+}

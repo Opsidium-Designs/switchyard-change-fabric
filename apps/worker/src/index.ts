@@ -21,6 +21,10 @@ import { selectProvisioner } from "./workspace-provisioner.ts";
 // the runtime can instantiate them from their bindings.
 export { ChangeState } from "./change-state.ts";
 export { ChangeWorkflow } from "./workflow.ts";
+// Integration on Cloudflare: the gate container's owner, its egress handler,
+// and the Workflow that integrates a board's pushes.
+export { GateEgress, GateRunner } from "./gate-runner.ts";
+export { IntegrationWorkflow } from "./integration-workflow.ts";
 
 export type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 
@@ -1008,6 +1012,88 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
   }
 
+  // Integration on Cloudflare (see docs/BOARD.md "Integration on Cloudflare").
+  //   POST /changes/:id/integration/cloud            (bearer) configure it for this Change
+  //   GET  /changes/:id/integration/cloud            the configuration (no inventory names), the Workflow, every attempt (open)
+  //   POST /changes/:id/integration/cloud/kick       (bearer) start or coalesce an integration now
+  //   POST /changes/:id/integration/cloud/workspace  (bearer) {ttlSeconds} provision the integration repo (+ a write token, once)
+  //   POST /changes/:id/integration/cloud/token      (bearer) {scope, ttlSeconds} a short-lived token for the integration repo
+  //   POST /changes/:id/integration/cloud/token/revoke (bearer) {tokenId}
+  //   POST /changes/:id/integration/cloud/attribution (bearer) {key, items} the run's advisory attribution of a held failing revision
+  // The configuration (the gate command, the contract, the baseline inventory)
+  // is accepted once, before the goal is posted, and is fixed from then on.
+  const cloudMatch = url.pathname.match(/^\/changes\/([^/]+)\/integration\/cloud(?:\/(kick|workspace|token|token\/revoke|attribution))?$/);
+  if (cloudMatch) {
+    const changeId = decodeURIComponent(cloudMatch[1] ?? "");
+    const action = cloudMatch[2];
+    const stub = changeStateStub(env, changeId);
+    // The integration repo can be provisioned before the Change is created (a
+    // run seeds it and records the baseline inventory first); the rest needs
+    // the Change.
+    const repoAction = action === "workspace" || action === "token" || action === "token/revoke";
+    if (!repoAction && !(await stub.isInitialized())) {
+      return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
+    }
+    if (request.method === "GET" && action === undefined) {
+      return json(await stub.getCloudIntegration());
+    }
+    if (request.method !== "POST") {
+      return json({ error: "not found" }, 404);
+    }
+    const body = await readBoardBody(request);
+    if (!body.ok) {
+      return json({ code: body.code, error: body.error }, body.status);
+    }
+    const value = isPlainObject(body.value) ? body.value : {};
+    if (action === undefined) {
+      const configured = await stub.configureCloudIntegration(body.value);
+      return configured.ok ? json(configured, 201) : json({ code: configured.code, error: configured.error }, configured.code === "INVALID_STATE" ? 409 : 400);
+    }
+    if (action === "attribution") {
+      const answered = await stub.answerCloudAttribution(body.value);
+      if (!answered.ok) {
+        return json({ code: answered.code, error: answered.error }, answered.code === "BAD_PAYLOAD" ? 400 : 409);
+      }
+      if (answered.instanceId && env.INTEGRATION_WORKFLOW && typeof value.key === "string") {
+        // Wake the Workflow waiting for it (it records with the parse alone if this is lost).
+        await env.INTEGRATION_WORKFLOW.get(answered.instanceId)
+          .then((instance) => instance.sendEvent({ type: `attribution-${value.key}`, payload: { key: value.key } }))
+          .catch(() => undefined);
+      }
+      return json({ accepted: true }, 201);
+    }
+    if (action === "kick") {
+      return json(await kickCloudIntegration(env, changeId));
+    }
+    const ttl = value.ttlSeconds === undefined ? 900 : value.ttlSeconds;
+    const { min, max } = BOARD_WORKSPACE_TTL_BOUNDS;
+    if (action !== "token/revoke" && (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < min || ttl > max)) {
+      return json({ code: "BAD_PAYLOAD", error: `ttlSeconds must be an integer from ${min} to ${max}` }, 400);
+    }
+    const provisioner = selectProvisioner(env);
+    const workspaceName = ((await stub.isInitialized()) ? (await stub.getCloudIntegrationRepo())?.workspaceName : undefined) ?? integrationWorkspaceName(changeId);
+    try {
+      if (action === "workspace") {
+        return json(await provisioner.provision(integrationWorkspaceName(changeId), { ttlSeconds: ttl as number }), 201);
+      }
+      if (action === "token") {
+        const scope = value.scope ?? "read";
+        const issue = scope === "write" ? provisioner.issueWriteToken?.bind(provisioner) : scope === "read" ? provisioner.issueReadToken?.bind(provisioner) : undefined;
+        if (!issue) {
+          return json({ code: "BAD_PAYLOAD", error: 'scope must be "read" or "write" (and this Worker must be able to issue it)' }, 400);
+        }
+        return json({ workspaceName, ...(await issue(workspaceName, ttl as number)) }, 201);
+      }
+      if (typeof value.tokenId !== "string" || value.tokenId === "") {
+        return json({ code: "BAD_PAYLOAD", error: "a revoke names a tokenId" }, 400);
+      }
+      await provisioner.revoke(workspaceName, value.tokenId);
+      return json({ revoked: value.tokenId });
+    } catch (error) {
+      return json({ code: "INVALID_STATE", error: `the integration repo operation failed: ${errorMessage(error)}` }, 502);
+    }
+  }
+
   // The Change board. Identity is established by the route, never by the
   // message body:
   //   POST /changes/:id/board/join      (bearer) an agent joins; returns its board token
@@ -1074,7 +1160,14 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
             await provisioner.archive(provisioned.workspaceName).catch(() => {});
           };
           try {
-            outcome = await stub.joinBoard(join.agent, { role: join.role, rationale: join.rationale }, { withWorkspace: true });
+            outcome = await stub.joinBoard(
+              join.agent,
+              { role: join.role, rationale: join.rationale },
+              {
+                withWorkspace: true,
+                repo: { workspaceName: provisioned.workspaceName, gitUrl: provisioned.gitUrl, defaultBranch: provisioned.defaultBranch },
+              },
+            );
           } catch (error) {
             await undo();
             return json({ code: "INVALID_STATE", error: `the join failed: ${errorMessage(error)}` }, 500);
@@ -1097,6 +1190,12 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
           return json({ code: "AUTH", error: `an agent board post requires the ${BOARD_TOKEN_HEADER} header` }, 401);
         }
         outcome = await stub.postBoardAsAgent(token, body.value);
+        if (outcome.ok && outcome.appended.some((m) => m.type === "push.announced")) {
+          // An announced push is what integration on Cloudflare reacts to (when
+          // configured): start the Change's integration Workflow, or coalesce
+          // into the running one. Never fails the agent's post.
+          await kickCloudIntegration(env, changeId).catch(() => undefined);
+        }
       }
       return outcome.ok
         ? json(outcome, 201)
@@ -1701,6 +1800,58 @@ function numberOr(value: unknown, fallback: number): number {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** The integration repo of a Change run integrated on Cloudflare. */
+export function integrationWorkspaceName(changeId: string): string {
+  return `${changeId}--integration`.replace(/[^A-Za-z0-9._-]+/g, "-");
+}
+
+/** What asking for integration on Cloudflare did. */
+export interface CloudIntegrationKick {
+  readonly started: boolean;
+  readonly coalesced?: boolean;
+  readonly instanceId?: string;
+  readonly reason?: string;
+}
+
+/**
+ * Ask for integration on Cloudflare: start the Change's IntegrationWorkflow,
+ * or coalesce into the active one. An active instance that ended without
+ * finishing (errored, terminated) is cleared and replaced.
+ */
+export async function kickCloudIntegration(env: EnvWithProvisioner, changeId: string): Promise<CloudIntegrationKick> {
+  const workflow = env.INTEGRATION_WORKFLOW;
+  if (!workflow) {
+    return { started: false, reason: "this Worker has no INTEGRATION_WORKFLOW binding" };
+  }
+  const stub = changeStateStub(env, changeId);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const request = await stub.requestCloudIntegration();
+    if (request.start && request.instanceId) {
+      try {
+        await workflow.create({ id: request.instanceId, params: { changeId, instanceId: request.instanceId } });
+        return { started: true, instanceId: request.instanceId };
+      } catch (error) {
+        await stub.clearCloudIntegration(request.instanceId);
+        return { started: false, reason: `the integration Workflow could not start: ${errorMessage(error)}` };
+      }
+    }
+    if (request.coalesced && request.activeInstance) {
+      const status = await workflow
+        .get(request.activeInstance)
+        .then((instance) => instance.status())
+        .then((s) => s.status as string)
+        .catch(() => "missing");
+      if (["errored", "terminated", "complete", "missing"].includes(status)) {
+        await stub.clearCloudIntegration(request.activeInstance);
+        continue;
+      }
+      return { started: false, coalesced: true, instanceId: request.activeInstance };
+    }
+    return { started: false, ...(request.reason ? { reason: request.reason } : {}) };
+  }
+  return { started: false, reason: "the integration Workflow could not be started" };
 }
 
 export default {

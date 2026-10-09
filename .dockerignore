@@ -1,0 +1,11 @@
+# The only image built from the repository root is the integration gate
+# container (apps/worker/containers/gate/Dockerfile, image_build_context in
+# apps/worker/wrangler.jsonc). Admit exactly what it copies.
+*
+!packages/verification/package.json
+!packages/verification/src/**
+!packages/artifact-workspace/package.json
+!packages/artifact-workspace/src/**
+!packages/change-core/package.json
+!packages/change-core/src/**
+!node_modules/yaml/**

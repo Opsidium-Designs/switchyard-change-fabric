@@ -82,6 +82,12 @@ Who sent a message is established by the route, never by the message body.
 | `POST /changes/:id/board/human` | bearer | A human message. |
 | `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected `contract`. It changes only the decision counts, never arbitration or the verdict. |
 | `POST /changes/:id/integration/revision` | bearer | An integration result `{commit, gate, merged, failing?}`; appends `integrated.rev` and what it triggers (completions and `rebase.needed` on a pass, `fix.requested` / `fix.exhausted` on a fail). |
+| `POST /changes/:id/integration/cloud` | bearer | Configure integration on Cloudflare for the Change: `{integration: {workspaceName, gitUrl, defaultBranch}, gateCommand?, requireGate, protectedPaths, protectedJsonKeys, testInventory?, gateSupportFiles?, timeouts: {installMs, gateMs}, identity?, registryHost?, attribution?: "engine"|"driver"}`, validated with the job schema (tokenless `https` URLs only). It is part of the goal-time record: accepted ONCE and only BEFORE `goal.posted`; any later change (for example a gate command of `true`) is refused with `409`. From then on every `push.announced` starts or coalesces the integration Workflow. See "Integration on Cloudflare" below. |
+| `POST /changes/:id/integration/cloud/attribution` | bearer | `{key, items}`: the run's ADVISORY attribution of a failing revision the Workflow holds (`attribution: "driver"`): items it merged only (`[]` = no confident choice). `409` for an unknown key or a second answer. |
+| `GET /changes/:id/integration/cloud` | open | The configuration (the test inventory as count and format only, never its names), the active Workflow, and every revision attempt: recorded or not and why, the egress phases the job ran under, the install outcome, the evidence, and whether the integration branch was advanced. |
+| `POST /changes/:id/integration/cloud/kick` | bearer | Start the integration Workflow now, or coalesce into the active one (an active instance that errored or was terminated is replaced). |
+| `POST /changes/:id/integration/cloud/workspace` | bearer | `{ttlSeconds}`: provision the integration repo (`<change>--integration`) and a write token, returned once (the run seeds the baseline with it). Allowed before the Change exists. |
+| `POST /changes/:id/integration/cloud/token` | bearer | `{scope: "read" or "write", ttlSeconds}`: a short-lived token for the integration repo (promotion reads with one). `.../token/revoke {tokenId}` revokes it. |
 | `GET /changes/:id/board?after=<seq>&limit=<n>` | open | One page (default 500, at most 1000) of messages after `seq`, `hasMore`, and the reduced state. |
 | `GET /changes/:id/board?for=<agent>&after=<seq>` | that agent's token | The agent's digest: its claims (with any unanswered fix request), pending claims, open contests it is in, open items, the latest passing revision, its rebase target, the latest failing revision's evidence when it asks this agent for a fix, the protected set, `pageEnd` (the last seq the page covered: page by it, since the messages are filtered), and the messages since `seq` addressed to it or touching its work. |
 | `GET /changes/:id/board/verify` | open | Re-verifies that the stored log reduces to exactly the stored state (`409` if not). |
@@ -383,8 +389,9 @@ is distributed changes: items are proposed and claimed, never assigned.
   board revision that changed an unreleased contract path or key.
 ### Continuous integration and the fix loop
 
-- `integrateBoardRevision` is a function of board state (a future queue or
-  workflow integrator can call it per `push.announced`): one unit per agent with
+- `integrateBoardRevision` is a function of board state (the input synthesis,
+  `planBoardIntegration` in change-core, is shared with the integration
+  Workflow on Cloudflare, below): one unit per agent with
   pending pushes on items it still holds, PINNED to its latest pending announced
   commit (the clone checks out exactly that commit; every other merged commit of
   the agent must be in its history), diffed against the agent's last commit a
@@ -603,12 +610,128 @@ make demo-board                     # offline: local control, generic policy, no
 switchyard-change run-board --offline [--fixture-gate] [--decide-contracts accept|reject] --goal-file <goal.txt> --project <dir> [--min N] [--max N]
 switchyard-change run-board "<goal>" --project <dir> --worker <url> [--min N] [--max N] \
   [--id <changeId>] [--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] \
-  [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--lockstep] [--gate|--no-gate] [--watch] [--allow-heuristic-planner]
+  [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] \
+  [--lockstep] [--gate|--no-gate] [--watch] [--allow-heuristic-planner]
 ```
+
+`--integrator local` (the default) integrates in the driver process;
+`--integrator cloud` leaves integration to the Worker's integration Workflow,
+with the gate in a Cloudflare Container (next section). `make run-board
+INTEGRATOR=cloud` passes it through.
 
 A live board run needs `EXECUTOR=ai-gateway` with the gateway URL and token
 (the turn model is `AI_GATEWAY_AGENT_MODEL`, else `AI_GATEWAY_MODEL`); without a
 live turn model it refuses rather than substituting the offline policy.
+
+## Integration on Cloudflare (`--integrator cloud`)
+
+With the cloud integrator the driver does not integrate. The Worker does, on
+Cloudflare primitives, through the same board path and with the same
+integrator code:
+
+- **Trigger.** An agent's `push.announced` (the board's authoritative signal:
+  the commit is pinned there) asks the ChangeState for integration. When no
+  integration Workflow is active for the Change, one starts
+  (`IntegrationWorkflow`); otherwise the active one is marked to look again
+  before it finishes, so pushes that land while a revision runs are coalesced
+  into the next. One revision at a time per Change. The Artifacts `repo.pushed`
+  queue path is unchanged (it drives run-live's recruitment, not the board).
+- **Plan.** A durable step plans the next revision's job from the board with
+  `planBoardIntegration`, exactly as the local integrator does (pins, includes,
+  diff bases, write-intent scope, yielded files, released contract paths, the
+  last recorded passing revision as the base). The job's idempotency key is the
+  Change, the base commit, and the pinned commits (`integrationJobKey`): every
+  later step is named by it, and a Workflow retry never integrates anything
+  else.
+- **Run.** The run step mints short-lived Artifact tokens Worker-side (a READ
+  token per agent repo, a WRITE token for the integration repo, TTL just over
+  the job's deadline), runs the job in the GateRunner's container, and revokes
+  the tokens in the same step. The step's timeout is the job's deadline
+  (install + gate + 5 minutes) plus 2 minutes. A job that cannot run (the
+  container, the tokens) is retried twice by the Workflow, then recorded as
+  transient (not a verdict; the same pushes are tried again on the next push or
+  kick).
+- **Containment.** Every job runs in a FRESH container: the GateRunner
+  destroys any running container, starts one from the image, and refuses to
+  start the job unless it is clean (no sandbox-user process; nothing in the
+  work root, the temp dirs, or the sandbox user's home); after the job,
+  success or failure, the container is destroyed. Inside a job the install and
+  the gate run as the sandbox user, capped at 512 processes (RLIMIT_NPROC), with
+  a HOME and temp dir inside the job's own root; whatever that user owns
+  outside the job root is removed before the job (and the job refuses to start
+  if anything remains). After the install and after the gate, every sandbox
+  process is killed with `kill(-1)` issued as the sandbox user (the kernel
+  signals all of them in one pass, so a respawning child cannot outrun it), and
+  the job THROWS if one survives: the result is refused and transient, no
+  verdict, and the push phase is never entered. Before each credentialed
+  phase (fetch, push) both the CLI and the GateRunner (from outside, as root)
+  check that no sandbox process is alive. A PID namespace (`unshare --pid`)
+  is not available in the container (not permitted), so the process cap, the
+  kill, and the checks are what contain the sandbox. tini is PID 1 and reaps
+  orphans.
+- **Attribute.** A failing revision's implicated items come from the same
+  parse as the local integrator (the failing output's files and names mapped to
+  the merged items' write intents, `attributeFailure` in change-core); when
+  nothing maps, every merged item. When the run has a decision model, the
+  configuration says `attribution: "driver"`: the Workflow holds the failing
+  revision (bounded, 3 minutes) and the run sends its advisory typed-decision
+  choice (`POST .../integration/cloud/attribution`, items it merged only); a
+  confident choice narrows exactly as it does locally, no answer or "no
+  choice" leaves the parse. The run records the decision on the board linked
+  to the revision.
+- **Record.** The result is recorded through the SAME path as
+  `POST /changes/:id/integration/revision` (`appendIntegratedRev` in the
+  ChangeState), with the local integrator's rules: nothing is recorded when
+  every pending push was excluded or the integrator refused, nor when a merged
+  push was superseded while the gate ran (the next plan integrates the newer
+  set); a failing revision carries its bounded, credential-scrubbed output.
+  Recording is idempotent by the job key (a replayed step returns the stored
+  record and never appends a second revision).
+- **Advance.** After a recorded pass, a second, git-only job fast-forwards the
+  integration branch to the gated commit and prunes the candidate refs
+  (`advanceIntegrationBranch`), so promotion clones a branch whose head is the
+  gated tree.
+- **Promote (local).** The driver follows the attempts (`GET
+  /changes/:id/integration/cloud`), turns recorded ones into its revisions
+  (with their evidence), waits for the Workflow to settle at the end, and
+  promotes as always: it reads the integration repo with a fresh short-lived
+  token, pins the gated commit, and refuses unless the promoted tree is the
+  gated tree.
+
+The job (`packages/verification/src/integrate-job.ts`) is tokenless JSON: the
+integration repo and every agent repo by URL only, the pinned commits, the
+contract, the baseline inventory (names stay in the Worker; the open view
+shows count and format only), the gate's shared support files, and the
+timeouts. The container's CLI (`integrate-cli.ts`) runs it with the unchanged
+`ChangeVerification` / `Integrator` / `LockfileDependencyInstaller` and prints
+the result: the gated commit, the verdict, the failing line, the bounded
+evidence, the install outcome, the executed-test count, and the phases.
+
+Egress phases inside one job (the container starts with internet access off;
+only intercepted hosts resolve, and the GateRunner's egress handler decides
+each request; switching a phase re-registers the handler with the next
+phase's policy):
+
+| Phase | Reachable | What runs |
+|---|---|---|
+| `fetch` | the Artifacts host, only the job's repos, git smart HTTP; the handler adds that repo's token | clone the integration repo and every pinned unit commit, verify each unit, compose, restore the contract, commit |
+| `deps` | the package registry (`registry.npmjs.org`), GET/HEAD only, no credential | `npm ci --ignore-scripts` (or pnpm/yarn from their lockfiles) as the unprivileged sandbox user |
+| `gate` | nothing | the gate command, as the sandbox user |
+| `push` | the Artifacts host again, as in `fetch` | every sandbox-user process is killed first; then the drift check and the trusted-repo push of the gated commit to its candidate ref |
+
+The CLI asks for each phase on its own stdout and waits for the GateRunner's
+acknowledgement on its stdin; the GateRunner moves the policy before it
+acknowledges, and refuses a phase that moves backwards. The install and the
+gate run as another user (`scfgate`, uid 64321, via `setpriv`), so they cannot
+read the integrator's trusted repo, its memory, or its protocol streams, and
+cannot forge a phase change. The phases each revision ran under are recorded
+with the attempt.
+
+Posture: the integration routes sit behind the same optional
+`SWITCHYARD_API_TOKEN` bearer as every other mutating route. With the bearer
+unset (local `wrangler dev` on localhost) anyone who can reach the Worker can
+create a Change and configure its integration before its goal; set the token
+before exposing the Worker on a LAN (`make dev-all-lan`) or deploying it.
 
 Glob note: `**` matches whole path segments in both matchers (the path scope
 and intent overlap): `src/**/x` matches `src/x`, `src/a/x`, and `src/a/b/x`,

@@ -1,6 +1,8 @@
 import type { ArtifactsBinding } from "@switchyard-change/artifact-workspace";
 
 import type { ChangeState } from "./change-state.ts";
+import type { GateRunner } from "./gate-runner.ts";
+import type { IntegrationWorkflowParams } from "./integration-workflow.ts";
 
 /**
  * Typed Worker bindings (wrangler.jsonc). In a configured build these can be
@@ -29,4 +31,11 @@ export interface Env {
    * `apps/worker/.dev.vars` (wrangler dev). See src/auth.ts.
    */
   readonly SWITCHYARD_API_TOKEN?: string;
+  /**
+   * Integration on Cloudflare (optional): the Durable Object that owns the gate
+   * container, and the Workflow that integrates a board's announced pushes in
+   * it. Absent bindings leave integration to the local driver.
+   */
+  readonly GATE_RUNNER?: DurableObjectNamespace<GateRunner>;
+  readonly INTEGRATION_WORKFLOW?: Workflow<IntegrationWorkflowParams>;
 }

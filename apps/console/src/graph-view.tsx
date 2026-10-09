@@ -495,7 +495,8 @@ export function isNonBlockingRoundFail(node: GraphNode, changePassed: boolean): 
 export function changeHasPassed(model: WorkGraphModel): boolean {
   const goal = model.nodes.find((n) => n.kind === "goal");
   if (goal && goal.backing.kind === "change" && goal.backing.integrationVerdict !== undefined) {
-    return goal.backing.integrationVerdict === "verified";
+    // A pass with no gate checked nothing: it is not a pass to lean on.
+    return goal.backing.integrationVerdict === "verified" && goal.backing.gated !== false;
   }
   return model.nodes.some((n) => n.kind === "verify" && n.verified);
 }

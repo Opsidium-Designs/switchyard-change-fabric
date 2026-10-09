@@ -269,3 +269,34 @@ export {
 
 export type { JevSmokeResult } from "./jev-smoke.ts";
 export { runJevSmoke } from "./jev-smoke.ts";
+
+export type {
+  BoardCaption,
+  BoardColumns,
+  BoardEscalationAtK,
+  BoardGraphEdge,
+  BoardGraphEdgeKind,
+  BoardGraphModel,
+  BoardGraphNode,
+  BoardGraphNodeKind,
+  BoardHullRect,
+  BoardLayout,
+  BoardMessageFamily,
+  BoardNodeDetail,
+  BoardPoint,
+  BoardSelection,
+  BoardTicker,
+} from "./board-graph.ts";
+export {
+  aggregateMessageEdges,
+  assertBoardBacked,
+  boardCaptions,
+  boardJumpTargets,
+  boardLayout,
+  boardMessageFamily,
+  boardNodePoint,
+  boardThread,
+  buildBoardGraph,
+  pendingEscalations,
+  revVerdictLabel,
+} from "./board-graph.ts";

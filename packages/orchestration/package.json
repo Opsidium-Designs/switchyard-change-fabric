@@ -9,7 +9,8 @@
   "types": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./graph-model": "./src/graph-model.ts"
+    "./graph-model": "./src/graph-model.ts",
+    "./board-graph": "./src/board-graph.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

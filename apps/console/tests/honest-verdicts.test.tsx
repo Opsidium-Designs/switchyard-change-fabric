@@ -117,6 +117,24 @@ describe("changeHasPassed follows the authoritative integration verdict", () => 
     );
     expect(changeHasPassed(model)).toBe(true);
   });
+
+  it('is false, and the goal reads "unverified: no gate", when the integration ran no gate', () => {
+    const model = buildWorkGraphModel(
+      snapshot({
+        ...ladderPass,
+        integration: { verdict: "verified", integratedUnits: ["fix"], excludedUnits: [], gated: false },
+      }),
+    );
+    expect(changeHasPassed(model)).toBe(false);
+    const goal = model.nodes.find((n) => n.kind === "goal")!;
+    expect(goal.verified).toBe(false);
+    const graph = renderToStaticMarkup(createElement(GraphView, { model, selectedId: null, onSelect: () => {} }));
+    expect(graph).toContain("WARNING: unverified: no gate (nothing checked)");
+    expect(graph).not.toContain('class="node node-goal is-verified');
+    const detail = renderToStaticMarkup(createElement(NodeDetail, { node: goal, onClose: () => {} }));
+    expect(detail).toContain("unverified: no gate (nothing checked)");
+    expect(detail).toContain("no (no gate ran: nothing checked)");
+  });
 });
 
 describe("console mutations prefer the launcher auth proxy", () => {

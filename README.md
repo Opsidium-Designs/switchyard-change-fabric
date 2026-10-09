@@ -106,8 +106,12 @@ edit, and push; every push is integrated continuously into the next gated
 revision (the original code's tests and the gate's configuration are a
 contract no agent changes alone), a failing revision asks the
 implicated owners for a fix, and only the last revision, when it passed, is
-promoted (`make demo-board` offline, `make run-board` live). See
-[docs/BOARD.md](./docs/BOARD.md).
+promoted (`make demo-board` offline, `make run-board` live). With
+`--integrator cloud` the integration runs on Cloudflare instead of in the
+driver: a Workflow gates each revision in a Cloudflare Container with phased
+egress (`make dev-containers` locally, Docker required). See
+[docs/BOARD.md](./docs/BOARD.md) and the "Integration on Cloudflare" section of
+[docs/LIVE-DEPLOY.md](./docs/LIVE-DEPLOY.md).
 
 ### What the graph shows
 

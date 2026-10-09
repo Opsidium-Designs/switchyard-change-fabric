@@ -7,7 +7,7 @@
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
-    "dev": "wrangler dev --ip ${WRANGLER_DEV_IP:-127.0.0.1} --port ${WRANGLER_DEV_PORT:-8787}",
+    "dev": "wrangler dev --ip ${WRANGLER_DEV_IP:-127.0.0.1} --port ${WRANGLER_DEV_PORT:-8787} --enable-containers=${WRANGLER_ENABLE_CONTAINERS:-false}",
     "deploy": "wrangler deploy",
     "cf-typegen": "wrangler types",
     "typecheck": "wrangler types && tsc --noEmit",
@@ -16,11 +16,12 @@
   },
   "dependencies": {
     "@switchyard-change/artifact-workspace": "*",
-    "@switchyard-change/change-core": "*"
+    "@switchyard-change/change-core": "*",
+    "@switchyard-change/verification": "*"
   },
   "devDependencies": {
     "typescript": "5.9.3",
     "vitest": "^2.1.8",
-    "wrangler": "^4.40.0"
+    "wrangler": "4.149.0"
   }
 }

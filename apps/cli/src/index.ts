@@ -832,7 +832,7 @@ const commands: Command[] = [
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
       `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--id <changeId>] ` +
-      `[--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--lockstep] [--gate|--no-gate] [--watch] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+      `[--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--lockstep] [--gate|--no-gate] [--watch] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const goal = await resolveGoal(args);
@@ -866,6 +866,17 @@ const commands: Command[] = [
       const gateTimeoutMs = gateTimeoutRaw === undefined ? undefined : Number(gateTimeoutRaw);
       if (gateTimeoutMs !== undefined && (!Number.isInteger(gateTimeoutMs) || gateTimeoutMs < 1000)) {
         console.error("Error: --gate-timeout-ms must be an integer of at least 1000");
+        return 1;
+      }
+      // Who integrates: this process (local, the default), or the Worker's
+      // integration Workflow with the gate in a Cloudflare Container (cloud).
+      const integratorFlag = optionValue(args, "--integrator") ?? "local";
+      if (integratorFlag !== "local" && integratorFlag !== "cloud") {
+        console.error("Error: --integrator must be local or cloud");
+        return 1;
+      }
+      if (integratorFlag === "cloud" && hasFlag(args, "--offline")) {
+        console.error("Error: --integrator cloud needs a live Worker; the offline board run integrates locally");
         return 1;
       }
       const gateWiring = buildAppGateWiring({
@@ -993,8 +1004,14 @@ const commands: Command[] = [
       console.log(`  agent turns: ${turn.description}`);
       console.log(`  executor: ${selected.description}`);
       console.log(`  ${gateLine}`);
+      console.log(
+        integratorFlag === "cloud"
+          ? "  integrator: cloud (the Worker's integration Workflow gates each revision in a Cloudflare Container; promotion stays local)"
+          : "  integrator: local (this process integrates and gates each revision)",
+      );
       console.log("");
       const result = await runBoard({
+        ...(integratorFlag === "cloud" ? { integrator: "cloud" as const, ...(gateTimeoutMs !== undefined ? { cloudGateTimeoutMs: gateTimeoutMs } : {}) } : {}),
         goal,
         projectDir,
         changeId,
