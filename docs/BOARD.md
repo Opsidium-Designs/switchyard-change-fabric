@@ -77,8 +77,9 @@ Who sent a message is established by the route, never by the message body.
 | Route | Auth | Effect |
 |---|---|---|
 | `POST /changes/:id/board/join` | bearer | `{agent, role?, rationale?, workspace?: {ttlSeconds}}` appends `agent.joined`; `201 {appended, token, workspace?}`. With `workspace`, the join is validated first (a join the board would refuse provisions nothing), then the agent's own repo (`<change>--board-<agent>`) and a repo-scoped write token with that explicit TTL (60 to 3600 s) are provisioned and returned once; a join refused or failing after that revokes the token AND archives the repo. |
-| `POST /changes/:id/board/read-token` | bearer | `{agent, ttlSeconds?}` (default 600, 60 to 3600): a short-lived READ token for a joined agent's repo, for the integrator. `201 {workspaceName, tokenId, token, tokenExpiresAt}`. The lead and an agent that joined without a workspace have no repo (`400 NOT_ALLOWED`). |
-| `POST /changes/:id/board/read-token/revoke` | bearer | `{agent, tokenId}`: revoke a read token the integrator is done with. |
+| `POST /changes/:id/board/read-token` | bearer | `{agent, ttlSeconds?, help?}` (default 600, 60 to 3600): a short-lived READ token for a joined agent's repo, for the integrator. `201 {workspaceName, tokenId, token, tokenExpiresAt}`. The lead and an agent that joined without a workspace have no repo (`400 NOT_ALLOWED`). With `help` (a help request id) it reads that request's FORK instead, only when `agent` holds the request's grant (the requester's pull). |
+| `POST /changes/:id/board/read-token/revoke` | bearer | `{agent, tokenId, help?}`: revoke a read token the integrator is done with. |
+| `POST /changes/:id/board/help-fork` | bearer | `{request, agent, ttlSeconds?}` (default 900, 60 to 3600): fork the REQUESTER's repo for `agent`, the helper of a help request that grants a scope (`<change>--help-<request>`, the Artifacts repo fork; offline, the local backend copies the repo). The board checks first (`checkHelpFork`: the request grants a scope, is live and not yet granted, the agent is another joined non-lead agent, the requester has a repo), so a fork the board would refuse is never made. `201 {workspaceName, gitUrl, defaultBranch, backend, fallback, tokenId, token, tokenExpiresAt, forkOf}`: the fork's one-time creation token is revoked and only a short write token is returned, once. The helper then posts `help.offered {forkOf, forkCommit, fork}` itself. Forks are archived at cleanup with the agents' repos (`DELETE /workspaces/:name`, which the offline control serves too). |
 | `POST /changes/:id/board` | agent token | `{type, payload, rationale?, inReplyTo?, to?}` appended as that agent; `201 {appended, escalations}`. |
 | `POST /changes/:id/board/human` | bearer | A human message. |
 | `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected `contract`. It changes only the decision counts, never arbitration or the verdict. |
@@ -105,7 +106,7 @@ write, leaves all of them untouched. Rejections carry a machine-readable code:
 `NO_GOAL`, `UNKNOWN_AGENT`, `UNKNOWN_REF`, `DUPLICATE`, `ITEM_NOT_OPEN`,
 `NOT_OWNER`, `CONTEST_OPEN`, `CONTEST_CLOSED`, `INTENT_OVERLAP`,
 `OUTSIDE_INTENT`, `OUTSIDE_SCOPE`, `PROTECTED`, `CONTRACT_REJECTED`, `NOT_WITHIN`, `INVALID_STATE`,
-`LIMIT`. `AUTH` is 401,
+`LIMIT`, `NOT_SUPPORTED` (a split under the cloud integrator). `AUTH` is 401,
 `LIMIT` is 409 (413 for an oversized body), the rest are 400.
 
 ## Envelope
@@ -118,17 +119,20 @@ bounded fields that define an item.
 
 ## Vocabulary
 
-`goal.posted {objective, rules, protected?, protectedKeys?, testInventory?}`, `item.proposed`, `item.accepted {item}`,
+`goal.posted {objective, rules, protected?, protectedKeys?, testInventory?, integrator?: local | cloud}`, `item.proposed`, `item.accepted {item}`,
 `item.rejected {item}` (the lead or a human; a rationale is required), `item.claimed {item, intent:
 {read, write}}`, `claim.granted`, `claim.contested`, `claim.ceded`,
 `claim.kept`, `claim.narrowed {contest, write}`, `claim.resolved`,
 `claim.escalated {..., reason: turns | idle}`, `item.split {item, children}`,
-`item.discovered {..., scopeHint?}`, `help.requested`, `help.offered`,
+`item.discovered {..., scopeHint?}`, `help.requested {request, item, need, scope?}`, `help.offered {request, forkOf?, forkCommit?, fork?}`,
+`help.delivered {request, commit, paths}`, `help.closed {request, reason: declined | pull-failed, detail?}`,
+`item.struggling {item, turnsSpent, failedEdits, reason: failed-edits | turn-budget | failing-revision, lastFailure?}`,
+`help.volunteered {item}` (addressed to the owner), `help.declined {item, volunteer}`,
 `contract.proposed {contract, target, kind, item?}`, `contract.escalated {contract, item,
 target, kind}` (engine: a protected contract waits for a human), `contract.accepted`,
 `contract.rejected`, `push.announced
-{item, commit, paths}`, `integrated.rev {n, commit, gate, merged, paths,
-contributors, failing?: {output, items}, gated?: false}` (`gated: false`: no gate ran, so its pass checked nothing), `rebase.needed`, `review.requested`,
+{item, commit, paths, merges?: [{item, commit}], pulled?: [request]}`, `integrated.rev {n, commit, gate, merged, paths,
+contributors, failing?: {output, items}, gated?: false}` (`gated: false`: no gate ran, so its pass checked nothing; `unverified: [{item, reason}]`: merged children of a sub-lead push the integrator could not verify, not integrated by it), `rebase.needed`, `review.requested`,
 `review.result`, `handoff`, `done.proposed`, `item.completed`, `item.reopened {item, previousOwner, commit?, n?}` (n absent for a tool item)
 (engine: a spent fix budget reopens the item for another agent), `fix.requested
 {item, n, attempt}` (engine, addressed to the item's owner), `fix.exhausted
@@ -166,7 +170,8 @@ decision is made once (`INVALID_STATE` after). A run's completion and its
 partial accounting count only accepted items: a rejected or undecided proposal
 never makes a passing run partial, and the summary lists each one (with the
 lead's rationale for a rejection). Split children stay open (they divide an
-item the agent already holds, inside its scope).
+item the agent already holds, inside its scope and its write intent), so they
+need no acceptance from the lead.
 
 0. Scope and contract. A claim's write intent must lie within the item's
    `scopeHint` (`OUTSIDE_SCOPE`; an item with no scope hint cannot be claimed),
@@ -186,7 +191,7 @@ item the agent already holds, inside its scope).
    (`CONTRACT_REJECTED`, with the reason) until a failing revision implicating
    the item has been recorded since. Contracts on other paths stay the lead's
    to decide. A split child must stay within its parent's scope
-   hint. New test files are never protected.
+   hint (and within its owner's write intent). New test files are never protected.
 1. A claim whose write intent overlaps no other agent's live claim is granted.
    An agent's own claims never contest each other (it is one writer).
 2. An overlapping write intent opens a contest naming the earliest-granted
@@ -215,7 +220,8 @@ item the agent already holds, inside its scope).
 8. Completion is derived, never posted: an item completes when its owner has
    proposed done AND a passing integrated revision merged the owner's latest
    push (whichever happens second triggers it), citing that passing revision.
-   Completing the last child of a split item completes the parent.
+   A split item completes when every child is done AND its sub-lead's push
+   for it passed (rule 11), citing that push's revision.
 9. A passing `integrated.rev` sends `rebase.needed` to each active agent, other
    than the contributors, whose live read or write intent intersects the changed
    paths. A failing one completes nothing; for each item its evidence implicates
@@ -233,12 +239,89 @@ item the agent already holds, inside its scope).
     changed files, names the item that agent holds and the push that carried
     them (inside that item's write intent). An `item.proposed` citing
     `fromTool` comes only from that tool's builder and still needs the lead.
+11. Splits and sub-leads: only the owner splits an item (not a tool item, not
+    in a contest, not while its own push on the item is unintegrated:
+    `INVALID_STATE`), and every child's scope must lie within the item's scope
+    hint and the owner's write intent (`OUTSIDE_INTENT`). The owner becomes the
+    item's SUB-LEAD (`subLead`) and keeps its write intent, which stays a LIVE
+    CLAIM of the sub-lead while it is on the board: a claim on its own
+    children never contests it, but any other claim overlapping it contests
+    the sub-lead (single writer: paths no child covers stay the sub-lead's and
+    nobody ships them), and the sub-lead can neither cede nor narrow it, nor a
+    human hand it to the claimant. A sub-lead's push carries only the write
+    intents of the children it merges (`OUTSIDE_INTENT`), and its integration
+    unit is scoped to exactly those, with the contract paths released for
+    those children. Before a revision marks merged children integrated, the
+    integrator verifies each one: the child's tree at its pushed commit,
+    within its write intent, must equal the sub-lead commit's tree for those
+    paths (content, deletions, released paths); a child that does not match is
+    recorded in the revision's `unverified` with the reason and is not
+    integrated (the sub-lead merges it again). The sub-lead mirrors each
+    child's in-intent tree, deleting what the child deleted. The integration
+    Workflow on Cloudflare does not read children's repos in this slice, so it
+    records every merged child unverified (nothing is integrated on a
+    sub-lead's word), so the goal records the integrator and the board refuses
+    splits under the cloud integrator (`NOT_SUPPORTED`) until it can verify
+    them. A child push a revision recorded unverified is never merged again at
+    the same commit (the child pushes again first), one child push is merged at
+    most 3 times (`LIMIT`), and an empty sub-lead push is refused. No push
+    carries a symlink inside its write intent (the runtime refuses the commit
+    before pushing, and a pull or merge that would bring one), so a
+    sub-lead's mirror and the integrator's check agree. While the sub-lead
+    is on the board, a child's push is NOT integrated directly (an integrated
+    revision merging it is refused): the sub-lead merges children's pushes
+    into its own repo and announces ONE `push.announced` for the split item
+    with `merges` (each a child's latest, unintegrated push; a split item's
+    push must carry merges, and only a split item's may). A passing revision
+    that merges the sub-lead's push integrates those children's pushes too
+    (they complete like any item once their owners proposed done, and their
+    authors are the revision's contributors); a failing one may implicate
+    those children, and the integrators narrow a failure of a split item to
+    the merged children whose write intents the failing output names (all of
+    them when it names none), so the fix goes to the child owners. When the
+    sub-lead has left, its children integrate directly and the split item
+    completes with them.
+12. Help with a fork: `help.requested` with `scope` GRANTS a sub-scope of the
+    requester's write intent on its item (`OUTSIDE_INTENT` otherwise; never
+    overlapping another live grant). The first `help.offered` with `forkOf`
+    (the requester; `forkCommit` its latest announced push, absent when it
+    pushed nothing; `fork` the fork's repo) takes the grant; a second is
+    `DUPLICATE`. A grant nobody has taken blocks nothing: the requester keeps
+    working on the scope and may propose done. Once a helper TAKES it (its
+    fork offer), single-writer holds inside the item while it is live: the
+    requester's pushes may not touch the scope (`INTENT_OVERLAP`) unless they
+    pull the delivered work, and it may not propose done (`INVALID_STATE`).
+    Only the grantee posts `help.delivered` (its fork's commit, concrete paths
+    inside the scope). The requester's `push.announced {pulled: [request]}`
+    closes the grant. Never waiting forever: a grant nobody takes within
+    `helpWaitMessages` (60) board messages of the request, or whose helper left
+    or did not deliver within 60 of its offer, or whose delivered work the
+    requester did not pull within 60 of the delivery, lapses (`helpGrantLive`,
+    a pure function of the board). A delivery is refused once the grant
+    lapsed or closed (a late one never revives it). The requester may close a
+    grant without pulling (`help.closed`: `declined`, or `pull-failed` with the
+    reason; the runtime posts the latter when a pull is refused for changing
+    paths outside the grant or does not merge), and the scope is its own again.
+    A grant may be addressed (`to`): only those agents may fork for it.
+13. Formation cues (status, never a decision): an owner's runtime reports an
+    item going badly with `item.struggling` (two failed or refused edits or
+    tool runs, half its item turn budget spent with no push of its own yet, or
+    a failing revision of ITS OWN push asking it for a fix; an inherited fix
+    request on a handed-off item does not count until its own push fails), at
+    most 3 times per item and owner, never twice the same, only by the current
+    owner, with the last failure of that item's own edits. The report goes stale once its owner pushes again. The
+    owner's digest then shows `struggling` and `idleAgents` (agents holding
+    nothing); an agent that holds nothing while no item is open sees
+    `busyOwners`. It may `help.volunteered` (addressed to the owner; one
+    unanswered offer per agent and item, at most 2), and the owner answers with
+    a grant addressed to it (`help.requested {scope}` with `to`, then the fork
+    flow) or `help.declined`.
 
 ## Limits
 
 Per board: 20000 messages, 1000 items, 100 agents, 200 published tool
 versions (64 findings per use, 16 checks per tool gate), 512 protected paths (more existing tests than that are collapsed into
-their dedicated test directories). Per message: 32 children per split, 64 entries
+their dedicated test directories). Per message: 32 children per split (and 32 merges per sub-lead push), 64 entries
 per intent (each at most 512 characters), 256 paths per push, 8192 characters
 of failing output per failing revision, bounded objective, acceptance, and
 rationale text, and a 64 KB request body. The state keeps counts and latest
@@ -270,7 +353,10 @@ is distributed changes: items are proposed and claimed, never assigned.
   one typed action: `claim`, `propose_item`, `split`, `message` (help,
   question, reply, contract, review; `to` addresses agents), `contest_reply`
   (cede, keep, narrow), `edit`, `propose_done`, `propose_tool`, `build_tool`,
-  `use_tool`, `decide_contract` and `decide_item` (the lead only), or `wait`. A lead turn
+  `use_tool`, `pull` (a sub-lead merges its children's pushes, or a requester
+  pulls a helper's delivered commit), `decide_contract` and `decide_item` (the
+  lead only), or `wait`. A `message` of kind `help` may carry `scope` (the
+  files it grants to a helper who forks its repo). A lead turn
   sees the pending proposals (`board.pendingItems`) and the accepted items
   (`board.items`) to compare them against; a new undecided proposal wakes it. The reply is validated strictly;
   an invalid reply or a failed call becomes a recorded `wait` with the reason.
@@ -291,6 +377,30 @@ is distributed changes: items are proposed and claimed, never assigned.
   board (a handoff to another worker when the board accepts it, else a help
   request with need `turn-budget` or `run-budget`, or `agent.left` when the
   agent holds nothing) and stops the agent.
+- Cues in the runtime: before a turn the runtime posts the owner's
+  `item.struggling` report when a threshold is crossed (once per reason and
+  revision); the turn input carries the digest's `struggling`, `idleAgents`,
+  `busyOwners`, and `volunteers`, and `board.cues.splittable` for struggling
+  items where a split is legal now (no unintegrated push of the owner's on
+  the item, not the cloud integrator) whose write intent spans at least 3 files or whose objective names at
+  least 2 sub-changes (`splitCue`: clauses split on `;`, `,`, `and`, `then`,
+  of at least two words). The model decides: `offer_help {itemId, toAgent,
+  why}`, `answer_volunteer {itemId, volunteer, accept, scope?}`, help with a
+  scope, or a split. A new cue set wakes the agent once (a struggling report
+  wakes agents only while they are free), so cues never storm.
+- Formation in the runtime (see "Splits, sub-leads, and fork-based help"):
+  a `split` posts `item.split` (children `<item>.<n>`); a `pull` on a split
+  item the agent leads copies each child's latest pushed files (inside that
+  child's write intent, read with an operator read token) into its own repo
+  and announces one push with `merges`; a `reply` to a help request that
+  grants a scope forks the requester's repo (the operator's help-fork route)
+  and offers with its lineage; an `edit` on the requester's item by its
+  grantee runs in the fork, only on the granted files, and posts
+  `help.delivered`; a `pull` with `requestId` fetches the delivered commit
+  from the fork, refuses it unless everything it changed since the fork
+  point lies inside the grant, merges it into the requester's own repo (a
+  fast-forward when nothing else moved), pushes, and announces with `pulled`.
+  An owner's own edits never touch files it granted while the grant is live.
 - The lead joins with role `lead`. Its first turn is the existing planner (the
   LLM planner live; a live run without one fails unless
   `--allow-heuristic-planner`, with the loud banner on a fallback); each planned
@@ -635,8 +745,11 @@ is distributed changes: items are proposed and claimed, never assigned.
   file listing, then the oldest messages), never cutting JSON mid-structure.
 - Schedules: `lockstep` steps the lead then each worker in a fixed order every
   round (offline demo and tests: byte-identical logs run to run, with a fixed
-  board clock and fixed Git commit dates); `concurrent` runs each agent's own
-  loop with idle backoff (live).
+  board clock and fixed Git commit dates), with the agents building a tool
+  that is not published yet first in the round (`lockstepOrder`, schedule
+  priority); `concurrent` runs each agent's own loop with idle backoff (live).
+  Recruitment counts a help request that grants a scope nobody has taken yet
+  as open work, so the dial can bring in a helper.
 - `packages/orchestration/src/board-policy.ts`: the deterministic,
   goal-agnostic stand-in for the turn model used offline. As the lead it decides
   workers' proposed items (`decide_item`): it rejects one that duplicates an
@@ -659,7 +772,17 @@ is distributed changes: items are proposed and claimed, never assigned.
   one proposal, and runs its scanner over the whole repository once right after publishing
   and again (bounded) after new passing code; the
   lead accepts tool proposals, and tool-found work unless an outstanding item
-  already covers its files. No rule names a file, an app, or a goal.
+  already covers its files. Formation: an owner splits a held item the
+  planner did not decompose (a worker's or a tool's proposal) that has no push
+  yet and spans at least two files no codemod covers, one child per directory
+  (else per file), then leaves the children to others (it takes one only
+  after waiting twice) and pulls their pushes as sub-lead; an owner whose
+  codemod pushed several files of an item grants the second half of the hand
+  pass to a helper, does not propose done until it pulls the delivered work,
+  and a free agent takes such a grant before claiming new work; while a
+  codemod covering a held item is still being built, its owner first reads
+  the item's files (a wait, at most two) before editing by hand. No rule
+  names a file, an app, or a goal.
 - `FirstAttemptFailingGate` (`run-board-offline.ts`): the generic offline gate
   FIXTURE (`--offline --fixture-gate`, used by `make demo-board`). It fails the
   first integrated revision, naming the first file that revision changed, and
@@ -799,6 +922,21 @@ app-specific.
   number) for another agent, who builds from the tool's branch with the
   failing checks; the builder who spent it may not claim it again, and after
   two reopenings the item stays with its last builder.
+- **Tool timing.** Tools are published early enough to be used: in lockstep
+  the builders of unpublished tools take the first turns of each round; in the
+  concurrent (live) schedule an owner whose only work is unpushed items a
+  codemod still being built covers is held back (no turns; `toolHold`, a pure
+  function of the board) for at most `toolHoldMs` (default 90 s), so the
+  builder moves first; a failed tool gate is rebuilt at once by its builder
+  with the failing checks and output, within the board's fix budget for the
+  tool item, in any schedule; an
+  owner holding an item a codemod being built covers reads its files first (at
+  most two turns), and the runtime gives a worker that waits while holding
+  such unpushed work another turn, at most twice (`MAX_HELD_WAIT_CUES`), so a
+  tool that never arrives (or a build failure no board message reports) never
+  stalls held work. The summary measures it from the log
+  (`codemodTiming`): `tool timing: codemod X changed N item(s) before any hand
+  edit of them (...); covered items edited by hand first: ...`.
 - **Never wait forever for a tool.** Each claim in an agent's digest carries
   `toolUnavailable`: the scanners and codemods covering its write intent that
   it must not wait for, because the lead rejected them, a build failed its own
@@ -839,7 +977,8 @@ app-specific.
   a fail publishes nothing and is addressed to the builder, who may rebuild
   (bounded). Wall-clock times are never recorded, so offline logs repeat.
 - **Use.** `use_tool {capability, version, args, itemId?}` pins a published
-  version. The runtime (the operator side, like the integrator) checks the
+  version. A codemod run for an item gets only arguments inside that item's
+  write intent (none left: the item's own files). The runtime (the operator side, like the integrator) checks the
   version is in the registry, fetches exactly its commit, and runs it over a
   COPY of the consumer's own view (the shared baseline or the revision it
   rebased onto, with its own pushed files on top). A codemod needs an item the
@@ -889,10 +1028,68 @@ app-specific.
   item is an ordinary item hull backed by `tool.proposed`.
 - **Offline demo.** `make demo-board` shows it twice: on the demo project, a
   scanner and a codemod are proposed, accepted, built, gated, published, and
-  used by two agents each; on the multi-resource example app, the scanner also
+  used by two agents each (the codemod on three items before any hand edit);
+  on the multi-resource example app, the scanner also
   finds places the plan did not itemize (the shared modules) on its first sweep
   over the whole repository right after it is published, its builder
   proposes that work, the lead accepts it, and it completes.
+
+## Splits, sub-leads, and fork-based help
+
+Formation beyond claiming: an owner divides its work (a split, it becomes the
+SUB-LEAD) or brings in a helper that starts from its in-progress repo (a fork).
+Both stay on the board's single-writer rules (rules 11 and 12 above) and the
+gate stays authoritative: nothing reaches the integrated tree except through
+an announced push the integrator gates.
+
+- **Split.** The owner posts `item.split`; children are open at once (inside
+  its scope and write intent, so no lead decision). Other agents claim them.
+  Children push to their own repos as usual, but the integrators do not merge
+  those pushes (`pendingPushItems` routes them to the sub-lead;
+  `awaitingSubLead` lists them). The sub-lead's `pull` is a mini-integration
+  in its own repo: it copies each child's pushed files inside that child's
+  write intent and announces ONE push for the split item (`merges`). No gate
+  runs in the sub-lead's repo in this slice; the main integration gates the
+  sub-lead's push on the integrated tree like any other (gate-equals-deploy is
+  unchanged). The split item completes when its children are done and that
+  push passed. A failure of the sub-lead's push is narrowed to the children
+  (`narrowToSplitChildren`) so their owners are asked to fix; the sub-lead then
+  merges their new pushes.
+- **Fork-based help.** `help.requested {scope}` grants files of the requester's
+  write intent. A helper (an idle agent, or one recruited because the grant
+  counts as open work) asks the operator to fork the requester's repo
+  (`POST /changes/:id/board/help-fork`; the Artifacts fork live, a copy of the
+  local repo offline), so it starts from the requester's latest push, then
+  offers with its lineage (`help.offered {forkOf, forkCommit, fork}`). It
+  edits only the granted files in its fork, with the fork's short-lived write
+  token, and posts `help.delivered {commit, paths}`. The requester pulls: the
+  operator reads the fork with a short read token (revoked right after), the
+  runtime checks the commit changes nothing outside the grant since the fork
+  point, merges it into the requester's repo, and the requester announces the
+  push with `pulled`, which closes the grant. Forks are archived at cleanup.
+- **The console.** A split item's children are hulls nested inside its hull
+  (the parent grows to hold them), with the sub-lead drawn on the parent
+  hull's border. Fork lineage is a `dependency` edge from the requester to the
+  helper labelled `fork`, backed by the `help.offered` seq; each child a
+  sub-lead merged is a `dependency` edge from the child to the split item
+  labelled `merged`, backed by the sub-lead's push. No new edge kind: the
+  backing check verifies both labels against their messages.
+- **Offline demo, cues.** On the demo project the owner of the tests item,
+  after its claims were refused and a contract rejected, reports it
+  struggling; both idle agents volunteer; it grants the new test file to the
+  first (fresh eyes), which forks its repo, delivers, and is pulled, and it
+  declines the second. The policy's deterministic versions of the cues: an
+  idle agent volunteers once per item; an owner hands a volunteer the second
+  half of several files (a struggling single file whole) or declines; a
+  struggling owner with idle agents waits one turn for a volunteer.
+- **Offline demo.** `make demo-board`: on the demo project the owner whose
+  codemod pushed two files grants one to a helper, which forks its repo at
+  that push, delivers, and the owner pulls it (a fast-forward) before
+  proposing done; on the multi-resource app the item the scanner found (two
+  shared modules) is split by its owner, two other agents claim the children,
+  and the sub-lead merges their pushes. The summary prints each under
+  `formation:` and the forks archived at cleanup. Both runs are
+  deterministic.
 
 ## Integration on Cloudflare (`--integrator cloud`)
 

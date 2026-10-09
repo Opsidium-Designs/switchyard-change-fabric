@@ -127,6 +127,9 @@ export type {
   BoardContract,
   BoardDecisionJuncture,
   BoardDigest,
+  BoardDigestHelp,
+  BoardDigestStruggle,
+  BoardVolunteer,
   BoardDraft,
   BoardErrorCode,
   BoardEscalationRecord,
@@ -202,6 +205,14 @@ export {
   toolItemId,
   toolScope,
   toolUnavailableReason,
+  helpGrantLive,
+  liveHelpGrants,
+  takenHelpGrants,
+  routedToSubLead,
+  checkHelpFork,
+  mergedChildrenWrite,
+  objectiveSubChanges,
+  splitCue,
   verifyBoard,
   withContractTriage,
 } from "./board.ts";
@@ -247,13 +258,14 @@ export {
   BOARD_AGENT_ID_PATTERN,
   BOARD_WORKSPACE_TTL_BOUNDS,
   boardAgentWorkspaceName,
+  boardHelpForkWorkspaceName,
   parseBoardJoinWorkspace,
   toolBranch,
   toolsWorkspaceName,
 } from "./board-join.ts";
 
 export type { BoardIntegrationPlan, BoardIntegrationUnitPlan } from "./board-integration-plan.ts";
-export { pendingPushItems, pendingPushKey, planBoardIntegration } from "./board-integration-plan.ts";
+export { awaitingSubLead, narrowToSplitChildren, pendingPushItems, pendingPushKey, planBoardIntegration } from "./board-integration-plan.ts";
 export type { AttributableUnit } from "./failure-attribution.ts";
 export { attributeFailure, combineAttribution } from "./failure-attribution.ts";
 export type { ImplicationSource } from "./failure-attribution.ts";

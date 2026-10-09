@@ -100,6 +100,17 @@ export const BOARD_LIMITS = {
   toolReopens: 2,
   /** Board messages a claim waits for an unpublished tool before the tool counts as unavailable. */
   toolWaitMessages: 60,
+  /**
+   * Board messages a help request that grants a sub-scope stays live without a
+   * helper (from the request), and a granted helper has to deliver (from its
+   * offer), before the grant lapses and the requester may write the scope again.
+   */
+  helpWaitMessages: 60,
+  /** item.struggling reports per item and owner, and volunteers per agent and item. */
+  maxStruggleReports: 3,
+  /** Sub-lead pushes that may merge one child's push. */
+  maxChildMerges: 3,
+  maxVolunteers: 2,
   maxObjective: 500,
   maxAcceptance: 20,
   maxRationale: 2000,
@@ -208,6 +219,12 @@ export interface BoardPayloads {
     readonly objective: string;
     readonly rules: BoardRules;
     /**
+     * Where integration runs, recorded with the goal. `cloud`: the integration
+     * Workflow, which cannot verify a sub-lead's merge of its children's pushes
+     * in this slice, so splits are refused (`NOT_SUPPORTED`). Absent: local.
+     */
+    readonly integrator?: "local" | "cloud";
+    /**
      * Paths and globs no agent may write: the files that define the gate (the
      * gate's own test files and directory, the project manifest and lockfile).
      * Posted with the goal so the protected set is visible on the board; claims
@@ -286,8 +303,44 @@ export interface BoardPayloads {
     /** The paths a claim on the discovered item may write (claims must stay within). */
     readonly scopeHint?: readonly string[];
   };
-  "help.requested": { readonly request: string; readonly item: string; readonly need: string };
-  "help.offered": { readonly request: string };
+  /**
+   * `scope` GRANTS a sub-scope of the requester's write intent on `item` to the
+   * first helper whose offer forks the requester's repo: until the requester
+   * pulls the helper's delivered commit (or the grant lapses), only the helper
+   * writes those paths, and the requester's own pushes may not touch them.
+   */
+  "help.requested": { readonly request: string; readonly item: string; readonly need: string; readonly scope?: readonly string[] };
+  /**
+   * An offer. With `forkOf` (the requester) the helper forked the requester's
+   * repo (`fork`, the fork's repo name) at `forkCommit` (the requester's latest
+   * announced push; absent when it had pushed nothing) and takes the grant.
+   */
+  "help.offered": { readonly request: string; readonly forkOf?: string; readonly forkCommit?: string; readonly fork?: string };
+  /** The granted helper's work: a commit in its fork, changing only `paths` inside the grant. */
+  "help.delivered": { readonly request: string; readonly commit: string; readonly paths: readonly string[] };
+  /**
+   * The requester closes its help request's grant without pulling: it
+   * `declined` the delivered work, or its pull failed (`pull-failed`, with the
+   * reason). The scope is the requester's again.
+   */
+  "help.closed": { readonly request: string; readonly reason: "declined" | "pull-failed"; readonly detail?: string };
+  /**
+   * The owner's runtime reports that its item is going badly (a mechanical
+   * status, never a decision): edits that failed or were refused, turns spent
+   * against the item budget, or a failing revision implicating it. Bounded per
+   * item and owner. It is what the struggling and busy-owner cues read.
+   */
+  "item.struggling": {
+    readonly item: string;
+    readonly turnsSpent: number;
+    readonly failedEdits: number;
+    readonly reason: "failed-edits" | "turn-budget" | "failing-revision";
+    readonly lastFailure?: string;
+  };
+  /** An agent volunteers to help the owner of `item` (addressed `to` the owner); rate-limited per agent and item. */
+  "help.volunteered": { readonly item: string };
+  /** The owner declines a volunteer's offer on its item (accepting is a help.requested with scope addressed to it). */
+  "help.declined": { readonly item: string; readonly volunteer: string };
   "contract.proposed": {
     readonly contract: string;
     readonly target: string;
@@ -304,7 +357,19 @@ export interface BoardPayloads {
   "contract.escalated": { readonly contract: string; readonly item: string; readonly target: string; readonly kind: "add" | "modify" | "remove" };
   "contract.accepted": { readonly contract: string };
   "contract.rejected": { readonly contract: string };
-  "push.announced": { readonly item: string; readonly commit: string; readonly paths: readonly string[] };
+  "push.announced": {
+    readonly item: string;
+    readonly commit: string;
+    readonly paths: readonly string[];
+    /**
+     * A sub-lead's push for its SPLIT item: the children's pushes (each a
+     * child's latest, unintegrated push) it merged into its own repo. A passing
+     * revision that merges this push integrates those children's pushes too.
+     */
+    readonly merges?: readonly { readonly item: string; readonly commit: string }[];
+    /** Help requests on this item whose delivered commit this push pulled (closing their grants). */
+    readonly pulled?: readonly string[];
+  };
   "integrated.rev": {
     readonly n: number;
     readonly commit: string;
@@ -322,6 +387,13 @@ export interface BoardPayloads {
      * "pass" means nothing was checked. Absent when a gate ran.
      */
     readonly gated?: false;
+    /**
+     * Children a merged sub-lead push names in `merges` whose pushed content
+     * the integrator could NOT verify is in the gated tree (their in-intent
+     * files at the child's commit differ from the sub-lead commit's): they are
+     * not integrated by this revision, with the reason.
+     */
+    readonly unverified?: readonly { readonly item: string; readonly reason: string }[];
   };
   "rebase.needed": { readonly agent: string; readonly n: number; readonly paths: readonly string[] };
   "review.requested": { readonly review: string; readonly item: string };
@@ -490,6 +562,11 @@ export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "item.discovered",
   "help.requested",
   "help.offered",
+  "help.delivered",
+  "help.closed",
+  "item.struggling",
+  "help.volunteered",
+  "help.declined",
   "contract.proposed",
   "contract.escalated",
   "contract.accepted",
@@ -574,6 +651,7 @@ export type BoardErrorCode =
   | "NOT_WITHIN"
   | "INVALID_STATE"
   | "LIMIT"
+  | "NOT_SUPPORTED"
   | "LOG_MISMATCH";
 
 /** A rejected message or an inconsistent log, with a machine-readable code. */
@@ -624,6 +702,13 @@ export interface BoardItemPush {
   readonly agent: string;
   readonly paths: readonly string[];
   integratedIn?: number;
+  /** A sub-lead's push: the children's pushes it merged. */
+  readonly merges?: readonly { readonly item: string; readonly commit: string }[];
+  /** Children of `merges` a revision could not verify in the gated tree (not integrated by it). */
+  unverified?: string[];
+  /** A child's push: how many sub-lead pushes merged it, and whether a revision recorded it unverified. */
+  mergedTimes?: number;
+  unverifiedIn?: number;
 }
 
 export interface BoardItem {
@@ -636,6 +721,12 @@ export interface BoardItem {
   readonly proposedSeq: number;
   readonly parent?: string;
   children: string[];
+  /**
+   * A split item's SUB-LEAD (its owner when it split): its children's pushes
+   * integrate into the sub-lead's repo first, and it announces one push for
+   * the item upward.
+   */
+  subLead?: string;
   readonly discovered?: { readonly by: string; readonly reason: string };
   /** The lead's (or a human's) decision on a worker's proposal. */
   triage?: { readonly decision: "accepted" | "rejected"; readonly by: string; readonly seq: number };
@@ -670,6 +761,16 @@ export interface BoardItem {
   readonly fromTool?: { readonly capability: string; readonly version: string };
   /** The seq at which a human last rejected a contract change for this item. */
   contractRejectedSeq?: number;
+  /** The current owner's latest struggling report (cleared when the claim changes hands or completes). */
+  struggling?: {
+    readonly owner: string;
+    readonly seq: number;
+    readonly turnsSpent: number;
+    readonly failedEdits: number;
+    readonly reason: "failed-edits" | "turn-budget" | "failing-revision";
+    readonly lastFailure?: string;
+    readonly reports: number;
+  };
   /** The seq of the latest failing revision whose evidence implicated this item. */
   implicatedSeq?: number;
 }
@@ -700,6 +801,18 @@ export interface BoardAgent {
   leftSeq?: number;
   /** The latest integrated revision this agent was told to rebase onto. */
   rebaseTo?: number;
+  /** The commit of the agent's latest announced push (what a fork of its repo starts from). */
+  lastPush?: string;
+}
+
+export interface BoardVolunteer {
+  readonly item: string;
+  readonly agent: string;
+  readonly owner: string;
+  seq: number;
+  count: number;
+  /** The owner's answer to the latest offer: a grant addressed to it, or a decline. */
+  answered?: { readonly how: "accepted" | "declined"; readonly seq: number; readonly request?: string };
 }
 
 export interface BoardHelpRequest {
@@ -708,6 +821,26 @@ export interface BoardHelpRequest {
   readonly need: string;
   readonly by: string;
   offers: string[];
+  /** The seq of the request. */
+  readonly seq?: number;
+  /** The sub-scope of the requester's write intent it grants (absent: a plain request). */
+  readonly scope?: readonly string[];
+  /** A grant addressed to these agents (for example a volunteer): only they may take it. */
+  readonly to?: readonly string[];
+  /** The helper that took the grant by forking the requester's repo. */
+  grant?: {
+    readonly agent: string;
+    readonly seq: number;
+    readonly forkOf: string;
+    readonly forkCommit?: string;
+    readonly fork?: string;
+  };
+  /** The helper's latest delivered commit. */
+  delivered?: { readonly commit: string; readonly paths: readonly string[]; readonly seq: number };
+  /** The requester's push that pulled the delivered commit (the grant is closed). */
+  pulledSeq?: number;
+  /** The requester closed the grant without pulling (declined, or its pull failed). */
+  closed?: { readonly seq: number; readonly reason: "declined" | "pull-failed"; readonly detail?: string };
 }
 
 export interface BoardContract {
@@ -783,6 +916,10 @@ export interface BoardState {
   items: Record<string, BoardItem>;
   contests: Record<string, BoardContest>;
   help: Record<string, BoardHelpRequest>;
+  /** Volunteers by `<item>:<agent>`: the latest offer, how many, and the owner's answer. */
+  volunteers?: Record<string, BoardVolunteer>;
+  /** Where integration runs, as posted with the goal (absent: local). */
+  integrator?: "local" | "cloud";
   contracts: Record<string, BoardContract>;
   reviews: Record<string, BoardReview>;
   tools: {
@@ -1036,6 +1173,19 @@ function ungatedFlag(raw: Raw): boolean {
   return true;
 }
 
+/** A revision's unverified sub-lead merges: [{item, reason}], bounded. */
+function unverifiedMerges(value: unknown): { item: string; reason: string }[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > BOARD_LIMITS.maxChildren) {
+    fail("BAD_PAYLOAD", `unverified must be a non-empty array of at most ${BOARD_LIMITS.maxChildren} {item, reason}`);
+  }
+  return value.map((entry) => {
+    if (!isRecord(entry)) {
+      fail("BAD_PAYLOAD", "each unverified merge must be an object {item, reason}");
+    }
+    return { item: id(entry, "item"), reason: text(entry, "reason", 300) };
+  });
+}
+
 function children(raw: Raw): BoardChildItem[] {
   const value = raw.children;
   if (!Array.isArray(value) || value.length === 0 || value.length > BOARD_LIMITS.maxChildren) {
@@ -1216,6 +1366,7 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         ...(guarded.length > 0 ? { protected: guarded } : {}),
         ...(keys.length > 0 ? { protectedKeys: keys } : {}),
         ...(inventory !== undefined ? { testInventory: inventory } : {}),
+        ...(raw.integrator !== undefined ? { integrator: oneOf(raw, "integrator", ["local", "cloud"] as const) } : {}),
       };
     }
     case "item.proposed":
@@ -1282,10 +1433,52 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         ...(scopeHint.length > 0 ? { scopeHint } : {}),
       };
     }
-    case "help.requested":
-      return { request: id(raw, "request"), item: id(raw, "item"), need: id(raw, "need") };
-    case "help.offered":
-      return { request: id(raw, "request") };
+    case "help.requested": {
+      const scope = pathList(raw, "scope", { optional: true, max: L.maxIntentEntries });
+      if (raw.scope !== undefined && scope.length === 0) {
+        fail("BAD_PAYLOAD", "scope, when present, must name at least one path inside the requester's write intent");
+      }
+      return { request: id(raw, "request"), item: id(raw, "item"), need: id(raw, "need"), ...(scope.length > 0 ? { scope } : {}) };
+    }
+    case "help.offered": {
+      const forkOf = optionalId(raw, "forkOf");
+      const forkCommit = optionalId(raw, "forkCommit");
+      const fork = optionalId(raw, "fork");
+      if (forkOf === undefined && (forkCommit !== undefined || fork !== undefined)) {
+        fail("BAD_PAYLOAD", "forkCommit and fork describe a fork: name the forked requester in forkOf");
+      }
+      return {
+        request: id(raw, "request"),
+        ...(forkOf !== undefined ? { forkOf } : {}),
+        ...(forkCommit !== undefined ? { forkCommit } : {}),
+        ...(fork !== undefined ? { fork } : {}),
+      };
+    }
+    case "item.struggling": {
+      const lastFailure = raw.lastFailure === undefined ? undefined : text(raw, "lastFailure", 300);
+      return {
+        item: id(raw, "item"),
+        turnsSpent: nonNegativeInt(raw, "turnsSpent"),
+        failedEdits: nonNegativeInt(raw, "failedEdits"),
+        reason: oneOf(raw, "reason", ["failed-edits", "turn-budget", "failing-revision"] as const),
+        ...(lastFailure !== undefined ? { lastFailure } : {}),
+      };
+    }
+    case "help.volunteered":
+      return { item: id(raw, "item") };
+    case "help.declined":
+      return { item: id(raw, "item"), volunteer: id(raw, "volunteer") };
+    case "help.closed": {
+      const detail = raw.detail === undefined ? undefined : text(raw, "detail", 300);
+      return { request: id(raw, "request"), reason: oneOf(raw, "reason", ["declined", "pull-failed"] as const), ...(detail !== undefined ? { detail } : {}) };
+    }
+    case "help.delivered": {
+      const paths = pathList(raw, "paths", { concrete: true });
+      if (paths.length === 0) {
+        fail("BAD_PAYLOAD", "a delivery names the files it changed");
+      }
+      return { request: id(raw, "request"), commit: id(raw, "commit"), paths };
+    }
     case "contract.proposed": {
       const [target] = pathList({ target: [raw.target] }, "target");
       const item = optionalId(raw, "item");
@@ -1311,8 +1504,34 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
     case "item.accepted":
     case "item.rejected":
       return { item: id(raw, "item") };
-    case "push.announced":
-      return { item: id(raw, "item"), commit: id(raw, "commit"), paths: pathList(raw, "paths", { concrete: true }) };
+    case "push.announced": {
+      let merges: { item: string; commit: string }[] | undefined;
+      if (raw.merges !== undefined) {
+        if (!Array.isArray(raw.merges) || raw.merges.length === 0 || raw.merges.length > L.maxChildren) {
+          fail("BAD_PAYLOAD", `merges must be a non-empty array of at most ${L.maxChildren} {item, commit}`);
+        }
+        merges = raw.merges.map((entry) => {
+          if (!isRecord(entry)) {
+            fail("BAD_PAYLOAD", "each merge must be an object {item, commit}");
+          }
+          return { item: id(entry, "item"), commit: id(entry, "commit") };
+        });
+        if (new Set(merges.map((m) => m.item)).size !== merges.length) {
+          fail("BAD_PAYLOAD", "merges names a child item twice");
+        }
+      }
+      const pulled = idList(raw, "pulled", { optional: true });
+      if (raw.pulled !== undefined && pulled.length === 0) {
+        fail("BAD_PAYLOAD", "pulled, when present, must name at least one help request");
+      }
+      return {
+        item: id(raw, "item"),
+        commit: id(raw, "commit"),
+        paths: pathList(raw, "paths", { concrete: true }),
+        ...(merges !== undefined ? { merges } : {}),
+        ...(pulled.length > 0 ? { pulled } : {}),
+      };
+    }
     case "integrated.rev": {
       const failing = raw.failing === undefined ? undefined : failingEvidence(raw.failing);
       return {
@@ -1324,6 +1543,7 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         contributors: idList(raw, "contributors", { max: L.maxAgents }),
         ...(failing !== undefined ? { failing } : {}),
         ...(ungatedFlag(raw) ? { gated: false as const } : {}),
+        ...(raw.unverified !== undefined ? { unverified: unverifiedMerges(raw.unverified) } : {}),
       };
     }
     case "rebase.needed":
@@ -1567,6 +1787,11 @@ const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "item.discovered": ["agent"],
   "help.requested": ["agent"],
   "help.offered": ["agent"],
+  "help.delivered": ["agent"],
+  "help.closed": ["agent"],
+  "item.struggling": ["agent"],
+  "help.volunteered": ["agent"],
+  "help.declined": ["agent"],
   "contract.proposed": ["agent"],
   "contract.escalated": ["engine"],
   "contract.accepted": ["lead", "human"],
@@ -1640,11 +1865,45 @@ function pendingContestOn(state: BoardState, item: string): BoardContest | undef
   );
 }
 
-/** Live claims held by agents other than `except`, excluding `skipItem`. */
-function liveClaims(state: BoardState, except: string, skipItem?: string): BoardItem[] {
+/**
+ * Live claims held by agents other than `except`, excluding `skipItem`. A
+ * SPLIT item whose sub-lead is still on the board stays a live claim of its
+ * sub-lead (single writer over its whole write intent: what no child covers
+ * stays the sub-lead's, and nobody else may write it), except for claims on
+ * its own descendants (`forItem`), which divide it.
+ */
+function liveClaims(state: BoardState, except: string, skipItem?: string, forItem?: string): BoardItem[] {
   return Object.values(state.items)
-    .filter((i) => i.status === "claimed" && i.owner !== undefined && i.owner !== except && i.intent && i.id !== skipItem)
+    .filter(
+      (i) =>
+        (i.status === "claimed" || (i.status === "split" && i.subLead !== undefined && activeAgent(state, i.subLead))) &&
+        i.owner !== undefined &&
+        i.owner !== except &&
+        i.intent &&
+        i.id !== skipItem &&
+        !(i.status === "split" && forItem !== undefined && isAncestor(state, i.id, forItem)),
+    )
     .sort((a, b) => (a.grantedSeq ?? 0) - (b.grantedSeq ?? 0));
+}
+
+/** True when `ancestor` is a (transitive) parent of `item`. */
+function isAncestor(state: BoardState, ancestor: string, item: string): boolean {
+  let parent = state.items[item]?.parent;
+  while (parent !== undefined) {
+    if (parent === ancestor) {
+      return true;
+    }
+    parent = state.items[parent]?.parent;
+  }
+  return false;
+}
+
+/** The write intents of the children a sub-lead push merges (what it may announce, and what integrates). */
+export function mergedChildrenWrite(state: BoardState, merges: readonly { readonly item: string }[]): string[] {
+  return [...new Set(merges.flatMap((m) => {
+    const child = state.items[m.item];
+    return (child?.intent?.write ?? child?.scopeHint ?? []).map(intentPath);
+  }))];
 }
 
 /**
@@ -1662,6 +1921,116 @@ function itemForPendingPush(state: BoardState, commit: string): BoardItem | unde
   return Object.values(state.items).find(
     (i) => i.lastPush !== undefined && i.lastPush.commit === commit && i.lastPush.integratedIn === undefined,
   );
+}
+
+/**
+ * The children's pushes a sub-lead's latest push merged that are still each
+ * child's latest, unintegrated push (a child that pushed again since is not
+ * integrated by it).
+ */
+function subLeadMerges(state: BoardState, item: BoardItem): { readonly item: string; readonly commit: string }[] {
+  return (item.lastPush?.merges ?? []).filter((m) => {
+    const child = state.items[m.item];
+    return child?.lastPush?.commit === m.commit && child.lastPush.integratedIn === undefined;
+  });
+}
+
+/**
+ * True while a help request's GRANT is live: it grants a sub-scope, the
+ * requester still holds the item, the requester has not pulled the helper's
+ * work yet, and either the helper delivered (the requester decides when to
+ * pull) or the wait is still bounded (no helper within `helpWaitMessages` of
+ * the request, or a granted helper that left or did not deliver within
+ * `helpWaitMessages` of its offer, lapses it). A pure function of the board.
+ */
+export function helpGrantLive(state: BoardState, request: BoardHelpRequest): boolean {
+  if (request.scope === undefined || request.pulledSeq !== undefined || request.closed !== undefined) {
+    return false;
+  }
+  const item = state.items[request.item];
+  if (!item || item.status !== "claimed" || item.owner !== request.by || !activeAgent(state, request.by)) {
+    return false;
+  }
+  if (request.delivered !== undefined) {
+    // Delivered work waits for the requester's pull, bounded too.
+    return state.lastSeq - request.delivered.seq <= BOARD_LIMITS.helpWaitMessages;
+  }
+  if (request.grant !== undefined) {
+    return activeAgent(state, request.grant.agent) && state.lastSeq - request.grant.seq <= BOARD_LIMITS.helpWaitMessages;
+  }
+  return state.lastSeq - (request.seq ?? 0) <= BOARD_LIMITS.helpWaitMessages;
+}
+
+/**
+ * May `agent` fork the requester's repo for help request `requestId`? The
+ * check the fork routes run BEFORE forking anything (so a fork the board would
+ * refuse to grant is never made): the request grants a scope, is live and not
+ * yet granted, and the agent is another joined, non-lead agent. Returns the
+ * requester whose repo is forked. Throws a BoardError otherwise.
+ */
+export function checkHelpFork(state: BoardState, requestId: string, agent: string): { readonly requester: string } {
+  const request = state.help[requestId] ?? fail("UNKNOWN_REF", `unknown help request ${requestId}`);
+  if (!activeAgent(state, agent)) {
+    fail("UNKNOWN_AGENT", `${agent} is not a joined agent of this board`);
+  }
+  if (state.agents[agent]?.role === LEAD_ROLE) {
+    fail("NOT_ALLOWED", `${agent} is the lead and does not edit`);
+  }
+  if (request.by === agent) {
+    fail("NOT_ALLOWED", "an agent cannot fork for its own help request");
+  }
+  if (request.scope === undefined) {
+    fail("NOT_ALLOWED", `help request ${requestId} grants no scope: there is nothing to fork for`);
+  }
+  if (request.to !== undefined && !request.to.includes(agent)) {
+    fail("NOT_ALLOWED", `help request ${requestId} grants its scope to ${request.to.join(", ")} only`);
+  }
+  if (request.grant !== undefined) {
+    fail("DUPLICATE", `help request ${requestId} is already granted to ${request.grant.agent}`);
+  }
+  if (!helpGrantLive(state, request)) {
+    fail("INVALID_STATE", `help request ${requestId}'s grant has lapsed or closed`);
+  }
+  return { requester: request.by };
+}
+
+/** The live help grants on an item (see helpGrantLive). */
+export function liveHelpGrants(state: BoardState, item: string): BoardHelpRequest[] {
+  return Object.values(state.help).filter((h) => h.item === item && helpGrantLive(state, h));
+}
+
+/**
+ * The live grants on an item that a helper has TAKEN (its fork offer is on
+ * the board): only these freeze the scope for the requester. A grant nobody
+ * has taken yet never blocks the requester's own work.
+ */
+export function takenHelpGrants(state: BoardState, item: string): BoardHelpRequest[] {
+  return liveHelpGrants(state, item).filter((h) => h.grant !== undefined);
+}
+
+/**
+ * True when an item's pushes go to its parent's SUB-LEAD rather than straight
+ * to integration: the parent is split and its sub-lead is still on the board.
+ * When the sub-lead has left, its children integrate directly.
+ */
+export function routedToSubLead(state: BoardState, item: Pick<BoardItem, "parent">): boolean {
+  if (item.parent === undefined) {
+    return false;
+  }
+  const parent = state.items[item.parent];
+  return parent !== undefined && parent.status === "split" && parent.subLead !== undefined && activeAgent(state, parent.subLead);
+}
+
+/**
+ * A split item completes when every child is done and, when its sub-lead
+ * announced a push for it, that push passed in an integrated revision (a
+ * sub-lead that left never blocks it).
+ */
+function splitReady(state: BoardState, item: BoardItem): boolean {
+  if (item.status !== "split" || !item.children.every((c) => state.items[c]?.status === "done")) {
+    return false;
+  }
+  return item.lastPush === undefined || item.lastPush.integratedIn !== undefined || item.subLead === undefined || !activeAgent(state, item.subLead);
 }
 
 /**
@@ -1805,7 +2174,7 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       if (item.status !== "open" && !pendingForAgent) {
         fail("ITEM_NOT_OPEN", `item ${item.id} is ${item.status} and cannot be granted`);
       }
-      const clash = liveClaims(state, draft.payload.agent).find(
+      const clash = liveClaims(state, draft.payload.agent, undefined, item.id).find(
         (holder) => overlappingEntries(draft.payload.intent.write, holder.intent!.write).length > 0,
       );
       if (clash) {
@@ -1815,7 +2184,10 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
     }
     case "claim.contested": {
       const item = requireItem(state, draft.payload.item);
-      requireOwner(state, draft.payload.ownerItem, draft.payload.owner);
+      const ownerItem = requireItem(state, draft.payload.ownerItem);
+      if (!((ownerItem.status === "claimed" || ownerItem.status === "split") && ownerItem.owner === draft.payload.owner)) {
+        fail("NOT_OWNER", `${draft.payload.owner} does not hold the claim on item ${ownerItem.id}`);
+      }
       if (item.status !== "open" && item.claimant?.agent !== draft.payload.claimant) {
         fail("ITEM_NOT_OPEN", `item ${item.id} is ${item.status} and cannot be contested`);
       }
@@ -1831,11 +2203,18 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       return;
     }
-    case "claim.ceded":
-      requireContestParty(state, draft.payload.contest, draft.from);
+    case "claim.ceded": {
+      const contest = requireContestParty(state, draft.payload.contest, draft.from);
+      if (draft.from === contest.owner && state.items[contest.ownerItem]?.status === "split") {
+        fail("NOT_ALLOWED", `${contest.ownerItem} is split: its sub-lead keeps its scope (the claimant narrows, cedes, or claims one of its children)`);
+      }
       return;
+    }
     case "claim.narrowed": {
       const contest = requireContestParty(state, draft.payload.contest, draft.from);
+      if (draft.from === contest.owner && state.items[contest.ownerItem]?.status === "split") {
+        fail("NOT_ALLOWED", `${contest.ownerItem} is split: its children divide its scope, its sub-lead does not narrow it`);
+      }
       const current =
         draft.from === contest.owner
           ? state.items[contest.ownerItem]?.intent?.write ?? []
@@ -1870,6 +2249,9 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       if (draft.payload.how === "human-decided" && draft.payload.winner === undefined) {
         fail("BAD_PAYLOAD", "a human-decided resolution must name the winner");
       }
+      if (draft.payload.how === "human-decided" && draft.payload.winner === contest.claimant && state.items[contest.ownerItem]?.status === "split") {
+        fail("NOT_ALLOWED", `${contest.ownerItem} is split: its scope stays its sub-lead's (claim one of its children instead)`);
+      }
       return;
     }
     case "claim.escalated": {
@@ -1881,6 +2263,19 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
     }
     case "item.split": {
       const item = requireOwner(state, draft.payload.item, draft.from);
+      if (item.tool) {
+        fail("NOT_ALLOWED", `item ${item.id} builds a tool: a tool is built whole by its builder, never split`);
+      }
+      if (state.integrator === "cloud") {
+        fail(
+          "NOT_SUPPORTED",
+          "this run integrates on Cloudflare, which cannot verify a sub-lead's merge of its children's pushes yet: splits are not supported; ask for help with a scope instead",
+        );
+      }
+      if (item.lastPush !== undefined && item.lastPush.integratedIn === undefined) {
+        // Its sub-lead would otherwise ship that push alongside the children's work.
+        fail("INVALID_STATE", `item ${item.id} has an unintegrated push (${item.lastPush.commit}): split it before pushing, or after that push is integrated`);
+      }
       if (pendingContestOn(state, item.id)) {
         fail("CONTEST_OPEN", `item ${item.id} is in a contest; resolve it before splitting`);
       }
@@ -1899,15 +2294,39 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
             `child ${child.item}'s scope hint ${outside.join(", ")} is outside item ${item.id}'s scope hint (${item.scopeHint.join(", ")})`,
           );
         }
+        // The owner becomes the children's sub-lead and announces their work
+        // upward under its own write intent: every child must lie inside it.
+        const write = item.intent?.write ?? [];
+        const beyond = child.scopeHint.filter((entry) => !write.some((w) => entryWithin(entry, intentPath(w))));
+        if (beyond.length > 0) {
+          fail(
+            "OUTSIDE_INTENT",
+            `child ${child.item}'s scope hint ${beyond.join(", ")} is outside your write intent on ${item.id} (${write.join(", ")}): as the sub-lead you announce the children's work under it`,
+          );
+        }
       }
       return;
     }
-    case "help.requested":
-      requireOwner(state, draft.payload.item, draft.from);
+    case "help.requested": {
+      const item = requireOwner(state, draft.payload.item, draft.from);
       if (state.help[draft.payload.request]) {
         fail("DUPLICATE", `help request ${draft.payload.request} already exists`);
       }
+      const scope = draft.payload.scope;
+      if (scope !== undefined) {
+        // A grant is a sub-scope of what the requester itself may write, never more.
+        const write = item.intent?.write ?? [];
+        const outside = scope.filter((entry) => !write.some((w) => entryWithin(entry, intentPath(w))));
+        if (outside.length > 0) {
+          fail("OUTSIDE_INTENT", `the granted scope ${outside.join(", ")} is outside your write intent on ${item.id} (${write.join(", ")})`);
+        }
+        const clash = liveHelpGrants(state, item.id).find((h) => overlappingEntries(scope, h.scope ?? []).length > 0);
+        if (clash) {
+          fail("INTENT_OVERLAP", `the granted scope overlaps help request ${clash.request}'s live grant (${(clash.scope ?? []).join(", ")})`);
+        }
+      }
       return;
+    }
     case "help.offered": {
       const request = state.help[draft.payload.request] ?? fail("UNKNOWN_REF", `unknown help request ${draft.payload.request}`);
       if (request.by === draft.from) {
@@ -1915,6 +2334,106 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       if (request.offers.includes(draft.from)) {
         fail("DUPLICATE", `${draft.from} already offered help on ${request.request}`);
+      }
+      if (draft.payload.forkOf !== undefined) {
+        // A fork offer takes the request's grant: the helper starts from the
+        // requester's in-progress repo and alone writes the granted scope.
+        if (request.scope === undefined) {
+          fail("NOT_ALLOWED", `help request ${request.request} grants no scope: there is nothing to fork for`);
+        }
+        if (draft.payload.forkOf !== request.by) {
+          fail("UNKNOWN_REF", `forkOf must name the requester ${request.by}, whose repo the helper forks`);
+        }
+        if (request.to !== undefined && !request.to.includes(draft.from)) {
+          fail("NOT_ALLOWED", `help request ${request.request} grants its scope to ${request.to.join(", ")} only`);
+        }
+        if (request.grant !== undefined) {
+          fail("DUPLICATE", `help request ${request.request} is already granted to ${request.grant.agent}`);
+        }
+        if (!helpGrantLive(state, request)) {
+          fail("INVALID_STATE", `help request ${request.request}'s grant has lapsed or closed`);
+        }
+        const head = state.agents[request.by]?.lastPush;
+        if (draft.payload.forkCommit !== head) {
+          fail(
+            "INVALID_STATE",
+            head === undefined
+              ? `${request.by} has announced no push: a fork of its repo carries no forkCommit`
+              : `forkCommit must be ${request.by}'s latest announced push (${head}), the state the fork starts from`,
+          );
+        }
+      }
+      return;
+    }
+    case "item.struggling": {
+      const item = requireOwner(state, draft.payload.item, draft.from);
+      const previous = item.struggling?.owner === draft.from ? item.struggling : undefined;
+      if ((previous?.reports ?? 0) >= BOARD_LIMITS.maxStruggleReports) {
+        fail("LIMIT", `${draft.from} already reported ${item.id} struggling ${BOARD_LIMITS.maxStruggleReports} times`);
+      }
+      if (
+        previous &&
+        previous.turnsSpent === draft.payload.turnsSpent &&
+        previous.failedEdits === draft.payload.failedEdits &&
+        previous.reason === draft.payload.reason
+      ) {
+        fail("DUPLICATE", `nothing changed since the last struggling report on ${item.id}`);
+      }
+      return;
+    }
+    case "help.volunteered": {
+      const item = requireItem(state, draft.payload.item);
+      if (item.status !== "claimed" || item.owner === undefined) {
+        fail("ITEM_NOT_OPEN", `item ${item.id} has no owner to help`);
+      }
+      if (item.owner === draft.from) {
+        fail("NOT_ALLOWED", "an owner does not volunteer on its own item");
+      }
+      if (draft.to?.length !== 1 || draft.to[0] !== item.owner) {
+        fail("BAD_PAYLOAD", `a volunteer's offer is addressed to the item's owner (to: [${item.owner}])`);
+      }
+      const known = state.volunteers?.[`${item.id}:${draft.from}`];
+      if (known && known.owner === item.owner && known.answered === undefined) {
+        fail("DUPLICATE", `${draft.from}'s offer on ${item.id} is still waiting for ${item.owner}'s answer`);
+      }
+      if (known && known.owner === item.owner && known.count >= BOARD_LIMITS.maxVolunteers) {
+        fail("LIMIT", `${draft.from} already volunteered ${known.count} times on ${item.id}`);
+      }
+      return;
+    }
+    case "help.declined": {
+      const item = requireOwner(state, draft.payload.item, draft.from);
+      const known = state.volunteers?.[`${item.id}:${draft.payload.volunteer}`];
+      if (!known || known.owner !== draft.from || known.answered !== undefined) {
+        fail("UNKNOWN_REF", `${draft.payload.volunteer} has no offer on ${item.id} waiting for your answer`);
+      }
+      return;
+    }
+    case "help.closed": {
+      const request = state.help[draft.payload.request] ?? fail("UNKNOWN_REF", `unknown help request ${draft.payload.request}`);
+      if (request.by !== draft.from) {
+        fail("NOT_ALLOWED", `only ${request.by}, who asked, closes help request ${request.request}`);
+      }
+      if (request.scope === undefined || request.pulledSeq !== undefined || request.closed !== undefined) {
+        fail("INVALID_STATE", `help request ${request.request} grants nothing open to close`);
+      }
+      return;
+    }
+    case "help.delivered": {
+      const request = state.help[draft.payload.request] ?? fail("UNKNOWN_REF", `unknown help request ${draft.payload.request}`);
+      if (request.grant?.agent !== draft.from) {
+        fail("NOT_ALLOWED", `${draft.from} does not hold help request ${request.request}'s grant`);
+      }
+      if (request.pulledSeq !== undefined) {
+        fail("INVALID_STATE", `help request ${request.request} was already pulled`);
+      }
+      // A late delivery never revives a lapsed or closed grant.
+      if (!helpGrantLive(state, request)) {
+        fail("INVALID_STATE", `help request ${request.request}'s grant has lapsed or closed: the scope is the requester's again`);
+      }
+      const outside = draft.payload.paths.filter((p) => !(request.scope ?? []).some((g) => entryWithin(p, intentPath(g))));
+      if (outside.length > 0) {
+        fail("OUTSIDE_INTENT", `delivered paths outside the granted scope (${(request.scope ?? []).join(", ")}): ${outside.join(", ")}`);
       }
       return;
     }
@@ -1972,7 +2491,73 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       return;
     }
     case "push.announced": {
-      const item = requireOwner(state, draft.payload.item, draft.from);
+      // The owner of a claimed item, or the SUB-LEAD of a split one.
+      const item = requireItem(state, draft.payload.item);
+      if (!((item.status === "claimed" || item.status === "split") && item.owner === draft.from)) {
+        fail("NOT_OWNER", `${draft.from} does not hold the claim on item ${item.id} (it is ${item.status})`);
+      }
+      const merges = draft.payload.merges ?? [];
+      if (item.status === "split") {
+        // A sub-lead announces only its merge of the children's pushes.
+        if (merges.length === 0) {
+          fail("NOT_ALLOWED", `item ${item.id} is split: as its sub-lead announce the merge of its children's pushes (merges)`);
+        }
+        for (const merge of merges) {
+          const child = state.items[merge.item];
+          if (!child || child.parent !== item.id) {
+            fail("UNKNOWN_REF", `${merge.item} is not a child of ${item.id}`);
+          }
+          if (child.lastPush?.commit !== merge.commit || child.lastPush.integratedIn !== undefined) {
+            fail("INVALID_STATE", `${merge.commit} is not ${merge.item}'s latest unintegrated push`);
+          }
+          // Never re-merge what a revision could not verify: the child pushes again first.
+          if (child.lastPush.unverifiedIn !== undefined) {
+            fail(
+              "INVALID_STATE",
+              `${merge.item}'s push ${merge.commit} was recorded unverified in revision ${child.lastPush.unverifiedIn}: it is not merged again until ${merge.item} pushes again`,
+            );
+          }
+          if ((child.lastPush.mergedTimes ?? 0) >= BOARD_LIMITS.maxChildMerges) {
+            fail("LIMIT", `${merge.item}'s push ${merge.commit} was already merged ${child.lastPush.mergedTimes} times`);
+          }
+        }
+        if (draft.payload.paths.length === 0) {
+          fail("NOT_ALLOWED", "a sub-lead push merges children's changes: an empty push merges nothing");
+        }
+        // A sub-lead ships ONLY its children's work: every path inside the
+        // write intents of the children it merges.
+        const childWrite = mergedChildrenWrite(state, merges);
+        const beyond = draft.payload.paths.filter((p) => !childWrite.some((w) => entryWithin(p, w)));
+        if (beyond.length > 0) {
+          fail("OUTSIDE_INTENT", `a sub-lead push carries only its merged children's work; ${beyond.join(", ")} is outside their write intents`);
+        }
+      } else if (merges.length > 0) {
+        fail("NOT_ALLOWED", `item ${item.id} is not split: only a sub-lead merges children's pushes`);
+      }
+      const pulled = draft.payload.pulled ?? [];
+      for (const requestId of pulled) {
+        const request = state.help[requestId];
+        if (!request || request.by !== draft.from || request.item !== item.id) {
+          fail("UNKNOWN_REF", `${requestId} is not your help request on ${item.id}`);
+        }
+        if (request.delivered === undefined || request.pulledSeq !== undefined) {
+          fail("INVALID_STATE", `help request ${requestId} has no delivered, unpulled work`);
+        }
+      }
+      // Single writer inside an item: a TAKEN grant's scope is the helper's
+      // until the requester pulls its delivered work (an untaken one blocks nothing).
+      for (const grant of takenHelpGrants(state, item.id)) {
+        if (pulled.includes(grant.request)) {
+          continue;
+        }
+        const clash = draft.payload.paths.filter((p) => (grant.scope ?? []).some((g) => entryWithin(p, intentPath(g))));
+        if (clash.length > 0) {
+          fail(
+            "INTENT_OVERLAP",
+            `${clash.join(", ")} ${clash.length === 1 ? "is" : "are"} granted to ${grant.grant?.agent ?? "a helper"} under help request ${grant.request}: pull its delivered work, or wait for the grant to lapse`,
+          );
+        }
+      }
       if (item.tool) {
         fail("NOT_ALLOWED", `item ${item.id} builds a tool: announce its build with tool.built (a tool is gated by its own gate, never integrated)`);
       }
@@ -2000,6 +2585,7 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         merged: draft.payload.merged,
         ...(draft.payload.failing !== undefined ? { failing: draft.payload.failing } : {}),
         ...(draft.payload.gated === false ? { gated: false as const } : {}),
+        ...(draft.payload.unverified !== undefined ? { unverified: draft.payload.unverified } : {}),
       });
       if (!sameJson(expected, draft.payload)) {
         fail("LOG_MISMATCH", "integrated.rev does not match the pushes it claims to merge");
@@ -2037,7 +2623,7 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       // After the handoff the recipient writes this intent, so it must not
       // overlap any claim held by anyone else (the sender's other claims too).
-      const clash = liveClaims(state, draft.payload.to, item.id).find(
+      const clash = liveClaims(state, draft.payload.to, item.id, item.id).find(
         (holder) => overlappingEntries(item.intent?.write ?? [], holder.intent!.write).length > 0,
       );
       if (clash) {
@@ -2048,9 +2634,19 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       return;
     }
-    case "done.proposed":
-      requireOwner(state, draft.payload.item, draft.from);
+    case "done.proposed": {
+      const item = requireOwner(state, draft.payload.item, draft.from);
+      // Work granted to a helper is part of the item: it is not done while
+      // that grant is live (pull the delivered work, or let it lapse).
+      const live = takenHelpGrants(state, item.id);
+      if (live.length > 0) {
+        fail(
+          "INVALID_STATE",
+          `help request ${live.map((h) => h.request).join(", ")} on ${item.id} is outstanding: pull the helper's delivered work before proposing done`,
+        );
+      }
       return;
+    }
     case "item.completed": {
       const item = requireItem(state, draft.payload.item);
       if (item.status === "done") {
@@ -2076,8 +2672,8 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         if (item.lastPush?.integratedIn !== draft.payload.n) {
           fail("INVALID_STATE", `the owner's latest push for ${item.id} was not merged by passing rev ${draft.payload.n}`);
         }
-      } else if (item.status !== "split" || !item.children.every((c) => state.items[c]?.status === "done")) {
-        fail("INVALID_STATE", `item ${item.id} still has unfinished children`);
+      } else if (!splitReady(state, item)) {
+        fail("INVALID_STATE", `item ${item.id} still has unfinished children, or its sub-lead's push has not passed`);
       }
       return;
     }
@@ -2311,6 +2907,9 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       state.protected = [...(message.payload.protected ?? [])];
       state.protectedKeys = [...(message.payload.protectedKeys ?? [])];
       state.testInventory = message.payload.testInventory ?? null;
+      if (message.payload.integrator !== undefined) {
+        state.integrator = message.payload.integrator;
+      }
       break;
     case "item.proposed":
       state.items[message.payload.item] = {
@@ -2361,6 +2960,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       item.owner = message.payload.agent;
       item.intent = message.payload.intent;
       item.grantedSeq = message.seq;
+      delete item.struggling;
       delete item.claimant;
       break;
     }
@@ -2441,7 +3041,10 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
     case "item.split": {
       const parent = state.items[message.payload.item]!;
       parent.status = "split";
-      delete parent.intent;
+      // The owner stays as the SUB-LEAD and keeps its write intent: it is what
+      // its one upward push for the children is checked against. A split item
+      // is no live claim (its children's claims are), so it blocks no claim.
+      parent.subLead = from;
       for (const child of message.payload.children) {
         parent.children.push(child.item);
         state.items[child.item] = {
@@ -2466,10 +3069,69 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         need: message.payload.need,
         by: from,
         offers: [],
+        seq: message.seq,
+        ...(message.payload.scope !== undefined ? { scope: [...message.payload.scope] } : {}),
+        ...(message.payload.scope !== undefined && message.to !== undefined && message.to.length > 0 ? { to: [...message.to] } : {}),
+      };
+      // A grant addressed to a volunteer answers its offer.
+      if (message.payload.scope !== undefined) {
+        for (const agent of message.to ?? []) {
+          const v = state.volunteers?.[`${message.payload.item}:${agent}`];
+          if (v && v.owner === from && v.answered === undefined) {
+            v.answered = { how: "accepted", seq: message.seq, request: message.payload.request };
+          }
+        }
+      }
+      break;
+    case "item.struggling": {
+      const item = state.items[message.payload.item]!;
+      const previous = item.struggling?.owner === from ? item.struggling.reports : 0;
+      item.struggling = {
+        owner: from,
+        seq: message.seq,
+        turnsSpent: message.payload.turnsSpent,
+        failedEdits: message.payload.failedEdits,
+        reason: message.payload.reason,
+        ...(message.payload.lastFailure !== undefined ? { lastFailure: message.payload.lastFailure } : {}),
+        reports: previous + 1,
       };
       break;
-    case "help.offered":
-      state.help[message.payload.request]!.offers.push(from);
+    }
+    case "help.volunteered": {
+      const item = state.items[message.payload.item]!;
+      const volunteers = (state.volunteers ??= {});
+      const key = `${item.id}:${from}`;
+      const known = volunteers[key];
+      volunteers[key] = { item: item.id, agent: from, owner: item.owner!, seq: message.seq, count: known && known.owner === item.owner ? known.count + 1 : 1 };
+      break;
+    }
+    case "help.declined":
+      state.volunteers![`${message.payload.item}:${message.payload.volunteer}`]!.answered = { how: "declined", seq: message.seq };
+      break;
+    case "help.offered": {
+      const request = state.help[message.payload.request]!;
+      request.offers.push(from);
+      const p = message.payload;
+      if (p.forkOf !== undefined) {
+        request.grant = {
+          agent: from,
+          seq: message.seq,
+          forkOf: p.forkOf,
+          ...(p.forkCommit !== undefined ? { forkCommit: p.forkCommit } : {}),
+          ...(p.fork !== undefined ? { fork: p.fork } : {}),
+        };
+      }
+      break;
+    }
+    case "help.delivered":
+      state.help[message.payload.request]!.delivered = { commit: message.payload.commit, paths: [...message.payload.paths], seq: message.seq };
+      break;
+    case "help.closed":
+      state.help[message.payload.request]!.closed = {
+        seq: message.seq,
+        reason: message.payload.reason,
+        ...(message.payload.detail !== undefined ? { detail: message.payload.detail } : {}),
+      };
       break;
     case "contract.proposed":
       state.contracts[message.payload.contract] = {
@@ -2503,9 +3165,22 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         commit: message.payload.commit,
         agent: from,
         paths: message.payload.paths,
+        ...(message.payload.merges !== undefined ? { merges: message.payload.merges.map((m) => ({ ...m })) } : {}),
       };
       // The owner answered any outstanding fix request with this push.
       delete item.fixRequested;
+      if (state.agents[from]) {
+        state.agents[from]!.lastPush = message.payload.commit;
+      }
+      for (const merge of message.payload.merges ?? []) {
+        const childPush = state.items[merge.item]?.lastPush;
+        if (childPush && childPush.commit === merge.commit) {
+          childPush.mergedTimes = (childPush.mergedTimes ?? 0) + 1;
+        }
+      }
+      for (const request of message.payload.pulled ?? []) {
+        state.help[request]!.pulledSeq = message.seq;
+      }
       break;
     }
     case "integrated.rev": {
@@ -2516,6 +3191,12 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         const item = itemForPendingPush(state, commit);
         if (item) {
           mergedByItem[item.id] = commit;
+          // A sub-lead's push carries its children's merged pushes.
+          for (const merge of subLeadMerges(state, item)) {
+            if (!(message.payload.unverified ?? []).some((u) => u.item === merge.item)) {
+              mergedByItem[merge.item] = merge.commit;
+            }
+          }
         }
       }
       const attribution = attributionOf(state);
@@ -2544,6 +3225,20 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         for (const commit of message.payload.merged) {
           const item = itemForPendingPush(state, commit);
           if (item?.lastPush) {
+            // Children first: their pushes are integrated through the sub-lead's,
+            // except those the integrator could not verify in the gated tree.
+            const unverified = (message.payload.unverified ?? []).map((u) => u.item);
+            for (const merge of subLeadMerges(state, item)) {
+              if (!unverified.includes(merge.item)) {
+                state.items[merge.item]!.lastPush!.integratedIn = message.payload.n;
+              }
+            }
+            if (unverified.length > 0) {
+              item.lastPush.unverified = unverified;
+              for (const child of unverified) {
+                state.items[child]!.lastPush!.unverifiedIn = message.payload.n;
+              }
+            }
             item.lastPush.integratedIn = message.payload.n;
           }
         }
@@ -2569,8 +3264,9 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
     case "handoff": {
       const item = state.items[message.payload.item]!;
       item.owner = message.payload.to;
-      // The new owner proposes done for itself.
+      // The new owner proposes done for itself (and has not struggled yet).
       item.doneProposed = false;
+      delete item.struggling;
       break;
     }
     case "done.proposed":
@@ -2585,6 +3281,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
           : { n: message.payload.n!, via: message.payload.via };
       delete item.intent;
       delete item.fixRequested;
+      delete item.struggling;
       break;
     }
     case "fix.requested": {
@@ -2751,6 +3448,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
 
 /** Release a held claim: the item reopens for anyone to claim. */
 function releaseClaim(item: BoardItem): void {
+  delete item.struggling;
   delete item.intent;
   delete item.owner;
   delete item.grantedSeq;
@@ -2803,7 +3501,7 @@ function decideClaim(
   intent: BoardIntent,
   contestId: string,
 ): BoardDraft {
-  for (const holder of liveClaims(state, agent)) {
+  for (const holder of liveClaims(state, agent, undefined, item)) {
     const overlap = overlappingEntries(intent.write, holder.intent!.write);
     if (overlap.length > 0) {
       return {
@@ -2904,6 +3602,22 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
     }
   };
 
+  // A split item completes when its children are done and its sub-lead's
+  // push (if it announced one) passed; it cites that push's revision.
+  const completeSplitUpward = (parentId: string | undefined, n: number): void => {
+    while (parentId !== undefined) {
+      const parent: BoardItem | undefined = work.items[parentId];
+      if (!parent || !splitReady(work, parent)) {
+        break;
+      }
+      const cited = parent.lastPush?.integratedIn ?? n;
+      emit({ from: BOARD_ENGINE, type: "item.completed", payload: { item: parent.id, n: cited, via: "children" } });
+      // Its scope stops being a live claim: contests waiting on it resolve.
+      resolveWaitersOn(parent.id);
+      parentId = parent.parent;
+    }
+  };
+
   const completeIfReady = (itemId: string): void => {
     const item = work.items[itemId];
     const n = item?.lastPush?.integratedIn;
@@ -2912,15 +3626,7 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
     }
     emit({ from: BOARD_ENGINE, type: "item.completed", payload: { item: item.id, n, via: "integrated" } });
     resolveWaitersOn(item.id);
-    let parentId = item.parent;
-    while (parentId !== undefined) {
-      const parent: BoardItem | undefined = work.items[parentId];
-      if (!parent || parent.status !== "split" || !parent.children.every((c) => work.items[c]?.status === "done")) {
-        break;
-      }
-      emit({ from: BOARD_ENGINE, type: "item.completed", payload: { item: parent.id, n, via: "children" } });
-      parentId = parent.parent;
-    }
+    completeSplitUpward(item.parent, n);
   };
 
   switch (incoming.type) {
@@ -2979,7 +3685,8 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
       break;
     }
     case "item.split":
-      resolveWaitersOn(incoming.payload.item);
+      // Nothing to release: the split item stays a live claim of its sub-lead
+      // (a split is refused while a contest is open on it).
       break;
     case "contract.proposed": {
       const contract = work.contracts[incoming.payload.contract];
@@ -3041,6 +3748,13 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
         for (const item of Object.values(work.items)) {
           if (item.lastPush?.integratedIn === incoming.payload.n) {
             completeIfReady(item.id);
+          }
+        }
+        // A sub-lead's push that passed completes its split item once every
+        // child is done (children that completed earlier waited for it).
+        for (const item of Object.values(work.items)) {
+          if (item.status === "split" && item.lastPush?.integratedIn === incoming.payload.n) {
+            completeSplitUpward(item.id, incoming.payload.n);
           }
         }
         for (const draft of rebaseTargets(work, incoming.payload)) {
@@ -3141,6 +3855,8 @@ export interface IntegratedRevInput {
   readonly failing?: BoardFailingEvidence;
   /** False when no gate ran (only with gate "pass"): nothing was checked. */
   readonly gated?: false;
+  /** Sub-lead merges the integrator could not verify in the gated tree (see integrated.rev). */
+  readonly unverified?: readonly { readonly item: string; readonly reason: string }[];
 }
 
 /**
@@ -3157,6 +3873,10 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
     if (!item?.lastPush) {
       fail("UNKNOWN_REF", `commit ${commit} is not the latest, unintegrated push of any item`);
     }
+    if (routedToSubLead(state, item)) {
+      // A split item's child integrates only through its sub-lead's push.
+      fail("UNKNOWN_REF", `commit ${commit} is ${item.id}'s push, which integrates through its sub-lead ${state.items[item.parent!]!.subLead}'s push`);
+    }
     mergedItems.push(item.id);
     for (const path of item.lastPush.paths) {
       if (!paths.includes(path)) {
@@ -3166,9 +3886,31 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
     if (!contributors.includes(item.lastPush.agent)) {
       contributors.push(item.lastPush.agent);
     }
+    // A sub-lead's push integrates its children's merged pushes: those items
+    // are merged too (a failing revision may implicate them), and their
+    // authors are contributors.
+    for (const merge of subLeadMerges(state, item)) {
+      if ((input.unverified ?? []).some((u) => u.item === merge.item)) {
+        continue; // not in the gated tree as pushed: not integrated by this revision
+      }
+      mergedItems.push(merge.item);
+      const author = state.items[merge.item]!.lastPush!.agent;
+      if (!contributors.includes(author)) {
+        contributors.push(author);
+      }
+    }
   }
   if (input.gated === false && input.gate !== "pass") {
     fail("BAD_PAYLOAD", "only a revision that no gate failed can be ungated");
+  }
+  for (const u of input.unverified ?? []) {
+    const named = input.merged.some((commit) => {
+      const item = itemForPendingPush(state, commit);
+      return item !== undefined && subLeadMerges(state, item).some((m) => m.item === u.item);
+    });
+    if (!named) {
+      fail("UNKNOWN_REF", `unverified names ${u.item}, which no merged sub-lead push merges`);
+    }
   }
   if (input.failing !== undefined) {
     if (input.gate !== "fail") {
@@ -3188,6 +3930,7 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
     contributors,
     ...(input.failing !== undefined ? { failing: { output: input.failing.output, items: [...input.failing.items] } } : {}),
     ...(input.gated === false ? { gated: false as const } : {}),
+    ...(input.unverified !== undefined ? { unverified: input.unverified.map((u) => ({ ...u })) } : {}),
   };
 }
 
@@ -3331,7 +4074,7 @@ export function appendIntegratedRev(state: BoardState, input: unknown, at: strin
     fail("BAD_PAYLOAD", "an integration result must be an object {commit, gate, merged}");
   }
   for (const key of Object.keys(input)) {
-    if (!["commit", "gate", "merged", "failing", "gated"].includes(key)) {
+    if (!["commit", "gate", "merged", "failing", "gated", "unverified"].includes(key)) {
       fail("BAD_PAYLOAD", `an integration result has an unknown field ${JSON.stringify(key)}`);
     }
   }
@@ -3342,6 +4085,7 @@ export function appendIntegratedRev(state: BoardState, input: unknown, at: strin
     merged: idList(input, "merged", { max: BOARD_LIMITS.maxIntentEntries }),
     ...(failing !== undefined ? { failing } : {}),
     ...(ungatedFlag(input) ? { gated: false as const } : {}),
+    ...(input.unverified !== undefined ? { unverified: unverifiedMerges(input.unverified) } : {}),
   };
   if (state.goal === null) {
     fail("NO_GOAL", "the board has no goal yet");
@@ -3548,8 +4292,79 @@ export interface BoardDigest {
   readonly protectedKeys: readonly string[];
   /** Protected paths accepted contracts released for this agent's items. */
   readonly released: readonly string[];
+  /**
+   * The split items this agent is the SUB-LEAD of: each child's state and
+   * latest push, and which of those pushes its own latest push merged. A
+   * child's push integrates only through the sub-lead's next push (`pull`).
+   */
+  readonly subLead?: readonly {
+    readonly item: string;
+    readonly objective: string;
+    readonly write: readonly string[];
+    readonly children: readonly {
+      readonly item: string;
+      readonly status: BoardItemStatus;
+      readonly owner?: string;
+      readonly lastPush?: { readonly commit: string; readonly agent: string; readonly integratedIn?: number };
+      /** The child's latest push is in the sub-lead's latest push. */
+      readonly merged: boolean;
+      /** A revision recorded this push unverified: it is not merged again until the child pushes again. */
+      readonly unverified?: boolean;
+    }[];
+    readonly lastPush?: { readonly commit: string; readonly integratedIn?: number };
+  }[];
+  /**
+   * Help with granted sub-scopes: this agent's own requests (`mine`), the
+   * grants it holds as a helper (`granted`), and live requests nobody has
+   * taken yet that it could offer to fork for (`wanted`).
+   */
+  readonly help?: {
+    readonly mine: readonly BoardDigestHelp[];
+    readonly granted: readonly BoardDigestHelp[];
+    readonly wanted: readonly BoardDigestHelp[];
+  };
+  /**
+   * STRUGGLING cue: this agent's claims that are going badly (its runtime
+   * reported it, or a failing revision asks it for a fix), with the agents
+   * that are idle right now (no claim, nothing pending) who could help.
+   */
+  readonly struggling?: readonly BoardDigestStruggle[];
+  readonly idleAgents?: readonly string[];
+  /**
+   * IDLE cue: when this agent holds nothing and no item is open, the owners
+   * whose items are going badly (it may volunteer: help.volunteered).
+   */
+  readonly busyOwners?: readonly (BoardDigestStruggle & { readonly agent: string; readonly scope: readonly string[] })[];
+  /** Volunteers waiting for this agent's answer on its items. */
+  readonly volunteers?: readonly { readonly agent: string; readonly item: string; readonly seq: number }[];
   /** Messages after `after` addressed to this agent or touching its work. */
   readonly messages: readonly BoardMessage[];
+}
+
+/** An item going badly, as the cues show it. */
+export interface BoardDigestStruggle {
+  readonly item: string;
+  readonly turnsSpent: number;
+  readonly failedEdits: number;
+  readonly reason: "failed-edits" | "turn-budget" | "failing-revision";
+  readonly lastFailure?: string;
+}
+
+/** One help request with a granted sub-scope, as a digest shows it. */
+export interface BoardDigestHelp {
+  readonly request: string;
+  readonly item: string;
+  readonly by: string;
+  readonly need: string;
+  readonly scope: readonly string[];
+  readonly live: boolean;
+  readonly grantee?: string;
+  readonly forkCommit?: string;
+  readonly fork?: string;
+  readonly delivered?: { readonly commit: string; readonly paths: readonly string[] };
+  readonly pulled: boolean;
+  /** The requester closed it without pulling. */
+  readonly closed?: "declined" | "pull-failed";
 }
 
 const BROADCAST_TYPES: ReadonlySet<BoardMessageType> = new Set([
@@ -3567,6 +4382,8 @@ const BROADCAST_TYPES: ReadonlySet<BoardMessageType> = new Set([
   "tool.gated",
   "tool.published",
   "item.reopened",
+  // A cue that an owner is struggling (idle agents may volunteer).
+  "item.struggling",
 ]);
 
 const DIGEST_OPEN_ITEMS = 100;
@@ -3592,7 +4409,15 @@ export function boardDigest(
       mine.add(item.id);
     }
   }
-  const myRequests = new Set(Object.values(state.help).filter((h) => h.by === agent).map((h) => h.request));
+  // A sub-lead follows its children (their pushes are its to merge).
+  for (const item of Object.values(state.items)) {
+    if (item.status === "split" && item.subLead === agent) {
+      for (const child of item.children) {
+        mine.add(child);
+      }
+    }
+  }
+  const myRequests = new Set(Object.values(state.help).filter((h) => h.by === agent || h.grant?.agent === agent).map((h) => h.request));
   const myReviews = new Set(Object.values(state.reviews).filter((r) => r.by === agent).map((r) => r.review));
   const relevant = (m: BoardMessage): boolean => {
     if (m.from === agent) {
@@ -3611,7 +4436,11 @@ export function boardDigest(
     if (typeof p.ownerItem === "string" && mine.has(p.ownerItem)) {
       return true;
     }
-    if (m.type === "help.offered" && myRequests.has(m.payload.request)) {
+    if ((m.type === "help.offered" || m.type === "help.delivered" || m.type === "help.closed") && myRequests.has(m.payload.request)) {
+      return true;
+    }
+    // A request that grants a sub-scope is open work for any agent.
+    if (m.type === "help.requested" && m.payload.scope !== undefined) {
       return true;
     }
     return m.type === "review.result" && myReviews.has(m.payload.review);
@@ -3669,6 +4498,130 @@ export function boardDigest(
     protected: state.protected,
     protectedKeys: state.protectedKeys,
     released: [...new Set(held.flatMap((i) => releasedTargets(state, i.id)))],
+    ...((): Pick<BoardDigest, "subLead"> => {
+      const led = Object.values(state.items).filter((i) => i.status === "split" && i.subLead === agent && i.owner === agent);
+      if (led.length === 0) {
+        return {};
+      }
+      return {
+        subLead: led.map((i) => {
+          const merged = new Set(
+            (i.lastPush?.merges ?? []).filter((m) => !(i.lastPush?.unverified ?? []).includes(m.item)).map((m) => `${m.item}@${m.commit}`),
+          );
+          return {
+            item: i.id,
+            objective: i.objective,
+            write: [...(i.intent?.write ?? [])],
+            children: i.children.map((id) => {
+              const child = state.items[id]!;
+              return {
+                item: id,
+                status: child.status,
+                ...(child.owner !== undefined ? { owner: child.owner } : {}),
+                ...(child.lastPush
+                  ? {
+                      lastPush: {
+                        commit: child.lastPush.commit,
+                        agent: child.lastPush.agent,
+                        ...(child.lastPush.integratedIn !== undefined ? { integratedIn: child.lastPush.integratedIn } : {}),
+                      },
+                    }
+                  : {}),
+                merged: child.lastPush !== undefined && merged.has(`${id}@${child.lastPush.commit}`),
+                // Recorded unverified at this commit: not merged again until the child pushes again.
+                ...(child.lastPush?.unverifiedIn !== undefined ? { unverified: true } : {}),
+              };
+            }),
+            ...(i.lastPush
+              ? { lastPush: { commit: i.lastPush.commit, ...(i.lastPush.integratedIn !== undefined ? { integratedIn: i.lastPush.integratedIn } : {}) } }
+              : {}),
+          };
+        }),
+      };
+    })(),
+    ...((): Pick<BoardDigest, "struggling" | "idleAgents" | "busyOwners" | "volunteers"> => {
+      const struggleOf = (i: BoardItem): BoardDigestStruggle | undefined => {
+        // A report goes stale once its owner pushed after it (that is progress).
+        const report =
+          i.struggling?.owner === i.owner && !(i.lastPush && i.lastPush.agent === i.owner && i.lastPush.seq > i.struggling!.seq) ? i.struggling : undefined;
+        const fixing = i.fixRequested !== undefined;
+        if (!report && !fixing) {
+          return undefined;
+        }
+        const failureLine =
+          report?.lastFailure ??
+          (fixing && state.lastFailure?.n === i.fixRequested
+            ? (state.lastFailure!.output.split("\n").find((l) => l.trim() !== "") ?? "").slice(0, 200)
+            : undefined);
+        return {
+          item: i.id,
+          turnsSpent: report?.turnsSpent ?? 0,
+          failedEdits: report?.failedEdits ?? 0,
+          reason: report?.reason ?? "failing-revision",
+          ...(failureLine ? { lastFailure: failureLine } : {}),
+        };
+      };
+      const holds = (a: string) =>
+        Object.values(state.items).some((i) => ((i.status === "claimed" || i.status === "split") && i.owner === a) || i.claimant?.agent === a) ||
+        Object.values(state.help).some((h) => h.grant?.agent === a && helpGrantLive(state, h));
+      const out: Pick<BoardDigest, "struggling" | "idleAgents" | "busyOwners" | "volunteers"> = {};
+      const mineStruggling = held.flatMap((i) => {
+        const s = struggleOf(i);
+        return s ? [s] : [];
+      });
+      if (mineStruggling.length > 0) {
+        Object.assign(out, {
+          struggling: mineStruggling,
+          idleAgents: Object.values(state.agents)
+            .filter((a) => a.leftSeq === undefined && a.role !== LEAD_ROLE && a.id !== agent && !holds(a.id))
+            .map((a) => a.id)
+            .sort(),
+        });
+      }
+      const open = Object.values(state.items).some((i) => i.status === "open");
+      if (record?.role !== LEAD_ROLE && !holds(agent) && !open) {
+        const busy = Object.values(state.items).flatMap((i) => {
+          if (i.status !== "claimed" || i.owner === undefined || i.owner === agent || !activeAgent(state, i.owner) || i.tool) {
+            return [];
+          }
+          const s = struggleOf(i);
+          return s ? [{ ...s, agent: i.owner, scope: [...(i.intent?.write ?? [])] }] : [];
+        });
+        if (busy.length > 0) {
+          Object.assign(out, { busyOwners: busy });
+        }
+      }
+      const waiting = Object.values(state.volunteers ?? {}).filter(
+        (v) => v.owner === agent && v.answered === undefined && state.items[v.item]?.status === "claimed" && state.items[v.item]?.owner === agent,
+      );
+      if (waiting.length > 0) {
+        Object.assign(out, { volunteers: waiting.map((v) => ({ agent: v.agent, item: v.item, seq: v.seq })) });
+      }
+      return out;
+    })(),
+    ...((): Pick<BoardDigest, "help"> => {
+      const view = (h: BoardHelpRequest): BoardDigestHelp => ({
+        request: h.request,
+        item: h.item,
+        by: h.by,
+        need: h.need,
+        scope: [...(h.scope ?? [])],
+        live: helpGrantLive(state, h),
+        ...(h.grant !== undefined ? { grantee: h.grant.agent } : {}),
+        ...(h.grant?.forkCommit !== undefined ? { forkCommit: h.grant.forkCommit } : {}),
+        ...(h.grant?.fork !== undefined ? { fork: h.grant.fork } : {}),
+        ...(h.delivered !== undefined ? { delivered: { commit: h.delivered.commit, paths: h.delivered.paths } } : {}),
+        pulled: h.pulledSeq !== undefined,
+        ...(h.closed !== undefined ? { closed: h.closed.reason } : {}),
+      });
+      const granting = Object.values(state.help).filter((h) => h.scope !== undefined);
+      const mineHelp = granting.filter((h) => h.by === agent && h.pulledSeq === undefined && h.closed === undefined).map(view);
+      const granted = granting.filter((h) => h.grant?.agent === agent && h.pulledSeq === undefined && h.closed === undefined).map(view);
+      const wanted = granting
+        .filter((h) => h.by !== agent && h.grant === undefined && helpGrantLive(state, h) && !h.offers.includes(agent) && (h.to === undefined || h.to.includes(agent)))
+        .map(view);
+      return mineHelp.length + granted.length + wanted.length > 0 ? { help: { mine: mineHelp, granted, wanted } } : {};
+    })(),
     messages: messages.filter((m) => m.seq > after && relevant(m)),
   };
 }
@@ -3951,4 +4904,24 @@ export function boardErrorStatus(code: BoardErrorCode): number {
     return 409;
   }
   return 400;
+}
+
+/**
+ * How many distinct sub-changes an objective names (a simple, documented
+ * heuristic for the split cue): its clauses split on ";", ",", " and ",
+ * " then ", counting those of at least two words. "Add input validation and
+ * require auth on every resource" names 2.
+ */
+export function objectiveSubChanges(objective: string): number {
+  const head = objective.split(/\s+\(/)[0] ?? objective;
+  return head
+    .split(/;|,|\band\b|\bthen\b/i)
+    .map((part) => part.trim().split(/\s+/).filter((w) => w.length > 0))
+    .filter((words) => words.length >= 2).length;
+}
+
+/** The split cue: an item is worth splitting when its write intent spans at least 3 files or its objective names at least 2 sub-changes. */
+export function splitCue(files: number, objective: string): { readonly splittable: boolean; readonly files: number; readonly subChanges: number } {
+  const subChanges = objectiveSubChanges(objective);
+  return { splittable: files >= 3 || subChanges >= 2, files, subChanges };
 }

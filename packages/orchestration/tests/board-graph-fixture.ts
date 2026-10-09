@@ -218,3 +218,49 @@ export function ungatedLog(): BoardMessage[] {
   b.rev({ commit: "rev1rev", gate: "pass", merged: ["f00f00f"], gated: false });
   return b.log;
 }
+
+/**
+ * A formation log: ag-1 splits item `wide` (it becomes the sub-lead) and its
+ * children are claimed by ag-2 and ag-3, who push; the sub-lead merges both
+ * pushes into one push that passes. On item `pair`, ag-2 grants a file to a
+ * helper: ag-3 forks ag-2's repo at its push, delivers, and ag-2 pulls.
+ */
+export function formationLog(): BoardMessage[] {
+  const b = new FixtureBoard();
+  b.human({ type: "goal.posted", payload: { objective: "change two areas" } });
+  b.join("lead", "lead");
+  for (const a of ["ag-1", "ag-2", "ag-3"]) {
+    b.join(a);
+  }
+  b.agent("lead", { type: "item.proposed", payload: { item: "wide", objective: "change src/a", scopeHint: ["src/a/**"] } });
+  b.agent("lead", { type: "item.proposed", payload: { item: "pair", objective: "change src/p", scopeHint: ["src/p/**"] } });
+  b.agent("ag-1", { type: "item.claimed", payload: { item: "wide", intent: { read: [], write: ["src/a/**"] } } });
+  b.agent("ag-1", {
+    type: "item.split",
+    payload: {
+      item: "wide",
+      children: [
+        { item: "wide.1", objective: "x", scopeHint: ["src/a/x.ts"] },
+        { item: "wide.2", objective: "y", scopeHint: ["src/a/y.ts"] },
+      ],
+    },
+  });
+  b.agent("ag-2", { type: "item.claimed", payload: { item: "wide.1", intent: { read: [], write: ["src/a/x.ts"] } } });
+  b.agent("ag-3", { type: "item.claimed", payload: { item: "wide.2", intent: { read: [], write: ["src/a/y.ts"] } } });
+  b.agent("ag-2", { type: "push.announced", payload: { item: "wide.1", commit: "c0000001", paths: ["src/a/x.ts"] } });
+  b.agent("ag-3", { type: "push.announced", payload: { item: "wide.2", commit: "c0000002", paths: ["src/a/y.ts"] } });
+  b.agent("ag-2", { type: "done.proposed", payload: { item: "wide.1" } });
+  b.agent("ag-3", { type: "done.proposed", payload: { item: "wide.2" } });
+  b.agent("ag-1", {
+    type: "push.announced",
+    payload: { item: "wide", commit: "c0000003", paths: ["src/a/x.ts", "src/a/y.ts"], merges: [{ item: "wide.1", commit: "c0000001" }, { item: "wide.2", commit: "c0000002" }] },
+  });
+  b.rev({ commit: "r0000001", gate: "pass", merged: ["c0000003"] });
+  b.agent("ag-2", { type: "item.claimed", payload: { item: "pair", intent: { read: [], write: ["src/p/**"] } } });
+  b.agent("ag-2", { type: "push.announced", payload: { item: "pair", commit: "c0000004", paths: ["src/p/a.ts", "src/p/b.ts"] } });
+  b.agent("ag-2", { type: "help.requested", payload: { request: "h1", item: "pair", need: "parallel-edit", scope: ["src/p/b.ts"] } });
+  b.agent("ag-3", { type: "help.offered", payload: { request: "h1", forkOf: "ag-2", forkCommit: "c0000004", fork: "chg--help-h1" }, to: ["ag-2"] });
+  b.agent("ag-3", { type: "help.delivered", payload: { request: "h1", commit: "c0000005", paths: ["src/p/b.ts"] }, to: ["ag-2"] });
+  b.agent("ag-2", { type: "push.announced", payload: { item: "pair", commit: "c0000005", paths: ["src/p/b.ts"], pulled: ["h1"] } });
+  return b.log;
+}

@@ -70,3 +70,12 @@ export function toolsWorkspaceName(changeId: string): string {
 export function toolBranch(capability: string): string {
   return `tools/${capability}`;
 }
+
+/**
+ * The repo a helper gets for a help request that grants a sub-scope: a FORK of
+ * the requester's repo (`<changeId>--help-<request>`), so the helper starts
+ * from the requester's in-progress state. One fork per request (one grantee).
+ */
+export function boardHelpForkWorkspaceName(changeId: string, request: string): string {
+  return `${changeId}--help-${request}`.replace(/[^A-Za-z0-9._-]+/g, "-");
+}

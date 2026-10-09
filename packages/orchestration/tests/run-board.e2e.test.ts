@@ -872,3 +872,103 @@ describe("dependency install before the gate (offline, fake installer)", () => {
     expect(result.verdict).toBe("verified");
   });
 });
+
+describe("lockstep schedule priority", () => {
+  it("steps agents building an unpublished tool first, then the rest in join order", async () => {
+    const { lockstepOrder } = await import("../src/run-board.ts");
+    const { emptyBoard } = await import("@switchyard-change/change-core");
+    const state = emptyBoard();
+    state.items["tool-cm"] = { id: "tool-cm", objective: "o", acceptance: [], scopeHint: ["tools/cm/**"], status: "claimed", owner: "agent-3", proposedBy: "lead", proposedSeq: 1, children: [], doneProposed: false, tool: { capability: "cm", kind: "codemod" } };
+    const workers = [{ id: "agent-1" }, { id: "agent-2" }, { id: "agent-3" }];
+    expect(lockstepOrder(workers, state).map((w) => w.id)).toEqual(["agent-3", "agent-1", "agent-2"]);
+    state.tools.published.push({ tool: "t", capability: "cm", version: "1", repo: "r", commit: "c", kind: "codemod", usage: "u", publishedBy: "agent-3", seq: 2, gateSeq: 2, uses: 0 });
+    expect(lockstepOrder(workers, state).map((w) => w.id)).toEqual(["agent-1", "agent-2", "agent-3"]);
+  });
+});
+
+describe("formation hardening in the driver", () => {
+  async function repo(files: Record<string, string>): Promise<{ dir: string; commit: string }> {
+    const dir = await mkdtemp(join(tmpdir(), "scf-verify-"));
+    await git("git", ["init", "-q", dir]);
+    for (const [rel, body] of Object.entries(files)) {
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      await writeFile(join(dir, rel), body);
+    }
+    await git("git", ["-C", dir, "add", "-A"]);
+    await git("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "c"]);
+    return { dir, commit: (await git("git", ["-C", dir, "rev-parse", "HEAD"])).stdout.trim() };
+  }
+
+  it("verifies each merged child's in-intent tree against the sub-lead's commit (content and deletions)", async () => {
+    const { verifySubLeadMerges } = await import("../src/run-board.ts");
+    const { emptyBoard } = await import("@switchyard-change/change-core");
+    const child = await repo({ "src/x.ts": "x2\n" });
+    const goodLead = await repo({ "src/x.ts": "x2\n", "src/y.ts": "other child\n" });
+    const staleLead = await repo({ "src/x.ts": "x1\n", "src/x-old.ts": "deleted by the child\n" });
+    const state = emptyBoard();
+    state.items.one = { id: "one", objective: "o", acceptance: [], scopeHint: ["src/**"], status: "split", owner: "lead-a", subLead: "lead-a", proposedBy: "lead", proposedSeq: 1, children: ["one-x"], doneProposed: false, intent: { read: [], write: ["src/**"] }, lastPush: { seq: 5, commit: "pa", agent: "lead-a", paths: ["src/x.ts"], merges: [{ item: "one-x", commit: child.commit }] } };
+    state.items["one-x"] = { id: "one-x", objective: "o", acceptance: [], scopeHint: ["src/x.ts", "src/x-old.ts"], status: "claimed", owner: "kid", parent: "one", proposedBy: "lead-a", proposedSeq: 2, children: [], doneProposed: true, intent: { read: [], write: ["src/x.ts", "src/x-old.ts"] }, lastPush: { seq: 4, commit: child.commit, agent: "kid", paths: ["src/x.ts"] } };
+    const run = async (lead: { dir: string; commit: string }) =>
+      verifySubLeadMerges({
+        units: [{ agent: "lead-a", commit: lead.commit, items: [state.items.one!] }],
+        state,
+        readRemote: async (agent) => (agent === "kid" ? child.dir : lead.dir),
+        workRoot: await mkdtemp(join(tmpdir(), "scf-verify-work-")),
+      });
+    expect(await run(goodLead)).toEqual([]);
+    const stale = await run(staleLead);
+    expect(stale).toEqual([{ item: "one-x", reason: expect.stringMatching(/does not carry one-x's push .* for src\/x-old\.ts, src\/x\.ts/) }]);
+  });
+
+  it("holds an owner (concurrent schedule) only while a codemod being built covers all its unpushed work", async () => {
+    const { toolHold } = await import("../src/run-board.ts");
+    const { emptyBoard } = await import("@switchyard-change/change-core");
+    const state = emptyBoard();
+    state.agents = { b: { id: "b", joinedSeq: 1 }, o: { id: "o", joinedSeq: 2 } };
+    state.tools.proposed.t = { tool: "t", capability: "cm", kind: "codemod", inputs: ["src/**"], outputs: [], proposedBy: "lead", seq: 1, item: "tool-cm", builds: 0, failedGates: 0 };
+    state.items["tool-cm"] = { id: "tool-cm", objective: "o", acceptance: [], scopeHint: ["tools/cm/**"], status: "claimed", owner: "b", proposedBy: "lead", proposedSeq: 1, children: [], doneProposed: false, tool: { capability: "cm", kind: "codemod" }, intent: { read: [], write: ["tools/cm/**"] } };
+    state.items.i = { id: "i", objective: "o", acceptance: [], scopeHint: ["src/a.ts"], status: "claimed", owner: "o", proposedBy: "lead", proposedSeq: 2, children: [], doneProposed: false, intent: { read: [], write: ["src/a.ts"] } };
+    state.lastSeq = 5;
+    expect(toolHold(state, "o")).toBe(true);
+    expect(toolHold(state, "b")).toBe(false); // the builder itself is never held
+    state.items.i.lastPush = { seq: 6, commit: "c", agent: "o", paths: ["src/a.ts"] };
+    expect(toolHold(state, "o")).toBe(false); // already pushed: nothing to wait for
+    delete state.items.i.lastPush;
+    state.tools.proposed.t.failedGates = 1;
+    expect(toolHold(state, "o")).toBe(false); // unavailable: never wait
+  });
+});
+
+describe("help that nobody takes never stalls the requester (live regression board-live-s2)", () => {
+  it("an owner grants its only file, nobody helps, and the item still completes with no blocked pushes", async () => {
+    const projectDir = await project();
+    const policy = createGenericBoardPolicy();
+    let granted = false;
+    const transport: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      const api = input.digest.claims.find((c) => c.item === "api");
+      // The owner of "api" grants its ONLY file right after its first push (as the live model did).
+      if (!granted && api?.lastPush?.agent === input.agent && !api.doneProposed) {
+        granted = true;
+        return { action: { type: "message", kind: "help", payload: { itemId: "api", need: "fix", scope: ["src/api/handler.ts"] }, rationale: "please take my only file" } };
+      }
+      const outcome = await policy(input);
+      // Nobody ever takes a grant.
+      if (outcome.action.type === "message" && outcome.action.kind === "reply" && (input.digest.help?.wanted ?? []).some((h) => h.request === (outcome.action as { payload: { requestId?: string } }).payload.requestId)) {
+        return { action: { type: "wait", reason: "not helping" } };
+      }
+      return outcome;
+    };
+    const gate = new FirstAttemptFailingGate();
+    const result = await offline({ goal: GOAL, projectDir, seed, transport, appGateCommand: ["gate"], verifyCommandRunner: gate });
+    expect(granted).toBe(true);
+    expect(of(result.log, "help.requested").some((m) => m.payload.item === "api" && m.payload.scope !== undefined)).toBe(true);
+    expect(of(result.log, "help.offered").filter((m) => m.payload.forkOf !== undefined)).toEqual([]);
+    // The untaken grant never blocked the owner's own pushes or its done proposal.
+    expect(result.turns.filter((t) => t.code === "INTENT_OVERLAP")).toEqual([]);
+    expect(result.state.items.api).toMatchObject({ status: "done" });
+    expect(result.incompleteItems).toEqual([]);
+    expect(result.verdict).toBe("verified");
+    expect(result.revisions.length).toBeLessThanOrEqual(6);
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  });
+});

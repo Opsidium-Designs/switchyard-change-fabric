@@ -18,9 +18,10 @@ import {
   boardPrefix,
   boardThread,
   buildBoardGraph,
+  hullAgentPoint,
   type BoardGraphModel,
 } from "../src/board-graph.ts";
-import { missionControlLog, ungatedLog } from "./board-graph-fixture.ts";
+import { formationLog, missionControlLog, ungatedLog } from "./board-graph-fixture.ts";
 
 const log = missionControlLog();
 const full = buildBoardGraph(log);
@@ -320,5 +321,71 @@ describe("threads, captions, and jump targets", () => {
     const jumps = boardJumpTargets(log);
     expect(jumps.revs).toEqual([seqOf("integrated.rev"), seqOf("integrated.rev", (m) => m.type === "integrated.rev" && m.payload.n === 2)]);
     expect(jumps.contests).toEqual([seqOf("claim.contested"), seqOf("claim.escalated"), seqOf("contract.escalated")]);
+  });
+});
+
+describe("formation: split hulls nested with the sub-lead on the border, and fork lineage", () => {
+  const flog = formationLog();
+  const graph = buildBoardGraph(flog);
+  const layout = boardLayout(flog);
+  const fseq = (type: string, pick: (m: BoardMessage) => boolean = () => true): number => flog.find((m) => m.type === type && pick(m))!.seq;
+
+  it("nests a split item's children inside its hull, and the parent grows to hold them", () => {
+    const parent = layout.items.get("wide")!;
+    for (const id of ["wide.1", "wide.2"]) {
+      const child = layout.items.get(id)!;
+      expect(child).toMatchObject({ parent: "wide", depth: 1 });
+      expect(child.x).toBeGreaterThanOrEqual(parent.x);
+      expect(child.x + child.w).toBeLessThanOrEqual(parent.x + parent.w);
+      expect(child.y).toBeGreaterThan(parent.y);
+      expect(child.y + child.h).toBeLessThanOrEqual(parent.y + parent.h);
+    }
+    // Top-level items still take grid slots and never overlap the grown hull.
+    const pair = layout.items.get("pair")!;
+    expect(pair.parent).toBeUndefined();
+    expect(pair.x >= parent.x + parent.w || pair.y >= parent.y + parent.h).toBe(true);
+    // An agent in a narrow nested hull stays inside it.
+    const child = layout.items.get("wide.1")!;
+    const p = hullAgentPoint(child, 0, "ag-2");
+    expect(p.x).toBeGreaterThan(child.x);
+    expect(p.x).toBeLessThan(child.x + child.w);
+  });
+
+  it("draws the sub-lead on the border of the split item's hull", () => {
+    // While the split item is in flight (before its sub-lead's push passed).
+    const atMerge = buildBoardGraph(flog, fseq("push.announced", (m) => m.type === "push.announced" && m.payload.merges !== undefined));
+    const subLead = atMerge.nodes.find((n) => n.id === "agent:ag-1")!;
+    expect(subLead.detail).toMatchObject({ kind: "agent", hull: "wide", subLeadOf: ["wide"] });
+    expect(atMerge.nodes.find((n) => n.id === "item:wide")!.detail).toMatchObject({ kind: "item", status: "split", subLead: "ag-1" });
+    expect(graph.nodes.find((n) => n.id === "item:wide")!.detail).toMatchObject({ kind: "item", status: "done", subLead: "ag-1" });
+    const hull = layout.items.get("wide")!;
+    expect(boardNodePoint(layout, subLead)).toEqual({ x: hull.x, y: hull.y + 32 + 36 });
+  });
+
+  it("draws fork lineage as a dependency edge labelled fork, backed by the help.offered seq, and merges as labelled dependency edges", () => {
+    const fork = graph.edges.find((e) => e.id === "fork:h1")!;
+    expect(fork).toMatchObject({ kind: "dependency", label: "fork", from: "agent:ag-2", to: "agent:ag-3", seqs: [fseq("help.offered")] });
+    expect(fork.tooltip).toContain("forked ag-2's repo at c0000004");
+    const merged = graph.edges.filter((e) => e.label === "merged");
+    expect(merged.map((e) => [e.from, e.to])).toEqual([
+      ["item:wide.1", "item:wide"],
+      ["item:wide.2", "item:wide"],
+    ]);
+    expect(graph.edges.every((e) => BOARD_GRAPH_EDGE_KINDS.includes(e.kind))).toBe(true);
+    // The helper's delivery is an ordinary message edge (addressed to the requester).
+    expect(graph.edges.some((e) => e.kind === "message" && e.type === "help.delivered" && e.to === "agent:ag-2")).toBe(true);
+    // Threads: the help messages belong to the item they help on.
+    expect(boardThread(flog, Number.POSITIVE_INFINITY, { kind: "item", id: "pair" }).map((m) => m.type)).toContain("help.delivered");
+  });
+
+  it("refuses a fork edge not backed by its help.offered, and a merged edge not backed by the sub-lead's push", () => {
+    const fork = graph.edges.find((e) => e.id === "fork:h1")!;
+    expect(() => assertBoardBacked({ ...graph, edges: [{ ...fork, seqs: [fseq("help.requested")] }] }, flog)).toThrow(/not the help.offered fork/);
+    expect(() => assertBoardBacked({ ...graph, edges: [{ ...fork, from: "agent:ag-1" }] }, flog)).toThrow(/not the help.offered fork/);
+    const merged = graph.edges.find((e) => e.label === "merged")!;
+    expect(() => assertBoardBacked({ ...graph, edges: [{ ...merged, seqs: [fseq("help.offered")] }] }, flog)).toThrow(/not a sub-lead push/);
+    for (let k = 0; k <= flog.at(-1)!.seq; k += 1) {
+      expect(() => buildBoardGraph(flog, k)).not.toThrow();
+    }
   });
 });

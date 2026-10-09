@@ -23,6 +23,8 @@ import {
   appendDiscoveredUnits,
   BOARD_AGENT_ID_PATTERN,
   boardAgentWorkspaceName,
+  boardHelpForkWorkspaceName,
+  checkHelpFork,
   BOARD_WORKSPACE_TTL_BOUNDS,
   checkBoardJoin,
   parseBoardJoinWorkspace,
@@ -1704,10 +1706,38 @@ export class LocalChangeControl {
     if (method === "POST" && readToken) {
       return this.handleBoardReadToken(dec(readToken[1]), parseBody(init));
     }
+    const helpFork = url.pathname.match(/^\/changes\/([^/]+)\/board\/help-fork$/);
+    if (method === "POST" && helpFork) {
+      return this.handleHelpFork(dec(helpFork[1]), parseBody(init));
+    }
+    // Mirrors the Worker's archive route for the repos this stand-in provisioned
+    // (board agents' repos, help forks, the tools repo).
+    const archive = url.pathname.match(/^\/workspaces\/([^/]+)$/);
+    if (method === "DELETE" && archive) {
+      const name = dec(archive[1]);
+      const ref = this.boardWorkspaces.get(name) ?? [...this.toolsWorkspaces.values()].find((r) => r.name === name);
+      if (!ref) {
+        return json({ error: `no such workspace: ${name}` }, 404);
+      }
+      await this.workspaces.archive(ref);
+      this.boardWorkspaces.delete(name);
+      for (const [change, tools] of this.toolsWorkspaces) {
+        if (tools.name === name) {
+          this.toolsWorkspaces.delete(change);
+        }
+      }
+      return json({ archived: name }, 200);
+    }
     const revokeRead = url.pathname.match(/^\/changes\/([^/]+)\/board\/read-token\/revoke$/);
     if (method === "POST" && revokeRead) {
       const b = parseBody(init);
-      const ref = typeof b.agent === "string" ? this.boardWorkspaces.get(boardAgentWorkspaceName(dec(revokeRead[1]), b.agent)) : undefined;
+      const repoName =
+        typeof b.help === "string"
+          ? boardHelpForkWorkspaceName(dec(revokeRead[1]), b.help)
+          : typeof b.agent === "string"
+            ? boardAgentWorkspaceName(dec(revokeRead[1]), b.agent)
+            : undefined;
+      const ref = repoName !== undefined ? this.boardWorkspaces.get(repoName) : undefined;
       if (!ref || typeof b.tokenId !== "string") {
         return json({ code: "BAD_PAYLOAD", error: "a revoke names a board agent with a repo and a tokenId" }, 400);
       }
@@ -2220,6 +2250,22 @@ export class LocalChangeControl {
     if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < min || ttl > max) {
       return json({ code: "BAD_PAYLOAD", error: `ttlSeconds must be an integer from ${min} to ${max}` }, 400);
     }
+    // A help fork (`help`): the operator reads the granted helper's fork to
+    // pull its delivered commit into the requester's repo (the grant decides,
+    // even after the helper left).
+    if (body.help !== undefined) {
+      const request = typeof body.help === "string" ? record.boardState.help[body.help] : undefined;
+      if (!request || request.grant === undefined || request.grant.agent !== agent) {
+        return json({ code: "NOT_ALLOWED", error: `${agent} holds no granted help fork for ${String(body.help)}` }, 400);
+      }
+      const forkName = boardHelpForkWorkspaceName(changeId, request.request);
+      const fork = this.boardWorkspaces.get(forkName);
+      if (!fork) {
+        return json({ code: "NOT_ALLOWED", error: `no fork was made for help request ${request.request}` }, 400);
+      }
+      const token = await this.workspaces.issueReadToken(fork, ttl);
+      return json({ workspaceName: forkName, tokenId: token.id, token: token.token, tokenExpiresAt: token.expiresAt }, 201);
+    }
     const joined = record.boardState.agents[agent];
     if (joined === undefined || joined.leftSeq !== undefined) {
       return json({ code: "UNKNOWN_AGENT", error: `${agent} is not a joined agent of this board` }, 400);
@@ -2234,6 +2280,62 @@ export class LocalChangeControl {
     }
     const token = await this.workspaces.issueReadToken(ref, ttl);
     return json({ workspaceName, tokenId: token.id, token: token.token, tokenExpiresAt: token.expiresAt }, 201);
+  }
+
+  /**
+   * Mirrors the Worker's help-fork route: fork the REQUESTER's repo for the
+   * helper of a help request that grants a sub-scope (checked on the board
+   * first, so a fork the board would refuse is never made), with a short-lived
+   * write token for the fork. The helper then posts help.offered {forkOf,
+   * forkCommit, fork} itself; the fork is archived at cleanup like any repo.
+   */
+  private async handleHelpFork(changeId: string, body: Record<string, unknown>): Promise<Response> {
+    const record = this.records.get(changeId);
+    if (!record) {
+      return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
+    }
+    if (typeof body.request !== "string" || typeof body.agent !== "string" || !BOARD_AGENT_ID_PATTERN.test(body.agent)) {
+      return json({ code: "BAD_PAYLOAD", error: "a help fork names a help request and a board agent id" }, 400);
+    }
+    const ttl = body.ttlSeconds === undefined ? 900 : body.ttlSeconds;
+    const { min, max } = BOARD_WORKSPACE_TTL_BOUNDS;
+    if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < min || ttl > max) {
+      return json({ code: "BAD_PAYLOAD", error: `ttlSeconds must be an integer from ${min} to ${max}` }, 400);
+    }
+    let requester: string;
+    try {
+      requester = checkHelpFork(record.boardState, body.request, body.agent).requester;
+    } catch (error) {
+      if (error instanceof BoardError) {
+        return json({ code: error.code, error: error.message }, boardErrorStatus(error.code));
+      }
+      throw error;
+    }
+    const source = this.boardWorkspaces.get(boardAgentWorkspaceName(changeId, requester));
+    if (!source) {
+      return json({ code: "NOT_ALLOWED", error: `${requester} joined without a workspace: there is no repo to fork` }, 400);
+    }
+    const forkName = boardHelpForkWorkspaceName(changeId, body.request);
+    if (this.boardWorkspaces.has(forkName)) {
+      return json({ code: "DUPLICATE", error: `help request ${body.request} already has a fork` }, 400);
+    }
+    const { ref, token } = await this.workspaces.fork(source, forkName, ttl);
+    this.boardWorkspaces.set(ref.name, ref);
+    return json(
+      {
+        workspaceId: ref.id,
+        workspaceName: ref.name,
+        gitUrl: ref.gitUrl,
+        defaultBranch: ref.defaultBranch,
+        backend: ref.backend,
+        fallback: ref.fallback,
+        tokenId: token.id,
+        token: token.token,
+        tokenExpiresAt: token.expiresAt,
+        forkOf: requester,
+      },
+      201,
+    );
   }
 
   private async handleLease(changeId: string, unitId: string): Promise<Response> {

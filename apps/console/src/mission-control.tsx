@@ -840,7 +840,7 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                 return (
                   <g
                     key={node.id}
-                    className={`mc-hull status-${node.status}${isSel ? " is-selected" : ""}`}
+                    className={`mc-hull status-${node.status}${isSel ? " is-selected" : ""}${rect.parent !== undefined ? " is-nested" : ""}`}
                     role="button"
                     tabIndex={0}
                     aria-label={`item ${d.item} (${node.status})`}
@@ -865,6 +865,20 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                         {"✓"}
                       </text>
                     ) : null}
+                    {d.struggling !== undefined ? (
+                      <g className="mc-struggling">
+                        <circle cx={rect.x + 18} cy={rect.y + rect.h - 20} r={10} />
+                        <text x={rect.x + 18} y={rect.y + rect.h - 15} textAnchor="middle">
+                          !
+                        </text>
+                        <title>{`struggling (${d.struggling.reason}, ${d.struggling.turnsSpent} turn(s)): idle agents may volunteer (seq ${d.struggling.seq}, item.struggling)`}</title>
+                      </g>
+                    ) : null}
+                    {d.volunteers !== undefined && d.volunteers.length > 0 ? (
+                      <text className="mc-volunteers" x={rect.x + 34} y={rect.y + rect.h - 15}>
+                        {d.volunteers.map((v) => `${v.agent}${v.answer ? ` (${v.answer})` : " offered"}`).join(", ")}
+                      </text>
+                    ) : null}
                     {collapsed.has(d.item) ? (
                       <text className="mc-hull-count" x={rect.x + rect.w / 2} y={rect.y + rect.h / 2 + 12} textAnchor="middle">
                         {d.agents.length} agents
@@ -886,10 +900,15 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
               return (
                 <g
                   key={edge.id}
-                  className={`mc-edge kind-${edge.kind}${edge.contest ? ` contest-${edge.contest}` : ""}${related ? " is-related" : ""}`}
+                  className={`mc-edge kind-${edge.kind}${edge.contest ? ` contest-${edge.contest}` : ""}${edge.label ? ` label-${edge.label}` : ""}${related ? " is-related" : ""}`}
                   onClick={() => selectEdge(edge)}
                 >
                   <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} />
+                  {edge.label ? (
+                    <text className="mc-edge-tag" x={(a.x + b.x) / 2} y={(a.y + b.y) / 2 - 4} textAnchor="middle">
+                      {edge.label}
+                    </text>
+                  ) : null}
                   <title>{edge.tooltip}</title>
                 </g>
               );
@@ -938,7 +957,7 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                 return (
                   <g
                     key={node.id}
-                    className={`mc-node kind-${node.kind} status-${node.status}${isSel ? " is-selected" : ""}`}
+                    className={`mc-node kind-${node.kind} status-${node.status}${isSel ? " is-selected" : ""}${node.detail.kind === "agent" && node.detail.subLeadOf !== undefined && node.detail.hull !== undefined && node.detail.subLeadOf.includes(node.detail.hull) ? " is-sub-lead" : ""}`}
                     style={{ transform: `translate(${p.x}px, ${p.y}px)` }}
                     role="button"
                     tabIndex={0}

@@ -19,7 +19,10 @@
  * and `contest` (an open claim contest between two agents). Each `message`
  * and `contest` edge is backed by its recorded message seq. A `spawn` edge
  * means only that an Artifact repo-pushed event recruited the target; the
- * board has no such message, so a board graph never draws one.
+ * board has no such message, so a board graph never draws one. Formation
+ * reuses `dependency`, labelled: a FORK edge (requester -> helper) is backed by
+ * the help.offered that recorded the fork, and a MERGED edge (child -> split
+ * item) by the sub-lead's push that merged the child's push.
  *
  * Gate verdicts appear only on revision nodes (and the ticker). Typed
  * decisions (Jev) are advisory nodes; a resolved attribution reads where the
@@ -95,6 +98,8 @@ export interface AgentNodeDetail {
   /** Told to rebase onto the latest passing revision and has not posted since. */
   readonly rebasing: boolean;
   readonly rebaseTo?: number;
+  /** The split items this agent is the sub-lead of (drawn on that hull's border). */
+  readonly subLeadOf?: readonly string[];
 }
 
 export interface ItemNodeDetail {
@@ -113,6 +118,12 @@ export interface ItemNodeDetail {
   readonly read: readonly string[];
   readonly parent?: string;
   readonly children: readonly string[];
+  /** A split item's sub-lead (its children integrate into its repo first). */
+  readonly subLead?: string;
+  /** Its owner reported it going badly (a cue: idle agents may volunteer), until it pushes again. */
+  readonly struggling?: { readonly reason: string; readonly turnsSpent: number; readonly seq: number };
+  /** Volunteers who offered help on it, and the owner's answers. */
+  readonly volunteers?: readonly { readonly agent: string; readonly seq: number; readonly answer?: "accepted" | "declined" }[];
   /** The owner proposed done: a hollow check until a passing revision completes it. */
   readonly doneProposed: boolean;
   readonly completed?: { readonly n?: number; readonly via: "integrated" | "children" | "tool"; readonly version?: string };
@@ -259,6 +270,8 @@ export interface BoardGraphEdge {
   /** How many messages an aggregated edge stands for (consumed-tool: uses). */
   readonly count: number;
   readonly tooltip: string;
+  /** A short label drawn on the edge (formation: "fork", "merged"). */
+  readonly label?: "fork" | "merged";
 }
 
 export interface BoardTicker {
@@ -338,6 +351,7 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     case "item.reopened":
     case "done.proposed":
     case "handoff":
+    case "item.struggling":
       return "item";
     case "item.claimed":
     case "claim.granted":
@@ -442,6 +456,15 @@ export function messageItems(message: BoardMessage, state?: BoardState): string[
   }
   if (isType(message, "integrated.rev") && message.payload.failing) {
     out.push(...message.payload.failing.items);
+  }
+  if (isType(message, "push.announced") && message.payload.merges) {
+    out.push(...message.payload.merges.map((m) => m.item));
+  }
+  if (state && (isType(message, "help.offered") || isType(message, "help.delivered"))) {
+    const help = state.help[message.payload.request];
+    if (help) {
+      out.push(help.item);
+    }
   }
   if (state && typeof payload.contest === "string") {
     const contest = state.contests[payload.contest];
@@ -557,6 +580,10 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
         ...(hull !== undefined && agent.leftSeq === undefined ? { hull } : {}),
         rebasing: rebasing.has(agent.id),
         ...(agent.rebaseTo !== undefined ? { rebaseTo: agent.rebaseTo } : {}),
+        ...((): { subLeadOf?: string[] } => {
+          const led = Object.values(state.items).filter((i) => i.status === "split" && i.subLead === agent.id).map((i) => i.id);
+          return led.length > 0 && agent.leftSeq === undefined ? { subLeadOf: led } : {};
+        })(),
       },
     });
   }
@@ -606,6 +633,12 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
     const seqs = new Set<number>([origin.seq]);
     if (item.grantedSeq !== undefined) seqs.add(item.grantedSeq);
     if (item.lastPush) seqs.add(item.lastPush.seq);
+    const struggle =
+      item.struggling && item.struggling.owner === item.owner && item.status === "claimed" && !(item.lastPush && item.lastPush.agent === item.owner && item.lastPush.seq > item.struggling.seq)
+        ? item.struggling
+        : undefined;
+    if (struggle) seqs.add(struggle.seq);
+    const volunteers = Object.values(state.volunteers ?? {}).filter((v) => v.item === item.id);
     if (item.triage) seqs.add(item.triage.seq);
     const status = contestedItems.has(item.id) && item.status !== "done" ? "contested" : item.status;
     const ownerText = item.owner !== undefined ? `, owner ${item.owner}` : "";
@@ -643,6 +676,11 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
         read: item.intent?.read ?? [],
         ...(item.parent !== undefined ? { parent: item.parent } : {}),
         children: item.children,
+        ...(item.subLead !== undefined ? { subLead: item.subLead } : {}),
+        ...(struggle ? { struggling: { reason: struggle.reason, turnsSpent: struggle.turnsSpent, seq: struggle.seq } } : {}),
+        ...(volunteers.length > 0
+          ? { volunteers: volunteers.map((v) => ({ agent: v.agent, seq: v.seq, ...(v.answered ? { answer: v.answered.how } : {}) })) }
+          : {}),
         doneProposed: item.doneProposed,
         ...(item.completed !== undefined ? { completed: item.completed } : {}),
         fixAttempts: item.fixAttempts ?? 0,
@@ -902,6 +940,48 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
         count: 1,
         tooltip: `${m.payload.fromTool.capability}@${m.payload.fromTool.version} findings became ${m.payload.item} ${backingSuffix(m)}`,
       });
+    }
+  }
+
+  // Formation. Fork lineage: requester -> helper, backed by the help.offered
+  // that recorded the fork (forkOf, forkCommit). Sub-lead merges: child ->
+  // split item, backed by the sub-lead's push that merged the child's push.
+  for (const m of messages) {
+    if (isType(m, "help.offered") && m.payload.forkOf !== undefined) {
+      const from = boardAgentNodeId(m.payload.forkOf);
+      const to = boardAgentNodeId(m.from);
+      if (nodeIds.has(from) && nodeIds.has(to)) {
+        edges.push({
+          id: `fork:${m.payload.request}`,
+          kind: "dependency",
+          from,
+          to,
+          seqs: [m.seq],
+          type: m.type,
+          count: 1,
+          label: "fork",
+          tooltip: `fork: ${m.from} forked ${m.payload.forkOf}'s repo at ${m.payload.forkCommit?.slice(0, 10) ?? "its empty state"} for help request ${m.payload.request} ${backingSuffix(m)}`,
+        });
+      }
+    }
+    if (isType(m, "push.announced") && m.payload.merges !== undefined) {
+      for (const merge of m.payload.merges) {
+        const from = boardItemNodeId(merge.item);
+        const to = boardItemNodeId(m.payload.item);
+        if (nodeIds.has(from) && nodeIds.has(to)) {
+          edges.push({
+            id: `merged:${m.seq}:${merge.item}`,
+            kind: "dependency",
+            from,
+            to,
+            seqs: [m.seq],
+            type: m.type,
+            count: 1,
+            label: "merged",
+            tooltip: `merged: sub-lead ${m.from} merged ${merge.item}'s push ${merge.commit.slice(0, 10)} into its push for ${m.payload.item} ${backingSuffix(m)}`,
+          });
+        }
+      }
     }
   }
 
@@ -1319,6 +1399,18 @@ export function assertBoardBacked(model: BoardGraphModel, log: readonly BoardMes
         throw new Error(`unbacked edge ${edge.id}: seq ${m.seq} is not the claim.contested that opened it`);
       }
     }
+    if (edge.label === "fork") {
+      const m = backing[0]!;
+      if (!isType(m, "help.offered") || m.payload.forkOf === undefined || boardAgentNodeId(m.payload.forkOf) !== edge.from || participantNode(m.from) !== edge.to) {
+        throw new Error(`unbacked edge ${edge.id}: seq ${m.seq} is not the help.offered fork from ${edge.from} to ${edge.to}`);
+      }
+    }
+    if (edge.label === "merged") {
+      const m = backing[0]!;
+      if (!isType(m, "push.announced") || boardItemNodeId(m.payload.item) !== edge.to || !(m.payload.merges ?? []).some((x) => boardItemNodeId(x.item) === edge.from)) {
+        throw new Error(`unbacked edge ${edge.id}: seq ${m.seq} is not a sub-lead push merging ${edge.from} into ${edge.to}`);
+      }
+    }
     if (edge.kind === "consumed-tool" && backing.some((m) => m.type !== "tool.used")) {
       throw new Error(`unbacked edge ${edge.id}: a consumed-tool edge must be backed by tool.used messages`);
     }
@@ -1339,6 +1431,9 @@ export interface BoardHullRect extends BoardPoint {
   readonly h: number;
   /** The item's slot (its order of first appearance). */
   readonly slot: number;
+  /** A split child is drawn NESTED inside its parent's hull: the parent item, and the nesting depth (0 = top level). */
+  readonly parent?: string;
+  readonly depth?: number;
 }
 
 export interface BoardLayout {
@@ -1367,6 +1462,9 @@ export const HULL_TITLE_H = 32;
 const MARGIN = 24;
 /** How many agents a hull shows before it collapses to a count. */
 export const HULL_MAX_AGENTS = 6;
+/** The height of a nested (split child) hull, and the gap between nested hulls. */
+export const NESTED_HULL_H = 104;
+const NESTED_GAP = 10;
 
 /** A stable offset in [-amp, amp] from a string (FNV-1a). */
 export function stableJitter(seed: string, amp: number): number {
@@ -1405,9 +1503,19 @@ export function boardLayout(log: readonly BoardMessage[]): BoardLayout {
   const revs: number[] = [];
   const tools: string[] = [];
   const jev: number[] = [];
+  const childrenOf = new Map<string, string[]>();
+  const parentOf = new Map<string, string>();
   for (const m of log) {
     if (isType(m, "item.proposed") || isType(m, "item.discovered")) addItem(m.payload.item);
-    else if (isType(m, "item.split")) m.payload.children.forEach((c) => addItem(c.item));
+    else if (isType(m, "item.split")) {
+      m.payload.children.forEach((c) => {
+        addItem(c.item);
+        if (!parentOf.has(c.item)) {
+          parentOf.set(c.item, m.payload.item);
+          childrenOf.set(m.payload.item, [...(childrenOf.get(m.payload.item) ?? []), c.item]);
+        }
+      });
+    }
     else if (isType(m, "item.claimed")) associate(m.payload.item, m.from);
     else if (isType(m, "claim.granted")) associate(m.payload.item, m.payload.agent);
     else if (isType(m, "claim.contested")) associate(m.payload.item, m.payload.claimant);
@@ -1418,17 +1526,53 @@ export function boardLayout(log: readonly BoardMessage[]): BoardLayout {
     else if (isType(m, "decision.recorded")) jev.push(m.seq);
   }
   // A portrait-leaning grid (2 columns for up to 6 items, 3 up to 13, then 4) so the
-  // graph fills a tall center pane instead of a wide strip.
-  const cols = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(Math.max(1, itemOrder.length) / 1.5))));
-  const rows = Math.max(1, Math.ceil(itemOrder.length / cols));
+  // graph fills a tall center pane instead of a wide strip. Only top-level
+  // items take grid slots: a split item's children are hulls NESTED inside
+  // its hull (two per row, below the parent's own agents), so a split reads
+  // as one piece of work with its parts inside.
+  const topLevel = itemOrder.filter((id) => !parentOf.has(id));
+  const cols = Math.max(1, Math.min(4, Math.ceil(Math.sqrt(Math.max(1, topLevel.length) / 1.5))));
+  const rows = Math.max(1, Math.ceil(topLevel.length / cols));
   const gridW = cols * HULL_W + (cols - 1) * HULL_GAP;
+  const slotOf = new Map(itemOrder.map((id, slot) => [id, slot]));
+  // The height a hull needs at width w: its own band plus its nested children.
+  const heightOf = (id: string, w: number, depth: number): number => {
+    const own = depth === 0 ? HULL_H : NESTED_HULL_H;
+    const kids = childrenOf.get(id) ?? [];
+    if (kids.length === 0) {
+      return own;
+    }
+    const perRow = w >= 2 * 90 + 3 * NESTED_GAP ? 2 : 1;
+    const kw = (w - (perRow + 1) * NESTED_GAP) / perRow;
+    let total = own;
+    for (let i = 0; i < kids.length; i += perRow) {
+      total += Math.max(...kids.slice(i, i + perRow).map((k) => heightOf(k, kw, depth + 1))) + NESTED_GAP;
+    }
+    return total;
+  };
   const items = new Map<string, BoardHullRect>();
-  itemOrder.forEach((id, slot) => {
-    const c = slot % cols;
-    const r = Math.floor(slot / cols);
-    items.set(id, { x: MARGIN + c * (HULL_W + HULL_GAP), y: TOP_BAND + r * (HULL_H + HULL_GAP), w: HULL_W, h: HULL_H, slot });
-  });
-  const gridBottom = TOP_BAND + rows * (HULL_H + HULL_GAP);
+  const place = (id: string, x: number, y: number, w: number, depth: number, parent?: string): number => {
+    const h = heightOf(id, w, depth);
+    items.set(id, { x, y, w, h, slot: slotOf.get(id) ?? 0, ...(parent !== undefined ? { parent, depth } : {}) });
+    const kids = childrenOf.get(id) ?? [];
+    const perRow = w >= 2 * 90 + 3 * NESTED_GAP ? 2 : 1;
+    const kw = (w - (perRow + 1) * NESTED_GAP) / perRow;
+    let rowY = y + (depth === 0 ? HULL_H : NESTED_HULL_H);
+    for (let i = 0; i < kids.length; i += perRow) {
+      const row = kids.slice(i, i + perRow);
+      const rowH = Math.max(...row.map((k, j) => place(k, x + NESTED_GAP + j * (kw + NESTED_GAP), rowY, kw, depth + 1, id)));
+      rowY += rowH + NESTED_GAP;
+    }
+    return h;
+  };
+  // Each grid row is as tall as its tallest hull (a split hull grows).
+  let rowTop = TOP_BAND;
+  for (let r = 0; r < rows; r += 1) {
+    const row = topLevel.slice(r * cols, r * cols + cols);
+    const heights = row.map((id, c) => place(id, MARGIN + c * (HULL_W + HULL_GAP), rowTop, HULL_W, 0));
+    rowTop += Math.max(HULL_H, ...heights) + HULL_GAP;
+  }
+  const gridBottom = rowTop;
   const benchPerRow = Math.max(1, Math.floor(gridW / 100));
   const bench = new Map<string, BoardPoint>();
   workers.forEach((agent, i) => {
@@ -1455,13 +1599,21 @@ export function boardLayout(log: readonly BoardMessage[]): BoardLayout {
   return { width, height, goal, human, leads: leadMap, items, agentSlots, bench, revs: revMap, tools: toolMap, jev: jevMap };
 }
 
-/** Where an agent's sub-slot sits inside an item hull. */
+/** Where an agent's sub-slot sits inside an item hull (a narrow nested hull stacks fewer per row). */
 export function hullAgentPoint(hull: BoardHullRect, slot: number, agent: string): BoardPoint {
   const i = slot % HULL_MAX_AGENTS;
+  const perRow = hull.w >= 230 ? 3 : hull.w >= 150 ? 2 : 1;
+  const step = perRow === 1 ? 0 : Math.min(79, (hull.w - 60) / (perRow - 1));
+  const nested = (hull.depth ?? 0) > 0;
   return {
-    x: hull.x + 46 + (i % 3) * 79 + stableJitter(`${agent}:x`, 5),
-    y: hull.y + 80 + Math.floor(i / 3) * 56 + stableJitter(`${agent}:y`, 4),
+    x: hull.x + (perRow === 1 ? hull.w / 2 : 30 + (i % perRow) * step) + stableJitter(`${agent}:x`, 5),
+    y: hull.y + (nested ? 62 : 80) + Math.floor(i / perRow) * (nested ? 40 : 56) + stableJitter(`${agent}:y`, 4),
   };
+}
+
+/** Where a sub-lead sits: ON the border of the split item's hull (it integrates the children inside). */
+export function subLeadBorderPoint(hull: BoardHullRect): BoardPoint {
+  return { x: hull.x, y: hull.y + HULL_TITLE_H + 36 };
 }
 
 /** The position of a node in the layout at K (an agent sits in its hull, else on the bench). */
@@ -1482,6 +1634,9 @@ export function boardNodePoint(layout: BoardLayout, node: BoardGraphNode): Board
       }
       if (d.hull !== undefined) {
         const hull = layout.items.get(d.hull);
+        if (hull && d.subLeadOf?.includes(d.hull)) {
+          return subLeadBorderPoint(hull);
+        }
         const slot = layout.agentSlots.get(d.hull)?.get(d.agent);
         if (hull && slot !== undefined) {
           return hullAgentPoint(hull, slot, d.agent);

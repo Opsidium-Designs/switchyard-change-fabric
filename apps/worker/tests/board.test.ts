@@ -273,6 +273,38 @@ describe("Worker board routes", () => {
     expect(h.provisioner.revoked).toContainEqual({ workspaceName: `${ID}--board-w1`, tokenId: "read-1" });
   });
 
+  it("forks the requester's repo for a helper only after the board allows it (bearer only), and reads the fork for the pull", async () => {
+    const h = createHarness({ apiToken: "op-secret" });
+    const auth = { authorization: "Bearer op-secret" };
+    expect((await h.request("POST", "/changes", specYaml(ID), auth)).status).toBe(201);
+    expect((await h.json("POST", `/changes/${ID}/board/human`, { type: "goal.posted", payload: { objective: "o" } }, auth)).status).toBe(201);
+    const tokens: Record<string, string> = {};
+    for (const agent of ["w1", "w2"]) {
+      tokens[agent] = (await h.json<{ token: string }>("POST", `/changes/${ID}/board/join`, { agent, workspace: { ttlSeconds: 900 } }, auth)).body.token;
+    }
+    expect((await h.json("POST", `/changes/${ID}/board/human`, { type: "item.proposed", payload: { item: "i1", objective: "o", scopeHint: ["src/**"] } }, auth)).status).toBe(201);
+    const as = (agent: string, draft: unknown) => h.json<{ code?: string }>("POST", `/changes/${ID}/board`, draft, { [TOKEN_HEADER]: tokens[agent]! });
+    expect((await as("w1", { type: "item.claimed", payload: { item: "i1", intent: { read: [], write: ["src/**"] } } })).status).toBe(201);
+    expect((await as("w1", { type: "help.requested", payload: { request: "h1", item: "i1", need: "parallel-edit", scope: ["src/b.ts"] } })).status).toBe(201);
+    const path = `/changes/${ID}/board/help-fork`;
+    expect((await h.json("POST", path, { request: "h1", agent: "w2" })).status).toBe(401);
+    expect((await h.json<{ code: string }>("POST", path, { request: "h1", agent: "w1" }, auth)).body.code).toBe("NOT_ALLOWED");
+    expect((await h.json<{ code: string }>("POST", path, { request: "h1", agent: "w2", ttlSeconds: 5 }, auth)).body.code).toBe("BAD_PAYLOAD");
+    expect(h.provisioner.forks).toEqual([]);
+    const forked = await h.json<{ workspaceName: string; forkOf: string; token: string }>("POST", path, { request: "h1", agent: "w2", ttlSeconds: 300 }, auth);
+    expect(forked.status).toBe(201);
+    expect(forked.body).toMatchObject({ workspaceName: `${ID}--help-h1`, forkOf: "w1" });
+    expect(h.provisioner.forks).toEqual([{ source: `${ID}--board-w1`, target: `${ID}--help-h1`, ttlSeconds: 300 }]);
+    const read = `/changes/${ID}/board/read-token`;
+    expect((await h.json<{ code: string }>("POST", read, { agent: "w2", help: "h1" }, auth)).body.code).toBe("NOT_ALLOWED");
+    expect((await as("w2", { type: "help.offered", payload: { request: "h1", forkOf: "w1", fork: `${ID}--help-h1` }, to: ["w1"] })).status).toBe(201);
+    const issued = await h.json<{ workspaceName: string }>("POST", read, { agent: "w2", help: "h1", ttlSeconds: 120 }, auth);
+    expect(issued.body.workspaceName).toBe(`${ID}--help-h1`);
+    // Once granted, a second fork is refused before anything is forked.
+    expect((await h.json<{ code: string }>("POST", path, { request: "h1", agent: "w2" }, auth)).body.code).toBe("DUPLICATE");
+    expect(h.provisioner.forks).toHaveLength(1);
+  });
+
   it("escalates a contract on the original tests to a human and posts the decision on the board", async () => {
     const h = await created();
     const endpoint = httpEndpoint(h);

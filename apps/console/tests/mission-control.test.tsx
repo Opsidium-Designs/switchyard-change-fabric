@@ -19,7 +19,7 @@ import {
   type BoardPoint,
 } from "@switchyard-change/orchestration/board-graph";
 
-import { FixtureBoard, missionControlLog, ungatedLog } from "../../../packages/orchestration/tests/board-graph-fixture.ts";
+import { FixtureBoard, formationLog, missionControlLog, ungatedLog } from "../../../packages/orchestration/tests/board-graph-fixture.ts";
 import { launchArgs, launchOptionsFromBody, runBoardArgs } from "../launcher";
 import { isBoardRun } from "../src/App.tsx";
 import { mergeBoardLog, pullBoard, resolveEscalation } from "../src/board-data.ts";
@@ -505,5 +505,35 @@ describe("captions", () => {
     expect(textBoost(0.8)).toBeCloseTo(1.25);
     expect(textBoost(0.2)).toBe(1.8);
     expect(textBoost(Number.NaN)).toBe(1);
+  });
+});
+
+describe("formation in the graph", () => {
+  it("nests split children in the parent hull, draws the sub-lead on its border, and labels fork and merge edges", () => {
+    const flog = formationLog();
+    const atMerge = flog.find((m) => m.type === "push.announced" && m.payload.merges !== undefined)!.seq;
+    const html = renderToStaticMarkup(createElement(MissionControl, { log: flog, escalations: [], busy: false, onResolve: () => {}, initialSeq: atMerge }));
+    expect(html).toMatch(/class="mc-hull status-[a-z]+ is-nested"/);
+    expect(html).toContain("is-sub-lead");
+    const full = renderToStaticMarkup(createElement(MissionControl, { log: flog, escalations: [], busy: false, onResolve: () => {} }));
+    expect(full).toMatch(/class="mc-edge kind-dependency label-fork/);
+    expect(full).toMatch(/<text class="mc-edge-tag"[^>]*>fork<\/text>/);
+    expect(full).toMatch(/<text class="mc-edge-tag"[^>]*>merged<\/text>/);
+  });
+
+  it("marks a struggling item and lists its volunteers on the hull", () => {
+    const b = new FixtureBoard();
+    b.human({ type: "goal.posted", payload: { objective: "o" } });
+    b.join("lead", "lead");
+    b.join("ag-1");
+    b.join("ag-2");
+    b.agent("lead", { type: "item.proposed", payload: { item: "hard", objective: "o", scopeHint: ["src/**"] } });
+    b.agent("ag-1", { type: "item.claimed", payload: { item: "hard", intent: { read: [], write: ["src/**"] } } });
+    b.agent("ag-1", { type: "item.struggling", payload: { item: "hard", turnsSpent: 4, failedEdits: 2, reason: "failed-edits" } });
+    b.agent("ag-2", { type: "help.volunteered", payload: { item: "hard" }, to: ["ag-1"] });
+    const html = renderToStaticMarkup(createElement(MissionControl, { log: b.log, escalations: [], busy: false, onResolve: () => {} }));
+    expect(html).toContain('class="mc-struggling"');
+    expect(html).toMatch(/struggling \(failed-edits, 4 turn\(s\)\)/);
+    expect(html).toMatch(/class="mc-volunteers"[^>]*>ag-2 offered/);
   });
 });

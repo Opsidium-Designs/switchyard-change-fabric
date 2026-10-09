@@ -31,6 +31,38 @@ const input: AgentTurnInput = {
 };
 
 describe("parseAgentAction", () => {
+  it("accepts a pull (sub-lead merge or a helper's delivery) and a help request granting a scope", () => {
+    expect(parseAgentAction({ action: { type: "pull", itemId: "i1", requestId: null, rationale: null } })).toEqual({ type: "pull", itemId: "i1" });
+    expect(parseAgentAction({ type: "pull", itemId: "i1", requestId: "h1", rationale: "the helper delivered" })).toEqual({
+      type: "pull",
+      itemId: "i1",
+      requestId: "h1",
+      rationale: "the helper delivered",
+    });
+    expect(() => parseAgentAction({ type: "pull", itemId: "i1", extra: 1 })).toThrow(/unknown field/);
+    expect(
+      parseAgentAction({
+        type: "message",
+        kind: "help",
+        payload: { itemId: "i1", need: "parallel-edit", requestId: null, target: null, change: null, reviewId: null, findings: null, scope: ["src/b.ts"] },
+        rationale: "take src/b.ts",
+      }),
+    ).toEqual({ type: "message", kind: "help", payload: { itemId: "i1", need: "parallel-edit", scope: ["src/b.ts"] }, rationale: "take src/b.ts" });
+    expect(JSON.stringify(AGENT_TURN_JSON_SCHEMA)).toContain('"pull"');
+    expect(parseAgentAction({ type: "pull", itemId: "i1", requestId: "h1", decline: true, rationale: null })).toEqual({ type: "pull", itemId: "i1", requestId: "h1", decline: true });
+    expect(() => parseAgentAction({ type: "pull", itemId: "i1", decline: true })).toThrow(/requestId/);
+    expect(parseAgentAction({ type: "offer_help", itemId: "i1", toAgent: "agent-2", why: "I am idle" })).toEqual({ type: "offer_help", itemId: "i1", toAgent: "agent-2", why: "I am idle" });
+    expect(parseAgentAction({ type: "answer_volunteer", itemId: "i1", volunteer: "agent-3", accept: true, scope: ["src/b.ts"], rationale: null })).toEqual({
+      type: "answer_volunteer",
+      itemId: "i1",
+      volunteer: "agent-3",
+      accept: true,
+      scope: ["src/b.ts"],
+    });
+    expect(parseAgentAction({ type: "answer_volunteer", itemId: "i1", volunteer: "agent-3", accept: false, scope: null })).toMatchObject({ accept: false });
+    expect(() => parseAgentAction({ type: "answer_volunteer", itemId: "i1", volunteer: "agent-3", accept: true, scope: [] })).toThrow(/grants it a scope/);
+  });
+
   it("accepts each action shape, with or without the {action} envelope", () => {
     expect(
       parseAgentAction({ action: { type: "claim", itemId: "i1", intent: { read: [], write: ["src/**"] }, rationale: null } }),

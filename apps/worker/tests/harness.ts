@@ -98,6 +98,11 @@ export class RecordingProvisioner implements WorkspaceProvisioner {
   async archive(workspaceName: string): Promise<void> {
     this.archived.push(workspaceName);
   }
+  readonly forks: { source: string; target: string; ttlSeconds?: number }[] = [];
+  async fork(source: string, target: string, options: { ttlSeconds?: number } = {}): Promise<ProvisionedWorkspace> {
+    this.forks.push({ source, target, ...(options.ttlSeconds !== undefined ? { ttlSeconds: options.ttlSeconds } : {}) });
+    return this.provision(target, options);
+  }
   readonly readTokens: { workspaceName: string; ttlSeconds: number }[] = [];
   async issueReadToken(workspaceName: string, ttlSeconds: number): Promise<{ tokenId: string; token: string; tokenExpiresAt: string }> {
     this.readTokens.push({ workspaceName, ttlSeconds });

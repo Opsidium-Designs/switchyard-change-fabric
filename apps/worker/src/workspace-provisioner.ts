@@ -71,6 +71,13 @@ export interface WorkspaceProvisioner {
    * Optional, like issueReadToken.
    */
   issueWriteToken?(workspaceName: string, ttlSeconds: number): Promise<IssuedReadToken>;
+  /**
+   * Fork an existing workspace into a new one (the Artifacts repo fork) and
+   * issue a short-lived write token for the fork; the fork's one-time creation
+   * token is revoked, so only the short token is ever handed out. Optional: a
+   * provisioner without it cannot serve the help-fork route.
+   */
+  fork?(sourceName: string, targetName: string, options: ProvisionOptions): Promise<ProvisionedWorkspace>;
 }
 
 /**
@@ -124,6 +131,32 @@ class CloudflareProvisioner implements WorkspaceProvisioner {
     } catch (error) {
       if (error instanceof BindingUnavailableError) {
         return this.fallback.provision(workspaceName, options);
+      }
+      throw error;
+    }
+  }
+
+  async fork(sourceName: string, targetName: string, options: ProvisionOptions = {}): Promise<ProvisionedWorkspace> {
+    try {
+      const { ref, token: creation } = await this.provider.fork(this.refByName(sourceName), targetName);
+      const token = await this.provider.issueWriteToken(ref, options.ttlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS);
+      // The fork's creation token is never handed out: only the short one is.
+      await this.provider.revokeToken(ref, creation).catch(() => false);
+      this.refs.set(targetName, { name: ref.name });
+      return {
+        workspaceId: ref.id,
+        workspaceName: ref.name,
+        gitUrl: ref.gitUrl,
+        defaultBranch: ref.defaultBranch,
+        backend: ref.backend,
+        fallback: ref.fallback,
+        tokenId: token.id,
+        token: token.token,
+        tokenExpiresAt: token.expiresAt,
+      };
+    } catch (error) {
+      if (error instanceof BindingUnavailableError) {
+        return this.fallback.fork(sourceName, targetName, options);
       }
       throw error;
     }
@@ -212,6 +245,11 @@ class WorkerMemoryProvisioner implements WorkspaceProvisioner {
       token: `worker-memory-fallback-token-${tokenId}`,
       tokenExpiresAt: new Date(Date.now() + (options.ttlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS) * 1000).toISOString(),
     };
+  }
+
+  async fork(_sourceName: string, targetName: string, options: ProvisionOptions = {}): Promise<ProvisionedWorkspace> {
+    // Nothing to copy in the memory fallback: an honest, labelled placeholder.
+    return this.provision(targetName, options);
   }
 
   async issueReadToken(_workspaceName: string, ttlSeconds: number): Promise<IssuedReadToken> {

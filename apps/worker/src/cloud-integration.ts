@@ -29,6 +29,7 @@ import {
   intentPath,
   pendingPushItems,
   planBoardIntegration,
+  narrowToSplitChildren,
   type BoardMessage,
   type BoardState,
 } from "@switchyard-change/change-core";
@@ -343,6 +344,7 @@ export type CloudRevisionDecision =
         readonly commit: string;
         readonly gate: "pass" | "fail";
         readonly merged: readonly string[];
+        readonly unverified?: readonly { readonly item: string; readonly reason: string }[];
         readonly failing?: { readonly output: string; readonly items: readonly string[] };
         readonly gated?: false;
       };
@@ -388,13 +390,25 @@ export function decideCloudRevision(plan: CloudJobPlan, result: IntegrateJobResu
     return { kind: "refuse", reason: "a merged push was superseded while the gate ran", stale: true, excludedAgents };
   }
   const merged = mergedItems.map((i) => i.commit);
+  // The integration job does not read children's repos, so it cannot verify
+  // that a sub-lead's push carries each merged child's pushed content: those
+  // children are recorded unverified (never integrated on the sub-lead's word).
+  const unverified = mergedItems.flatMap((i) => {
+    const item = stateNow.items[i.item];
+    return item?.status === "split"
+      ? (item.lastPush?.merges ?? [])
+          .filter((m) => stateNow.items[m.item]?.lastPush?.commit === m.commit && stateNow.items[m.item]?.lastPush?.integratedIn === undefined)
+          .map((m) => ({ item: m.item, reason: "the cloud integration job does not verify a sub-lead's merge of a child's push in this slice" }))
+      : [];
+  });
+  const withUnverified = unverified.length > 0 ? { unverified } : {};
   const integratedItems = mergedItems.map((i) => i.item);
   const excludedItems = plan.items.filter((i) => !mergedAgents.has(i.agent)).map((i) => i.item);
   const check = result.evidence.integration.finalCheck;
   if (result.gate === "pass") {
     return {
       kind: "record",
-      input: { commit: result.commit, gate: "pass", merged, ...(result.gated === false ? { gated: false as const } : {}) },
+      input: { commit: result.commit, gate: "pass", merged, ...(result.gated === false ? { gated: false as const } : {}), ...withUnverified },
       integratedItems,
       excludedItems,
       excludedAgents,
@@ -414,11 +428,12 @@ export function decideCloudRevision(plan: CloudJobPlan, result: IntegrateJobResu
   const choice = driver && driver.key === plan.key ? driver.items.filter((i) => integratedItems.includes(i)) : [];
   const valid = choice.length > 0 && choice.length === (driver?.items.length ?? 0);
   const combined = combineAttribution({ merged: integratedItems, parsed, attributed: parse.attributed, picks: valid ? choice : [] });
-  const ordered = [...combined.items];
+  // A split item's failure is its children's work: ask their owners.
+  const ordered = narrowToSplitChildren(stateNow, combined.items, raw);
   const source: AttributionSource = combined.source;
   return {
     kind: "record",
-    input: { commit: result.commit, gate: "fail", merged, failing: { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: ordered } },
+    input: { commit: result.commit, gate: "fail", merged, failing: { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: ordered }, ...withUnverified },
     integratedItems,
     excludedItems,
     excludedAgents,

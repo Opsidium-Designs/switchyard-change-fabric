@@ -35,6 +35,8 @@ import { dirname, join } from "node:path";
 
 import {
   detectBoardToolNeed,
+  entriesOverlap,
+  splitCue,
   hasWildcard,
   intentPath,
   isAcceptedItem,
@@ -159,6 +161,18 @@ export interface BoardAgentOptions {
   /** The ids of the agents still running (a handoff only ever goes to one of them). */
   readonly runningAgents?: () => readonly string[];
   /**
+   * Fork the REQUESTER's repo for this agent, the helper of a help request
+   * that grants a sub-scope (the operator calls the help-fork route; the agent
+   * never holds the bearer). Returns the fork and a short write token.
+   */
+  readonly forkForHelp?: (agent: string, request: string) => Promise<({ readonly ok: true; readonly forkOf: string } & JoinedWorkspace) | BoardRejection>;
+  /**
+   * Materialize a helper's fork of help request `request` at `commit` (read
+   * with an operator read token) and return the directory, so the requester
+   * can pull the helper's delivered commit into its own repo.
+   */
+  readonly fetchFork?: (request: string, helper: string, commit: string) => Promise<string | undefined>;
+  /**
    * The ordered escalation models for fix attempts: fix attempt k on an item
    * runs on escalationModels[k - 1] (clamped to the last entry). Empty keeps
    * every attempt on the executor's own base model.
@@ -181,7 +195,7 @@ const LEAD_ACTIONS: readonly AgentActionType[] = ["decide_contract", "decide_ite
 const WORKER_ACTIONS: readonly AgentActionType[] = AGENT_ACTION_TYPES.filter((t) => t !== "decide_contract" && t !== "decide_item");
 
 /** Message types that matter to an agent only while it is free to take new work. */
-const NEW_WORK_TYPES: ReadonlySet<string> = new Set(["item.proposed", "item.accepted", "item.discovered", "item.split"]);
+const NEW_WORK_TYPES: ReadonlySet<string> = new Set(["item.proposed", "item.accepted", "item.discovered", "item.split", "help.requested", "item.struggling"]);
 /** Board-wide messages that are context, never a reason by themselves to take a turn. */
 const CONTEXT_ONLY_TYPES: ReadonlySet<string> = new Set([
   "goal.posted",
@@ -205,6 +219,12 @@ const MAX_PENDING_MESSAGES = 200;
 export const MAX_DONE_CUES = 5;
 /** How many times a free agent that waited is told to claim the open items. */
 export const MAX_CLAIM_NUDGES = 3;
+/**
+ * How many times a worker that waits while holding an item it has not pushed
+ * (for example reading its files while a codemod for it is built) is given
+ * another turn anyway: it never stalls on held work, and never waits long.
+ */
+export const MAX_HELD_WAIT_CUES = 2;
 /** The failing gate output a fix edit hands the executor, in characters. */
 const MAX_FIX_EVIDENCE = 4000;
 
@@ -330,6 +350,9 @@ function actionItem(action: AgentAction, digest: BoardDigest): string | undefine
     case "build_tool":
       return toolItemId(action.capability);
     case "use_tool":
+    case "pull":
+    case "offer_help":
+    case "answer_volunteer":
       return action.itemId;
     default:
       return undefined;
@@ -371,8 +394,16 @@ export class BoardAgent {
   private acting = false;
   /** The tools this agent's claims may not wait for, as last seen (a change wakes it). */
   private lastUnavailable = "";
+  /** The formation cues last seen (a new set wakes it once). */
+  private lastCue = "";
   /** Nudges to claim open work after waiting while free, per set of open items (bounded). */
   private readonly claimNudges = new Map<string, number>();
+  /** Edits (and codemod runs) on an item that were refused or failed, per item. */
+  private readonly failedEdits = new Map<string, number>();
+  /** Struggling reports already posted, per `<item>:<reason>[:<rev>]`. */
+  private readonly struggleReported = new Set<string>();
+  /** Waits taken while holding unpushed work, per held item set (bounded re-cues). */
+  private readonly heldWaitCues = new Map<string, number>();
   /** Lead: the undecided worker proposals it last saw (a change wakes it). */
   private lastProposals = "";
   /** Items (and tool items) this agent proposed: their decision wakes it. */
@@ -381,6 +412,8 @@ export class BoardAgent {
   private readonly builtTools = new Set<string>();
   /** The latest failing gate evidence of each tool this agent builds (fed to a rebuild). */
   private readonly toolGateFailures = new Map<string, string>();
+  /** Forks this agent made as a helper: help request -> its fork's worktree and remote. */
+  private readonly forks = new Map<string, { readonly workspace: JoinedWorkspace; readonly remote: string; readonly dir: string; readonly requester: string }>();
 
   constructor(private readonly options: BoardAgentOptions) {
     this.id = options.id;
@@ -571,6 +604,16 @@ export class BoardAgent {
       .join(",");
     const newlyUnavailable = unavailableKey !== "" && unavailableKey !== this.lastUnavailable;
     this.lastUnavailable = unavailableKey;
+    // Formation cues wake the agent once per distinct cue set (never a storm):
+    // owners going badly while it is idle, volunteers waiting for its answer,
+    // or its own struggling item while agents are idle.
+    const cueKey = [
+      ...(digest.busyOwners ?? []).map((b) => `busy:${b.item}:${b.agent}`),
+      ...(digest.volunteers ?? []).map((v) => `volunteer:${v.item}:${v.agent}:${v.seq}`),
+      ...((digest.idleAgents ?? []).length > 0 ? (digest.struggling ?? []).map((s) => `struggling:${s.item}:${s.reason}`) : []),
+    ].join(",");
+    const newCue = cueKey !== "" && cueKey !== this.lastCue;
+    this.lastCue = cueKey;
     // A free agent whose last turn was a wait while open items exist is told,
     // a bounded number of times, to claim one: nothing on the board waits for
     // a tool (a model that waits "for the tool" left every item unclaimed).
@@ -584,7 +627,7 @@ export class BoardAgent {
         `I hold no item and ${digest.openItems.length} open item(s) can be claimed: claim one now. Tools are accelerators, never prerequisites: when a tool is published use_tool it, otherwise edit by hand; never wait for a tool.`,
       );
     }
-    if (!(this.followUp || relevant || nudged || newlyUnavailable || claimNudge || (freeKey !== undefined && freeKey !== this.lastFreeKey))) {
+    if (!(this.followUp || relevant || nudged || newlyUnavailable || newCue || claimNudge || (freeKey !== undefined && freeKey !== this.lastFreeKey))) {
       return "idle";
     }
     // A cue counts as delivered only on a turn it caused by itself (not a
@@ -612,14 +655,20 @@ export class BoardAgent {
    * Keep stepping until halted, sleeping with backoff while idle (the live,
    * concurrent schedule). A thrown step stops the agent with the reason.
    */
-  async run(options: { readonly signal: AbortSignal; readonly minPollMs?: number; readonly maxPollMs?: number }): Promise<void> {
+  async run(options: {
+    readonly signal: AbortSignal;
+    readonly minPollMs?: number;
+    readonly maxPollMs?: number;
+    /** The driver holds the agent back (no step) while this is true; the driver bounds it. */
+    readonly hold?: () => boolean;
+  }): Promise<void> {
     const min = options.minPollMs ?? 250;
     const max = options.maxPollMs ?? 4000;
     let wait = min;
     while (!options.signal.aborted && !this.stop) {
       let result: AgentStepResult;
       try {
-        result = await this.step();
+        result = options.hold?.() ? "idle" : await this.step();
       } catch (error) {
         this.stop = { reason: "stopped", detail: `step failed: ${this.scrub(error instanceof Error ? error.message : String(error))}` };
         return;
@@ -638,13 +687,26 @@ export class BoardAgent {
     }
   }
 
-  /** Free: every claim it holds has a done proposal and no fix request, and no claim is pending. */
+  /**
+   * Free: every claim it holds has a done proposal and no fix request, no
+   * claim is pending, and it holds no help grant it has not delivered yet.
+   */
   private isFree(digest: BoardDigest): boolean {
-    return digest.pending.length === 0 && digest.claims.every((c) => c.doneProposed && c.fix === undefined);
+    return (
+      digest.pending.length === 0 &&
+      digest.claims.every((c) => c.doneProposed && c.fix === undefined) &&
+      !(digest.help?.granted ?? []).some((g) => g.live && g.delivered === undefined)
+    );
   }
 
   private record(entry: Omit<AgentTurnRecord, "agent">, history?: AgentTurnHistoryEntry): void {
     this.options.onTurn?.({ agent: this.id, ...entry });
+    if ((entry.action.type === "edit" || entry.action.type === "use_tool") && entry.outcome !== "posted" && entry.code !== undefined) {
+      const item = entry.action.itemId;
+      if (item !== undefined) {
+        this.failedEdits.set(item, (this.failedEdits.get(item) ?? 0) + 1);
+      }
+    }
     if (history) {
       this.history.push(history);
       const limit = this.options.historyLimit ?? 12;
@@ -743,7 +805,71 @@ export class BoardAgent {
     }
   }
 
-  private async takeTurn(digest: BoardDigest, state: BoardState): Promise<void> {
+  /**
+   * The mechanical STRUGGLING report (a status, never a decision): an item
+   * this agent holds whose edits failed or were refused twice, that used half
+   * its turn budget, or that a failing revision asks it to fix is reported
+   * once per reason (and revision) on the board, where the struggling and
+   * busy-owner cues read it. The board bounds reports per item too.
+   */
+  private async reportStruggles(digest: BoardDigest, state: BoardState): Promise<boolean> {
+    let reported = false;
+    if (this.role !== "worker") {
+      return reported;
+    }
+    for (const claim of digest.claims) {
+      if (state.items[claim.item]?.tool || claim.doneProposed && claim.fix === undefined) {
+        continue;
+      }
+      const turnsSpent = this.turnsByItem.get(claim.item) ?? 0;
+      const failedEdits = this.failedEdits.get(claim.item) ?? 0;
+      // A failing revision counts only when it failed THIS agent's own push
+      // (an inherited fix request on a handed-off item is not its struggle yet).
+      const ownPushFailed = claim.fix !== undefined && claim.lastPush?.agent === this.id;
+      const reason: "failing-revision" | "failed-edits" | "turn-budget" | undefined =
+        ownPushFailed && !this.struggleReported.has(`${claim.item}:failing-revision:${claim.fix!.n}`)
+          ? "failing-revision"
+          : failedEdits >= 2 && !this.struggleReported.has(`${claim.item}:failed-edits`)
+            ? "failed-edits"
+            : // Half the item budget spent with no push of its own yet (pushes waiting for, or past, integration are progress).
+              turnsSpent >= Math.ceil(this.options.maxTurnsPerItem / 2) &&
+                (!claim.lastPush || claim.lastPush.agent !== this.id) &&
+                !this.struggleReported.has(`${claim.item}:turn-budget`)
+              ? "turn-budget"
+              : undefined;
+      if (reason === undefined) {
+        continue;
+      }
+      this.struggleReported.add(reason === "failing-revision" ? `${claim.item}:failing-revision:${claim.fix!.n}` : `${claim.item}:${reason}`);
+      const lastFailure =
+        reason === "failing-revision" && digest.failure
+          ? digest.failure.output.split("\n").find((l) => l.trim() !== "")
+          : // Only this item's failed edits or tool runs, never an unrelated refusal (a claim, a split).
+            this.history
+              .filter((h) => h.code !== undefined && (h.action.type === "edit" || h.action.type === "use_tool") && h.action.itemId === claim.item)
+              .at(-1)?.error;
+      const outcome = await this.requireClient().post({
+        type: "item.struggling",
+        payload: { item: claim.item, turnsSpent, failedEdits, reason, ...(lastFailure ? { lastFailure: bounded(this.scrub(lastFailure), 300) } : {}) },
+        rationale: `reporting ${claim.item} as struggling (${reason})`,
+      });
+      if (outcome.ok) {
+        reported = true;
+        this.evidence.push(`reported ${claim.item} struggling (${reason}); idle agents may volunteer`);
+      }
+    }
+    return reported;
+  }
+
+  private async takeTurn(initialDigest: BoardDigest, initialState: BoardState): Promise<void> {
+    let digest = initialDigest;
+    let state = initialState;
+    if (await this.reportStruggles(digest, state)) {
+      // The turn sees the cue it just raised (its struggling item, the idle agents).
+      const client = this.requireClient();
+      digest = { ...(await client.digest(this.lastSeen)).digest, messages: digest.messages };
+      state = await client.state();
+    }
     const input = await this.turnInput(digest, state);
     const outcome = await this.options.transport(input);
     const action = outcome.action;
@@ -765,8 +891,14 @@ export class BoardAgent {
   }
 
   private async turnInput(digest: BoardDigest, state: BoardState): Promise<AgentTurnInput<BoardDigest, BoardMessage>> {
+    // A split item whose sub-lead is on the board stays its sub-lead's live claim.
     const liveClaims = Object.values(state.items)
-      .filter((i) => i.status === "claimed" && i.owner !== undefined && i.intent)
+      .filter(
+        (i) =>
+          (i.status === "claimed" || (i.status === "split" && i.subLead !== undefined && state.agents[i.subLead]?.leftSeq === undefined)) &&
+          i.owner !== undefined &&
+          i.intent,
+      )
       .map((i) => ({ item: i.id, owner: i.owner!, write: [...i.intent!.write] }));
     const pendingContracts = Object.values(state.contracts)
       .filter((c) => c.status === "proposed")
@@ -803,6 +935,7 @@ export class BoardAgent {
         ...(i.status === "claimed" && i.intent ? { write: [...i.intent.write] } : {}),
         ...(i.tool ? { tool: i.tool.capability } : {}),
         ...(i.fromTool ? { fromTool: { ...i.fromTool } } : {}),
+        ...(i.parent !== undefined ? { parent: i.parent } : {}),
         // Planned work (the lead's or a human's items), as opposed to a worker's proposal.
         ...(i.proposedBy === "human" || state.agents[i.proposedBy]?.role === LEAD_ROLE ? { planned: true } : {}),
       }));
@@ -846,7 +979,24 @@ export class BoardAgent {
         decisions: [...this.history],
         evidence: this.evidence.slice(-12),
       },
-      board: { liveClaims, pendingContracts, pendingItems, items: acceptedItems, tools },
+      board: {
+        liveClaims,
+        pendingContracts,
+        pendingItems,
+        items: acceptedItems,
+        tools,
+        ...((): { cues?: { splittable: { item: string; files: number; subChanges: number }[] } } => {
+          // No split cue where splits are not supported (the cloud integrator).
+          const splittable = (state.integrator === "cloud" ? [] : (digest.struggling ?? [])).flatMap((s) => {
+            const claim = digest.claims.find((c) => c.item === s.item);
+            // Only where a split is legal now: no unintegrated push of its own on the item.
+            if (!claim || (claim.lastPush !== undefined && claim.lastPush.integratedIn === undefined) || state.items[s.item]?.tool) return [];
+            const cue = splitCue(resolveIntentFiles(claim.intent.write, files).filter((f) => !hasWildcard(f)).length, claim.objective);
+            return cue.splittable ? [{ item: s.item, files: cue.files, subChanges: cue.subChanges }] : [];
+          });
+          return splittable.length > 0 ? { cues: { splittable } } : {};
+        })(),
+      },
       repo: { files, excerpts },
       ...(this.lastRejection ? { lastRejection: this.lastRejection } : {}),
       allowed: this.role === "lead" ? LEAD_ACTIONS : WORKER_ACTIONS,
@@ -855,9 +1005,10 @@ export class BoardAgent {
 
   /** Bounded file contents inside the agent's intents (or the open items it may claim). */
   private async excerpts(digest: BoardDigest, files: readonly string[]): Promise<AgentRepoExcerpt[]> {
+    const granted = (digest.help?.granted ?? []).filter((g) => g.live).flatMap((g) => g.scope);
     const entries =
-      digest.claims.length > 0
-        ? digest.claims.flatMap((c) => [...c.intent.write, ...c.intent.read])
+      digest.claims.length > 0 || granted.length > 0
+        ? [...digest.claims.flatMap((c) => [...c.intent.write, ...c.intent.read]), ...granted]
         : digest.openItems.flatMap((i) => i.scopeHint);
     const out: AgentRepoExcerpt[] = [];
     for (const path of resolveIntentFiles(entries, files)) {
@@ -945,12 +1096,41 @@ export class BoardAgent {
     }
 
     switch (action.type) {
-      case "wait":
+      case "wait": {
         this.record(
           { turn, action, outcome: "local", ...(invalid !== undefined ? { invalid } : {}) },
           { turn, action, outcome: "local" },
         );
+        // Waiting (reading its files) while holding work it has not pushed and
+        // a tool for it is not published yet: the agent gets another turn
+        // anyway, a bounded number of times, then must act on it (a tool that
+        // never arrives, or a build failure no board message reports, never
+        // stalls held work).
+        const awaitingTool = (write: readonly string[]): boolean =>
+          Object.values(state.tools.proposed).some(
+            (t) =>
+              (t.kind === "codemod" || t.kind === "scanner") &&
+              !state.tools.published.some((p) => p.capability === t.capability) &&
+              (t.inputs.length === 0 || write.some((w) => t.inputs.some((i) => entriesOverlap(intentPath(w), i)))),
+          );
+        const unpushed = digest.claims
+          .filter((c) => !state.items[c.item]?.tool && (!c.lastPush || c.lastPush.agent !== this.id) && c.fix === undefined && awaitingTool(c.intent.write))
+          .map((c) => c.item);
+        if (this.role === "worker" && unpushed.length > 0) {
+          const key = unpushed.join(",");
+          const cues = this.heldWaitCues.get(key) ?? 0;
+          if (cues < MAX_HELD_WAIT_CUES) {
+            this.heldWaitCues.set(key, cues + 1);
+            this.followUp = true;
+            this.evidence.push(
+              cues + 1 >= MAX_HELD_WAIT_CUES
+                ? `I hold ${key} with no push of mine: edit it by hand now (never wait longer for a tool)`
+                : `I hold ${key} with no push of mine: when a tool for it is published use it, otherwise edit by hand`,
+            );
+          }
+        }
         return;
+      }
       case "claim":
         await posted({ type: "item.claimed", payload: { item: action.itemId, intent: action.intent }, ...rationale(action.rationale) });
         return;
@@ -1000,13 +1180,63 @@ export class BoardAgent {
         return;
       }
       case "message":
+        if (action.kind === "reply" && action.payload.requestId !== undefined && digest.help?.wanted.some((h) => h.request === action.payload.requestId)) {
+          // Taking a request that GRANTS a scope: fork the requester's repo first.
+          await this.offerFork(action, digest, local, posted);
+          return;
+        }
         await this.message(action, posted);
+        return;
+      case "offer_help":
+        await posted(
+          { type: "help.volunteered", payload: { item: action.itemId }, rationale: action.why, to: [action.toAgent] },
+          { item: action.itemId, to: action.toAgent },
+        );
+        return;
+      case "answer_volunteer":
+        if (action.accept) {
+          // Accepting grants the volunteer a scope; the existing fork flow follows.
+          await posted(
+            {
+              type: "help.requested",
+              payload: { request: this.nextId("help"), item: action.itemId, need: "volunteer", scope: action.scope ?? [] },
+              rationale: action.rationale ?? `accepting ${action.volunteer}'s offer: it takes ${(action.scope ?? []).join(", ")}`,
+              to: [action.volunteer],
+            },
+            { item: action.itemId, volunteer: action.volunteer },
+          );
+        } else {
+          await posted(
+            { type: "help.declined", payload: { item: action.itemId, volunteer: action.volunteer }, rationale: action.rationale ?? "declined", to: [action.volunteer] },
+            { item: action.itemId, volunteer: action.volunteer },
+          );
+        }
+        return;
+      case "pull":
+        if (action.requestId !== undefined && action.decline === true) {
+          await posted(
+            { type: "help.closed", payload: { request: action.requestId, reason: "declined" }, ...(action.rationale !== undefined ? { rationale: action.rationale } : {}) },
+            { request: action.requestId },
+          );
+          return;
+        }
+        if (action.requestId !== undefined) {
+          await this.pullHelp(action, digest, local, posted);
+        } else {
+          await this.pullChildren(action, digest, state, local, posted);
+        }
         return;
       case "edit": {
         // A tool item is built in the tools repo, never edited in the agent's own repo.
         const tool = state.items[action.itemId]?.tool;
         if (tool) {
           await this.buildTool({ type: "build_tool", capability: tool.capability, rationale: action.instruction.slice(0, 500) }, digest, state, local, posted);
+          return;
+        }
+        // A helper edits the requester's item only inside its grant, in its fork.
+        const grant = digest.help?.granted.find((g) => g.item === action.itemId && g.live);
+        if (grant && !digest.claims.some((c) => c.item === action.itemId)) {
+          await this.helperEdit(grant, action.instruction, local, posted);
           return;
         }
         await this.edit(action.itemId, action.instruction, digest, local, posted);
@@ -1081,7 +1311,12 @@ export class BoardAgent {
         await posted(
           {
             type: "help.requested",
-            payload: { request: this.nextId(action.kind), item: p.itemId, need: p.need ?? action.kind },
+            payload: {
+              request: this.nextId(action.kind),
+              item: p.itemId,
+              need: p.need ?? action.kind,
+              ...(action.kind === "help" && p.scope !== undefined && p.scope.length > 0 ? { scope: p.scope } : {}),
+            },
             rationale: action.rationale,
             ...to,
           },
@@ -1244,7 +1479,10 @@ export class BoardAgent {
       }
     }
     const files = [...new Set([...(await listRepoFiles(this.baseDir)), ...(await listRepoFiles(worktree))])].sort();
-    const allowed = resolveIntentFiles(writeGlobs, files);
+    // Files granted to a helper are the helper's until pulled: never edit them here.
+    // (Only a grant a helper has taken; an untaken one never blocks the owner.)
+    const granted = (digest.help?.mine ?? []).filter((h) => h.item === itemId && h.live && h.grantee !== undefined).flatMap((h) => h.scope.map(intentPath));
+    const allowed = resolveIntentFiles(writeGlobs, files).filter((f) => !granted.some((g) => matchesGlob(f, g)));
     const view = await this.editView(allowed, worktree);
 
     // A fix attempt carries the failing gate output and escalates the model one
@@ -1307,12 +1545,13 @@ export class BoardAgent {
     local: (code: string, error: string) => void,
     posted: (draft: Record<string, unknown>) => Promise<boolean>,
     what: string,
+    extra: { readonly payload?: Record<string, unknown>; readonly allowEmpty?: boolean } = {},
   ): Promise<{ readonly commit: string; readonly changed: readonly string[] } | undefined> {
     // What changed is read from Git's status (never `git add -A`, never the
     // executor's word); only these paths are ever staged, and only after they
     // all lie inside the write intent.
     const changed = await worktreeChanges(worktree);
-    if (changed.length === 0) {
+    if (changed.length === 0 && !extra.allowEmpty) {
       await this.discard(worktree, head);
       local("NO_CHANGE", `${what} changed nothing`);
       return undefined;
@@ -1339,7 +1578,9 @@ export class BoardAgent {
       local("OUTSIDE_INTENT", `${what} touched paths outside the write intent: ${outOfScope.join(", ")}`);
       return undefined;
     }
-    await gitOut(worktree, ["add", "--", ...changed.map((p) => `:(literal)${p}`)]);
+    if (changed.length > 0) {
+      await gitOut(worktree, ["add", "--", ...changed.map((p) => `:(literal)${p}`)]);
+    }
     const staged = (await gitOut(worktree, ["diff", "--cached", "--name-only", ...(head ? [head] : [])]))
       .split("\n")
       .map((l) => l.trim())
@@ -1354,7 +1595,22 @@ export class BoardAgent {
     const branch = this.workspace?.defaultBranch ?? "main";
     let commit: string;
     try {
-      commit = await commitStaged(worktree, bounded(`${itemId}: ${message}`, 200), identity);
+      commit =
+        changed.length > 0
+          ? await commitStaged(worktree, bounded(`${itemId}: ${message}`, 200), identity)
+          : await (async () => {
+              await gitOut(worktree, ["-c", `user.name=${identity.name}`, "-c", `user.email=${identity.email}`, "commit", "--no-verify", "-q", "--allow-empty", "-m", bounded(`${itemId}: ${message}`, 200)]);
+              return (await gitOut(worktree, ["rev-parse", "HEAD"])).trim();
+            })();
+      // Never push a commit that carries a symlink inside the write intent
+      // (the integrator refuses them, and a sub-lead's mirror could never match).
+      const links = (await gitOut(worktree, ["ls-tree", "-r", commit])).split("\n").filter((l) => l.startsWith("120000 ")).map((l) => l.slice(l.indexOf("\t") + 1));
+      const inWrite = links.filter((l) => partitionByScope([l], writeGlobs).inScope.length > 0);
+      if (inWrite.length > 0) {
+        await this.discard(worktree, head);
+        local("UNSAFE_PATH", `${what} would push a commit with symlinks inside the write intent, which are never pushed: ${inWrite.join(", ")}`);
+        return undefined;
+      }
       await push(worktree, this.remote, branch);
     } catch (error) {
       // A push that fails (an expired token, an unreachable repo) is the
@@ -1365,7 +1621,7 @@ export class BoardAgent {
     }
     const ok = await posted({
       type: "push.announced",
-      payload: { item: itemId, commit, paths: changed },
+      payload: { item: itemId, commit, paths: changed, ...(extra.payload ?? {}) },
       rationale: bounded(`pushed ${changed.length} file(s) for ${itemId}`, 200),
     });
     if (!ok) {
@@ -1387,6 +1643,383 @@ export class BoardAgent {
     }
     this.followUp = true;
     return { commit, changed };
+  }
+
+  /**
+   * Take a help request that GRANTS a sub-scope: the operator forks the
+   * requester's repo for this agent (the board checks the grant first), this
+   * agent clones the fork (so it starts from the requester's in-progress
+   * state), and offers with the fork's lineage: help.offered {forkOf,
+   * forkCommit, fork}. The first such offer takes the grant.
+   */
+  private async offerFork(
+    action: Extract<AgentAction, { type: "message" }>,
+    digest: BoardDigest,
+    local: (code: string, error: string, note?: Record<string, string>) => void,
+    posted: (draft: Record<string, unknown>, note?: Record<string, string>) => Promise<boolean>,
+  ): Promise<void> {
+    const requestId = action.payload.requestId!;
+    const wanted = digest.help!.wanted.find((h) => h.request === requestId)!;
+    const note = { request: requestId, to: wanted.by };
+    if (!this.options.forkForHelp) {
+      local("NOT_ALLOWED", "this run cannot fork repos for help", note);
+      return;
+    }
+    let forked;
+    try {
+      forked = await this.options.forkForHelp(this.id, requestId);
+    } catch (error) {
+      local("FORK_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300), note);
+      return;
+    }
+    if (!forked.ok) {
+      local(forked.code, forked.error, note);
+      return;
+    }
+    const dir = join(this.options.workRoot, "forks", `${this.id}-${requestId}`.replace(/[^A-Za-z0-9._-]+/g, "-"));
+    const remote = authenticatedRemote(forked.gitUrl, forked.token);
+    let head: string | undefined;
+    try {
+      await rm(dir, { recursive: true, force: true });
+      await mkdir(dirname(dir), { recursive: true });
+      await clone(remote, dir);
+      head = (await gitOut(dir, ["rev-parse", "--verify", "-q", "HEAD"]).catch(() => "")).trim() || undefined;
+    } catch (error) {
+      local("CLONE_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)).split(forked.token).join("[redacted]"), 300), note);
+      return;
+    }
+    this.forks.set(requestId, { workspace: forked, remote, dir, requester: wanted.by });
+    const known = this.requests.get(requestId);
+    const ok = await posted(
+      {
+        type: "help.offered",
+        payload: { request: requestId, forkOf: wanted.by, ...(head !== undefined ? { forkCommit: head } : {}), fork: forked.workspaceName },
+        rationale: action.rationale,
+        ...(known ? { inReplyTo: known.seq } : {}),
+        to: [wanted.by],
+      },
+      note,
+    );
+    if (ok) {
+      this.evidence.push(
+        `forked ${wanted.by}'s repo (${forked.workspaceName}) at ${head ?? "its empty state"} for help request ${requestId} on ${wanted.item}: I write only ${wanted.scope.join(", ")}`,
+      );
+    }
+  }
+
+  /**
+   * A helper's edit: inside the granted scope only, in its FORK of the
+   * requester's repo (reading each file as the requester left it, else the
+   * baseline), committed and pushed to the fork, then delivered to the
+   * requester (help.delivered) to pull.
+   */
+  private async helperEdit(
+    grant: NonNullable<BoardDigest["help"]>["granted"][number],
+    instruction: string,
+    local: (code: string, error: string, note?: Record<string, string>) => void,
+    posted: (draft: Record<string, unknown>, note?: Record<string, string>) => Promise<boolean>,
+  ): Promise<void> {
+    const note = { request: grant.request };
+    const fork = this.forks.get(grant.request);
+    if (!fork) {
+      local("NO_FORK", `this agent has no fork for help request ${grant.request}`, note);
+      return;
+    }
+    if (!this.options.executor) {
+      local("NOT_ALLOWED", `${this.id} has no executor`, note);
+      return;
+    }
+    const worktree = fork.dir;
+    const head = (await gitOut(worktree, ["rev-parse", "--verify", "-q", "HEAD"]).catch(() => "")).trim() || undefined;
+    await this.cleanStray(worktree, head, `helping on ${grant.item}`);
+    const scope = [...new Set(grant.scope.map(intentPath))];
+    const files = [...new Set([...(await listRepoFiles(this.baseDir)), ...(await listRepoFiles(worktree))])].sort();
+    const allowed = resolveIntentFiles(scope, files);
+    const view = await this.editView(allowed, worktree);
+    try {
+      await this.options.executor.execute({
+        worktreeDir: worktree,
+        workUnitId: grant.item,
+        objective: [`Help ${grant.by} on item ${grant.item} (${grant.need}): change only ${grant.scope.join(", ")}.`, `Instruction: ${instruction}`].join("\n"),
+        paths: allowed,
+        baselineRef: "HEAD",
+        baselineDir: view,
+      });
+    } catch (error) {
+      await this.discard(worktree, head);
+      local("EXECUTOR_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300), note);
+      return;
+    } finally {
+      await rm(view, { recursive: true, force: true });
+    }
+    const changed = await worktreeChanges(worktree);
+    if (changed.length === 0) {
+      local("NO_CHANGE", `the help on ${grant.item} changed nothing`, note);
+      return;
+    }
+    const { outOfScope } = partitionByScope(changed, scope);
+    const unsafe = [];
+    for (const rel of changed) {
+      if (rel.split("/").some((seg) => seg === "node_modules" || seg === ".git") || (await lstat(join(worktree, rel)).catch(() => undefined))?.isSymbolicLink()) {
+        unsafe.push(rel);
+      }
+    }
+    if (outOfScope.length > 0 || unsafe.length > 0) {
+      await this.discard(worktree, head);
+      local("OUTSIDE_INTENT", `the help touched paths outside the granted scope or unsafe paths: ${[...outOfScope, ...unsafe].join(", ")}`, note);
+      return;
+    }
+    let commit: string;
+    try {
+      await gitOut(worktree, ["add", "--", ...changed.map((p) => `:(literal)${p}`)]);
+      commit = await commitStaged(worktree, bounded(`${grant.item}: help ${grant.request} for ${grant.by}`, 200), this.identity());
+      await push(worktree, fork.remote, fork.workspace.defaultBranch);
+    } catch (error) {
+      await this.discard(worktree, head).catch(() => undefined);
+      local("PUSH_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)).split(fork.workspace.token).join("[redacted]"), 300), note);
+      return;
+    }
+    const ok = await posted(
+      { type: "help.delivered", payload: { request: grant.request, commit, paths: changed }, rationale: bounded(`delivered ${changed.length} file(s) for ${grant.item}; pull ${commit}`, 200), to: [grant.by] },
+      note,
+    );
+    if (ok) {
+      this.evidence.push(`delivered ${commit} (${changed.join(", ")}) in my fork for ${grant.by}'s help request ${grant.request}`);
+    }
+  }
+
+  /**
+   * The requester pulls a helper's delivered commit: the operator materializes
+   * the helper's fork at that commit, the runtime checks that everything the
+   * helper changed since the fork point lies inside the grant, fetches the
+   * commit into this agent's own repo and merges it (a fast-forward when
+   * nothing else moved), pushes, and announces the push with `pulled`.
+   */
+  private async pullHelp(
+    action: Extract<AgentAction, { type: "pull" }>,
+    digest: BoardDigest,
+    local: (code: string, error: string, note?: Record<string, string>) => void,
+    posted: (draft: Record<string, unknown>, note?: Record<string, string>) => Promise<boolean>,
+  ): Promise<void> {
+    const requestId = action.requestId!;
+    const note = { request: requestId };
+    // A pull that cannot be taken (it changes paths outside the grant, or does
+    // not merge) closes the grant with the reason, so the requester is never
+    // pinned by work it cannot take: the scope is its own again.
+    const fail = async (code: string, error: string): Promise<void> => {
+      local(code, error, note);
+      if (code === "OUTSIDE_INTENT" || code === "MERGE_FAILED") {
+        const outcome = await this.requireClient().post({
+          type: "help.closed",
+          payload: { request: requestId, reason: "pull-failed", detail: bounded(`${code}: ${error}`, 300) },
+        });
+        if (outcome.ok) {
+          this.evidence.push(`closed help request ${requestId}: the pull failed (${code}); its scope is mine again`);
+        }
+      }
+    };
+    const claim = digest.claims.find((c) => c.item === action.itemId);
+    const help = digest.help?.mine.find((h) => h.request === requestId && h.item === action.itemId);
+    if (!claim || !help) {
+      await fail("NOT_OWNER", `${this.id} holds no help request ${requestId} on item ${action.itemId}`);
+      return;
+    }
+    if (help.delivered === undefined || help.grantee === undefined) {
+      await fail("INVALID_STATE", `help request ${requestId} has no delivered work to pull yet`);
+      return;
+    }
+    if (!this.options.fetchFork) {
+      await fail("NOT_ALLOWED", "this run cannot read help forks");
+      return;
+    }
+    const delivered = help.delivered.commit;
+    const from = await this.options.fetchFork(requestId, help.grantee, delivered);
+    if (from === undefined) {
+      await fail("FETCH_FAILED", `could not read ${help.grantee}'s fork at ${delivered}`);
+      return;
+    }
+    // Never take the helper's word for what it changed: diff its commit
+    // against the fork point, and refuse anything outside the grant.
+    const scope = [...new Set(help.scope.map(intentPath))];
+    const touched = (
+      help.forkCommit !== undefined
+        ? await gitOut(from, ["diff", "--name-only", help.forkCommit, delivered])
+        : await gitOut(from, ["ls-tree", "-r", "--name-only", delivered])
+    )
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l !== "");
+    const { outOfScope } = partitionByScope(touched, scope);
+    if (touched.length === 0 || outOfScope.length > 0) {
+      await fail("OUTSIDE_INTENT", touched.length === 0 ? `${delivered} changes nothing` : `${delivered} changes paths outside the grant: ${outOfScope.join(", ")}`);
+      return;
+    }
+    let worktree: string;
+    try {
+      worktree = await this.ensureWorktree();
+    } catch (error) {
+      await fail("CLONE_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
+      return;
+    }
+    const head = (await gitOut(worktree, ["rev-parse", "--verify", "-q", "HEAD"]).catch(() => "")).trim() || undefined;
+    await this.cleanStray(worktree, head, `pulling ${requestId}`);
+    const identity = this.identity();
+    try {
+      await gitOut(worktree, ["fetch", "-q", from, delivered]);
+      if (head) {
+        await gitOut(worktree, ["-c", `user.name=${identity.name}`, "-c", `user.email=${identity.email}`, "merge", "-q", "--no-edit", "-m", bounded(`${action.itemId}: pull ${requestId} from ${help.grantee}`, 200), delivered]);
+      } else {
+        await gitOut(worktree, ["reset", "-q", "--hard", delivered]);
+      }
+    } catch (error) {
+      await gitOut(worktree, ["merge", "--abort"]).catch(() => "");
+      await this.discard(worktree, head).catch(() => undefined);
+      await fail("MERGE_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
+      return;
+    }
+    const commit = (await gitOut(worktree, ["rev-parse", "HEAD"])).trim();
+    const links = (await gitOut(worktree, ["ls-tree", "-r", commit])).split("\n").filter((l) => l.startsWith("120000 ")).map((l) => l.slice(l.indexOf("\t") + 1));
+    if (links.some((l) => scope.some((g) => matchesGlob(l, g)))) {
+      await this.discard(worktree, head).catch(() => undefined);
+      if (head) {
+        await gitOut(worktree, ["reset", "-q", "--hard", head]).catch(() => "");
+      }
+      await fail("OUTSIDE_INTENT", `${delivered} carries a symlink inside the grant, which is never pushed`);
+      return;
+    }
+    const paths = (head ? await gitOut(worktree, ["diff", "--name-only", head, commit]) : await gitOut(worktree, ["ls-tree", "-r", "--name-only", commit]))
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l !== "")
+      .sort();
+    const branch = this.workspace?.defaultBranch ?? "main";
+    const rollback = async (): Promise<void> => {
+      if (head) {
+        await gitOut(worktree, ["reset", "-q", "--hard", head]).catch(() => "");
+        await gitOut(worktree, ["push", "-q", "--force", this.remote, `${head}:refs/heads/${branch}`]).catch(() => "");
+      }
+    };
+    const { outOfScope: beyond } = partitionByScope(paths, [...new Set(claim.intent.write.map(intentPath))]);
+    if (beyond.length > 0) {
+      await rollback();
+      await fail("OUTSIDE_INTENT", `the pull touches paths outside my write intent: ${beyond.join(", ")}`);
+      return;
+    }
+    try {
+      await push(worktree, this.remote, branch);
+    } catch (error) {
+      await rollback();
+      await fail("PUSH_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
+      return;
+    }
+    const ok = await posted(
+      {
+        type: "push.announced",
+        payload: { item: action.itemId, commit, paths, pulled: [requestId] },
+        rationale: bounded(`pulled ${help.grantee}'s delivered ${delivered} (help ${requestId}) into my repo`, 200),
+      },
+      note,
+    );
+    if (!ok) {
+      await rollback();
+      return;
+    }
+    this.evidence.push(`pulled ${help.grantee}'s ${delivered} for ${action.itemId} (help ${requestId}): pushed ${commit}`);
+  }
+
+  /**
+   * The SUB-LEAD's mini-integration: copy each child's latest pushed files
+   * (inside that child's write intent only, read with an operator read token)
+   * into this agent's own repo, commit, push, and announce ONE push for the
+   * split item that `merges` every child push not yet integrated. No gate runs
+   * here: the main integration gates the sub-lead's push like any other.
+   */
+  private async pullChildren(
+    action: Extract<AgentAction, { type: "pull" }>,
+    digest: BoardDigest,
+    state: BoardState,
+    local: (code: string, error: string, note?: Record<string, string>) => void,
+    posted: (draft: Record<string, unknown>, note?: Record<string, string>) => Promise<boolean>,
+  ): Promise<void> {
+    const led = digest.subLead?.find((s) => s.item === action.itemId);
+    if (!led) {
+      local("NOT_OWNER", `${this.id} is not the sub-lead of a split item ${action.itemId}`);
+      return;
+    }
+    // A push a revision recorded unverified is never merged again at the same
+    // commit (its child pushes again first).
+    const pending = led.children.filter((c) => c.lastPush !== undefined && c.lastPush.integratedIn === undefined && c.unverified !== true);
+    const fresh = pending.filter((c) => !c.merged);
+    if (fresh.length === 0) {
+      local("NO_CHANGE", `no child of ${action.itemId} has a push to merge`);
+      return;
+    }
+    if (!this.options.fetchPush) {
+      local("NOT_ALLOWED", "this run cannot read other agents' pushes");
+      return;
+    }
+    let worktree: string;
+    try {
+      worktree = await this.ensureWorktree();
+    } catch (error) {
+      local("CLONE_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
+      return;
+    }
+    const head = (await gitOut(worktree, ["rev-parse", "--verify", "-q", "HEAD"]).catch(() => "")).trim() || undefined;
+    await this.cleanStray(worktree, head, `merging the children of ${action.itemId}`);
+    for (const child of fresh) {
+      const from = await this.options.fetchPush(child.lastPush!.agent, child.lastPush!.commit);
+      if (from === undefined) {
+        await this.discard(worktree, head);
+        local("FETCH_FAILED", `could not read ${child.item}'s push ${child.lastPush!.commit}`);
+        return;
+      }
+      // Mirror the child's tree inside its write intent exactly: its files
+      // (from Git, never a directory walk) are copied, and a file the child no
+      // longer has is removed here too (deletions propagate).
+      const childWrite = [...new Set((state.items[child.item]?.intent?.write ?? state.items[child.item]?.scopeHint ?? []).map(intentPath))];
+      const inIntent = (out: string) =>
+        out
+          .split("\n")
+          .map((l) => l.trim())
+          .filter((l) => l !== "" && childWrite.some((g) => matchesGlob(l, g)));
+      // A child's push never carries a symlink (refused at its push); if one
+      // does, it is not merged (the integrator would never verify it).
+      const links = (await gitOut(from, ["ls-tree", "-r", "HEAD"])).split("\n").filter((l) => l.startsWith("120000 ")).map((l) => l.slice(l.indexOf("\t") + 1));
+      if (links.some((l) => childWrite.some((g) => matchesGlob(l, g)))) {
+        await this.discard(worktree, head);
+        local("UNSAFE_PATH", `${child.item}'s push ${child.lastPush!.commit} carries a symlink inside its write intent; it is not merged`);
+        return;
+      }
+      const theirs = inIntent(await gitOut(from, ["ls-tree", "-r", "--name-only", "HEAD"]));
+      const ours = inIntent(await gitOut(worktree, ["ls-files"]).catch(() => ""));
+      for (const rel of ours.filter((f) => !theirs.includes(f))) {
+        await rm(join(worktree, rel), { force: true });
+      }
+      for (const rel of theirs) {
+        if ((await lstat(join(from, rel)).catch(() => undefined))?.isSymbolicLink()) {
+          continue;
+        }
+        await mkdir(dirname(join(worktree, rel)), { recursive: true });
+        await cp(join(from, rel), join(worktree, rel));
+      }
+    }
+    const merges = pending.map((c) => ({ item: c.item, commit: c.lastPush!.commit }));
+    const writeGlobs = [...new Set(led.write.map(intentPath))];
+    const pushed = await this.commitPushAnnounce(
+      action.itemId,
+      worktree,
+      head,
+      writeGlobs,
+      `merge ${merges.map((m) => m.item).join(", ")} (sub-lead)`,
+      local,
+      posted,
+      `the merge of ${action.itemId}'s children`,
+      { payload: { merges } },
+    );
+    if (pushed !== undefined) {
+      this.evidence.push(`as sub-lead of ${action.itemId}, merged ${merges.map((m) => `${m.item}@${m.commit.slice(0, 10)}`).join(", ")}: pushed ${pushed.commit}`);
+    }
   }
 
   private identity(): GitIdentity {
@@ -1427,6 +2060,7 @@ export class BoardAgent {
     state: BoardState,
     local: (code: string, error: string, note?: Record<string, string>) => void,
     posted: (draft: Record<string, unknown>, note?: Record<string, string>) => Promise<boolean>,
+    rebuild = 0,
   ): Promise<void> {
     const capability = action.capability;
     const itemId = toolItemId(capability);
@@ -1543,6 +2177,26 @@ export class BoardAgent {
           : `built ${capability} at ${commit}: its own gate FAILED (${bounded(failed.join("; ") || gated.error || "not recorded", 300)})`,
       );
       this.followUp = true;
+      if (!gated.passed) {
+        // A failed tool gate is a fix request for the builder: rebuild now,
+        // with the failing checks and output, whatever the schedule (no turn
+        // model has to think of it). Bounded by the board's fix budget for the
+        // tool item (past it the engine reopens the item for another builder).
+        const after = await this.requireClient().state();
+        const tool = after.items[itemId];
+        if (tool?.status === "claimed" && tool.owner === this.id && (tool.toolFailures ?? 0) < after.rules.maxFixAttempts && rebuild + 1 < after.rules.maxFixAttempts) {
+          this.evidence.push(`rebuilding ${capability} (rebuild ${rebuild + 1}) with its failing checks`);
+          await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+          await this.buildTool(
+            { type: "build_tool", capability, rationale: `rebuilding ${capability}: its own gate failed (${bounded(failed.join("; "), 200)})` },
+            digest,
+            after,
+            local,
+            posted,
+            rebuild + 1,
+          );
+        }
+      }
     } catch (error) {
       local("TOOL_BUILD_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
     } finally {
@@ -1602,12 +2256,24 @@ export class BoardAgent {
         return;
       }
     }
+    // A codemod for an item runs only on that item's files: arguments outside
+    // its write intent are dropped (none left: the item's files the tool covers).
+    let args = action.args;
+    if (tool.kind === "codemod" && claim) {
+      const write = [...new Set(claim.intent.write.map(intentPath))];
+      const inside = action.args.filter((a) => write.some((w) => matchesGlob(intentPath(a), w)));
+      const own = resolveIntentFiles(write, await listRepoFiles(this.baseDir)).filter((f) => !hasWildcard(f));
+      args = inside.length > 0 ? inside : own;
+      if (args.length !== action.args.length || args.some((a, i) => a !== action.args[i])) {
+        note.args = args.join(",").slice(0, 300);
+      }
+    }
     let ran;
     try {
       ran = await bench.run(state, {
         capability: tool.capability,
         version: tool.version,
-        args: action.args,
+        args,
         layers: [this.baseDir, ...(worktree !== undefined ? [worktree] : [])],
       });
     } catch (error) {

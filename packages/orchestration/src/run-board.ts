@@ -47,6 +47,10 @@ import {
   pendingPushItems,
   pendingPushKey,
   planBoardIntegration,
+  narrowToSplitChildren,
+  helpGrantLive,
+  routedToSubLead,
+  entriesOverlap,
   contractTriageRecommendation,
   withContractTriage,
   entryWithin,
@@ -85,6 +89,7 @@ import {
   inventoryAfterContracts,
   recordBaselineInventory,
   GATED_REF_PREFIX,
+  matchesGlob,
   type CommandRunner as VerificationCommandRunner,
   type CompletedWorkUnit,
   type EvidenceSummary,
@@ -175,6 +180,12 @@ export interface BoardRunBudgets {
    * quiescent, in ms (default 2 minutes).
    */
   readonly quiescenceMs?: number;
+  /**
+   * Concurrent schedule: how long an owner whose unpushed item a codemod being
+   * built covers is held back (no turns) so the builder moves first, in ms
+   * (default 90 s). Bounded: after it, the owner works on, and edits by hand.
+   */
+  readonly toolHoldMs?: number;
 }
 
 /** A progress event of a board run. */
@@ -195,6 +206,8 @@ export type BoardRunEvent =
   | { readonly kind: "nothing-to-integrate" }
   /** The operator ran a tool's own gate on a build and recorded it (published only on a pass). */
   | { readonly kind: "tool-gated"; readonly gate: ToolGateRecord }
+  /** The operator forked a requester's repo for the helper of a help request. */
+  | { readonly kind: "help-forked"; readonly request: string; readonly helper: string; readonly forkOf: string; readonly workspace: string }
   | FullLiveEvent;
 
 /** Why the agent phase ended. */
@@ -607,6 +620,73 @@ export async function attributeRevisionFailure(input: {
   return { items: combined.items, source: combined.source, ...(pick !== undefined ? { pick } : {}) };
 }
 
+/** One path's tree entry (mode and blob) in a commit, for the paths a glob set covers. */
+async function treeEntries(dir: string, rev: string, globs: readonly string[]): Promise<Map<string, string>> {
+  const { stdout } = await runGit(["-C", dir, "ls-tree", "-r", "--full-tree", rev]);
+  const out = new Map<string, string>();
+  for (const line of stdout.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab < 0) continue;
+    const path = line.slice(tab + 1);
+    const [mode, , blob] = line.slice(0, tab).split(" ");
+    if (globs.some((g) => matchesGlob(path, g))) {
+      out.set(path, `${mode} ${blob}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * For every sub-lead push a revision merges: each child its `merges` names
+ * (still that child's latest, unintegrated push) is verified, never taken on
+ * the sub-lead's word: the child's tree at its pushed commit, restricted to
+ * the child's write intent, must equal the sub-lead's pinned commit's tree for
+ * those paths (a file the child deleted must be gone, a released contract path
+ * must carry the child's version). A child that does not match, or cannot be
+ * read, is returned with the reason, so the board does not integrate it.
+ */
+export async function verifySubLeadMerges(input: {
+  readonly units: readonly { readonly agent: string; readonly commit: string; readonly items: readonly BoardItem[] }[];
+  readonly state: BoardState;
+  readonly readRemote: (agent: string) => Promise<string>;
+  readonly workRoot: string;
+  readonly scrub?: (text: string) => string;
+}): Promise<{ item: string; reason: string }[]> {
+  const scrub = input.scrub ?? redactSecrets;
+  const out: { item: string; reason: string }[] = [];
+  for (const unit of input.units) {
+    for (const item of unit.items) {
+      if (item.status !== "split") continue;
+      for (const merge of item.lastPush?.merges ?? []) {
+        const child = input.state.items[merge.item];
+        if (!child?.lastPush || child.lastPush.commit !== merge.commit || child.lastPush.integratedIn !== undefined) continue;
+        const globs = [...new Set((child.intent?.write ?? child.scopeHint).map(intentPath))];
+        await mkdir(input.workRoot, { recursive: true });
+        const dir = await mkdtemp(join(input.workRoot, "verify-merge-"));
+        try {
+          await runGit(["init", "-q", dir]);
+          await runGit(["-C", dir, "fetch", "-q", await input.readRemote(child.lastPush.agent), merge.commit]);
+          const theirs = await treeEntries(dir, merge.commit, globs);
+          await runGit(["-C", dir, "fetch", "-q", await input.readRemote(unit.agent), unit.commit]);
+          const ours = await treeEntries(dir, unit.commit, globs);
+          const differ = [...new Set([...theirs.keys(), ...ours.keys()])].filter((p) => theirs.get(p) !== ours.get(p)).sort();
+          if (differ.length > 0) {
+            out.push({
+              item: merge.item,
+              reason: `the sub-lead's commit does not carry ${merge.item}'s push ${merge.commit.slice(0, 10)} for ${differ.slice(0, 5).join(", ")}${differ.length > 5 ? ", ..." : ""}`.slice(0, 300),
+            });
+          }
+        } catch (error) {
+          out.push({ item: merge.item, reason: scrub(`could not verify ${merge.item}'s push: ${error instanceof Error ? error.message : String(error)}`).slice(0, 300) });
+        } finally {
+          await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 /** Keep `chosen` in the items' order. */
 function inOrder(chosen: readonly string[], items: readonly { readonly id: string }[]): string[] {
   return items.map((i) => i.id).filter((id) => chosen.includes(id));
@@ -851,16 +931,35 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
       // Buffered: an attribution is recorded once its revision is (linked to it).
       ...(options.recordDecision ? { onDecision: async (decision: BoardDecisionRecord) => void attributionDecisions.push(decision) } : {}),
     });
-    implicated = attribution;
+    // A split item's failure is its children's work: ask their owners.
+    const narrowed = narrowToSplitChildren(state, attribution.items, raw);
+    implicated = { ...attribution, items: narrowed };
     const note =
       regressed.length > 0
         ? `regressed completed item(s): ${regressed.map((i) => i.id).join(", ")} (their files fail after this revision's pushes)\n`
         : "";
-    failing = { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: [...attribution.items] };
+    failing = { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: [...narrowed] };
   }
   // No final check ran (no gate configured): the revision passed without being checked.
   const gated = !(gate === "pass" && evidence.integration.finalCheck.skipped);
-  const recorded = await options.operator.recordRevision({ commit, gate, merged, ...(failing ? { failing } : {}), ...(gated ? {} : { gated: false as const }) });
+  // Before a sub-lead's push marks its children integrated: each merged
+  // child's pushed in-intent tree must be exactly the sub-lead commit's tree
+  // for those paths (deletions and released contract paths included).
+  const unverified = await verifySubLeadMerges({
+    units: plan.units.filter((u) => mergedAgents.includes(u.agent)),
+    state,
+    readRemote: options.readRemote,
+    workRoot: options.worktreeRoot,
+    scrub,
+  });
+  const recorded = await options.operator.recordRevision({
+    commit,
+    gate,
+    merged,
+    ...(failing ? { failing } : {}),
+    ...(gated ? {} : { gated: false as const }),
+    ...(unverified.length > 0 ? { unverified } : {}),
+  });
   if (!recorded.ok) {
     await flushDecisions(undefined);
     if (recorded.code === "UNKNOWN_REF") {
@@ -889,7 +988,11 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     ...(install ? { install } : {}),
     commit,
     merged,
-    integratedItems: mergedItems.map((i) => i.id),
+    // A sub-lead's push integrates the children's pushes it merged.
+    integratedItems: mergedItems.flatMap((i) => [
+      i.id,
+      ...(i.status === "split" ? (i.lastPush?.merges ?? []).filter((m) => state.items[m.item]?.lastPush?.commit === m.commit).map((m) => m.item) : []),
+    ]),
     excludedItems: pending.filter((i) => !mergedItems.includes(i)).map((i) => i.id),
     excludedAgents,
     completedItems: recorded.appended.flatMap((m) => (m.type === "item.completed" ? [m.payload.item] : [])),
@@ -1052,7 +1155,9 @@ export class ContinuousBoardIntegrator {
  * the lead accepted it) that are neither split (its children carry it) nor done.
  */
 function outstanding(state: BoardState): BoardItem[] {
-  return Object.values(state.items).filter((i) => isChangeItem(i) && i.status !== "split" && i.status !== "done");
+  // A split item counts too: it completes only when its children are done and
+  // its sub-lead's push passed.
+  return Object.values(state.items).filter((i) => isChangeItem(i) && i.status !== "done");
 }
 
 /**
@@ -1063,7 +1168,20 @@ function outstanding(state: BoardState): BoardItem[] {
 export function incompleteItemReasons(state: BoardState): string[] {
   return outstanding(state).map((i) => {
     const push = i.lastPush;
+    if (i.status === "split") {
+      const open = i.children.filter((c) => state.items[c]?.status !== "done");
+      return open.length > 0
+        ? `item ${i.id}: split; child item(s) ${open.join(", ")} not completed (sub-lead ${i.subLead ?? i.owner ?? "?"})`
+        : `item ${i.id}: split; its sub-lead ${i.subLead ?? "?"}'s push for it has not passed`;
+    }
     if (i.status === "claimed" && i.owner !== undefined) {
+      if (push !== undefined && push.integratedIn === undefined && routedToSubLead(state, i)) {
+        const parent = state.items[i.parent!]!;
+        const merged = (parent.lastPush?.merges ?? []).some((m) => m.item === i.id && m.commit === push.commit);
+        return merged
+          ? `item ${i.id}: its push is in its sub-lead ${parent.subLead}'s push for ${parent.id}, which has not passed (owner ${i.owner})`
+          : `item ${i.id}: its push awaits its sub-lead ${parent.subLead}'s merge into ${parent.id} (owner ${i.owner})`;
+      }
       if (push?.integratedIn !== undefined && !i.doneProposed) {
         return `item ${i.id}: its push passed in rev ${push.integratedIn} but its owner did not propose done (owner ${i.owner})`;
       }
@@ -1114,6 +1232,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     timeoutMs: options.budgets?.timeoutMs ?? 30 * 60 * 1000,
     maxFixAttemptsPerItem: options.budgets?.maxFixAttemptsPerItem ?? 3,
     quiescenceMs: options.budgets?.quiescenceMs ?? 2 * 60 * 1000,
+    toolHoldMs: options.budgets?.toolHoldMs ?? 90 * 1000,
   };
   const ttl = options.workspaceTtlSeconds ?? 1800;
   if (budgets.timeoutMs > ttl * 1000) {
@@ -1231,6 +1350,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       objective,
       rules: { ...(options.rules ?? {}), maxFixAttempts: options.rules?.maxFixAttempts ?? budgets.maxFixAttemptsPerItem },
       protected: guarded.paths,
+      // Recorded with the goal: the board refuses splits under the cloud integrator.
+      ...(cloud ? { integrator: "cloud" } : {}),
       ...(guarded.keyLabels.length > 0 ? { protectedKeys: guarded.keyLabels } : {}),
       ...(options.appGateCommand && options.appGateCommand.length > 0
         ? {
@@ -1270,22 +1391,24 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   };
 
   // Read tokens the integrator was issued, revoked as soon as it is done with them.
-  const issuedReadTokens: { agent: string; tokenId: string }[] = [];
+  const issuedReadTokens: { agent: string; tokenId: string; help?: string }[] = [];
   const revokeReadTokens = async (): Promise<void> => {
     for (const issued of issuedReadTokens.splice(0)) {
-      await operator.revokeReadToken(issued.agent, issued.tokenId).catch(() => undefined);
+      await operator.revokeReadToken(issued.agent, issued.tokenId, issued.help).catch(() => undefined);
     }
   };
-  const readRemote = async (agent: string): Promise<string> => {
-    const repo = agentRepos.get(agent);
+  // Help forks the run made: help request -> the fork (for reads and cleanup).
+  const helpForks = new Map<string, { readonly workspaceName: string; readonly gitUrl: string; readonly helper: string }>();
+  const readRemote = async (agent: string, help?: string): Promise<string> => {
+    const repo = help !== undefined ? helpForks.get(help) : agentRepos.get(agent);
     if (!repo) {
-      throw new Error(`no repo is known for ${agent}`);
+      throw new Error(help !== undefined ? `no fork is known for help request ${help}` : `no repo is known for ${agent}`);
     }
     // A transient refusal (5xx, the network) is retried a bounded number of times.
     let issued: Awaited<ReturnType<BoardOperatorClient["readToken"]>> | undefined;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
-        issued = await operator.readToken(agent, readTtl);
+        issued = await operator.readToken(agent, readTtl, help !== undefined ? { help } : {});
       } catch (error) {
         issued = { ok: false, code: "NETWORK", error: error instanceof Error ? error.message : String(error), status: 0 };
       }
@@ -1298,7 +1421,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       throw new Error(`no read token for ${agent} (${issued?.code ?? "?"}): ${issued?.error ?? "unknown"}`);
     }
     secrets.add(issued.token);
-    issuedReadTokens.push({ agent, tokenId: issued.tokenId });
+    issuedReadTokens.push({ agent, tokenId: issued.tokenId, ...(help !== undefined ? { help } : {}) });
     return authenticatedRemote(repo.gitUrl, issued.token);
   };
 
@@ -1354,6 +1477,39 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     }
     return found;
   };
+  // A helper's fork, materialized at its delivered commit for the requester's pull.
+  const fetchFork = (request: string, helper: string, commit: string): Promise<string | undefined> => {
+    const key = `help:${request}@${commit}`;
+    let found = pushDirs.get(key);
+    if (!found) {
+      found = (async () => {
+        const dir = join(workRoot, "pushes", `help-${request.replace(/[^A-Za-z0-9._-]+/g, "-")}-${commit.slice(0, 12)}`);
+        try {
+          await rm(dir, { recursive: true, force: true });
+          await runGit(["clone", "-q", await readRemote(helper, request), dir]);
+          await runGit(["-C", dir, "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", commit]);
+          return dir;
+        } catch {
+          return undefined;
+        } finally {
+          await revokeReadTokens();
+        }
+      })();
+      pushDirs.set(key, found);
+    }
+    return found;
+  };
+  // The operator forks the requester's repo for a helper (the board checks the
+  // grant first); the fork's short write token goes to the helper only.
+  const forkForHelp = async (agent: string, request: string) => {
+    const forked = await operator.helpFork(request, agent, Math.min(3600, Math.max(60, ttl)));
+    if (forked.ok) {
+      secrets.add(forked.token);
+      helpForks.set(request, { workspaceName: forked.workspaceName, gitUrl: forked.gitUrl, helper: agent });
+      emit({ kind: "help-forked", request, helper: agent, forkOf: forked.forkOf, workspace: forked.workspaceName });
+    }
+    return forked;
+  };
   const runningAgents = () => workers.filter((w) => !w.stopped).map((w) => w.id);
   // Agent-built tools: the tools repo (provisioned on the first build), each
   // tool's own gate on the ORIGINAL code, pinned runs, engine-recorded uses.
@@ -1389,6 +1545,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       runBudget,
       fetchRevision,
       fetchPush,
+      fetchFork,
+      forkForHelp,
       runningAgents,
       tools: toolBench,
       toolAuthor,
@@ -1573,7 +1731,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       }
     }
     await toolBench.revokeTokens();
-    for (const name of [toolBench.workspaceName, ...workers.map((w) => w.joinedWorkspace?.workspaceName)]) {
+    // Help forks are archived with the agents' repos (their tokens go with them).
+    for (const name of [toolBench.workspaceName, ...workers.map((w) => w.joinedWorkspace?.workspaceName), ...[...helpForks.values()].map((f) => f.workspaceName)]) {
       if (!name || cleanedUp.includes(name)) {
         continue;
       }
@@ -1610,7 +1769,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     const recruit = async (state: BoardState): Promise<number> => {
       let joined = 0;
       const inFlight = () => workers.filter((w) => !w.stopped).length;
-      const open = Object.values(state.items).filter((i) => i.status === "open").length;
+      // Open items, plus help requests that grant a scope nobody has taken yet
+      // (a helper recruited for one forks the requester's repo).
+      const helpWanted = Object.values(state.help).filter((h) => h.scope !== undefined && h.grant === undefined && helpGrantLive(state, h)).length;
+      const open = Object.values(state.items).filter((i) => i.status === "open").length + helpWanted;
       while (workers.length < options.dial.maxConcurrency && (inFlight() < options.dial.minConcurrency || open > inFlight())) {
         const worker = makeAgent(`agent-${workers.length + 1}`, "worker");
         await worker.join(open > 0 ? `${open} open item(s) outnumber the ${inFlight()} agent(s) in flight` : "the dial's minimum");
@@ -1678,7 +1840,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         }
         const joined = await recruit(state);
         let acted = false;
-        for (const agent of [lead, ...workers]) {
+        for (const agent of [lead, ...lockstepOrder(workers, (await operator.page(0, 1)).state)]) {
           if ((await agent.step()) === "acted") {
             acted = true;
           }
@@ -1701,6 +1863,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       stopReason ??= check((await operator.page(0, 1)).state) ?? "max-rounds";
     } else {
       loops.push(lead.run({ signal: controller.signal }));
+      let latestState: BoardState | undefined;
+      const heldSince = new Map<string, number>();
       const pollMs = options.pollMs ?? 500;
       let lastSeq = -1;
       let quietSince = Date.now();
@@ -1710,10 +1874,21 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         if (stopReason) {
           break;
         }
+        latestState = state;
         const before = workers.length;
         await recruit(state);
         for (const worker of workers.slice(before)) {
-          loops.push(worker.run({ signal: controller.signal }));
+          // Tool builders first: an owner whose unpushed work a codemod being
+          // built covers waits (bounded by toolHoldMs from when it was first held).
+          const hold = () => {
+            if (!latestState || !toolHold(latestState, worker.id)) {
+              return false;
+            }
+            const since = heldSince.get(worker.id) ?? Date.now();
+            heldSince.set(worker.id, since);
+            return Date.now() - since < budgets.toolHoldMs;
+          };
+          loops.push(worker.run({ signal: controller.signal, hold }));
         }
         reportStops();
         if (integrator.wants(state)) {
@@ -1940,6 +2115,62 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
 }
 
 /**
+ * Concurrent schedule priority for tool builders: true when `agent` should
+ * not take a turn yet because everything it has to do is editing items it has
+ * not pushed that a codemod still being built covers (the tool item claimed by
+ * another agent, nothing published, not unavailable). Pure: a function of the
+ * board. The driver holds such an owner for a bounded time only.
+ */
+export function toolHold(state: BoardState, agent: string): boolean {
+  const building = Object.values(state.tools.proposed).filter((t) => {
+    const item = state.items[t.item];
+    return (
+      t.kind === "codemod" &&
+      item?.status === "claimed" &&
+      item.owner !== undefined &&
+      item.owner !== agent &&
+      !state.tools.published.some((p) => p.capability === t.capability) &&
+      toolUnavailableReason(state, t.capability) === undefined
+    );
+  });
+  if (building.length === 0) {
+    return false;
+  }
+  if (Object.values(state.contests).some((c) => c.status !== "resolved" && (c.owner === agent || c.claimant === agent))) {
+    return false;
+  }
+  const held = Object.values(state.items).filter((i) => i.status === "claimed" && i.owner === agent && i.intent);
+  const waiting = held.filter((i) => !i.doneProposed || i.fixRequested !== undefined);
+  return (
+    waiting.length > 0 &&
+    waiting.every(
+      (i) =>
+        i.tool === undefined &&
+        i.fixRequested === undefined &&
+        (i.lastPush === undefined || i.lastPush.agent !== agent) &&
+        building.some((t) => i.intent!.write.some((w) => t.inputs.some((input) => entriesOverlap(intentPath(w), input)))),
+    )
+  );
+}
+
+/**
+ * The lockstep order of the workers in a round: agents building a tool that is
+ * not published yet go FIRST (schedule priority), so a tool the lead seeded is
+ * published before the owners of the items it covers edit by hand; the rest
+ * keep their join order. Deterministic: a function of the board and the join
+ * order. Tools stay accelerators: nobody waits, the order only changes who
+ * moves first within a round.
+ */
+export function lockstepOrder<A extends { readonly id: string }>(workers: readonly A[], state: BoardState): A[] {
+  const building = new Set(
+    Object.values(state.items)
+      .filter((i) => i.tool !== undefined && i.status === "claimed" && i.owner !== undefined && !state.tools.published.some((t) => t.capability === i.tool!.capability))
+      .map((i) => i.owner!),
+  );
+  return [...workers.filter((w) => building.has(w.id)), ...workers.filter((w) => !building.has(w.id))];
+}
+
+/**
  * The lead's seed from a decomposed Change: each planned unit becomes one open
  * item (its objective, its paths as the scope hint), proposed, never assigned.
  * The plan's source says whether a model planned it.
@@ -2032,11 +2263,34 @@ function payloadSummary(m: BoardMessage): string {
     case "claim.escalated":
       return `${String(p.contest)} after ${String(p.turns)} turn(s) (${String(p.reason)})`;
     case "help.requested":
-      return `${String(p.request)} on ${String(p.item)} (need ${String(p.need)})`;
+      return `${String(p.request)} on ${String(p.item)} (need ${String(p.need)})${Array.isArray(p.scope) ? `, grants ${list(p.scope)} to the helper who forks` : ""}`;
     case "help.offered":
-      return String(p.request);
-    case "push.announced":
-      return `${String(p.item)} commit ${String(p.commit).slice(0, 10)} paths ${list(p.paths)}`;
+      return p.forkOf !== undefined
+        ? `${String(p.request)}: forked ${String(p.forkOf)}'s repo at ${p.forkCommit !== undefined ? String(p.forkCommit).slice(0, 10) : "its empty state"}${p.fork !== undefined ? ` (fork ${String(p.fork)})` : ""}; takes the grant`
+        : String(p.request);
+    case "help.delivered":
+      return `${String(p.request)}: commit ${String(p.commit).slice(0, 10)} in the fork, paths ${list(p.paths)}`;
+    case "help.closed":
+      return `${String(p.request)} closed (${String(p.reason)})${p.detail !== undefined ? `: ${String(p.detail).slice(0, 100)}` : ""}`;
+    case "item.struggling":
+      return `${String(p.item)}: ${String(p.reason)} (${String(p.turnsSpent)} turn(s), ${String(p.failedEdits)} failed edit(s))${p.lastFailure !== undefined ? `: ${String(p.lastFailure).slice(0, 80)}` : ""}`;
+    case "help.volunteered":
+      return `offers help on ${String(p.item)}`;
+    case "help.declined":
+      return `${String(p.volunteer)}'s offer on ${String(p.item)}`;
+    case "item.split": {
+      const children = p.children as { item: string; scopeHint: string[] }[];
+      return `${String(p.item)} into ${children.map((c) => `${c.item} [${c.scopeHint.join(", ")}]`).join(", ")}; ${m.from} is its sub-lead`;
+    }
+    case "push.announced": {
+      const merges = p.merges as { item: string; commit: string }[] | undefined;
+      const pulled = p.pulled as string[] | undefined;
+      return (
+        `${String(p.item)} commit ${String(p.commit).slice(0, 10)} paths ${list(p.paths) || "(none)"}` +
+        (merges ? ` (sub-lead merge of ${merges.map((x) => `${x.item}@${x.commit.slice(0, 10)}`).join(", ")})` : "") +
+        (pulled ? ` (pulled help ${pulled.join(", ")})` : "")
+      );
+    }
     case "done.proposed":
       return String(p.item);
     case "decision.resolved":
@@ -2172,6 +2426,102 @@ export function formatToolRegistry(result: Pick<RunBoardResult, "state" | "log" 
 }
 
 /** A readable summary of a board run. */
+/** How early a codemod was used: items it changed before any hand edit of them, and covered items edited by hand first. */
+export interface CodemodTiming {
+  readonly capability: string;
+  /** Items whose FIRST push was the codemod's (no hand edit before it). */
+  readonly early: readonly string[];
+  /** Items the codemod's inputs cover whose first push was a hand edit. */
+  readonly handFirst: readonly string[];
+}
+
+/**
+ * Codemod timing, from the log alone: for each codemod, the items whose first
+ * push came from a recorded use of it (`tool.used` with the push's commit)
+ * before any hand-edited push of the item, and the covered items edited by
+ * hand first. A sub-lead merge or a pulled help push is neither.
+ */
+export function codemodTiming(log: readonly BoardMessage[], state: BoardState): CodemodTiming[] {
+  const toolCommits = new Map<string, string>();
+  for (const m of log) {
+    if (m.type === "tool.used" && m.payload.commit !== undefined) {
+      toolCommits.set(m.payload.commit, m.payload.capability);
+    }
+  }
+  const firstPush = new Map<string, { readonly kind: "tool" | "hand" | "other"; readonly capability?: string }>();
+  for (const m of log) {
+    if (m.type !== "push.announced" || firstPush.has(m.payload.item)) {
+      continue;
+    }
+    const capability = toolCommits.get(m.payload.commit);
+    firstPush.set(
+      m.payload.item,
+      capability !== undefined ? { kind: "tool", capability } : m.payload.merges !== undefined || m.payload.pulled !== undefined ? { kind: "other" } : { kind: "hand" },
+    );
+  }
+  return Object.values(state.tools.proposed)
+    .filter((t) => t.kind === "codemod")
+    .map((t) => {
+      const covered = Object.values(state.items).filter(
+        (i) => isChangeItem(i) && i.scopeHint.some((h) => t.inputs.some((input) => entriesOverlap(h, input))),
+      );
+      return {
+        capability: t.capability,
+        early: [...firstPush].filter(([, f]) => f.kind === "tool" && f.capability === t.capability).map(([item]) => item),
+        handFirst: covered.filter((i) => firstPush.get(i.id)?.kind === "hand").map((i) => i.id),
+      };
+    });
+}
+
+/** Formation lines from the log: each split (sub-lead, children, merges) and each fork-based help. */
+export function formatFormation(log: readonly BoardMessage[], state: BoardState): string[] {
+  const lines: string[] = [];
+  const grantedTo = new Map<string, string>();
+  for (const m of log) {
+    if (m.type === "claim.granted" && !grantedTo.has(m.payload.item)) {
+      grantedTo.set(m.payload.item, m.payload.agent);
+    }
+  }
+  for (const m of log) {
+    if (m.type === "item.split") {
+      const parent = state.items[m.payload.item];
+      const merges = log.filter((x) => x.type === "push.announced" && x.payload.item === m.payload.item && x.payload.merges !== undefined).map((x) => x.seq);
+      lines.push(
+        `    split ${m.payload.item} (seq ${m.seq}): ${m.from} is its sub-lead; children ${m.payload.children
+          .map((c) => `${c.item} ${grantedTo.has(c.item) ? `claimed by ${grantedTo.get(c.item)}` : "unclaimed"}`)
+          .join(", ")}; sub-lead push(es) merging them: ${merges.length > 0 ? `seq ${merges.join(", ")}` : "none"}; ${
+          parent?.status === "done" ? `done via rev ${parent.completed?.n ?? "?"}` : `not done (${parent?.status ?? "?"})`
+        }`,
+      );
+    }
+    if (m.type === "help.requested" && m.payload.scope !== undefined) {
+      const offered = log.find((x) => x.type === "help.offered" && x.payload.request === m.payload.request && x.payload.forkOf !== undefined);
+      const delivered = log.filter((x) => x.type === "help.delivered" && x.payload.request === m.payload.request).at(-1);
+      const pulled = log.find((x) => x.type === "push.announced" && (x.payload.pulled ?? []).includes(m.payload.request));
+      lines.push(
+        `    help ${m.payload.request} on ${m.payload.item} (seq ${m.seq}, grants ${m.payload.scope.join(", ")}): ` +
+          (offered && offered.type === "help.offered"
+            ? `${offered.from} forked ${m.from}'s repo at ${offered.payload.forkCommit?.slice(0, 10) ?? "its empty state"} (seq ${offered.seq}${offered.payload.fork ? `, fork ${offered.payload.fork}` : ""})`
+            : "nobody took it") +
+          (delivered && delivered.type === "help.delivered" ? `; delivered ${delivered.payload.commit.slice(0, 10)} (seq ${delivered.seq})` : "") +
+          (pulled ? `; ${m.from} pulled it (seq ${pulled.seq})` : ""),
+      );
+    }
+  }
+  for (const m of log) {
+    if (m.type === "help.volunteered") {
+      const grant = log.find((x) => x.type === "help.requested" && x.seq > m.seq && x.payload.item === m.payload.item && x.payload.scope !== undefined && (x.to ?? []).includes(m.from));
+      const declined = log.find((x) => x.type === "help.declined" && x.seq > m.seq && x.payload.item === m.payload.item && x.payload.volunteer === m.from);
+      const report = [...log].reverse().find((x) => x.type === "item.struggling" && x.seq < m.seq && x.payload.item === m.payload.item);
+      lines.push(
+        `    volunteer ${m.from} on ${m.payload.item} (seq ${m.seq}${report && report.type === "item.struggling" ? `, after ${report.from}'s struggling report at seq ${report.seq}: ${report.payload.reason}` : ""}): ` +
+          (grant && grant.type === "help.requested" ? `granted ${grant.payload.scope!.join(", ")} (help ${grant.payload.request}, seq ${grant.seq})` : declined ? `declined (seq ${declined.seq})` : "unanswered"),
+      );
+    }
+  }
+  return lines.length > 0 ? ["  formation:", ...lines] : [];
+}
+
 export function formatBoardRunSummary(result: RunBoardResult): string {
   // Only accepted items count: a worker's proposal the lead rejected (or never
   // decided) is not part of the Change.
@@ -2234,6 +2584,16 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     lines.push(`  ${formatAttributionTally(boardAttributionTally(result.state))}`);
   }
   lines.push(...formatToolRegistry(result));
+  for (const timing of codemodTiming(result.log, result.state)) {
+    lines.push(
+      `  tool timing: codemod ${timing.capability} changed ${timing.early.length} item(s) before any hand edit of them (${timing.early.join(", ") || "none"}); covered items edited by hand first: ${timing.handFirst.join(", ") || "none"}`,
+    );
+  }
+  lines.push(...formatFormation(result.log, result.state));
+  const forks = result.cleanedUp.filter((name) => name.includes("--help-"));
+  if (result.cleanedUp.length > 0) {
+    lines.push(`  repos archived at cleanup: ${result.cleanedUp.length}${forks.length > 0 ? ` (help fork(s): ${forks.join(", ")})` : ""}`);
+  }
   const proposals = result.proposals ?? proposalOutcomes(result.state, result.log);
   const notCounted = [
     ...(proposals.rejected.length > 0 ? [`${proposals.rejected.length} worker proposal(s) rejected`] : []),

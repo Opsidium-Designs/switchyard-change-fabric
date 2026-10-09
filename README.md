@@ -110,7 +110,11 @@ promoted (`make demo-board` offline, `make run-board` live). Agents also build
 tools for each other on the board (scanners, codemods, checks): a proposed tool
 is an item the lead accepts, it is built in the Change's tools repo, published
 only after it passes its own gate on the original code, and every use is
-recorded by the engine (see "Agent-built tools" in docs/BOARD.md). With
+recorded by the engine (see "Agent-built tools" in docs/BOARD.md). Owners can
+split an item and become its sub-lead (the children's pushes integrate into
+the sub-lead's repo first, and it announces one push upward), or grant part of
+an item to a helper that forks their repo and delivers a commit they pull (see
+"Splits, sub-leads, and fork-based help" in docs/BOARD.md). With
 `--integrator cloud` the integration runs on Cloudflare instead of in the
 driver: a Workflow gates each revision in a Cloudflare Container with phased
 egress (`make dev-containers` locally, Docker required). See

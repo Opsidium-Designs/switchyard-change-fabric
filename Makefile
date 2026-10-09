@@ -142,7 +142,11 @@ demo:
 # and other agents run the pinned versions in their own repos (the engine
 # records every use). A second run, on the multi-resource example app, shows a
 # scanner finding places no item covers: its builder proposes that work, the
-# lead accepts it, and it completes through the normal gate.
+# lead accepts it, and it completes through the normal gate. Formation shows
+# too: in the first run an owner grants part of its item to a helper that
+# FORKS its repo, and pulls the helper's commit; in the second the owner of the
+# scanner-found item SPLITS it, other agents claim the children, and it merges
+# their pushes as the sub-lead. The summary prints both and the codemod timing.
 BOARD_GOAL = $(CURDIR)/examples/goals/audit-logging.goal.txt
 BOARD_PROJECT = $(CURDIR)/examples/demo-project
 TOOLS_GOAL = $(CURDIR)/examples/goals/service-api-validation-auth.goal.txt
@@ -156,7 +160,7 @@ demo-board:
 	npm -w apps/cli run dev -- run-board --offline --fixture-gate --decide-contracts $(DECIDE_CONTRACTS) --goal-file "$(BOARD_GOAL)" --project "$(BOARD_PROJECT)" \
 	  --min $(MIN) --max $(MAX)
 	@echo ""
-	@echo "=== Agents build tools for each other: a scanner's findings become work ==="
+	@echo "=== Agents build tools for each other: a scanner's findings become work (and a split with a sub-lead) ==="
 	@echo ""
 	npm -w apps/cli run dev -- run-board --offline --fixture-gate --decide-contracts $(DECIDE_CONTRACTS) --goal-file "$(TOOLS_GOAL)" --project "$(TOOLS_PROJECT)" \
 	  --min $(MIN) --max $(MAX)

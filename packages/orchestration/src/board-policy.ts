@@ -40,6 +40,24 @@
  *     revision (a sweep, bounded);
  *   - as the lead, accept a tool proposal, and accept a proposal from a
  *     tool's findings unless an outstanding item already covers its files.
+ * Formation (splits, sub-leads, fork-based help), woven in:
+ *   - SPLIT: a held item the planner did not decompose (a worker's or a
+ *     tool's proposal, not a planned item) with no push yet, whose write
+ *     intent spans at least two files no codemod covers (several distinct
+ *     sub-changes, not one repeated change), is split into children, one per
+ *     directory when they span several, else one per file; the owner becomes
+ *     the SUB-LEAD and leaves its children to others (it claims one itself
+ *     only after waiting twice); when children push, it pulls them (one
+ *     merged push upward);
+ *   - HELP: after a codemod pushed the mechanical part of an item across
+ *     several files, the hand pass that remains can go in parallel: the owner
+ *     grants the second half of the files to a helper (help.requested with
+ *     scope) and does not propose done until it pulls the delivered work; a
+ *     free agent takes such a request (the runtime forks the requester's
+ *     repo), edits the granted files in its fork, and delivers;
+ *   - TOOL TIMING: while a codemod covering a held item is being built (not
+ *     published, not unavailable), the owner first spends at most two turns
+ *     reading its files (a wait) before editing by hand.
  * No rule names a file, an app, or a goal: the same policy runs unchanged on any
  * repo.
  */
@@ -203,6 +221,104 @@ function filesOf(input: Input, write: readonly string[]): string[] {
 function toolBuildsSpent(input: Input, capability: string, ownerFailures: number): boolean {
   const builds = input.capsule.decisions.filter((h) => h.action.type === "build_tool" && h.action.capability === capability);
   return ownerFailures >= 2 || builds.filter((h) => h.outcome !== "posted").length >= 2 || builds.length >= 3;
+}
+
+/** Turns spent exploring an item while a codemod for it is built (bounded). */
+export const MAX_EXPLORE_TURNS = 2;
+
+/** The codemods (published, or still being built and not unavailable) whose inputs cover any of `files`. */
+function codemodsCovering(input: Input, files: readonly string[]): BoardToolFact[] {
+  return (input.board.tools ?? []).filter((t) => t.kind === "codemod" && t.status !== "rejected" && files.some((f) => toolCovers(t, f)));
+}
+
+/**
+ * The children of a split: one per directory when the files span several
+ * directories, else one per file (at most 32). Each child's scope is its
+ * concrete files, inside the owner's write intent.
+ */
+function splitChildren(objective: string, files: readonly string[]): { objective: string; acceptance: string[]; scopeHint: string[] }[] {
+  const dirOf = (f: string) => (f.includes("/") ? f.slice(0, f.lastIndexOf("/")) : ".");
+  const dirs = [...new Set(files.map(dirOf))];
+  const groups = dirs.length >= 2 ? dirs.map((d) => files.filter((f) => dirOf(f) === d)) : files.map((f) => [f]);
+  const capped = groups.length > 32 ? [...groups.slice(0, 31), groups.slice(31).flat()] : groups;
+  return capped.map((group) => ({
+    objective: `${objective.split(" (claim this item now")[0]}: ${group.join(", ")}`.slice(0, 500),
+    acceptance: ["the change gate passes on an integrated revision that merges the sub-lead's push"],
+    scopeHint: group,
+  }));
+}
+
+/** The formation actions of a worker (sub-lead pulls, help), or undefined. */
+function formationAction(input: Input): AgentAction | undefined {
+  const d = input.digest;
+  const decisions = input.capsule.decisions;
+  const failed = (pred: (a: AgentAction) => boolean) => decisions.filter((h) => pred(h.action) && h.outcome !== "posted").length;
+  // An owner answers a volunteer on its item: it hands over the second half of
+  // the item's files when there are several, else declines (nothing to divide).
+  for (const volunteer of d.volunteers ?? []) {
+    const claim = d.claims.find((c) => c.item === volunteer.item);
+    if (!claim || decisions.some((h) => h.action.type === "answer_volunteer" && h.action.itemId === volunteer.item && h.action.volunteer === volunteer.agent && h.outcome === "posted")) {
+      continue;
+    }
+    // The item's files: existing ones its intent covers, plus concrete new paths it names.
+    const files = [
+      ...new Set([
+        ...filesOf(input, claim.intent.write),
+        ...claim.intent.write.map(intentPath).filter((w) => !hasWildcard(w) && !d.protected.some((p) => entryWithin(w, p) || w === p)),
+      ]),
+    ].sort();
+    const granted = (d.help?.mine ?? []).filter((h) => h.item === claim.item && h.live).flatMap((h) => h.scope);
+    const free = files.filter((f) => !granted.includes(f));
+    if (free.length >= 2 && claim.fix === undefined) {
+      const scope = free.slice(Math.ceil(free.length / 2));
+      return { type: "answer_volunteer", itemId: claim.item, volunteer: volunteer.agent, accept: true, scope, rationale: `${volunteer.agent} takes ${scope.join(", ")} (it forks my repo); I keep the rest` };
+    }
+    // Struggling on a single file: fresh eyes take it (from my repo's state).
+    if (free.length === 1 && claim.fix === undefined && (d.struggling ?? []).some((s) => s.item === claim.item)) {
+      return {
+        type: "answer_volunteer",
+        itemId: claim.item,
+        volunteer: volunteer.agent,
+        accept: true,
+        scope: free,
+        rationale: `${claim.item} is going badly for me; ${volunteer.agent} takes ${free[0]} with fresh eyes, starting from my repo`,
+      };
+    }
+    return {
+      type: "answer_volunteer",
+      itemId: claim.item,
+      volunteer: volunteer.agent,
+      accept: false,
+      rationale: claim.fix !== undefined ? "I am answering a fix request on it now" : `${claim.item} has no second file to hand over`,
+    };
+  }
+  // A helper delivers the granted files first (someone is waiting for them).
+  for (const grant of d.help?.granted ?? []) {
+    if (!grant.live || grant.delivered !== undefined) {
+      continue;
+    }
+    if (failed((a) => a.type === "edit" && a.itemId === grant.item) < 2) {
+      return { type: "edit", itemId: grant.item, instruction: `Help ${grant.by} on ${grant.item}: finish ${grant.scope.join(", ")}` };
+    }
+  }
+  // A requester pulls a helper's delivered work.
+  for (const help of d.help?.mine ?? []) {
+    if (help.delivered !== undefined && !help.pulled && failed((a) => a.type === "pull" && a.requestId === help.request) < 2) {
+      return { type: "pull", itemId: help.item, requestId: help.request, rationale: `${help.grantee} delivered ${help.delivered.commit} for ${help.scope.join(", ")}` };
+    }
+  }
+  // A sub-lead merges its children's new pushes into one push upward.
+  for (const led of d.subLead ?? []) {
+    const fresh = led.children.filter((c) => c.lastPush !== undefined && c.lastPush.integratedIn === undefined && !c.merged && c.unverified !== true);
+    if (fresh.length > 0 && failed((a) => a.type === "pull" && a.itemId === led.item && a.requestId === undefined) < 3) {
+      return {
+        type: "pull",
+        itemId: led.item,
+        rationale: `as sub-lead of ${led.item}, merging ${fresh.map((c) => `${c.item} (${c.owner ?? "?"})`).join(", ")} into one push`,
+      };
+    }
+  }
+  return undefined;
 }
 
 /** The tool actions of a worker, or undefined when no tool rule applies. */
@@ -478,7 +594,8 @@ function decide(input: Input): AgentAction {
     decisions.flatMap((h) => (h.action.type === "message" && h.action.kind === "reply" && h.action.payload.requestId ? [h.action.payload.requestId] : [])),
   );
   for (const m of input.messages) {
-    if (m.type === "help.requested" && m.to?.includes(me) && !answered.has(m.payload.request)) {
+    // (A request granting a scope is taken through the fork, below, not answered here.)
+    if (m.type === "help.requested" && m.to?.includes(me) && m.payload.scope === undefined && !answered.has(m.payload.request)) {
       return {
         type: "message",
         kind: "reply",
@@ -487,6 +604,12 @@ function decide(input: Input): AgentAction {
         rationale: `answering ${m.from} on item ${m.payload.item}: my write intent stays as granted; yours is clear of it`,
       };
     }
+  }
+
+  // 3b. Formation: deliver granted help, pull delivered help, merge children (sub-lead).
+  const formation = formationAction(input);
+  if (formation) {
+    return formation;
   }
 
   // 4. After narrowing, ask the other party about the shared boundary.
@@ -511,6 +634,27 @@ function decide(input: Input): AgentAction {
         to: [owner],
         payload: { itemId: item, need: "shared-boundary" },
         rationale: `I narrowed item ${item} away from your write intent; tell me if you also need any file I kept`,
+      };
+    }
+  }
+
+  // 5a. Split a held item that spans several distinct sub-changes (once, before any push).
+  const itemFacts = new Map((input.board.items ?? []).map((i) => [i.item, i]));
+  const toolItemIds = new Set((input.board.tools ?? []).map((t) => t.item));
+  for (const claim of d.claims) {
+    const fact = itemFacts.get(claim.item);
+    // Planned items are already the planner's decomposition.
+    if (claim.lastPush || claim.fix !== undefined || toolItemIds.has(claim.item) || fact?.parent !== undefined || fact?.planned === true) {
+      continue;
+    }
+    const files = filesOf(input, claim.intent.write);
+    const tried = decisions.some((h) => h.action.type === "split" && h.action.itemId === claim.item);
+    if (files.length >= 2 && !tried && codemodsCovering(input, files).length === 0) {
+      return {
+        type: "split",
+        itemId: claim.item,
+        children: splitChildren(claim.objective, files),
+        rationale: `${claim.item} spans ${files.length} files that are distinct sub-changes (no codemod covers them): splitting so other agents take parts; I integrate their pushes as sub-lead`,
       };
     }
   }
@@ -547,7 +691,60 @@ function decide(input: Input): AgentAction {
       if (failedEdits >= 2) {
         continue;
       }
+      // A codemod covering this item is being built: read the files first
+      // (bounded), so a codemod published early is used before hand edits.
+      const files = filesOf(input, claim.intent.write);
+      const building = codemodsCovering(input, files).find((t) => t.versions.length === 0 && t.unavailable === undefined);
+      const explored = decisions.filter((h) => h.action.type === "wait" && h.action.reason.startsWith(`exploring ${claim.item}:`)).length;
+      if (building && explored < MAX_EXPLORE_TURNS && !claim.lastPush) {
+        return {
+          type: "wait",
+          reason: `exploring ${claim.item}: reading ${files.length} file(s) while the codemod ${building.capability} is built (${explored + 1} of ${MAX_EXPLORE_TURNS}; then I edit by hand)`,
+        };
+      }
+      // Struggling with idle agents around: give them one turn to volunteer
+      // before editing again (once per item; a volunteer's offer wakes me).
+      const waitedForVolunteer = decisions.some((h) => h.action.type === "wait" && h.action.reason.startsWith(`struggling on ${claim.item}:`));
+      if (!waitedForVolunteer && (d.struggling ?? []).some((s) => s.item === claim.item) && (d.idleAgents ?? []).length > 0 && (d.help?.mine ?? []).every((h) => h.item !== claim.item)) {
+        return { type: "wait", reason: `struggling on ${claim.item}: ${(d.idleAgents ?? []).length} idle agent(s) may volunteer; waiting one turn` };
+      }
+      // Everything this item writes is granted to a helper: wait for its delivery.
+      const grantedAll = (d.help?.mine ?? []).filter((h) => h.item === claim.item && h.live && !h.pulled && h.grantee !== undefined).flatMap((h) => h.scope);
+      if (grantedAll.length > 0 && files.every((f) => grantedAll.includes(f))) {
+        continue;
+      }
       return { type: "edit", itemId: claim.item, instruction: `Implement: ${claim.objective}` };
+    }
+    // A codemod pushed the mechanical part across several files: grant the
+    // second half of the hand pass to a helper (once).
+    const myHelp = (d.help?.mine ?? []).filter((h) => h.item === claim.item);
+    const files = filesOf(input, claim.intent.write);
+    const asked = decisions.some((h) => h.action.type === "message" && h.action.kind === "help" && h.action.payload.itemId === claim.item);
+    const byCodemod = decisions.some(
+      (h) =>
+        h.action.type === "use_tool" &&
+        h.action.itemId === claim.item &&
+        h.outcome === "posted" &&
+        Number(h.note?.changed ?? 0) >= 2 &&
+        (input.board.tools ?? []).some((t) => t.kind === "codemod" && t.capability === (h.action as { capability: string }).capability),
+    );
+    if (!claim.doneProposed && byCodemod && files.length >= 2 && myHelp.length === 0 && !asked && claim.fix === undefined) {
+      const scope = files.slice(Math.ceil(files.length / 2));
+      return {
+        type: "message",
+        kind: "help",
+        payload: { itemId: claim.item, need: "parallel-edit", scope },
+        rationale: `a codemod pushed ${claim.item}'s mechanical change (${claim.lastPush.commit.slice(0, 10)}); a helper who forks my repo can do the hand pass on ${scope.join(", ")} in parallel`,
+      };
+    }
+    // Work a helper has taken is part of the item: never propose done before pulling it.
+    if (myHelp.some((h) => h.live && !h.pulled && h.grantee !== undefined)) {
+      continue;
+    }
+    // An untaken grant blocks nothing: give a helper two of my turns to take it, then go on.
+    const askedAt = decisions.map((h) => h.action.type === "message" && h.action.kind === "help" && h.action.payload.itemId === claim.item).lastIndexOf(true);
+    if (myHelp.some((h) => h.live && h.grantee === undefined) && askedAt >= 0 && decisions.length - 1 - askedAt < 2) {
+      return { type: "wait", reason: `waiting for a helper to take my grant on ${claim.item} (then I go on without it)` };
     }
     if (!claim.doneProposed) {
       return { type: "propose_done", itemId: claim.item, rationale: `pushed ${claim.lastPush.commit}` };
@@ -570,10 +767,40 @@ function decide(input: Input): AgentAction {
     if (freeTurn) {
       return freeTurn;
     }
+    // Idle with no open item: volunteer to an owner whose item is going badly (once per item).
+    if (d.openItems.length === 0) {
+      for (const busy of d.busyOwners ?? []) {
+        if (!decisions.some((h) => h.action.type === "offer_help" && h.action.itemId === busy.item)) {
+          return {
+            type: "offer_help",
+            itemId: busy.item,
+            toAgent: busy.agent,
+            why: `I hold nothing and ${busy.item} is going badly (${busy.reason}${busy.lastFailure ? `: ${busy.lastFailure.slice(0, 80)}` : ""}); I can fork your repo and take part of it`,
+          };
+        }
+      }
+    }
+    // Take a help request that grants a scope (the runtime forks the requester's repo).
+    for (const wanted of d.help?.wanted ?? []) {
+      const offered = decisions.some((h) => h.action.type === "message" && h.action.kind === "reply" && h.action.payload.requestId === wanted.request);
+      if (!offered) {
+        return {
+          type: "message",
+          kind: "reply",
+          payload: { requestId: wanted.request },
+          rationale: `taking ${wanted.by}'s ${wanted.need} on ${wanted.item}: I fork its repo and finish ${wanted.scope.join(", ")}`,
+        };
+      }
+    }
     // A worker's tool item is claimed by whoever proposed it (another agent's is left to it).
     const seeded = new Set((input.board.items ?? []).filter((i) => i.tool !== undefined && i.planned === true).map((i) => i.item));
     const otherTools = new Set((input.board.tools ?? []).filter((t) => t.proposedBy !== me && !seeded.has(t.item)).map((t) => t.item));
-    for (const open of d.openItems.filter((i) => i.scopeHint.length > 0 && !otherTools.has(i.item))) {
+    // A sub-lead leaves its children to other agents; after waiting twice it may take one.
+    const led = new Set((d.subLead ?? []).map((s) => s.item));
+    const splitAt = decisions.map((h) => h.action.type === "split" && h.outcome === "posted").lastIndexOf(true);
+    const waitedSinceSplit = splitAt < 0 ? 0 : decisions.slice(splitAt + 1).filter((h) => h.action.type === "wait").length;
+    const mine = (i: { readonly parent?: string }) => i.parent !== undefined && led.has(i.parent) && waitedSinceSplit < 2;
+    for (const open of d.openItems.filter((i) => i.scopeHint.length > 0 && !otherTools.has(i.item) && !mine(i))) {
       const claims = decisions.filter((h) => h.action.type === "claim" && h.action.itemId === open.item);
       const last = claims.at(-1);
       if (last === undefined || last.outcome === "posted") {

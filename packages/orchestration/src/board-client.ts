@@ -196,6 +196,8 @@ export class BoardOperatorClient {
     readonly failing?: { readonly output: string; readonly items: readonly string[] };
     /** False when no gate ran (a pass that checked nothing). */
     readonly gated?: false;
+    /** Sub-lead merges the integrator could not verify in the gated tree. */
+    readonly unverified?: readonly { readonly item: string; readonly reason: string }[];
   }): Promise<BoardPostOutcome> {
     const { res, body } = await this.post("/integration/revision", input);
     return res.status === 201 ? { ok: true, appended: (body.appended as BoardMessage[] | undefined) ?? [] } : rejection(res, body);
@@ -215,8 +217,9 @@ export class BoardOperatorClient {
   async readToken(
     agent: string,
     ttlSeconds = 600,
+    options: { readonly help?: string } = {},
   ): Promise<{ readonly ok: true; readonly token: string; readonly tokenId: string; readonly tokenExpiresAt: string } | BoardRejection> {
-    const { res, body } = await this.post("/board/read-token", { agent, ttlSeconds });
+    const { res, body } = await this.post("/board/read-token", { agent, ttlSeconds, ...(options.help !== undefined ? { help: options.help } : {}) });
     if (res.status !== 201 || typeof body.token !== "string") {
       return rejection(res, body);
     }
@@ -229,9 +232,22 @@ export class BoardOperatorClient {
   }
 
   /** Revoke a read token the operator no longer needs. */
-  async revokeReadToken(agent: string, tokenId: string): Promise<boolean> {
-    const { res } = await this.post("/board/read-token/revoke", { agent, tokenId });
+  async revokeReadToken(agent: string, tokenId: string, help?: string): Promise<boolean> {
+    const { res } = await this.post("/board/read-token/revoke", { agent, tokenId, ...(help !== undefined ? { help } : {}) });
     return res.status < 400;
+  }
+
+  /**
+   * Fork the requester's repo for `agent`, the helper of help request
+   * `request` (the board checks the grant first), with a short-lived write
+   * token for the fork, returned once.
+   */
+  async helpFork(request: string, agent: string, ttlSeconds: number): Promise<({ readonly ok: true; readonly forkOf: string } & JoinedWorkspace) | BoardRejection> {
+    const { res, body } = await this.post("/board/help-fork", { request, agent, ttlSeconds });
+    if (res.status !== 201 || typeof body.token !== "string" || typeof body.gitUrl !== "string") {
+      return rejection(res, body);
+    }
+    return { ok: true, ...(body as unknown as JoinedWorkspace), forkOf: String(body.forkOf ?? "") };
   }
 
   /**

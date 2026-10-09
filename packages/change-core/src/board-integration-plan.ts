@@ -16,7 +16,8 @@
  * Pure: no I/O, no clock.
  */
 
-import { releasedTargets, type BoardItem, type BoardMessage, type BoardState } from "./board.ts";
+import { mergedChildrenWrite, releasedTargets, routedToSubLead, type BoardItem, type BoardMessage, type BoardState } from "./board.ts";
+import { attributeFailure } from "./failure-attribution.ts";
 import { entriesOverlap, intentPath } from "./path-overlap.ts";
 
 /** One agent's pending pushes, as one unit of the next revision. */
@@ -48,15 +49,33 @@ export interface BoardIntegrationPlan {
   readonly units: readonly BoardIntegrationUnitPlan[];
 }
 
-/** An item's announced, not yet integrated push, still held by the agent that pushed it. */
+/**
+ * An item's announced, not yet integrated push, still held by the agent that
+ * pushed it: a claimed item's owner, or a split item's SUB-LEAD (its push
+ * merges the children's). A child of a split item whose sub-lead is still on
+ * the board is not integrated directly: its push goes to the sub-lead, who
+ * merges it into its own repo and announces one push for the parent.
+ */
 export function pendingPushItems(state: BoardState): BoardItem[] {
   return Object.values(state.items).filter(
     (i) =>
       i.lastPush !== undefined &&
       i.lastPush.integratedIn === undefined &&
-      i.status === "claimed" &&
-      i.owner === i.lastPush.agent,
+      (i.status === "claimed" || (i.status === "split" && i.subLead !== undefined && state.agents[i.subLead]?.leftSeq === undefined)) &&
+      i.owner === i.lastPush.agent &&
+      !routedToSubLead(state, i),
   );
+}
+
+/** Children's pushes still waiting for their sub-lead to merge them (not pending integration). */
+export function awaitingSubLead(state: BoardState): BoardItem[] {
+  return Object.values(state.items).filter((i) => {
+    if (i.lastPush === undefined || i.lastPush.integratedIn !== undefined || !routedToSubLead(state, i)) {
+      return false;
+    }
+    const parent = state.items[i.parent!]!;
+    return !(parent.lastPush?.merges ?? []).some((m) => m.item === i.id && m.commit === i.lastPush!.commit);
+  });
 }
 
 /** A stable key for the set of pending pushes (what one integration would merge). */
@@ -101,13 +120,21 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
     const mine = pending.filter((i) => i.lastPush!.agent === agent).sort((a, b) => a.lastPush!.seq - b.lastPush!.seq);
     const pin = mine.at(-1)!.lastPush!;
     const base = (announced.get(agent) ?? []).filter((p) => p.seq < pin.seq && passingMerged.has(p.commit)).at(-1)?.commit;
-    const scope = [...new Set(mine.flatMap((i) => (i.intent?.write ?? []).map(intentPath)))].sort();
+    // A sub-lead's push integrates only its merged children's write intents
+    // (never the rest of the split item's scope).
+    const writeOf = (i: BoardItem): string[] =>
+      i.status === "split" ? mergedChildrenWrite(state, i.lastPush?.merges ?? []) : (i.intent?.write ?? []).map(intentPath);
+    const scope = [...new Set(mine.flatMap(writeOf))].sort();
     // Items this agent handed to someone else: their files are not its to apply.
     const yieldedScope = [...(handedOff.get(agent) ?? [])]
       .map((id) => state.items[id])
       .flatMap((item) => (item ? [...(item.intent?.write ?? []).map(intentPath), ...(item.lastPush?.paths ?? [])] : []))
       .filter((entry) => !scope.some((own) => entriesOverlap(entry, own)));
-    const released = [...new Set(mine.flatMap((i) => releasedTargets(state, i.id)))].sort();
+    // Contract paths released for the items this unit integrates, including the
+    // children a sub-lead's push merges (their accepted changes ship through it).
+    const released = [
+      ...new Set(mine.flatMap((i) => [i.id, ...(i.status === "split" ? (i.lastPush?.merges ?? []).map((m) => m.item) : [])]).flatMap((id) => releasedTargets(state, id))),
+    ].sort();
     units.push({
       agent,
       items: mine,
@@ -120,4 +147,39 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
     });
   }
   return { key, pending, units };
+}
+
+/**
+ * A failing revision that implicates a SPLIT item implicates the work of its
+ * children: the sub-lead only merged their pushes. Each implicated split item
+ * is replaced by the children whose pushes its latest push merged and whose
+ * write intents the failing output names (all of those merged children when
+ * the output names none of them), so the fix request goes to the child owners
+ * who wrote the code. The children are items the revision merged (through the
+ * sub-lead's push), so the board accepts them as implicated. Pure.
+ */
+export function narrowToSplitChildren(state: BoardState, implicated: readonly string[], output: string): string[] {
+  const out: string[] = [];
+  const add = (id: string): void => {
+    if (!out.includes(id)) {
+      out.push(id);
+    }
+  };
+  for (const id of implicated) {
+    const item = state.items[id];
+    const merged = (item?.status === "split" ? (item.lastPush?.merges ?? []) : []).filter((m) => {
+      const child = state.items[m.item];
+      return child?.lastPush?.commit === m.commit && child.lastPush.integratedIn === undefined;
+    });
+    if (merged.length === 0) {
+      add(id);
+      continue;
+    }
+    const children = merged.map((m) => ({ unitId: m.item, paths: (state.items[m.item]!.intent?.write ?? state.items[m.item]!.scopeHint).map(intentPath) }));
+    const parse = attributeFailure(children, output);
+    for (const unit of parse.units) {
+      add(unit.unitId);
+    }
+  }
+  return out;
 }

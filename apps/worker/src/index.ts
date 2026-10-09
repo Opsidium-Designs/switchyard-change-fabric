@@ -3,6 +3,7 @@ import {
   BOARD_LIMITS,
   BOARD_WORKSPACE_TTL_BOUNDS,
   boardAgentWorkspaceName,
+  boardHelpForkWorkspaceName,
   toolsWorkspaceName,
   boardErrorStatus,
   parseBoardJoinWorkspace,
@@ -1317,8 +1318,12 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     if (typeof wanted.agent !== "string" || !BOARD_AGENT_ID_PATTERN.test(wanted.agent) || typeof wanted.tokenId !== "string" || wanted.tokenId === "") {
       return json({ code: "BAD_PAYLOAD", error: "a revoke names a board agent id and a tokenId" }, 400);
     }
+    if (wanted.help !== undefined && (typeof wanted.help !== "string" || !BOARD_AGENT_ID_PATTERN.test(wanted.help))) {
+      return json({ code: "BAD_PAYLOAD", error: "help, when present, names a help request id" }, 400);
+    }
     try {
-      await selectProvisioner(env).revoke(boardAgentWorkspaceName(changeId, wanted.agent), wanted.tokenId);
+      const repo = typeof wanted.help === "string" ? boardHelpForkWorkspaceName(changeId, wanted.help) : boardAgentWorkspaceName(changeId, wanted.agent);
+      await selectProvisioner(env).revoke(repo, wanted.tokenId);
       return json({ revoked: wanted.tokenId });
     } catch (error) {
       return json({ code: "INVALID_STATE", error: `could not revoke the read token: ${errorMessage(error)}` }, 502);
@@ -1346,7 +1351,12 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < min || ttl > max) {
       return json({ code: "BAD_PAYLOAD", error: `ttlSeconds must be an integer from ${min} to ${max}` }, 400);
     }
-    const allowed = await stub.checkBoardRepoAgent(agent);
+    // `help`: read the granted helper's FORK (the requester pulls its delivered commit).
+    const help = wanted.help;
+    if (help !== undefined && (typeof help !== "string" || !BOARD_AGENT_ID_PATTERN.test(help))) {
+      return json({ code: "BAD_PAYLOAD", error: "help, when present, names a help request id" }, 400);
+    }
+    const allowed = typeof help === "string" ? await stub.checkBoardHelpRead(help, agent) : await stub.checkBoardRepoAgent(agent);
     if (!allowed.ok) {
       return json({ code: allowed.code, error: allowed.error }, 400);
     }
@@ -1354,11 +1364,55 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     if (!provisioner.issueReadToken) {
       return json({ code: "INVALID_STATE", error: "this Worker cannot issue read tokens" }, 501);
     }
-    const workspaceName = boardAgentWorkspaceName(changeId, agent);
+    const workspaceName = typeof help === "string" ? boardHelpForkWorkspaceName(changeId, help) : boardAgentWorkspaceName(changeId, agent);
     try {
       return json({ workspaceName, ...(await provisioner.issueReadToken(workspaceName, ttl)) }, 201);
     } catch (error) {
       return json({ code: "INVALID_STATE", error: `could not issue a read token: ${errorMessage(error)}` }, 502);
+    }
+  }
+
+  // A helper's FORK of the requester's repo for a help request that grants a
+  // sub-scope (bearer; the operator calls it for the helper, which never holds
+  // the bearer):
+  //   POST /changes/:id/board/help-fork  {request, agent, ttlSeconds?}
+  //     -> {workspaceName, gitUrl, defaultBranch, backend, fallback, tokenId, token, tokenExpiresAt, forkOf}
+  // The board checks the grant FIRST (a fork the board would refuse is never
+  // made); the fork's creation token is revoked and a short write token is
+  // returned once. The helper then posts help.offered {forkOf, forkCommit, fork}.
+  const helpForkMatch = url.pathname.match(/^\/changes\/([^/]+)\/board\/help-fork$/);
+  if (request.method === "POST" && helpForkMatch) {
+    const changeId = decodeURIComponent(helpForkMatch[1] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
+    }
+    const body = await readBoardBody(request);
+    if (!body.ok) {
+      return json({ code: body.code, error: body.error }, body.status);
+    }
+    const wanted = isPlainObject(body.value) ? body.value : {};
+    if (typeof wanted.request !== "string" || !BOARD_AGENT_ID_PATTERN.test(wanted.request) || typeof wanted.agent !== "string" || !BOARD_AGENT_ID_PATTERN.test(wanted.agent)) {
+      return json({ code: "BAD_PAYLOAD", error: "a help fork names a help request and a board agent id" }, 400);
+    }
+    const ttl = wanted.ttlSeconds === undefined ? 900 : wanted.ttlSeconds;
+    const { min, max } = BOARD_WORKSPACE_TTL_BOUNDS;
+    if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < min || ttl > max) {
+      return json({ code: "BAD_PAYLOAD", error: `ttlSeconds must be an integer from ${min} to ${max}` }, 400);
+    }
+    const allowed = await stub.checkBoardHelpFork(wanted.request, wanted.agent);
+    if (!allowed.ok) {
+      return json({ code: allowed.code, error: allowed.error }, boardErrorStatus(allowed.code as BoardErrorCode));
+    }
+    const provisioner = selectProvisioner(env);
+    if (!provisioner.fork) {
+      return json({ code: "INVALID_STATE", error: "this Worker cannot fork repos" }, 501);
+    }
+    try {
+      const forked = await provisioner.fork(boardAgentWorkspaceName(changeId, allowed.requester), boardHelpForkWorkspaceName(changeId, wanted.request), { ttlSeconds: ttl });
+      return json({ ...forked, forkOf: allowed.requester }, 201);
+    } catch (error) {
+      return json({ code: "INVALID_STATE", error: `could not fork the requester's repo: ${errorMessage(error)}` }, 502);
     }
   }
 

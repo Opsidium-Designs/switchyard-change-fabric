@@ -21,6 +21,7 @@ import {
   boardMessagesAfter,
   boardResolutionForDecision,
   checkBoardTransition,
+  checkHelpFork,
   contestResponder,
   formatAttributionTally,
   emptyBoard,
@@ -30,6 +31,12 @@ import {
   pureBoardEndpoint,
   reduceBoard,
   runBoardScript,
+  awaitingSubLead,
+  narrowToSplitChildren,
+  objectiveSubChanges,
+  pendingPushItems,
+  splitCue,
+  planBoardIntegration,
   summarizeBoard,
   verifyBoard,
   type BoardAppendResult,
@@ -160,7 +167,12 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
   "item.split": { from: "a", payload: { item: "i", children: [{ item: "k", objective: "o" }] } },
   "item.discovered": { from: "a", payload: { item: "k", objective: "o", reason: "found a gap", parent: "i" } },
   "help.requested": { from: "a", payload: { request: "r", item: "i", need: "tool" } },
-  "help.offered": { from: "b", payload: { request: "r" } },
+  "help.offered": { from: "b", payload: { request: "r", forkOf: "a", forkCommit: "abc123", fork: "chg--help-r" } },
+  "help.delivered": { from: "b", payload: { request: "r", commit: "def456", paths: ["src/a.ts"] } },
+  "help.closed": { from: "a", payload: { request: "r", reason: "pull-failed", detail: "merge conflict" } },
+  "item.struggling": { from: "a", payload: { item: "i", turnsSpent: 4, failedEdits: 2, reason: "failed-edits", lastFailure: "NO_CHANGE" } },
+  "help.volunteered": { from: "b", payload: { item: "i" } },
+  "help.declined": { from: "a", payload: { item: "i", volunteer: "b" } },
   "contract.proposed": { from: "a", payload: { contract: "k", target: "src/api.ts#handler", kind: "modify" } },
   "contract.escalated": { from: "engine", payload: { contract: "k", item: "i", target: "tests/a.test.ts", kind: "modify" } },
   "contract.accepted": { from: "lead", payload: { contract: "k" } },
@@ -214,6 +226,11 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "item.discovered": { item: "k", objective: "o" },
   "help.requested": { request: "r", item: "i" },
   "help.offered": {},
+  "help.delivered": { request: "r", commit: "def456", paths: ["src/*.ts"] },
+  "help.closed": { request: "r", reason: "bored" },
+  "item.struggling": { item: "i", turnsSpent: -1, failedEdits: 0, reason: "tired" },
+  "help.volunteered": { item: "bad id!" },
+  "help.declined": { item: "i" },
   "contract.proposed": { contract: "k", target: "src/a.ts", kind: "rewrite" },
   "contract.escalated": { contract: "k", item: "i", target: "../x", kind: "modify" },
   "contract.accepted": {},
@@ -243,7 +260,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(40);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(45);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -759,7 +776,8 @@ describe("completion is derived from a passing revision", () => {
     );
   });
 
-  it("a split item opens its children and completes when they all complete", () => {
+  /** Split item one (owner a, write src/a/**) into one-x and one-y, claimed by b and c, each pushed. */
+  function splitAndPush(): TestBoard {
     const board = seeded();
     board.post(claim("a", "one", ["src/a/**"]));
     board.post(
@@ -771,19 +789,107 @@ describe("completion is derived from a passing revision", () => {
         ],
       }),
     );
-    expect(board.state.items.one).toMatchObject({ status: "split", owner: "a", children: ["one-x", "one-y"] });
     board.post(claim("b", "one-x", ["src/a/x.ts"]));
     board.post(claim("c", "one-y", ["src/a/y.ts"]));
     board.post(push("b", "one-x", "px", ["src/a/x.ts"]));
     board.post(push("c", "one-y", "py", ["src/a/y.ts"]));
     board.post(msg("b", "done.proposed", { item: "one-x" }));
     board.post(msg("c", "done.proposed", { item: "one-y" }));
+    return board;
+  }
+
+  it("a split item's owner becomes its sub-lead: children are open and claimed by others, their pushes go to the sub-lead", () => {
+    const board = splitAndPush();
+    expect(board.state.items.one).toMatchObject({ status: "split", owner: "a", subLead: "a", children: ["one-x", "one-y"], intent: { write: ["src/a/**"] } });
+    expect(board.state.items["one-x"]).toMatchObject({ status: "claimed", owner: "b", parent: "one" });
+    // The children's pushes are not integrated directly while the sub-lead is on the board.
+    board.reject(rev("pass", ["px"], "r1"), /integrates through its sub-lead a's push/, "UNKNOWN_REF");
+    // The sub-lead sees its children and their pushes in its digest.
+    const digest = boardDigest(board.state, board.log, "a", 0);
+    expect(digest.subLead).toEqual([
+      {
+        item: "one",
+        objective: "do one",
+        write: ["src/a/**"],
+        children: [
+          { item: "one-x", status: "claimed", owner: "b", lastPush: { commit: "px", agent: "b" }, merged: false },
+          { item: "one-y", status: "claimed", owner: "c", lastPush: { commit: "py", agent: "c" }, merged: false },
+        ],
+      },
+    ]);
+    expect(digest.messages.some((m) => m.type === "push.announced" && m.payload.item === "one-x")).toBe(true);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("the sub-lead announces ONE push merging its children; the parent completes when the children are done and that push passes", () => {
+    const board = splitAndPush();
+    board.reject(push("a", "one", "pa", ["src/a/x.ts"]), /announce the merge of its children's pushes/, "NOT_ALLOWED");
+    board.reject(msg("a", "push.announced", { item: "one", commit: "pa", paths: ["src/a/x.ts"], merges: [{ item: "one-x", commit: "nope" }] }), /not one-x's latest unintegrated push/, "INVALID_STATE");
+    board.reject(msg("a", "push.announced", { item: "one", commit: "pa", paths: ["src/b.ts"], merges: [{ item: "one-x", commit: "px" }] }), /outside their write intents/, "OUTSIDE_INTENT");
+    board.reject(msg("b", "push.announced", { item: "one-x", commit: "pz", paths: ["src/a/x.ts"], merges: [{ item: "one-y", commit: "py" }] }), /only a sub-lead merges/, "NOT_ALLOWED");
+    board.post(
+      msg("a", "push.announced", {
+        item: "one",
+        commit: "pa",
+        paths: ["src/a/x.ts", "src/a/y.ts"],
+        merges: [
+          { item: "one-x", commit: "px" },
+          { item: "one-y", commit: "py" },
+        ],
+      }),
+    );
+    expect(boardDigest(board.state, board.log, "a", 0).subLead?.[0]?.children.map((c) => c.merged)).toEqual([true, true]);
+    const appended = board.post(rev("pass", ["pa"], "r1"));
+    const integrated = appended.find((m) => m.type === "integrated.rev")!;
+    expect(integrated.payload).toMatchObject({ merged: ["pa"], contributors: ["a", "b", "c"] });
+    expect(appended.filter((m) => m.type === "item.completed").map((m) => m.payload)).toEqual([
+      { item: "one-x", n: 1, via: "integrated" },
+      { item: "one-y", n: 1, via: "integrated" },
+      { item: "one", n: 1, via: "children" },
+    ]);
+    expect(board.state.items.one).toMatchObject({ status: "done", completed: { n: 1, via: "children" } });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a failing revision of a sub-lead's push asks the children's owners for the fix, and children must stay inside the owner's write intent", () => {
+    const board = splitAndPush();
+    board.post(msg("a", "push.announced", { item: "one", commit: "pa", paths: ["src/a/x.ts", "src/a/y.ts"], merges: [{ item: "one-x", commit: "px" }, { item: "one-y", commit: "py" }] }));
+    const fixes = board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["pa"], failing: { output: "src/a/y.ts:3 boom", items: ["one-y"] } }));
+    expect(fixes.filter((m) => m.type === "fix.requested").map((m) => ({ item: m.payload.item, to: m.to }))).toEqual([{ item: "one-y", to: ["c"] }]);
+    // A child's scope must lie inside the sub-lead's write intent, not only the item's scope hint.
+    const other = seeded();
+    other.post(claim("a", "one", ["src/a/x.ts"]));
+    other.reject(
+      msg("a", "item.split", { item: "one", children: [{ item: "c1", objective: "o", scopeHint: ["src/b.ts"] }] }),
+      /outside your write intent on one/,
+      "OUTSIDE_INTENT",
+    );
+  });
+
+  it("integration plans route children's pushes to the sub-lead and integrate its one push; a failure is narrowed to the children", () => {
+    const board = splitAndPush();
+    expect(pendingPushItems(board.state).map((i) => i.id)).toEqual([]);
+    expect(awaitingSubLead(board.state).map((i) => i.id)).toEqual(["one-x", "one-y"]);
+    board.post(msg("a", "push.announced", { item: "one", commit: "pa", paths: ["src/a/x.ts"], merges: [{ item: "one-x", commit: "px" }] }));
+    expect(awaitingSubLead(board.state).map((i) => i.id)).toEqual(["one-y"]);
+    // The sub-lead's unit integrates only its merged children's write intents.
+    const plan = planBoardIntegration(board.log, board.state);
+    expect(plan.units.map((u) => ({ agent: u.agent, commit: u.commit, scope: u.scope }))).toEqual([{ agent: "a", commit: "pa", scope: ["src/a/x.ts"] }]);
+    expect(narrowToSplitChildren(board.state, ["one"], "AssertionError at src/a/x.ts:4")).toEqual(["one-x"]);
+    // Nothing named: every child the push merged; not a split item: unchanged.
+    expect(narrowToSplitChildren(board.state, ["one", "two"], "it failed")).toEqual(["one-x", "two"]);
+  });
+
+  it("when the sub-lead leaves, its children integrate directly and the parent completes with them", () => {
+    const board = splitAndPush();
+    board.post(msg("a", "agent.left"));
     const appended = board.post(rev("pass", ["px", "py"], "r1"));
     expect(appended.filter((m) => m.type === "item.completed").map((m) => m.payload)).toEqual([
       { item: "one-x", n: 1, via: "integrated" },
       { item: "one-y", n: 1, via: "integrated" },
       { item: "one", n: 1, via: "children" },
     ]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
   });
 
   it("the state keeps counts and latest values, not per-event lists", () => {
@@ -1601,5 +1707,287 @@ describe("scripted agents through the endpoint (join, tokens, routes)", () => {
       ok: false,
       code: "AUTH",
     });
+  });
+});
+
+describe("help with a granted sub-scope: the helper forks the requester's repo", () => {
+  /** a holds item one (src/a/**) and pushed c1; it grants src/a/y.ts under request h1. */
+  function granting(): TestBoard {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(push("a", "one", "c1", ["src/a/x.ts", "src/a/y.ts"]));
+    board.post(msg("a", "help.requested", { request: "h1", item: "one", need: "parallel-edit", scope: ["src/a/y.ts"] }));
+    return board;
+  }
+
+  it("a grant must lie inside the requester's write intent and never overlap another live grant", () => {
+    const board = granting();
+    board.reject(msg("a", "help.requested", { request: "h2", item: "one", need: "x", scope: ["src/b.ts"] }), /outside your write intent/, "OUTSIDE_INTENT");
+    board.reject(msg("a", "help.requested", { request: "h2", item: "one", need: "x", scope: ["src/a/**"] }), /overlaps help request h1/, "INTENT_OVERLAP");
+    expect(board.state.help.h1).toMatchObject({ scope: ["src/a/y.ts"], by: "a" });
+    // Every agent sees a live, untaken grant as work it can offer to fork for.
+    expect(boardDigest(board.state, board.log, "b", 0).help?.wanted.map((h) => h.request)).toEqual(["h1"]);
+    expect(boardDigest(board.state, board.log, "b", 0).messages.some((m) => m.type === "help.requested")).toBe(true);
+  });
+
+  it("the first fork offer from the requester's latest push takes the grant (fork lineage on the board)", () => {
+    const board = granting();
+    board.reject(msg("b", "help.offered", { request: "h1", forkOf: "c", forkCommit: "c1" }), /forkOf must name the requester a/, "UNKNOWN_REF");
+    board.reject(msg("b", "help.offered", { request: "h1", forkOf: "a", forkCommit: "zz" }), /latest announced push \(c1\)/, "INVALID_STATE");
+    board.post(msg("b", "help.offered", { request: "h1", forkOf: "a", forkCommit: "c1", fork: "chg--help-h1" }, { to: ["a"] }));
+    expect(board.state.help.h1?.grant).toMatchObject({ agent: "b", forkOf: "a", forkCommit: "c1", fork: "chg--help-h1" });
+    board.reject(msg("c", "help.offered", { request: "h1", forkOf: "a", forkCommit: "c1" }), /already granted to b/, "DUPLICATE");
+    // A plain reply (no fork) is still just an answer.
+    expect(board.types(msg("c", "help.offered", { request: "h1" }))).toEqual(["help.offered"]);
+    expect(boardDigest(board.state, board.log, "b", 0).help?.granted).toMatchObject([{ request: "h1", by: "a", scope: ["src/a/y.ts"], forkCommit: "c1", live: true }]);
+  });
+
+  it("a grant nobody has taken yet blocks nothing: the requester keeps pushing and may propose done", () => {
+    const board = granting();
+    expect(board.types(push("a", "one", "c2", ["src/a/y.ts"]))).toEqual(["push.announced"]);
+    expect(board.types(msg("a", "done.proposed", { item: "one" }))).toEqual(["done.proposed"]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("single writer: the requester cannot touch the granted scope or propose done until it pulls the helper's delivered work", () => {
+    const board = granting();
+    board.post(msg("b", "help.offered", { request: "h1", forkOf: "a", forkCommit: "c1" }));
+    board.reject(push("a", "one", "c2", ["src/a/y.ts"]), /granted to b under help request h1/, "INTENT_OVERLAP");
+    expect(board.types(push("a", "one", "c2", ["src/a/x.ts"]))).toEqual(["push.announced"]);
+    board.reject(msg("a", "done.proposed", { item: "one" }), /help request h1 on one is outstanding/, "INVALID_STATE");
+    board.reject(msg("c", "help.delivered", { request: "h1", commit: "f1", paths: ["src/a/y.ts"] }), /does not hold help request h1's grant/, "NOT_ALLOWED");
+    board.reject(msg("b", "help.delivered", { request: "h1", commit: "f1", paths: ["src/a/x.ts"] }), /outside the granted scope/, "OUTSIDE_INTENT");
+    board.post(msg("b", "help.delivered", { request: "h1", commit: "f1", paths: ["src/a/y.ts"] }, { to: ["a"] }));
+    expect(boardDigest(board.state, board.log, "a", 0).help?.mine).toMatchObject([{ request: "h1", grantee: "b", delivered: { commit: "f1", paths: ["src/a/y.ts"] } }]);
+    board.reject(msg("a", "push.announced", { item: "one", commit: "c3", paths: ["src/a/y.ts"], pulled: ["nope"] }), /not your help request/, "UNKNOWN_REF");
+    board.post(msg("a", "push.announced", { item: "one", commit: "c3", paths: ["src/a/y.ts"], pulled: ["h1"] }));
+    expect(board.state.help.h1?.pulledSeq).toBeDefined();
+    board.post(msg("a", "done.proposed", { item: "one" }));
+    const appended = board.post(rev("pass", ["c3"], "r1"));
+    expect(appended.some((m) => m.type === "item.completed" && m.payload.item === "one")).toBe(true);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("never waits forever: an untaken grant lapses after the bounded wait and the requester may write the scope again", () => {
+    const board = granting();
+    for (let i = 0; i <= BOARD_LIMITS.helpWaitMessages; i += 1) {
+      board.post(msg("lead", "item.proposed", { item: `pad-${i}`, objective: "pad", scopeHint: ["pad/**"] }));
+    }
+    expect(boardDigest(board.state, board.log, "b", 0).help?.wanted ?? []).toEqual([]);
+    board.reject(msg("b", "help.offered", { request: "h1", forkOf: "a", forkCommit: "c1" }), /lapsed or closed/, "INVALID_STATE");
+    expect(board.types(push("a", "one", "c2", ["src/a/y.ts"]))).toEqual(["push.announced"]);
+  });
+});
+
+describe("formation hardening: one writer under a split, verified merges, grants that never pin the requester", () => {
+  function split(): TestBoard {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(msg("a", "item.split", { item: "one", children: [{ item: "one-x", objective: "x", scopeHint: ["src/a/x.ts"] }] }));
+    return board;
+  }
+
+  it("a split item stays a live claim of its sub-lead: paths no child covers are never another agent's", () => {
+    const board = split();
+    // Another item reaching into the split item's scope (src/a/z.ts is no child's) contests the sub-lead.
+    expect(board.types(claim("b", "two", ["src/a/z.ts"]))).toEqual(["item.claimed", "claim.contested"]);
+    const contest = lastContest(board);
+    expect(board.state.contests[contest]).toMatchObject({ owner: "a", ownerItem: "one" });
+    board.reject(msg("a", "claim.ceded", { contest }), /sub-lead keeps its scope/, "NOT_ALLOWED");
+    board.reject(msg("a", "claim.narrowed", { contest, write: ["src/a/x.ts"] }), /sub-lead does not narrow/, "NOT_ALLOWED");
+    board.reject(msg("human", "claim.resolved", { contest, how: "human-decided", winner: "b" }), /stays its sub-lead's/, "NOT_ALLOWED");
+    // A claim on its own child is not blocked by it.
+    expect(board.types(claim("c", "one-x", ["src/a/x.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+    // The sub-lead ships only its merged children's work.
+    board.post(push("c", "one-x", "px", ["src/a/x.ts"]));
+    board.reject(
+      msg("a", "push.announced", { item: "one", commit: "pa", paths: ["src/a/x.ts", "src/a/z.ts"], merges: [{ item: "one-x", commit: "px" }] }),
+      /outside their write intents/,
+      "OUTSIDE_INTENT",
+    );
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a sub-lead's unit carries the contract paths released for the children it merges", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["gate/a.test.ts"] }));
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("human", "item.proposed", { item: "one", objective: "o", scopeHint: ["gate/**", "src/**"] }));
+    board.post(claim("a", "one", ["src/**"]));
+    board.post(msg("a", "item.split", { item: "one", children: [{ item: "one-x", objective: "x", scopeHint: ["src/x.ts"] }] }));
+    board.post(claim("b", "one-x", ["src/x.ts"]));
+    board.post(msg("b", "contract.proposed", { contract: "k1", target: "src/x.ts", kind: "modify", item: "one-x" }));
+    board.post(msg("human", "contract.accepted", { contract: "k1" }));
+    board.post(push("b", "one-x", "px", ["src/x.ts"]));
+    board.post(msg("a", "push.announced", { item: "one", commit: "pa", paths: ["src/x.ts"], merges: [{ item: "one-x", commit: "px" }] }));
+    expect(planBoardIntegration(board.log, board.state).units[0]).toMatchObject({ agent: "a", scope: ["src/x.ts"], releasedPaths: ["src/x.ts"] });
+  });
+
+  it("refuses splits when the goal records the cloud integrator, and caps how often one child push is merged", () => {
+    const cloud = new TestBoard();
+    cloud.post(msg("human", "goal.posted", { objective: "o", integrator: "cloud" }));
+    cloud.post(msg("a", "agent.joined"));
+    cloud.post(msg("human", "item.proposed", { item: "one", objective: "o", scopeHint: ["src/**"] }));
+    cloud.post(claim("a", "one", ["src/**"]));
+    cloud.reject(msg("a", "item.split", { item: "one", children: [{ item: "k", objective: "o", scopeHint: ["src/x.ts"] }] }), /splits are not supported/, "NOT_SUPPORTED");
+    expect(reduceBoard(cloud.log)).toEqual(cloud.state);
+
+    const board = split();
+    board.post(claim("c", "one-x", ["src/a/x.ts"]));
+    board.post(push("c", "one-x", "px", ["src/a/x.ts"]));
+    for (const commit of ["p1", "p2", "p3"]) {
+      board.post(msg("a", "push.announced", { item: "one", commit, paths: ["src/a/x.ts"], merges: [{ item: "one-x", commit: "px" }] }));
+    }
+    board.reject(msg("a", "push.announced", { item: "one", commit: "p4", paths: ["src/a/x.ts"], merges: [{ item: "one-x", commit: "px" }] }), /already merged 3 times/, "LIMIT");
+  });
+
+  it("refuses a split while the owner's push on the item is not integrated", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(push("a", "one", "c1", ["src/a/x.ts"]));
+    board.reject(msg("a", "item.split", { item: "one", children: [{ item: "k", objective: "o", scopeHint: ["src/a/y.ts"] }] }), /unintegrated push/, "INVALID_STATE");
+    board.post(rev("pass", ["c1"], "r1"));
+    expect(board.types(msg("a", "item.split", { item: "one", children: [{ item: "k", objective: "o", scopeHint: ["src/a/y.ts"] }] }))).toEqual(["item.split"]);
+  });
+
+  it("a merged child the integrator could not verify in the gated tree is not integrated; the sub-lead must merge it again", () => {
+    const board = split();
+    board.post(claim("c", "one-x", ["src/a/x.ts"]));
+    board.post(push("c", "one-x", "px", ["src/a/x.ts"]));
+    board.post(msg("c", "done.proposed", { item: "one-x" }));
+    board.post(msg("a", "push.announced", { item: "one", commit: "pa", paths: ["src/a/x.ts"], merges: [{ item: "one-x", commit: "px" }] }));
+    board.reject(msg("engine", "integrated.rev", { commit: "r1", gate: "pass", merged: ["pa"], unverified: [{ item: "two", reason: "x" }] }), /no merged sub-lead push merges/, "UNKNOWN_REF");
+    const appended = board.post(
+      msg("engine", "integrated.rev", { commit: "r1", gate: "pass", merged: ["pa"], unverified: [{ item: "one-x", reason: "src/a/x.ts differs from one-x's push" }] }),
+    );
+    expect(appended.find((m) => m.type === "integrated.rev")!.payload).toMatchObject({ contributors: ["a"], unverified: [{ item: "one-x" }] });
+    expect(appended.some((m) => m.type === "item.completed")).toBe(false);
+    expect(board.state.items["one-x"]!.lastPush!.integratedIn).toBeUndefined();
+    expect(boardDigest(board.state, board.log, "a", 0).subLead![0]!.children[0]).toMatchObject({ item: "one-x", merged: false, unverified: true });
+    // Never re-merged at the same child commit (no loop), and never an empty sub-lead push.
+    board.reject(msg("a", "push.announced", { item: "one", commit: "pb", paths: ["src/a/x.ts"], merges: [{ item: "one-x", commit: "px" }] }), /recorded unverified in revision 1/, "INVALID_STATE");
+    // The child pushes again; that push is merged (and verified): both complete.
+    board.post(push("c", "one-x", "px2", ["src/a/x.ts"]));
+    board.reject(msg("a", "push.announced", { item: "one", commit: "pb", paths: [], merges: [{ item: "one-x", commit: "px2" }] }), /empty push merges nothing/, "NOT_ALLOWED");
+    board.post(msg("a", "push.announced", { item: "one", commit: "pb", paths: ["src/a/x.ts"], merges: [{ item: "one-x", commit: "px2" }] }));
+    const done = board.post(rev("pass", ["pb"], "r2"));
+    expect(done.filter((m) => m.type === "item.completed").map((m) => m.payload)).toEqual([
+      { item: "one-x", n: 2, via: "integrated" },
+      { item: "one", n: 2, via: "children" },
+    ]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a late delivery never revives a lapsed grant; a delivered grant lapses too; the requester can close it", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(push("a", "one", "c1", ["src/a/x.ts"]));
+    board.post(msg("a", "help.requested", { request: "h1", item: "one", need: "n", scope: ["src/a/y.ts"] }));
+    board.post(msg("b", "help.offered", { request: "h1", forkOf: "a", forkCommit: "c1" }));
+    const pad = (n: number, tag: string) => {
+      for (let i = 0; i <= n; i += 1) board.post(msg("lead", "item.proposed", { item: `${tag}-${i}`, objective: "pad", scopeHint: ["pad/**"] }));
+    };
+    pad(BOARD_LIMITS.helpWaitMessages, "p");
+    board.reject(msg("b", "help.delivered", { request: "h1", commit: "f1", paths: ["src/a/y.ts"] }), /lapsed or closed/, "INVALID_STATE");
+    expect(board.types(msg("a", "done.proposed", { item: "one" }))).toEqual(["done.proposed"]);
+
+    // A delivered, unpulled grant lapses after the bounded wait.
+    const other = seeded();
+    other.post(claim("a", "one", ["src/a/**"]));
+    other.post(push("a", "one", "c1", ["src/a/x.ts"]));
+    other.post(msg("a", "help.requested", { request: "h1", item: "one", need: "n", scope: ["src/a/y.ts"] }));
+    other.post(msg("b", "help.offered", { request: "h1", forkOf: "a", forkCommit: "c1" }));
+    other.post(msg("b", "help.delivered", { request: "h1", commit: "f1", paths: ["src/a/y.ts"] }));
+    other.reject(push("a", "one", "c2", ["src/a/y.ts"]), /granted to b/, "INTENT_OVERLAP");
+    for (let i = 0; i <= BOARD_LIMITS.helpWaitMessages; i += 1) other.post(msg("lead", "item.proposed", { item: `q-${i}`, objective: "pad", scopeHint: ["pad/**"] }));
+    expect(other.types(push("a", "one", "c2", ["src/a/y.ts"]))).toEqual(["push.announced"]);
+
+    // The requester closes a delivered grant (a failed pull, or a decline): its scope is its own again.
+    const third = seeded();
+    third.post(claim("a", "one", ["src/a/**"]));
+    third.post(push("a", "one", "c1", ["src/a/x.ts"]));
+    third.post(msg("a", "help.requested", { request: "h1", item: "one", need: "n", scope: ["src/a/y.ts"] }));
+    third.post(msg("b", "help.offered", { request: "h1", forkOf: "a", forkCommit: "c1" }));
+    third.post(msg("b", "help.delivered", { request: "h1", commit: "f1", paths: ["src/a/y.ts"] }));
+    third.reject(msg("b", "help.closed", { request: "h1", reason: "declined" }), /only a, who asked/, "NOT_ALLOWED");
+    third.post(msg("a", "help.closed", { request: "h1", reason: "pull-failed", detail: "MERGE_FAILED: conflict" }));
+    expect(third.state.help.h1!.closed).toMatchObject({ reason: "pull-failed" });
+    third.reject(msg("a", "help.closed", { request: "h1", reason: "declined" }), /nothing open to close/, "INVALID_STATE");
+    third.reject(msg("b", "help.delivered", { request: "h1", commit: "f2", paths: ["src/a/y.ts"] }), /lapsed or closed/, "INVALID_STATE");
+    expect(third.types(msg("a", "done.proposed", { item: "one" }))).toEqual(["done.proposed"]);
+    expect(reduceBoard(third.log)).toEqual(third.state);
+  });
+});
+
+describe("formation cues: struggling owners, idle volunteers, answers (bounded, no storms)", () => {
+  /** a holds one (two files), b holds two, c is idle; one is the only other item and all are claimed. */
+  function cued(): TestBoard {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(claim("b", "two", ["src/b/**"]));
+    board.post(claim("c", "three", ["src/c/**"]));
+    board.post(push("c", "three", "c3", ["src/c/x.ts"]));
+    board.post(msg("c", "done.proposed", { item: "three" }));
+    board.post(rev("pass", ["c3"], "r1"));
+    return board;
+  }
+
+  it("an owner's struggling report shows in its digest with the idle agents; it is bounded and goes stale once the owner pushes", () => {
+    const board = cued();
+    board.reject(msg("b", "item.struggling", { item: "one", turnsSpent: 4, failedEdits: 0, reason: "turn-budget" }), /does not hold/, "NOT_OWNER");
+    board.post(msg("a", "item.struggling", { item: "one", turnsSpent: 4, failedEdits: 2, reason: "failed-edits", lastFailure: "EXECUTOR_FAILED: no anchor" }));
+    const a = boardDigest(board.state, board.log, "a", 0);
+    expect(a.struggling).toEqual([{ item: "one", turnsSpent: 4, failedEdits: 2, reason: "failed-edits", lastFailure: "EXECUTOR_FAILED: no anchor" }]);
+    expect(a.idleAgents).toEqual(["c"]);
+    board.reject(msg("a", "item.struggling", { item: "one", turnsSpent: 4, failedEdits: 2, reason: "failed-edits" }), /nothing changed/, "DUPLICATE");
+    board.post(msg("a", "item.struggling", { item: "one", turnsSpent: 5, failedEdits: 2, reason: "turn-budget" }));
+    board.post(msg("a", "item.struggling", { item: "one", turnsSpent: 6, failedEdits: 3, reason: "failed-edits" }));
+    board.reject(msg("a", "item.struggling", { item: "one", turnsSpent: 7, failedEdits: 3, reason: "failed-edits" }), /3 times/, "LIMIT");
+    // The idle agent sees the busy owner only when no item is open.
+    expect(boardDigest(board.state, board.log, "c", 0).busyOwners).toMatchObject([{ agent: "a", item: "one", reason: "failed-edits", scope: ["src/a/**"] }]);
+    board.post(msg("lead", "item.proposed", { item: "four", objective: "o", scopeHint: ["src/d/**"] }));
+    expect(boardDigest(board.state, board.log, "c", 0).busyOwners).toBeUndefined();
+    // A push by the owner is progress: the report goes stale.
+    const fresh = cued();
+    fresh.post(msg("a", "item.struggling", { item: "one", turnsSpent: 4, failedEdits: 0, reason: "turn-budget" }));
+    fresh.post(push("a", "one", "c1", ["src/a/x.ts"]));
+    expect(boardDigest(fresh.state, fresh.log, "a", 0).struggling).toBeUndefined();
+    expect(boardDigest(fresh.state, fresh.log, "c", 0).busyOwners).toBeUndefined();
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a volunteer's offer is addressed to the owner, rate-limited, and answered by a grant addressed to it (only it may fork) or a decline", () => {
+    const board = cued();
+    board.post(msg("a", "item.struggling", { item: "one", turnsSpent: 4, failedEdits: 2, reason: "failed-edits" }));
+    board.reject(msg("c", "help.volunteered", { item: "one" }), /addressed to the item's owner/, "BAD_PAYLOAD");
+    board.reject(msg("a", "help.volunteered", { item: "one" }, { to: ["b"] }), /own item/, "NOT_ALLOWED");
+    board.post(msg("c", "help.volunteered", { item: "one" }, { to: ["a"] }));
+    board.reject(msg("c", "help.volunteered", { item: "one" }, { to: ["a"] }), /still waiting/, "DUPLICATE");
+    expect(boardDigest(board.state, board.log, "a", 0).volunteers).toMatchObject([{ agent: "c", item: "one" }]);
+    expect(boardDigest(board.state, board.log, "a", 0).messages.some((m) => m.type === "help.volunteered")).toBe(true);
+    // Decline, then a second offer, then the limit.
+    board.reject(msg("a", "help.declined", { item: "one", volunteer: "b" }), /no offer/, "UNKNOWN_REF");
+    board.post(msg("a", "help.declined", { item: "one", volunteer: "c" }, { to: ["c"] }));
+    expect(board.state.volunteers!["one:c"]!.answered).toMatchObject({ how: "declined" });
+    board.post(msg("c", "help.volunteered", { item: "one" }, { to: ["a"] }));
+    // Accept: a grant addressed to the volunteer answers it, and only it may fork for it.
+    board.post(msg("a", "help.requested", { request: "h1", item: "one", need: "volunteer", scope: ["src/a/y.ts"] }, { to: ["c"] }));
+    expect(board.state.volunteers!["one:c"]!.answered).toMatchObject({ how: "accepted", request: "h1" });
+    expect(boardDigest(board.state, board.log, "b", 0).help?.wanted ?? []).toEqual([]);
+    expect(() => checkHelpFork(board.state, "h1", "b")).toThrow(/grants its scope to c only/);
+    board.reject(msg("b", "help.offered", { request: "h1", forkOf: "a" }), /grants its scope to c only/, "NOT_ALLOWED");
+    expect(board.types(msg("c", "help.offered", { request: "h1", forkOf: "a" }))).toEqual(["help.offered"]);
+    board.post(msg("c", "help.delivered", { request: "h1", commit: "f1", paths: ["src/a/y.ts"] }));
+    board.reject(msg("c", "help.volunteered", { item: "one" }, { to: ["a"] }), /volunteered 2 times/, "LIMIT");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("the split cue: at least 3 files, or an objective naming at least 2 sub-changes", () => {
+    expect(objectiveSubChanges("Add input validation and require auth on every resource")).toBe(2);
+    expect(objectiveSubChanges("Add organization-level audit logging with a read API and tests")).toBe(1);
+    expect(objectiveSubChanges("fix a; fix b, then document c (claim this item now, if the codemod ...)")).toBe(3);
+    expect(splitCue(3, "one change")).toMatchObject({ splittable: true, files: 3 });
+    expect(splitCue(1, "one change")).toMatchObject({ splittable: false, subChanges: 1 });
+    expect(splitCue(1, "validate input and log errors")).toMatchObject({ splittable: true, subChanges: 2 });
   });
 });

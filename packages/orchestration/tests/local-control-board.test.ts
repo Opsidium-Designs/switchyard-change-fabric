@@ -232,6 +232,40 @@ describe("LocalChangeControl board routes (parity with the Worker)", () => {
     expect(c.revokedReadTokens).toEqual([tokenId]);
   });
 
+  it("forks the requester's repo for a helper only once the board allows it, reads the fork for the pull, and archives it (mirrors the Worker)", async () => {
+    const { mkdtempSync } = await import("node:fs");
+    const c = new LocalChangeControl(new LocalFilesystemWorkspaceProvider({ rootDir: mkdtempSync(join(tmpdir(), "scf-lc-fork-")) }));
+    c.createChange(SPEC);
+    expect((await call(c, "POST", `/changes/${ID}/board/human`, { type: "goal.posted", payload: { objective: "o" } })).status).toBe(201);
+    const tokens: Record<string, string> = {};
+    for (const agent of ["w1", "w2"]) {
+      tokens[agent] = (await call<{ token: string }>(c, "POST", `/changes/${ID}/board/join`, { agent, workspace: { ttlSeconds: 600 } })).body.token;
+    }
+    expect((await call(c, "POST", `/changes/${ID}/board/join`, { agent: "lead", role: "lead" })).status).toBe(201);
+    expect((await call(c, "POST", `/changes/${ID}/board/human`, { type: "item.proposed", payload: { item: "i1", objective: "o", scopeHint: ["src/**"] } })).status).toBe(201);
+    const as = (agent: string, draft: unknown) => call<{ code?: string }>(c, "POST", `/changes/${ID}/board`, draft, { [BOARD_TOKEN_HEADER]: tokens[agent]! });
+    expect((await as("w1", { type: "item.claimed", payload: { item: "i1", intent: { read: [], write: ["src/**"] } } })).status).toBe(201);
+    expect((await as("w1", { type: "help.requested", payload: { request: "h1", item: "i1", need: "parallel-edit", scope: ["src/b.ts"] } })).status).toBe(201);
+
+    const fork = (agent: string, request = "h1") => call<{ code?: string; workspaceName?: string; forkOf?: string; token?: string; tokenExpiresAt?: string }>(c, "POST", `/changes/${ID}/board/help-fork`, { request, agent, ttlSeconds: 300 });
+    expect((await fork("w1")).body.code).toBe("NOT_ALLOWED"); // its own request
+    expect((await fork("lead")).body.code).toBe("NOT_ALLOWED");
+    expect((await fork("w2", "nope")).body.code).toBe("UNKNOWN_REF");
+    const made = await fork("w2");
+    expect(made.status).toBe(201);
+    expect(made.body).toMatchObject({ workspaceName: `${ID}--help-h1`, forkOf: "w1", token: expect.stringMatching(/^local-fallback-write-/) });
+    expect(Date.parse(made.body.tokenExpiresAt!) - Date.now()).toBeLessThanOrEqual(300_000);
+    expect((await fork("w2")).body.code).toBe("DUPLICATE");
+    // The fork is read for the pull only once the board recorded the grant.
+    const read = () => call<{ code?: string; workspaceName?: string }>(c, "POST", `/changes/${ID}/board/read-token`, { agent: "w2", help: "h1", ttlSeconds: 120 });
+    expect((await read()).body.code).toBe("NOT_ALLOWED");
+    expect((await as("w2", { type: "help.offered", payload: { request: "h1", forkOf: "w1", fork: `${ID}--help-h1` }, to: ["w1"] })).status).toBe(201);
+    expect((await read()).body).toMatchObject({ workspaceName: `${ID}--help-h1` });
+    // Archived at cleanup, once.
+    expect((await call(c, "DELETE", `/workspaces/${ID}--help-h1`)).status).toBe(200);
+    expect((await call(c, "DELETE", `/workspaces/${ID}--help-h1`)).status).toBe(404);
+  });
+
   it("serves the planning-first create and stamps board messages with an injected clock", async () => {
     let tick = 0;
     const c = new LocalChangeControl(new LocalFilesystemWorkspaceProvider({ rootDir: join(tmpdir(), "scf-lc-board-unused") }), {

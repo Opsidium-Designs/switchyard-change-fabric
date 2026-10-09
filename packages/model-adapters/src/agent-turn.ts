@@ -37,6 +37,9 @@ export const AGENT_ACTION_TYPES = [
   "propose_tool",
   "build_tool",
   "use_tool",
+  "pull",
+  "offer_help",
+  "answer_volunteer",
   "decide_contract",
   "decide_item",
   "wait",
@@ -56,7 +59,8 @@ export interface AgentReviewFinding {
 /**
  * The payload of a `message`, by kind:
  *   - help / question: `itemId` (an item the sender holds) and an optional
- *     short `need` id;
+ *     short `need` id; a help request may GRANT `scope` (paths inside the
+ *     sender's write intent) to the first helper that forks its repo;
  *   - reply: `requestId` (the help or question being answered);
  *   - contract: `target` (a repo path, glob, or `path#symbol`), `change`, and
  *     optionally `itemId` (the item the change is for; an accepted contract on
@@ -67,6 +71,8 @@ export interface AgentReviewFinding {
 export interface AgentMessagePayload {
   readonly itemId?: string;
   readonly need?: string;
+  /** help: the sub-scope of your write intent a helper takes over (it forks your repo). */
+  readonly scope?: readonly string[];
   readonly requestId?: string;
   readonly target?: string;
   readonly change?: "add" | "modify" | "remove";
@@ -157,6 +163,40 @@ export type AgentAction =
       readonly version: string;
       readonly args: readonly string[];
       readonly itemId?: string;
+      readonly rationale?: string;
+    }
+  | {
+      /**
+       * Pull work others did for an item into your own repo and announce it as
+       * one push: as the SUB-LEAD of a split item (`itemId` = the split item),
+       * merge the children's latest pushes; or (`requestId`) pull the commit a
+       * helper delivered for your help request on `itemId`.
+       */
+      readonly type: "pull";
+      readonly itemId: string;
+      readonly requestId?: string;
+      /** With `requestId`: close the help request's grant WITHOUT pulling (the scope is yours again). */
+      readonly decline?: boolean;
+      readonly rationale?: string;
+    }
+  | {
+      /** Volunteer to help the owner of an item that is going badly (digest.busyOwners); addressed to that owner. */
+      readonly type: "offer_help";
+      readonly itemId: string;
+      readonly toAgent: string;
+      readonly why: string;
+    }
+  | {
+      /**
+       * Answer a volunteer on your item (digest.volunteers): accept by granting
+       * it `scope` (files inside your write intent; it forks your repo, delivers,
+       * you pull), or decline.
+       */
+      readonly type: "answer_volunteer";
+      readonly itemId: string;
+      readonly volunteer: string;
+      readonly accept: boolean;
+      readonly scope?: readonly string[];
       readonly rationale?: string;
     }
   | {
@@ -289,10 +329,13 @@ function parsePayload(kind: AgentMessageKind, raw: unknown): AgentMessagePayload
   if (!isRecord(raw)) {
     bad("message payload must be an object");
   }
-  only(raw, ["itemId", "need", "requestId", "target", "change", "reviewId", "findings"], "message payload");
+  only(raw, ["itemId", "need", "requestId", "target", "change", "reviewId", "findings", "scope"], "message payload");
   const need = present(raw, "need") ? idOf(raw, "need") : undefined;
   switch (kind) {
-    case "help":
+    case "help": {
+      const scope = present(raw, "scope") ? strList(raw, "scope", AGENT_ACTION_LIMITS.maxList, AGENT_ACTION_LIMITS.maxEntry) : [];
+      return { itemId: idOf(raw, "itemId"), ...(need !== undefined ? { need } : {}), ...(scope.length > 0 ? { scope } : {}) };
+    }
     case "question":
       return { itemId: idOf(raw, "itemId"), ...(need !== undefined ? { need } : {}) };
     case "reply":
@@ -514,6 +557,40 @@ export function parseAgentAction(raw: unknown, allowed: readonly AgentActionType
         value,
       );
     }
+    case "pull":
+      only(value, ["type", "itemId", "requestId", "decline", "rationale"], "pull");
+      if (present(value, "decline") && typeof value.decline !== "boolean") {
+        bad("decline must be a boolean");
+      }
+      if (value.decline === true && !present(value, "requestId")) {
+        bad("decline closes a help request: name its requestId");
+      }
+      return withRationale(
+        {
+          type: "pull",
+          itemId: idOf(value, "itemId"),
+          ...(present(value, "requestId") ? { requestId: idOf(value, "requestId") } : {}),
+          ...(value.decline === true ? { decline: true } : {}),
+        },
+        value,
+      );
+    case "offer_help":
+      only(value, ["type", "itemId", "toAgent", "why"], "offer_help");
+      return { type: "offer_help", itemId: idOf(value, "itemId"), toAgent: idOf(value, "toAgent"), why: str(value, "why", L.maxRationale) };
+    case "answer_volunteer": {
+      only(value, ["type", "itemId", "volunteer", "accept", "scope", "rationale"], "answer_volunteer");
+      if (typeof value.accept !== "boolean") {
+        bad("accept must be true or false");
+      }
+      const scope = present(value, "scope") ? strList(value, "scope", L.maxList, L.maxEntry) : [];
+      if (value.accept && scope.length === 0) {
+        bad("accepting a volunteer grants it a scope: list the files inside your write intent it takes over");
+      }
+      return withRationale(
+        { type: "answer_volunteer", itemId: idOf(value, "itemId"), volunteer: idOf(value, "volunteer"), accept: value.accept, ...(value.accept ? { scope } : {}) },
+        value,
+      );
+    }
     case "decide_contract":
       only(value, ["type", "contractId", "decision", "rationale"], "decide_contract");
       return withRationale(
@@ -633,7 +710,15 @@ export interface AgentTurnInput<D = unknown, M = unknown> {
       readonly fromTool?: { readonly capability: string; readonly version: string };
       /** Planned by the lead (or a human), as opposed to proposed by a worker. */
       readonly planned?: boolean;
+      /** A child of a split item (its sub-lead integrates it). */
+      readonly parent?: string;
     }[];
+    /**
+     * Formation cues the runtime adds: items of yours that are struggling and
+     * could be split (write intent over at least 3 files, or an objective with
+     * at least 2 distinct sub-changes).
+     */
+    readonly cues?: { readonly splittable: readonly { readonly item: string; readonly files: number; readonly subChanges: number }[] };
     /**
      * The Change's tools: proposed (their items), being built, and the
      * published versions a consumer pins (with how to run them).
@@ -705,9 +790,14 @@ const CHILD = {
 const PAYLOAD = {
   type: "object",
   additionalProperties: false,
-  required: ["itemId", "need", "requestId", "target", "change", "reviewId", "findings"],
+  required: ["itemId", "need", "requestId", "target", "change", "reviewId", "findings", "scope"],
   properties: {
     itemId: NS,
+    scope: {
+      type: ["array", "null"],
+      items: S,
+      description: "help only: the paths inside your write intent a helper takes over (it forks your repo and delivers a commit you pull).",
+    },
     need: {
       type: ["string", "null"],
       description: "A short id for what is needed, like auth-contract (letters, digits, - _ . :, at most 64 characters). Explain the need in the rationale, never here.",
@@ -786,6 +876,9 @@ export const AGENT_TURN_JSON_SCHEMA = {
         }),
         variant("build_tool", { capability: S, rationale: NS }),
         variant("use_tool", { capability: S, version: S, args: SA, itemId: NS, rationale: NS }),
+        variant("pull", { itemId: S, requestId: NS, decline: { type: ["boolean", "null"] }, rationale: NS }),
+        variant("offer_help", { itemId: S, toAgent: S, why: S }),
+        variant("answer_volunteer", { itemId: S, volunteer: S, accept: { type: "boolean" }, scope: NSA, rationale: NS }),
         variant("decide_contract", {
           contractId: S,
           decision: { type: "string", enum: ["accept", "reject"] },
@@ -887,6 +980,11 @@ export function buildAgentTurnMessages(input: AgentTurnInput): WorkersAiMessage[
     "- Tool items the lead seeded (tool-<capability>, open) are claimable work: claim one (write intent tools/<capability>/**) and build_tool. If a tool.gated message addressed to you says your build FAILED, build_tool again: the failing checks are given to the builder.",
     "- Tools are accelerators, NEVER prerequisites: claim your item now; when a tool covering your files is published (board.tools[].versions), use_tool it (the scanner first to find the places, then the codemod with those files as args, itemId = your item); otherwise edit by hand. Never wait for a tool, and never leave open items unclaimed because a tool is not ready. claims[].toolUnavailable lists tools you must not count on.",
     "- Use message for help, questions (address them with `to`), replies (payload.requestId), contract changes, and reviews. payload.need is a SHORT id such as auth-contract or shared-boundary (letters, digits, - _ . :; at most 64 characters): explain the need in rationale, never in need.",
+    "- SPLIT: when an item you hold spans many files or several distinct sub-changes, split it into children (each child's scopeHint inside your write intent; no pushes of yours on it yet). You become its SUB-LEAD: other agents claim the children (leave them to others); when children push (digest.subLead[].children[].lastPush with merged false), pull {itemId: the split item} merges their pushes into your repo and announces ONE push for the item; the item completes when every child is done and that push passes an integrated revision.",
+    "- HELP WITH A FORK: when you hold an item with several files and have pushed part of it, you may message kind help {itemId, need, scope: files inside your write intent} to grant those files to a helper. Do not touch them, and do not propose_done, until you pull: when digest.help.mine shows the helper's delivered commit, pull {itemId, requestId} (or pull {itemId, requestId, decline: true} to close the grant without taking it; a failed pull closes it too). When you are free and digest.help.wanted lists a request, message kind reply {requestId} to take it: the runtime forks the requester's repo (you start from its in-progress state); then edit {itemId: the requester's item} works only on the granted scope in your fork and delivers it (digest.help.granted).",
+    "- STRUGGLING: when digest.struggling lists an item of yours (failed edits, turns spent, or a failing revision implicating it) and digest.idleAgents is not empty, consider asking for help: message kind help {itemId, need, scope} grants part of it to a helper who forks your repo; or split it when board.cues.splittable lists it (a split is refused while your own push on the item is not yet integrated, and when the run integrates on Cloudflare; do not retry a refused split). A help grant blocks you only once a helper takes it (its fork offer); until then keep working. You decide; it is a cue, not an order.",
+    "- IDLE: when you hold nothing and no item is open, digest.busyOwners lists owners whose items are going badly: offer_help {itemId, toAgent: the owner, why} volunteers (once per item until answered). When digest.volunteers lists a volunteer on your item, answer_volunteer {itemId, volunteer, accept: true, scope: files inside your write intent it takes over} (it forks your repo and delivers; you pull) or accept: false to decline.",
+    "- A codemod being built (board.tools[] with no versions yet, not unavailable) that covers your item: you may spend at most two turns reading your files (wait) before editing; then edit by hand. Never wait longer for a tool.",
     "- The original code's existing tests and the gate's configuration are the CONTRACT (digest.protected). A claim touching them is refused with PROTECTED. Changing one needs a HUMAN decision: send message kind contract {target: one exact path from digest.protected inside the item's scope, change, itemId}, wait, and claim again only if it is accepted. You may add NEW test files inside your scope freely (claim a new file path that is not in digest.protected).",
     "- If your previous action was rejected, read lastRejection (code and error) and choose differently.",
     "- When nothing useful can be done right now, return wait with a short reason.",

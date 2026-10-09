@@ -92,6 +92,24 @@ export class LocalFilesystemWorkspaceProvider implements WorkspaceProvider {
     await runGit(["-C", record.repoDir, "fetch", baselineRemote, "+refs/heads/*:refs/heads/*"]);
   }
 
+  /**
+   * Fork an existing workspace into a new one (the offline counterpart of the
+   * Artifacts repo fork): the new bare repo gets a copy of every branch of the
+   * source, so a clone starts from the source's current state. Returns the new
+   * ref and a write token (a local placeholder, like every token here).
+   */
+  async fork(ref: WorkspaceRef, targetName: string, ttlSeconds = DEFAULT_TOKEN_TTL_SECONDS): Promise<{ ref: WorkspaceRef; token: ScopedToken }> {
+    const source = this.require(ref.name);
+    if (this.repos.has(targetName)) {
+      throw new Error(`local workspace already exists: ${targetName}`);
+    }
+    const forked = await this.create(targetName, { defaultBranch: ref.defaultBranch });
+    const target = this.require(forked.name);
+    // An empty source has no branch yet: the fork is empty too.
+    await runGit(["-C", target.repoDir, "fetch", "-q", source.repoDir, "+refs/heads/*:refs/heads/*"]);
+    return { ref: forked, token: await this.issueWriteToken(forked, ttlSeconds) };
+  }
+
   async issueReadToken(ref: WorkspaceRef, ttlSeconds = DEFAULT_TOKEN_TTL_SECONDS): Promise<ScopedToken> {
     return this.issueToken(ref, "read", ttlSeconds);
   }

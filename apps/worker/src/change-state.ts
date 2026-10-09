@@ -11,6 +11,7 @@ import {
   BoardError,
   boardDigest,
   checkBoardJoin,
+  checkHelpFork,
   LEAD_ROLE,
   boardContractDecision,
   boardResolutionForDecision,
@@ -1218,6 +1219,36 @@ export class ChangeState extends DurableObject<Env> {
       }
       throw error;
     }
+  }
+
+  /**
+   * May `agent` fork the requester's repo for help request `request`? The
+   * help-fork route runs this BEFORE forking anything; the requester must have
+   * joined with its own repo (the fork's source).
+   */
+  async checkBoardHelpFork(request: string, agent: string): Promise<{ readonly ok: true; readonly requester: string } | BoardFailure> {
+    let requester: string;
+    try {
+      requester = checkHelpFork(await this.loadBoardState(), request, agent).requester;
+    } catch (error) {
+      if (error instanceof BoardError) {
+        return { ok: false, code: error.code, error: error.message };
+      }
+      throw error;
+    }
+    if (!((await this.ctx.storage.get<string[]>("boardRepoAgents")) ?? []).includes(requester)) {
+      return { ok: false, code: "NOT_ALLOWED", error: `${requester} joined without a workspace: there is no repo to fork` };
+    }
+    return { ok: true, requester };
+  }
+
+  /** May the operator read the help fork of `request`? Only when `agent` holds its grant. */
+  async checkBoardHelpRead(request: string, agent: string): Promise<{ readonly ok: true } | BoardFailure> {
+    const help = (await this.loadBoardState()).help[request];
+    if (!help || help.grant === undefined || help.grant.agent !== agent) {
+      return { ok: false, code: "NOT_ALLOWED", error: `${agent} holds no granted help fork for ${request}` };
+    }
+    return { ok: true };
   }
 
   /**

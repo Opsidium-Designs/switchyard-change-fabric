@@ -1370,6 +1370,15 @@ body {
 .mc-edge.kind-contest line { stroke: #f85149; stroke-width: 3; }
 .mc-edge.kind-contest.contest-escalated line { stroke: #f5d547; animation: mc-pulse 1.4s ease-in-out infinite; }
 .mc-edge.kind-message line { stroke: #79c0ff; stroke-dasharray: 2 4; opacity: 0.6; }
+/* Formation on the dependency vocabulary: fork lineage (requester -> helper) and a sub-lead's merge (child -> split item). */
+.mc-edge.kind-dependency.label-fork line { stroke: #a371f7; stroke-dasharray: 8 3; opacity: 0.9; stroke-width: 1.8; }
+.mc-edge.kind-dependency.label-merged line { stroke: #3fb950; opacity: 0.8; }
+.mc-edge-tag { font-size: calc(11px * var(--mc-t, 1)); pointer-events: none; }
+.mc-edge.label-fork .mc-edge-tag { fill: #a371f7; }
+.mc-edge.label-merged .mc-edge-tag { fill: #3fb950; }
+/* A split child is drawn nested inside its parent's hull; the sub-lead sits on the parent's border. */
+.mc-hull.is-nested > rect:first-of-type { stroke-dasharray: 4 3; }
+.mc-node.kind-agent.is-sub-lead .shape { stroke: #3fb950; stroke-width: 3; stroke-dasharray: 5 3; }
 .mc-edge.is-related line { opacity: 1; stroke-width: 2.2; }
 .mc-edge.is-transient { animation: mc-fade 4s ease-out forwards; }
 .mc-msg-dot { fill: #79c0ff; }
@@ -1494,3 +1503,8 @@ body {
   .mc-board, .mc-right { max-height: 420px; }
   .mc-graph-stage { height: 560px; flex: none; }
 }
+
+/* A struggling item (its owner reported it going badly): idle agents may volunteer. */
+.mc-struggling circle { fill: rgba(245, 213, 71, 0.18); stroke: #f5d547; stroke-width: 1.5; }
+.mc-struggling text { fill: #f5d547; font-weight: 700; font-size: calc(13px * var(--mc-t, 1)); pointer-events: none; }
+.mc-volunteers { fill: var(--muted); font-size: calc(11px * var(--mc-t, 1)); pointer-events: none; }

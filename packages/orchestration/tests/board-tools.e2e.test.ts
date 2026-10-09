@@ -31,7 +31,7 @@ import type { ExecutionResult, ExecutorContext, ExecutorProvider } from "@switch
 import { runBoardOffline } from "../src/run-board-offline.ts";
 import { createGenericBoardPolicy } from "../src/board-policy.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
-import { formatBoardRunSummary, formatBoardTranscript, runBoard, type BoardSeed } from "../src/run-board.ts";
+import { codemodTiming, formatBoardRunSummary, formatBoardTranscript, runBoard, type BoardSeed } from "../src/run-board.ts";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 import type { AgentTurnTransport } from "@switchyard-change/model-adapters";
 import type { BoardDigest } from "@switchyard-change/change-core";
@@ -614,4 +614,72 @@ describe("agents build tools for each other (offline, deterministic)", () => {
     expect(of(result.log, "tool.used").filter((m) => m.payload.capability === "codemod-guard")).toEqual([]);
     expect(result.incompleteItems).toEqual([]);
   });
+});
+
+describe("tool rebuilds and builder priority in the concurrent (live) schedule", () => {
+  async function concurrentRun(id: string, toolAuthor: ToolAuthor) {
+    const projectDir = await project();
+    const root = await mkdtemp(join(tmpdir(), `scf-${id}-`));
+    const control = new LocalChangeControl(new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "repos") }));
+    return runBoard({
+      goal: GOAL,
+      projectDir,
+      changeId: id,
+      workerUrl: "http://local-control",
+      fetchFn: control.fetch as unknown as typeof fetch,
+      dial: { minConcurrency: 1, maxConcurrency: 3 },
+      transport: createGenericBoardPolicy(),
+      seed,
+      schedule: "concurrent",
+      pollMs: 20,
+      budgets: { quiescenceMs: 4000, timeoutMs: 80_000 },
+      workRoot: join(root, "work"),
+      toolAuthor,
+      resolveContract: reject,
+    });
+  }
+
+  it("a failed tool gate is rebuilt at once by its builder with the failing checks, bounded, whatever the schedule", async () => {
+    const failures: (string | undefined)[] = [];
+    let codemodBuilds = 0;
+    const flaky: ToolAuthor = async (request) => {
+      if (request.kind !== "codemod") {
+        return templateToolAuthor(request);
+      }
+      codemodBuilds += 1;
+      failures.push(request.gateFailure);
+      await templateToolAuthor(request);
+      if (codemodBuilds === 1) {
+        // The first build's own test fails: the tool's gate must fail it.
+        await writeFile(join(request.worktreeDir, "tools", request.capability, "test.mjs"), 'import test from "node:test";\nimport assert from "node:assert";\ntest("broken", () => assert.equal(1, 2));\n');
+      }
+    };
+    const result = await concurrentRun("change-tool-rebuild", flaky);
+    const built = of(result.log, "tool.built").filter((m) => m.payload.capability === "codemod-guard");
+    const gated = of(result.log, "tool.gated").filter((m) => m.payload.capability === "codemod-guard");
+    expect(gated.map((m) => m.payload.passed)).toEqual([false, true]);
+    expect(built).toHaveLength(2);
+    expect(new Set(built.map((m) => m.from)).size).toBe(1);
+    expect(built[1]!.seq).toBeGreaterThan(gated[0]!.seq);
+    // The rebuild was told what failed.
+    expect(failures[0]).toBeUndefined();
+    expect(failures[1]).toMatch(/tests/);
+    expect(of(result.log, "tool.published").map((m) => m.payload.capability)).toContain("codemod-guard");
+    expect(["guard-a", "guard-b", "guard-c"].every((i) => result.state.items[i]?.status === "done")).toBe(true);
+  }, 120_000);
+
+  it("concurrent: owners whose items a codemod being built covers are held so the builder moves first, and the codemod is used before hand edits", async () => {
+    const slow: ToolAuthor = async (request) => {
+      if (request.kind === "codemod") {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+      }
+      return templateToolAuthor(request);
+    };
+    const result = await concurrentRun("change-tool-hold", slow);
+    const timing = codemodTiming(result.log, result.state).find((t) => t.capability === "codemod-guard")!;
+    expect(timing.early.length).toBeGreaterThanOrEqual(2);
+    expect(timing.handFirst).toEqual([]);
+    // The planned items all completed (later scanner-found work depends on timing).
+    expect(["guard-a", "guard-b", "guard-c"].every((i) => result.state.items[i]?.status === "done")).toBe(true);
+  }, 120_000);
 });
