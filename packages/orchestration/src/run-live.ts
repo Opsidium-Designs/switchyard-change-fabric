@@ -38,6 +38,10 @@ import {
   detectPathCollisions,
   leaseOwnerOverridesFromEscalations,
   planWriteLeases,
+  resolveAttributionOutcome,
+  tallyAttributionOutcomes,
+  type AttributionResolution,
+  type AttributionTally,
   type Change,
   type ConcurrencyDial,
   type LeaseDecision,
@@ -57,6 +61,10 @@ import {
 } from "@switchyard-change/local-runner";
 import {
   ChangeVerification,
+  InstallingCommandRunner,
+  LockfileDependencyInstaller,
+  type DependencyInstaller,
+  type DependencyInstallOutcome,
   type CommandOutcome as VerificationCommandOutcome,
   type CommandRunner as VerificationCommandRunner,
   type CompletedWorkUnit,
@@ -176,6 +184,16 @@ export interface RunFullLiveResult {
   readonly tool?: ToolBuildResult;
   /** The deterministic verification + integration evidence. */
   readonly evidence: EvidenceSummary;
+  /**
+   * Where the ADVISORY attribution picks landed over the ladder's failing
+   * rounds, when a decision model was configured and the ladder ran: each pick
+   * placed against the units whose re-fan changed something before the next
+   * passing round (unresolved when no round passed after it). Not a controlled
+   * accuracy measure.
+   */
+  readonly attribution?: AttributionTally;
+  /** The dependency install that preceded the final gate, when a gate ran. */
+  readonly dependencyInstall?: DependencyInstallOutcome;
   /** The local-Git promotion result (a real branch and commit). */
   readonly promotion: PromotionResult;
   /** Absolute path to the local source repository the result was promoted into. */
@@ -408,6 +426,14 @@ export interface RunFullLiveOptions {
    */
   readonly verifyCommandRunner?: VerificationCommandRunner;
   /**
+   * Installs a gated tree's dependencies before every gate run (ladder
+   * previews and the final gate). Default: from the tree's lockfile, install
+   * scripts off, `installTimeoutMs`, a package cache under the work root.
+   */
+  readonly dependencyInstaller?: DependencyInstaller;
+  /** The limit on one dependency install, in ms (default 5 minutes). */
+  readonly installTimeoutMs?: number;
+  /**
    * The bounded max-retries dial for the model-escalation ladder: how many RETRY
    * attempts past the base attempt the ladder may run on a verify-fail. Default
    * 1 (base attempt, then one escalation retry). Data-driven and N-capable: a
@@ -505,9 +531,32 @@ export type FullLiveEvent =
       readonly implicatedUnits: readonly string[];
     }
   | {
+      /**
+       * Where an ADVISORY attribution's pick landed: at the first passing
+       * ladder round after failing round `round`, `fixed` are the units whose
+       * re-fan pushed an edit in between, and `outcome` says whether the pick
+       * is among them. Not an accuracy measure (attribution chose which units
+       * re-ran). `disagreement` is set when the pick differed from the parse.
+       * Never affects a verdict.
+       */
+      readonly kind: "attribution-resolved";
+      readonly round: number;
+      readonly passedRound: number;
+      readonly choice: string;
+      readonly outcome: AttributionResolution["outcome"];
+      readonly fixed: readonly string[];
+      readonly parseOutcome: AttributionResolution["parseOutcome"];
+      readonly disagreement?: AttributionResolution["disagreement"];
+    }
+  | {
       readonly kind: "integration-verdict";
       readonly verdict: "verified" | "failed";
       readonly integratedUnits: readonly string[];
+      /**
+       * False when NO gate ran (no gate configured): a "verified" verdict then
+       * means nothing was checked, and is reported as unverified.
+       */
+      readonly gated?: false;
     }
   | { readonly kind: "promoting"; readonly branch: string }
   | { readonly kind: "promotion-skipped"; readonly reason: string }
@@ -1013,7 +1062,18 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   // the change is neither promoted nor redeployed. The verifier is mechanical on
   // every round (the escalation model gets another round, it never grades
   // itself).
-  const gateCommandRunner = options.verifyCommandRunner;
+  // Every gate run installs the gated tree's dependencies first (a clone has
+  // none); a failed install fails that gate run honestly.
+  const gateCommandRunner = options.verifyCommandRunner
+    ? new InstallingCommandRunner(
+        options.verifyCommandRunner,
+        options.dependencyInstaller ??
+          new LockfileDependencyInstaller({
+            cacheDir: join(workRoot, "package-cache"),
+            ...(options.installTimeoutMs !== undefined ? { timeoutMs: options.installTimeoutMs } : {}),
+          }),
+      )
+    : undefined;
   const maxModelRetries = Math.max(0, Math.floor(options.maxModelRetries ?? 1));
   const escalationModel = (options.escalationModel ?? "").trim();
   // The ORDERED escalation ladder: prefer the explicit list; otherwise fall back
@@ -1043,8 +1103,9 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
   // A run with no gate (no gated units, or no runner) skips the ladder entirely.
   // The ladder's boolean result is advisory (it only decided whether to retry),
   // so it is not read here: the final verdict is the integration gate below.
+  let attributionTally: AttributionTally | undefined;
   if (options.appGateCommandFor && gateCommandRunner && gatedUnits.length > 0) {
-    await runChangeLevelEscalationLadder({
+    const ladder = await runChangeLevelEscalationLadder({
       changeId,
       baselineRef: effectiveChange.baseline,
       projectDir: options.projectDir,
@@ -1074,6 +1135,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
       jevThreshold: options.jevThreshold ?? 0.75,
       ...(options.rePlan ? { rePlan: options.rePlan } : {}),
     });
+    attributionTally = ladder.attribution;
   }
 
   const completedInputs: CompletedWorkUnit[] = [];
@@ -1155,13 +1217,15 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     verdict: "verified" | "failed",
     integratedUnits: readonly string[],
     excludedUnits: readonly string[],
+    gated = true,
   ): Promise<void> => {
     await post(`/changes/${encodeURIComponent(changeId)}/integration`, {
       verdict,
       integratedUnits: [...integratedUnits],
       excludedUnits: [...excludedUnits],
+      ...(gated ? {} : { gated: false }),
     }).catch(() => {});
-    emit({ kind: "integration-verdict", verdict, integratedUnits });
+    emit({ kind: "integration-verdict", verdict, integratedUnits, ...(gated ? {} : { gated: false as const }) });
   };
 
   // The gate's contract (the original code's existing tests, the test-runner
@@ -1210,10 +1274,14 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     );
     throw error;
   }
+  // The dependency install that preceded the final gate (when a gate ran).
+  const dependencyInstall = evidence.integration.finalCheck.skipped ? undefined : gateCommandRunner?.takeLastInstall();
   await reportIntegrationVerdict(
     evidence.integration.verdict,
     evidence.integration.integratedUnits,
     evidence.integration.excludedUnits,
+    // No final check ran (no gate configured): the verdict checked nothing.
+    !(evidence.integration.verdict === "verified" && evidence.integration.finalCheck.skipped),
   );
 
   // Record the mechanical verification verdict per unit as a real activity step,
@@ -1344,6 +1412,8 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     ).map((f) => ({ unitId: String(f.unitId ?? ""), reason: String(f.reason ?? "agent failed") })),
     escalation,
     evidence,
+    ...(attributionTally ? { attribution: attributionTally } : {}),
+    ...(dependencyInstall ? { dependencyInstall } : {}),
     promotion,
     sourceRepoDir,
     cleanedUp,
@@ -1610,7 +1680,9 @@ interface ChangeLevelLadderInput {
  * durable change-level state on the Worker, so the graph nodes/edges that render
  * are backed, now at the change level (one per round, hung off the goal).
  */
-async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Promise<boolean> {
+async function runChangeLevelEscalationLadder(
+  input: ChangeLevelLadderInput,
+): Promise<{ readonly passed: boolean; readonly attribution?: AttributionTally }> {
   const {
     changeId,
     gatedUnits,
@@ -1675,6 +1747,35 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
     return dir;
   };
 
+  // ADVISORY attribution accuracy: each Jev choice on a failing round waits for
+  // the next passing round; the units whose re-fan pushed an edit in between
+  // are the fixed set. Measured only, it never affects the verdict.
+  const openAttributions: { round: number; choice: string; parsed: readonly string[]; changed: Set<string> }[] = [];
+  const resolvedAttributions: AttributionResolution[] = [];
+  const finish = (passed: boolean, passedRound?: number) => {
+    if (passed && passedRound !== undefined) {
+      for (const open of openAttributions.splice(0)) {
+        const fixed = [...open.changed].sort();
+        const resolved = resolveAttributionOutcome({ choice: open.choice, parsed: open.parsed, fixed });
+        resolvedAttributions.push(resolved);
+        emit({
+          kind: "attribution-resolved",
+          round: open.round,
+          passedRound,
+          choice: open.choice,
+          outcome: resolved.outcome,
+          fixed,
+          parseOutcome: resolved.parseOutcome,
+          ...(resolved.disagreement !== undefined ? { disagreement: resolved.disagreement } : {}),
+        });
+      }
+    }
+    return {
+      passed,
+      ...(input.jev ? { attribution: tallyAttributionOutcomes(resolvedAttributions, openAttributions.length) } : {}),
+    };
+  };
+
   try {
     // The gate command is per-app, so any gated unit's command is the change's
     // gate command. Use the first gated unit's command.
@@ -1717,7 +1818,7 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
     );
     emit({ kind: "verify-attempt", round, outcome: outcome.passed ? "pass" : "fail", model: currentModel });
     if (outcome.passed) {
-      return true;
+      return finish(true, round);
     }
     lastEvidence = outcome.evidence;
 
@@ -1823,6 +1924,15 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
             answer: recordableAnswer,
             accepted: confident,
           });
+          // Track the choice (confident or not) for its mechanical outcome.
+          if (answer && typeof answer.choice === "string" && unitIds.includes(answer.choice)) {
+            openAttributions.push({
+              round,
+              choice: answer.choice,
+              parsed: attribution.attributed ? parsed.map((u) => u.unitId) : [],
+              changed: new Set(),
+            });
+          }
           if (confident && answer) {
             // A confident Jev choice is the PRIMARY implicated-unit selector:
             // the Jev-chosen unit drives the re-fan. Union it with any
@@ -2121,6 +2231,9 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
           // push the SAME commit to the round-N agent's OWN repo (its recorded
           // workspace, a fresh bare repo) so that node is a real pushed agent.
           await push(worktreeDir, unit.authRemote, input.defaultBranch);
+          for (const open of openAttributions) {
+            open.changed.add(unit.unitId);
+          }
           if (roundRemote) {
             roundReportStep("push", `pushing to the round ${nextRound} workspace`);
             await push(worktreeDir, roundRemote, input.defaultBranch).catch(() => {});
@@ -2177,12 +2290,12 @@ async function runChangeLevelEscalationLadder(input: ChangeLevelLadderInput): Pr
       );
       emit({ kind: "verify-attempt", round, outcome: outcome.passed ? "pass" : "fail", model: currentModel });
       if (outcome.passed) {
-        return true;
+        return finish(true, round);
       }
       lastEvidence = outcome.evidence;
     }
 
-    return false;
+    return finish(false);
   } finally {
     for (const dir of unitWorktrees.values()) {
       await rm(dir, { recursive: true, force: true });

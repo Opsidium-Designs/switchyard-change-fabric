@@ -21,8 +21,12 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  boardRunExitCode,
+  formatDependencyInstall,
+  offlineFixtureGateLabel,
   changeToSpecYaml,
   cleanupLive,
+  formatAttributionTally,
   clearAppDeployment,
   createPlanningChange,
   decideLivePlanner,
@@ -103,7 +107,7 @@ function resolveProjectDir(specPath: string, args: string[]): string {
 const commands: Command[] = [
   {
     name: "jev-smoke",
-    summary: "Live check: ask the decision model one noul, one choice, and one score question and print pass/fail (needs EXECUTOR=ai-gateway and credentials).",
+    summary: "Live check: ask the decision model the contract-triage question and one noul, one choice, and one score question and print pass/fail (needs EXECUTOR=ai-gateway and credentials).",
     usage: `${CLI_NAME} jev-smoke`,
     async run() {
       const jev = selectJev();
@@ -717,13 +721,21 @@ const commands: Command[] = [
             case "escalation-resolved":
               console.log(`Escalation resolved: ${event.escalation.decision}`);
               break;
+            case "attribution-resolved":
+              console.log(
+                `Jev attribution of round ${event.round} picked ${event.choice}: ${event.outcome} at round ${event.passedRound} ` +
+                  `(changed: ${event.fixed.join(", ") || "none"}; parse ${event.parseOutcome}` +
+                  `${event.disagreement ? `; pick differed from parse: ${event.disagreement}` : ""}) (advisory, not an accuracy measure)`,
+              );
+              break;
             case "verifying":
               console.log("Verifying and integrating (mechanical ground truth)...");
               break;
             case "integration-verdict":
               console.log(
-                `Integration verdict (authoritative gate): ${event.verdict} ` +
-                  `(${event.integratedUnits.length} unit(s) integrated)`,
+                event.gated === false
+                  ? `Integration verdict: unverified (no gate configured: nothing checked) (${event.integratedUnits.length} unit(s) integrated)`
+                  : `Integration verdict (authoritative gate): ${event.verdict} (${event.integratedUnits.length} unit(s) integrated)`,
               );
               break;
             case "promoting":
@@ -776,10 +788,20 @@ const commands: Command[] = [
             `${result.tool.consumptions.filter((c) => c.changed).length} downstream unit(s)`,
         );
       }
-      console.log(`  verification: ${result.evidence.integration.verdict}`);
+      // A "verified" verdict with no final check checked nothing: label it.
+      const ungated = result.evidence.integration.verdict === "verified" && result.evidence.integration.finalCheck.skipped;
+      console.log(`  verification: ${ungated ? "unverified (no gate configured: nothing checked)" : result.evidence.integration.verdict}`);
+      if (result.dependencyInstall) {
+        console.log(`  dependency install (before the final gate): ${formatDependencyInstall(result.dependencyInstall)}`);
+      }
+      if (result.attribution) {
+        // Advisory accuracy of the decision model's failure attribution, scored
+        // against what changed before the next passing ladder round.
+        console.log(`  ${formatAttributionTally(result.attribution)}`);
+      }
       if (result.promotion.committed) {
         console.log(
-          `  promoted: ${result.promotion.branch} (${result.promotion.commit.slice(0, 10)}) in ${result.sourceRepoDir}`,
+          `  ${ungated ? "promoted unverified (no gate)" : "promoted"}: ${result.promotion.branch} (${result.promotion.commit.slice(0, 10)}) in ${result.sourceRepoDir}`,
         );
       } else if (result.promotion.refusedReason) {
         console.log(`  promoted: REFUSED (${result.promotion.refusedReason})`);
@@ -869,7 +891,12 @@ const commands: Command[] = [
       const contractOptions =
         decideFlag !== undefined
           ? {
-              resolveContract: async (request: { readonly contract: string; readonly path?: string }) => {
+              resolveContract: async (request: { readonly contract: string; readonly path?: string; readonly recommendation?: string }) => {
+                // The advisory triage is shown; the operator's flag is the decision.
+                console.log(
+                  `  contract ${request.contract}${request.path ? ` on ${request.path}` : ""}: advisory triage: ` +
+                    `${request.recommendation ?? "no recommendation (no decision model configured)"}`,
+                );
                 console.log(`  human decision (--decide-contracts): ${decideFlag} contract ${request.contract}${request.path ? ` on ${request.path}` : ""}`);
                 return decideFlag as "accept" | "reject";
               },
@@ -890,18 +917,23 @@ const commands: Command[] = [
         // The offline board run: no network, no credentials. The heuristic
         // decomposition is the lead's planner and a deterministic, goal-agnostic
         // policy takes every agent turn. Labelled as such, never a live run.
-        // --fixture-gate (only for a project without a gate of its own) wires the
-        // generic offline gate FIXTURE so the run shows the fix loop.
-        const fixtureGate = hasFlag(args, "--fixture-gate") && !appGateCommand && !gateWiring.requireAppGate;
+        // --fixture-gate wires the generic offline gate FIXTURE so the run shows
+        // the fix loop. OFFLINE ONLY it replaces a project's declared gate (the
+        // noop executor can never satisfy a real gate), and says so everywhere;
+        // a live run always uses the project's declared gate.
+        const fixtureGate = hasFlag(args, "--fixture-gate");
+        const declaredGate = fixtureGate && (appGateCommand || gateWiring.requireAppGate) ? (appGateCommand ?? ["npm", "run", "gate"]) : undefined;
         console.log("Offline board run (no network, deterministic)");
         console.log("  planner: heuristic decomposition (offline stub)");
         console.log("  agent turns: generic deterministic policy (offline stand-in for the turn model)");
         console.log("  executor: scoped deterministic noop; workspaces: local fallback repos");
         console.log(
           `  dial: min ${dial.minConcurrency}, max ${dial.maxConcurrency}; ` +
-            (fixtureGate
-              ? "gate: the generic offline gate FIXTURE (fails the first revision, naming a file it changed; passes once that file is fixed), not a project gate"
-              : gateLine),
+            (declaredGate
+              ? `gate: ${offlineFixtureGateLabel(declaredGate)} (the fixture fails the first revision, naming a file it changed; passes once that file is fixed)`
+              : fixtureGate
+                ? "gate: the generic offline gate FIXTURE (fails the first revision, naming a file it changed; passes once that file is fixed), not a project gate"
+                : gateLine),
         );
         console.log("");
         const result = await runBoardOffline({
@@ -910,20 +942,27 @@ const commands: Command[] = [
           ...(optionValue(args, "--id") ? { changeId: optionValue(args, "--id")! } : {}),
           dial,
           budgets,
-          ...gateOptions,
+          // The fixture replaces the declared gate entirely (offline only).
+          ...(fixtureGate ? {} : gateOptions),
           ...contractOptions,
           ...(fixtureGate ? { fixtureGate: true } : {}),
+          ...(declaredGate ? { replacesDeclaredGate: declaredGate } : {}),
         });
         console.log("Board transcript:");
         console.log(redactSecrets(formatBoardTranscript(result.log)));
         console.log("");
         console.log(redactSecrets(formatBoardRunSummary(result)));
-        return result.verdict === "verified" && result.incompleteItems.length === 0 ? 0 : 1;
+        // Non-zero unless a gate ran and passed and every item completed.
+        return boardRunExitCode(result);
       }
 
       // A live board run: the turn model, the planner, and the executor all run
       // through the AI Gateway. Without a live turn model the run refuses; the
       // offline policy is never a silent live substitute.
+      if (hasFlag(args, "--fixture-gate")) {
+        console.error("Error: --fixture-gate is offline only; a live board run always uses the project's declared gate");
+        return 1;
+      }
       const turn = selectAgentTurn();
       if (!turn.live || !turn.transport) {
         console.error(
@@ -1002,6 +1041,9 @@ const commands: Command[] = [
               console.log(
                 `  contract ${event.contract}${event.path ? ` on ${event.path}` : ""} waits for a human decision: resolve escalation ${event.escalationId} in the console or POST /changes/${changeId}/escalations/${event.escalationId}/resolve {"decision":"accept"|"reject"}`,
               );
+              if (event.recommendation !== undefined) {
+                console.log(redactSecrets(`    advisory triage: ${event.recommendation}`));
+              }
               break;
             case "contract-decision":
               console.log(`  contract ${event.contract}${event.path ? ` on ${event.path}` : ""}: ${event.decision} (human)`);
@@ -1058,7 +1100,8 @@ const commands: Command[] = [
       console.log(redactSecrets(formatBoardTranscript(result.log)));
       console.log("");
       console.log(redactSecrets(formatBoardRunSummary(result)));
-      return result.verdict === "verified" && result.promotion?.committed && result.incompleteItems.length === 0 ? 0 : 1;
+      // Non-zero unless a gate ran and passed, every item completed, and it was promoted.
+      return boardRunExitCode(result, { requirePromotion: true });
     },
   },
   {

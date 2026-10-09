@@ -7,6 +7,7 @@ import {
   appendDecisionRecorded,
   appendIntegratedRev,
   applyBoardEscalations,
+  boardAttributionTally,
   boardContractDecision,
   BOARD_LIMITS,
   BOARD_MESSAGE_TYPES,
@@ -19,6 +20,7 @@ import {
   boardResolutionForDecision,
   checkBoardTransition,
   contestResponder,
+  formatAttributionTally,
   emptyBoard,
   endpointPoster,
   foldBoard,
@@ -168,7 +170,11 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
   "tool.proposed": { from: "a", payload: { tool: "t", capability: "scan", inputs: ["files"], outputs: ["items"] } },
   "tool.published": { from: "a", payload: { tool: "t", capability: "scan", version: "1", repo: "tools", commit: "abc", verified: true } },
   "tool.used": { from: "b", payload: { capability: "scan", version: "1", changedFiles: ["src/a.ts"] } },
-  "decision.recorded": { from: "engine", payload: { juncture: "attribution", question: "which?", answer: "i", confidence: 0.9, accepted: true } },
+  "decision.recorded": { from: "engine", payload: { juncture: "attribution", question: "which?", answer: "i", confidence: 0.9, accepted: true, rev: 2, parsed: ["j"] } },
+  "decision.resolved": {
+    from: "engine",
+    payload: { decisionSeq: 9, rev: 2, passed: 3, answer: "i", outcome: "in-fixed-set", fixed: ["i"], parsed: ["j"], parseOutcome: "not-in-fixed-set" },
+  },
   "agent.joined": { from: "a", payload: { role: "builder" } },
   "agent.left": { from: "a", payload: {} },
 };
@@ -208,6 +214,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "tool.published": { tool: "t", capability: "scan", version: "1", repo: "tools", commit: "abc", verified: false },
   "tool.used": { capability: "scan" },
   "decision.recorded": { juncture: "guess", question: "q", accepted: true },
+  "decision.resolved": { decisionSeq: 1, rev: 1, passed: 2, answer: "i", outcome: "confirmed", fixed: [], parsed: [], parseOutcome: "none" },
   "agent.joined": { role: "has spaces" },
   "agent.left": { extra: "ignored" },
 };
@@ -215,7 +222,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(35);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(36);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -960,6 +967,172 @@ describe("advisory decisions", () => {
     board.reject(msg("engine", "decision.recorded", { juncture: "plan-review", question: "q", accepted: true, extra: 1 }), /unknown field/, "BAD_PAYLOAD");
     board.reject(msg("a", "decision.recorded", { juncture: "plan-review", question: "q", accepted: true }), /cannot be sent by an agent/, "NOT_ALLOWED");
     expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("a revision no gate checked", () => {
+  it("is recorded explicitly as ungated (only for a pass), and replays", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/one.ts"]));
+    board.post(push("a", "one", "c1", ["src/one.ts"]));
+    board.reject(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1"], gated: false }), /no gate failed/, "BAD_PAYLOAD");
+    board.reject(msg("engine", "integrated.rev", { commit: "r1", gate: "pass", merged: ["c1"], gated: true }), /must be false/, "BAD_PAYLOAD");
+    const [rev] = board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "pass", merged: ["c1"], gated: false }));
+    expect(rev!.payload).toMatchObject({ n: 1, gate: "pass", gated: false });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+    // Absent means a gate ran.
+    board.post(push("a", "one", "c2", ["src/one.ts"]));
+    expect(board.post(rev ? msg("engine", "integrated.rev", { commit: "r2", gate: "pass", merged: ["c2"] }) : {})[0]!.payload).not.toHaveProperty("gated");
+  });
+});
+
+describe("attribution outcomes (advisory, derived mechanically)", () => {
+  /** a holds one (src/one.ts), b holds two (src/two.ts); both pushed; revision 1 failed. */
+  function failedOnce(): TestBoard {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/one.ts"]));
+    board.post(claim("b", "two", ["src/two.ts"]));
+    board.post(push("a", "one", "c1", ["src/one.ts"]));
+    board.post(push("b", "two", "c2", ["src/two.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1", "c2"], failing: { output: "FAIL", items: ["one", "two"] } }));
+    return board;
+  }
+  const attribution = (answer: string, rev: number, parsed: string[], extra: Record<string, unknown> = {}) =>
+    msg("engine", "decision.recorded", { juncture: "attribution", question: "which item?", answer, confidence: 0.9, accepted: true, rev, parsed, ...extra });
+
+  it("places the pick in the fixed set when its item changed before the next passing revision; places the parse alongside", () => {
+    const board = failedOnce();
+    const [decision] = board.post(attribution("one", 1, ["two"]));
+    expect(board.state.attribution.open).toHaveLength(1);
+    // Only one's owner pushes again; two's earlier push is merged unchanged.
+    board.post(push("a", "one", "c3", ["src/one.ts"]));
+    const appended = board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "pass", merged: ["c3", "c2"] }));
+    const resolved = appended.find((m) => m.type === "decision.resolved");
+    expect(resolved).toMatchObject({
+      from: "engine",
+      inReplyTo: appended[0]!.seq,
+      payload: { decisionSeq: decision!.seq, rev: 1, passed: 2, answer: "one", outcome: "in-fixed-set", fixed: ["one"], parsed: ["two"], parseOutcome: "not-in-fixed-set" },
+    });
+    // The pick differed from the parse, and only the pick landed in the fixed set.
+    expect(boardAttributionTally(board.state)).toEqual({
+      decisions: 1,
+      inFixedSet: 1,
+      notInFixedSet: 0,
+      unresolved: 0,
+      parse: { inFixedSet: 0, notInFixedSet: 1, none: 0, extra: 1 },
+      differed: { total: 1, pickOnly: 1, parseOnly: 0, both: 0, neither: 0 },
+    });
+    // Advisory only: the decisions changed nothing but their own counts.
+    expect(board.state.items.one!.status).toBe("claimed");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("places a pick outside the fixed set, counts changes across a failing revision in between, and leaves a later one unresolved", () => {
+    const board = failedOnce();
+    board.post(attribution("two", 1, []));
+    board.post(push("a", "one", "c3", ["src/one.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c3", "c2"], failing: { output: "FAIL", items: ["one"] } }));
+    board.post(attribution("one", 2, ["one"]));
+    board.post(push("a", "one", "c4", ["src/one.ts"]));
+    const appended = board.post(msg("engine", "integrated.rev", { commit: "r3", gate: "pass", merged: ["c4", "c2"] }));
+    expect(appended.filter((m) => m.type === "decision.resolved").map((m) => m.payload)).toEqual([
+      { decisionSeq: expect.any(Number), rev: 1, passed: 3, answer: "two", outcome: "not-in-fixed-set", fixed: ["one"], parsed: [], parseOutcome: "none" },
+      { decisionSeq: expect.any(Number), rev: 2, passed: 3, answer: "one", outcome: "in-fixed-set", fixed: ["one"], parsed: ["one"], parseOutcome: "in-fixed-set" },
+    ]);
+    // A later failure with no passing revision after it stays unresolved.
+    board.post(push("b", "two", "c5", ["src/two.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r4", gate: "fail", merged: ["c5"], failing: { output: "FAIL", items: ["two"] } }));
+    board.post(attribution("two", 4, ["two"]));
+    const tally = boardAttributionTally(board.state);
+    // Neither resolved pick differed from its parse (one parse attributed nothing, one agreed).
+    expect(tally).toEqual({
+      decisions: 3,
+      inFixedSet: 1,
+      notInFixedSet: 1,
+      unresolved: 1,
+      parse: { inFixedSet: 1, notInFixedSet: 0, none: 1, extra: 0 },
+      differed: { total: 0, pickOnly: 0, parseOnly: 0, both: 0, neither: 0 },
+    });
+    expect(formatAttributionTally(tally)).toBe(
+      "jev attribution: 3 decision(s); pick among items changed before the next pass: 1, not: 1, unresolved: 1 " +
+        "(not a controlled accuracy measure: the items asked to fix tend to change; parse among them: 1, not: 0, unattributed: 1, extra item(s): 0; " +
+        "pick differed from parse: 0 (pick only: 0, parse only: 0, both: 0, neither: 0), biased toward whichever was asked to fix)",
+    );
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("refuses an attribution that is not about the latest failing revision, and a forged outcome on replay", () => {
+    const board = failedOnce();
+    board.reject(attribution("one", 2, []), /not the latest failing revision/, "INVALID_STATE");
+    board.reject(attribution("ghost", 1, []), /unknown item/, "UNKNOWN_REF");
+    board.reject(msg("engine", "decision.recorded", { juncture: "plan-review", question: "q", accepted: true, rev: 1 }), /attribution decision/, "BAD_PAYLOAD");
+    board.post(attribution("two", 1, ["one"]));
+    board.post(push("a", "one", "c3", ["src/one.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "pass", merged: ["c3", "c2"] }));
+    board.reject(attribution("one", 2, []), /not the latest failing revision/, "INVALID_STATE");
+    const forged = board.log.map((m) =>
+      m.type === "decision.resolved" ? ({ ...m, payload: { ...m.payload, outcome: "in-fixed-set" } } as BoardMessage) : m,
+    );
+    expect(() => reduceBoard(forged)).toThrow(/does not match arbitration/);
+    // An unresolved, unanswered (error) attribution is never tracked.
+    expect(boardAttributionTally(board.state).decisions).toBe(1);
+  });
+
+  it("a board stored before outcomes existed refuses to link an older revision, then tracks new ones", () => {
+    const board = failedOnce();
+    const legacy = { ...board.state } as Partial<BoardState>;
+    delete legacy.attribution;
+    board.state = legacy as BoardState;
+    // No record of what revision 1 merged: linking is refused (the run records it unlinked).
+    board.reject(attribution("one", 1, []), /predates attribution outcomes/, "INVALID_STATE");
+    // The next revisions are tracked, and a decision about them resolves.
+    board.post(push("a", "one", "c3", ["src/one.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c3", "c2"], failing: { output: "FAIL", items: ["one"] } }));
+    board.post(attribution("one", 2, ["one"]));
+    expect(board.state.attribution.open).toHaveLength(1);
+    board.post(push("a", "one", "c4", ["src/one.ts"]));
+    expect(board.post(msg("engine", "integrated.rev", { commit: "r3", gate: "pass", merged: ["c4", "c2"] })).map((m) => m.type)).toContain("decision.resolved");
+  });
+});
+
+describe("contract triage (advisory)", () => {
+  function escalated(): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["tests/a.test.ts"] }));
+    board.post(msg("a", "agent.joined"));
+    board.post(msg("human", "item.proposed", { item: "t", objective: "o", scopeHint: ["tests/**"] }));
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/a.test.ts", kind: "modify", item: "t" }));
+    return board;
+  }
+  const triage = (extra: Record<string, unknown>) =>
+    msg("engine", "decision.recorded", { juncture: "contract-triage", question: "needed?", contract: "k1", ...extra });
+
+  it("records a triage linked to its protected contract and shows it on the pending escalation, which stays pending", () => {
+    const board = escalated();
+    const raised = applyBoardEscalations([], board.log, 0);
+    expect(raised.list).toMatchObject([{ status: "pending", boardContract: "k1" }]);
+    const appended = board.post(triage({ answer: "reject", confidence: 0.86, accepted: true }));
+    const shown = applyBoardEscalations(raised.list, appended, 1);
+    expect(shown.list[0]).toMatchObject({ status: "pending", recommendation: "reject (confidence 0.86)" });
+    expect(shown.list[0]!.question).toMatch(/Accept or reject\?\nAdvisory triage \(a typed decision; the human decides\): reject \(confidence 0\.86\)$/);
+    // A later triage replaces the line; an error shows "no recommendation (reason)".
+    const again = applyBoardEscalations(shown.list, board.post(triage({ accepted: false, error: "HTTP 500: upstream" })), 2);
+    expect(again.list[0]!.recommendation).toBe("no recommendation (HTTP 500: upstream)");
+    expect(again.list[0]!.question.match(/Advisory triage/g)).toHaveLength(1);
+    // The contract is still undecided: only the human decides it.
+    expect(board.state.contracts.k1!.status).toBe("proposed");
+    expect(board.state.decisions).toEqual({ calls: 2, accepted: 1, errors: 1 });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("states low confidence as no recommendation, and refuses a triage without a protected contract", () => {
+    const board = escalated();
+    const low = board.post(triage({ answer: "accept", confidence: 0.55, accepted: false }))[0]!;
+    const shown = applyBoardEscalations(applyBoardEscalations([], board.log.slice(0, -1), 0).list, [low], 1);
+    expect(shown.list[0]!.recommendation).toBe("no recommendation (low confidence: leaning accept (confidence 0.55))");
+    board.reject(triage({ contract: "nope", accepted: false }), /unknown contract/, "UNKNOWN_REF");
+    board.reject(msg("engine", "decision.recorded", { juncture: "contract-triage", question: "q", accepted: false }), /names its contract/, "BAD_PAYLOAD");
+    board.reject(msg("engine", "decision.recorded", { juncture: "plan-review", question: "q", accepted: false, contract: "k1" }), /contract-triage/, "BAD_PAYLOAD");
   });
 });
 

@@ -201,6 +201,8 @@ export interface IntegrationRecord {
   readonly verdict: "verified" | "failed";
   readonly integratedUnits: readonly string[];
   readonly excludedUnits: readonly string[];
+  /** False when no gate ran: a "verified" verdict checked nothing (mirrors the Worker). */
+  readonly gated?: false;
   readonly at: string;
 }
 
@@ -431,6 +433,8 @@ export interface Escalation {
   readonly decision?: string;
   readonly raisedAt: string;
   readonly resolvedAt?: string;
+  /** A protected contract's advisory triage, shown to the human (mirrors the Worker). */
+  readonly recommendation?: string;
 }
 
 /** The input to raise an escalation offline (mirrors the Worker). */
@@ -678,6 +682,7 @@ export class LocalChangeControl {
       verdict: input.verdict,
       integratedUnits: [...input.integratedUnits],
       excludedUnits: [...input.excludedUnits],
+      ...(input.gated === false ? { gated: false as const } : {}),
       at: new Date().toISOString(),
     };
     record.integration = stored;
@@ -1748,11 +1753,15 @@ export class LocalChangeControl {
       if (!isStrings(b.integratedUnits) || !isStrings(b.excludedUnits)) {
         return json({ error: "integratedUnits and excludedUnits must be string arrays" }, 400);
       }
+      if (b.gated !== undefined && (b.gated !== false || b.verdict !== "verified")) {
+        return json({ error: "gated, when present, must be false (no gate ran) on a verified verdict" }, 400);
+      }
       try {
         const recorded = this.recordIntegration(dec(integrationRoute[1]), {
           verdict: b.verdict,
           integratedUnits: b.integratedUnits,
           excludedUnits: b.excludedUnits,
+          ...(b.gated === false ? { gated: false as const } : {}),
         });
         return json({ integration: recorded }, 201);
       } catch (error) {

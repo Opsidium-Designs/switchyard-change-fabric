@@ -31,6 +31,12 @@
  */
 
 import {
+  resolveAttributionOutcome,
+  type AttributionOutcome,
+  type AttributionTally,
+  type ParseAttributionOutcome,
+} from "./attribution-outcome.ts";
+import {
   entriesOverlap,
   entryWithin,
   hasWildcard,
@@ -121,6 +127,12 @@ export interface BoardFinding {
   readonly kind: "advisory" | "failing-test";
   readonly path?: string;
 }
+
+/** Where an advisory typed decision was made. */
+export type BoardDecisionJuncture = "plan-review" | "attribution" | "fix-confidence" | "contract-triage";
+
+/** The juncture values, in order. */
+export const BOARD_DECISION_JUNCTURES: readonly BoardDecisionJuncture[] = ["plan-review", "attribution", "fix-confidence", "contract-triage"];
 
 /** The payload of each message type. */
 /** The baseline gate run's executed-test inventory, as posted with the goal. */
@@ -239,6 +251,11 @@ export interface BoardPayloads {
     readonly contributors: readonly string[];
     /** A failing revision's evidence: the bounded gate output and the implicated items. */
     readonly failing?: BoardFailingEvidence;
+    /**
+     * False when NO gate ran on this revision (the project has none): its
+     * "pass" means nothing was checked. Absent when a gate ran.
+     */
+    readonly gated?: false;
   };
   "rebase.needed": { readonly agent: string; readonly n: number; readonly paths: readonly string[] };
   "review.requested": { readonly review: string; readonly item: string };
@@ -285,12 +302,41 @@ export interface BoardPayloads {
    * affects arbitration, completion, or the verdict.
    */
   "decision.recorded": {
-    readonly juncture: "plan-review" | "attribution" | "fix-confidence";
+    readonly juncture: BoardDecisionJuncture;
     readonly question: string;
     readonly answer?: string;
     readonly confidence?: number;
     readonly accepted: boolean;
     readonly error?: string;
+    /**
+     * Attribution only: the failing revision the decision is about. It must be
+     * the latest revision, and failing, when recorded; the engine then resolves
+     * the decision mechanically at the next passing revision (decision.resolved).
+     */
+    readonly rev?: number;
+    /** Attribution only: the items the string-parse attributed (empty: it attributed nothing). */
+    readonly parsed?: readonly string[];
+    /** Contract triage only: the protected contract the advice is about. */
+    readonly contract?: string;
+  };
+  /**
+   * Engine (derived when a passing revision is recorded): the mechanical outcome
+   * of an attribution decision. `fixed` are the items whose pushes changed
+   * between the failing revision `rev` and the passing revision `passed`;
+   * `outcome` says whether the decision's pick (`answer`) is among them, and
+   * `parseOutcome` the same for the parse attribution. This is where the pick
+   * landed, not whether it was right: attribution chose whom to ask to fix.
+   * Advisory: it changes only the outcome counts.
+   */
+  "decision.resolved": {
+    readonly decisionSeq: number;
+    readonly rev: number;
+    readonly passed: number;
+    readonly answer: string;
+    readonly outcome: AttributionOutcome;
+    readonly fixed: readonly string[];
+    readonly parsed: readonly string[];
+    readonly parseOutcome: ParseAttributionOutcome;
   };
   "agent.joined": { readonly role?: string };
   "agent.left": Record<string, never>;
@@ -333,6 +379,7 @@ export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "tool.published",
   "tool.used",
   "decision.recorded",
+  "decision.resolved",
   "agent.joined",
   "agent.left",
 ];
@@ -582,8 +629,57 @@ export interface BoardState {
   testInventory: BoardTestInventory | null;
   /** Advisory typed decisions recorded: how many, accepted, and failed calls. */
   decisions: { calls: number; accepted: number; errors: number };
+  /** Attribution decisions awaiting, and resolved to, a mechanical outcome (advisory). */
+  attribution: BoardAttributionState;
   /** The latest failing revision's evidence (bounded), or null. */
   lastFailure: ({ readonly n: number } & BoardFailingEvidence) | null;
+}
+
+/** An attribution decision waiting for the next passing revision. */
+export interface BoardOpenAttribution {
+  readonly decisionSeq: number;
+  /** The failing revision it is about. */
+  readonly rev: number;
+  /** The model's choice (an item id). */
+  readonly answer: string;
+  readonly parsed: readonly string[];
+  /** Item -> the push commit the failing revision merged (a later different commit is a change). */
+  readonly base: Readonly<Record<string, string>>;
+  /** Items whose pushes changed in revisions after `rev` (so far). */
+  changed: string[];
+}
+
+/** The board's attribution-outcome bookkeeping. */
+export interface BoardAttributionState {
+  /** The latest revision's merged pushes, item -> commit (the base of a decision about it). */
+  lastRev: { readonly n: number; readonly merged: Readonly<Record<string, string>> } | null;
+  open: BoardOpenAttribution[];
+  /** Picks that were (not) among the items changed before the next pass. */
+  inFixedSet: number;
+  notInFixedSet: number;
+  parse: { inFixedSet: number; notInFixedSet: number; none: number; extra: number };
+  /** Resolved decisions whose pick differed from the parse, by which landed in the fixed set. */
+  differed: { total: number; pickOnly: number; parseOnly: number; both: number; neither: number };
+}
+
+/** Empty attribution bookkeeping. */
+function emptyAttribution(): BoardAttributionState {
+  return {
+    lastRev: null,
+    open: [],
+    inFixedSet: 0,
+    notInFixedSet: 0,
+    parse: { inFixedSet: 0, notInFixedSet: 0, none: 0, extra: 0 },
+    differed: { total: 0, pickOnly: 0, parseOnly: 0, both: 0, neither: 0 },
+  };
+}
+
+/** The attribution bookkeeping, created on a state stored before it existed. */
+function attributionOf(state: BoardState): BoardAttributionState {
+  if (state.attribution === undefined) {
+    state.attribution = emptyAttribution();
+  }
+  return state.attribution;
 }
 
 /** An empty board. */
@@ -607,6 +703,7 @@ export function emptyBoard(): BoardState {
     protectedKeys: [],
     testInventory: null,
     decisions: { calls: 0, accepted: 0, errors: 0 },
+    attribution: emptyAttribution(),
     lastFailure: null,
   };
 }
@@ -750,6 +847,17 @@ function idList(raw: Raw, field: string, options: { readonly optional?: boolean;
     }
   }
   return out;
+}
+
+/** An optional `gated` flag: only `false` is meaningful (absent means a gate ran). */
+function ungatedFlag(raw: Raw): boolean {
+  if (raw.gated === undefined) {
+    return false;
+  }
+  if (raw.gated !== false) {
+    fail("BAD_PAYLOAD", "gated, when present, must be false (no gate ran)");
+  }
+  return true;
 }
 
 function children(raw: Raw): BoardChildItem[] {
@@ -966,6 +1074,7 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         paths: pathList(raw, "paths", { max: L.maxPaths * L.maxIntentEntries }),
         contributors: idList(raw, "contributors", { max: L.maxAgents }),
         ...(failing !== undefined ? { failing } : {}),
+        ...(ungatedFlag(raw) ? { gated: false as const } : {}),
       };
     }
     case "rebase.needed":
@@ -1043,15 +1152,45 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
       if (typeof raw.accepted !== "boolean") {
         fail("BAD_PAYLOAD", "accepted must be a boolean");
       }
+      const juncture = oneOf(raw, "juncture", BOARD_DECISION_JUNCTURES);
+      const rev = raw.rev === undefined ? undefined : positiveInt(raw, "rev");
+      const parsed = raw.parsed === undefined ? undefined : idList(raw, "parsed", { max: L.maxIntentEntries });
+      const contract = optionalId(raw, "contract");
+      if ((rev !== undefined || parsed !== undefined) && juncture !== "attribution") {
+        fail("BAD_PAYLOAD", "rev and parsed belong to an attribution decision");
+      }
+      if (parsed !== undefined && rev === undefined) {
+        fail("BAD_PAYLOAD", "parsed needs the rev it attributes");
+      }
+      if (juncture === "contract-triage" && contract === undefined) {
+        fail("BAD_PAYLOAD", "a contract-triage decision names its contract");
+      }
+      if (contract !== undefined && juncture !== "contract-triage") {
+        fail("BAD_PAYLOAD", "contract belongs to a contract-triage decision");
+      }
       return {
-        juncture: oneOf(raw, "juncture", ["plan-review", "attribution", "fix-confidence"] as const),
+        juncture,
         question: text(raw, "question", 500),
         ...(answer !== undefined ? { answer } : {}),
         ...(confidence !== undefined ? { confidence } : {}),
         accepted: raw.accepted,
         ...(error !== undefined ? { error } : {}),
+        ...(rev !== undefined ? { rev } : {}),
+        ...(parsed !== undefined ? { parsed } : {}),
+        ...(contract !== undefined ? { contract } : {}),
       };
     }
+    case "decision.resolved":
+      return {
+        decisionSeq: positiveInt(raw, "decisionSeq"),
+        rev: positiveInt(raw, "rev"),
+        passed: positiveInt(raw, "passed"),
+        answer: id(raw, "answer"),
+        outcome: oneOf(raw, "outcome", ["in-fixed-set", "not-in-fixed-set"] as const),
+        fixed: idList(raw, "fixed", { max: L.maxIntentEntries }),
+        parsed: idList(raw, "parsed", { max: L.maxIntentEntries }),
+        parseOutcome: oneOf(raw, "parseOutcome", ["in-fixed-set", "not-in-fixed-set", "none"] as const),
+      };
     case "agent.joined": {
       const role = optionalId(raw, "role");
       return role !== undefined ? { role } : {};
@@ -1153,6 +1292,7 @@ const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "tool.published": ["agent"],
   "tool.used": ["agent"],
   "decision.recorded": ["engine"],
+  "decision.resolved": ["engine"],
   "agent.joined": ["agent"],
   "agent.left": ["agent"],
 };
@@ -1534,6 +1674,7 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         gate: draft.payload.gate,
         merged: draft.payload.merged,
         ...(draft.payload.failing !== undefined ? { failing: draft.payload.failing } : {}),
+        ...(draft.payload.gated === false ? { gated: false as const } : {}),
       });
       if (!sameJson(expected, draft.payload)) {
         fail("LOG_MISMATCH", "integrated.rev does not match the pushes it claims to merge");
@@ -1662,9 +1803,61 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       return;
     }
+    case "decision.recorded": {
+      const p = draft.payload;
+      if (p.contract !== undefined) {
+        const contract = state.contracts[p.contract] ?? fail("UNKNOWN_REF", `unknown contract ${p.contract}`);
+        if (!contract.guarded) {
+          fail("INVALID_STATE", `contract ${p.contract} is not a protected contract a human decides`);
+        }
+      }
+      if (p.rev !== undefined) {
+        // An attribution is about the LATEST revision, and it must have failed:
+        // its outcome is resolved from what changes after it.
+        if (p.rev !== state.lastRevN || state.lastFailure?.n !== p.rev) {
+          fail("INVALID_STATE", `revision ${p.rev} is not the latest failing revision`);
+        }
+        // A board stored before outcomes existed has no record of what that
+        // revision merged: linking would derive an outcome replay cannot.
+        if (state.attribution?.lastRev?.n !== p.rev) {
+          fail("INVALID_STATE", `revision ${p.rev} predates attribution outcomes on this board`);
+        }
+        const unknown = [...(p.answer !== undefined ? [p.answer] : []), ...(p.parsed ?? [])].filter((i) => state.items[i] === undefined);
+        if (unknown.length > 0) {
+          fail("UNKNOWN_REF", `unknown item(s) ${unknown.join(", ")}`);
+        }
+      }
+      return;
+    }
+    case "decision.resolved": {
+      const open = (state.attribution ?? emptyAttribution()).open.find((o) => o.decisionSeq === draft.payload.decisionSeq);
+      if (!open || state.integrated?.n !== draft.payload.passed || state.lastRevN !== draft.payload.passed) {
+        fail("INVALID_STATE", `decision ${draft.payload.decisionSeq} has no outcome at revision ${draft.payload.passed}`);
+      }
+      if (!sameJson(attributionResolution(open, draft.payload.passed), draft.payload)) {
+        fail("LOG_MISMATCH", "decision.resolved does not match the revisions since the decision");
+      }
+      return;
+    }
     default:
       return;
   }
+}
+
+/** The mechanical outcome of an open attribution decision at passing revision `passed`. */
+function attributionResolution(open: BoardOpenAttribution, passed: number): BoardPayloads["decision.resolved"] {
+  const fixed = [...open.changed].sort();
+  const resolved = resolveAttributionOutcome({ choice: open.answer, parsed: open.parsed, fixed });
+  return {
+    decisionSeq: open.decisionSeq,
+    rev: open.rev,
+    passed,
+    answer: open.answer,
+    outcome: resolved.outcome,
+    fixed,
+    parsed: [...open.parsed],
+    parseOutcome: resolved.parseOutcome,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1880,7 +2073,27 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       delete item.fixRequested;
       break;
     }
-    case "integrated.rev":
+    case "integrated.rev": {
+      // Before anything is marked integrated: which item each merged push is
+      // for, so open attribution decisions can see what changed since them.
+      const mergedByItem: Record<string, string> = {};
+      for (const commit of message.payload.merged) {
+        const item = itemForPendingPush(state, commit);
+        if (item) {
+          mergedByItem[item.id] = commit;
+        }
+      }
+      const attribution = attributionOf(state);
+      for (const open of attribution.open) {
+        if (open.rev < message.payload.n) {
+          for (const [item, commit] of Object.entries(mergedByItem)) {
+            if (open.base[item] !== commit && !open.changed.includes(item)) {
+              open.changed.push(item);
+            }
+          }
+        }
+      }
+      attribution.lastRev = { n: message.payload.n, merged: mergedByItem };
       state.lastRevN = message.payload.n;
       if (message.payload.gate === "fail" && message.payload.failing !== undefined) {
         state.lastFailure = { n: message.payload.n, ...message.payload.failing };
@@ -1901,6 +2114,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         }
       }
       break;
+    }
     case "rebase.needed":
       state.agents[message.payload.agent]!.rebaseTo = message.payload.n;
       break;
@@ -1995,7 +2209,45 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       if (message.payload.error !== undefined) {
         state.decisions.errors += 1;
       }
+      // An attribution about a failing revision waits for its mechanical
+      // outcome (a decision without an answer has nothing to confirm).
+      if (message.payload.rev !== undefined && message.payload.answer !== undefined && message.payload.error === undefined) {
+        const attribution = attributionOf(state);
+        attribution.open.push({
+          decisionSeq: message.seq,
+          rev: message.payload.rev,
+          answer: message.payload.answer,
+          parsed: [...(message.payload.parsed ?? [])],
+          base: attribution.lastRev?.n === message.payload.rev ? { ...attribution.lastRev.merged } : {},
+          changed: [],
+        });
+      }
       break;
+    case "decision.resolved": {
+      const attribution = attributionOf(state);
+      attribution.open = attribution.open.filter((o) => o.decisionSeq !== message.payload.decisionSeq);
+      const r = resolveAttributionOutcome({ choice: message.payload.answer, parsed: message.payload.parsed, fixed: message.payload.fixed });
+      if (r.outcome === "in-fixed-set") {
+        attribution.inFixedSet += 1;
+      } else {
+        attribution.notInFixedSet += 1;
+      }
+      if (r.parseOutcome === "none") {
+        attribution.parse.none += 1;
+      } else if (r.parseOutcome === "in-fixed-set") {
+        attribution.parse.inFixedSet += 1;
+      } else {
+        attribution.parse.notInFixedSet += 1;
+      }
+      attribution.parse.extra += r.parseExtra.length;
+      if (r.disagreement !== undefined) {
+        // Older bookkeeping may lack the field.
+        const d = (attribution.differed ??= { total: 0, pickOnly: 0, parseOnly: 0, both: 0, neither: 0 });
+        d.total += 1;
+        d[r.disagreement === "pick-only" ? "pickOnly" : r.disagreement === "parse-only" ? "parseOnly" : r.disagreement] += 1;
+      }
+      break;
+    }
     case "agent.joined":
       state.agents[from] = {
         id: from,
@@ -2265,6 +2517,10 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
         for (const draft of rebaseTargets(work, incoming.payload)) {
           emit(draft);
         }
+        // Every open attribution decision now has its mechanical outcome.
+        for (const open of [...attributionOf(work).open]) {
+          emit({ from: BOARD_ENGINE, type: "decision.resolved", payload: attributionResolution(open, incoming.payload.n) });
+        }
       } else {
         // A failing revision advances nothing. Each implicated item's owner is
         // asked for a fix (addressed to it) while the item's fix budget lasts;
@@ -2354,6 +2610,8 @@ export interface IntegratedRevInput {
   readonly merged: readonly string[];
   /** A failing revision's bounded output and implicated items (only with gate "fail"). */
   readonly failing?: BoardFailingEvidence;
+  /** False when no gate ran (only with gate "pass"): nothing was checked. */
+  readonly gated?: false;
 }
 
 /**
@@ -2380,6 +2638,9 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
       contributors.push(item.lastPush.agent);
     }
   }
+  if (input.gated === false && input.gate !== "pass") {
+    fail("BAD_PAYLOAD", "only a revision that no gate failed can be ungated");
+  }
   if (input.failing !== undefined) {
     if (input.gate !== "fail") {
       fail("BAD_PAYLOAD", "only a failing revision carries failing evidence");
@@ -2397,6 +2658,7 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
     paths,
     contributors,
     ...(input.failing !== undefined ? { failing: { output: input.failing.output, items: [...input.failing.items] } } : {}),
+    ...(input.gated === false ? { gated: false as const } : {}),
   };
 }
 
@@ -2533,7 +2795,7 @@ export function appendIntegratedRev(state: BoardState, input: unknown, at: strin
     fail("BAD_PAYLOAD", "an integration result must be an object {commit, gate, merged}");
   }
   for (const key of Object.keys(input)) {
-    if (!["commit", "gate", "merged", "failing"].includes(key)) {
+    if (!["commit", "gate", "merged", "failing", "gated"].includes(key)) {
       fail("BAD_PAYLOAD", `an integration result has an unknown field ${JSON.stringify(key)}`);
     }
   }
@@ -2543,6 +2805,7 @@ export function appendIntegratedRev(state: BoardState, input: unknown, at: strin
     gate: oneOf(input, "gate", ["pass", "fail"] as const),
     merged: idList(input, "merged", { max: BOARD_LIMITS.maxIntentEntries }),
     ...(failing !== undefined ? { failing } : {}),
+    ...(ungatedFlag(input) ? { gated: false as const } : {}),
   };
   if (state.goal === null) {
     fail("NO_GOAL", "the board has no goal yet");
@@ -2587,12 +2850,28 @@ export function appendDecisionRecorded(state: BoardState, input: unknown, at: st
     fail("BAD_PAYLOAD", "a decision record must be an object");
   }
   for (const key of Object.keys(input)) {
-    if (!["juncture", "question", "answer", "confidence", "accepted", "error"].includes(key)) {
+    if (!["juncture", "question", "answer", "confidence", "accepted", "error", "rev", "parsed", "contract"].includes(key)) {
       fail("BAD_PAYLOAD", `a decision record has an unknown field ${JSON.stringify(key)}`);
     }
   }
   const payload = parsePayload("decision.recorded", input) as BoardPayloads["decision.recorded"];
   return appendChecked(state, { from: BOARD_ENGINE, type: "decision.recorded", payload }, at);
+}
+
+/**
+ * The board's attribution outcomes as a tally: resolved decisions, and those
+ * still open (unresolved: no passing revision has followed them yet).
+ */
+export function boardAttributionTally(state: BoardState): AttributionTally {
+  const a = state.attribution ?? emptyAttribution();
+  return {
+    decisions: a.inFixedSet + a.notInFixedSet + a.open.length,
+    inFixedSet: a.inFixedSet,
+    notInFixedSet: a.notInFixedSet,
+    unresolved: a.open.length,
+    parse: { ...a.parse },
+    differed: { ...(a.differed ?? emptyAttribution().differed) },
+  };
 }
 
 /** Messages with seq greater than `after`. */
@@ -2930,6 +3209,36 @@ export interface BoardEscalationRecord {
   readonly decision?: string;
   readonly raisedAt: string;
   readonly resolvedAt?: string;
+  /**
+   * A protected contract's ADVISORY triage (a typed decision), shown to the
+   * human beside the question: "accept (confidence 0.86)", or "no
+   * recommendation (reason)". The human still decides; it never resolves.
+   */
+  readonly recommendation?: string;
+}
+
+/** Separates an escalation's question from its advisory triage line. */
+export const CONTRACT_TRIAGE_MARKER = "\nAdvisory triage (a typed decision; the human decides): ";
+
+/**
+ * The recommendation a contract-triage decision gives the human: the answer and
+ * its confidence when the decision was confident (accepted), otherwise "no
+ * recommendation (reason)" (an error, no answer, or low confidence).
+ */
+export function contractTriageRecommendation(decision: BoardPayloads["decision.recorded"]): string {
+  if (decision.error !== undefined) {
+    return `no recommendation (${decision.error})`;
+  }
+  if (decision.answer === undefined) {
+    return "no recommendation (the decision reply carried no answer)";
+  }
+  const confidence = decision.confidence !== undefined ? ` (confidence ${decision.confidence.toFixed(2)})` : "";
+  return decision.accepted ? `${decision.answer}${confidence}` : `no recommendation (low confidence: leaning ${decision.answer}${confidence})`;
+}
+
+/** An escalation question with its triage line (replacing any earlier one). */
+export function withContractTriage(question: string, recommendation: string): string {
+  return `${question.split(CONTRACT_TRIAGE_MARKER)[0]}${CONTRACT_TRIAGE_MARKER}${recommendation}`;
 }
 
 /**
@@ -2947,10 +3256,24 @@ export function applyBoardEscalations<E extends BoardEscalationRecord>(
   const at = new Date(nowMs).toISOString();
   const settled = boardContestClosures(appended);
   const decided = boardContractClosures(appended);
+  // The latest advisory triage per contract among the appended messages.
+  const triage = new Map<string, string>();
+  for (const message of appended) {
+    if (message.type === "decision.recorded" && message.payload.juncture === "contract-triage" && message.payload.contract !== undefined) {
+      triage.set(message.payload.contract, contractTriageRecommendation(message.payload));
+    }
+  }
   const out = list.map((e): E => {
     const decision =
       e.boardContest !== undefined ? settled.get(e.boardContest) : e.boardContract !== undefined ? decided.get(e.boardContract) : undefined;
-    return e.status === "pending" && decision !== undefined ? { ...e, status: "resolved", decision, resolvedAt: at } : e;
+    if (e.status === "pending" && decision !== undefined) {
+      return { ...e, status: "resolved", decision, resolvedAt: at };
+    }
+    // Advice only decorates a PENDING contract escalation; it never resolves one.
+    const recommendation = e.boardContract !== undefined ? triage.get(e.boardContract) : undefined;
+    return e.status === "pending" && recommendation !== undefined
+      ? { ...e, question: withContractTriage(e.question, recommendation), recommendation }
+      : e;
   });
   const raised: E[] = [];
   for (const request of boardEscalationRequests(appended)) {

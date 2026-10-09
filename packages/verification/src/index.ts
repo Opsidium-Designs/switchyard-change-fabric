@@ -44,6 +44,24 @@ export {
   boundOutput,
 } from "./command.ts";
 
+export type {
+  DependencyInstaller,
+  DependencyInstallOutcome,
+  DependencyInstallPlan,
+  DependencyInstallStatus,
+  LockfileDependencyInstallerOptions,
+} from "./dependency-install.ts";
+export {
+  DEFAULT_INSTALL_TIMEOUT_MS,
+  dependencyInstallFailureLine,
+  formatDependencyInstall,
+  InstallingCommandRunner,
+  LockfileDependencyInstaller,
+  NO_DEPENDENCY_INSTALL,
+  planDependencyInstall,
+  programOnPath,
+} from "./dependency-install.ts";
+
 export { matchesAny, matchesGlob, partitionByScope } from "./pathscope.ts";
 
 export type { GitIdentity } from "./git.ts";

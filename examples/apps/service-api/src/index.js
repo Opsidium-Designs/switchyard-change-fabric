@@ -33,6 +33,7 @@ import { handle as products } from "./resources/products.js";
 import { handle as auth } from "./resources/auth.js";
 import { handle as search } from "./resources/search.js";
 import { handle as notifications } from "./resources/notifications.js";
+import { PAGE } from "./ui.js";
 
 /** The resource registry: path segment to its owning module's handler. */
 const RESOURCES = {
@@ -66,44 +67,7 @@ export default {
 // from ./contracts/response.js.
 export { json, problem };
 
-/** A small self-contained HTML page listing the resources, browser-visible. */
-const PAGE = `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>service-api</title>
-<style>
-  body { font-family: system-ui, sans-serif; max-width: 44rem; margin: 2rem auto; padding: 0 1rem; }
-  h1 { font-size: 1.5rem; }
-  .hint { background: #fffbe6; border: 1px solid #f0e0a0; padding: 0.75rem; border-radius: 6px; }
-  ul { list-style: none; padding: 0; }
-  li { border: 1px solid #ddd; padding: 0.6rem 0.8rem; margin: 0.3rem 0; border-radius: 4px; }
-  code { background: #f3f3f3; padding: 0.1rem 0.35rem; border-radius: 3px; }
-  .method { font-weight: 600; color: #334; }
-</style>
-</head>
-<body>
-<h1>service-api</h1>
-<p class="hint">
-  A multi-resource JSON API served by one Worker. Each resource below is owned by
-  its own module. With the planted gap, every resource accepts unauthenticated
-  and invalid requests. After the fix, each resource requires a bearer token and
-  validates its input: an unauthenticated request returns 401 and an invalid one
-  returns 400.
-</p>
-<ul>
-  <li><span class="method">users</span> &mdash; <code>GET /users</code>, <code>POST /users {"email"}</code></li>
-  <li><span class="method">orders</span> &mdash; <code>GET /orders</code>, <code>POST /orders {"sku","qty"}</code></li>
-  <li><span class="method">products</span> &mdash; <code>GET /products</code>, <code>POST /products {"name","price"}</code></li>
-  <li><span class="method">auth</span> &mdash; <code>GET /auth</code>, <code>POST /auth {"label"}</code></li>
-  <li><span class="method">search</span> &mdash; <code>GET /search?q=term</code></li>
-  <li><span class="method">notifications</span> &mdash; <code>GET /notifications</code>, <code>POST /notifications {"to","message"}</code></li>
-</ul>
-</body>
-</html>
-`;
-
+/** The interactive tester page (src/ui.js), browser-visible at GET /. */
 function home() {
   return new Response(PAGE, {
     status: 200,

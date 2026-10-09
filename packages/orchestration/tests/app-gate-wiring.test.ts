@@ -16,8 +16,10 @@
  * no inference), so it runs under `make check`.
  */
 
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
@@ -148,16 +150,15 @@ describe("buildAppGateWiring", () => {
 });
 
 describe("projectHasGateScript (real shipped fixtures)", () => {
-  it("reports a gate script for a real example app and none for the intro change target", async () => {
-    // A real app (service-api) declares a `gate` script, so a run against it is
-    // gated; the intro change target (demo-project) does not, so a run against
-    // it is NOT forced through a gate it does not have (honest cannot-pass vs
-    // auto-pass split).
-    const realApp = resolve(REPO_ROOT, "examples/apps/service-api");
-    const introTarget = resolve(REPO_ROOT, "examples/demo-project");
-
-    expect(await projectHasGateScript(realApp)).toBe(true);
-    expect(await projectHasGateScript(introTarget)).toBe(false);
+  it("reports a gate script for the example projects that declare one, and none for a manifest without it", async () => {
+    // Both shipped examples declare a `gate` script, so runs against them are
+    // gated (a declared gate is required: disabling it is cannot-pass).
+    expect(await projectHasGateScript(resolve(REPO_ROOT, "examples/apps/service-api"))).toBe(true);
+    expect(await projectHasGateScript(resolve(REPO_ROOT, "examples/demo-project"))).toBe(true);
+    // A manifest with scripts but no `gate` is not forced through a gate it does not have.
+    const noGate = await mkdtemp(join(tmpdir(), "scf-no-gate-"));
+    await writeFile(join(noGate, "package.json"), JSON.stringify({ name: "x", scripts: { test: "node --test" } }));
+    expect(await projectHasGateScript(noGate)).toBe(false);
     // A directory with no package.json is simply "no gate".
     expect(await projectHasGateScript(resolve(REPO_ROOT, "examples/goals"))).toBe(false);
   });

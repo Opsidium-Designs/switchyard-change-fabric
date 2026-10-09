@@ -8,7 +8,7 @@
 #   make dev-all   run the Worker and the console together
 #   make cli ARGS="doctor"   run the switchyard-change CLI
 #   make doctor    run the readiness check (switchyard-change doctor)
-#   make jev-smoke live check of the decision model's question types (needs .env; not in check)
+#   make jev-smoke live check of the decision model's question types and contract triage (needs .env; not in check)
 #   make demo      run the example audit-logging Change end to end (offline)
 #   make demo-board  agents form around a goal on the Change board (offline, deterministic)
 #   make run-board   live board run against a running Worker (needs the AI Gateway in .env)
@@ -112,8 +112,10 @@ demo:
 # other party a question (a `to`-addressed message) and gets a reply, each
 # worker edits in its own repo (the deterministic scoped executor) and announces
 # its push, and the continuous integrator builds a revision as pushes land. The
-# demo project has no gate of its own, so the generic offline gate FIXTURE
-# stands in: it fails the first revision (naming a file it changed), the board
+# noop executor can never satisfy the demo project's declared gate, so the
+# generic offline gate FIXTURE REPLACES it (offline only, labeled in the run:
+# this demo shows coordination, not a real fix; a live run always uses the
+# project's gate): it fails the first revision (naming a file it changed), the board
 # asks that item's owner for a fix, the owner pushes again, the next revision
 # passes, the board derives each item's completion, and the last (passing)
 # revision is promoted to local Git. Every agent turn is taken by a generic,
@@ -355,7 +357,9 @@ delete-app:
 	  || { echo "Teardown may have failed; check the account."; exit 1; }
 
 # Opt-in LIVE check of the decision model (never part of make check): one call
-# per question type (noul, choice, score), printing PASS/FAIL, so an API drift
+# per question type (noul, choice, score) plus the contract-triage question a
+# board run asks before a human decides a contract change (same question and
+# state builder, synthetic data), printing PASS/FAIL, so an API drift
 # is caught at once instead of surfacing as silently skipped decisions. Needs
 # EXECUTOR=ai-gateway with the gateway and account credentials in .env.
 jev-smoke:

@@ -57,6 +57,17 @@ describe("POST /changes/:id/integration", () => {
     });
   });
 
+  it("records a pass no gate checked as gated: false (only on a verified verdict)", async () => {
+    const h = createHarness();
+    await h.json("POST", "/changes", specYaml(ID));
+    const body = { verdict: "verified", integratedUnits: ["a"], excludedUnits: [], gated: false };
+    expect((await h.json("POST", `/changes/${ID}/integration`, { ...body, gated: true })).status).toBe(400);
+    expect((await h.json("POST", `/changes/${ID}/integration`, { ...body, verdict: "failed" })).status).toBe(400);
+    expect((await h.json("POST", `/changes/${ID}/integration`, body)).status).toBe(201);
+    const after = await h.json<{ integration: { verdict: string; gated?: boolean } }>("GET", `/changes/${ID}`);
+    expect(after.body.integration).toMatchObject({ verdict: "verified", gated: false });
+  });
+
   it("rejects a malformed verdict or unit list, and an unknown Change", async () => {
     const h = createHarness();
     await h.json("POST", "/changes", specYaml(ID));

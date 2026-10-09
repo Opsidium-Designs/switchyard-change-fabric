@@ -28,12 +28,12 @@ import type {
   ExecutorContext,
   ExecutorProvider,
 } from "@switchyard-change/model-adapters";
-import type { CommandOutcome, CommandRunner } from "@switchyard-change/verification";
+import type { CommandOutcome, CommandRunner, DependencyInstaller } from "@switchyard-change/verification";
 
 import { createGenericBoardPolicy } from "../src/board-policy.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
 import { FirstAttemptFailingGate, runBoardOffline } from "../src/run-board-offline.ts";
-import { formatBoardRunSummary, formatBoardTranscript, runBoard, type BoardRunEvent, type BoardSeed, type RunBoardOptions } from "../src/run-board.ts";
+import { boardRunExitCode, formatBoardRunSummary, formatBoardTranscript, runBoard, type BoardRunEvent, type BoardSeed, type RunBoardOptions } from "../src/run-board.ts";
 
 const git = promisify(execFile);
 const GOAL = "Make every module report its status";
@@ -194,14 +194,25 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     expect(of(log, "item.completed").map((m) => m.payload.item).sort()).toEqual(["api", "core", "tests", "wiring"]);
     expect(result.stopReason).toBe("all-items-done");
 
-    // The verdict is the last revision's gate, and the promoted tree IS its tree.
-    expect(result.verdict).toBe("verified");
+    // The project has no gate: every revision says so, and the verdict is
+    // UNVERIFIED (nothing was checked), never "verified". The tree is still
+    // promoted, labeled unverified; the CLI exits non-zero.
+    expect(revs.every((r) => r.payload.gated === false)).toBe(true);
+    expect(result.revisions.every((r) => !r.gated)).toBe(true);
+    expect(result.verdict).toBe("unverified");
+    const summary = formatBoardRunSummary(result);
+    expect(summary).toMatch(/integrated revision 1: no gate: nothing checked/);
+    expect(summary).toContain("verdict: unverified (no gate configured: nothing checked)");
+    expect(summary).toContain("promoted unverified (no gate): branch switchyard/change-board-offline");
+    expect(summary).not.toMatch(/verdict: verified/);
+    expect(formatBoardTranscript(log)).toMatch(/integrated\.rev\s+rev 1 no gate: nothing checked/);
+    expect(boardRunExitCode(result)).toBe(1);
+    expect(events.find((e) => e.kind === "integration-verdict")).toMatchObject({ verdict: "verified", gated: false });
     expect(result.evidence!.integration.commit).toBe(result.revision!.commit);
     expect(result.promotion).toMatchObject({ committed: true, branch: "switchyard/change-board-offline" });
     expect(await treeOf(result.sourceRepoDir!, result.promotion!.commit)).toBe(
       await treeOf(join(result.workRoot, "integration-artifacts", "change-board-offline--integration.git"), result.revision!.commit),
     );
-    expect(events.some((e) => e.kind === "integration-verdict" && e.verdict === "verified")).toBe(true);
 
     expect(reduceBoard(log)).toEqual(result.state);
   });
@@ -424,7 +435,7 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     expect(of(accepted.log, "contract.accepted").every((m) => m.from === "human")).toBe(true);
     const grant = of(accepted.log, "claim.granted").find((m) => m.payload.item === "tests")!;
     expect(grant.payload.intent.write).toEqual(["tests/**"]);
-    expect(accepted.verdict).toBe("verified");
+    expect(accepted.verdict).toBe("unverified"); // no gate in this project
     const { stdout } = await git("git", ["-C", accepted.sourceRepoDir!, "show", `${accepted.promotion!.commit}:tests/core.test.ts`]);
     expect(stdout).not.toBe("// tests\n"); // the released change shipped
 
@@ -440,8 +451,9 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     const result = await runBoardOffline({ goal: GOAL, projectDir, seed, onEvent: (e) => events.push(e) });
     expect(events.some((e) => e.kind === "contract-awaiting-human")).toBe(true);
     expect(result.incompleteItems).toEqual(["tests"]);
-    expect(result.verdict).toBe("verified");
-    expect(formatBoardRunSummary(result)).toMatch(/verified \(partial: 1 item\(s\) not completed: tests; the Change is not complete\)/);
+    expect(result.verdict).toBe("unverified"); // no gate in this project
+    expect(formatBoardRunSummary(result)).toMatch(/unverified \(no gate configured: nothing checked\) \(partial: 1 item\(s\) not completed: tests; the Change is not complete\)/);
+    expect(boardRunExitCode(result)).toBe(1);
   });
 
   it("records the baseline gate's test inventory with the goal, and fails a revision whose run skipped baseline tests", async () => {
@@ -550,7 +562,7 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
       return inner(input, init);
     }) as typeof fetch;
     const result = await runBoard({ ...base, projectDir, fetchFn });
-    expect(result.verdict).toBe("verified");
+    expect(result.verdict).toBe("unverified"); // no gate in this project
     expect(issued).toBeGreaterThan(0);
     expect(control.revokedReadTokens).toHaveLength(issued);
   });
@@ -653,7 +665,7 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
       return inner(input, init);
     }) as typeof fetch;
     const result = await runBoard({ ...base, projectDir, fetchFn });
-    expect(result.verdict).toBe("verified");
+    expect(result.verdict).toBe("unverified"); // no gate in this project
     expect(new Set(readTokens)).toEqual(new Set(["agent-1", "agent-2", "agent-3"]));
   });
 });
@@ -664,7 +676,7 @@ describe("runBoard (concurrent schedule)", () => {
     const { base } = await direct("change-board-concurrent");
     const result = await runBoard({ ...base, projectDir, schedule: "concurrent", pollMs: 20, budgets: { timeoutMs: 60_000 } });
     expect(result.stopReason).toBe("all-items-done");
-    expect(result.verdict).toBe("verified");
+    expect(result.verdict).toBe("unverified"); // no gate in this project
     expect(Object.values(result.state.items).every((i) => i.status === "done")).toBe(true);
     expect(reduceBoard(result.log)).toEqual(result.state);
   });
@@ -687,5 +699,104 @@ describe("runBoard (concurrent schedule)", () => {
     expect(result.stopReason).toBe("quiescent");
     expect(Date.now() - started).toBeLessThan(30_000);
     expect(events.find((e) => e.kind === "agents-done")).toMatchObject({ reason: "quiescent", detail: expect.stringMatching(/idle/) });
+  });
+});
+
+describe("boardRunExitCode (what the CLI exits with)", () => {
+  const promoted = { committed: true } as RunBoardResultPromotion;
+  type RunBoardResultPromotion = NonNullable<Parameters<typeof boardRunExitCode>[0]["promotion"]>;
+  it("is 0 only for a gated, verified, complete (and, when required, promoted) result", () => {
+    expect(boardRunExitCode({ verdict: "verified", incompleteItems: [], promotion: promoted })).toBe(0);
+    expect(boardRunExitCode({ verdict: "verified", incompleteItems: [] }, { requirePromotion: true })).toBe(1);
+    expect(boardRunExitCode({ verdict: "verified", incompleteItems: [], promotion: promoted }, { requirePromotion: true })).toBe(0);
+  });
+
+  it("is non-zero for a partial result (verified, items not completed), an unverified (no gate) one, and a failed one", () => {
+    expect(boardRunExitCode({ verdict: "verified", incompleteItems: ["a", "b"], promotion: promoted })).toBe(1);
+    expect(boardRunExitCode({ verdict: "verified", incompleteItems: ["a", "b"], promotion: promoted }, { requirePromotion: true })).toBe(1);
+    expect(boardRunExitCode({ verdict: "unverified", incompleteItems: [], promotion: promoted })).toBe(1);
+    expect(boardRunExitCode({ verdict: "failed", incompleteItems: [] })).toBe(1);
+  });
+
+  it("a gated run (the fixture gate) stays verified and exits 0", async () => {
+    const projectDir = await project();
+    const result = await offline({ goal: GOAL, projectDir, seed, fixtureGate: true });
+    expect(result.revisions.every((r) => r.gated)).toBe(true);
+    expect(of(result.log, "integrated.rev").every((r) => r.payload.gated === undefined)).toBe(true);
+    expect(result.verdict).toBe("verified");
+    expect(boardRunExitCode(result)).toBe(0);
+    expect(formatBoardRunSummary(result)).toMatch(/\n {2}promoted: branch /);
+  });
+});
+
+describe("dependency install before the gate (offline, fake installer)", () => {
+  async function lockedProject(): Promise<string> {
+    const dir = await project();
+    await writeFile(join(dir, "package-lock.json"), '{"lockfileVersion":3}\n');
+    return dir;
+  }
+
+  it("installs in every gated tree (never the source project) before the gate, and reports it per revision and for the baseline", async () => {
+    const projectDir = await lockedProject();
+    const dirs: string[] = [];
+    const dependencyInstaller: DependencyInstaller = {
+      async install(dir) {
+        dirs.push(dir);
+        return { status: "installed", tool: "npm", detail: "npm ci --ignore-scripts", durationMs: 1200 };
+      },
+    };
+    const gate = new FixedGate(0);
+    const result = await offline({ goal: GOAL, projectDir, seed, appGateCommand: ["gate"], verifyCommandRunner: gate, dependencyInstaller });
+    expect(dirs.length).toBeGreaterThan(0);
+    expect(dirs).not.toContain(projectDir);
+    // Every gate run happened in a tree that was installed first.
+    expect(gate.ran.every((cwd) => dirs.includes(cwd))).toBe(true);
+    expect(result.revisions.every((r) => r.install?.status === "installed")).toBe(true);
+    expect(result.testInventory).toContain("dependency install: installed (npm ci --ignore-scripts, 1.2 s)");
+    expect(formatBoardRunSummary(result)).toMatch(/integrated revision 1: gate pass[^\n]*\n {4}dependency install: installed \(npm ci --ignore-scripts, 1\.2 s\)/);
+    expect(result.verdict).toBe("verified");
+  });
+
+  it("a failed install fails the revision honestly: the gate never runs and the reason leads", async () => {
+    const projectDir = await lockedProject();
+    const dependencyInstaller: DependencyInstaller = {
+      async install() {
+        return { status: "failed", tool: "npm", detail: "npm ci: npm error code ERESOLVE", durationMs: 50 };
+      },
+    };
+    const gate = new FixedGate(0);
+    const result = await offline({ goal: GOAL, projectDir, seed, appGateCommand: ["gate"], verifyCommandRunner: gate, dependencyInstaller, budgets: { maxFixAttemptsPerItem: 1 } });
+    expect(gate.ran).toEqual([]);
+    expect(result.revisions.length).toBeGreaterThan(0);
+    expect(result.revisions.every((r) => r.gate === "fail" && r.install?.status === "failed")).toBe(true);
+    expect(result.revisions[0]!.failure).toMatch(/^dependency install failed: npm ci: npm error code ERESOLVE/);
+    expect(of(result.log, "integrated.rev")[0]!.payload.failing!.output).toMatch(/^dependency install failed:/);
+    expect(result.testInventory).toContain("dependency install: failed: npm ci: npm error code ERESOLVE");
+    expect(result.verdict).toBe("failed");
+    expect(boardRunExitCode(result)).toBe(1);
+  });
+
+  it("offline, the fixture gate may replace a declared gate: labeled, no install, and it shows coordination only", async () => {
+    const projectDir = await lockedProject();
+    let installs = 0;
+    const result = await runBoardOffline({
+      goal: GOAL,
+      projectDir,
+      seed,
+      resolveContract: reject,
+      fixtureGate: true,
+      replacesDeclaredGate: ["npm", "run", "gate"],
+      dependencyInstaller: {
+        async install() {
+          installs += 1;
+          return { status: "installed", detail: "x", durationMs: 0 };
+        },
+      },
+    });
+    expect(installs).toBe(0); // the fixture installs nothing, whatever the caller passed
+    expect(result.gateLabel).toBe("offline fixture gate replaces the project's declared gate (npm run gate); this demo shows coordination, not a real fix");
+    expect(formatBoardRunSummary(result)).toContain(`  gate: ${result.gateLabel}`);
+    expect(result.revisions.every((r) => r.install?.status === "skipped" && /disabled for this gate/.test(r.install.detail))).toBe(true);
+    expect(result.verdict).toBe("verified");
   });
 });

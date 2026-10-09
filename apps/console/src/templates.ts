@@ -96,7 +96,7 @@ export const TEMPLATES: readonly Template[] = [
     whatItDoes:
       "Adds audit logging to a small TypeScript project with three agents (model, api, tests).",
     problemItSolves:
-      "api and tests both declare src/audit/events.ts. The lease plan keeps it single-writer (one unit owns it, the other yields it at integration), but who should own a shared file is a call evidence cannot settle, so the run escalates and waits for your answer. The unit you choose owns the path: its version is the one integrated and shipped (an answer that names neither unit falls back to the first-declared owner, and the evidence records why).",
+      "api and tests both declare src/audit/events.ts. The lease plan keeps it single-writer (one unit owns it, the other yields it at integration), but who should own a shared file is a call evidence cannot settle, so the run escalates and waits for your answer. The unit you choose owns the path: its version is the one integrated and shipped (an answer that names neither unit falls back to the first-declared owner, and the evidence records why). The project's gate (npm run gate) passes only once each organization's audit log is readable at /orgs/:orgId/audit/events without exposing another organization's events.",
     agentCountHint: "about 3 agents",
     escalates: true,
     source: { kind: "change", changeFile: "examples/changes/audit-logging.change.yaml" },
@@ -109,7 +109,7 @@ export const TEMPLATES: readonly Template[] = [
     whatItDoes:
       "service-api: one Cloudflare Worker serving users, orders, products, auth, search, and notifications, each its own module over frozen requireAuth and json/problem contracts.",
     problemItSolves:
-      "No resource validates input or calls requireAuth. Before: an unauthenticated POST returns 201. After: it returns 401, and an invalid body returns 400. If you Deployed the app first, the verified fix redeploys to the same URL.",
+      "No resource validates input or calls requireAuth. Before: an unauthenticated POST returns 201. After: it returns 401, and an invalid body returns 400. If you Deployed the app first, the verified fix redeploys to the same URL. Its home page is a tester that runs all 18 checks: about 6 of 18 pass before the fix, 18 of 18 after.",
     agentCountHint: "about 6 agents, one per resource",
     escalates: false,
     source: { kind: "goal", goalFile: "examples/goals/service-api-validation-auth.goal.txt" },

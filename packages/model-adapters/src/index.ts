@@ -142,4 +142,6 @@ export {
   createAiGatewayAgentTurnInvoke,
   DEFAULT_AGENT_TURN_MAX_TOKENS,
   parseAgentAction,
+  UNTRUSTED_CLOSE,
+  UNTRUSTED_OPEN,
 } from "./agent-turn.ts";

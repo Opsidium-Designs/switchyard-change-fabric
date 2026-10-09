@@ -47,10 +47,14 @@ make demo-board  # agents form around a goal on the Change board (offline, deter
 3. **Open `http://127.0.0.1:5173/`** and launch a template:
    - **Audit logging (intro):** about 3 agents; two contend for a shared module,
      so the run pauses and asks you in the console which agent owns it.
+     Its acceptance gate (`npm run gate` in `examples/demo-project`) passes only
+     once an organization-scoped audit read API exists.
    - **Fix a multi-resource API (many agents):** about 6 agents, one per
      resource of `examples/apps/service-api`. Optionally click **Deploy app** first
      to see the broken app at a stable `workers.dev` URL; a verified fix is then
-     redeployed in place at the same URL.
+     redeployed in place at the same URL. The app's home page (`GET /`) is an
+     interactive tester that runs the gate's 18 checks: about 6 of 18 pass on the
+     broken app, 18 of 18 after the fix.
 
    Each launch gets a fresh unique Change id. **Tear down** deletes that run's
    Artifact repos (and the deployed app, if any).

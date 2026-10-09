@@ -25,6 +25,13 @@ export interface ApiResponse {
  * Minimal router for the two read endpoints:
  *   GET /audit/events        list events (optional orgId/actor/action filters)
  *   GET /audit/events/:id    fetch a single event
+ *
+ * FABRIC-FOLLOWUP: there is no organization-level read surface yet. The goal
+ * (organization-level audit logging with a read API) adds
+ *   GET /orgs/:orgId/audit/events        that org's events only, newest first
+ *   GET /orgs/:orgId/audit/events/:id    one event, only if it is in that org
+ * without ever disclosing another organization's events. See the README
+ * "Acceptance contract"; `npm run gate` checks it.
  */
 export function createAuditApi(store: AuditStore) {
   function handle(req: ApiRequest): ApiResponse {

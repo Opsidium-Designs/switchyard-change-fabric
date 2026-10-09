@@ -1,6 +1,8 @@
 /**
- * jev-smoke: one live call per decision question type (noul, choice, score)
- * against the configured decision model, reporting pass or fail for each, so
+ * jev-smoke: one live call per decision question type (noul, choice, score),
+ * plus the contract-triage question exactly as a board run asks it (its
+ * question and a delimited, scrubbed state built by the same code), against
+ * the configured decision model, reporting pass or fail for each, so
  * an API drift (for example a changed criteria shape) is caught by running one
  * command instead of being discovered as silently skipped decisions. Opt-in
  * (`make jev-smoke`); never part of `make check`.
@@ -8,9 +10,12 @@
 
 import { jevErrorReason, type AskJev, type JevAnswer } from "@switchyard-change/model-adapters";
 
+import { buildContractTriageState, CONTRACT_TRIAGE_KEY, CONTRACT_TRIAGE_QUESTIONS } from "./contract-triage.ts";
+
 /** One question type's smoke result. */
 export interface JevSmokeResult {
-  readonly type: "noul" | "choice" | "score";
+  /** The question type, or "contract-triage" for the triage-shaped choice. */
+  readonly type: "noul" | "choice" | "score" | "contract-triage";
   readonly ok: boolean;
   /** The answer in brief, or the failure reason (credential-free). */
   readonly detail: string;
@@ -49,6 +54,30 @@ export async function runJevSmoke(ask: AskJev): Promise<readonly JevSmokeResult[
     } catch (error) {
       out.push({ type: c.type, ok: false, detail: jevErrorReason(error) });
     }
+  }
+  // The contract-triage question with a synthetic, triage-shaped state.
+  const triageState = buildContractTriageState({
+    changeId: "smoke",
+    contract: "smoke-contract-1",
+    kind: "modify",
+    target: "tests/users.test.ts",
+    item: "validation",
+    goal: "Add input validation to the users module.",
+    itemObjective: "validate the users module's inputs",
+    proposer: "agent-1",
+    rationale: "The existing test asserts that an empty name is accepted; the goal makes it an error, so the expectation must change.",
+    failingEvidence: "not ok 3 - accepts an empty name\n# expected 201, got 400",
+    targetExcerpt: "test('accepts an empty name', async () => {\n  expect((await post({ name: '' })).status).toBe(201);\n});",
+  });
+  try {
+    const answer = (await ask(triageState, CONTRACT_TRIAGE_QUESTIONS))[CONTRACT_TRIAGE_KEY];
+    out.push(
+      answer && answer.type === "choice" && (answer.choice === "accept" || answer.choice === "reject")
+        ? { type: "contract-triage", ok: true, detail: brief(answer) }
+        : { type: "contract-triage", ok: false, detail: "no accept/reject choice in the reply" },
+    );
+  } catch (error) {
+    out.push({ type: "contract-triage", ok: false, detail: jevErrorReason(error) });
   }
   return out;
 }

@@ -132,8 +132,10 @@ describe("MC5: the example Change runs end to end deterministically offline", ()
     expect(summary).toContain("Conflict coordination:");
     expect(summary).toContain("src/audit/events.ts");
     expect(summary).toContain("write lease to api");
-    expect(summary).toContain("Integration verdict: verified");
-    expect(summary).toContain("Promoted to local Git:");
+    // The example has no gate: the summary says nothing was checked, and the
+    // promotion is labeled unverified rather than verified.
+    expect(summary).toContain("Integration verdict: unverified (no gate configured: nothing checked)");
+    expect(summary).toContain("Promoted to local Git (unverified: no gate):");
     expect(summary).toContain("switchyard/change-audit-logging");
   });
 

@@ -115,10 +115,12 @@ export { appendDiscoveredUnits, discoveredUnitId, DiscoverError } from "./discov
 export type {
   BoardAgent,
   BoardAppendResult,
+  BoardAttributionState,
   BoardChildItem,
   BoardContest,
   BoardContestStatus,
   BoardContract,
+  BoardDecisionJuncture,
   BoardDigest,
   BoardDraft,
   BoardErrorCode,
@@ -136,6 +138,7 @@ export type {
   BoardMessage,
   BoardMessageOf,
   BoardMessageType,
+  BoardOpenAttribution,
   BoardOrigin,
   BoardPayloads,
   BoardPublishedTool,
@@ -154,6 +157,8 @@ export {
   applyBoardEscalations,
   applyBoardMessage,
   arbitrate,
+  boardAttributionTally,
+  BOARD_DECISION_JUNCTURES,
   BOARD_ENGINE,
   BOARD_HUMAN,
   BOARD_LIMITS,
@@ -169,6 +174,8 @@ export {
   boardResolutionForDecision,
   checkBoardJoin,
   checkBoardTransition,
+  CONTRACT_TRIAGE_MARKER,
+  contractTriageRecommendation,
   DEFAULT_BOARD_RULES,
   emptyBoard,
   foldBoard,
@@ -178,7 +185,21 @@ export {
   releasedTargets,
   summarizeBoard,
   verifyBoard,
+  withContractTriage,
 } from "./board.ts";
+
+export type {
+  AttributionDisagreement,
+  AttributionOutcome,
+  AttributionResolution,
+  AttributionTally,
+  ParseAttributionOutcome,
+} from "./attribution-outcome.ts";
+export {
+  formatAttributionTally,
+  resolveAttributionOutcome,
+  tallyAttributionOutcomes,
+} from "./attribution-outcome.ts";
 
 export {
   entriesOverlap,

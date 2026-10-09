@@ -80,7 +80,7 @@ Who sent a message is established by the route, never by the message body.
 | `POST /changes/:id/board/read-token/revoke` | bearer | `{agent, tokenId}`: revoke a read token the integrator is done with. |
 | `POST /changes/:id/board` | agent token | `{type, payload, rationale?, inReplyTo?, to?}` appended as that agent; `201 {appended, escalations}`. |
 | `POST /changes/:id/board/human` | bearer | A human message. |
-| `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). It changes only the decision counts, never arbitration or the verdict. |
+| `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected `contract`. It changes only the decision counts, never arbitration or the verdict. |
 | `POST /changes/:id/integration/revision` | bearer | An integration result `{commit, gate, merged, failing?}`; appends `integrated.rev` and what it triggers (completions and `rebase.needed` on a pass, `fix.requested` / `fix.exhausted` on a fail). |
 | `GET /changes/:id/board?after=<seq>&limit=<n>` | open | One page (default 500, at most 1000) of messages after `seq`, `hasMore`, and the reduced state. |
 | `GET /changes/:id/board?for=<agent>&after=<seq>` | that agent's token | The agent's digest: its claims (with any unanswered fix request), pending claims, open contests it is in, open items, the latest passing revision, its rebase target, the latest failing revision's evidence when it asks this agent for a fix, the protected set, `pageEnd` (the last seq the page covered: page by it, since the messages are filtered), and the messages since `seq` addressed to it or touching its work. |
@@ -116,11 +116,14 @@ bounded fields that define an item.
 target, kind}` (engine: a protected contract waits for a human), `contract.accepted`,
 `contract.rejected`, `push.announced
 {item, commit, paths}`, `integrated.rev {n, commit, gate, merged, paths,
-contributors, failing?: {output, items}}`, `rebase.needed`, `review.requested`,
+contributors, failing?: {output, items}, gated?: false}` (`gated: false`: no gate ran, so its pass checked nothing), `rebase.needed`, `review.requested`,
 `review.result`, `handoff`, `done.proposed`, `item.completed`, `item.reopened {item, previousOwner, commit?, n}`
 (engine: a spent fix budget reopens the item for another agent), `fix.requested
 {item, n, attempt}` (engine, addressed to the item's owner), `fix.exhausted
-{item, n, attempts}` (engine), `tool.proposed`, `tool.published`, `tool.used`, `decision.recorded` (engine, advisory),
+{item, n, attempts}` (engine), `tool.proposed`, `tool.published`, `tool.used`, `decision.recorded {juncture:
+plan-review | attribution | fix-confidence | contract-triage, question, answer?, confidence?, accepted, error?, rev?,
+parsed?, contract?}` (engine, advisory), `decision.resolved {decisionSeq, rev, passed, answer, outcome:
+in-fixed-set | not-in-fixed-set, fixed, parsed, parseOutcome: in-fixed-set | not-in-fixed-set | none}` (engine, derived, advisory),
 `agent.joined`, `agent.left`.
 
 Intent entries are repo-relative paths, globs (`**`, `*`, `?`), or
@@ -443,6 +446,18 @@ is distributed changes: items are proposed and claimed, never assigned.
   agent that spent an item's budget cannot claim it again. The agent phase ends
   (`fix-budget`) when every outstanding item has been spent by every running
   agent, and the run budget bounds everything.
+- No gate, no verification: when the project has no gate (and none is
+  required), the integrator runs no final check. Such a revision is recorded
+  `gate: pass` with `gated: false` and shown as "no gate: nothing checked"; the
+  run's verdict is `unverified (no gate configured: nothing checked)`, never
+  `verified`. The tree is still promoted, labeled "promoted unverified (no
+  gate)" in the summary, and the control plane's integration record carries
+  `gated: false`. The CLI exits non-zero unless the verdict is verified (a
+  gate ran and passed) and every item completed (`boardRunExitCode`), so an
+  unverified or partial result is never a success. `run`, `run-goal`, and
+  `run-live` label a no-final-check verdict the same way (summary, CLI, the
+  `integration-verdict` event, the control-plane record); their exit codes are
+  unchanged.
 - The verdict is the last revision's gate, but a passing last revision that
   left announced pushes ungated (excluded, refused, unreadable) is PARTIAL: the
   verdict is failed with that reason and nothing is promoted. A verified run
@@ -468,7 +483,55 @@ is distributed changes: items are proposed and claimed, never assigned.
   call(s), M accepted, K error(s)`. The decision API's wire shapes: a choice
   question's criteria is a record option -> description, a score question's an
   array, a noul carries none. `make jev-smoke` (opt-in, live, never part of
-  `make check`) asks one question of each type and prints PASS/FAIL.
+  `make check`) asks one question of each type, plus the contract-triage
+  question below, and prints PASS/FAIL.
+- Decision outcomes (where attribution picks landed, advisory): an
+  attribution decision is recorded AFTER its failing revision, linked to it
+  (`rev`, and `parsed`: what the string-parse attributed on its own). The link
+  is refused unless that revision is the latest, failing, and its merged pushes
+  are on record (a board stored before outcomes existed records it unlinked).
+  When the next PASSING revision is recorded, arbitration derives
+  `decision.resolved` for every open attribution: `fixed` are the items whose
+  merged push commit changed between the failing revision and the passing one
+  (a newly merged item counts as changed); `outcome` says whether the pick is
+  `in-fixed-set`, and `parseOutcome` the same for the parse (`none` when it
+  attributed nothing). A decision with no passing revision after it stays open:
+  unresolved. The outcome is derived from the log, so replay re-derives it and a
+  forged one is rejected. The summary prints `jev attribution: N decision(s);
+  pick among items changed before the next pass: C, not: M, unresolved: U (not
+  a controlled accuracy measure: ...; parse among them: ...; pick differed from
+  parse: D (pick only, parse only, both, neither), biased toward whichever was
+  asked to fix)`. It is NOT an accuracy measure: attribution decides whose owner
+  is asked for a fix (a confident pick together with the parse's items,
+  otherwise the parse's items alone), and the asked items tend to be the ones
+  that change. The one comparison with some signal is where the pick differed
+  from the parse (the parse attributed items and the pick is not among them):
+  which of the two landed in the fixed set. It is still biased toward
+  whichever was asked. Recording a linked decision distinguishes a refusal from
+  a transport error: a 4xx records it once unlinked; a 5xx or network error
+  checks the board for the linked copy and retries (bounded), and never posts a
+  second, unlinked copy. `run-live` places its ladder picks the same way in
+  process (the units whose re-fan pushed an edit before the next passing
+  round), emits `attribution-resolved` per decision, returns the tally as
+  `result.attribution`, and prints the same line; it is not recorded on the
+  Worker.
+- Contract triage (advisory): before a protected contract's escalation is
+  handed to the human (the resolver, `--decide-contracts`, or the console), a
+  configured decision model is asked one choice question, accept or reject
+  ("Is changing this existing test needed to achieve the goal (rather than
+  weakening the check)?"), over the item's objective, the proposing agent's
+  rationale, the target path, the latest failing output that implicated the
+  item, and a bounded excerpt of the target file as it is in the baseline (a
+  regular file inside the project only). The proposed change itself is not
+  available yet: a protected path cannot be pushed before a human accepts it.
+  Every free-text field is bounded, credential-scrubbed, and framed as
+  delimited UNTRUSTED DATA. The result is recorded as `decision.recorded
+  {juncture: contract-triage, contract}`; the escalation record then carries
+  `recommendation` ("reject (confidence 0.86)", or "no recommendation (reason)"
+  for an error or a confidence below the threshold) and the same line appended
+  to its question. The resolver request carries it too, and the CLI prints it.
+  The human still decides: the triage never resolves an escalation, and without
+  a decision model nothing is asked.
 - `rebase.needed` matters mid-run: an agent whose intents intersect a passing
   revision's changes refetches that revision before its next edit.
 - Handoffs go only to agents still running, and the new owner's first edit of a
@@ -502,10 +565,36 @@ is distributed changes: items are proposed and claimed, never assigned.
   protected contract; it accepts others unless the target is held by another
   agent (a live lead decides on the goal). No rule names a file, an app, or a goal.
 - `FirstAttemptFailingGate` (`run-board-offline.ts`): the generic offline gate
-  FIXTURE for a project without a gate (`--offline --fixture-gate`, used by
-  `make demo-board`). It fails the first integrated revision, naming the first
-  file that revision changed, and passes once that file was edited again. It is
+  FIXTURE (`--offline --fixture-gate`, used by `make demo-board`). It fails the
+  first integrated revision, naming the first file that revision changed, and
+  passes once that file was edited again. Offline only, it REPLACES a
+  project's declared gate (the noop executor can never satisfy a real gate),
+  and the run says so in its header and summary: "offline fixture gate
+  replaces the project's declared gate (npm run gate); this demo shows
+  coordination, not a real fix". It installs no dependencies. A live run
+  refuses `--fixture-gate` and always uses the project's declared gate. It is
   a labelled demo stand-in, never a project's gate.
+- Dependency install before every gate run: every tree a gate runs on (the
+  baseline inventory run, unit checkouts, each revision's integrated tree, and
+  run-live's ladder previews and final gate) is a fresh clone with no
+  installed dependencies, so the gate runner installs what the GATED TREE's
+  lockfile declares first, in the gate's directory: `package-lock.json` ->
+  `npm ci --ignore-scripts --no-audit --no-fund --prefer-offline`;
+  `pnpm-lock.yaml` / `yarn.lock` -> a frozen, script-free install when the
+  tool is on PATH (else stated unsupported); a bun lockfile and python
+  manifests are stated unsupported and not attempted; `go.mod` needs nothing
+  (go fetches on test, over the network); a `package.json` without a lockfile
+  is NOT installed (an unlocked install is not deterministic). Install
+  scripts never run. The install runs with the gate's allowlisted environment
+  (no credentials), its own process group, a timeout (default 5 minutes,
+  `installTimeoutMs`), and a package cache shared under the run's work root;
+  network is allowed for the install. A failed install fails that gate run
+  with "dependency install failed: <reason>" as its first line, and the gate
+  does not run. The outcome (installed, skipped, unsupported, or failed, with
+  its duration) is recorded per revision (`BoardRevision.install`), on the
+  baseline inventory line, and in run-live's `result.dependencyInstall`, and
+  printed in the summaries. The installer is injectable (`dependencyInstaller`;
+  `make check` uses fakes or lockfile-free fixtures, so it stays offline).
 
 Usage:
 

@@ -39,7 +39,7 @@ import {
   toolNodeId,
   type ChangeStateSnapshot,
 } from "../src/graph-model.ts";
-import { runFullLive } from "../src/run-live.ts";
+import { runFullLive, type FullLiveEvent } from "../src/run-live.ts";
 
 /**
  * A seeded Change with a shared contested path: `api` and `tests` both declare
@@ -257,6 +257,7 @@ describe("M5: the full end-to-end run with the human escalation beat", () => {
     await writeFile(join(projectDir, "src", "index.ts"), "export const seeded = true;\n", "utf8");
 
     const resolverCalls: string[] = [];
+    const events: FullLiveEvent[] = [];
 
     const result = await runFullLive({
       change,
@@ -266,6 +267,7 @@ describe("M5: the full end-to-end run with the human escalation beat", () => {
       projectDir,
       workRoot: join(workRoot, "run"),
       fetchFn,
+      onEvent: (event) => events.push(event),
       resolveEscalation: async (escalation) => {
         resolverCalls.push(escalation.id);
         // The human chooses the owner among the contenders (the first option).
@@ -298,6 +300,10 @@ describe("M5: the full end-to-end run with the human escalation beat", () => {
       "model",
       "tests",
     ]);
+    // No gate is configured for this project: nothing was checked, so the
+    // verdict is reported with gated: false (labeled unverified), not plain verified.
+    expect(result.evidence.integration.finalCheck.skipped).toBe(true);
+    expect(events.find((e) => e.kind === "integration-verdict")).toMatchObject({ verdict: "verified", gated: false });
 
     // promotion produced a real local-Git branch and commit.
     expect(result.promotion.committed).toBe(true);

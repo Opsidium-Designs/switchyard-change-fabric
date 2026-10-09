@@ -94,7 +94,9 @@ export function formatRunSummary(result: RunChangeResult): string {
   // Integration + verification.
   const integration = result.evidence.integration;
   lines.push("Verification + integration:");
-  lines.push(`  Integration verdict: ${integration.verdict}`);
+  // A "verified" verdict with no final check checked nothing: say so.
+  const ungated = integration.verdict === "verified" && integration.finalCheck.skipped;
+  lines.push(`  Integration verdict: ${ungated ? "unverified (no gate configured: nothing checked)" : integration.verdict}`);
   lines.push(
     `  Integrated units:    ${[...integration.integratedUnits].join(", ") || "(none)"}`,
   );
@@ -113,7 +115,7 @@ export function formatRunSummary(result: RunChangeResult): string {
   // Promotion result.
   const p = result.promotion;
   if (p.committed) {
-    lines.push("Promoted to local Git:");
+    lines.push(ungated ? "Promoted to local Git (unverified: no gate):" : "Promoted to local Git:");
     lines.push(`  branch: ${p.branch}`);
     lines.push(`  commit: ${short(p.commit)}`);
     lines.push(`  repo:   ${result.sourceRepoDir}`);

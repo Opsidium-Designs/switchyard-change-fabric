@@ -43,10 +43,15 @@ import { join } from "node:path";
 
 import {
   BOARD_LIMITS,
+  boardAttributionTally,
+  contractTriageRecommendation,
+  withContractTriage,
   entriesOverlap,
   entryWithin,
+  formatAttributionTally,
   intentPath,
   releasedTargets,
+  type BoardDecisionJuncture,
   type BoardDigest,
   type BoardItem,
   type BoardMessage,
@@ -63,6 +68,12 @@ import type { PromotionResult } from "@switchyard-change/git-promotion";
 import {
   advanceIntegrationBranch,
   ChangeVerification,
+  ChildProcessCommandRunner,
+  formatDependencyInstall,
+  InstallingCommandRunner,
+  LockfileDependencyInstaller,
+  type DependencyInstaller,
+  type DependencyInstallOutcome,
   inventoryAfterContracts,
   recordBaselineInventory,
   GATED_REF_PREFIX,
@@ -73,6 +84,7 @@ import {
 
 import { BoardAgent, RunTurnBudget, type AgentStop, type AgentTurnRecord, type BoardSeedItem } from "./board-agent.ts";
 import { BoardOperatorClient, type JoinedWorkspace } from "./board-client.ts";
+import { readTargetExcerpt, triageContract } from "./contract-triage.ts";
 import { deriveProtectedPaths, type ProtectedPaths } from "./protected-paths.ts";
 import type { TestInventory } from "@switchyard-change/verification";
 import { redactSecrets } from "./redact.ts";
@@ -93,13 +105,29 @@ import { withWorkerAuth } from "./worker-auth.ts";
 
 /** An advisory typed decision and its outcome, as recorded on the board. */
 export interface BoardDecisionRecord {
-  readonly juncture: "plan-review" | "attribution" | "fix-confidence";
+  readonly juncture: BoardDecisionJuncture;
   readonly question: string;
   readonly answer?: string;
   readonly confidence?: number;
   readonly accepted: boolean;
   readonly error?: string;
+  /** Attribution: the failing revision it is about (set once the revision is recorded). */
+  readonly rev?: number;
+  /** Attribution: the items the string-parse attributed (empty when it attributed nothing). */
+  readonly parsed?: readonly string[];
+  /** Contract triage: the protected contract it is about. */
+  readonly contract?: string;
 }
+
+/**
+ * How recording a decision went: appended, refused by the board (a definite
+ * answer: nothing was appended), or a transport failure (unknown: it may or may
+ * not have been appended).
+ */
+export type BoardDecisionRecordOutcome = "recorded" | "refused" | "failed";
+
+/** Records an advisory decision on the board. */
+export type RecordBoardDecision = (decision: BoardDecisionRecord) => Promise<BoardDecisionRecordOutcome | void>;
 
 /** What the lead's planner produced. */
 export interface BoardSeed {
@@ -136,7 +164,9 @@ export type BoardRunEvent =
   | { readonly kind: "change-created"; readonly changeId: string }
   | { readonly kind: "goal-posted"; readonly protected: readonly string[]; readonly testInventory: string }
   | { readonly kind: "contract-decision"; readonly contract: string; readonly decision: string; readonly path?: string }
-  | { readonly kind: "contract-awaiting-human"; readonly contract: string; readonly escalationId: string; readonly path?: string }
+  | { readonly kind: "contract-awaiting-human"; readonly contract: string; readonly escalationId: string; readonly path?: string; readonly recommendation?: string }
+  /** The advisory triage of a protected contract, recorded before the human is asked. */
+  | { readonly kind: "contract-triage"; readonly contract: string; readonly recommendation: string }
   | { readonly kind: "seeded"; readonly source: string; readonly model?: string; readonly items: number }
   | { readonly kind: "agent-joined"; readonly agent: string; readonly role: string; readonly workspace?: string; readonly backend?: string }
   | { readonly kind: "turn"; readonly record: AgentTurnRecord }
@@ -161,6 +191,10 @@ export type BoardStopReason =
 export interface BoardRevision {
   readonly n: number;
   readonly gate: "pass" | "fail";
+  /** False when no gate ran on this revision: its "pass" checked nothing. */
+  readonly gated: boolean;
+  /** The dependency install that preceded this revision's gate, when a gate ran. */
+  readonly install?: DependencyInstallOutcome;
   /** The commit of the exact tree the gate ran on. */
   readonly commit: string;
   /** The announced push commits this revision merged (each contained in the gated tree). */
@@ -189,7 +223,13 @@ export interface BoardContractDecisionRequest {
   readonly escalationId: string;
   readonly contract: string;
   readonly path?: string;
+  /** The escalation's question (with the advisory triage line when there is one). */
   readonly question: string;
+  /**
+   * The ADVISORY triage: "accept (confidence 0.86)" or "no recommendation
+   * (reason)". Absent when no decision model is configured. The human decides.
+   */
+  readonly recommendation?: string;
 }
 
 /** Options for a board run. */
@@ -228,12 +268,30 @@ export interface RunBoardOptions {
   readonly requireAppGate?: boolean;
   readonly verifyCommandRunner?: VerificationCommandRunner;
   /**
+   * Installs a gated tree's dependencies before the gate runs there (default:
+   * from its lockfile, with install scripts off, `installTimeoutMs`, and a
+   * package cache under the work root). `NO_DEPENDENCY_INSTALL` opts out (a
+   * fixture gate that needs no dependencies).
+   */
+  readonly dependencyInstaller?: DependencyInstaller;
+  /** The limit on one dependency install, in ms (default 5 minutes). */
+  readonly installTimeoutMs?: number;
+  /**
+   * A label for the gate when it is not the project's own (the offline
+   * fixture gate replacing a declared gate), shown in the summary.
+   */
+  readonly gateLabel?: string;
+  /**
    * The HUMAN's answer to a contract change on the original tests or the
    * gate's configuration (an escalation the board raised). Without it the
    * decision waits durably for the console or the escalation resolve route.
    */
   readonly resolveContract?: (request: BoardContractDecisionRequest) => Promise<"accept" | "reject">;
-  /** Optional typed-decision caller for failure attribution (advisory; a confident choice narrows). */
+  /**
+   * Optional typed-decision caller (advisory): failure attribution (a confident
+   * choice narrows), and the triage of a protected contract shown to the human
+   * before the human decides it.
+   */
   readonly jev?: AskJev;
   readonly jevThreshold?: number;
   readonly deployAppDir?: string;
@@ -267,7 +325,13 @@ export interface RunBoardResult {
   readonly revision?: BoardRevision;
   /** Integrations that recorded no revision, and why (credential-free). */
   readonly integrationFailures: readonly string[];
-  readonly verdict: "verified" | "failed";
+  /**
+   * The last revision's gate: "verified" when a gate ran and passed,
+   * "unverified" when the last revision passed but NO gate ran (no gate
+   * configured: nothing was checked; the tree is still promoted, labeled
+   * unverified), else "failed".
+   */
+  readonly verdict: "verified" | "unverified" | "failed";
   /** Set when the last revision passed but pushes were left ungated: why the verdict is failed. */
   readonly partial?: string;
   /**
@@ -276,8 +340,10 @@ export interface RunBoardResult {
    * PARTIAL result: the gate passed, but the Change is not complete.
    */
   readonly incompleteItems: readonly string[];
-  /** The test inventory the baseline gate run recorded, as a readable line. */
+  /** The test inventory the baseline gate run recorded, as a readable line (with its dependency install). */
   readonly testInventory: string;
+  /** Set when the gate is not the project's own (the offline fixture gate): what ran instead. */
+  readonly gateLabel?: string;
   /** The last revision's evidence. */
   readonly evidence?: EvidenceSummary;
   readonly promotion?: PromotionResult;
@@ -329,7 +395,7 @@ export interface IntegrateBoardOptions {
   /** Strip credentials from any text that leaves the integrator (default: redactSecrets). */
   readonly scrub?: (text: string) => string;
   /** Record an advisory typed decision's outcome (attribution) on the board. */
-  readonly recordDecision?: (decision: BoardDecisionRecord) => Promise<void>;
+  readonly recordDecision?: RecordBoardDecision;
 }
 
 /** The result of one integration attempt. */
@@ -384,6 +450,8 @@ export function gateFailureLine(output: string): string | undefined {
     .map((l) => l.trim())
     .filter((l) => l !== "" && !/^[>$] /.test(l) && !/^npm (error|ERR!)/.test(l));
   return (
+    // An install that failed means the gate never ran: that is the reason.
+    lines.find((l) => /^dependency install failed:/.test(l)) ??
     lines.find((l) => /^\w*(Error|Exception)\b(\s*\[[A-Z_]+\])?:/.test(l)) ??
     lines.find((l) => /^(not ok\b|\u2716|FAIL\b|--- FAIL)/.test(l) && !/^\u2716 failing tests:/.test(l)) ??
     lines.find((l) => /\b(Error|Exception):/.test(l))
@@ -446,7 +514,7 @@ export async function attributeRevisionFailure(input: {
   readonly jev?: AskJev;
   readonly jevThreshold?: number;
   /** Record the typed decision's outcome (accepted, low-confidence, or an error): never silent. */
-  readonly onDecision?: (decision: BoardDecisionRecord) => Promise<void>;
+  readonly onDecision?: (decision: BoardDecisionRecord) => Promise<unknown>;
 }): Promise<{ readonly items: readonly string[]; readonly source: "parse" | "jev" | "all" }> {
   const units: GatedUnitInput[] = input.items.map((i) => ({
     unitId: i.id,
@@ -458,6 +526,7 @@ export async function attributeRevisionFailure(input: {
   }));
   const parsed = attributeImplicatedUnits(units, input.output);
   let implicated = parsed.units.map((u) => u.unitId);
+  const parsedItems = parsed.attributed ? inOrder(implicated, input.items) : [];
   let source: "parse" | "jev" | "all" = parsed.attributed ? "parse" : "all";
   if (input.jev && units.length > 1) {
     const ids = units.map((u) => u.unitId);
@@ -488,6 +557,8 @@ export async function attributeRevisionFailure(input: {
         ...(answer !== undefined ? { confidence: answer.confidence } : {}),
         accepted: confident,
         ...(answer === undefined ? { error: "the decision reply carried no attribution answer" } : {}),
+        // What the parse said on its own, so its outcome can be scored too.
+        parsed: parsedItems,
       });
       if (confident) {
         implicated = parsed.attributed ? [...new Set([...implicated, answer!.choice!])] : [answer!.choice!];
@@ -627,6 +698,9 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     options.integration.workspaces,
     options.verifyCommandRunner ? { commandRunner: options.verifyCommandRunner } : {},
   );
+  // The install outcome of the last command this integration runs (the gate on the integrated tree).
+  const installing = options.verifyCommandRunner instanceof InstallingCommandRunner ? options.verifyCommandRunner : undefined;
+  installing?.takeLastInstall();
   let evidence: EvidenceSummary;
   try {
     evidence = await verification.verifyAndIntegrate({
@@ -700,6 +774,53 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   const merged = mergedItems.map((i) => i.lastPush!.commit);
 
   const gate: "pass" | "fail" = evidence.integration.verdict === "verified" ? "pass" : "fail";
+  const install = evidence.integration.finalCheck.skipped ? undefined : installing?.takeLastInstall();
+  const attributionDecisions: BoardDecisionRecord[] = [];
+  // Record the buffered attribution decisions: linked to revision `n` when it
+  // was recorded (the board then resolves each at the next passing revision),
+  // otherwise, or if the board REFUSES the link, recorded unlinked so the call
+  // stays visible. A transport failure is not a refusal (the linked copy may
+  // have been appended): the linked recording is retried, bounded, and an
+  // unlinked second copy is never posted, so no decision is counted twice.
+  const flushDecisions = async (n: number | undefined): Promise<void> => {
+    const record = options.recordDecision;
+    if (!record) {
+      attributionDecisions.length = 0;
+      return;
+    }
+    // Was a linked attribution of revision `rev` already appended (a lost response)?
+    const alreadyLinked = async (rev: number): Promise<boolean | undefined> => {
+      try {
+        const page = await options.operator.log();
+        return page.messages.some((m) => m.type === "decision.recorded" && m.payload.juncture === "attribution" && m.payload.rev === rev);
+      } catch {
+        return undefined;
+      }
+    };
+    for (const decision of attributionDecisions.splice(0)) {
+      const { parsed, ...unlinked } = decision;
+      if (n === undefined || decision.error !== undefined) {
+        // One attempt only: an unlinked copy cannot be matched on the board, so it is never retried.
+        await record(unlinked);
+        continue;
+      }
+      let outcome: BoardDecisionRecordOutcome | void = await record({ ...unlinked, rev: n, parsed: parsed ?? [] });
+      for (let attempt = 1; attempt < 3 && outcome === "failed"; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** attempt));
+        const found = await alreadyLinked(n);
+        if (found !== false) {
+          // Appended already, or the board is unreadable: never risk a second copy.
+          outcome = found === true ? "recorded" : "failed";
+          break;
+        }
+        outcome = await record({ ...unlinked, rev: n, parsed: parsed ?? [] });
+      }
+      if (outcome === "refused") {
+        // A definite refusal appended nothing: record it unlinked so it stays visible.
+        await record(unlinked);
+      }
+    }
+  };
   let failing: { output: string; items: string[] } | undefined;
   let implicated: BoardRevision["implicated"];
   if (gate === "fail") {
@@ -721,7 +842,8 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
       changeId: options.change.id,
       ...(options.jev ? { jev: options.jev } : {}),
       ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
-      ...(options.recordDecision ? { onDecision: options.recordDecision } : {}),
+      // Buffered: an attribution is recorded once its revision is (linked to it).
+      ...(options.recordDecision ? { onDecision: async (decision: BoardDecisionRecord) => void attributionDecisions.push(decision) } : {}),
     });
     implicated = attribution;
     const note =
@@ -730,8 +852,11 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
         : "";
     failing = { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: [...attribution.items] };
   }
-  const recorded = await options.operator.recordRevision({ commit, gate, merged, ...(failing ? { failing } : {}) });
+  // No final check ran (no gate configured): the revision passed without being checked.
+  const gated = !(gate === "pass" && evidence.integration.finalCheck.skipped);
+  const recorded = await options.operator.recordRevision({ commit, gate, merged, ...(failing ? { failing } : {}), ...(gated ? {} : { gated: false as const }) });
   if (!recorded.ok) {
+    await flushDecisions(undefined);
     if (recorded.code === "UNKNOWN_REF") {
       return { requiresIntegrationGate, key, evidence, stale: true, failure: scrub(`the board refused the revision: ${recorded.error}`) };
     }
@@ -750,9 +875,12 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   }
   const rev = recorded.appended.find((m) => m.type === "integrated.rev");
   const n = rev && rev.type === "integrated.rev" ? rev.payload.n : state.lastRevN + 1;
+  await flushDecisions(rev ? n : undefined);
   const revision: BoardRevision = {
     n,
     gate,
+    gated,
+    ...(install ? { install } : {}),
     commit,
     merged,
     integratedItems: mergedItems.map((i) => i.id),
@@ -965,6 +1093,20 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     return redactSecrets(out);
   };
 
+  // Every gate run installs the gated tree's dependencies first (a clone has
+  // none); an install failure fails that gate honestly.
+  const gateRunner: VerificationCommandRunner | undefined =
+    options.appGateCommand && options.appGateCommand.length > 0
+      ? new InstallingCommandRunner(
+          options.verifyCommandRunner ?? new ChildProcessCommandRunner(),
+          options.dependencyInstaller ??
+            new LockfileDependencyInstaller({
+              cacheDir: join(workRoot, "package-cache"),
+              ...(options.installTimeoutMs !== undefined ? { timeoutMs: options.installTimeoutMs } : {}),
+            }),
+        )
+      : options.verifyCommandRunner;
+
   // 1. The planning-first Change, then the goal (with the contract and the
   //    baseline gate's test inventory), posted by the human.
   const guarded = await deriveProtectedPaths(options.projectDir, options.appGateCommand);
@@ -979,15 +1121,18 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           integrationRef: integration.integrationRef,
           integrationToken: integration.integrationToken,
           gateCommand: options.appGateCommand,
-          ...(options.verifyCommandRunner ? { commandRunner: options.verifyCommandRunner } : {}),
+          ...(gateRunner ? { commandRunner: gateRunner } : {}),
           workRoot: worktreeRoot,
         }).catch(() => undefined)
       : undefined;
-  const inventoryLabel = !options.appGateCommand
-    ? "no gate"
-    : inventory
-      ? `${inventory.count} test(s) (${inventory.format})`
-      : "test inventory unavailable: the gate's output does not show which tests ran; revisions fall back to its exit code";
+  const baselineInstall = gateRunner instanceof InstallingCommandRunner ? gateRunner.takeLastInstall() : undefined;
+  const inventoryLabel =
+    (!options.appGateCommand
+      ? "no gate"
+      : inventory
+        ? `${inventory.count} test(s) (${inventory.format})`
+        : "test inventory unavailable: the gate's output does not show which tests ran; revisions fall back to its exit code") +
+    (baselineInstall ? `; dependency install: ${formatDependencyInstall(baselineInstall)}` : "");
   const created = await createPlanningChange({
     workerUrl: base,
     header: { id: changeId, objective, baseline: "HEAD", budgetUsd: 0, assurance: "standard" },
@@ -1028,8 +1173,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   const agentRepos = new Map<string, BoardAgentRepo>();
   // Every advisory typed decision (and every failed call) is recorded on the
   // board as decision.recorded: visible, never affecting arbitration or verdict.
-  const recordDecision = async (decision: BoardDecisionRecord): Promise<void> => {
-    await operator
+  const recordDecision = async (decision: BoardDecisionRecord): Promise<BoardDecisionRecordOutcome> => {
+    const outcome = await operator
       .recordDecision({
         ...decision,
         question: decision.question.slice(0, 500),
@@ -1037,6 +1182,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         ...(decision.error !== undefined ? { error: scrub(decision.error).slice(0, 300) } : {}),
       })
       .catch(() => undefined);
+    // A 4xx is the board's definite refusal; anything else (5xx, the network) is unknown.
+    return outcome?.ok === true ? "recorded" : outcome !== undefined && outcome.status >= 400 && outcome.status < 500 ? "refused" : "failed";
   };
 
   // Read tokens the integrator was issued, revoked as soon as it is done with them.
@@ -1180,7 +1327,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     identity,
     ...(options.appGateCommand ? { appGateCommand: options.appGateCommand } : {}),
     ...(options.requireAppGate ? { requireAppGate: true } : {}),
-    ...(options.verifyCommandRunner ? { verifyCommandRunner: options.verifyCommandRunner } : {}),
+    ...(gateRunner ? { verifyCommandRunner: gateRunner } : {}),
     contract: guarded,
     ...(inventory ? { testInventory: inventory } : {}),
     onSettled: revokeReadTokens,
@@ -1196,6 +1343,44 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   // one to the resolver once (a durable wait for the console otherwise).
   const asked = new Set<string>();
   const authed = withWorkerAuth(rawFetch);
+  // Before a human is asked, an ADVISORY triage of the contract (when a
+  // decision model is configured), recorded on the board linked to the
+  // contract; the escalation then shows its recommendation. It never decides.
+  const triageContractFor = async (contractId: string): Promise<string | undefined> => {
+    if (!options.jev) {
+      return undefined;
+    }
+    const page = await operator.log().catch(() => undefined);
+    const contract = page?.state.contracts[contractId];
+    if (!page || !contract) {
+      return undefined;
+    }
+    const proposal = page.messages.find((m) => m.type === "contract.proposed" && m.payload.contract === contractId);
+    const item = contract.item !== undefined ? page.state.items[contract.item] : undefined;
+    const failure = page.state.lastFailure;
+    const decision = await triageContract({
+      ask: options.jev,
+      ...(options.jevThreshold !== undefined ? { threshold: options.jevThreshold } : {}),
+      scrub,
+      input: {
+        changeId,
+        contract: contractId,
+        kind: contract.kind,
+        target: contract.target,
+        goal: objective,
+        ...(contract.item !== undefined ? { item: contract.item } : {}),
+        ...(item ? { itemObjective: item.objective } : {}),
+        proposer: contract.proposedBy,
+        ...(proposal?.rationale !== undefined ? { rationale: proposal.rationale } : {}),
+        ...(failure && contract.item !== undefined && failure.items.includes(contract.item) ? { failingEvidence: failure.output } : {}),
+        ...(await readTargetExcerpt(options.projectDir, contract.target).then((excerpt) => (excerpt !== undefined ? { targetExcerpt: excerpt } : {}))),
+      },
+    });
+    await recordDecision(decision);
+    const recommendation = contractTriageRecommendation({ ...decision, ...(decision.error !== undefined ? { error: scrub(decision.error).slice(0, 300) } : {}) });
+    emit({ kind: "contract-triage", contract: contractId, recommendation });
+    return recommendation;
+  };
   const settleContracts = async (): Promise<boolean> => {
     let decided = false;
     const res = await authed(`${base}/changes/${encodeURIComponent(changeId)}/escalations`).catch(() => undefined);
@@ -1205,11 +1390,20 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         continue;
       }
       asked.add(e.id);
+      const recommendation = await triageContractFor(e.boardContract);
+      const question = recommendation !== undefined ? withContractTriage(e.question, recommendation) : e.question;
       if (!options.resolveContract) {
-        emit({ kind: "contract-awaiting-human", contract: e.boardContract, escalationId: e.id, ...(e.path ? { path: e.path } : {}) });
+        emit({ kind: "contract-awaiting-human", contract: e.boardContract, escalationId: e.id, ...(e.path ? { path: e.path } : {}), ...(recommendation !== undefined ? { recommendation } : {}) });
         continue;
       }
-      const decision = await options.resolveContract({ escalationId: e.id, contract: e.boardContract, ...(e.path ? { path: e.path } : {}), question: e.question });
+      // The human decides; the recommendation is shown, never applied.
+      const decision = await options.resolveContract({
+        escalationId: e.id,
+        contract: e.boardContract,
+        ...(e.path ? { path: e.path } : {}),
+        question,
+        ...(recommendation !== undefined ? { recommendation } : {}),
+      });
       const posted = await authed(`${base}/changes/${encodeURIComponent(changeId)}/escalations/${encodeURIComponent(e.id)}/resolve`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -1461,17 +1655,20 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     }
     const integratedItems = verdict === "verified" ? Object.values(finalState.items).filter((i) => i.lastPush?.integratedIn !== undefined).map((i) => i.id) : [];
     const excludedItems = Object.keys(finalState.items).filter((i) => !integratedItems.includes(i));
+    // A pass no gate checked is recorded as such (the control plane keeps the
+    // flag; the run reports it as unverified).
+    const ungatedPass = verdict === "verified" && last !== undefined && !last.gated;
     const recorded = await withWorkerAuth(rawFetch)(`${base}/changes/${encodeURIComponent(changeId)}/integration`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ verdict, integratedUnits: integratedItems, excludedUnits: excludedItems }),
+      body: JSON.stringify({ verdict, integratedUnits: integratedItems, excludedUnits: excludedItems, ...(ungatedPass ? { gated: false } : {}) }),
     }).catch((error: unknown) => error);
     if (!(recorded instanceof Response) || recorded.status >= 400) {
       // Never promote a verdict the control plane did not record.
       const why = recorded instanceof Response ? `HTTP ${recorded.status}` : scrub(String(recorded));
       throw new Error(`the integration verdict could not be recorded (${why}); not promoting`);
     }
-    emit({ kind: "integration-verdict", verdict, integratedUnits: integratedItems });
+    emit({ kind: "integration-verdict", verdict, integratedUnits: integratedItems, ...(ungatedPass ? { gated: false as const } : {}) });
 
     // An ADVISORY fix-confidence decision on the final passing revision:
     // recorded only, it never gates promotion or the deploy.
@@ -1562,10 +1759,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     revisions: [...integrator.revisions],
     ...(last ? { revision: last } : {}),
     integrationFailures: [...integrator.failures],
-    verdict,
+    verdict: verdict === "verified" && last !== undefined && !last.gated ? "unverified" : verdict,
     ...(partial !== undefined ? { partial } : {}),
     incompleteItems,
     testInventory: inventoryLabel,
+    ...(options.gateLabel !== undefined ? { gateLabel: options.gateLabel } : {}),
     ...(evidence ? { evidence } : {}),
     ...(promotion ? { promotion } : {}),
     ...(sourceRepoDir ? { sourceRepoDir } : {}),
@@ -1649,8 +1847,10 @@ function payloadSummary(m: BoardMessage): string {
       return `${String(p.item)} commit ${String(p.commit).slice(0, 10)} paths ${list(p.paths)}`;
     case "done.proposed":
       return String(p.item);
+    case "decision.resolved":
+      return `#${String(p.decisionSeq)} picked ${String(p.answer)} for revision ${String(p.rev)}: ${String(p.outcome)} at revision ${String(p.passed)} (changed: ${list(p.fixed)}; parse ${String(p.parseOutcome)}) (advisory)`;
     case "decision.recorded":
-      return `${String(p.juncture)}: ${p.error ? `error: ${String(p.error).slice(0, 120)}` : `${String(p.answer ?? "no answer")}${typeof p.confidence === "number" ? ` (confidence ${p.confidence.toFixed(2)})` : ""}, ${p.accepted ? "accepted" : "not accepted"}`} (advisory)`;
+      return `${p.contract ? `contract ${String(p.contract)} ` : ""}${String(p.juncture)}${typeof p.rev === "number" ? ` of revision ${p.rev}` : ""}: ${p.error ? `error: ${String(p.error).slice(0, 120)}` : `${String(p.answer ?? "no answer")}${typeof p.confidence === "number" ? ` (confidence ${p.confidence.toFixed(2)})` : ""}, ${p.accepted ? "accepted" : "not accepted"}`} (advisory)`;
     case "integrated.rev": {
       const failing = p.failing as { output: string; items: string[] } | undefined;
       // The most telling line of the failing output: a failing test line when
@@ -1658,7 +1858,7 @@ function payloadSummary(m: BoardMessage): string {
       const lines = failing ? failing.output.split("\n").map((l) => l.trim()).filter((l) => l !== "") : [];
       const firstLine = firstLines(lines.find((l) => /^not ok\b|\bFAIL|\u2716/.test(l)) ?? lines[0] ?? "", 300);
       return (
-        `rev ${String(p.n)} gate ${String(p.gate)} commit ${String(p.commit).slice(0, 10)} merged ${(p.merged as string[]).length} push(es) from ${list(p.contributors)}` +
+        `rev ${String(p.n)} ${p.gated === false ? "no gate: nothing checked" : `gate ${String(p.gate)}`} commit ${String(p.commit).slice(0, 10)} merged ${(p.merged as string[]).length} push(es) from ${list(p.contributors)}` +
         (failing ? `; implicated ${failing.items.join(", ") || "none"}: "${firstLine}"` : "")
       );
     }
@@ -1699,6 +1899,21 @@ export function formatBoardTranscript(log: readonly BoardMessage[]): string {
     .join("\n");
 }
 
+/**
+ * The process exit code for a board run: 0 only for a VERIFIED verdict (a
+ * gate ran and passed) with every item completed, and, when `requirePromotion`,
+ * the result promoted. An unverified (no gate), failed, or partial result is 1.
+ */
+export function boardRunExitCode(
+  result: Pick<RunBoardResult, "verdict" | "incompleteItems" | "promotion">,
+  options: { readonly requirePromotion?: boolean } = {},
+): 0 | 1 {
+  if (result.verdict !== "verified" || result.incompleteItems.length > 0) {
+    return 1;
+  }
+  return options.requirePromotion && result.promotion?.committed !== true ? 1 : 0;
+}
+
 /** A readable summary of a board run. */
 export function formatBoardRunSummary(result: RunBoardResult): string {
   const items = Object.values(result.state.items);
@@ -1712,6 +1927,7 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     `  agents: ${result.agents.map((a) => `${a.id}${a.role === "lead" ? " (lead)" : ""}${a.stop ? ` [stopped: ${a.stop.detail}]` : ""}`).join(", ")}`,
     `  turns: ${result.turns.length} (${waits} wait(s), ${invalid} invalid model output(s), ${rejected.length} refused action(s))`,
     `  agent phase ended: ${result.stopReason}`,
+    ...(result.gateLabel !== undefined ? [`  gate: ${result.gateLabel}`] : []),
     `  baseline gate inventory: ${result.testInventory}`,
     `  contract (existing tests and gate configuration; changing one needs an accepted contract): ${result.protected.join(", ") || "none"}`,
     ...(result.protectedKeys.length > 0 ? [`  contract keys (restored before every gate run): ${result.protectedKeys.join(", ")}`] : []),
@@ -1722,8 +1938,11 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
   if (result.revisions.length > 0) {
     for (const rev of result.revisions) {
       lines.push(
-        `  integrated revision ${rev.n}: gate ${rev.gate}, commit ${rev.commit.slice(0, 12)}, merged ${rev.merged.length} push(es) (items ${rev.integratedItems.join(", ") || "none"})`,
+        `  integrated revision ${rev.n}: ${rev.gated ? `gate ${rev.gate}` : "no gate: nothing checked"}, commit ${rev.commit.slice(0, 12)}, merged ${rev.merged.length} push(es) (items ${rev.integratedItems.join(", ") || "none"})`,
       );
+      if (rev.install) {
+        lines.push(`    dependency install: ${formatDependencyInstall(rev.install)}`);
+      }
       if (rev.failure) {
         lines.push(`    failure: ${rev.failure}`);
       }
@@ -1752,20 +1971,26 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
   const decisions = result.state.decisions;
   if (decisions && decisions.calls > 0) {
     lines.push(`  jev: ${decisions.calls} call(s), ${decisions.accepted} accepted, ${decisions.errors} error(s)`);
+    // Advisory accuracy, decided by what changed before the next passing gate.
+    lines.push(`  ${formatAttributionTally(boardAttributionTally(result.state))}`);
   }
   lines.push(`  items completed: ${done} of ${items.length}`);
   const incomplete =
-    result.verdict === "verified" && result.incompleteItems.length > 0
+    result.verdict !== "failed" && result.incompleteItems.length > 0
       ? ` (partial: ${result.incompleteItems.length} item(s) not completed: ${result.incompleteItems.join(", ")}; the Change is not complete)`
       : "";
-  lines.push(`  verdict: ${result.verdict}${incomplete}${result.revision ? ` (the gate of the last revision, ${result.revision.n})` : ""}`);
+  lines.push(
+    result.verdict === "unverified"
+      ? `  verdict: unverified (no gate configured: nothing checked)${incomplete}${result.revision ? ` (the last revision, ${result.revision.n})` : ""}`
+      : `  verdict: ${result.verdict}${incomplete}${result.revision ? ` (the gate of the last revision, ${result.revision.n})` : ""}`,
+  );
   if (result.partial) {
     lines.push(`    partial: ${result.partial}`);
   }
   if (result.promotion) {
     lines.push(
       result.promotion.committed
-        ? `  promoted: branch ${result.promotion.branch} commit ${result.promotion.commit.slice(0, 12)}${result.sourceRepoDir ? `\n  repo: ${result.sourceRepoDir}` : ""}`
+        ? `  ${result.verdict === "unverified" ? "promoted unverified (no gate)" : "promoted"}: branch ${result.promotion.branch} commit ${result.promotion.commit.slice(0, 12)}${result.sourceRepoDir ? `\n  repo: ${result.sourceRepoDir}` : ""}`
         : `  not promoted: ${result.promotion.refusedReason ?? "nothing to commit"}`,
     );
   } else {

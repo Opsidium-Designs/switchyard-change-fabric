@@ -46,6 +46,7 @@ import {
   type ChangeStateSnapshot,
   type GraphNode,
 } from "../src/graph-model.ts";
+import type { DependencyInstaller } from "@switchyard-change/verification";
 import { runFullLive, createPlanningChange, type DeployApp, type FullLiveEvent } from "../src/run-live.ts";
 import {
   MarkerGateRunner,
@@ -385,6 +386,8 @@ async function seedProject(dir: string): Promise<void> {
 /** Run the ladder once with a given gate passing-model, returning run + control. */
 async function runLadder(options: {
   readonly passingModel: string;
+  /** An injected dependency installer (default: the lockfile installer; these fixtures have no lockfile). */
+  readonly dependencyInstaller?: DependencyInstaller;
   readonly maxModelRetries?: number;
   readonly subdir: string;
   /** Override the Change spec (defaults to the single-unit SPEC). */
@@ -559,6 +562,7 @@ async function runLadder(options: {
     maxModelRetries: options.maxModelRetries ?? 1,
     ...(options.jev ? { jev: options.jev, jevThreshold: options.jevThreshold ?? 0.75 } : {}),
     ...(options.rePlan ? { rePlan: options.rePlan } : {}),
+    ...(options.dependencyInstaller ? { dependencyInstaller: options.dependencyInstaller } : {}),
     // Redeploy-in-place wiring (M8.4): the app was already deployed, so a
     // verified fix refreshes it; a red run must not redeploy.
     deployAppDir: projectDir,
@@ -571,6 +575,38 @@ async function runLadder(options: {
   const snapshot = control.state(changeId) as ChangeStateSnapshot;
   return { result, control, snapshot, events, redeployed, executor, opLog, planningStateBeforeAttach };
 }
+
+describe("dependency install before every gate run (offline, fake installer)", () => {
+  it("installs in each gated tree before the ladder and final gates, and reports the final gate's install", async () => {
+    const dirs: string[] = [];
+    const installer: DependencyInstaller = {
+      async install(dir) {
+        dirs.push(dir);
+        return { status: "installed", tool: "npm", detail: "npm ci", durationMs: 7 };
+      },
+    };
+    const { result } = await runLadder({ passingModel: ESCALATION_MODEL, subdir: "install-ok", dependencyInstaller: installer });
+    // A ladder round preview and the final gate each ran in their own tree, each installed first.
+    expect(new Set(dirs).size).toBeGreaterThanOrEqual(2);
+    expect(dirs.every((d) => !d.endsWith("/project"))).toBe(true);
+    expect(result.dependencyInstall).toEqual({ status: "installed", tool: "npm", detail: "npm ci", durationMs: 7 });
+    expect(result.evidence.integration.verdict).toBe("verified");
+  });
+
+  it("a failed install fails the gate honestly (the gate never runs) with the reason as the first line", async () => {
+    const installer: DependencyInstaller = {
+      async install() {
+        return { status: "failed", tool: "npm", detail: "npm ci: npm error code ERESOLVE", durationMs: 3 };
+      },
+    };
+    const { result, redeployed } = await runLadder({ passingModel: BASE_MODEL, subdir: "install-fail", dependencyInstaller: installer });
+    expect(result.evidence.integration.verdict).toBe("failed");
+    expect(result.evidence.integration.finalCheck.outputs.map((o) => o.text).join("\n")).toMatch(/^dependency install failed: npm ci: npm error code ERESOLVE/m);
+    expect(result.dependencyInstall).toMatchObject({ status: "failed" });
+    expect(result.promotion.committed).toBe(false);
+    expect(redeployed).toEqual([]);
+  });
+});
 
 describe("T10: the bounded model-escalation ladder (offline, deterministic)", () => {
   it("seeded failure: base fails -> escalation passes -> green + redeploy, with a visible ladder", async () => {
@@ -1697,6 +1733,70 @@ describe("H2: the Jev typed-decision junctures (offline, faked Jev, no network)"
     for (const node of model.nodes) {
       expect(() => assertBacked(node, snapshot)).not.toThrow();
     }
+  });
+
+  it("attribution outcome: a pick is in the fixed set when its unit's re-fan changed something before the next passing round", async () => {
+    const { jev } = makeFakeJev({ attribution: { type: "choice", choice: "beta", confidence: 0.9 } });
+    const { result, events } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      alwaysPassingUnits: ["alpha"],
+      subdir: "jev-attribution-outcome",
+      jev,
+      jevThreshold: 0.75,
+    });
+    expect(events.filter((e) => e.kind === "attribution-resolved")).toEqual([
+      { kind: "attribution-resolved", round: 1, passedRound: 2, choice: "beta", outcome: "in-fixed-set", fixed: ["beta"], parseOutcome: "in-fixed-set" },
+    ]);
+    expect(result.attribution).toEqual({
+      decisions: 1,
+      inFixedSet: 1,
+      notInFixedSet: 0,
+      unresolved: 0,
+      parse: { inFixedSet: 1, notInFixedSet: 0, none: 0, extra: 0 },
+      differed: { total: 0, pickOnly: 0, parseOnly: 0, both: 0, neither: 0 },
+    });
+  });
+
+  it("attribution outcome: a low-confidence pick that differed from the parse lands outside the fixed set (the parse's unit re-ran), the verdict unaffected", async () => {
+    const { jev } = makeFakeJev({ attribution: { type: "choice", choice: "alpha", confidence: 0.2 } });
+    const { result, events } = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      alwaysPassingUnits: ["alpha"],
+      subdir: "jev-attribution-missed",
+      jev,
+      jevThreshold: 0.75,
+    });
+    expect(events.find((e) => e.kind === "attribution-resolved")).toMatchObject({ choice: "alpha", outcome: "not-in-fixed-set", fixed: ["beta"], disagreement: "parse-only" });
+    expect(result.attribution).toMatchObject({ decisions: 1, inFixedSet: 0, notInFixedSet: 1, unresolved: 0, differed: { total: 1, parseOnly: 1 } });
+    expect(result.evidence.integration.integratedUnits).toContain("beta");
+  });
+
+  it("attribution outcome: a pick with no passing round after it stays unresolved; without Jev there is no tally", async () => {
+    const { jev } = makeFakeJev({ attribution: { type: "choice", choice: "beta", confidence: 0.9 } });
+    const { result } = await runLadder({
+      passingModel: "never-passes",
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      alwaysPassingUnits: ["alpha"],
+      subdir: "jev-attribution-unresolved",
+      jev,
+      jevThreshold: 0.75,
+    });
+    expect(result.attribution).toMatchObject({ inFixedSet: 0, notInFixedSet: 0 });
+    expect(result.attribution!.unresolved).toBe(result.attribution!.decisions);
+    expect(result.attribution!.decisions).toBeGreaterThan(0);
+    const plain = await runLadder({
+      passingModel: ESCALATION_MODEL,
+      spec: SPEC_TWO_UNITS,
+      changeId: "change-ladder-two",
+      alwaysPassingUnits: ["alpha"],
+      subdir: "jev-attribution-absent",
+    });
+    expect(plain.result.attribution).toBeUndefined();
   });
 
   it("JUNCTURE (c) fix-confidence is ADVISORY: a confident 'unacceptable' with a PASSING gate still ships", async () => {

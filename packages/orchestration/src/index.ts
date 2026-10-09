@@ -212,6 +212,9 @@ export { createGenericBoardPolicy } from "./board-policy.ts";
 
 export type {
   BoardAgentRepo,
+  BoardContractDecisionRequest,
+  BoardDecisionRecord,
+  BoardDecisionRecordOutcome,
   BoardRevision,
   BoardRunBudgets,
   BoardRunEvent,
@@ -219,11 +222,25 @@ export type {
   BoardStopReason,
   IntegrateBoardOptions,
   IntegrateBoardResult,
+  RecordBoardDecision,
   RunBoardOptions,
   RunBoardResult,
 } from "./run-board.ts";
+export type { ContractTriageDecision, ContractTriageInput } from "./contract-triage.ts";
+export { formatAttributionTally, type AttributionTally } from "@switchyard-change/change-core";
+export {
+  buildContractTriageState,
+  CONTRACT_TRIAGE_KEY,
+  CONTRACT_TRIAGE_LIMITS,
+  CONTRACT_TRIAGE_QUESTION,
+  CONTRACT_TRIAGE_QUESTIONS,
+  readTargetExcerpt,
+  scrubForDecision,
+  triageContract,
+} from "./contract-triage.ts";
 export {
   attributeRevisionFailure,
+  boardRunExitCode,
   boardSeedFromChange,
   ContinuousBoardIntegrator,
   describeWorkspace,
@@ -238,9 +255,17 @@ export { deriveProtectedPaths, isRunnerConfig, isTestShaped, RUNNER_CONFIG_FILES
 export { promoteVerifiedIntegration, redeployIfPreviouslyDeployed } from "./run-live.ts";
 export type { LocalChangeControlOptions } from "./local-control.ts";
 export type { RunBoardOfflineOptions } from "./run-board-offline.ts";
-export { FirstAttemptFailingGate, OFFLINE_BOARD_EPOCH, OFFLINE_GATE_FIXTURE_COMMAND, runBoardOffline } from "./run-board-offline.ts";
+export { FirstAttemptFailingGate, OFFLINE_BOARD_EPOCH, OFFLINE_GATE_FIXTURE_COMMAND, offlineFixtureGateLabel, runBoardOffline } from "./run-board-offline.ts";
 
 export { ChildProcessCommandRunner } from "@switchyard-change/verification";
+export {
+  formatDependencyInstall,
+  InstallingCommandRunner,
+  LockfileDependencyInstaller,
+  NO_DEPENDENCY_INSTALL,
+  type DependencyInstaller,
+  type DependencyInstallOutcome,
+} from "@switchyard-change/verification";
 
 export type { JevSmokeResult } from "./jev-smoke.ts";
 export { runJevSmoke } from "./jev-smoke.ts";

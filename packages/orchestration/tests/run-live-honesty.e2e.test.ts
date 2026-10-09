@@ -242,10 +242,12 @@ describe("run-live honesty regressions", () => {
     const deploymentIdx = calls.findIndex((c) => c.path.endsWith("/deployment"));
     expect(integrationIdx).toBeGreaterThan(-1);
     expect(deploymentIdx).toBeGreaterThan(integrationIdx);
+    // This run configures no gate: the record says nothing was checked.
     expect(calls[integrationIdx]!.body).toEqual({
       verdict: "verified",
       integratedUnits: ["fix"],
       excludedUnits: [],
+      gated: false,
     });
 
     // Every Worker call carried the bearer token.

@@ -285,7 +285,18 @@ describe("Worker board routes", () => {
     const listed = await h.json<{ escalations: { id: string; status: string; boardContract?: string; options: string[] }[] }>("GET", `/changes/${ID}/escalations`);
     const escalation = listed.body.escalations.find((e) => e.boardContract === "k1")!;
     expect(escalation).toMatchObject({ status: "pending", options: ["accept", "reject"] });
+    // An advisory triage decorates the pending escalation; it never resolves it.
+    const triage = { juncture: "contract-triage", question: "needed?", contract: "k1", answer: "reject", confidence: 0.8, accepted: true };
+    expect((await h.json("POST", `/changes/${ID}/board/decision`, triage)).status).toBe(201);
+    const advised = await h.json<{ escalations: { id: string; status: string; question: string; recommendation?: string; options: string[] }[] }>("GET", `/changes/${ID}/escalations`);
+    expect(advised.body.escalations.find((e) => e.id === escalation.id)).toMatchObject({
+      status: "pending",
+      options: ["accept", "reject"],
+      recommendation: "reject (confidence 0.80)",
+      question: expect.stringMatching(/Accept or reject\?\nAdvisory triage \(a typed decision; the human decides\): reject \(confidence 0\.80\)$/),
+    });
     expect((await h.json("POST", `/changes/${ID}/escalations/${escalation.id}/resolve`, { decision: "maybe" })).status).toBe(400);
+    // The human decides against the recommendation; that is what the board applies.
     expect((await h.json("POST", `/changes/${ID}/escalations/${escalation.id}/resolve`, { decision: "accept" })).status).toBe(200);
     const board = await h.json<BoardBody>("GET", `/changes/${ID}/board?after=0&limit=100`);
     expect(board.body.messages.at(-1)).toMatchObject({ from: "human", type: "contract.accepted", payload: { contract: "k1" } });

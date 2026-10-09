@@ -14,6 +14,7 @@
 import type {
   BoardDigest,
   BoardMessage,
+  BoardPayloads,
   BoardState,
 } from "@switchyard-change/change-core";
 
@@ -181,20 +182,15 @@ export class BoardOperatorClient {
     readonly merged: readonly string[];
     /** A failing revision's bounded, credential-free output and implicated items. */
     readonly failing?: { readonly output: string; readonly items: readonly string[] };
+    /** False when no gate ran (a pass that checked nothing). */
+    readonly gated?: false;
   }): Promise<BoardPostOutcome> {
     const { res, body } = await this.post("/integration/revision", input);
     return res.status === 201 ? { ok: true, appended: (body.appended as BoardMessage[] | undefined) ?? [] } : rejection(res, body);
   }
 
   /** Record an advisory typed decision and its outcome (the engine appends decision.recorded). */
-  async recordDecision(input: {
-    readonly juncture: "plan-review" | "attribution" | "fix-confidence";
-    readonly question: string;
-    readonly answer?: string;
-    readonly confidence?: number;
-    readonly accepted: boolean;
-    readonly error?: string;
-  }): Promise<BoardPostOutcome> {
+  async recordDecision(input: BoardPayloads["decision.recorded"]): Promise<BoardPostOutcome> {
     const { res, body } = await this.post("/board/decision", input);
     return res.status === 201 ? { ok: true, appended: (body.appended as BoardMessage[] | undefined) ?? [] } : rejection(res, body);
   }

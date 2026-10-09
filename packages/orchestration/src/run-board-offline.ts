@@ -10,11 +10,15 @@
  * commit dates, two runs of the same goal on the same project produce
  * byte-identical board logs.
  *
- * For a project without a gate of its own, the demo can run the generic
- * offline gate FIXTURE (`FirstAttemptFailingGate`) so the run shows the fix
- * loop: it fails the first integrated revision, naming one file that revision
- * changed, and passes once that file has been edited again. It knows nothing
- * about any app or goal, and it is labelled as a fixture wherever it is used.
+ * The demo can run the generic offline gate FIXTURE (`FirstAttemptFailingGate`)
+ * so the run shows the fix loop: it fails the first integrated revision, naming
+ * one file that revision changed, and passes once that file has been edited
+ * again. It knows nothing about any app or goal, and it is labelled as a
+ * fixture wherever it is used. Offline ONLY, it may replace a project's
+ * declared gate (`replacesDeclaredGate`): the noop executor can never satisfy
+ * a real gate, so the demo then shows coordination, not a real fix, and says
+ * so. A live run always uses the project's declared gate. The fixture needs
+ * no dependencies, so no dependency install runs for it.
  */
 
 import { execFile } from "node:child_process";
@@ -26,7 +30,7 @@ import { join } from "node:path";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 import type { BoardDigest, BoardMessage, ConcurrencyDial } from "@switchyard-change/change-core";
 import type { AgentTurnTransport, ExecutorProvider } from "@switchyard-change/model-adapters";
-import type { CommandOutcome, CommandRunner as VerificationCommandRunner } from "@switchyard-change/verification";
+import { NO_DEPENDENCY_INSTALL, type CommandOutcome, type CommandRunner as VerificationCommandRunner } from "@switchyard-change/verification";
 
 import { createGenericBoardPolicy } from "./board-policy.ts";
 import { decomposeGoal } from "./decompose-goal.ts";
@@ -43,6 +47,11 @@ import {
 
 /** The fixed instant offline board stamps and Git commit dates start from. */
 export const OFFLINE_BOARD_EPOCH = "2026-01-01T00:00:00.000Z";
+
+/** The label shown wherever the offline fixture gate replaces a project's declared gate. */
+export function offlineFixtureGateLabel(declared: readonly string[]): string {
+  return `offline fixture gate replaces the project's declared gate (${declared.join(" ")}); this demo shows coordination, not a real fix`;
+}
 
 /** The argv the offline gate fixture is wired as (it is never executed as a process). */
 export const OFFLINE_GATE_FIXTURE_COMMAND: readonly string[] = ["node", "--offline-gate-fixture"];
@@ -117,6 +126,14 @@ export interface RunBoardOfflineOptions {
    * explicit gate command is given.
    */
   readonly fixtureGate?: boolean;
+  /**
+   * The project's declared gate command the fixture REPLACES (offline only),
+   * for the label: "offline fixture gate replaces the project's declared gate
+   * (...); this demo shows coordination, not a real fix".
+   */
+  readonly replacesDeclaredGate?: readonly string[];
+  /** Installs a gated tree's dependencies (see RunBoardOptions.dependencyInstaller); the fixture gate never installs. */
+  readonly dependencyInstaller?: RunBoardOptions["dependencyInstaller"];
   readonly escalationModels?: readonly string[];
   /** A typed-decision caller (advisory; see RunBoardOptions.jev). Offline runs pass a fake. */
   readonly jev?: RunBoardOptions["jev"];
@@ -171,6 +188,16 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
         : options.fixtureGate && !options.appGateCommand
           ? { verifyCommandRunner: new FirstAttemptFailingGate() }
           : {}),
+      ...(options.dependencyInstaller ? { dependencyInstaller: options.dependencyInstaller } : {}),
+      ...(options.fixtureGate && !options.appGateCommand
+        ? {
+            // The fixture reads only the integrated tree: it needs no dependencies.
+            dependencyInstaller: NO_DEPENDENCY_INSTALL,
+            gateLabel: options.replacesDeclaredGate
+              ? `${offlineFixtureGateLabel(options.replacesDeclaredGate)}`
+              : "the generic offline gate FIXTURE (the project has no gate of its own); this demo shows coordination, not a real fix",
+          }
+        : {}),
       ...(options.escalationModels ? { escalationModels: options.escalationModels } : {}),
       ...(options.resolveContract ? { resolveContract: options.resolveContract } : {}),
       ...(options.jev ? { jev: options.jev } : {}),

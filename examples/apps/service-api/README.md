@@ -16,7 +16,13 @@ imports.
 | search | `GET /search?q=term` |
 | notifications | `GET /notifications`, `POST /notifications {"to","message"}` |
 
-`GET /` serves a small browser-visible page listing the resources.
+`GET /` serves an interactive tester (`src/ui.js`, inline HTML/CSS/JS, no
+external scripts). For every resource it runs the gate's three checks against
+the Worker it is served from: an unauthenticated write (expect `401`/`403`), an
+authenticated invalid request (expect `400`), and an authenticated valid request
+(expect `2xx`); search mirrors the gate with GET requests. It shows expected vs
+actual status, pass/fail, the response body on click, and a score ("N of 18
+checks secure"): 6 of 18 on the broken baseline, 18 of 18 after a correct fix.
 
 ## The frozen shared contracts
 

@@ -556,11 +556,15 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     if (!isStringArray(body.integratedUnits) || !isStringArray(body.excludedUnits)) {
       return json({ error: "integratedUnits and excludedUnits must be string arrays" }, 400);
     }
+    if (body.gated !== undefined && (body.gated !== false || body.verdict !== "verified")) {
+      return json({ error: "gated, when present, must be false (no gate ran) on a verified verdict" }, 400);
+    }
     try {
       const integration = await stub.recordIntegration({
         verdict: body.verdict,
         integratedUnits: body.integratedUnits,
         excludedUnits: body.excludedUnits,
+        ...(body.gated === false ? { gated: false as const } : {}),
       });
       return json({ integration }, 201);
     } catch (error) {
@@ -1496,6 +1500,7 @@ interface IntegrationBody {
   readonly verdict?: IntegrationVerdict;
   readonly integratedUnits?: unknown;
   readonly excludedUnits?: unknown;
+  readonly gated?: unknown;
 }
 
 /** Body of POST /changes/:id/verify-attempt: one change-level mechanical gate run. */

@@ -425,6 +425,11 @@ export interface IntegrationRecord {
   readonly integratedUnits: readonly string[];
   /** The unit ids the final integration excluded (not shipped). */
   readonly excludedUnits: readonly string[];
+  /**
+   * False when NO gate ran (no gate configured): a "verified" verdict then
+   * checked nothing and is unverified. Absent when a gate ran.
+   */
+  readonly gated?: false;
   readonly at: string;
 }
 
@@ -804,6 +809,12 @@ export interface Escalation {
   readonly decision?: string;
   readonly raisedAt: string;
   readonly resolvedAt?: string;
+  /**
+   * A protected contract's ADVISORY triage (a typed decision), also appended to
+   * the question: the recommendation and its confidence, or "no recommendation
+   * (reason)". The human still decides; it never resolves the escalation.
+   */
+  readonly recommendation?: string;
 }
 
 /** The input to raise an escalation (ids and timestamps are assigned by the DO). */
@@ -1295,6 +1306,7 @@ export class ChangeState extends DurableObject<Env> {
       verdict: input.verdict,
       integratedUnits: [...input.integratedUnits],
       excludedUnits: [...input.excludedUnits],
+      ...(input.gated === false ? { gated: false as const } : {}),
       at: new Date().toISOString(),
     };
     await this.ctx.storage.put("integration", stored);
