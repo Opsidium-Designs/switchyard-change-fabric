@@ -6,7 +6,10 @@ command, then tear it down so it stops billing. The reference example is
 [`examples/apps/service-api`](../examples/apps/service-api/README.md), a
 multi-resource JSON API whose every resource carries a deliberate, observable gap
 (it skips input validation and the shared auth check) so a before/after is obvious
-on the live service.
+on the live service. The second example,
+[`examples/apps/storefront`](../examples/apps/storefront/README.md), is a
+TypeScript Worker (wrangler bundles it as is) and deploys the same way with
+`APP=storefront`.
 
 ## What path this uses and why
 

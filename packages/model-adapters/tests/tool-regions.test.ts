@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   buildToolRegionMessages,
+  CODEMOD_REGION_EXAMPLES,
   createAiGatewayToolRegionFiller,
   parseToolRegionFills,
   ToolRegionError,
@@ -51,6 +52,29 @@ describe("tool region fills", () => {
     expect(user!.content).toContain("Add input validation and require auth on every resource");
     expect(user!.content).toContain("UNTRUSTED DATA: the previous build's failing gate checks");
     expect(user!.content).toContain("UNTRUSTED DATA: files the tool acts on");
+  });
+
+  it("a codemod's prompt asks for decision logic only on the edit helpers, never string surgery; other kinds are not told so", () => {
+    const codemod: ToolRegionRequest = {
+      ...request,
+      capability: "codemod-unit",
+      kind: "codemod",
+      regions: [
+        { file: "tools/codemod-unit/run.mjs", name: "plan", guidance: "decide the edits", signature: "function plan(path, text, edit)", example: CODEMOD_REGION_EXAMPLES.plan },
+        { file: "tools/codemod-unit/test.mjs", name: "expectChange", guidance: "assert one changed file", signature: "function expectChange(path, before, after)", example: CODEMOD_REGION_EXAMPLES.expectChange },
+      ],
+    };
+    const [system, user] = buildToolRegionMessages({ ...codemod, scopeFiles: ["src/resources/a.js", "src/resources/b.js"] });
+    expect(system!.content).toContain("write DECISION logic only");
+    expect(system!.content).toContain("NEVER by a file's name or path");
+    expect(user!.content).toContain("Every file in the tool's inputs (2; the tool must handle each): src/resources/a.js, src/resources/b.js");
+    expect(system!.content).toMatch(/never regex-replace code/);
+    expect(system!.content).toContain("fn.params[0]");
+    expect(user!.content).toContain("edit.insertAtStart(");
+    expect(user!.content).toContain("edit.addImport({ from: edit.relativeImport(path,");
+    expect(CODEMOD_REGION_EXAMPLES.plan).toContain("function plan(path, text, edit)");
+    expect(CODEMOD_REGION_EXAMPLES.expectChange).toContain("function expectChange(path, before, after)");
+    expect(buildToolRegionMessages(request)[0]!.content).not.toContain("DECISION logic");
   });
 
   it("validates replies strictly: every region exactly once, known regions only, the signature kept", () => {

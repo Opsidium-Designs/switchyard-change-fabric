@@ -42,6 +42,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { cp, lstat, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -67,6 +68,29 @@ const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "out", "cove
  */
 export const TOOL_SKELETON_MARKER = "SWITCHYARD-TOOL-SKELETON";
 const FILL_MARKER = /FILL-(?:BEGIN|END)\b/;
+
+/**
+ * The edit helpers the runtime ships with every codemod skeleton (at
+ * `tools/<capability>/lib/edit.mjs`): safe, re-parse-validated, idempotent
+ * edit primitives, so a codemod's own code only DECIDES what to change.
+ */
+export const TOOL_EDIT_LIB = "lib/edit.mjs";
+
+let editLibSource: string | undefined;
+
+/** The source of the codemod edit helpers (read once, from this package). */
+export function toolEditLibSource(): string {
+  editLibSource ??= readFileSync(new URL("./tool-lib/edit.mjs", import.meta.url), "utf8");
+  return editLibSource;
+}
+
+/**
+ * The variable a tool's own tests see during its gate: a fresh COPY of the
+ * original code the tool proves itself on (never the gate's baseline itself),
+ * so a codemod's test exercises real files in its scope instead of a
+ * hand-written fixture.
+ */
+export const TOOL_BASELINE_ENV = "SWITCHYARD_TOOL_BASELINE";
 
 /** The repo-relative entry path of a tool. */
 export function toolEntryPath(capability: string): string {
@@ -231,11 +255,12 @@ export function parseToolFindings(stdout: string): { findings: ToolFinding[]; in
 }
 
 /** A runner for one tool command: allowlisted env, private HOME, bounded time and output, process-group kill. */
-function isolatedRunner(home: string, limits: ToolRunLimits, timeoutMs: number): ChildProcessCommandRunner {
+function isolatedRunner(home: string, limits: ToolRunLimits, timeoutMs: number, extraEnv?: Readonly<Record<string, string>>): ChildProcessCommandRunner {
   return new ChildProcessCommandRunner({
     timeoutMs,
     maxBuffer: limits.maxOutputBytes ?? DEFAULT_TOOL_MAX_OUTPUT,
     parentEnv: { ...(limits.parentEnv ?? process.env), HOME: home, CI: "1" },
+    ...(extraEnv ? { extraEnv } : {}),
   });
 }
 
@@ -331,6 +356,14 @@ function stoppedReason(outcome: CommandOutcome): string {
  * for what the tool must do. Every unfilled function throws, the test fails,
  * and the gate's `filled` check refuses it until the marker line and every
  * FILL line are gone.
+ *
+ * A codemod's regions hold DECISION logic only: `plan` returns edits built
+ * with the runtime's edit helpers (`lib/edit.mjs`, shipped with the skeleton),
+ * which apply them re-parse-validated and idempotently, and `expectChange`
+ * asserts what one changed file must now contain. Its test runs the codemod
+ * on a copy of the original code (the gate's `SWITCHYARD_TOOL_BASELINE`) and
+ * checks that it changes something, that every changed file parses, and that
+ * a second run changes nothing.
  */
 export function toolSkeleton(kind: ToolGateKind, capability: string, inputs: readonly string[]): Record<string, string> {
   const marker = `// ${TOOL_SKELETON_MARKER}: complete every FILL region with anchored edits (replace the code between the FILL-BEGIN and FILL-END lines), then delete this line and every FILL-BEGIN/FILL-END line. An unfilled skeleton fails its own gate.`;
@@ -338,11 +371,22 @@ export function toolSkeleton(kind: ToolGateKind, capability: string, inputs: rea
   const regions =
     kind === "codemod"
       ? [
-          "// FILL-BEGIN apply: return the new text of one file with the change applied everywhere it is needed (the text unchanged when nothing is needed). Change only what the goal needs; keep the file syntactically valid.",
-          "function apply(path, text) {",
-          '  throw new Error("tool skeleton: apply() is not filled in");',
+          "// The edit helpers (lib/edit.mjs, written by the runtime; never change it). plan() only DECIDES: the",
+          "// runtime applies its edits, re-parses the file after each one (an edit that would break it is skipped",
+          "// and reported on stderr), and every edit is idempotent, so a second run changes nothing:",
+          "//   edit.functions(text): [{ name, kind (function|arrow|method), exported, async, params, header, body, line }]",
+          "//   edit.insertAtStart(target, statement): statement first in every matched function body",
+          "//   edit.wrapBody(target, before, after): wrap every matched function body",
+          "//   edit.addImport({ from, names: [..], default? }): add the import unless it is already there",
+          "//   edit.replaceOnce(find, replacement): only when `find` occurs exactly once",
+          '//   edit.relativeImport(path, "src/x/y.js"): the import specifier from this file to a repo file',
+          "// A target: a function name, a RegExp on the name, (fn) => boolean, or { name, exported, kind, async, pattern, where }.",
+          "// A statement (and before/after) is a string, or (fn) => string built from the function (undefined skips it).",
+          "// FILL-BEGIN plan: decide the edits for ONE file and return them as an array built with the edit helpers ([] when the file needs nothing). Decision logic only: never read or write a file and never rewrite the text yourself (no string surgery, no regex replace over code).",
+          "function plan(path, text, edit) {",
+          '  throw new Error("tool skeleton: plan() is not filled in");',
           "}",
-          "// FILL-END apply",
+          "// FILL-END plan",
         ]
       : finds
         ? [
@@ -362,11 +406,17 @@ export function toolSkeleton(kind: ToolGateKind, capability: string, inputs: rea
   const main =
     kind === "codemod"
       ? [
+          "let changed = 0;",
           "for (const file of targets()) {",
           '  const before = readFileSync(file, "utf8");',
-          "  const after = apply(file, before);",
-          '  if (after !== before) writeFileSync(file, after, "utf8");',
+          "  const result = edit.applyEdits(file, before, plan(file, before, edit));",
+          '  for (const finding of result.findings) console.error("codemod: " + finding);',
+          "  if (result.text !== before) {",
+          '    writeFileSync(file, result.text, "utf8");',
+          "    changed += 1;",
+          "  }",
           "}",
+          'console.error("codemod: changed " + changed + " file(s)");',
         ]
       : finds
         ? [
@@ -386,6 +436,7 @@ export function toolSkeleton(kind: ToolGateKind, capability: string, inputs: rea
     `// The ${kind} tool ${capability}. Usage: node tools/${capability}/run.mjs [paths...] from the repository root (no paths: every file in its inputs).`,
     'import { readdirSync, readFileSync, writeFileSync } from "node:fs";',
     'import { join } from "node:path";',
+    ...(kind === "codemod" ? [`import * as edit from "./${TOOL_EDIT_LIB}";`] : []),
     "",
     `const SCOPE = ${JSON.stringify(inputs)};`,
     'const SKIP = new Set([".git", "node_modules", "dist", "build", "coverage", "tools"]);',
@@ -411,7 +462,7 @@ export function toolSkeleton(kind: ToolGateKind, capability: string, inputs: rea
     ...main,
     "",
   ].join("\n");
-  const test = [
+  const test = kind === "codemod" ? codemodTest(marker, capability) : [
     marker,
     'import test from "node:test";',
     'import assert from "node:assert/strict";',
@@ -429,9 +480,7 @@ export function toolSkeleton(kind: ToolGateKind, capability: string, inputs: rea
     "  try {",
     finds
       ? "    // FILL-BEGIN fixture: write a small file inside the tool's inputs that needs the change, run the tool, and assert its JSON-line findings (then fix the file and assert it finds nothing)."
-      : kind === "codemod"
-        ? "    // FILL-BEGIN fixture: write a small file inside the tool's inputs that needs the change, run the tool, assert the file changed as intended, and assert a second run changes nothing."
-        : "    // FILL-BEGIN fixture: build a small fixture, run the tool, and assert what it produces.",
+      : "    // FILL-BEGIN fixture: build a small fixture, run the tool, and assert what it produces.",
     '    assert.fail("tool skeleton: this test is not filled in");',
     "    // FILL-END fixture",
     "    void run; void mkdirSync; void readFileSync; void writeFileSync; void dirname;",
@@ -448,9 +497,72 @@ export function toolSkeleton(kind: ToolGateKind, capability: string, inputs: rea
     "",
     `Run: \`node tools/${capability}/run.mjs [paths...]\` from the repository root.`,
     `Inputs: ${inputs.join(", ") || "the whole repository"}`,
+    ...(kind === "codemod" ? ["", `Its edits are applied by \`${TOOL_EDIT_LIB}\` (the runtime's helpers): each is re-parse-validated and idempotent.`] : []),
     "",
   ].join("\n");
-  return { "run.mjs": run, "test.mjs": test, "README.md": readme };
+  return { "run.mjs": run, "test.mjs": test, "README.md": readme, ...(kind === "codemod" ? { [TOOL_EDIT_LIB]: toolEditLibSource() } : {}) };
+}
+
+/** A codemod skeleton's test: run it on a copy of the original code; it must change something, keep every file parsing, and be idempotent. */
+function codemodTest(marker: string, capability: string): string {
+  return [
+    marker,
+    'import test from "node:test";',
+    'import assert from "node:assert/strict";',
+    'import { spawnSync } from "node:child_process";',
+    'import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";',
+    'import { tmpdir } from "node:os";',
+    'import { join } from "node:path";',
+    'import { fileURLToPath } from "node:url";',
+    `import { parseProblem } from "./${TOOL_EDIT_LIB}";`,
+    "",
+    'const RUN = fileURLToPath(new URL("./run.mjs", import.meta.url));',
+    `const BASELINE = process.env.${TOOL_BASELINE_ENV};`,
+    'const run = (cwd, args = []) => spawnSync(process.execPath, [RUN, ...args], { cwd, encoding: "utf8" });',
+    'const SKIP = new Set([".git", "node_modules", "dist", "build", "coverage", "tools"]);',
+    "/** Every file under root (repo-relative path to its text). */",
+    'const snapshot = (root, rel = "", out = new Map()) => {',
+    "  for (const e of readdirSync(join(root, rel), { withFileTypes: true })) {",
+    "    if (SKIP.has(e.name)) continue;",
+    '    const p = rel === "" ? e.name : rel + "/" + e.name;',
+    "    if (e.isDirectory()) snapshot(root, p, out);",
+    '    else if (e.isFile()) out.set(p, readFileSync(join(root, p), "utf8"));',
+    "  }",
+    "  return out;",
+    "};",
+    "",
+    "// FILL-BEGIN expectChange: assert that ONE file the codemod changed now carries the intended change (assertions on its text before and after, with assert). The harness below already runs the codemod on a copy of the original code and checks that it changes a file, that every changed file still parses, and that a second run changes nothing.",
+    "function expectChange(path, before, after) {",
+    '  throw new Error("tool skeleton: expectChange() is not filled in");',
+    "}",
+    "// FILL-END expectChange",
+    "",
+    `test("codemod ${capability} on a copy of the original code: changes it, keeps it parsing, and is idempotent", () => {`,
+    `  assert.ok(BASELINE, "${TOOL_BASELINE_ENV} is not set: the tool gate runs this test on a copy of the original code");`,
+    '  const dir = mkdtempSync(join(tmpdir(), "tool-test-"));',
+    "  try {",
+    "    cpSync(BASELINE, dir, { recursive: true });",
+    "    const original = snapshot(dir);",
+    "    const first = run(dir);",
+    "    assert.equal(first.status, 0, first.stderr);",
+    "    const once = snapshot(dir);",
+    "    const changed = [...once.keys()].filter((p) => once.get(p) !== original.get(p));",
+    '    assert.ok(changed.length > 0, "the codemod changed no file of the original code\\n" + first.stderr);',
+    "    for (const p of changed) {",
+    '      assert.ok(original.has(p), "the codemod created " + p);',
+    "      const problem = parseProblem(p, once.get(p));",
+    '      assert.equal(problem, undefined, p + " no longer parses: " + problem);',
+    "      expectChange(p, original.get(p), once.get(p));",
+    "    }",
+    "    const second = run(dir);",
+    "    assert.equal(second.status, 0, second.stderr);",
+    '    assert.deepEqual(snapshot(dir), once, "a second run must change nothing");',
+    "  } finally {",
+    "    rmSync(dir, { recursive: true, force: true });",
+    "  }",
+    "});",
+    "",
+  ].join("\n");
 }
 
 /** One FILL region of a skeleton file: its name, its guidance, and the signature its code must keep. */
@@ -668,12 +780,15 @@ export async function runToolGate(options: ToolGateOptions): Promise<ToolGateRes
     return result();
   }
 
-  // 2. Its own tests pass (run isolated, from the tools checkout).
+  // 2. Its own tests pass (run isolated, from the tools checkout), with a
+  // private copy of the original code they may use as their fixture.
   const scratch = await mkdtemp(join(options.scratchParent ?? tmpdir(), "scf-toolgate-"));
   try {
     const home = join(scratch, "home");
     await mkdir(home, { recursive: true });
-    const testRun = await isolatedRunner(home, options, options.testTimeoutMs ?? DEFAULT_TOOL_TEST_TIMEOUT_MS).run(
+    const baselineCopy = join(scratch, "baseline");
+    await materializeToolTree([options.baselineDir], baselineCopy);
+    const testRun = await isolatedRunner(home, options, options.testTimeoutMs ?? DEFAULT_TOOL_TEST_TIMEOUT_MS, { [TOOL_BASELINE_ENV]: baselineCopy }).run(
       [options.nodePath ?? process.execPath, "--test", ...tests],
       options.toolCheckoutDir,
     );

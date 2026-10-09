@@ -10,11 +10,15 @@
 #   make cli ARGS="doctor"   run the switchyard-change CLI
 #   make doctor    run the readiness check (switchyard-change doctor)
 #   make jev-smoke live check of the decision model's question types and contract triage (needs .env; not in check)
+#   make tool-smoke live check: the region filler builds the service-api codemod and its own gate runs (needs .env; not in check)
 #   make demo      run the example audit-logging Change end to end (offline)
 #   make demo-board  agents form around a goal on the Change board and build tools for each other (offline, deterministic)
 #   make run-board   live board run against a running Worker (needs the AI Gateway in .env)
 #   make run-live-watch  watchable live run: stable id, escalation fires, repos left up
 #   make run-live-service  live run of the MODULAR service-api app (carries the blueprint)
+#   make demo-board-storefront  the board on the multi-domain storefront app (offline, deterministic)
+#   make run-board-storefront   live board run on the storefront app (needs a running Worker and the AI Gateway)
+#   make storefront-gate  install the storefront app's pinned deps and run its gate (fails on the planted gaps)
 #   make demo-live   one-command watchable live demo (needs `make dev-all` running)
 #   make clean-live  tear down the real repos a watch run left up
 #   make seed-change seed the demo Change into a running Worker (for the console)
@@ -31,7 +35,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: jev-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -257,6 +261,38 @@ run-live-service:
 	npm -w apps/cli run dev -- run-live --goal-file "$(SERVICE_GOAL)" --project "$(SERVICE_PROJECT)" \
 	  --worker "$(WORKER)" --min $(MIN) --max $(MAX) $(if $(OWNER),--owner $(OWNER),)
 
+# The SECOND example app: a multi-domain storefront (catalog, orders, billing)
+# over shared money, http, and auth contracts, written in TypeScript with a
+# lockfile (typescript + vitest), so a run installs dependencies before its gate.
+# Its planted gaps give each board path a real reason to happen (see
+# examples/apps/storefront/README.md): one mechanical change repeated across many
+# handlers (a scanner and a codemod pay off), a billing domain with several
+# distinct sub-changes (a split or help candidate), a shared money contract that
+# must change (a contract proposal, then rebases), and one existing test that
+# pins the old tax rounding (a human decides that contract change; rejecting it
+# leaves the gate failing, honestly). The engine treats it like any project.
+#
+# demo-board-storefront runs it offline and deterministically with the generic
+# fixture gate (coordination only, not a real fix; no credentials). The live run
+# needs a running Worker (`make dev`) and the AI Gateway in .env; set
+# DECIDE=accept|reject to answer the test contract change from the CLI, or
+# leave it unset to answer in the console. storefront-gate runs the app's own
+# gate locally (it FAILS on the baseline; that is the point).
+STOREFRONT_GOAL = $(CURDIR)/examples/goals/storefront-correct-and-safe.goal.txt
+STOREFRONT_PROJECT = $(CURDIR)/examples/apps/storefront
+DECIDE ?=
+
+demo-board-storefront:
+	npm -w apps/cli run dev -- run-board --offline --fixture-gate --decide-contracts $(DECIDE_CONTRACTS) --goal-file "$(STOREFRONT_GOAL)" --project "$(STOREFRONT_PROJECT)" \
+	  --min $(MIN) --max $(MAX)
+
+run-board-storefront:
+	npm -w apps/cli run dev -- run-board --goal-file "$(STOREFRONT_GOAL)" --project "$(STOREFRONT_PROJECT)" --worker "$(WORKER)" \
+	  --min $(MIN) --max $(MAX) $(if $(INTEGRATOR),--integrator $(INTEGRATOR),) $(if $(DECIDE),--decide-contracts $(DECIDE),)
+
+storefront-gate:
+	cd examples/apps/storefront && npm ci --no-audit --no-fund && npm run gate
+
 # The watchable live headline run. It uses the seeded audit-logging Change (which
 # has the hardcoded src/audit/events.ts collision), so the human escalation beat
 # fires EVERY time, and it runs in watch mode: a STABLE Change id
@@ -357,7 +393,7 @@ infra-down:
 # hop: a tiny real Worker goes from source to a clickable page in one command.
 # Authenticate first with a scoped CLOUDFLARE_API_TOKEN in a gitignored .env
 # (sourced below) or `wrangler login`. Tear it down with `make delete-app`.
-# See docs/LIVE-DEPLOY.md. The example app is: service-api.
+# See docs/LIVE-DEPLOY.md. The example apps are: service-api, storefront.
 # Defaults to service-api.
 APP ?= service-api
 
@@ -390,6 +426,16 @@ delete-app:
 # EXECUTOR=ai-gateway with the gateway and account credentials in .env.
 jev-smoke:
 	npm -w apps/cli run dev -- jev-smoke
+
+# Opt-in LIVE check of agent-built tool reliability (never part of make check):
+# the live region filler builds the codemod for the service-api plan, and the
+# tool's OWN gate runs on a copy of the app, ATTEMPTS times (default 3), with
+# no board, no Worker, and no Cloudflare resource. Prints PASS/FAIL per build
+# and the pass rate. Needs EXECUTOR=ai-gateway with the gateway credentials in
+# .env (read into memory by the CLI). ARGS passes extra flags (--rebuilds N).
+ATTEMPTS ?= 3
+tool-smoke:
+	npm -w apps/cli run dev -- tool-smoke --attempts $(ATTEMPTS) $(ARGS)
 
 build:
 	npm run build

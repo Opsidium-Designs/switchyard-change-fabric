@@ -383,24 +383,10 @@ describe("agents build tools for each other (offline, deterministic)", () => {
           '    assert.equal(JSON.parse(first.stdout.trim().split("\\n")[0]).path, "src/x.js");',
         ].join("\n"),
       },
+      // A codemod's regions are decision logic on the skeleton's edit helpers (lib/edit.mjs).
       codemod: {
-        apply: [
-          "function apply(path, text) {",
-          '  const lines = text.split("\\n");',
-          "  const out = [];",
-          '  lines.forEach((l, i) => { if (/^\\s*export\\s+(?:async\\s+)?function\\s/.test(l) && (i === 0 || lines[i - 1].trim() !== "// switchyard:guard")) out.push("// switchyard:guard"); out.push(l); });',
-          '  return out.join("\\n");',
-          "}",
-        ].join("\n"),
-        fixture: [
-          '    mkdirSync(join(dir, "src"), { recursive: true });',
-          '    writeFileSync(join(dir, "src/a.js"), "export function a() {}\\n");',
-          "    assert.equal(run(dir).status, 0);",
-          '    const after = readFileSync(join(dir, "src/a.js"), "utf8");',
-          '    assert.ok(after.startsWith("// switchyard:guard\\n"));',
-          "    assert.equal(run(dir).status, 0);",
-          '    assert.equal(readFileSync(join(dir, "src/a.js"), "utf8"), after);',
-        ].join("\n"),
+        plan: ["function plan(path, text, edit) {", '  return [edit.insertAtStart({ exported: true }, "guard();")];', "}"].join("\n"),
+        expectChange: ["function expectChange(path, before, after) {", "  assert.match(after, /guard\\(\\);/);", "}"].join("\n"),
       },
     };
     // Anchored edits only: an absent file cannot be anchored (as the live executor refuses).
@@ -535,18 +521,10 @@ describe("agents build tools for each other (offline, deterministic)", () => {
           "  return out;",
           "}",
         ].join("\n"),
-        apply: [
-          "function apply(path, text) {",
-          '  const lines = text.split("\\n");',
-          "  const out = [];",
-          '  lines.forEach((l, i) => { if (/^\\s*export\\s+(?:async\\s+)?function\\s/.test(l) && (i === 0 || lines[i - 1].trim() !== "// guarded")) out.push("// guarded"); out.push(l); });',
-          '  return out.join("\\n");',
-          "}",
-        ].join("\n"),
-        fixture:
-          request.kind === "codemod"
-            ? ['mkdirSync(join(dir, "src"), { recursive: true });', 'writeFileSync(join(dir, "src/a.js"), "export function a() {}\\n");', "assert.equal(run(dir).status, 0);", 'assert.ok(readFileSync(join(dir, "src/a.js"), "utf8").startsWith("// guarded\\n"));'].join("\n")
-            : ['mkdirSync(join(dir, "src"), { recursive: true });', 'writeFileSync(join(dir, "src/x.js"), "export function x() {}\\n");', "const r = run(dir);", "assert.equal(r.status, 0);", 'assert.equal(JSON.parse(r.stdout.trim().split("\\n")[0]).path, "src/x.js");'].join("\n"),
+        // A codemod's fill is decision logic only; the skeleton's edit helpers do the surgery.
+        plan: ["function plan(path, text, edit) {", '  return [edit.insertAtStart({ exported: true }, "guard();")];', "}"].join("\n"),
+        expectChange: ["function expectChange(path, before, after) {", "  assert.match(after, /\\{\\n\\s*guard\\(\\);/);", "}"].join("\n"),
+        fixture: ['mkdirSync(join(dir, "src"), { recursive: true });', 'writeFileSync(join(dir, "src/x.js"), "export function x() {}\\n");', "const r = run(dir);", "assert.equal(r.status, 0);", 'assert.equal(JSON.parse(r.stdout.trim().split("\\n")[0]).path, "src/x.js");'].join("\n"),
       };
       return { fills: request.regions.map((r) => ({ file: r.file, name: r.name, code: code[r.name]! })), model: "strong" };
     };
@@ -559,7 +537,7 @@ describe("agents build tools for each other (offline, deterministic)", () => {
     // The model was asked for exactly the skeleton's regions, with their signatures.
     expect(asked.map((r) => r.regions.map((x) => `${x.file}#${x.name}:${x.signature}`))).toEqual([
       ["tools/scan-guard/run.mjs#detect:function detect(path, text)", "tools/scan-guard/test.mjs#fixture:"],
-      ["tools/codemod-guard/run.mjs#apply:function apply(path, text)", "tools/codemod-guard/test.mjs#fixture:"],
+      ["tools/codemod-guard/run.mjs#plan:function plan(path, text, edit)", "tools/codemod-guard/test.mjs#expectChange:function expectChange(path, before, after)"],
     ]);
     expect(of(result.log, "tool.used").some((m) => m.payload.capability === "codemod-guard" && m.payload.changedFiles.length > 0)).toBe(true);
     expect(result.incompleteItems).toEqual([]);

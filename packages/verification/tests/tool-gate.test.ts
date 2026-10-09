@@ -225,27 +225,83 @@ describe("the runtime's tool skeleton", () => {
   });
 });
 
+describe("a codemod built on the runtime's edit helpers", () => {
+  /** The codemod skeleton with its two decision regions filled, as a tools checkout. */
+  async function filledCodemod(capability: string, plan: string, expectChange: string): Promise<string> {
+    const files = toolSkeleton("codemod", capability, ["src/**"]);
+    const filled: Record<string, string> = {};
+    for (const [name, body] of Object.entries(files)) {
+      const regions = skeletonRegions(body);
+      filled[`tools/${capability}/${name}`] = regions.length === 0 ? body : spliceRegions(body, regions.map((r) => ({ name: r.name, code: r.name === "plan" ? plan : expectChange })));
+    }
+    return tree(filled);
+  }
+
+  it("ships lib/edit.mjs (no marker in it), and a decision-only fill passes its own gate: its test ran on a copy of the original code", async () => {
+    const files = toolSkeleton("codemod", "guard", ["src/**"]);
+    expect(Object.keys(files).sort()).toEqual(["README.md", "lib/edit.mjs", "run.mjs", "test.mjs"]);
+    expect(files["lib/edit.mjs"]).not.toMatch(/FILL-(?:BEGIN|END)|SWITCHYARD-TOOL-SKELETON/);
+    const toolDir = await filledCodemod(
+      "guard",
+      ["function plan(path, text, edit) {", "  return [edit.insertAtStart({ exported: true }, (fn) => `check(${fn.params[0]});`)];", "}"].join("\n"),
+      ["function expectChange(path, before, after) {", '  assert.match(after, /check\\(x\\);/, path);', "}"].join("\n"),
+    );
+    const base = await baseline();
+    const result = await runToolGate({ toolCheckoutDir: toolDir, capability: "guard", kind: "codemod", inputs: ["src/**"], baselineDir: base });
+    expect(result.checks.map((c) => `${c.check}:${c.passed}`)).toEqual(["layout:true", "filled:true", "tests:true", "baseline-run:true", "changes-baseline:true", "in-scope:true", "syntax:true"]);
+    expect(result.changed).toEqual(["src/a.ts"]);
+    // The gate's baseline itself was never written (the test got a copy).
+    expect(await readFile(join(base, "src/a.ts"), "utf8")).toBe("export function a(x: number): number {\n  // TODO validate\n  return x;\n}\n");
+  });
+
+  it("an edit that would break the file is skipped by the helpers, so the file stays valid and the gate fails honestly on changing nothing", async () => {
+    const toolDir = await filledCodemod(
+      "broken",
+      ["function plan(path, text, edit) {", '  return [edit.insertAtStart({ exported: true }, "if (x {")];', "}"].join("\n"),
+      ["function expectChange(path, before, after) {", "  assert.ok(after);", "}"].join("\n"),
+    );
+    const result = await runToolGate({ toolCheckoutDir: toolDir, capability: "broken", kind: "codemod", inputs: ["src/**"], baselineDir: await baseline() });
+    expect(result.passed).toBe(false);
+    expect(failed(result)).toEqual(["tests", "changes-baseline"]);
+    expect(result.checks.find((c) => c.check === "syntax")).toMatchObject({ passed: true });
+    expect(result.output).toMatch(/the result would not parse/);
+  });
+
+  it("a non-idempotent plan fails its own test (a second run must change nothing)", async () => {
+    const toolDir = await filledCodemod(
+      "grows",
+      // Decision logic that is NOT idempotent: a fresh statement every run.
+      ["function plan(path, text, edit) {", "  const n = (text.match(/tick\\(/g) || []).length;", "  return [edit.insertAtStart({ exported: true }, `tick(${n});`)];", "}"].join("\n"),
+      ["function expectChange(path, before, after) {", "  assert.match(after, /tick\\(/);", "}"].join("\n"),
+    );
+    const result = await runToolGate({ toolCheckoutDir: toolDir, capability: "grows", kind: "codemod", inputs: ["src/**"], baselineDir: await baseline() });
+    expect(failed(result)).toEqual(["tests"]);
+    expect(result.output).toMatch(/a second run must change nothing/);
+  });
+});
+
 describe("splicing region fills on the skeleton's own markers", () => {
   const run = toolSkeleton("codemod", "fix", ["src/**"])["run.mjs"]!;
 
   it("lists each region with its signature", () => {
-    expect(skeletonRegions(run)).toEqual([{ name: "apply", guidance: expect.stringMatching(/return the new text/), signature: "function apply(path, text)" }]);
+    expect(skeletonRegions(run)).toEqual([{ name: "plan", guidance: expect.stringMatching(/Decision logic only/), signature: "function plan(path, text, edit)" }]);
+    expect(skeletonRegions(toolSkeleton("codemod", "fix", ["src/**"])["test.mjs"]!)).toEqual([{ name: "expectChange", guidance: expect.stringMatching(/ONE file the codemod changed/), signature: "function expectChange(path, before, after)" }]);
     expect(skeletonRegions(toolSkeleton("scanner", "s", [])["test.mjs"]!)).toEqual([{ name: "fixture", guidance: expect.stringMatching(/write a small file/), signature: "" }]);
   });
 
   it("replaces a region between its markers and removes the skeleton line once every region is filled", async () => {
-    const out = spliceRegions(run, [{ name: "apply", code: 'function apply(path, text) {\n  return text.replace(/var /g, "let ");\n}' }]);
+    const out = spliceRegions(run, [{ name: "plan", code: 'function plan(path, text, edit) {\n  return [edit.replaceOnce("var ", "let ")];\n}' }]);
     expect(out).not.toMatch(/FILL-(BEGIN|END)|SWITCHYARD-TOOL-SKELETON/);
-    expect(out).toContain('return text.replace(/var /g, "let ");');
+    expect(out).toContain('return [edit.replaceOnce("var ", "let ")];');
     expect(await syntaxProblem("run.mjs", out)).toBeUndefined();
   });
 
   it("refuses an unknown region, a region filled twice, broken markers, and code that carries a marker", () => {
     expect(() => spliceRegions(run, [{ name: "detect", code: "x" }])).toThrow(/no FILL region named detect/);
-    expect(() => spliceRegions(run, [{ name: "apply", code: "a" }, { name: "apply", code: "b" }])).toThrow(/filled twice/);
-    const doubled = run.replace("// FILL-END apply", "// FILL-END apply\n// FILL-BEGIN apply: again\n// FILL-END apply");
-    expect(() => spliceRegions(doubled, [{ name: "apply", code: "a" }])).toThrow(/missing, duplicated, or out of order/);
-    expect(() => spliceRegions(run, [{ name: "apply", code: "// FILL-END apply" }])).toThrow(/contains a skeleton marker/);
+    expect(() => spliceRegions(run, [{ name: "plan", code: "a" }, { name: "plan", code: "b" }])).toThrow(/filled twice/);
+    const doubled = run.replace("// FILL-END plan", "// FILL-END plan\n// FILL-BEGIN plan: again\n// FILL-END plan");
+    expect(() => spliceRegions(doubled, [{ name: "plan", code: "a" }])).toThrow(/missing, duplicated, or out of order/);
+    expect(() => spliceRegions(run, [{ name: "plan", code: "// FILL-END plan" }])).toThrow(/contains a skeleton marker/);
   });
 
   it("a partial fill keeps the skeleton line, so the gate still refuses it", () => {

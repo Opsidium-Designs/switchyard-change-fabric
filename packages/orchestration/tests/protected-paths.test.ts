@@ -97,6 +97,47 @@ describe("deriveProtectedPaths: the original code's existing tests are the contr
     expect(contract.jsonKeys[0]!.keys).toEqual(keysFor("gate", "typecheck"));
   });
 
+  it("resolves harness imports the way Node and TS bundlers do: extensionless, .js naming a .ts source, a directory index, and each extension", async () => {
+    const dir = await project({
+      "package.json": JSON.stringify({ scripts: { gate: "node --test gate/gate.test.ts" } }),
+      "gate/gate.test.ts": [
+        'import { h } from "./harness";',
+        'import { j } from "./js-named.js";',
+        'import { i } from "./support";',
+        'import { m } from "./mod";',
+        'import { c } from "./common";',
+        'import app from "../src/app";',
+        "",
+      ].join("\n"),
+      "gate/harness.ts": 'export { deep } from "./deep";\nexport const h = 1;\n',
+      "gate/deep.tsx": "export const deep = 1;\n",
+      "gate/js-named.ts": "export const j = 1;\n",
+      "gate/support/index.ts": "export const i = 1;\n",
+      "gate/mod.mts": "export const m = 1;\n",
+      "gate/common.cjs": "module.exports = { c: 1 };\n",
+      "gate/unused.ts": "",
+      "src/app.ts": "export default {};\n",
+    });
+    const contract = await deriveProtectedPaths(dir, APP_GATE_COMMAND);
+    expect(contract.paths).toEqual(
+      expect.arrayContaining(["gate/gate.test.ts", "gate/harness.ts", "gate/deep.tsx", "gate/js-named.ts", "gate/support/index.ts", "gate/mod.mts", "gate/common.cjs"]),
+    );
+    expect(contract.paths).not.toContain("gate/unused.ts");
+    expect(contract.paths).not.toContain("src/app.ts");
+  });
+
+  it("an exact file wins over an extension, as at run time", async () => {
+    const dir = await project({
+      "package.json": JSON.stringify({ scripts: { gate: "node --test gate/gate.test.mjs" } }),
+      "gate/gate.test.mjs": 'import { h } from "./harness.js";\n',
+      "gate/harness.js": "export const h = 1;\n",
+      "gate/harness.ts": "export const h = 2;\n",
+    });
+    const contract = await deriveProtectedPaths(dir, APP_GATE_COMMAND);
+    expect(contract.paths).toContain("gate/harness.js");
+    expect(contract.paths).not.toContain("gate/harness.ts");
+  });
+
   it("protects tsconfig files when the gate runs the type checker, and removes newly added root runner configs", async () => {
     const dir = await project({
       "package.json": JSON.stringify({ scripts: { gate: "tsc -p tsconfig.build.json && node --test" } }),

@@ -152,6 +152,7 @@ export {
 export type { AiGatewayToolRegionOptions, ToolRegionFill, ToolRegionFiller, ToolRegionRequest, ToolRegionSpec } from "./tool-regions.ts";
 export {
   buildToolRegionMessages,
+  CODEMOD_REGION_EXAMPLES,
   createAiGatewayToolRegionFiller,
   MAX_REGION_CODE,
   parseToolRegionFills,

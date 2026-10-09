@@ -79,6 +79,8 @@ import {
   redactSecrets,
   ChildProcessCommandRunner,
   runJevSmoke,
+  runToolSmoke,
+  formatToolSmokeBuild,
 } from "@switchyard-change/orchestration";
 import { DiscoveringExecutor } from "@switchyard-change/model-adapters";
 
@@ -131,6 +133,62 @@ const commands: Command[] = [
         console.log(redactSecrets(`  ${r.ok ? "PASS" : "FAIL"} ${r.type}: ${r.detail}`));
       }
       return results.every((r) => r.ok) ? 0 : 1;
+    },
+  },
+  {
+    name: "tool-smoke",
+    summary: "Live check: build one agent tool (default: the service-api codemod) with the live region filler and run its own gate, N times, printing pass/fail (needs EXECUTOR=ai-gateway and credentials; no board, no Worker, no Cloudflare resource).",
+    usage: `${CLI_NAME} tool-smoke [--attempts N] [--rebuilds N] [--project <dir> --inputs <glob,...>] [--goal-file <file>] [--kind codemod|scanner|check] [--capability <name>]`,
+    async run(args) {
+      const tools = selectToolFiller();
+      if (!tools.live || !tools.filler) {
+        console.error(`tool-smoke: no live tool author (${tools.description})`);
+        return 1;
+      }
+      const explicitProject = optionValue(args, "--project");
+      const projectDir = explicitProject ? resolve(explicitProject) : resolve(repoRoot(), "examples", "apps", "service-api");
+      const inputsRaw = optionValue(args, "--inputs") ?? (explicitProject ? undefined : "src/resources/*.js");
+      if (inputsRaw === undefined) {
+        console.error("tool-smoke: --inputs is required with --project (the tool's declared scope, comma separated)");
+        return 2;
+      }
+      const inputs = inputsRaw.split(",").map((s) => s.trim()).filter((s) => s !== "");
+      const goalFile = optionValue(args, "--goal-file") ?? (explicitProject ? undefined : resolve(repoRoot(), "examples", "goals", "service-api-validation-auth.goal.txt"));
+      const goal = goalFile ? (await readFile(goalFile, "utf8")).trim() : optionValue(args, "--goal");
+      if (!goal) {
+        console.error("tool-smoke: --goal-file or --goal is required with --project");
+        return 2;
+      }
+      const kindRaw = optionValue(args, "--kind") ?? "codemod";
+      if (!["codemod", "scanner", "check"].includes(kindRaw)) {
+        console.error(`tool-smoke: --kind must be codemod, scanner, or check (got ${kindRaw})`);
+        return 2;
+      }
+      const kind = kindRaw as "codemod" | "scanner" | "check";
+      const capability = optionValue(args, "--capability") ?? (kind === "codemod" ? "codemod-unit" : `${kind === "scanner" ? "scan" : "check"}-unit`);
+      const attempts = Number(optionValue(args, "--attempts") ?? "1");
+      const rebuilds = Number(optionValue(args, "--rebuilds") ?? "0");
+      if (!Number.isInteger(attempts) || attempts < 1 || attempts > 20 || !Number.isInteger(rebuilds) || rebuilds < 0 || rebuilds > 5) {
+        console.error("tool-smoke: --attempts must be 1..20 and --rebuilds 0..5");
+        return 2;
+      }
+      console.log(`tool-smoke: ${tools.description}`);
+      console.log(`  ${kind} ${capability} over ${projectDir} (inputs ${inputs.join(", ")}), ${attempts} attempt(s), ${rebuilds} rebuild(s) each`);
+      const results = await runToolSmoke({
+        filler: tools.filler,
+        projectDir,
+        goal,
+        capability,
+        kind,
+        inputs,
+        attempts,
+        rebuilds,
+        onBuild: (attempt, build, result) => console.log(redactSecrets(formatToolSmokeBuild(attempt, build, result))),
+      });
+      const passed = results.filter((r) => r.passed).length;
+      const firstBuild = results.filter((r) => r.builds[0]?.passed).length;
+      console.log(`tool-smoke: ${passed}/${results.length} attempt(s) passed their own gate (${firstBuild}/${results.length} on the first build)`);
+      return passed === results.length ? 0 : 1;
     },
   },
   {
@@ -1589,7 +1647,7 @@ function wranglerEnv(): NodeJS.ProcessEnv {
 }
 
 /** The commands that read `.env`: they talk to the live Worker, Cloudflare, or the AI Gateway. */
-const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "cleanup-live"]);
+const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "tool-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "cleanup-live"]);
 
 /**
  * Load the repo's `.env` (or SCF_ENV_FILE) into memory, never into this

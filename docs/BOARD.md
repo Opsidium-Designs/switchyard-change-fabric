@@ -501,7 +501,7 @@ is distributed changes: items are proposed and claimed, never assigned.
   (`/proc/<pid>/environ`), so a gate or tool child could read its parent's. No
   Makefile target exports `.env` into the CLI any more: the live commands
   (`run-live`, `run-board` without `--offline`, `recruit-live`, `doctor`,
-  `jev-smoke`, `deploy-app`, `cleanup-live`, `env-check`) read `.env` (or
+  `jev-smoke`, `tool-smoke`, `deploy-app`, `cleanup-live`, `env-check`) read `.env` (or
   `SCF_ENV_FILE`) themselves into memory, and the offline commands never read
   it (`packages/orchestration/src/credentials.ts`,
   a small parser, no dependency), and the code that needs a credential reads it
@@ -529,7 +529,11 @@ is distributed changes: items are proposed and claimed, never assigned.
   `.yarnrc`, `.yarnrc.yml`, `bunfig.toml`, `.pnpmfile.cjs`, protected even
   when absent); `Makefile` or `justfile` when the gate invokes make or just;
   the files the gate command runs, and the in-repo harness they import,
-  transitively (bounded depth): an imported file in the test tree (a directory
+  transitively (bounded depth; a relative specifier resolves as Node and TS
+  bundlers do: the exact file, a `.js`/`.jsx`/`.mjs`/`.cjs` specifier naming its
+  `.ts`/`.tsx`/`.mts`/`.cts` source, the path plus each extension, then
+  `<path>/index.<ext>`, so `import ... from "./harness"` protects
+  `gate/harness.ts`): an imported file in the test tree (a directory
   holding a gate-named or test file, or below one; the repo root only for files
   directly in it) is harness, protected and followed; an imported file anywhere
   else is application code, the code under test, neither protected nor
@@ -907,7 +911,34 @@ app-specific.
   down the ladder only on a transport error, never because the reply was
   wrong; a rebuild shows it its previous files and the failing checks. The
   executor-backed author (anchored search/replace against the skeleton) stays
-  the fallback when no gateway is configured. An `edit` on a tool item goes to
+  the fallback when no gateway is configured.
+- **Codemods are decision logic on the runtime's edit helpers.** Model-written
+  whole-file string surgery broke files (live runs: its own tests failing and
+  `Expected '}', got '<eof>'` in the files it rewrote), so a codemod's
+  skeleton ships `tools/<capability>/lib/edit.mjs` (the runtime's
+  dependency-free helpers, `packages/verification/src/tool-lib/edit.mjs`) and
+  its regions hold DECISIONS only: `plan(path, text, edit)` returns edits built
+  with the helpers (`insertAtStart(target, statement)`, `wrapBody(target,
+  before, after)`, `addImport({from, names, default?})`, `replaceOnce(find,
+  replacement)`; `functions(text)` lists a file's functions, with their
+  export, kind, and parameter names, for deciding; `relativeImport` gives a
+  specifier), and the skeleton applies them with `applyEdits`, never the
+  model's code. Every edit is re-parsed (Node's TypeScript-stripping parser,
+  plus a token-aware bracket check) and skipped with a finding (on stderr)
+  when its result would not parse; a file that does not parse is left alone;
+  `replaceOnce` refuses a snippet that matches more than once; every primitive
+  is idempotent. The second region, `expectChange(path, before, after)`,
+  asserts what one changed file must contain; the skeleton's test runs the
+  codemod on a COPY of the original code (the gate hands its tests a private
+  copy in `SWITCHYARD_TOOL_BASELINE`) and asserts that it changes a file, that
+  every changed file parses, and that a second run changes nothing. The
+  fill prompt carries the helper API and a worked example (a guard call first
+  in every exported handler, plus its import). The tool gate's checks are
+  unchanged. `make tool-smoke` (opt-in, live, never in `make check`) builds
+  the service-api codemod with the live filler and runs its own gate
+  `ATTEMPTS` times (default 3; `ARGS="--rebuilds 1"` adds a rebuild with the
+  failing evidence), printing PASS/FAIL per build and the pass rate, with no
+  board, Worker, or Cloudflare resource. An `edit` on a tool item goes to
   the build flow, never to the agent's own repo, and `use_tool` or
   `propose_done` on a tool item is refused (`TOOL_ITEM`). App code edits keep
   the anchored search/replace path unchanged. The live author is also given
@@ -954,7 +985,8 @@ app-specific.
   tool code runs there, and checks, on a copy of the ORIGINAL code
   (`packages/verification/src/tool-gate.ts`):
   - every kind: only its own directory, an entry point, at least one test
-    file, and its tests pass;
+    file, and its tests pass (they run with `SWITCHYARD_TOOL_BASELINE` naming
+    a private copy of the original code, never the gate's baseline itself);
   - scanner: exit 0 with bounded output, every stdout line a well-formed
     finding naming an existing file, at least ONE finding (a scanner that
     finds nothing proves nothing), and no file changed;

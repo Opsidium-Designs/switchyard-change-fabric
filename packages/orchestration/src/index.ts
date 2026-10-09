@@ -274,6 +274,8 @@ export {
 
 export type { JevSmokeResult } from "./jev-smoke.ts";
 export { runJevSmoke } from "./jev-smoke.ts";
+export type { ToolSmokeAttempt, ToolSmokeBuild, ToolSmokeOptions } from "./tool-smoke.ts";
+export { formatToolSmokeBuild, runToolSmoke } from "./tool-smoke.ts";
 
 export type {
   BoardCaption,

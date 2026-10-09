@@ -187,6 +187,31 @@ function insideRoot(root: string, abs: string): string | undefined {
   return rel.split(sep).join(posix.sep);
 }
 
+/** The extensions a relative specifier may leave off, in the order Node/TS bundler resolution tries them. */
+const RESOLVE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"];
+/** A JS-extension specifier may name a TS source (the TS ESM convention: `./x.js` is `./x.ts`). */
+const JS_TO_TS: Readonly<Record<string, readonly string[]>> = { ".js": [".ts", ".tsx"], ".jsx": [".tsx"], ".mjs": [".mts"], ".cjs": [".cts"] };
+
+/**
+ * The candidate files a relative specifier resolves to, in order, as Node and
+ * TS bundler resolution try them: the exact path, a JS extension's TS source,
+ * the path plus each extension, then `<path>/index.<ext>`.
+ */
+export function importCandidates(abs: string): string[] {
+  const out = [abs];
+  const ext = posix.extname(abs.split(sep).join(posix.sep));
+  for (const ts of JS_TO_TS[ext] ?? []) {
+    out.push(abs.slice(0, abs.length - ext.length) + ts);
+  }
+  for (const e of RESOLVE_EXTENSIONS) {
+    out.push(abs + e);
+  }
+  for (const e of RESOLVE_EXTENSIONS) {
+    out.push(join(abs, `index${e}`));
+  }
+  return out;
+}
+
 function relativeImports(source: string): string[] {
   const out: string[] = [];
   const re = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)["'](\.{1,2}\/[^"']+)["']/g;
@@ -378,15 +403,24 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
       continue;
     }
     for (const spec of relativeImports(source)) {
-      const abs = resolve(dirname(join(root, file)), spec);
-      const rel = insideRoot(root, abs);
-      if (rel === undefined) {
-        if ((await kind(abs)) === "file") {
-          outside.add(abs);
+      // Resolve as the runtime would (extensionless, `.js` naming a `.ts`
+      // source, a directory's index), so a harness imported bundler-style is
+      // protected like one imported by its exact name.
+      let rel: string | undefined;
+      let outsideFile: string | undefined;
+      for (const candidate of importCandidates(resolve(dirname(join(root, file)), spec))) {
+        const inside = insideRoot(root, candidate);
+        if (inside !== undefined ? fileSet.has(inside) : (await kind(candidate)) === "file") {
+          rel = inside;
+          outsideFile = inside === undefined ? candidate : undefined;
+          break;
         }
+      }
+      if (outsideFile !== undefined) {
+        outside.add(outsideFile);
         continue;
       }
-      if (!fileSet.has(rel) || !inTestTree(rel)) {
+      if (rel === undefined || !inTestTree(rel)) {
         continue;
       }
       paths.add(rel);

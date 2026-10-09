@@ -337,6 +337,18 @@ describe("launching a board run", () => {
     expect(live).toContain("examples/changes/audit-logging.change.yaml");
   });
 
+  it("runs the storefront app on the board from its goal, project, gate, and app, like any real-app template", () => {
+    const storefront = templateById("storefront")!;
+    expect(storefront.app).toBe("storefront");
+    const args = runBoardArgs(storefront, "x", dial, "console");
+    const line = args.join(" ");
+    expect(line).toContain("run-board");
+    expect(line).toContain("examples/goals/storefront-correct-and-safe.goal.txt");
+    expect(line).toContain("examples/apps/storefront");
+    expect(args).toContain("--gate");
+    expect(args[args.indexOf("--deploy-app-name") + 1]).toBe("switchyard-change-fabric-storefront");
+  });
+
   it("passes --decide-contracts only for an automatic policy", () => {
     expect(runBoardArgs(serviceApi, "x", dial, "accept").slice(-2)).toEqual(["--decide-contracts", "accept"]);
     expect(runBoardArgs(serviceApi, "x", dial, "reject").slice(-2)).toEqual(["--decide-contracts", "reject"]);

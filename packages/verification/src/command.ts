@@ -121,6 +121,8 @@ export interface ChildProcessCommandRunnerOptions {
   readonly maxBuffer?: number;
   /** The parent environment to allowlist from (default process.env). */
   readonly parentEnv?: NodeJS.ProcessEnv;
+  /** Variables the runtime itself sets for the command (added after the allowlist; never a credential). */
+  readonly extraEnv?: Readonly<Record<string, string>>;
 }
 
 /**
@@ -149,7 +151,7 @@ export class ChildProcessCommandRunner implements CommandRunner {
     }
     const temp = await mkdtemp(join(tmpdir(), "scf-cmd-"));
     try {
-      return await this.spawnIn(program, args, cwd, gateEnvironment(this.options.parentEnv ?? process.env, temp));
+      return await this.spawnIn(program, args, cwd, { ...gateEnvironment(this.options.parentEnv ?? process.env, temp), ...(this.options.extraEnv ?? {}) });
     } finally {
       await rm(temp, { recursive: true, force: true }).catch(() => undefined);
     }

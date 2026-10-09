@@ -21,6 +21,7 @@ make install
 make check   # typecheck + build + test, offline and deterministic
 make demo    # the whole flow end to end with the noop executor, no Cloudflare
 make demo-board  # agents form around a goal on the Change board and build tools for each other (offline, deterministic)
+make demo-board-storefront  # the same board on the larger multi-domain storefront app (offline, deterministic)
 ```
 
 ## Live run
@@ -55,11 +56,22 @@ make demo-board  # agents form around a goal on the Change board and build tools
      redeployed in place at the same URL. The app's home page (`GET /`) is an
      interactive tester that runs the gate's 18 checks: about 6 of 18 pass on the
      broken app, 18 of 18 after the fix.
+   - **Make a storefront correct and safe (board):** a larger TypeScript app,
+     `examples/apps/storefront` (catalog, orders, billing over shared money,
+     http, and auth contracts, with a lockfile). Choose "agents on the board":
+     the fix repeats one change across many handlers, splits billing into
+     several sub-changes, changes the shared money contract, and contradicts
+     one existing test that pins the old tax rounding, so the run asks you to
+     accept or reject that test change (rejecting it leaves the gate failing,
+     honestly). Its home page is a tester: about 1 of 16 checks correct before,
+     16 of 16 after. See its [README](examples/apps/storefront/README.md).
 
    Each launch gets a fresh unique Change id. **Tear down** deletes that run's
    Artifact repos (and the deployed app, if any).
 
 CLI equivalents: `make run-live-service` (the service-api fix),
+`make run-board-storefront` (the storefront on the board; `DECIDE=accept|reject`
+answers the test contract change from the CLI),
 `make run-live-watch` / `make demo-live` (the audit-logging run, repos left up;
 remove them with `make clean-live`).
 

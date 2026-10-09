@@ -84,7 +84,7 @@ export interface Template {
 
 /**
  * The shipped templates. ONE is the simple intro (the audit-logging change);
- * the other is a REAL small web app the fabric fixes.
+ * the others are REAL small web apps the fabric fixes.
  *
  *   - audit-logging: the simple intro. A layered 3-agent change where two units
  *     declare the same shared file, so it ESCALATES and pauses for a human.
@@ -93,6 +93,12 @@ export interface Template {
  *     Every resource skips validation and auth; the fabric recruits one agent per
  *     resource. A verified fix redeploys IN PLACE only when the app was manually
  *     Deployed first; otherwise it promotes to Git with no live URL.
+ *   - storefront: a multi-domain TypeScript store (catalog, orders, billing)
+ *     whose gaps give each board path a reason to happen: a repeated change
+ *     across handlers, a billing domain with several sub-changes, a shared money
+ *     contract that must change, and one existing test pinning the old tax
+ *     rounding (a human contract decision). run-live has no contract route, so
+ *     there the pinned test is restored and the gate stays failing, honestly.
  */
 export const TEMPLATES: readonly Template[] = [
   {
@@ -122,6 +128,20 @@ export const TEMPLATES: readonly Template[] = [
     source: { kind: "goal", goalFile: "examples/goals/service-api-validation-auth.goal.txt" },
     projectDir: "examples/apps/service-api",
     app: "service-api",
+  },
+  {
+    id: "storefront",
+    name: "Make a storefront correct and safe (board)",
+    description: "A TypeScript store with money, tax, refund, and auth bugs across three domains; best run with agents on the board.",
+    whatItDoes:
+      "storefront: one Cloudflare Worker in TypeScript with a catalog (products, categories, search), orders (cart, checkout, history), and billing (invoices, payments, tax, refunds) over shared money, http, and auth contracts, with a lockfile, so the run installs dependencies before its gate.",
+    problemItSolves:
+      "Money is floating-point dollars, so a $19.99 price reads back as 1998 cents and tax is truncated; refunds and payments are uncapped; writes and customer data need no token; inputs and page sizes are unchecked. The gate (typecheck, the existing tests, and an acceptance suite) passes only when all of it is fixed. The fix repeats one change across many handlers, splits billing into several sub-changes, changes the shared money contract, and contradicts one existing test that pins the old tax rounding: changing that test is a contract change you decide (on the board). Its home page is a tester: about 1 of 16 checks correct before the fix, 16 of 16 after.",
+    agentCountHint: "about 4 to 8 agents",
+    escalates: false,
+    source: { kind: "goal", goalFile: "examples/goals/storefront-correct-and-safe.goal.txt" },
+    projectDir: "examples/apps/storefront",
+    app: "storefront",
   },
 ];
 
