@@ -23,12 +23,31 @@
  *      touches the contract (existing tests, gate config) proposes a contract
  *      change per protected entry, waits for the decision, and claims again;
  *   7. otherwise wait.
+ * Tools (agents build tools for each other), woven into the rules above:
+ *   - the lead seeds tools itself when the structural rule fires (see
+ *     BoardAgent's seed turn); otherwise, when free and the planned items
+ *     share a repeated mechanical change (`detectBoardToolNeed`), a worker
+ *     proposes a scanner and, as another agent, a codemod; one tool per agent;
+ *   - claim your own accepted tool item, or a lead-seeded one, first, and
+ *     build it (a rebuild after a failed gate, bounded);
+ *   - on a held item with no push yet: run a published scanner over its files,
+ *     then a published codemod on the files the scanner flagged (fall back to
+ *     an edit when it changed nothing); with no published tool, edit by hand
+ *     at once: tools are accelerators, never prerequisites (no waiting);
+ *   - as a scanner's builder, turn findings no outstanding item covers into
+ *     one proposal citing the tool (the lead decides it); run the scanner over
+ *     the whole repo right after publishing, then again over each new passing
+ *     revision (a sweep, bounded);
+ *   - as the lead, accept a tool proposal, and accept a proposal from a
+ *     tool's findings unless an outstanding item already covers its files.
  * No rule names a file, an app, or a goal: the same policy runs unchanged on any
  * repo.
  */
 
 import {
+  detectBoardToolNeed,
   entriesOverlap,
+  entryWithin,
   hasWildcard,
   intentPath,
   overlappingEntries,
@@ -130,6 +149,243 @@ export function duplicateOf(
   return undefined;
 }
 
+type BoardTools = NonNullable<Input["board"]["tools"]>;
+type BoardToolFact = BoardTools[number];
+
+/** The latest published version of a tool, if any. */
+function latest(tool: BoardToolFact): BoardToolFact["versions"][number] | undefined {
+  return tool.versions.at(-1);
+}
+
+/** True when a tool's declared inputs cover `file` (no inputs: the whole repo). */
+function toolCovers(tool: BoardToolFact, file: string): boolean {
+  return tool.inputs.length === 0 || tool.inputs.some((g) => entryWithin(file, g));
+}
+
+/**
+ * True when an OUTSTANDING item already covers `file`: an open (or contested)
+ * item's scope hint, a claimed item's write intent (its owner narrowed the rest
+ * away), or an undecided proposal's scope. Done, rejected, and split items and
+ * tool items cover nothing.
+ */
+export function coveredByOutstanding(
+  file: string,
+  items: NonNullable<Input["board"]["items"]>,
+  pending: NonNullable<Input["board"]["pendingItems"]>,
+): boolean {
+  const within = (entries: readonly string[]) => entries.some((e) => entryWithin(file, intentPath(e)));
+  for (const item of items) {
+    if (item.tool !== undefined) {
+      continue;
+    }
+    if ((item.status === "open" || item.status === "contested") && within(item.scopeHint)) {
+      return true;
+    }
+    if (item.status === "claimed" && within(item.write ?? item.scopeHint)) {
+      return true;
+    }
+  }
+  return pending.some((p) => p.tool === undefined && within(p.scopeHint));
+}
+
+/** The concrete, unprotected repo files a write intent covers. */
+function filesOf(input: Input, write: readonly string[]): string[] {
+  return input.repo.files.filter(
+    (f) => write.some((w) => matchesGlob(f, intentPath(w))) && !input.digest.protected.some((p) => entryWithin(f, p) || f === p),
+  );
+}
+
+/**
+ * True when building a tool should stop: its own gate failed twice, or two
+ * build attempts were refused (for example a rebuild that changed nothing),
+ * or three builds were tried.
+ */
+function toolBuildsSpent(input: Input, capability: string, ownerFailures: number): boolean {
+  const builds = input.capsule.decisions.filter((h) => h.action.type === "build_tool" && h.action.capability === capability);
+  return ownerFailures >= 2 || builds.filter((h) => h.outcome !== "posted").length >= 2 || builds.length >= 3;
+}
+
+/** The tool actions of a worker, or undefined when no tool rule applies. */
+function toolAction(input: Input, stage: "held" | "free"): AgentAction | undefined {
+  const d = input.digest;
+  const me = input.agent;
+  const decisions = input.capsule.decisions;
+  const tools = input.board.tools ?? [];
+  const items = input.board.items ?? [];
+  const pending = input.board.pendingItems ?? [];
+
+  if (stage === "held") {
+    // My own accepted tool item comes first, even while I hold other work:
+    // others may be waiting for it.
+    for (const tool of tools) {
+      if (tool.proposedBy !== me || tool.status !== "open") {
+        continue;
+      }
+      const refused = decisions.filter((h) => h.action.type === "claim" && h.action.itemId === tool.item && h.outcome !== "posted").length;
+      if (refused < 2) {
+        return { type: "claim", itemId: tool.item, intent: { read: [], write: [`tools/${tool.capability}/**`] }, rationale: `building the tool I proposed (${tool.capability})` };
+      }
+    }
+    // Build a tool item I hold (a rebuild after a failed gate, bounded).
+    for (const claim of d.claims) {
+      const tool = tools.find((t) => t.item === claim.item);
+      if (!tool || tool.versions.length > 0 || toolBuildsSpent(input, tool.capability, tool.ownerFailures ?? tool.failedGates)) {
+        continue;
+      }
+      return {
+        type: "build_tool",
+        capability: tool.capability,
+        rationale: tool.failedGates > 0 ? `rebuilding ${tool.capability} after its own gate failed` : `building the ${tool.kind} ${tool.capability} other agents will run`,
+      };
+    }
+
+    // Findings of a scanner I built that no outstanding item covers become one proposal.
+    const proposed = decisions.flatMap((h) => (h.action.type === "propose_item" && h.action.fromTool !== undefined ? h.action.scopeHint : []));
+    for (const m of input.messages) {
+      if (m.type !== "tool.used" || (m.payload.findings ?? []).length === 0) {
+        continue;
+      }
+      const tool = tools.find((t) => t.capability === m.payload.capability);
+      const version = tool?.versions.find((v) => v.version === m.payload.version);
+      if (!tool || !version || version.publishedBy !== me) {
+        continue;
+      }
+      const findings = m.payload.findings ?? [];
+      const files = [...new Set(findings.map((f) => f.path))]
+        .filter((f) => !coveredByOutstanding(f, items, pending) && !proposed.includes(f) && !d.protected.some((p) => entryWithin(f, p) || f === p))
+        .sort();
+      if (files.length === 0) {
+        continue;
+      }
+      const places = findings.filter((f) => files.includes(f.path)).length;
+      return {
+        type: "propose_item",
+        objective: `Apply the change ${tool.capability} finds at ${places} place(s) that no outstanding item covers: ${files.join(", ")}`.slice(0, 500),
+        acceptance: [`${tool.capability} finds nothing left in ${files.join(", ")}`.slice(0, 500), "the change gate passes on an integrated revision that merges this item's push"],
+        scopeHint: files.slice(0, 64),
+        fromTool: { capability: tool.capability, version: version.version },
+        rationale: `${m.payload.by === me ? "my" : `${m.payload.by}'s`} run of ${tool.capability}@${version.version} (seq ${m.seq}) found ${places} place(s) no outstanding item covers`,
+      };
+    }
+
+    // Held items with no push of mine yet: a published scanner, then a codemod.
+    for (const claim of d.claims) {
+      if (tools.some((t) => t.item === claim.item) || claim.fix !== undefined || (claim.lastPush && claim.lastPush.agent === me)) {
+        continue;
+      }
+      const files = filesOf(input, claim.intent.write);
+      const usedOn = (capability: string) =>
+        decisions.filter((h) => h.action.type === "use_tool" && h.action.capability === capability && h.action.itemId === claim.item);
+      const scanner = tools.find((t) => t.kind === "scanner" && latest(t) !== undefined && files.some((f) => toolCovers(t, f)));
+      const codemod = tools.find((t) => t.kind === "codemod" && latest(t) !== undefined && files.some((f) => toolCovers(t, f)));
+      if (scanner && usedOn(scanner.capability).length === 0) {
+        return {
+          type: "use_tool",
+          capability: scanner.capability,
+          version: latest(scanner)!.version,
+          args: files.filter((f) => toolCovers(scanner, f)),
+          itemId: claim.item,
+          rationale: `finding every place in item ${claim.item} that needs the change before editing`,
+        };
+      }
+      if (codemod && usedOn(codemod.capability).length === 0) {
+        const scan = scanner ? usedOn(scanner.capability).at(-1) : undefined;
+        const flagged = scan?.note?.files !== undefined ? scan.note.files.split(",").filter((f) => files.includes(f)) : undefined;
+        const targets = flagged ?? files.filter((f) => toolCovers(codemod, f));
+        if (targets.length > 0) {
+          return {
+            type: "use_tool",
+            capability: codemod.capability,
+            version: latest(codemod)!.version,
+            args: targets,
+            itemId: claim.item,
+            rationale: `applying the repeated change with ${codemod.capability} instead of editing ${targets.length} file(s) by hand`,
+          };
+        }
+      }
+      // Tools are accelerators, never prerequisites: with no published tool
+      // for this item, it is edited by hand now (the normal edit below).
+    }
+    return undefined;
+  }
+
+  // Free: my own accepted tool item first, then a tool the lead seeded
+  // (other agents' items wait for it).
+  const plannedTools = new Set(items.filter((i) => i.tool !== undefined && i.planned === true).map((i) => i.item));
+  for (const tool of [...tools.filter((t) => t.proposedBy === me), ...tools.filter((t) => t.proposedBy !== me && plannedTools.has(t.item))]) {
+    if (tool.status !== "open") {
+      continue;
+    }
+    const refused = decisions.filter((h) => h.action.type === "claim" && h.action.itemId === tool.item && h.outcome !== "posted").length;
+    if (refused < 2) {
+      return {
+        type: "claim",
+        itemId: tool.item,
+        intent: { read: [], write: [`tools/${tool.capability}/**`] },
+        rationale: tool.proposedBy === me ? `building the tool I proposed (${tool.capability})` : `building the ${tool.kind} ${tool.capability} the lead seeded; other items wait for it`,
+      };
+    }
+  }
+
+  // A repeated mechanical change across the planned items: propose a tool for it (one per agent).
+  if (!decisions.some((h) => h.action.type === "propose_tool")) {
+    const need = detectBoardToolNeed(
+      items
+        .filter((i) => i.planned === true)
+        .map((i) => ({ item: i.item, scopeHint: i.scopeHint, status: i.status, objective: i.objective, ...(i.tool !== undefined || i.fromTool !== undefined ? { tool: true } : {}) })),
+      input.repo.files,
+      { protected: d.protected },
+    );
+    if (need) {
+      const has = (capability: string) => tools.some((t) => t.capability === capability);
+      const why = `${need.items.length} items (${need.items.join(", ")}) apply the same "${need.editKind}" change across ${need.files.length} files`;
+      if (!has(need.scanner)) {
+        return {
+          type: "propose_tool",
+          capability: need.scanner,
+          kind: "scanner",
+          why: `${why}: a scanner finds every place in the repository that needs it, including any the plan missed`,
+          // A scanner looks everywhere (no inputs: the whole repository); only a codemod's changes are scoped.
+          inputs: [],
+          outputs: ["findings"],
+        };
+      }
+      if (!has(need.codemod)) {
+        return {
+          type: "propose_tool",
+          capability: need.codemod,
+          kind: "codemod",
+          why: `${why}: one codemod applies it the same way everywhere instead of hand edits`,
+          inputs: [...need.scope],
+          outputs: ["edits"],
+        };
+      }
+    }
+  }
+
+  // A scanner I built: re-run it over the latest passing revision when new code landed (a sweep).
+  const rev = d.integrated?.n ?? 0;
+  for (const tool of tools) {
+    const version = latest(tool);
+    if (tool.kind !== "scanner" || !version || version.publishedBy !== me) {
+      continue;
+    }
+    const sweeps = decisions.filter((h) => h.action.type === "use_tool" && h.action.capability === tool.capability && h.action.itemId === undefined);
+    const lastRev = Number(sweeps.at(-1)?.note?.rev ?? 0);
+    // The first sweep right after publishing (the whole repo as it is), then one per new passing revision.
+    if ((sweeps.length === 0 || rev > lastRev) && sweeps.length < 4) {
+      return {
+        type: "use_tool",
+        capability: tool.capability,
+        version: version.version,
+        args: [],
+        rationale: rev === 0 ? `running ${tool.capability} over the whole repository to find every place that needs the change` : `re-running ${tool.capability} over revision ${rev} to find any place still missing the change`,
+      };
+    }
+  }
+  return undefined;
+}
+
 function decide(input: Input): AgentAction {
   const d = input.digest;
   const me = input.agent;
@@ -153,6 +409,30 @@ function decide(input: Input): AgentAction {
       };
     }
     const proposal = input.board.pendingItems?.[0];
+    if (proposal?.tool !== undefined) {
+      // A tool is internal work: it must pass its own gate, and it never counts toward the Change.
+      return {
+        type: "decide_item",
+        itemId: proposal.item,
+        decision: "accept",
+        rationale: `${proposal.tool} is a tool other agents can run instead of repeating hand edits; it is published only if it passes its own gate`,
+      };
+    }
+    if (proposal?.fromTool !== undefined) {
+      const covered = proposal.scopeHint.filter((f) => coveredByOutstanding(f, input.board.items ?? [], (input.board.pendingItems ?? []).filter((p) => p.item !== proposal.item)));
+      const empty = proposal.scopeHint.length === 0;
+      return {
+        type: "decide_item",
+        itemId: proposal.item,
+        decision: covered.length === 0 && !empty ? "accept" : "reject",
+        rationale:
+          covered.length === 0 && !empty
+            ? `${proposal.item} is new work: ${proposal.fromTool.capability} found it in files no outstanding item covers`
+            : empty
+              ? `${proposal.item} is not taken: it declares no scope`
+              : `${proposal.item} duplicates outstanding work: ${covered.join(", ")} is already covered`,
+      };
+    }
     if (proposal) {
       const dup = duplicateOf(proposal, input.board.items ?? []);
       return {
@@ -236,6 +516,11 @@ function decide(input: Input): AgentAction {
   }
 
   // 5. Work on held items: a requested fix first.
+  const fixFirst = d.claims.some((c) => c.fix !== undefined);
+  const toolTurn = fixFirst ? undefined : toolAction(input, "held");
+  if (toolTurn) {
+    return toolTurn;
+  }
   for (const claim of d.claims) {
     if (claim.fix !== undefined) {
       const failedFixes = decisions.filter(
@@ -250,7 +535,12 @@ function decide(input: Input): AgentAction {
       }
     }
   }
+  const toolItems = new Set((input.board.tools ?? []).map((t) => t.item));
   for (const claim of d.claims) {
+    // A tool item is built (build_tool above), never edited or proposed done.
+    if (toolItems.has(claim.item)) {
+      continue;
+    }
     // No push yet, or only the previous owner's (a handed-off item): edit it.
     if (!claim.lastPush || claim.lastPush.agent !== me) {
       const failedEdits = decisions.filter((h) => h.action.type === "edit" && h.action.itemId === claim.item && h.outcome !== "posted").length;
@@ -268,9 +558,22 @@ function decide(input: Input): AgentAction {
   //    it touches the contract (PROTECTED) goes through the contract route:
   //    propose the change for each protected entry it needs, wait for the
   //    decision, then claim once more (a second PROTECTED refusal gives up).
-  const free = d.pending.length === 0 && d.claims.every((c) => c.doneProposed && c.fix === undefined);
+  // A tool whose builds are spent no longer keeps its builder from other work.
+  const spentTools = new Set(
+    (input.board.tools ?? [])
+      .filter((t) => t.versions.length === 0 && toolBuildsSpent(input, t.capability, t.ownerFailures ?? t.failedGates))
+      .map((t) => t.item),
+  );
+  const free = d.pending.length === 0 && d.claims.every((c) => spentTools.has(c.item) || (c.doneProposed && c.fix === undefined));
   if (free) {
-    for (const open of d.openItems.filter((i) => i.scopeHint.length > 0)) {
+    const freeTurn = toolAction(input, "free");
+    if (freeTurn) {
+      return freeTurn;
+    }
+    // A worker's tool item is claimed by whoever proposed it (another agent's is left to it).
+    const seeded = new Set((input.board.items ?? []).filter((i) => i.tool !== undefined && i.planned === true).map((i) => i.item));
+    const otherTools = new Set((input.board.tools ?? []).filter((t) => t.proposedBy !== me && !seeded.has(t.item)).map((t) => t.item));
+    for (const open of d.openItems.filter((i) => i.scopeHint.length > 0 && !otherTools.has(i.item))) {
       const claims = decisions.filter((h) => h.action.type === "claim" && h.action.itemId === open.item);
       const last = claims.at(-1);
       if (last === undefined || last.outcome === "posted") {

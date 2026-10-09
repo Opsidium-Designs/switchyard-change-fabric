@@ -57,6 +57,8 @@ import {
   type BoardItem,
   combineAttribution,
   isAcceptedItem,
+  isChangeItem,
+  toolUnavailableReason,
   type BoardMessage,
   type BoardRules,
   type BoardState,
@@ -99,6 +101,7 @@ import {
   type CloudIntegrationWorkspace,
 } from "./cloud-board-integrator.ts";
 import { BoardOperatorClient, type JoinedWorkspace } from "./board-client.ts";
+import { executorToolAuthor, ToolBench, type ToolAuthor, type ToolGateRecord } from "./board-tools.ts";
 import { readTargetExcerpt, triageContract } from "./contract-triage.ts";
 import { deriveProtectedPaths, type ProtectedPaths } from "./protected-paths.ts";
 import type { TestInventory } from "@switchyard-change/verification";
@@ -190,6 +193,8 @@ export type BoardRunEvent =
   | { readonly kind: "integrated"; readonly revision: BoardRevision }
   | { readonly kind: "integration-not-recorded"; readonly reason: string }
   | { readonly kind: "nothing-to-integrate" }
+  /** The operator ran a tool's own gate on a build and recorded it (published only on a pass). */
+  | { readonly kind: "tool-gated"; readonly gate: ToolGateRecord }
   | FullLiveEvent;
 
 /** Why the agent phase ended. */
@@ -330,6 +335,18 @@ export interface RunBoardOptions {
   readonly cloudGateTimeoutMs?: number;
   /** Cloud integrator: how long to wait for the Workflow to settle at the end, in ms (default 30 minutes). */
   readonly cloudSettleTimeoutMs?: number;
+  /**
+   * Who writes an agent-built tool's files (default: the run's executor). The
+   * offline run uses the deterministic template author; every tool still has
+   * to pass its own gate before it is published.
+   */
+  readonly toolAuthor?: ToolAuthor;
+  /** A label for the tool author in the summary (for example the offline template). */
+  readonly toolAuthorLabel?: string;
+  /** Isolation limits for agent-built tools (their tests and runs). */
+  readonly toolTimeoutMs?: number;
+  /** The project's own syntax or type check, run on a codemod's output in the codemod's gate (when declared). */
+  readonly toolSyntaxCommand?: readonly string[];
   readonly onEvent?: (event: BoardRunEvent) => void;
 }
 
@@ -337,6 +354,8 @@ export interface RunBoardOptions {
 export interface RunBoardResult {
   readonly changeId: string;
   readonly stopReason: BoardStopReason;
+  /** Why the agent phase ended, in words (quiescence states how long the board was quiet). */
+  readonly stopDetail?: string;
   /** The whole board log and its reduced state, read back from the board. */
   readonly log: readonly BoardMessage[];
   readonly state: BoardState;
@@ -389,6 +408,10 @@ export interface RunBoardResult {
   /** The run's whole scratch directory when it is wider than `workRoot` (the offline run's control repos too). */
   readonly scratchRoot?: string;
   readonly cleanedUp: readonly string[];
+  /** Every tool gate the run's bench ran and recorded, in order. */
+  readonly toolGates?: readonly ToolGateRecord[];
+  /** The tool author's label (when the run set one). */
+  readonly toolAuthorLabel?: string;
 }
 
 /** The repo of one agent the integrator reads (no credential: it reads with fresh operator tokens). */
@@ -1029,7 +1052,7 @@ export class ContinuousBoardIntegrator {
  * the lead accepted it) that are neither split (its children carry it) nor done.
  */
 function outstanding(state: BoardState): BoardItem[] {
-  return Object.values(state.items).filter((i) => isAcceptedItem(i) && i.status !== "split" && i.status !== "done");
+  return Object.values(state.items).filter((i) => isChangeItem(i) && i.status !== "split" && i.status !== "done");
 }
 
 /**
@@ -1332,6 +1355,21 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     return found;
   };
   const runningAgents = () => workers.filter((w) => !w.stopped).map((w) => w.id);
+  // Agent-built tools: the tools repo (provisioned on the first build), each
+  // tool's own gate on the ORIGINAL code, pinned runs, engine-recorded uses.
+  // With the cloud integrator the tool gates still run here, in the driver.
+  const toolBench = new ToolBench({
+    operator,
+    workRoot,
+    projectDir: options.projectDir,
+    scrub,
+    secrets,
+    tokenTtlSeconds: Math.min(3600, Math.max(60, ttl)),
+    ...(options.toolTimeoutMs !== undefined ? { limits: { timeoutMs: options.toolTimeoutMs, testTimeoutMs: Math.max(options.toolTimeoutMs, 60_000) } } : {}),
+    ...(options.toolSyntaxCommand ? { syntaxCommand: options.toolSyntaxCommand } : {}),
+    onGate: (gate) => emit({ kind: "tool-gated", gate }),
+  });
+  const toolAuthor = options.toolAuthor ?? executorToolAuthor(executor);
   const makeAgent = (id: string, role: "worker" | "lead") =>
     new BoardAgent({
       id,
@@ -1352,6 +1390,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       fetchRevision,
       fetchPush,
       runningAgents,
+      tools: toolBench,
+      toolAuthor,
       ...(options.escalationModels ? { escalationModels: options.escalationModels } : {}),
       ...(role === "lead"
         ? {
@@ -1532,8 +1572,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         // Best-effort.
       }
     }
-    for (const worker of workers) {
-      const name = worker.joinedWorkspace?.workspaceName;
+    await toolBench.revokeTokens();
+    for (const name of [toolBench.workspaceName, ...workers.map((w) => w.joinedWorkspace?.workspaceName)]) {
       if (!name || cleanedUp.includes(name)) {
         continue;
       }
@@ -1604,7 +1644,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       // A worker's proposal awaiting the lead keeps the phase open (the lead
       // decides it next); once decided, only accepted items count.
       const awaitingLead = Object.values(state.items).some((i) => i.status === "proposed");
-      if (Object.values(state.items).some(isAcceptedItem) && owed.length === 0 && !awaitingLead) {
+      if (Object.values(state.items).some(isChangeItem) && owed.length === 0 && !awaitingLead) {
         return "all-items-done";
       }
       // Every outstanding item was spent by every agent still running: nobody
@@ -1688,7 +1728,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           quietSince = Date.now();
         } else if (Date.now() - quietSince >= budgets.quiescenceMs) {
           stopReason = "quiescent";
-          stopDetail = `every agent was idle and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s`;
+          stopDetail = `every agent was idle (none taking a turn), nothing was integrating or pending, and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s`;
           break;
         }
         await new Promise((resolve) => setTimeout(resolve, pollMs));
@@ -1718,6 +1758,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         }).catch(() => false);
       }
       await cleanupRepos();
+      await toolBench.dispose();
     }
   }
   emit({ kind: "agents-done", reason: stopReason!, ...(stopDetail ? { detail: stopDetail } : {}) });
@@ -1761,7 +1802,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     }
     const integratedItems = verdict === "verified" ? Object.values(finalState.items).filter((i) => i.lastPush?.integratedIn !== undefined).map((i) => i.id) : [];
     const excludedItems = Object.values(finalState.items)
-      .filter((i) => isAcceptedItem(i) && !integratedItems.includes(i.id))
+      .filter((i) => isChangeItem(i) && !integratedItems.includes(i.id))
       .map((i) => i.id);
     // A pass no gate checked is recorded as such (the control plane keeps the
     // flag; the run reports it as unverified).
@@ -1855,6 +1896,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     }
   } finally {
     await cleanupRepos();
+    // The bench's private root (tool checkouts, the baseline copy, scratch) is not part of any work root.
+    await toolBench.dispose();
   }
 
   const final = await operator.log();
@@ -1862,6 +1905,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   return {
     changeId,
     stopReason: stopReason!,
+    ...(stopDetail !== undefined ? { stopDetail } : {}),
     log: final.messages,
     state: final.state,
     turns,
@@ -1890,6 +1934,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     ...(deployment ? { deployment } : {}),
     workRoot,
     cleanedUp,
+    toolGates: [...toolBench.gates],
+    ...(options.toolAuthorLabel !== undefined ? { toolAuthorLabel: options.toolAuthorLabel } : {}),
   };
 }
 
@@ -1942,8 +1988,34 @@ function payloadSummary(m: BoardMessage): string {
       return p.role ? `role ${String(p.role)}` : "";
     case "agent.left":
       return "";
-    case "item.proposed":
-      return `${String(p.item)}: ${String(p.objective).slice(0, 70)} [scope ${list(p.scopeHint)}]`;
+    case "item.proposed": {
+      const from = p.fromTool as { capability: string; version: string } | undefined;
+      return `${String(p.item)}: ${String(p.objective).slice(0, 70)} [scope ${list(p.scopeHint)}]${from ? ` (from ${from.capability}@${from.version} findings)` : ""}`;
+    }
+    case "tool.proposed":
+      return `${String(p.kind)} ${String(p.capability)} -> item tool-${String(p.capability)}${(p.inputs as string[]).length > 0 ? ` [inputs ${list(p.inputs)}]` : ""}`;
+    case "tool.built":
+      return `${String(p.capability)} commit ${String(p.commit).slice(0, 10)} paths ${list(p.paths)}`;
+    case "tool.gated": {
+      const checks = p.checks as { check: string; passed: boolean; detail: string }[];
+      const failed = checks.filter((c) => !c.passed);
+      return (
+        `${String(p.capability)} commit ${String(p.commit).slice(0, 10)} tool gate ${p.passed ? "PASSED" : "FAILED"} ` +
+        `(${checks.map((c) => `${c.check} ${c.passed ? "ok" : "FAIL"}`).join(", ")})` +
+        (failed.length > 0 ? `: ${failed[0]!.detail.slice(0, 120)}` : "")
+      );
+    }
+    case "tool.published":
+      return `${String(p.capability)}@${String(p.version)} (${String(p.kind)}) commit ${String(p.commit).slice(0, 10)} in ${String(p.repo)}, verified${p.joinsGate === false ? "; joinsGate: false (a check does not join the gate in this slice)" : ""}`;
+    case "tool.used": {
+      const findings = (p.findings as { path: string }[] | undefined) ?? [];
+      const changed = p.changedFiles as string[];
+      return (
+        `${String(p.capability)}@${String(p.version)} by ${String(p.by)}${p.item ? ` for ${String(p.item)}` : " (sweep)"}` +
+        (changed.length > 0 ? `: changed ${changed.join(", ")} (push ${String(p.commit).slice(0, 10)})` : "") +
+        (findings.length > 0 ? `: ${findings.length} finding(s) in ${[...new Set(findings.map((f) => f.path))].join(", ")}` : changed.length === 0 ? ": nothing found or changed" : "")
+      );
+    }
     case "item.claimed":
       return `${String(p.item)} write ${list((p.intent as { write: string[] }).write)}`;
     case "claim.granted":
@@ -2001,7 +2073,7 @@ function payloadSummary(m: BoardMessage): string {
     case "rebase.needed":
       return `${String(p.agent)} onto rev ${String(p.n)}`;
     case "item.completed":
-      return `${String(p.item)} via rev ${String(p.n)}`;
+      return p.via === "tool" ? `${String(p.item)} via its own tool gate (published v${String(p.version)})` : `${String(p.item)} via rev ${String(p.n)}`;
     case "handoff":
       return `${String(p.item)} -> ${String(p.to)}`;
     default:
@@ -2037,11 +2109,73 @@ export function boardRunExitCode(
   return options.requirePromotion && result.promotion?.committed !== true ? 1 : 0;
 }
 
+/**
+ * The tool registry of a run, from the board: each tool, its builder, its own
+ * gate's evidence, its versions, and who used it (all from recorded messages).
+ */
+export function formatToolRegistry(result: Pick<RunBoardResult, "state" | "log" | "toolAuthorLabel">): string[] {
+  const proposals = Object.values(result.state.tools.proposed);
+  if (proposals.length === 0) {
+    return [];
+  }
+  const allGates = result.log.filter((m) => m.type === "tool.gated");
+  const passedGates = allGates.filter((m) => m.type === "tool.gated" && m.payload.passed).length;
+  const builds = result.log.filter((m) => m.type === "tool.built").length;
+  const uses = result.log.filter((m) => m.type === "tool.used").length;
+  const lines = [
+    `  tools: ${proposals.length} proposed, ${builds} built, ${allGates.length} gated (${passedGates} passed, ${allGates.length - passedGates} failed), ` +
+      `${result.state.tools.published.length} version(s) published, ${uses} use(s)${result.toolAuthorLabel ? ` (author: ${result.toolAuthorLabel})` : ""}`,
+  ];
+  for (const proposal of proposals) {
+    const item = result.state.items[proposal.item];
+    const versions = result.state.tools.published.filter((t) => t.capability === proposal.capability);
+    const gates = result.log.filter((m): m is Extract<BoardMessage, { type: "tool.gated" }> => m.type === "tool.gated" && m.payload.capability === proposal.capability);
+    const uses = result.log.filter((m): m is Extract<BoardMessage, { type: "tool.used" }> => m.type === "tool.used" && m.payload.capability === proposal.capability);
+    const users = [...new Set(uses.map((m) => m.payload.by))];
+    const status =
+      versions.length > 0
+        ? `published ${versions.map((v) => `v${v.version} (commit ${v.commit.slice(0, 10)})`).join(", ")} by ${versions.at(-1)!.publishedBy}`
+        : item?.status === "rejected"
+          ? "rejected by the lead"
+          : item?.status === "proposed"
+            ? "awaiting the lead"
+            : gates.length > 0
+              ? `NOT published: its own gate failed ${gates.length} time(s)`
+              : `not built (item ${item?.status ?? "?"})`;
+    lines.push(`    ${proposal.kind} ${proposal.capability}: proposed by ${proposal.proposedBy}; ${status}`);
+    const reopened = item?.exhaustedBy?.length ?? 0;
+    lines.push(
+      `      builds ${proposal.builds}, gates ${gates.filter((g) => g.payload.passed).length} passed / ${gates.filter((g) => !g.payload.passed).length} failed` +
+        (reopened > 0 ? `, reopened for another builder ${reopened} time(s) (spent by ${item!.exhaustedBy!.join(", ")})` : "") +
+        (item?.status === "claimed" && versions.length === 0 ? `, held by ${item.owner}` : ""),
+    );
+    const unavailable = toolUnavailableReason(result.state, proposal.capability);
+    if (unavailable !== undefined) {
+      lines.push(`      unavailable to the items it covers (they edit by hand): ${unavailable}`);
+    }
+    const last = gates.at(-1);
+    if (last) {
+      lines.push(`      tool gate (seq ${last.seq}): ${last.payload.checks.map((c) => `${c.check} ${c.passed ? "ok" : "FAIL"}: ${c.detail}`).join("; ").slice(0, 600)}`);
+    }
+    if (versions.some((v) => v.joinsGate === false)) {
+      lines.push("      joinsGate: false (a check tool does not join the Change's gate in this slice)");
+    }
+    if (uses.length > 0) {
+      lines.push(`      used ${uses.length} time(s) by ${users.join(", ")} (seqs ${uses.map((m) => m.seq).join(", ")})`);
+    }
+  }
+  const generated = Object.values(result.state.items).filter((i) => i.fromTool !== undefined);
+  for (const item of generated) {
+    lines.push(`    work from ${item.fromTool!.capability}@${item.fromTool!.version} findings: ${item.id} [${item.scopeHint.join(", ")}] (${item.status === "done" ? "completed" : item.status})`);
+  }
+  return lines;
+}
+
 /** A readable summary of a board run. */
 export function formatBoardRunSummary(result: RunBoardResult): string {
   // Only accepted items count: a worker's proposal the lead rejected (or never
   // decided) is not part of the Change.
-  const items = Object.values(result.state.items).filter(isAcceptedItem);
+  const items = Object.values(result.state.items).filter(isChangeItem);
   const done = items.filter((i) => i.status === "done").length;
   const waits = result.turns.filter((t) => t.action.type === "wait").length;
   const invalid = result.turns.filter((t) => t.invalid !== undefined).length;
@@ -2051,7 +2185,7 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     `  planner: ${result.seed.source}${result.seed.model ? ` (${result.seed.model})` : ""}, ${result.seed.items.length} item(s) proposed`,
     `  agents: ${result.agents.map((a) => `${a.id}${a.role === "lead" ? " (lead)" : ""}${a.stop ? ` [stopped: ${a.stop.detail}]` : ""}`).join(", ")}`,
     `  turns: ${result.turns.length} (${waits} wait(s), ${invalid} invalid model output(s), ${rejected.length} refused action(s))`,
-    `  agent phase ended: ${result.stopReason}`,
+    `  agent phase ended: ${result.stopReason}${result.stopDetail ? ` (${result.stopDetail})` : ""}`,
     ...(result.gateLabel !== undefined ? [`  gate: ${result.gateLabel}`] : []),
     `  baseline gate inventory: ${result.testInventory}`,
     `  contract (existing tests and gate configuration; changing one needs an accepted contract): ${result.protected.join(", ") || "none"}`,
@@ -2099,6 +2233,7 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     // Advisory accuracy, decided by what changed before the next passing gate.
     lines.push(`  ${formatAttributionTally(boardAttributionTally(result.state))}`);
   }
+  lines.push(...formatToolRegistry(result));
   const proposals = result.proposals ?? proposalOutcomes(result.state, result.log);
   const notCounted = [
     ...(proposals.rejected.length > 0 ? [`${proposals.rejected.length} worker proposal(s) rejected`] : []),

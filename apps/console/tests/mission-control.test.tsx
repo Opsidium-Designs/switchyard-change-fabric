@@ -39,6 +39,7 @@ import {
   MissionControl,
   Thread,
   Ticker,
+  ToolsRegistry,
   type BoardEscalationRecord,
 } from "../src/mission-control.tsx";
 import { templateById } from "../src/templates.ts";
@@ -226,6 +227,22 @@ describe("honesty labels", () => {
     const markup = render({ log: ungatedLog() });
     expect(markup).toContain("rev 1 [no gate: nothing checked]");
     expect(markup).not.toContain("GATE PASS");
+  });
+
+  it("lists the tool registry: capability, version, kind, builder, its own gate's evidence, and who used it", () => {
+    const model = buildBoardGraph(log);
+    const markup = renderToStaticMarkup(createElement(ToolsRegistry, { model }));
+    expect(markup).toContain("<th>Capability</th>");
+    expect(markup).toContain("<strong>scan-unguarded-routes</strong>");
+    expect(markup).toContain("v1 (t00l001)");
+    expect(markup).toContain("<td>scanner</td>");
+    expect(markup).toContain("<td>ag-4</td>");
+    expect(markup).toMatch(/passed: tests ok, finds ok \(seq \d+\)/);
+    expect(markup).toContain("ag-1 x1, ag-2 x2");
+    const tool = model.nodes.find((n) => n.kind === "tool")!;
+    const detail = renderToStaticMarkup(createElement(BoardNodeDetail, { node: tool }));
+    expect(detail).toContain("Tool gate evidence");
+    expect(detail).toContain("finds: ok - found 4 place(s) in 4 file(s) on the baseline");
   });
 
   it("describes a resolved attribution as where the pick landed, advisory", () => {

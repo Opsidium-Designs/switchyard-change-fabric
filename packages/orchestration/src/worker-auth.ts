@@ -10,12 +10,14 @@
  * token is only ever placed in the request header; it is never logged.
  */
 
+import { runtimeEnv } from "./credentials.ts";
+
 /** The environment variable holding the Worker API bearer token. */
 export const WORKER_API_TOKEN_ENV = "SWITCHYARD_API_TOKEN";
 
 /** Read the Worker API token from the environment, or undefined when unset/blank. */
 export function workerApiToken(
-  env: Readonly<Record<string, string | undefined>> = process.env,
+  env: Readonly<Record<string, string | undefined>> = runtimeEnv(),
 ): string | undefined {
   const token = (env[WORKER_API_TOKEN_ENV] ?? "").trim();
   return token === "" ? undefined : token;
@@ -29,7 +31,7 @@ export function workerApiToken(
  */
 export function withWorkerAuth(
   fetchFn: typeof fetch,
-  env: Readonly<Record<string, string | undefined>> = process.env,
+  env: Readonly<Record<string, string | undefined>> = runtimeEnv(),
 ): typeof fetch {
   const token = workerApiToken(env);
   if (token === undefined) {

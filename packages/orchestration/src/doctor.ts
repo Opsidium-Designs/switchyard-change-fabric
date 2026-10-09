@@ -13,6 +13,8 @@
  * with no network still finishes fast.
  */
 
+import { runtimeEnv } from "./credentials.ts";
+
 import { execFile } from "node:child_process";
 
 /** How a single check came out. */
@@ -48,7 +50,7 @@ export interface DoctorEnv {
 
 /** Run the full readiness check and return a structured report. */
 export async function runDoctor(options: DoctorEnv = {}): Promise<DoctorReport> {
-  const env = options.env ?? process.env;
+  const env = options.env ?? runtimeEnv();
   const runCommand = options.runCommand ?? defaultRunCommand;
 
   const checks: DoctorCheck[] = [];

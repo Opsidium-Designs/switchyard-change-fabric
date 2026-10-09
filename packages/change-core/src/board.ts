@@ -89,6 +89,17 @@ export const BOARD_LIMITS = {
   maxShortList: 32,
   maxRecipients: 16,
   maxTools: 200,
+  /** Findings one tool.used may carry, and the characters of each finding's message. */
+  maxToolFindings: 64,
+  maxToolFindingMessage: 200,
+  /** Checks one tool.gated may carry, the characters of each detail, and of its failing output. */
+  maxToolChecks: 16,
+  maxToolCheckDetail: 300,
+  maxToolOutput: 2000,
+  /** Times a tool item whose builds keep failing their own gate is reopened for another agent. */
+  toolReopens: 2,
+  /** Board messages a claim waits for an unpublished tool before the tool counts as unavailable. */
+  toolWaitMessages: 60,
   maxObjective: 500,
   maxAcceptance: 20,
   maxRationale: 2000,
@@ -133,6 +144,47 @@ export type BoardDecisionJuncture = "plan-review" | "attribution" | "fix-confide
 
 /** The juncture values, in order. */
 export const BOARD_DECISION_JUNCTURES: readonly BoardDecisionJuncture[] = ["plan-review", "attribution", "fix-confidence", "contract-triage"];
+
+/**
+ * The kinds of tool an agent can build for other agents:
+ *   - scanner: finds every place that needs a change (JSON lines {path, line?, message});
+ *   - codemod: applies one mechanical transform across many files;
+ *   - check: a scanner run in reverse (it FAILS while a violation remains);
+ *   - harness, repro, index: shared fixtures, a failing command for a bug, a
+ *     repo index other agents query instead of rereading files.
+ */
+export const TOOL_KINDS = ["scanner", "codemod", "check", "harness", "repro", "index"] as const;
+export type ToolKind = (typeof TOOL_KINDS)[number];
+
+/** Where every tool lives in the Change's tools repo: `tools/<capability>/`. */
+export const TOOLS_DIR = "tools";
+
+/** A tool capability: lower-case, at most 64 characters (it names a directory and a branch). */
+export const TOOL_CAPABILITY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/** The board item a tool proposal becomes (building the tool is claimable work). */
+export function toolItemId(capability: string): string {
+  return `tool-${capability}`;
+}
+
+/** The only path a tool's builder may write: its own directory in the tools repo. */
+export function toolScope(capability: string): string {
+  return `${TOOLS_DIR}/${capability}/**`;
+}
+
+/** One finding a tool reported: a repo path, an optional line, and a short message. */
+export interface BoardToolFinding {
+  readonly path: string;
+  readonly line?: number;
+  readonly message: string;
+}
+
+/** One named check of a tool's own gate and its outcome. */
+export interface BoardToolGateCheck {
+  readonly check: string;
+  readonly passed: boolean;
+  readonly detail: string;
+}
 
 /** The payload of each message type. */
 /** The baseline gate run's executed-test inventory, as posted with the goal. */
@@ -180,6 +232,12 @@ export interface BoardPayloads {
     readonly objective: string;
     readonly acceptance: readonly string[];
     readonly scopeHint: readonly string[];
+    /**
+     * The published tool whose findings this proposal comes from (a scanner's
+     * owner turning findings into work). Only that tool's builder may cite it;
+     * the proposal still needs the lead's acceptance.
+     */
+    readonly fromTool?: { readonly capability: string; readonly version: string };
   };
   /**
    * The lead (or a human) accepts an item a WORKER proposed: it becomes open
@@ -274,7 +332,17 @@ export interface BoardPayloads {
     readonly capsule: { readonly repo: string; readonly commit?: string };
   };
   "done.proposed": { readonly item: string; readonly commit?: string };
-  "item.completed": { readonly item: string; readonly n: number; readonly via: "integrated" | "children" };
+  /**
+   * Engine: an item completed. `via: integrated` and `children` cite the passing
+   * revision `n`; `via: tool` completes a tool item when its tool passed its own
+   * gate and was published (`version`), which no integrated revision decides.
+   */
+  "item.completed": {
+    readonly item: string;
+    readonly n?: number;
+    readonly via: "integrated" | "children" | "tool";
+    readonly version?: string;
+  };
   /** Engine: a failing revision implicated this item; its owner is asked (`to`) for fix `attempt`. */
   "fix.requested": { readonly item: string; readonly n: number; readonly attempt: number };
   /** Engine: a failing revision implicated this item after its fix budget was spent. */
@@ -284,13 +352,51 @@ export interface BoardPayloads {
    * DIFFERENT agent (fresh eyes), who starts from the previous owner's latest
    * push (`commit`); the previous owner may not claim it again.
    */
-  "item.reopened": { readonly item: string; readonly previousOwner: string; readonly commit?: string; readonly n: number };
+  "item.reopened": {
+    readonly item: string;
+    readonly previousOwner: string;
+    readonly commit?: string;
+    /** The failing revision; absent for a TOOL item, reopened after its builds failed their own gate. */
+    readonly n?: number;
+  };
+  /**
+   * An agent proposes a tool. It becomes a board item (`tool-<capability>`,
+   * scoped to `tools/<capability>/**`) that the lead accepts like any worker
+   * proposal; whoever claims it builds it. `inputs` are the repo paths or globs
+   * the tool acts on (a codemod must declare them: its intended scope);
+   * `outputs` name what it produces. The reason goes in the rationale.
+   */
   "tool.proposed": {
     readonly tool: string;
     readonly capability: string;
+    readonly kind: ToolKind;
     readonly inputs: readonly string[];
     readonly outputs: readonly string[];
   };
+  /** The tool item's owner pushed a build of the tool to the tools repo (paths inside its write intent). */
+  "tool.built": { readonly capability: string; readonly commit: string; readonly paths: readonly string[] };
+  /**
+   * Engine (recorded by the operator after it ran the tool's OWN gate on the
+   * built commit): the checks and their outcomes. A pass derives
+   * `tool.published`; a fail publishes nothing.
+   */
+  "tool.gated": {
+    readonly capability: string;
+    readonly commit: string;
+    readonly passed: boolean;
+    readonly checks: readonly BoardToolGateCheck[];
+    /** The tools repo the commit lives in (a name, never a credential). */
+    readonly repo: string;
+    /** How a consumer runs the tool (for example `node tools/<capability>/run.mjs [paths...]`). */
+    readonly usage: string;
+    /** A failing gate's bounded, credential-free output. */
+    readonly output?: string;
+  };
+  /**
+   * Engine (derived from a passing `tool.gated`): the tool is in the registry.
+   * `verified` is always true: only a tool that passed its own gate is ever
+   * published. A check tool does not join the Change's gate (`joinsGate: false`).
+   */
   "tool.published": {
     readonly tool: string;
     readonly capability: string;
@@ -298,11 +404,25 @@ export interface BoardPayloads {
     readonly repo: string;
     readonly commit: string;
     readonly verified: true;
+    readonly kind: ToolKind;
+    readonly usage: string;
+    readonly joinsGate?: false;
   };
+  /**
+   * Engine (recorded by the operator after the runtime ran the pinned tool
+   * version in the consumer's own repo): agents can never post a use record.
+   * A codemod's `changedFiles` were committed and announced as `commit`, the
+   * latest push of `item`, inside its write intent.
+   */
   "tool.used": {
     readonly capability: string;
     readonly version: string;
+    readonly by: string;
+    readonly item?: string;
+    readonly commit?: string;
     readonly changedFiles: readonly string[];
+    readonly findings?: readonly BoardToolFinding[];
+    readonly exit?: number;
   };
   /**
    * Engine: one ADVISORY typed decision (a plan review, a failure attribution,
@@ -386,6 +506,8 @@ export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "fix.exhausted",
   "item.reopened",
   "tool.proposed",
+  "tool.built",
+  "tool.gated",
   "tool.published",
   "tool.used",
   "decision.recorded",
@@ -485,6 +607,16 @@ export function isAcceptedItem(item: Pick<BoardItem, "status">): boolean {
   return item.status !== "proposed" && item.status !== "rejected";
 }
 
+/**
+ * True for an item that is part of the Change's deliverable: accepted (see
+ * `isAcceptedItem`) and not a tool item. A tool is internal infrastructure other
+ * agents run; it is decided by its own gate and reported in the tool registry,
+ * never counted toward (or against) the Change's completion.
+ */
+export function isChangeItem(item: Pick<BoardItem, "status" | "tool">): boolean {
+  return isAcceptedItem(item) && item.tool === undefined;
+}
+
 /** The latest push announced for an item, and the revision that merged it. */
 export interface BoardItemPush {
   readonly seq: number;
@@ -517,7 +649,7 @@ export interface BoardItem {
   claimant?: { readonly agent: string; intent: BoardIntent; contest: string };
   doneProposed: boolean;
   lastPush?: BoardItemPush;
-  completed?: { readonly n: number; readonly via: "integrated" | "children" };
+  completed?: { readonly n?: number; readonly via: "integrated" | "children" | "tool"; readonly version?: string };
   /** Fix requests failing revisions sent for this item so far. */
   fixAttempts?: number;
   /** The failing revision whose fix request is still unanswered (cleared by the owner's next push). */
@@ -528,6 +660,14 @@ export interface BoardItem {
   exhaustedBy?: string[];
   /** The previous owner's latest push a reopened item starts from. */
   reopenedFrom?: { readonly agent: string; readonly commit?: string };
+  /** A tool item: building the tool `capability` (its own gate decides it, not an integrated revision). */
+  readonly tool?: { readonly capability: string; readonly kind: ToolKind };
+  /** A tool item's builds that failed their own gate under its current owner. */
+  toolFailures?: number;
+  /** A tool item's latest build (tool.built) and, once recorded, its own gate's outcome. */
+  toolBuild?: { readonly commit: string; readonly paths: readonly string[]; readonly seq: number; gated?: boolean; passed?: boolean };
+  /** The published tool whose findings this item was proposed from. */
+  readonly fromTool?: { readonly capability: string; readonly version: string };
   /** The seq at which a human last rejected a contract change for this item. */
   contractRejectedSeq?: number;
   /** The seq of the latest failing revision whose evidence implicated this item. */
@@ -593,9 +733,16 @@ export interface BoardReview {
 export interface BoardToolProposal {
   readonly tool: string;
   readonly capability: string;
+  readonly kind: ToolKind;
   readonly inputs: readonly string[];
   readonly outputs: readonly string[];
   readonly proposedBy: string;
+  readonly seq: number;
+  /** The board item building it is (tool-<capability>). */
+  readonly item: string;
+  /** Builds pushed (tool.built) and builds whose own gate failed. */
+  builds: number;
+  failedGates: number;
 }
 
 export interface BoardPublishedTool {
@@ -604,8 +751,15 @@ export interface BoardPublishedTool {
   readonly version: string;
   readonly repo: string;
   readonly commit: string;
+  readonly kind: ToolKind;
+  readonly usage: string;
+  /** The agent that built it (the tool item's owner when its gate passed). */
   readonly publishedBy: string;
   readonly seq: number;
+  /** The tool.gated message whose checks it passed (the gate evidence). */
+  readonly gateSeq: number;
+  /** A check tool never joins the Change's gate in this slice. */
+  readonly joinsGate?: false;
   /** How many tool.used messages pinned this version (the uses stay in the log). */
   uses: number;
 }
@@ -979,6 +1133,75 @@ function testInventory(value: unknown): BoardTestInventory {
   };
 }
 
+/** A tool capability id (lower-case; it names the tool's directory and branch). */
+function capability(raw: Raw, field = "capability"): string {
+  const value = raw[field];
+  if (typeof value !== "string" || !TOOL_CAPABILITY_PATTERN.test(value)) {
+    fail("BAD_PAYLOAD", `${field} must be a tool capability (lower-case letters, digits, . _ -; at most 64 chars)`);
+  }
+  return value;
+}
+
+function bool(raw: Raw, field: string): boolean {
+  if (typeof raw[field] !== "boolean") {
+    fail("BAD_PAYLOAD", `${field} must be a boolean`);
+  }
+  return raw[field] as boolean;
+}
+
+/** Bounded tool findings: {path (concrete repo path), line?, message}. */
+function toolFindings(value: unknown): BoardToolFinding[] {
+  const L = BOARD_LIMITS;
+  if (!Array.isArray(value) || value.length > L.maxToolFindings) {
+    fail("BAD_PAYLOAD", `findings must be an array of at most ${L.maxToolFindings} findings`);
+  }
+  return value.map((finding, index) => {
+    if (!isRecord(finding)) {
+      fail("BAD_PAYLOAD", `findings[${index}] must be an object {path, line?, message}`);
+    }
+    for (const key of Object.keys(finding)) {
+      if (!["path", "line", "message"].includes(key)) {
+        fail("BAD_PAYLOAD", `findings[${index}] has an unknown field ${JSON.stringify(key)}`);
+      }
+    }
+    const [path] = pathList({ path: [finding.path] }, "path", { concrete: true });
+    const line = finding.line === undefined ? undefined : positiveInt(finding, "line");
+    return { path: path!, ...(line !== undefined ? { line } : {}), message: text(finding, "message", L.maxToolFindingMessage) };
+  });
+}
+
+/** Bounded tool-gate checks: {check (id), passed, detail}. */
+function toolChecks(value: unknown): BoardToolGateCheck[] {
+  const L = BOARD_LIMITS;
+  if (!Array.isArray(value) || value.length === 0 || value.length > L.maxToolChecks) {
+    fail("BAD_PAYLOAD", `checks must be a non-empty array of at most ${L.maxToolChecks} checks`);
+  }
+  return value.map((check, index) => {
+    if (!isRecord(check)) {
+      fail("BAD_PAYLOAD", `checks[${index}] must be an object {check, passed, detail}`);
+    }
+    for (const key of Object.keys(check)) {
+      if (!["check", "passed", "detail"].includes(key)) {
+        fail("BAD_PAYLOAD", `checks[${index}] has an unknown field ${JSON.stringify(key)}`);
+      }
+    }
+    return { check: id(check, "check"), passed: bool(check, "passed"), detail: text(check, "detail", L.maxToolCheckDetail) };
+  });
+}
+
+/** An optional {capability, version} reference to a published tool. */
+function toolRef(value: unknown, field: string): { capability: string; version: string } {
+  if (!isRecord(value)) {
+    fail("BAD_PAYLOAD", `${field} must be an object {capability, version}`);
+  }
+  for (const key of Object.keys(value)) {
+    if (key !== "capability" && key !== "version") {
+      fail("BAD_PAYLOAD", `${field} has an unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  return { capability: capability(value), version: id(value, "version") };
+}
+
 /** Validate and normalize one payload by type. */
 function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMessageType] {
   const L = BOARD_LIMITS;
@@ -1001,6 +1224,7 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         objective: text(raw, "objective", L.maxObjective),
         acceptance: textList(raw, "acceptance", L.maxAcceptance, L.maxObjective),
         scopeHint: pathList(raw, "scopeHint", { optional: true, max: L.maxIntentEntries }),
+        ...(raw.fromTool !== undefined ? { fromTool: toolRef(raw.fromTool, "fromTool") } : {}),
       };
     case "item.claimed":
       return { item: id(raw, "item"), intent: intent(raw, "intent") };
@@ -1124,46 +1348,89 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
       const commit = optionalId(raw, "commit");
       return { item: id(raw, "item"), ...(commit !== undefined ? { commit } : {}) };
     }
-    case "item.completed":
-      return {
-        item: id(raw, "item"),
-        n: positiveInt(raw, "n"),
-        via: oneOf(raw, "via", ["integrated", "children"] as const),
-      };
+    case "item.completed": {
+      const via = oneOf(raw, "via", ["integrated", "children", "tool"] as const);
+      if (via === "tool") {
+        if (raw.n !== undefined) {
+          fail("BAD_PAYLOAD", "a tool item completes by its own gate, not by an integrated revision (no n)");
+        }
+        return { item: id(raw, "item"), via, version: id(raw, "version") };
+      }
+      if (raw.version !== undefined) {
+        fail("BAD_PAYLOAD", "version belongs to a tool item's completion");
+      }
+      return { item: id(raw, "item"), n: positiveInt(raw, "n"), via };
+    }
     case "fix.requested":
       return { item: id(raw, "item"), n: positiveInt(raw, "n"), attempt: positiveInt(raw, "attempt") };
     case "fix.exhausted":
       return { item: id(raw, "item"), n: positiveInt(raw, "n"), attempts: nonNegativeInt(raw, "attempts") };
     case "item.reopened": {
       const commit = optionalId(raw, "commit");
-      return { item: id(raw, "item"), previousOwner: id(raw, "previousOwner"), n: positiveInt(raw, "n"), ...(commit !== undefined ? { commit } : {}) };
+      const n = raw.n === undefined ? undefined : positiveInt(raw, "n");
+      return { item: id(raw, "item"), previousOwner: id(raw, "previousOwner"), ...(n !== undefined ? { n } : {}), ...(commit !== undefined ? { commit } : {}) };
     }
     case "tool.proposed":
       return {
         tool: id(raw, "tool"),
-        capability: id(raw, "capability"),
-        inputs: idList(raw, "inputs", { optional: true }),
+        capability: capability(raw),
+        kind: oneOf(raw, "kind", TOOL_KINDS),
+        inputs: pathList(raw, "inputs", { optional: true, max: L.maxIntentEntries }),
         outputs: idList(raw, "outputs", { optional: true }),
+      };
+    case "tool.built":
+      return { capability: capability(raw), commit: id(raw, "commit"), paths: pathList(raw, "paths", { concrete: true }) };
+    case "tool.gated":
+      return {
+        capability: capability(raw),
+        commit: id(raw, "commit"),
+        passed: bool(raw, "passed"),
+        checks: toolChecks(raw.checks),
+        repo: text(raw, "repo", L.maxObjective),
+        usage: text(raw, "usage", L.maxObjective),
+        ...(raw.output !== undefined ? { output: text(raw, "output", L.maxToolOutput) } : {}),
       };
     case "tool.published": {
       if (raw.verified !== true) {
         fail("INVALID_STATE", "a tool can only be published after it passed its own gate (verified must be true)");
       }
+      if (raw.joinsGate !== undefined && raw.joinsGate !== false) {
+        fail("BAD_PAYLOAD", "joinsGate, when present, must be false (a tool never joins the gate in this slice)");
+      }
       return {
         tool: id(raw, "tool"),
-        capability: id(raw, "capability"),
+        capability: capability(raw),
         version: id(raw, "version"),
         repo: text(raw, "repo", L.maxObjective),
         commit: id(raw, "commit"),
         verified: true,
+        kind: oneOf(raw, "kind", TOOL_KINDS),
+        usage: text(raw, "usage", L.maxObjective),
+        ...(raw.joinsGate === false ? { joinsGate: false as const } : {}),
       };
     }
-    case "tool.used":
+    case "tool.used": {
+      const item = optionalId(raw, "item");
+      const commit = optionalId(raw, "commit");
+      const findingList = raw.findings === undefined ? undefined : toolFindings(raw.findings);
+      let exit: number | undefined;
+      if (raw.exit !== undefined) {
+        if (typeof raw.exit !== "number" || !Number.isInteger(raw.exit) || raw.exit < 0 || raw.exit > 255) {
+          fail("BAD_PAYLOAD", "exit must be an integer from 0 to 255");
+        }
+        exit = raw.exit;
+      }
       return {
-        capability: id(raw, "capability"),
+        capability: capability(raw),
         version: id(raw, "version"),
+        by: id(raw, "by"),
+        ...(item !== undefined ? { item } : {}),
+        ...(commit !== undefined ? { commit } : {}),
         changedFiles: pathList(raw, "changedFiles", { concrete: true, optional: true }),
+        ...(findingList !== undefined ? { findings: findingList } : {}),
+        ...(exit !== undefined ? { exit } : {}),
       };
+    }
     case "decision.recorded": {
       const answer = raw.answer === undefined ? undefined : text(raw, "answer", 200);
       const error = raw.error === undefined ? undefined : text(raw, "error", 300);
@@ -1316,8 +1583,13 @@ const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "fix.exhausted": ["engine"],
   "item.reopened": ["engine"],
   "tool.proposed": ["agent"],
-  "tool.published": ["agent"],
-  "tool.used": ["agent"],
+  "tool.built": ["agent"],
+  // A tool's gate result, its publication, and every use are the ENGINE's:
+  // recorded from what the operator's runtime actually ran, never posted by an
+  // agent (an agent cannot claim its tool passed, or fake a use).
+  "tool.gated": ["engine"],
+  "tool.published": ["engine"],
+  "tool.used": ["engine"],
   "decision.recorded": ["engine"],
   "decision.resolved": ["engine"],
   "agent.joined": ["agent"],
@@ -1459,6 +1731,18 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       if (draft.type === "item.discovered" && draft.payload.parent !== undefined) {
         requireItem(state, draft.payload.parent);
+      }
+      if (draft.type === "item.proposed" && draft.payload.fromTool !== undefined) {
+        // A tool's findings become work only through its builder, citing a
+        // version that is in the registry (the lead still decides the proposal).
+        const ref = draft.payload.fromTool;
+        const tool = state.tools.published.find((t) => t.capability === ref.capability && t.version === ref.version);
+        if (!tool) {
+          fail("UNKNOWN_REF", `${ref.capability}@${ref.version} is not a published tool version`);
+        }
+        if (tool.publishedBy !== draft.from) {
+          fail("NOT_ALLOWED", `only ${tool.publishedBy}, who built ${ref.capability}, proposes work from its findings`);
+        }
       }
       return;
     }
@@ -1689,6 +1973,9 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
     }
     case "push.announced": {
       const item = requireOwner(state, draft.payload.item, draft.from);
+      if (item.tool) {
+        fail("NOT_ALLOWED", `item ${item.id} builds a tool: announce its build with tool.built (a tool is gated by its own gate, never integrated)`);
+      }
       const write = item.intent?.write ?? [];
       // Each announced path is a concrete file that must lie INSIDE the write
       // intent (a symbol-scoped entry covers its file), not merely touch it.
@@ -1769,7 +2056,17 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       if (item.status === "done") {
         fail("INVALID_STATE", `item ${item.id} is already done`);
       }
-      if (!state.passingRevs.includes(draft.payload.n)) {
+      if (draft.payload.via === "tool") {
+        // A tool item completes when its tool passed its own gate and was published.
+        const published = item.tool
+          ? state.tools.published.find((t) => t.capability === item.tool!.capability && t.version === draft.payload.version)
+          : undefined;
+        if (item.status !== "claimed" || !published || item.toolBuild?.commit !== published.commit || item.toolBuild?.passed !== true) {
+          fail("INVALID_STATE", `item ${item.id} has no published tool build to complete it`);
+        }
+        return;
+      }
+      if (!state.passingRevs.includes(draft.payload.n!)) {
         fail("INVALID_STATE", `item.completed must cite a passing integrated revision (rev ${draft.payload.n} did not pass)`);
       }
       if (draft.payload.via === "integrated") {
@@ -1802,36 +2099,116 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       if (item.status !== "claimed" || item.owner !== draft.payload.previousOwner) {
         fail("INVALID_STATE", `item ${item.id} is not held by ${draft.payload.previousOwner}`);
       }
+      if (draft.payload.n === undefined && !item.tool) {
+        fail("BAD_PAYLOAD", `item.reopened names the failing revision for item ${item.id}`);
+      }
       return;
     }
-    case "tool.proposed":
-      if (state.tools.proposed[draft.payload.tool]) {
-        fail("DUPLICATE", `tool ${draft.payload.tool} was already proposed`);
+    case "tool.proposed": {
+      const p = draft.payload;
+      if (state.tools.proposed[p.tool]) {
+        fail("DUPLICATE", `tool ${p.tool} was already proposed`);
+      }
+      const same = Object.values(state.tools.proposed).find((t) => t.capability === p.capability);
+      if (same) {
+        fail("DUPLICATE", `a tool with capability ${p.capability} was already proposed (${same.tool} by ${same.proposedBy})`);
+      }
+      if (state.items[toolItemId(p.capability)]) {
+        fail("DUPLICATE", `item ${toolItemId(p.capability)} already exists`);
+      }
+      if (itemCount + 1 > BOARD_LIMITS.maxItems) {
+        fail("LIMIT", `a board holds at most ${BOARD_LIMITS.maxItems} items`);
+      }
+      if (p.kind === "codemod" && p.inputs.length === 0) {
+        fail("BAD_PAYLOAD", "a codemod must declare its inputs: the paths or globs it may change (its intended scope)");
+      }
+      if (draft.rationale === undefined || draft.rationale.trim() === "") {
+        fail("BAD_PAYLOAD", "tool.proposed needs a rationale (why a tool beats hand edits here)");
       }
       return;
+    }
+    case "tool.built": {
+      const item = requireOwner(state, toolItemId(draft.payload.capability), draft.from);
+      if (!item.tool) {
+        fail("INVALID_STATE", `item ${item.id} is not a tool item`);
+      }
+      // Each built path is a concrete file INSIDE the claim's write intent,
+      // which itself lies inside tools/<capability>/: one writer per tool path.
+      const write = item.intent?.write ?? [];
+      const outside = draft.payload.paths.filter(
+        (p) => !write.some((w) => entryWithin(p, intentPath(w))) || !entryWithin(p, toolScope(draft.payload.capability)),
+      );
+      if (outside.length > 0) {
+        fail("OUTSIDE_INTENT", `built paths outside the tool item's write intent (${toolScope(draft.payload.capability)}): ${outside.join(", ")}`);
+      }
+      if (item.toolBuild !== undefined && item.toolBuild.gated !== true) {
+        fail("INVALID_STATE", `the previous build of ${draft.payload.capability} (${item.toolBuild.commit}) has not been gated yet`);
+      }
+      return;
+    }
+    case "tool.gated": {
+      const item = requireItem(state, toolItemId(draft.payload.capability));
+      if (!item.tool || item.status !== "claimed" || item.owner === undefined) {
+        fail("INVALID_STATE", `tool item ${item.id} is not being built`);
+      }
+      if (item.toolBuild?.commit !== draft.payload.commit || item.toolBuild.gated === true) {
+        fail("INVALID_STATE", `${draft.payload.commit} is not the latest, ungated build of ${draft.payload.capability}`);
+      }
+      if (draft.payload.passed !== draft.payload.checks.every((c) => c.passed)) {
+        fail("BAD_PAYLOAD", "a tool gate passes exactly when every one of its checks passed");
+      }
+      return;
+    }
     case "tool.published": {
+      const p = draft.payload;
       const proposal =
-        state.tools.proposed[draft.payload.tool] ??
-        fail("UNKNOWN_REF", `tool ${draft.payload.tool} must be proposed (tool.proposed) before it is published`);
-      if (proposal.proposedBy !== draft.from) {
-        fail("NOT_ALLOWED", `only ${proposal.proposedBy}, who proposed tool ${proposal.tool}, can publish it`);
+        state.tools.proposed[p.tool] ?? fail("UNKNOWN_REF", `tool ${p.tool} must be proposed (tool.proposed) before it is published`);
+      if (proposal.capability !== p.capability || proposal.kind !== p.kind) {
+        fail("BAD_PAYLOAD", `tool ${proposal.tool} was proposed as the ${proposal.kind} ${proposal.capability}`);
       }
-      if (proposal.capability !== draft.payload.capability) {
-        fail("BAD_PAYLOAD", `tool ${proposal.tool} was proposed with capability ${proposal.capability}`);
+      const item = state.items[proposal.item];
+      if (!item || item.toolBuild?.commit !== p.commit || item.toolBuild.passed !== true) {
+        fail("INVALID_STATE", `${p.capability}@${p.commit} did not pass its own gate: an unverified tool is never published`);
       }
-      if (state.tools.published.some((t) => t.capability === draft.payload.capability && t.version === draft.payload.version)) {
-        fail("DUPLICATE", `${draft.payload.capability}@${draft.payload.version} is already published`);
+      if (state.tools.published.some((t) => t.capability === p.capability && t.version === p.version)) {
+        fail("DUPLICATE", `${p.capability}@${p.version} is already published`);
       }
       if (state.tools.published.length >= BOARD_LIMITS.maxTools) {
         fail("LIMIT", `a board publishes at most ${BOARD_LIMITS.maxTools} tool versions`);
       }
       return;
     }
-    case "tool.used":
-      if (!state.tools.published.some((t) => t.capability === draft.payload.capability && t.version === draft.payload.version)) {
-        fail("UNKNOWN_REF", `${draft.payload.capability}@${draft.payload.version} is not a published tool version`);
+    case "tool.used": {
+      const p = draft.payload;
+      if (!state.tools.published.some((t) => t.capability === p.capability && t.version === p.version)) {
+        fail("UNKNOWN_REF", `${p.capability}@${p.version} is not a published tool version (a consumer pins a published version)`);
+      }
+      if (!activeAgent(state, p.by)) {
+        fail("UNKNOWN_AGENT", `${p.by} is not a joined agent`);
+      }
+      if (p.item !== undefined) {
+        requireOwner(state, p.item, p.by);
+      }
+      if (p.changedFiles.length > 0) {
+        // A tool's changes count only as the consumer's own announced push,
+        // inside the write intent of the item it holds.
+        if (p.item === undefined || p.commit === undefined) {
+          fail("BAD_PAYLOAD", "a use that changed files names the item and the pushed commit");
+        }
+        const item = state.items[p.item]!;
+        if (item.lastPush?.commit !== p.commit || item.lastPush.agent !== p.by) {
+          fail("INVALID_STATE", `${p.commit} is not ${p.by}'s latest push for item ${p.item}`);
+        }
+        const write = item.intent?.write ?? [];
+        const outside = p.changedFiles.filter((f) => !write.some((w) => entryWithin(f, intentPath(w))));
+        if (outside.length > 0) {
+          fail("OUTSIDE_INTENT", `changed files outside item ${p.item}'s write intent: ${outside.join(", ")}`);
+        }
+      } else if (p.commit !== undefined) {
+        fail("BAD_PAYLOAD", "a use that changed no files has no commit");
       }
       return;
+    }
     case "agent.left": {
       const holding = Object.values(state.items).filter(
         (i) => (i.status === "claimed" && i.owner === draft.from) || i.claimant?.agent === draft.from,
@@ -1946,6 +2323,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         proposedSeq: message.seq,
         children: [],
         doneProposed: false,
+        ...(message.payload.fromTool !== undefined ? { fromTool: { ...message.payload.fromTool } } : {}),
       };
       break;
     case "item.discovered": {
@@ -2201,7 +2579,10 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
     case "item.completed": {
       const item = state.items[message.payload.item]!;
       item.status = "done";
-      item.completed = { n: message.payload.n, via: message.payload.via };
+      item.completed =
+        message.payload.via === "tool"
+          ? { via: "tool", version: message.payload.version! }
+          : { n: message.payload.n!, via: message.payload.via };
       delete item.intent;
       delete item.fixRequested;
       break;
@@ -2223,32 +2604,82 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       item.exhaustedBy = [...(item.exhaustedBy ?? []), message.payload.previousOwner];
       item.reopenedFrom = { agent: message.payload.previousOwner, ...(message.payload.commit !== undefined ? { commit: message.payload.commit } : {}) };
       releaseClaim(item);
-      // The next owner gets its own fix budget.
+      // The next owner gets its own fix budget (and, for a tool, its own gate failures).
       item.fixAttempts = 0;
+      delete item.toolFailures;
       delete item.fixExhausted;
       break;
     }
-    case "tool.proposed":
-      state.tools.proposed[message.payload.tool] = {
-        tool: message.payload.tool,
-        capability: message.payload.capability,
-        inputs: message.payload.inputs,
-        outputs: message.payload.outputs,
+    case "tool.proposed": {
+      const p = message.payload;
+      const itemId = toolItemId(p.capability);
+      state.tools.proposed[p.tool] = {
+        tool: p.tool,
+        capability: p.capability,
+        kind: p.kind,
+        inputs: p.inputs,
+        outputs: p.outputs,
         proposedBy: from,
+        seq: message.seq,
+        item: itemId,
+        builds: 0,
+        failedGates: 0,
+      };
+      // Building the tool is work like any other: an item the lead accepts (a
+      // worker's proposal) and an agent claims, writing only its tool directory.
+      state.items[itemId] = {
+        id: itemId,
+        objective: `Build the ${p.kind} tool ${p.capability} in ${TOOLS_DIR}/${p.capability}/ and pass its own gate`,
+        acceptance: [`the ${p.kind} tool's own gate passes and it is published`],
+        scopeHint: [toolScope(p.capability)],
+        status: proposalStatus(state, from),
+        proposedBy: from,
+        proposedSeq: message.seq,
+        children: [],
+        doneProposed: false,
+        tool: { capability: p.capability, kind: p.kind },
       };
       break;
-    case "tool.published":
+    }
+    case "tool.built": {
+      const item = state.items[toolItemId(message.payload.capability)]!;
+      item.toolBuild = { commit: message.payload.commit, paths: message.payload.paths, seq: message.seq };
+      const proposal = Object.values(state.tools.proposed).find((t) => t.capability === message.payload.capability);
+      if (proposal) {
+        proposal.builds += 1;
+      }
+      break;
+    }
+    case "tool.gated": {
+      const item = state.items[toolItemId(message.payload.capability)]!;
+      item.toolBuild = { ...item.toolBuild!, gated: true, passed: message.payload.passed };
+      const proposal = Object.values(state.tools.proposed).find((t) => t.capability === message.payload.capability);
+      if (proposal && !message.payload.passed) {
+        proposal.failedGates += 1;
+        item.toolFailures = (item.toolFailures ?? 0) + 1;
+      }
+      break;
+    }
+    case "tool.published": {
+      const p = message.payload;
+      const proposal = state.tools.proposed[p.tool];
+      const item = proposal ? state.items[proposal.item] : undefined;
       state.tools.published.push({
-        tool: message.payload.tool,
-        capability: message.payload.capability,
-        version: message.payload.version,
-        repo: message.payload.repo,
-        commit: message.payload.commit,
-        publishedBy: from,
+        tool: p.tool,
+        capability: p.capability,
+        version: p.version,
+        repo: p.repo,
+        commit: p.commit,
+        kind: p.kind,
+        usage: p.usage,
+        publishedBy: item?.owner ?? from,
         seq: message.seq,
+        gateSeq: message.inReplyTo ?? message.seq,
+        ...(p.joinsGate === false ? { joinsGate: false as const } : {}),
         uses: 0,
       });
       break;
+    }
     case "tool.used": {
       const tool = state.tools.published.find(
         (t) => t.capability === message.payload.capability && t.version === message.payload.version,
@@ -2564,6 +2995,47 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
     case "done.proposed":
       completeIfReady(incoming.payload.item);
       break;
+    case "tool.gated": {
+      // Only a build that passed its OWN gate enters the registry, as the next
+      // version of its capability; the tool item completes with it.
+      const p = incoming.payload;
+      const proposal = Object.values(work.tools.proposed).find((t) => t.capability === p.capability);
+      if (p.passed && proposal) {
+        const version = String(work.tools.published.filter((t) => t.capability === p.capability).length + 1);
+        emit({
+          from: BOARD_ENGINE,
+          type: "tool.published",
+          payload: {
+            tool: proposal.tool,
+            capability: p.capability,
+            version,
+            repo: p.repo,
+            commit: p.commit,
+            verified: true,
+            kind: proposal.kind,
+            usage: p.usage,
+            ...(proposal.kind === "check" ? { joinsGate: false as const } : {}),
+          },
+        });
+        emit({ from: BOARD_ENGINE, type: "item.completed", payload: { item: proposal.item, via: "tool", version } });
+        resolveWaitersOn(proposal.item);
+      } else if (proposal) {
+        // A builder whose builds keep failing their own gate does not hold the
+        // tool forever: past the fix budget the tool item reopens for another
+        // agent (who starts from the tool's branch), bounded to TOOL_REOPENS.
+        const item = work.items[proposal.item];
+        if (
+          item?.status === "claimed" &&
+          item.owner !== undefined &&
+          (item.toolFailures ?? 0) >= rules.maxFixAttempts &&
+          (item.exhaustedBy?.length ?? 0) < BOARD_LIMITS.toolReopens
+        ) {
+          emit({ from: BOARD_ENGINE, type: "item.reopened", payload: { item: item.id, previousOwner: item.owner, commit: p.commit } });
+          resolveWaitersOn(item.id);
+        }
+      }
+      break;
+    }
     case "integrated.rev":
       if (incoming.payload.gate === "pass") {
         for (const item of Object.values(work.items)) {
@@ -2724,6 +3196,13 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
 // ---------------------------------------------------------------------------
 
 /**
+ * Engine messages that START a batch: each records an operator-side result
+ * through its own route (an integration, an advisory decision, a tool's gate,
+ * a tool use). Every other engine message is derived by arbitration.
+ */
+const RECORDED_ENGINE_TYPES: ReadonlySet<BoardMessageType> = new Set(["integrated.rev", "decision.recorded", "tool.gated", "tool.used"]);
+
+/**
  * Replay a log into state. Replay is a full re-verification, not a blind fold:
  * each participant message is re-checked exactly as the board route checks it,
  * each integrated revision is re-derived from the pushes it names, arbitration
@@ -2740,7 +3219,7 @@ export function reduceBoard(messages: readonly BoardMessage[]): BoardState {
     if (incoming.seq !== work.lastSeq + 1) {
       fail("LOG_MISMATCH", `board log is not contiguous at seq ${incoming.seq} (expected ${work.lastSeq + 1})`);
     }
-    if (incoming.from === BOARD_ENGINE && incoming.type !== "integrated.rev" && incoming.type !== "decision.recorded") {
+    if (incoming.from === BOARD_ENGINE && !RECORDED_ENGINE_TYPES.has(incoming.type)) {
       fail("LOG_MISMATCH", `engine ${incoming.type} at seq ${incoming.seq} was not produced by arbitration`);
     }
     const expected = arbitrateInPlace(work, incoming);
@@ -2915,6 +3394,54 @@ export function appendDecisionRecorded(state: BoardState, input: unknown, at: st
   return appendChecked(state, { from: BOARD_ENGINE, type: "decision.recorded", payload }, at);
 }
 
+/** Validate an operator record against the fields one engine message type accepts. */
+function recordedPayload<K extends "tool.gated" | "tool.used">(type: K, input: unknown, fields: readonly string[]): BoardPayloads[K] {
+  if (!isRecord(input)) {
+    fail("BAD_PAYLOAD", `a ${type} record must be an object`);
+  }
+  for (const key of Object.keys(input)) {
+    if (!fields.includes(key)) {
+      fail("BAD_PAYLOAD", `a ${type} record has an unknown field ${JSON.stringify(key)}`);
+    }
+  }
+  return parsePayload(type, input) as BoardPayloads[K];
+}
+
+/**
+ * Append the engine's tool.gated for a tool gate the operator ran on the
+ * latest build of a tool item (`POST /changes/:id/tools/gate`). It is
+ * addressed to the builder. A pass derives tool.published (the next version)
+ * and completes the tool item; a fail publishes nothing.
+ */
+export function appendToolGated(state: BoardState, input: unknown, at: string): BoardAppendResult {
+  if (state.goal === null) {
+    fail("NO_GOAL", "the board has no goal yet");
+  }
+  const payload = recordedPayload("tool.gated", input, ["capability", "commit", "passed", "checks", "repo", "usage", "output"]);
+  const owner = state.items[toolItemId(payload.capability)]?.owner;
+  return appendChecked(
+    state,
+    { from: BOARD_ENGINE, type: "tool.gated", payload, ...(owner !== undefined && activeAgent(state, owner) ? { to: [owner] } : {}) },
+    at,
+  );
+}
+
+/**
+ * Append the engine's tool.used for a run of a PINNED, published tool version
+ * the operator's runtime executed in a consumer's own repo
+ * (`POST /changes/:id/tools/used`). It is addressed to the tool's builder (so
+ * a scanner's findings reach whoever can turn them into proposals).
+ */
+export function appendToolUsed(state: BoardState, input: unknown, at: string): BoardAppendResult {
+  if (state.goal === null) {
+    fail("NO_GOAL", "the board has no goal yet");
+  }
+  const payload = recordedPayload("tool.used", input, ["capability", "version", "by", "item", "commit", "changedFiles", "findings", "exit"]);
+  const builder = state.tools.published.find((t) => t.capability === payload.capability && t.version === payload.version)?.publishedBy;
+  const to = builder !== undefined && builder !== payload.by && activeAgent(state, builder) ? { to: [builder] } : {};
+  return appendChecked(state, { from: BOARD_ENGINE, type: "tool.used", payload, ...to }, at);
+}
+
 /**
  * The board's attribution outcomes as a tally: resolved decisions, and those
  * still open (unresolved: no passing revision has followed them yet).
@@ -2994,6 +3521,12 @@ export interface BoardDigest {
     readonly fix?: { readonly n: number; readonly attempt: number };
     /** The item's fix budget is spent. */
     readonly fixExhausted?: boolean;
+    /**
+     * Tools whose inputs cover this claim's write intent that it must NOT wait
+     * for (rejected, failed their own gate, or not published within
+     * `toolWaitMessages`): edit by hand instead.
+     */
+    readonly toolUnavailable?: readonly { readonly capability: string; readonly reason: string }[];
   }[];
   readonly pending: readonly { readonly item: string; readonly contest: string }[];
   readonly contests: readonly BoardContest[];
@@ -3030,6 +3563,8 @@ const BROADCAST_TYPES: ReadonlySet<BoardMessageType> = new Set([
   "contract.proposed",
   "contract.accepted",
   "contract.rejected",
+  "tool.proposed",
+  "tool.gated",
   "tool.published",
   "item.reopened",
 ]);
@@ -3067,7 +3602,7 @@ export function boardDigest(
       return true;
     }
     const p = m.payload as Record<string, unknown>;
-    if (["agent", "owner", "claimant", "winner", "to"].some((k) => p[k] === agent)) {
+    if (["agent", "owner", "claimant", "winner", "to", "by"].some((k) => p[k] === agent)) {
       return true;
     }
     if (typeof p.item === "string" && mine.has(p.item)) {
@@ -3107,6 +3642,10 @@ export function boardDigest(
         : {}),
       ...(i.fixRequested !== undefined ? { fix: { n: i.fixRequested, attempt: i.fixAttempts ?? 1 } } : {}),
       ...(i.fixExhausted ? { fixExhausted: true } : {}),
+      ...((): { toolUnavailable?: { capability: string; reason: string }[] } => {
+        const unavailable = i.tool ? [] : unavailableToolsFor(state, i.intent!.write);
+        return unavailable.length > 0 ? { toolUnavailable: unavailable } : {};
+      })(),
     })),
     pending: Object.values(state.items)
       .filter((i) => i.claimant?.agent === agent)
@@ -3132,6 +3671,46 @@ export function boardDigest(
     released: [...new Set(held.flatMap((i) => releasedTargets(state, i.id)))],
     messages: messages.filter((m) => m.seq > after && relevant(m)),
   };
+}
+
+/**
+ * Why a tool is unavailable to wait for, or undefined while it may still come
+ * (or is published): the lead rejected it, a build failed its own gate, or it
+ * was not published within `toolWaitMessages` board messages of its proposal.
+ * A pure function of the board, so every substrate derives the same answer.
+ */
+export function toolUnavailableReason(state: BoardState, capability: string): string | undefined {
+  const proposal = Object.values(state.tools.proposed).find((t) => t.capability === capability);
+  if (!proposal || state.tools.published.some((t) => t.capability === capability)) {
+    return undefined;
+  }
+  const item = state.items[proposal.item];
+  if (item?.status === "rejected") {
+    return "the lead rejected it";
+  }
+  if (proposal.failedGates > 0) {
+    return `its own gate failed ${proposal.failedGates} time(s)${(item?.exhaustedBy?.length ?? 0) > 0 ? ` (reopened for another builder ${item!.exhaustedBy!.length} time(s))` : ""}`;
+  }
+  if (state.lastSeq - proposal.seq > BOARD_LIMITS.toolWaitMessages) {
+    return `not published within ${BOARD_LIMITS.toolWaitMessages} board messages of its proposal`;
+  }
+  return undefined;
+}
+
+/** The unavailable tools whose inputs cover a write intent (a scanner or codemod with no inputs covers everything). */
+function unavailableToolsFor(state: BoardState, write: readonly string[]): { capability: string; reason: string }[] {
+  const out: { capability: string; reason: string }[] = [];
+  for (const proposal of Object.values(state.tools.proposed)) {
+    if (proposal.kind !== "codemod" && proposal.kind !== "scanner") {
+      continue;
+    }
+    const covers = proposal.inputs.length === 0 || write.some((w) => proposal.inputs.some((input) => entriesOverlap(intentPath(w), input)));
+    const reason = covers ? toolUnavailableReason(state, proposal.capability) : undefined;
+    if (reason !== undefined) {
+      out.push({ capability: proposal.capability, reason });
+    }
+  }
+  return out;
 }
 
 /**

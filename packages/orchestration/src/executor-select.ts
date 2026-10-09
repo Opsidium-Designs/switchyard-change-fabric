@@ -23,9 +23,12 @@
  * executor, so an offline run and `make check` never call the network.
  */
 
+import { runtimeEnv } from "./credentials.ts";
 import type { BoardDigest, BoardMessage } from "@switchyard-change/change-core";
 import type { AgentTurnTransport, ExecutorProvider, PlannerPlan } from "@switchyard-change/model-adapters";
 import {
+  createAiGatewayToolRegionFiller,
+  type ToolRegionFiller,
   createAiGatewayAgentTurnInvoke,
   createAiGatewayJevInvoke,
   createAiGatewayPlannerInvoke,
@@ -117,7 +120,7 @@ export const SUPPORTED_EXECUTORS: readonly string[] = ["ai-gateway", "workers-ai
  * unsupported executor, rather than silently falling back to a noop that would
  * mask a real edit as deterministic. Unset or "noop" selects the noop stub.
  */
-export function selectExecutor(env: ExecutorEnv = process.env): SelectedExecutor {
+export function selectExecutor(env: ExecutorEnv = runtimeEnv()): SelectedExecutor {
   const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
   if (choice === "workers-ai") {
     const accountId = (env.CLOUDFLARE_ACCOUNT_ID ?? "").trim();
@@ -309,7 +312,7 @@ export interface SelectedPlanner {
  * is surfaced as an error), so the planner never falls back to a network call it
  * cannot authenticate.
  */
-export function selectPlanner(env: ExecutorEnv = process.env): SelectedPlanner {
+export function selectPlanner(env: ExecutorEnv = runtimeEnv()): SelectedPlanner {
   const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
   if (choice !== "ai-gateway") {
     return {
@@ -371,7 +374,7 @@ export interface SelectedAgentTurn {
  * run then refuses to start rather than silently substituting the offline
  * policy, which only `run-board --offline` (the demo and tests) uses.
  */
-export function selectAgentTurn(env: ExecutorEnv = process.env): SelectedAgentTurn {
+export function selectAgentTurn(env: ExecutorEnv = runtimeEnv()): SelectedAgentTurn {
   const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
   const gatewayUrl = (env.CLOUDFLARE_AI_GATEWAY_URL ?? "").trim();
   const gatewayToken = (env.CLOUDFLARE_AI_GATEWAY_TOKEN ?? "").trim();
@@ -510,7 +513,7 @@ export interface SelectedJev {
  * (the executor selection surfaces that misconfig as an error), so Jev never
  * attempts an unauthenticated network call.
  */
-export function selectJev(env: ExecutorEnv = process.env): SelectedJev {
+export function selectJev(env: ExecutorEnv = runtimeEnv()): SelectedJev {
   const threshold = parseConfidenceThreshold(
     env.JEV_CONFIDENCE_THRESHOLD,
     DEFAULT_JEV_CONFIDENCE_THRESHOLD,
@@ -563,4 +566,37 @@ function parseConfidenceThreshold(raw: string | undefined, fallback: number): nu
     return fallback;
   }
   return Math.min(1, Math.max(0, n));
+}
+
+/** The tool-region filler for agent-built tools, when the AI Gateway is live. */
+export interface SelectedToolFiller {
+  readonly live: boolean;
+  readonly description: string;
+  /** The models in the order they are tried: STRONGEST first (the ladder's top), down to the base model. */
+  readonly models: readonly string[];
+  readonly filler?: ToolRegionFiller;
+}
+
+/**
+ * Select how a live run fills tool skeletons: one schema-constrained call per
+ * build through the AI Gateway, on the strongest configured model first (the
+ * last entry of the escalation ladder), falling back down the ladder only on a
+ * transport error. Tools are small but must be correct.
+ */
+export function selectToolFiller(env: ExecutorEnv = runtimeEnv()): SelectedToolFiller {
+  const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
+  const gatewayUrl = (env.CLOUDFLARE_AI_GATEWAY_URL ?? "").trim();
+  const gatewayToken = (env.CLOUDFLARE_AI_GATEWAY_TOKEN ?? "").trim();
+  if (choice !== "ai-gateway" || gatewayUrl === "" || gatewayToken === "") {
+    return { live: false, description: "no live tool author (the executor writes tools)", models: [] };
+  }
+  const base = (env.AI_GATEWAY_MODEL ?? "").trim() || DEFAULT_AI_GATEWAY_MODEL;
+  const ladder = parseEscalationModels(env.AI_GATEWAY_ESCALATION_MODELS, env.AI_GATEWAY_ESCALATION_MODEL, DEFAULT_AI_GATEWAY_ESCALATION_MODEL);
+  const models = [...new Set([...[...ladder].reverse(), base])];
+  return {
+    live: true,
+    description: `ai-gateway tool fills (models, strongest first: ${models.join(", ")})`,
+    models,
+    filler: createAiGatewayToolRegionFiller({ gatewayUrl, gatewayToken, models }),
+  };
 }

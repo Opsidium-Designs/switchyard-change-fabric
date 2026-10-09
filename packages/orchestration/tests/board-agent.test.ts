@@ -170,12 +170,11 @@ describe("BoardAgent scheduling", () => {
     await w1.join();
     expect(w1.joinedWorkspace).toMatchObject({ workspaceName: `${ID}--board-w1`, backend: "local-filesystem" });
 
-    expect(await w1.step()).toBe("acted"); // first look after joining
-    expect(await w1.step()).toBe("idle"); // nothing new, same open items
-    await env.human({ type: "item.proposed", payload: { item: "i3", objective: "do c", scopeHint: ["docs/**"] } });
-    expect(await w1.step()).toBe("acted"); // new open work while free -> claims i1
+    expect(await w1.step()).toBe("acted"); // first look after joining -> waits while free
+    expect(await w1.step()).toBe("acted"); // waited while open items exist: nudged to claim -> claims i1
+    expect(transport.inputs.at(-1)!.capsule.evidence.at(-1)).toMatch(/claim one now.*never wait for a tool/);
     expect(await w1.step()).toBe("acted"); // its accepted claim keeps the initiative -> waits
-    expect(await w1.step()).toBe("idle");
+    expect(await w1.step()).toBe("idle"); // holding work, nothing new
 
     // A message addressed to it wakes it; a context-only broadcast does not.
     const w2 = await env.operator.join("w2", { role: "worker" });
@@ -392,6 +391,84 @@ describe("BoardAgent edits", () => {
     expect(stdout.trim()).toBe(""); // nothing was pushed
     await w1.step();
     expect(transport.inputs.at(-1)!.lastRejection).toMatchObject({ code: "OUTSIDE_INTENT", action: "edit" });
+  });
+
+  it("never pushes what another process wrote into its worktree: stray changes are discarded (and logged) before an edit, and only listed in-intent paths are staged", async () => {
+    const env = await setup();
+    const executor = new RecordingExecutor((ctx) => ({ "src/a/x.ts": `edit ${ctx.objective.length}\n` }));
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "first" },
+      { type: "edit", itemId: "i1", instruction: "second, after something wrote into my worktree" },
+    ]);
+    const w1 = env.agent("w1", { transport, executor });
+    await w1.join();
+    await w1.step(); // claim
+    await w1.step(); // first edit, pushed
+    // Another process (say, a tool run by another agent) writes into w1's worktree:
+    // one file inside w1's write intent, one outside, and a change to a tracked file.
+    const worktree = join(env.root, "work", "agents", "w1");
+    await mkdir(join(worktree, "src/a"), { recursive: true });
+    await writeFile(join(worktree, "src/a/injected.ts"), "export const injected = true;\n");
+    await mkdir(join(worktree, "src/b"), { recursive: true });
+    await writeFile(join(worktree, "src/b/evil.ts"), "evil\n");
+    await w1.step(); // second edit
+    const pushes = (await env.log()).messages.filter((m) => m.type === "push.announced");
+    expect(pushes).toHaveLength(2);
+    for (const push of pushes) {
+      expect((push.payload as { readonly paths: readonly string[] }).paths).toEqual(["src/a/x.ts"]);
+    }
+    const second = (pushes[1]!.payload as { commit: string }).commit;
+    const { stdout } = await run("git", ["-C", worktree, "ls-tree", "-r", "--name-only", second]);
+    expect(stdout.split("\n").filter((l) => l !== "")).toEqual(["src/a/x.ts"]);
+    expect(env.turns.filter((t) => t.action.type === "edit").map((t) => t.outcome)).toEqual(["posted", "posted"]);
+    // The discard is logged in the agent's evidence (its next turn input).
+    await w1.step();
+    expect(transport.inputs.at(-1)!.capsule.evidence.join("\n")).toMatch(/discarded 2 uncommitted change\(s\) found in my worktree before editing i1 \(nobody announced them; never pushed\): src\/a\/injected\.ts, src\/b\/evil\.ts/);
+  });
+
+  it("a free agent that keeps waiting while open items exist is nudged to claim a bounded number of times, then left idle", async () => {
+    const env = await setup();
+    const transport = scripted(Array.from({ length: 10 }, () => ({ type: "wait" as const, reason: "waiting for the tools" })));
+    const w1 = env.agent("w1", { transport });
+    await w1.join();
+    const results: string[] = [];
+    for (let i = 0; i < 8; i += 1) {
+      results.push(await w1.step());
+    }
+    // The first look, then MAX_CLAIM_NUDGES (3) nudged turns, then idle.
+    expect(results).toEqual(["acted", "acted", "acted", "acted", "idle", "idle", "idle", "idle"]);
+    expect(transport.inputs.filter((i) => i.capsule.evidence.some((e) => /claim one now/.test(e)))).toHaveLength(3);
+  });
+
+  it("an edit on a tool item goes to the build flow (never the agent's own repo); use_tool and propose_done on it are refused", async () => {
+    const env = await setup();
+    await env.human({ type: "item.proposed", payload: { item: "i9", objective: "x", scopeHint: ["docs/**"] } });
+    const transport = scripted([
+      { type: "propose_tool", capability: "scan-x", kind: "scanner", why: "find every place", inputs: [], outputs: ["findings"] },
+      { type: "wait", reason: "the lead decides" },
+    ]);
+    const w1 = env.agent("w1", { transport });
+    await w1.join();
+    await w1.step();
+    await env.human({ type: "item.accepted", payload: { item: "tool-scan-x" } });
+    const next = scripted([
+      { type: "claim", itemId: "tool-scan-x", intent: { read: [], write: ["tools/scan-x/**"] } },
+      { type: "edit", itemId: "tool-scan-x", instruction: "write the scanner" },
+      { type: "use_tool", capability: "scan-x", version: "1", args: [], itemId: "tool-scan-x" },
+      { type: "propose_done", itemId: "tool-scan-x" },
+    ]);
+    const w2 = env.agent("w2", { transport: next });
+    await w2.join();
+    for (let i = 0; i < 4; i += 1) {
+      await w2.step();
+    }
+    const records = env.turns.filter((t) => t.agent === "w2");
+    // No tool bench in this runtime: the edit was routed to build_tool, which says so; nothing reached w2's own repo.
+    expect(records.find((t) => t.action.type === "edit")).toMatchObject({ outcome: "local", code: "NOT_ALLOWED", error: expect.stringMatching(/tools cannot be built/) });
+    expect(records.find((t) => t.action.type === "use_tool")).toMatchObject({ outcome: "local", code: "TOOL_ITEM" });
+    expect(records.find((t) => t.action.type === "propose_done")).toMatchObject({ outcome: "local", code: "TOOL_ITEM" });
+    expect((await env.log()).messages.some((m) => m.type === "push.announced" || m.type === "done.proposed")).toBe(false);
   });
 
   it("records an unreachable repo as a refusal instead of crashing the run", async () => {

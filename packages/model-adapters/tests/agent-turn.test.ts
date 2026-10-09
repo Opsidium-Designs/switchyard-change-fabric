@@ -13,6 +13,7 @@ import {
   buildAgentTurnMessages,
   createAiGatewayAgentTurnInvoke,
   parseAgentAction,
+  slugifyNeed,
   type AgentTurnInput,
 } from "../src/index.ts";
 import { AGENT_TURN_MAX_CONTEXT_CHARS, UNTRUSTED_CLOSE, UNTRUSTED_OPEN } from "../src/agent-turn.ts";
@@ -91,9 +92,46 @@ describe("parseAgentAction", () => {
       instruction: "fix it",
     });
     expect(parseAgentAction({ type: "propose_done", itemId: "i1" })).toEqual({ type: "propose_done", itemId: "i1" });
-    expect(parseAgentAction({ type: "propose_tool", capability: "codemod", why: "repeated edit" })).toMatchObject({
-      capability: "codemod",
+    expect(parseAgentAction({ type: "propose_tool", capability: "codemod-add", kind: "codemod", why: "repeated edit", inputs: ["src/**"], outputs: ["edits"] })).toEqual({
+      type: "propose_tool",
+      capability: "codemod-add",
+      kind: "codemod",
+      why: "repeated edit",
+      inputs: ["src/**"],
+      outputs: ["edits"],
     });
+    expect(parseAgentAction({ type: "build_tool", capability: "scan-add", rationale: null })).toEqual({ type: "build_tool", capability: "scan-add" });
+    expect(parseAgentAction({ type: "use_tool", capability: "scan-add", version: "1", args: ["src/a.ts"], itemId: null })).toEqual({
+      type: "use_tool",
+      capability: "scan-add",
+      version: "1",
+      args: ["src/a.ts"],
+    });
+    expect(
+      parseAgentAction({ type: "propose_item", objective: "o", acceptance: [], scopeHint: ["lib/x.ts"], rationale: null, fromTool: { capability: "scan-add", version: "1" } }),
+    ).toMatchObject({ fromTool: { capability: "scan-add", version: "1" } });
+    expect(() => parseAgentAction({ type: "propose_tool", capability: "Codemod Add", kind: "codemod", why: "w" })).toThrow(/capability/);
+    expect(() => parseAgentAction({ type: "propose_tool", capability: "x", kind: "linter", why: "w" })).toThrow(/kind must be one of/);
+    expect(() => parseAgentAction({ type: "use_tool", capability: "x", args: [] })).toThrow(/version/);
+  });
+
+  it("normalizes a free-text need into a short id instead of discarding the turn, keeping the words in the rationale", () => {
+    const action = parseAgentAction({
+      type: "message",
+      kind: "help",
+      to: null,
+      payload: { itemId: "i1", need: "I need the auth contract (requireAuth signature) before guarding users", requestId: null, target: null, change: null, reviewId: null, findings: null },
+      rationale: "blocked on auth",
+    });
+    expect(action).toMatchObject({ type: "message", payload: { itemId: "i1", need: "i-need-the-auth-contract-requireauth-signature-before-guarding-u" } });
+    expect(action.type === "message" && action.payload.need!.length).toBeLessThanOrEqual(64);
+    expect(action.type === "message" && action.rationale).toBe("blocked on auth (need: I need the auth contract (requireAuth signature) before guarding users)");
+    // A valid id is untouched; text with no usable characters is dropped from need (the words stay in the rationale).
+    expect(parseAgentAction({ type: "message", kind: "help", payload: { itemId: "i1", need: "auth-contract" }, rationale: "r" })).toMatchObject({ payload: { need: "auth-contract" }, rationale: "r" });
+    const dropped = parseAgentAction({ type: "message", kind: "question", payload: { itemId: "i1", need: "???" }, rationale: "r" });
+    expect(dropped.type === "message" && dropped.payload.need).toBeUndefined();
+    expect(dropped.type === "message" && dropped.rationale).toBe("r (need: ???)");
+    expect(slugifyNeed("x".repeat(300))).toHaveLength(64);
     expect(parseAgentAction({ type: "decide_contract", contractId: "k1", decision: "accept" })).toMatchObject({
       decision: "accept",
     });

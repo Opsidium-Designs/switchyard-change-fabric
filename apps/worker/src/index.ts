@@ -3,6 +3,7 @@ import {
   BOARD_LIMITS,
   BOARD_WORKSPACE_TTL_BOUNDS,
   boardAgentWorkspaceName,
+  toolsWorkspaceName,
   boardErrorStatus,
   parseBoardJoinWorkspace,
   parseChangeSpec,
@@ -1094,6 +1095,69 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
   }
 
+  // The Change's TOOLS repo (agent-built tools; see docs/BOARD.md "Agent-built tools"):
+  //   POST /changes/:id/tools/workspace     (bearer) {ttlSeconds} provision it once (a repeat returns it with a fresh write token)
+  //   POST /changes/:id/tools/token         (bearer) {scope, ttlSeconds} a short-lived read or write token for it
+  //   POST /changes/:id/tools/token/revoke  (bearer) {tokenId}
+  const toolsRepoMatch = url.pathname.match(/^\/changes\/([^/]+)\/tools\/(workspace|token|token\/revoke)$/);
+  if (request.method === "POST" && toolsRepoMatch) {
+    const changeId = decodeURIComponent(toolsRepoMatch[1] ?? "");
+    const action = toolsRepoMatch[2];
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
+    }
+    const body = await readBoardBody(request);
+    if (!body.ok) {
+      return json({ code: body.code, error: body.error }, body.status);
+    }
+    const value = isPlainObject(body.value) ? body.value : {};
+    const provisioner = selectProvisioner(env);
+    const repo = await stub.getToolsRepo();
+    try {
+      if (action === "token/revoke") {
+        if (!repo || typeof value.tokenId !== "string" || value.tokenId === "") {
+          return json({ code: "BAD_PAYLOAD", error: "a revoke names a tokenId of a provisioned tools repo" }, 400);
+        }
+        await provisioner.revoke(repo.workspaceName, value.tokenId);
+        return json({ revoked: value.tokenId });
+      }
+      const ttl = value.ttlSeconds === undefined ? 900 : value.ttlSeconds;
+      const { min, max } = BOARD_WORKSPACE_TTL_BOUNDS;
+      if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < min || ttl > max) {
+        return json({ code: "BAD_PAYLOAD", error: `ttlSeconds must be an integer from ${min} to ${max}` }, 400);
+      }
+      if (action === "token") {
+        const scope = value.scope ?? "read";
+        const issue = scope === "write" ? provisioner.issueWriteToken?.bind(provisioner) : scope === "read" ? provisioner.issueReadToken?.bind(provisioner) : undefined;
+        if (!repo || !issue) {
+          return json({ code: repo ? "BAD_PAYLOAD" : "INVALID_STATE", error: repo ? 'scope must be "read" or "write" (and this Worker must be able to issue it)' : "the tools repo is not provisioned yet" }, 400);
+        }
+        return json({ workspaceName: repo.workspaceName, ...(await issue(repo.workspaceName, ttl)) }, 201);
+      }
+      if (repo) {
+        // Provisioned once per Change: a repeat hands out a fresh write token
+        // (a provisioner that cannot issue one on its own re-provisions, idempotently).
+        if (!provisioner.issueWriteToken) {
+          const again = await provisioner.provision(repo.workspaceName, { ttlSeconds: ttl });
+          return json({ ...repo, tokenId: again.tokenId, token: again.token, tokenExpiresAt: again.tokenExpiresAt }, 201);
+        }
+        return json({ ...repo, ...(await provisioner.issueWriteToken(repo.workspaceName, ttl)) }, 201);
+      }
+      const provisioned = await provisioner.provision(toolsWorkspaceName(changeId), { ttlSeconds: ttl });
+      await stub.recordToolsRepo({
+        workspaceName: provisioned.workspaceName,
+        gitUrl: provisioned.gitUrl,
+        defaultBranch: provisioned.defaultBranch,
+        backend: provisioned.backend,
+        fallback: provisioned.fallback,
+      });
+      return json(provisioned, 201);
+    } catch (error) {
+      return json({ code: "INVALID_STATE", error: `the tools repo operation failed: ${errorMessage(error)}` }, 502);
+    }
+  }
+
   // The Change board. Identity is established by the route, never by the
   // message body:
   //   POST /changes/:id/board/join      (bearer) an agent joins; returns its board token
@@ -1103,8 +1167,12 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
   //   GET  /changes/:id/board?after=&limit=  the log page and reduced state (open)
   //   GET  /changes/:id/board?for=<agent>    that agent's digest (agent board token)
   //   GET  /changes/:id/board/verify         re-verify the stored log against the state
+  //   POST /changes/:id/tools/gate           (bearer) the operator records a tool's own gate result
+  //   POST /changes/:id/tools/used           (bearer) the operator records a run of a pinned tool version
   // The engine's own messages are never accepted from any route.
-  const boardRoute = url.pathname.match(/^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|integration\/revision)$/);
+  const boardRoute = url.pathname.match(
+    /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|integration\/revision|tools\/gate|tools\/used)$/,
+  );
   if (boardRoute) {
     const changeId = decodeURIComponent(boardRoute[1] ?? "");
     const kind = boardRoute[2];
@@ -1184,6 +1252,10 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         outcome = await stub.recordBoardIntegration(body.value);
       } else if (kind === "board/decision") {
         outcome = await stub.recordBoardDecision(body.value);
+      } else if (kind === "tools/gate") {
+        outcome = await stub.recordToolGate(body.value);
+      } else if (kind === "tools/used") {
+        outcome = await stub.recordToolUse(body.value);
       } else {
         const token = request.headers.get(BOARD_TOKEN_HEADER);
         if (!token) {

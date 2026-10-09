@@ -38,7 +38,7 @@ describe("the board graph at the live head", () => {
     expect(kinds("goal")).toEqual(["Reject unauthenticated and invalid requests on every resource"]);
     expect(kinds("lead")).toEqual(["lead"]);
     expect(kinds("agent")).toEqual(["ag-1", "ag-2", "ag-3", "ag-4", "ag-5", "ag-6"]);
-    expect(kinds("item")).toEqual(["users", "orders", "auth", "products", "search", "tests"]);
+    expect(kinds("item")).toEqual(["users", "orders", "auth", "products", "search", "tests", "tool-scan-unguarded-routes"]);
     expect(kinds("rev")).toEqual(["rev 1", "rev 2"]);
     expect(kinds("tool")).toEqual(["scan-unguarded-routes"]);
     expect(kinds("jev")).toEqual(["plan-review", "attribution", "contract-triage"]);
@@ -77,12 +77,46 @@ describe("the board graph at the live head", () => {
     expect(users.detail).toMatchObject({ completed: { n: 2, via: "integrated" } });
   });
 
-  it("aggregates consumed-tool edges per user", () => {
+  it("aggregates consumed-tool edges per user, backed by the engine's tool.used records", () => {
     const tool = full.edges.filter((e) => e.kind === "consumed-tool");
     expect(tool.map((e) => [e.to, e.count])).toEqual([
       ["agent:ag-1", 1],
       ["agent:ag-2", 2],
     ]);
+    for (const edge of tool) {
+      expect(edge.seqs.every((seq) => log.find((m) => m.seq === seq)?.type === "tool.used" && log.find((m) => m.seq === seq)?.from === "engine")).toBe(true);
+    }
+  });
+
+  it("a tool node carries its registry entry: kind, builder, the gate evidence it passed, its versions and users", () => {
+    const node = full.nodes.find((n) => n.id === "tool:scan-unguarded-routes")!;
+    expect(node.status).toBe("published");
+    expect(node.detail).toMatchObject({
+      kind: "tool",
+      toolKind: "scanner",
+      proposedBy: "ag-4",
+      item: "tool-scan-unguarded-routes",
+      versions: [{ version: "1", publishedBy: "ag-4", commit: "t00l001", uses: 3 }],
+      users: [
+        { agent: "ag-1", uses: 1 },
+        { agent: "ag-2", uses: 2 },
+      ],
+      published: true,
+    });
+    const gated = log.find((m) => m.type === "tool.gated")!;
+    expect(node.seqs).toContain(gated.seq);
+    expect(node.detail.kind === "tool" && node.detail.gates?.[0]).toMatchObject({ seq: gated.seq, passed: true });
+    expect(node.detail.kind === "tool" && node.detail.versions[0]!.gateSeq).toBe(gated.seq);
+    // The tool item's passing build published it: a trigger edge backed by tool.published.
+    const published = full.edges.find((e) => e.id === "trigger:item:tool-scan-unguarded-routes->tool:scan-unguarded-routes")!;
+    expect(published).toMatchObject({ kind: "trigger", type: "tool.published" });
+  });
+
+  it("refuses a consumed-tool edge backed by anything but a tool.used record", () => {
+    const edge = full.edges.find((e) => e.kind === "consumed-tool")!;
+    const pushed = log.find((m) => m.type === "push.announced")!;
+    const forged = { ...full, edges: full.edges.map((e) => (e.id === edge.id ? { ...e, seqs: [pushed.seq] } : e)) };
+    expect(() => assertBoardBacked(forged, log)).toThrow(/must be backed by tool.used/);
   });
 
   it("chains revisions and feeds each with the items whose pushes it merged", () => {
@@ -243,7 +277,13 @@ describe("ticker and labels", () => {
   });
 
   it("sorts items into the board columns", () => {
-    expect(full.columns).toEqual({ proposed: [], open: [], claimed: ["tests"], contested: ["auth", "search"], done: ["users", "orders", "products"] });
+    expect(full.columns).toEqual({
+      proposed: [],
+      open: [],
+      claimed: ["tests"],
+      contested: ["auth", "search"],
+      done: ["users", "orders", "products", "tool-scan-unguarded-routes"],
+    });
   });
 
   it("pins the escalations waiting on a human, with the contract's advisory triage", () => {

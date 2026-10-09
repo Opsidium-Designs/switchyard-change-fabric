@@ -26,6 +26,14 @@ import {
   KEEP_WORK_ROOT_FLAG,
   formatDependencyInstall,
   offlineFixtureGateLabel,
+  OFFLINE_TOOL_AUTHOR_LABEL,
+  regionToolAuthor,
+  selectToolFiller,
+  initialEnvironmentCredentialKeys,
+  loadDotEnvFile,
+  runtimeCredentialNames,
+  runtimeEnv,
+  setRuntimeCredentials,
   changeToSpecYaml,
   cleanupLive,
   formatAttributionTally,
@@ -123,6 +131,15 @@ const commands: Command[] = [
         console.log(redactSecrets(`  ${r.ok ? "PASS" : "FAIL"} ${r.type}: ${r.detail}`));
       }
       return results.every((r) => r.ok) ? 0 : 1;
+    },
+  },
+  {
+    name: "env-check",
+    summary: "Confirm no credential is in this process's environment (names only); .env is read into memory instead.",
+    usage: `${CLI_NAME} env-check`,
+    async run() {
+      // Handled in main before anything else runs (it needs the startup environment).
+      return 0;
     },
   },
   {
@@ -948,6 +965,7 @@ const commands: Command[] = [
         console.log("  planner: heuristic decomposition (offline stub)");
         console.log("  agent turns: generic deterministic policy (offline stand-in for the turn model)");
         console.log("  executor: scoped deterministic noop; workspaces: local fallback repos");
+        console.log(`  agent-built tools: ${OFFLINE_TOOL_AUTHOR_LABEL}; tool gates and tool runs isolated like gate commands`);
         console.log(
           `  dial: min ${dial.minConcurrency}, max ${dial.maxConcurrency}; ` +
             (declaredGate
@@ -1032,6 +1050,11 @@ const commands: Command[] = [
         transport: turn.transport,
         executor: selected.executor,
         ...(selected.escalationModels.length > 0 ? { escalationModels: selected.escalationModels } : {}),
+        // Tool skeletons are filled region by region on the strongest model (anchored on the runtime's markers).
+        ...(() => {
+          const tools = selectToolFiller();
+          return tools.live && tools.filler ? { toolAuthor: regionToolAuthor(tools.filler), toolAuthorLabel: tools.description } : {};
+        })(),
         ...contractOptions,
         ...(() => {
           // The typed-decision layer, when live, only narrows failure
@@ -1299,7 +1322,7 @@ function maxModelRetriesFromArgs(args: readonly string[], executorDefault?: numb
     executorDefault !== undefined && Number.isFinite(executorDefault) && executorDefault >= 0
       ? Math.floor(executorDefault)
       : 3;
-  const raw = optionValue(args, "--max-model-retries") ?? process.env.WORKERS_AI_MAX_MODEL_RETRIES;
+  const raw = optionValue(args, "--max-model-retries") ?? runtimeEnv().WORKERS_AI_MAX_MODEL_RETRIES;
   if (raw === undefined) {
     return fallback;
   }
@@ -1542,7 +1565,9 @@ async function wranglerDeploy(appDir: string): Promise<string> {
   const [cmd, cmdArgs] = await wranglerCommand(["deploy"]);
   const { stdout, stderr } = await run(cmd, cmdArgs, {
     cwd: appDir,
-    env: process.env,
+    // wrangler (a trusted tool) needs the Cloudflare credentials in its own
+    // environment; they are passed to it explicitly, never held in ours.
+    env: wranglerEnv(),
     maxBuffer: 4 * 1024 * 1024,
   });
   const text = `${stdout}\n${stderr}`;
@@ -1551,6 +1576,32 @@ async function wranglerDeploy(appDir: string): Promise<string> {
     throw new Error("wrangler deploy did not print a workers.dev URL");
   }
   return match[0];
+}
+
+/** wrangler's environment: ours plus exactly the Cloudflare credentials it needs. */
+function wranglerEnv(): NodeJS.ProcessEnv {
+  const env = runtimeEnv();
+  return {
+    ...process.env,
+    ...(env.CLOUDFLARE_API_TOKEN ? { CLOUDFLARE_API_TOKEN: env.CLOUDFLARE_API_TOKEN } : {}),
+    ...(env.CLOUDFLARE_ACCOUNT_ID ? { CLOUDFLARE_ACCOUNT_ID: env.CLOUDFLARE_ACCOUNT_ID } : {}),
+  };
+}
+
+/** The commands that read `.env`: they talk to the live Worker, Cloudflare, or the AI Gateway. */
+const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "cleanup-live"]);
+
+/**
+ * Load the repo's `.env` (or SCF_ENV_FILE) into memory, never into this
+ * process's environment: code the CLI runs (gates, tools) can read a parent's
+ * initial environment, so secrets never travel through it.
+ */
+function loadCredentials(): void {
+  const path = process.env.SCF_ENV_FILE ?? resolve(repoRoot(), ".env");
+  const values = loadDotEnvFile(path);
+  if (values) {
+    setRuntimeCredentials(values);
+  }
 }
 
 /** The wrangler invocation: the repo's installed binary, else npx. */
@@ -1578,7 +1629,7 @@ async function wranglerDelete(appDir: string): Promise<void> {
   const run = promisify(execFile);
   await run("npx", ["wrangler", "delete"], {
     cwd: appDir,
-    env: process.env,
+    env: wranglerEnv(),
     maxBuffer: 4 * 1024 * 1024,
   }).catch(() => {
     /* best-effort teardown; the Makefile delete-app is the authoritative path */
@@ -1586,6 +1637,27 @@ async function wranglerDelete(appDir: string): Promise<void> {
 }
 async function main(argv: string[]): Promise<number> {
   const args = argv.slice(2);
+  // The credential names in this process's INITIAL environment (what any
+  // same-user process can read), taken before anything is loaded.
+  const exposed = initialEnvironmentCredentialKeys();
+  // Only the live commands read .env (the targets that used to source it); the
+  // offline ones (run, run-goal, decompose, recruit, run-board --offline, ...)
+  // never see a credential or a live executor setting.
+  if (LIVE_COMMANDS.has(args[0] ?? "") && !(args[0] === "run-board" && args.includes("--offline"))) {
+    loadCredentials();
+  }
+  if (exposed.length > 0 && args[0] !== "env-check") {
+    console.error(
+      `Warning: credential(s) in this process's environment (${exposed.join(", ")}): code this CLI runs could read them from it. ` +
+        "Put them in .env instead (the CLI reads it into memory) and do not export them into the CLI's environment.",
+    );
+  }
+  if (args[0] === "env-check") {
+    // Names only, never values.
+    console.log(`credential names in this process's environment: ${exposed.length > 0 ? exposed.join(", ") : "none"}`);
+    console.log(`names loaded into memory from .env (values never shown): ${runtimeCredentialNames().join(", ") || "none"}`);
+    return exposed.length > 0 ? 1 : 0;
+  }
 
   if (args.length === 0 || args[0] === "-h" || args[0] === "--help" || args[0] === "help") {
     printHelp();

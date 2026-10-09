@@ -1456,7 +1456,10 @@ body {
 .mc-detail .meta { grid-template-columns: 1fr; gap: 0.3rem; }
 .mc-detail dd { overflow-wrap: anywhere; }
 .mc-backing { margin-top: 0.6rem; font-size: 0.75rem; }
-.mc-tools { margin: 0; padding-left: 1rem; }
+.mc-tools { width: 100%; border-collapse: collapse; font-size: 0.85em; }
+.mc-tools th, .mc-tools td { text-align: left; padding: 0.25rem 0.4rem; border-bottom: 1px solid rgba(127, 127, 127, 0.25); vertical-align: top; }
+.mc-tool-checks { margin: 0.2rem 0 0.6rem; padding-left: 1rem; font-size: 0.85em; }
+.mc-tool-checks .is-fail { color: #f85149; }
 
 /* Replay */
 .mc-replay {

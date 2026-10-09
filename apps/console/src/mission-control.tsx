@@ -177,7 +177,11 @@ export function payloadSummary(message: BoardMessage): string {
     case "agent.left":
       return "left";
     case "tool.proposed":
-      return `${message.payload.capability} (${message.payload.inputs.join(", ")} -> ${message.payload.outputs.join(", ")})`;
+      return `${message.payload.kind} ${message.payload.capability}${message.payload.inputs.length > 0 ? ` over ${message.payload.inputs.join(", ")}` : " over the whole repo"}`;
+    case "tool.built":
+      return `${message.payload.capability} build ${message.payload.commit.slice(0, 10)}`;
+    case "tool.gated":
+      return `${message.payload.capability}: its own gate ${message.payload.passed ? "passed" : `failed (${message.payload.checks.filter((c) => !c.passed).map((c) => c.check).join(", ")})`}`;
     case "contract.accepted":
     case "contract.rejected":
       return message.payload.contract;
@@ -188,7 +192,7 @@ export function payloadSummary(message: BoardMessage): string {
     case "done.proposed":
       return `${message.payload.item} (a proposal: done only on a passing revision)`;
     case "item.completed":
-      return `${message.payload.item} at rev ${message.payload.n}`;
+      return message.payload.via === "tool" ? `${message.payload.item}: its tool was published (v${message.payload.version})` : `${message.payload.item} at rev ${message.payload.n}`;
     case "contract.proposed":
     case "contract.escalated":
       return `${message.payload.contract}: ${message.payload.kind} ${message.payload.target}`;
@@ -203,9 +207,15 @@ export function payloadSummary(message: BoardMessage): string {
         ? `Jev picked ${message.payload.answer}; ${message.payload.answer} changed before the next pass`
         : `Jev picked ${message.payload.answer}; ${message.payload.answer} did not change before the next pass`;
     case "tool.published":
-      return `${message.payload.capability} v${message.payload.version}`;
+      return `${message.payload.capability} v${message.payload.version} (verified by its own gate)${message.payload.joinsGate === false ? "; does not join the gate" : ""}`;
     case "tool.used":
-      return `${message.payload.capability} v${message.payload.version}`;
+      return `${message.payload.by} ran ${message.payload.capability} v${message.payload.version}${
+        message.payload.changedFiles.length > 0
+          ? `: changed ${message.payload.changedFiles.length} file(s)`
+          : (message.payload.findings ?? []).length > 0
+            ? `: ${(message.payload.findings ?? []).length} finding(s)`
+            : ""
+      }`;
     default:
       return clip(JSON.stringify(message.payload), 110);
   }
@@ -1163,8 +1173,14 @@ export function BoardNodeDetail({ node }: { node: BoardGraphNode }) {
         ) : null}
         {d.kind === "tool" ? (
           <>
+            {row("Kind", d.toolKind)}
             {row("Proposed by", d.proposedBy)}
+            {row("Builder", d.builder ?? d.versions.at(-1)?.publishedBy)}
+            {row("Inputs", d.inputs !== undefined ? (d.inputs.length > 0 ? list(d.inputs) : "the whole repository") : undefined)}
             {row("Published", d.published ? d.versions.map((v) => `v${v.version} by ${v.publishedBy} (used x${v.uses})`).join("; ") : "no: an unverified tool cannot be published")}
+            {row("Usage", d.versions.at(-1)?.usage)}
+            {row("Used by", d.users && d.users.length > 0 ? d.users.map((u) => `${u.agent} x${u.uses}`).join(", ") : undefined)}
+            {row("Joins the gate", d.versions.some((v) => v.joinsGate === false) ? "no: a check tool does not join the gate in this slice" : undefined)}
           </>
         ) : null}
         {d.kind === "jev" ? (
@@ -1186,6 +1202,25 @@ export function BoardNodeDetail({ node }: { node: BoardGraphNode }) {
       ) : null}
       {d.kind === "rev" && !d.gated ? (
         <p className="detail-warning">No gate ran on this revision: its pass checked nothing, so it is unverified.</p>
+      ) : null}
+      {d.kind === "tool" && d.gates && d.gates.length > 0 ? (
+        <>
+          <h4>Tool gate evidence</h4>
+          {d.gates.map((g) => (
+            <div key={g.seq}>
+              <p className="muted">
+                build {g.commit.slice(0, 10)}: {g.passed ? "passed" : "FAILED"} (seq {g.seq}, tool.gated)
+              </p>
+              <ul className="mc-tool-checks">
+                {g.checks.map((c) => (
+                  <li key={c.check} className={c.passed ? "is-pass" : "is-fail"}>
+                    {c.check}: {c.passed ? "ok" : "FAIL"} - {c.detail}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </>
       ) : null}
       {d.kind === "jev" ? (
         <>
@@ -1212,20 +1247,44 @@ export function ToolsRegistry({ model }: { model: BoardGraphModel }) {
     );
   }
   return (
-    <ul className="mc-tools">
-      {tools.map((node) =>
-        node.detail.kind === "tool" ? (
-          <li key={node.id} title={node.tooltip}>
-            <strong>{node.detail.capability}</strong>{" "}
-            <span className="muted">
-              {node.detail.published
-                ? node.detail.versions.map((v) => `v${v.version} by ${v.publishedBy}, used x${v.uses}`).join("; ")
-                : `proposed by ${node.detail.proposedBy ?? "?"}, not published (unverified)`}
-            </span>
-          </li>
-        ) : null,
-      )}
-    </ul>
+    <table className="mc-tools">
+      <thead>
+        <tr>
+          <th>Capability</th>
+          <th>Version</th>
+          <th>Kind</th>
+          <th>Builder</th>
+          <th>Tool gate</th>
+          <th>Uses</th>
+        </tr>
+      </thead>
+      <tbody>
+        {tools.map((node) => {
+          const d = node.detail;
+          if (d.kind !== "tool") {
+            return null;
+          }
+          const latest = d.versions.at(-1);
+          const gate = latest?.gateSeq !== undefined ? d.gates?.find((g) => g.seq === latest.gateSeq) : d.gates?.at(-1);
+          return (
+            <tr key={node.id} title={node.tooltip}>
+              <td>
+                <strong>{d.capability}</strong>
+              </td>
+              <td>{latest ? `v${latest.version}${latest.commit ? ` (${latest.commit.slice(0, 10)})` : ""}` : "unpublished"}</td>
+              <td>{d.toolKind ?? "?"}</td>
+              <td>{d.builder ?? latest?.publishedBy ?? d.proposedBy ?? "?"}</td>
+              <td>
+                {gate
+                  ? `${gate.passed ? "passed" : "failed"}: ${gate.checks.map((c) => `${c.check} ${c.passed ? "ok" : "FAIL"}`).join(", ")} (seq ${gate.seq})`
+                  : "not gated yet: an unverified tool cannot be published"}
+              </td>
+              <td>{d.users && d.users.length > 0 ? d.users.map((u) => `${u.agent} x${u.uses}`).join(", ") : "none"}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
   );
 }
 

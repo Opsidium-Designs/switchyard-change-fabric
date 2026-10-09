@@ -1,6 +1,6 @@
 {
   "formation": {
-    "description": "Agents and a lead join with tokens and form around a goal: a free claim, a contest the owner cedes, a waiting claimant, a read-only claim, a failing then a passing integrated revision (targeted rebase), completion derived from done.proposed plus a merged push, a split whose children complete the parent, a contract the lead accepts, an addressed help request, and a tool proposed, published, and used. Two posts are refused: an unverified tool and an agent trying to complete its own item.",
+    "description": "Agents and a lead join with tokens and form around a goal: a free claim, a contest the owner cedes, a waiting claimant, a read-only claim, a failing then a passing integrated revision (targeted rebase), completion derived from done.proposed plus a merged push, a split whose children complete the parent, a contract the lead accepts, an addressed help request, and a tool proposed that the lead rejects. Three posts are refused: an agent trying to complete its own item, an agent trying to publish its own tool (only the engine publishes, after the tool's own gate), and an agent trying to record a use (only the engine records uses).",
     "responders": [{ "id": "agent-a", "answer": "cede" }],
     "steps": [
       { "from": "human", "type": "goal.posted", "payload": { "objective": "make the service reject malformed input", "rules": { "maxContestTurns": 3, "contestIdleMessages": 25 } } },
@@ -23,10 +23,10 @@
       { "from": "agent-c", "type": "item.split", "payload": { "item": "docs", "children": [ { "item": "docs-api", "objective": "api docs", "scopeHint": ["docs/api.md"] }, { "item": "docs-guide", "objective": "guide", "scopeHint": ["docs/guide.md"] } ] } },
       { "from": "agent-c", "type": "item.claimed", "payload": { "item": "docs-api", "intent": { "read": [], "write": ["docs/api.md"] } } },
       { "from": "agent-b", "type": "item.claimed", "payload": { "item": "docs-guide", "intent": { "read": [], "write": ["docs/guide.md"] } } },
-      { "from": "agent-c", "type": "tool.proposed", "payload": { "tool": "link-check", "capability": "doc-link-scan", "inputs": ["docs"], "outputs": ["findings"] } },
-      { "from": "agent-c", "type": "tool.published", "payload": { "tool": "link-check", "capability": "doc-link-scan", "version": "1", "repo": "tools-repo", "commit": "t00l001", "verified": false } },
-      { "from": "agent-c", "type": "tool.published", "payload": { "tool": "link-check", "capability": "doc-link-scan", "version": "1", "repo": "tools-repo", "commit": "t00l001", "verified": true } },
-      { "from": "agent-b", "type": "tool.used", "payload": { "capability": "doc-link-scan", "version": "1", "changedFiles": ["docs/guide.md"] } },
+      { "from": "agent-c", "type": "tool.proposed", "payload": { "tool": "link-check", "capability": "doc-link-scan", "kind": "scanner", "inputs": ["docs/**"], "outputs": ["findings"] }, "rationale": "every doc page needs the same link check" },
+      { "from": "agent-c", "type": "tool.published", "payload": { "tool": "link-check", "capability": "doc-link-scan", "version": "1", "repo": "tools-repo", "commit": "t00l001", "verified": true, "kind": "scanner", "usage": "node tools/doc-link-scan/run.mjs" } },
+      { "from": "agent-b", "type": "tool.used", "payload": { "capability": "doc-link-scan", "version": "1", "by": "agent-b", "changedFiles": [] } },
+      { "from": "lead", "type": "item.rejected", "payload": { "item": "tool-doc-link-scan" }, "rationale": "two doc pages do not need a tool" },
       { "from": "agent-c", "type": "push.announced", "payload": { "item": "docs-api", "commit": "papi001", "paths": ["docs/api.md"] } },
       { "from": "agent-b", "type": "push.announced", "payload": { "item": "docs-guide", "commit": "pgde001", "paths": ["docs/guide.md"] } },
       { "from": "agent-c", "type": "done.proposed", "payload": { "item": "docs-api" } },

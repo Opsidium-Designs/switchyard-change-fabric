@@ -40,7 +40,7 @@ async function exists(path: string): Promise<boolean> {
 
 /** Run the CLI offline with its own TMPDIR; resolve its exit code and stdout. */
 function runCli(args: readonly string[], tmp: string): Promise<{ code: number; stdout: string }> {
-  const env: NodeJS.ProcessEnv = { ...process.env, TMPDIR: tmp };
+  const env: NodeJS.ProcessEnv = { ...process.env, TMPDIR: tmp, SCF_ENV_FILE: "/dev/null" };
   for (const key of ["EXECUTOR", "CLOUDFLARE_AI_GATEWAY_URL", "CLOUDFLARE_AI_GATEWAY_TOKEN", "SWITCHYARD_API_TOKEN"]) {
     delete env[key];
   }

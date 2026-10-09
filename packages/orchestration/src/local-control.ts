@@ -27,6 +27,9 @@ import {
   checkBoardJoin,
   parseBoardJoinWorkspace,
   appendIntegratedRev,
+  appendToolGated,
+  appendToolUsed,
+  toolsWorkspaceName,
   applyBoardEscalations,
   BOARD_LIMITS,
   BoardError,
@@ -598,6 +601,8 @@ export class LocalChangeControl {
   private readonly records = new Map<string, ChangeRecord>();
   /** Board agents' workspaces by repo name (for the operator's read tokens). */
   private readonly boardWorkspaces = new Map<string, WorkspaceRef>();
+  /** Each Change's tools repo (provisioned once, on the first tool build). */
+  private readonly toolsWorkspaces = new Map<string, WorkspaceRef>();
   /** Read tokens the operator revoked (observable offline). */
   readonly revokedReadTokens: string[] = [];
   private readonly boardClock: () => Date;
@@ -1646,7 +1651,7 @@ export class LocalChangeControl {
     const method = (init?.method ?? "GET").toUpperCase();
 
     const boardRoute = url.pathname.match(
-      /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|integration\/revision)$/,
+      /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|integration\/revision|tools\/gate|tools\/used)$/,
     );
     if (boardRoute && (method === "POST" || method === "GET")) {
       const response = await this.handleBoard(dec(boardRoute[1]), boardRoute[2] ?? "", method, url, init);
@@ -1690,6 +1695,10 @@ export class LocalChangeControl {
       } catch (error) {
         return json({ error: error instanceof Error ? error.message : String(error) }, 400);
       }
+    }
+    const toolsRepo = url.pathname.match(/^\/changes\/([^/]+)\/tools\/(workspace|token|token\/revoke)$/);
+    if (method === "POST" && toolsRepo) {
+      return this.handleToolsRepo(dec(toolsRepo[1]), toolsRepo[2] ?? "", parseBody(init));
     }
     const readToken = url.pathname.match(/^\/changes\/([^/]+)\/board\/read-token$/);
     if (method === "POST" && readToken) {
@@ -2125,6 +2134,14 @@ export class LocalChangeControl {
     } else if (kind === "board/decision") {
       const record = this.require(changeId);
       outcome = this.boardOutcome(() => this.appendToBoard(record, (state) => appendDecisionRecorded(state, body, this.boardAt())));
+    } else if (kind === "tools/gate") {
+      // The operator ran a tool's own gate: the engine records it (and publishes a pass).
+      const record = this.require(changeId);
+      outcome = this.boardOutcome(() => this.appendToBoard(record, (state) => appendToolGated(state, body, this.boardAt())));
+    } else if (kind === "tools/used") {
+      // The operator's runtime ran a pinned tool version in a consumer's repo: the engine records the use.
+      const record = this.require(changeId);
+      outcome = this.boardOutcome(() => this.appendToBoard(record, (state) => appendToolUsed(state, body, this.boardAt())));
     } else {
       const token = headers.get(BOARD_TOKEN_HEADER);
       if (!token) {
@@ -2135,6 +2152,57 @@ export class LocalChangeControl {
     return outcome.ok
       ? json(outcome, 201)
       : json({ code: outcome.code, error: outcome.error }, boardErrorStatus(outcome.code as BoardErrorCode));
+  }
+
+  /**
+   * Mirrors the Worker's tools-repo routes: provision the Change's tools repo
+   * once (a repeat returns the same repo with a fresh write token), issue a
+   * short-lived read or write token for it, or revoke one.
+   */
+  private async handleToolsRepo(changeId: string, action: string, body: Record<string, unknown>): Promise<Response> {
+    if (!this.records.has(changeId)) {
+      return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
+    }
+    const ref = this.toolsWorkspaces.get(changeId);
+    if (action === "token/revoke") {
+      if (!ref || typeof body.tokenId !== "string" || body.tokenId === "") {
+        return json({ code: "BAD_PAYLOAD", error: "a revoke names a tokenId of a provisioned tools repo" }, 400);
+      }
+      await this.workspaces.revokeToken(ref, body.tokenId).catch(() => false);
+      return json({ revoked: body.tokenId }, 200);
+    }
+    const ttl = body.ttlSeconds === undefined ? 900 : body.ttlSeconds;
+    const { min, max } = BOARD_WORKSPACE_TTL_BOUNDS;
+    if (typeof ttl !== "number" || !Number.isInteger(ttl) || ttl < min || ttl > max) {
+      return json({ code: "BAD_PAYLOAD", error: `ttlSeconds must be an integer from ${min} to ${max}` }, 400);
+    }
+    if (action === "token") {
+      if (!ref) {
+        return json({ code: "INVALID_STATE", error: "the tools repo is not provisioned yet" }, 400);
+      }
+      const scope = body.scope ?? "read";
+      if (scope !== "read" && scope !== "write") {
+        return json({ code: "BAD_PAYLOAD", error: 'scope must be "read" or "write"' }, 400);
+      }
+      const token = scope === "write" ? await this.workspaces.issueWriteToken(ref, ttl) : await this.workspaces.issueReadToken(ref, ttl);
+      return json({ workspaceName: ref.name, tokenId: token.id, token: token.token, tokenExpiresAt: token.expiresAt }, 201);
+    }
+    const repo = ref ?? (await this.workspaces.create(toolsWorkspaceName(changeId), { defaultBranch: "main" }));
+    this.toolsWorkspaces.set(changeId, repo);
+    const token = await this.workspaces.issueWriteToken(repo, ttl);
+    return json(
+      {
+        workspaceName: repo.name,
+        gitUrl: repo.gitUrl,
+        defaultBranch: repo.defaultBranch,
+        backend: repo.backend,
+        fallback: repo.fallback,
+        tokenId: token.id,
+        token: token.token,
+        tokenExpiresAt: token.expiresAt,
+      },
+      201,
+    );
   }
 
   /** Mirrors the Worker's read-token route: a short-lived read token for a joined agent's repo. */

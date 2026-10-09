@@ -146,7 +146,7 @@ describe("LocalChangeControl board routes (parity with the Worker)", () => {
       [BOARD_TOKEN_HEADER]: token,
     });
     expect([huge.status, huge.body.code]).toEqual([413, "LIMIT"]);
-    expect(c.state(ID).board).toMatchObject({ messages: log.length + 1, toolsPublished: 1, integratedRev: 3 });
+    expect(c.state(ID).board).toMatchObject({ messages: log.length + 1, toolsPublished: 0, integratedRev: 3 });
   });
 
   it("serves an agent its digest only with its own token; agent.left revokes the token", async () => {

@@ -36,6 +36,7 @@
  * none). No I/O, no clock, no goal-string branching.
  */
 
+import { entryWithin } from "./path-overlap.ts";
 import type { Change, WorkUnit } from "./types.ts";
 
 /**
@@ -190,4 +191,227 @@ function distinctConcreteFiles(units: readonly WorkUnit[]): readonly string[] {
     }
   }
   return [...files].sort();
+}
+
+// ---------------------------------------------------------------------------
+// The same structural rule over a board's items (agents decide; this only
+// tells them when a tool pays for itself)
+// ---------------------------------------------------------------------------
+
+/** One board item as the board-level rule reads it. */
+export interface BoardToolNeedItem {
+  readonly item: string;
+  readonly scopeHint: readonly string[];
+  readonly status: string;
+  /** The item's objective (compared with its siblings' after removing its own scope and id words). */
+  readonly objective?: string;
+  /** A tool item (it builds a tool) or an item proposed from a tool's findings: never grouped. */
+  readonly tool?: boolean;
+}
+
+/** A repeated mechanical change across a board's items, and the scope a tool for it would cover. */
+export interface BoardToolNeed {
+  /** A short name for the shared change (the id prefix, or the leading words the objectives share). */
+  readonly editKind: string;
+  /** Which signal grouped them: a shared id prefix, or near-identical objectives over sibling files. */
+  readonly signal: "id-prefix" | "objective";
+  /** The items applying it (still outstanding). */
+  readonly items: readonly string[];
+  /** The distinct existing, unprotected files their scopes cover. */
+  readonly files: readonly string[];
+  /** The union of their scope hints: the tool's intended inputs. */
+  readonly scope: readonly string[];
+  /** Deterministic tool capabilities for it: a scanner (find every place) and a codemod (apply the change). */
+  readonly scanner: string;
+  readonly codemod: string;
+}
+
+const OUTSTANDING: ReadonlySet<string> = new Set(["open", "claimed", "contested"]);
+
+/** Objectives at least this similar (token Jaccard, after removing each item's own words) are one change. */
+export const OBJECTIVE_SIMILARITY = 0.7;
+/**
+ * Or: the overlap coefficient |A∩B| / min(|A|, |B|) of the full objectives'
+ * words at least this (a planner adds item-specific detail after an identical
+ * lead), when both have at least OVERLAP_MIN_WORDS words.
+ */
+export const OBJECTIVE_OVERLAP = 0.6;
+export const OVERLAP_MIN_WORDS = 3;
+
+/** A capability id from free parts: lower-case, [a-z0-9._-], at most 64 characters. */
+export function toolCapabilityFor(prefix: string, editKind: string): string {
+  const slug = `${prefix}-${editKind}`
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^[^a-z0-9]+/, "")
+    .slice(0, 64)
+    .replace(/[-._]+$/, "");
+  return slug === "" ? prefix : slug;
+}
+
+/** Lower-case word tokens of a text (letters and digits). */
+function tokens(text: string): string[] {
+  return text.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t !== "");
+}
+
+/**
+ * An objective's words with the item's OWN words removed: its scope's path
+ * tokens (directories, file names, extensions), its id's tokens, numbers, and
+ * words of fewer than three letters. What remains is the change itself.
+ */
+export function objectiveChangeWords(item: Pick<BoardToolNeedItem, "item" | "scopeHint" | "objective">, part: "all" | "first" = "all"): string[] {
+  const own = new Set([...item.scopeHint.flatMap(tokens), ...tokens(item.item)]);
+  // The first sentence or clause: split on . ; : that END a phrase (not the dot in "auth.js").
+  const text = part === "first" ? (item.objective ?? "").split(/[.;:](?:\s|$)/)[0] ?? "" : item.objective ?? "";
+  const out: string[] = [];
+  for (const t of tokens(text)) {
+    if (t.length < 3 || /^\d+$/.test(t) || own.has(t) || out.includes(t)) {
+      continue;
+    }
+    out.push(t);
+  }
+  return out;
+}
+
+function overlap(a: readonly string[], b: readonly string[]): number {
+  if (a.length < OVERLAP_MIN_WORDS || b.length < OVERLAP_MIN_WORDS) {
+    return 0;
+  }
+  const sb = new Set(b);
+  return a.filter((t) => sb.has(t)).length / Math.min(a.length, b.length);
+}
+
+function jaccard(a: readonly string[], b: readonly string[]): number {
+  if (a.length === 0 || b.length === 0) {
+    return 0;
+  }
+  const sb = new Set(b);
+  const shared = a.filter((t) => sb.has(t)).length;
+  return shared / (new Set([...a, ...b]).size);
+}
+
+/** The literal (wildcard-free) path of a scope entry's first segments. */
+function literalPath(entry: string): string {
+  const out: string[] = [];
+  for (const seg of entry.split("#")[0]!.split("/")) {
+    if (seg === "" || /[*?]/.test(seg)) {
+      break;
+    }
+    out.push(seg);
+  }
+  return out.join("/");
+}
+
+/**
+ * Where an item works, for the sibling rule: the parent directory of its
+ * first concrete scope file (a glob's literal directory), and the file's
+ * "pattern" (its name in a sibling directory: `<grandparent>/*\/<name>`).
+ */
+function siblingKeys(item: BoardToolNeedItem): string[] {
+  const first = item.scopeHint[0];
+  if (first === undefined) {
+    return [];
+  }
+  const literal = literalPath(first);
+  const concrete = !/[*?]/.test(first);
+  const parts = literal === "" ? [] : literal.split("/");
+  if (!concrete) {
+    return [`dir:${parts.join("/")}`];
+  }
+  const keys = [`dir:${parts.slice(0, -1).join("/")}`];
+  if (parts.length >= 2) {
+    keys.push(`pattern:${parts.slice(0, -2).join("/")}/*/${parts.at(-1)}`);
+  }
+  return keys;
+}
+
+/**
+ * The board form of the structural trigger, from two goal-agnostic signals:
+ *   - a shared id prefix (the decomposer names a fanned-out action
+ *     `<action>-<file>`), as before;
+ *   - near-identical objectives over sibling files: after removing each
+ *     item's own words (its scope's path tokens, its id's tokens, numbers),
+ *     the objectives' first clauses have token Jaccard of at least
+ *     OBJECTIVE_SIMILARITY, or the full objectives an overlap coefficient of
+ *     at least OBJECTIVE_OVERLAP (an identical lead, item-specific tails), and the
+ *     items' scopes are siblings (the same parent directory, or the same file
+ *     name in sibling directories). A planner that numbers or names its items
+ *     freely (`u1-auth-resource`, `u2-notifications-resource`) still groups.
+ * A group needs at least two OUTSTANDING items whose scopes cover at least
+ * `minFanout` distinct existing, unprotected files. The largest group wins
+ * (an id-prefix group on a tie). Pure: ids, scopes, objectives, and the file
+ * listing; never a goal-specific word.
+ */
+export function detectBoardToolNeed(
+  items: readonly BoardToolNeedItem[],
+  files: readonly string[],
+  options: { readonly minFanout?: number; readonly protected?: readonly string[] } = {},
+): BoardToolNeed | undefined {
+  const minFanout = options.minFanout ?? DEFAULT_MIN_FANOUT;
+  const guarded = options.protected ?? [];
+  const candidates = items.filter((i) => !i.tool && OUTSTANDING.has(i.status));
+
+  const groups: { readonly editKind: string; readonly signal: BoardToolNeed["signal"]; readonly members: BoardToolNeedItem[] }[] = [];
+  // Signal 1: a shared id prefix.
+  const byPrefix = new Map<string, BoardToolNeedItem[]>();
+  for (const item of candidates.filter((i) => i.item.includes("-"))) {
+    const kind = item.item.slice(0, item.item.indexOf("-"));
+    byPrefix.set(kind, [...(byPrefix.get(kind) ?? []), item]);
+  }
+  for (const [editKind, members] of [...byPrefix.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    groups.push({ editKind, signal: "id-prefix", members });
+  }
+  // Signal 2: near-identical objectives over sibling files (greedy, in item order, per sibling key).
+  const words = new Map(candidates.map((i) => [i.item, objectiveChangeWords(i)]));
+  const firsts = new Map(candidates.map((i) => [i.item, objectiveChangeWords(i, "first")]));
+  // One change: the first clauses nearly identical, or the full objectives overlapping strongly.
+  const similar = (a: string, b: string): boolean =>
+    jaccard(firsts.get(a)!, firsts.get(b)!) >= OBJECTIVE_SIMILARITY || overlap(words.get(a)!, words.get(b)!) >= OBJECTIVE_OVERLAP;
+  const byKey = new Map<string, BoardToolNeedItem[]>();
+  for (const item of candidates.filter((i) => (words.get(i.item) ?? []).length > 0)) {
+    for (const key of siblingKeys(item)) {
+      byKey.set(key, [...(byKey.get(key) ?? []), item]);
+    }
+  }
+  for (const [, siblings] of [...byKey.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+    const left = [...siblings];
+    while (left.length > 0) {
+      const seed = left.shift()!;
+      const seedWords = words.get(seed.item)!;
+      const members = [seed, ...left.filter((i) => similar(seed.item, i.item))];
+      for (const m of members.slice(1)) {
+        left.splice(left.indexOf(m), 1);
+      }
+      if (members.length >= 2) {
+        // The words every member shares (the first clause first), in the seed's order, name the change.
+        const firstShared = firsts.get(seed.item)!.filter((w) => members.every((m) => words.get(m.item)!.includes(w)));
+        const shared = firstShared.length > 0 ? firstShared : seedWords.filter((w) => members.every((m) => words.get(m.item)!.includes(w)));
+        groups.push({ editKind: shared.slice(0, 2).join("-") || "change", signal: "objective", members });
+      }
+    }
+  }
+
+  let best: BoardToolNeed | undefined;
+  for (const group of groups) {
+    if (group.members.length < 2) {
+      continue;
+    }
+    const scope = [...new Set(group.members.flatMap((i) => i.scopeHint))];
+    const covered = files.filter(
+      (f) => scope.some((entry) => entryWithin(f, entry)) && !guarded.some((p) => entryWithin(f, p) || f === p),
+    );
+    if (covered.length < minFanout || (best !== undefined && covered.length <= best.files.length)) {
+      continue;
+    }
+    best = {
+      editKind: group.editKind,
+      signal: group.signal,
+      items: group.members.map((i) => i.item),
+      files: [...covered].sort(),
+      scope,
+      scanner: toolCapabilityFor("scan", group.editKind),
+      codemod: toolCapabilityFor("codemod", group.editKind),
+    };
+  }
+  return best;
 }

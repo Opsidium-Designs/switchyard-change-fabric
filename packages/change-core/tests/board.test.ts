@@ -6,6 +6,8 @@ import {
   appendBoardMessage,
   appendDecisionRecorded,
   appendIntegratedRev,
+  appendToolGated,
+  appendToolUsed,
   applyBoardEscalations,
   boardAttributionTally,
   boardContractDecision,
@@ -54,9 +56,14 @@ class TestBoard {
   private run(draft: Record<string, unknown>): BoardAppendResult {
     const { from, ...body } = draft;
     if (from === "engine") {
+      const payload = (draft.payload ?? {}) as unknown;
       return draft.type === "decision.recorded"
-        ? appendDecisionRecorded(this.state, (draft.payload ?? {}) as unknown, AT)
-        : appendIntegratedRev(this.state, (draft.payload ?? {}) as unknown, AT);
+        ? appendDecisionRecorded(this.state, payload, AT)
+        : draft.type === "tool.gated"
+          ? appendToolGated(this.state, payload, AT)
+          : draft.type === "tool.used"
+            ? appendToolUsed(this.state, payload, AT)
+            : appendIntegratedRev(this.state, payload, AT);
     }
     const origin: BoardOrigin =
       from === "human"
@@ -169,9 +176,17 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
   "fix.requested": { from: "engine", payload: { item: "i", n: 2, attempt: 1 } },
   "fix.exhausted": { from: "engine", payload: { item: "i", n: 3, attempts: 2 } },
   "item.reopened": { from: "engine", payload: { item: "i", previousOwner: "a", commit: "c1", n: 3 } },
-  "tool.proposed": { from: "a", payload: { tool: "t", capability: "scan", inputs: ["files"], outputs: ["items"] } },
-  "tool.published": { from: "a", payload: { tool: "t", capability: "scan", version: "1", repo: "tools", commit: "abc", verified: true } },
-  "tool.used": { from: "b", payload: { capability: "scan", version: "1", changedFiles: ["src/a.ts"] } },
+  "tool.proposed": { from: "a", payload: { tool: "t", capability: "scan", kind: "scanner", inputs: ["src/**"], outputs: ["findings"] } },
+  "tool.built": { from: "a", payload: { capability: "scan", commit: "abc", paths: ["tools/scan/run.mjs"] } },
+  "tool.gated": {
+    from: "engine",
+    payload: { capability: "scan", commit: "abc", passed: true, checks: [{ check: "tests", passed: true, detail: "1 test passed" }], repo: "tools", usage: "node tools/scan/run.mjs" },
+  },
+  "tool.published": {
+    from: "engine",
+    payload: { tool: "t", capability: "scan", version: "1", repo: "tools", commit: "abc", verified: true, kind: "scanner", usage: "node tools/scan/run.mjs" },
+  },
+  "tool.used": { from: "engine", payload: { capability: "scan", version: "1", by: "b", item: "i", commit: "c1", changedFiles: ["src/a.ts"], findings: [{ path: "src/a.ts", line: 3, message: "m" }] } },
   "decision.recorded": { from: "engine", payload: { juncture: "attribution", question: "which?", answer: "i", confidence: 0.9, accepted: true, rev: 2, parsed: ["j"] } },
   "decision.resolved": {
     from: "engine",
@@ -213,10 +228,12 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "item.completed": { item: "i", n: 1, via: "vibes" },
   "fix.requested": { item: "i", n: 0, attempt: 1 },
   "fix.exhausted": { item: "i", n: 1, attempts: -1 },
-  "item.reopened": { item: "i", previousOwner: "a" },
-  "tool.proposed": { tool: "t" },
-  "tool.published": { tool: "t", capability: "scan", version: "1", repo: "tools", commit: "abc", verified: false },
-  "tool.used": { capability: "scan" },
+  "item.reopened": { item: "i", previousOwner: "a", n: 0 },
+  "tool.proposed": { tool: "t", capability: "scan", kind: "linter" },
+  "tool.built": { capability: "Scan Tool", commit: "abc", paths: ["tools/scan/run.mjs"] },
+  "tool.gated": { capability: "scan", commit: "abc", passed: true, checks: [], repo: "tools", usage: "u" },
+  "tool.published": { tool: "t", capability: "scan", version: "1", repo: "tools", commit: "abc", verified: false, kind: "scanner", usage: "u" },
+  "tool.used": { capability: "scan", version: "1", by: "b", findings: [{ path: "src/*.ts", message: "m" }] },
   "decision.recorded": { juncture: "guess", question: "q", accepted: true },
   "decision.resolved": { decisionSeq: 1, rev: 1, passed: 2, answer: "i", outcome: "confirmed", fixed: [], parsed: [], parseOutcome: "none" },
   "agent.joined": { role: "has spaces" },
@@ -226,7 +243,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(38);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(40);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -774,10 +791,9 @@ describe("completion is derived from a passing revision", () => {
     board.post(claim("a", "one", ["src/a.ts"]));
     board.post(push("a", "one", "c1", ["src/a.ts"]));
     board.post(push("a", "one", "c2", ["src/a.ts"]));
-    board.post(msg("a", "tool.proposed", { tool: "t1", capability: "scan" }));
-    board.post(msg("a", "tool.published", { tool: "t1", capability: "scan", version: "1", repo: "tools", commit: "abc", verified: true }));
-    board.post(msg("b", "tool.used", { capability: "scan", version: "1", changedFiles: ["src/x.ts"] }));
-    board.post(msg("c", "tool.used", { capability: "scan", version: "1" }));
+    publishTool(board, "c", "scan", "scanner");
+    board.post(msg("engine", "tool.used", { capability: "scan", version: "1", by: "b", findings: [{ path: "src/x.ts", message: "m" }] }));
+    board.post(msg("engine", "tool.used", { capability: "scan", version: "1", by: "a" }));
     expect(board.state.pushes).toBe(2);
     expect(board.state.items.one?.lastPush).toMatchObject({ commit: "c2" });
     expect(board.state.tools.published[0]?.uses).toBe(2);
@@ -993,7 +1009,7 @@ describe("the fix loop: failing evidence and fix requests", () => {
     const forged = board.log.map((m) =>
       m.type === "fix.requested" ? ({ ...m, payload: { ...m.payload, attempt: 2 } } as BoardMessage) : m,
     );
-    expect(() => reduceBoard(forged)).toThrow(/does not match arbitration/);
+    expect(() => reduceBoard(forged)).toThrow(/not produced by arbitration|does not match arbitration/);
   });
 });
 
@@ -1114,7 +1130,7 @@ describe("attribution outcomes (advisory, derived mechanically)", () => {
     const forged = board.log.map((m) =>
       m.type === "decision.resolved" ? ({ ...m, payload: { ...m.payload, outcome: "in-fixed-set" } } as BoardMessage) : m,
     );
-    expect(() => reduceBoard(forged)).toThrow(/does not match arbitration/);
+    expect(() => reduceBoard(forged)).toThrow(/not produced by arbitration|does not match arbitration/);
     // An unresolved, unanswered (error) attribution is never tracked.
     expect(boardAttributionTally(board.state).decisions).toBe(1);
   });
@@ -1177,26 +1193,201 @@ describe("contract triage (advisory)", () => {
   });
 });
 
-describe("tool registry", () => {
-  it("publishing requires a prior proposal by the same agent, verification, and a unique version", () => {
+describe("tool registry: agents build tools for each other", () => {
+  const checks = (passed: boolean) => [
+    { check: "tests", passed: true, detail: "its own tests passed" },
+    { check: "finds", passed, detail: passed ? "2 finding(s) on the baseline" : "found nothing on the baseline" },
+  ];
+  const gated = (capability: string, commit: string, passed: boolean) =>
+    msg("engine", "tool.gated", { capability, commit, passed, checks: checks(passed), repo: "change--tools", usage: `node tools/${capability}/run.mjs` });
+
+  it("a worker's tool proposal becomes a tool item the lead must accept before anyone can claim it", () => {
     const board = seeded();
-    const publish = (from: string, version: string, extra: Record<string, unknown> = {}) =>
-      msg(from, "tool.published", { tool: "t1", capability: "scan", version, repo: "tools", commit: "abc", verified: true, ...extra });
-    board.reject(publish("a", "1"), /must be proposed/, "UNKNOWN_REF");
-    board.post(msg("a", "tool.proposed", { tool: "t1", capability: "scan", inputs: ["files"], outputs: ["items"] }));
-    board.reject(msg("b", "tool.proposed", { tool: "t1", capability: "other" }), /already proposed/);
-    board.reject(publish("a", "1", { verified: false }), /passed its own gate/);
-    board.reject(publish("a", "1", { verified: "true" }), /passed its own gate/);
-    board.reject(publish("b", "1"), /only a, who proposed tool t1/);
-    board.reject(publish("a", "1", { capability: "codemod" }), /proposed with capability scan/);
-    board.reject(msg("b", "tool.used", { capability: "scan", version: "1" }), /not a published tool version/);
-    board.post(publish("a", "1"));
-    board.reject(publish("a", "1"), /scan@1 is already published/);
-    board.post(publish("a", "2"));
-    board.post(msg("b", "tool.used", { capability: "scan", version: "1", changedFiles: ["src/a.ts"] }));
-    expect(board.state.tools.published.map((t) => `${t.capability}@${t.version}:${t.uses}`)).toEqual(["scan@1:1", "scan@2:0"]);
+    board.reject(msg("a", "tool.proposed", { tool: "t1", capability: "scan-add", kind: "scanner" }), /needs a rationale/, "BAD_PAYLOAD");
+    board.reject(msg("a", "tool.proposed", { tool: "t1", capability: "fix", kind: "codemod" }, { rationale: "r" }), /must declare its inputs/, "BAD_PAYLOAD");
+    board.post(msg("a", "tool.proposed", { tool: "t1", capability: "scan-add", kind: "scanner", inputs: ["src/**"], outputs: ["findings"] }, { rationale: "the same change repeats in many files" }));
+    expect(board.state.items["tool-scan-add"]).toMatchObject({ status: "proposed", scopeHint: ["tools/scan-add/**"], tool: { capability: "scan-add", kind: "scanner" } });
+    board.reject(msg("b", "tool.proposed", { tool: "t2", capability: "scan-add", kind: "scanner" }, { rationale: "r" }), /already proposed/, "DUPLICATE");
+    board.reject(claim("a", "tool-scan-add", ["tools/scan-add/**"]), /is proposed and cannot be claimed/, "ITEM_NOT_OPEN");
+    board.post(msg("lead", "item.accepted", { item: "tool-scan-add" }));
+    // One writer per tool path: only inside tools/<capability>/.
+    board.reject(claim("a", "tool-scan-add", ["tools/**"]), /outside item tool-scan-add's scope/, "OUTSIDE_SCOPE");
+    expect(board.types(claim("a", "tool-scan-add", ["tools/scan-add/**"]))).toEqual(["item.claimed", "claim.granted"]);
+    board.reject(claim("b", "tool-scan-add", ["tools/scan-add/**"]), /cannot be claimed/, "ITEM_NOT_OPEN");
+    // A tool item is never pushed for integration: it is built.
+    board.reject(push("a", "tool-scan-add", "b1", ["tools/scan-add/run.mjs"]), /announce its build with tool.built/, "NOT_ALLOWED");
+  });
+
+  it("only a build that passed its own gate is published (by the engine), as the next version, and completes the tool item", () => {
+    const board = seeded();
+    claimedTool(board, "a", "scan", "scanner");
+    // Builds stay inside the tool item's write intent; only its owner builds.
+    board.reject(msg("a", "tool.built", { capability: "scan", commit: "b0", paths: ["src/a.ts"] }), /outside the tool item's write intent/, "OUTSIDE_INTENT");
+    board.reject(msg("b", "tool.built", { capability: "scan", commit: "b0", paths: ["tools/scan/run.mjs"] }), /does not hold the claim/, "NOT_OWNER");
+    board.post(msg("a", "tool.built", { capability: "scan", commit: "b1", paths: ["tools/scan/run.mjs", "tools/scan/test.mjs"] }));
+    board.reject(msg("a", "tool.built", { capability: "scan", commit: "b2", paths: ["tools/scan/run.mjs"] }), /has not been gated yet/, "INVALID_STATE");
+    // Agents can never claim a pass, publish, or record a use themselves.
+    board.reject(msg("a", "tool.gated", { capability: "scan", commit: "b1", passed: true, checks: checks(true), repo: "r", usage: "u" }), /cannot be sent by an agent/, "NOT_ALLOWED");
+    board.reject(
+      msg("a", "tool.published", { tool: "t-scan", capability: "scan", version: "1", repo: "r", commit: "b1", verified: true, kind: "scanner", usage: "u" }),
+      /cannot be sent by an agent/,
+      "NOT_ALLOWED",
+    );
+    // The gate's verdict must match its checks, and must be about the latest build.
+    board.reject(msg("engine", "tool.gated", { capability: "scan", commit: "b1", passed: true, checks: checks(false), repo: "r", usage: "u" }), /every one of its checks/, "BAD_PAYLOAD");
+    board.reject(gated("scan", "zz", true), /not the latest, ungated build/, "INVALID_STATE");
+    // A failing tool gate publishes nothing; the builder is told.
+    const failed = board.post(gated("scan", "b1", false));
+    expect(failed.map((m) => m.type)).toEqual(["tool.gated"]);
+    expect(failed[0]!.to).toEqual(["a"]);
+    expect(board.state.tools.published).toEqual([]);
+    expect(board.state.items["tool-scan"]).toMatchObject({ status: "claimed", toolBuild: { commit: "b1", gated: true, passed: false } });
+    board.reject(msg("engine", "tool.used", { capability: "scan", version: "1", by: "b" }), /not a published tool version/, "UNKNOWN_REF");
+    // A rebuild that passes is published as version 1 and completes the tool item.
+    board.post(msg("a", "tool.built", { capability: "scan", commit: "b2", paths: ["tools/scan/run.mjs"] }));
+    const passed = board.post(gated("scan", "b2", true));
+    expect(passed.map((m) => m.type)).toEqual(["tool.gated", "tool.published", "item.completed"]);
+    expect(passed[1]!.payload).toEqual({
+      tool: "t-scan",
+      capability: "scan",
+      version: "1",
+      repo: "change--tools",
+      commit: "b2",
+      verified: true,
+      kind: "scanner",
+      usage: "node tools/scan/run.mjs",
+    });
+    expect(passed[2]!.payload).toEqual({ item: "tool-scan", via: "tool", version: "1" });
+    expect(board.state.tools.published[0]).toMatchObject({ publishedBy: "a", gateSeq: passed[0]!.seq, uses: 0 });
+    expect(board.state.tools.proposed["t-scan"]).toMatchObject({ builds: 2, failedGates: 1 });
+    // A tool item is not part of the Change's deliverable.
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a check tool is published with joinsGate: false (it never joins the Change's gate in this slice)", () => {
+    const board = seeded();
+    const appended = publishTool(board, "a", "no-legacy", "check");
+    expect(appended.find((m) => m.type === "tool.published")!.payload).toMatchObject({ kind: "check", joinsGate: false });
+  });
+
+  it("use records are the engine's only, pin a published version, and a use that changed files must be the consumer's own push inside its write intent", () => {
+    const board = seeded();
+    publishTool(board, "c", "fix-add", "codemod");
+    board.post(claim("b", "one", ["src/b/**"]));
+    board.post(push("b", "one", "p1", ["src/b/x.ts"]));
+    const use = (payload: Record<string, unknown>) => msg("engine", "tool.used", { capability: "fix-add", version: "1", by: "b", ...payload });
+    // An agent can never record a use (it cannot fake one).
+    board.reject(msg("b", "tool.used", { capability: "fix-add", version: "1", by: "b" }), /cannot be sent by an agent/, "NOT_ALLOWED");
+    board.reject(use({ version: "2" }), /not a published tool version/, "UNKNOWN_REF");
+    board.reject(use({ by: "zed" }), /not a joined agent/, "UNKNOWN_AGENT");
+    board.reject(use({ item: "two" }), /does not hold the claim/, "NOT_OWNER");
+    board.reject(use({ item: "one", changedFiles: ["src/b/x.ts"] }), /names the item and the pushed commit/, "BAD_PAYLOAD");
+    board.reject(use({ item: "one", commit: "other", changedFiles: ["src/b/x.ts"] }), /not b's latest push/, "INVALID_STATE");
+    board.reject(use({ item: "one", commit: "p1", changedFiles: ["src/a/y.ts"] }), /outside item one's write intent/, "OUTSIDE_INTENT");
+    const used = board.post(use({ item: "one", commit: "p1", changedFiles: ["src/b/x.ts"] }));
+    // Addressed to the builder, so its findings can become work.
+    expect(used[0]).toMatchObject({ from: "engine", type: "tool.used", to: ["c"] });
+    expect(board.state.tools.published[0]!.uses).toBe(1);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("work from a scanner's findings is proposed by the scanner's builder only, citing a published version, and waits for the lead", () => {
+    const board = seeded();
+    publishTool(board, "a", "scan-add", "scanner");
+    board.post(msg("engine", "tool.used", { capability: "scan-add", version: "1", by: "b", findings: [{ path: "lib/x.ts", line: 4, message: "needs the change" }] }));
+    const proposal = (from: string, fromTool: Record<string, unknown>) =>
+      msg(from, "item.proposed", { item: `${from}-found-1`, objective: "apply the change in lib/x.ts", acceptance: [], scopeHint: ["lib/x.ts"], fromTool });
+    board.reject(proposal("b", { capability: "scan-add", version: "1" }), /only a, who built scan-add/, "NOT_ALLOWED");
+    board.reject(proposal("a", { capability: "scan-add", version: "9" }), /not a published tool version/, "UNKNOWN_REF");
+    board.post(proposal("a", { capability: "scan-add", version: "1" }));
+    expect(board.state.items["a-found-1"]).toMatchObject({ status: "proposed", fromTool: { capability: "scan-add", version: "1" } });
+    board.reject(claim("b", "a-found-1", ["lib/x.ts"]), /cannot be claimed/, "ITEM_NOT_OPEN");
+    board.post(msg("lead", "item.accepted", { item: "a-found-1" }));
+    expect(board.types(claim("b", "a-found-1", ["lib/x.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+  });
+
+  it("a tool item whose builds keep failing their own gate reopens for another builder (bounded), who may not be the one who spent it", () => {
+    const board = seeded();
+    claimedTool(board, "a", "scan", "scanner");
+    const fail = (agent: string, commit: string) => {
+      board.post(msg(agent, "tool.built", { capability: "scan", commit, paths: ["tools/scan/run.mjs"] }));
+      return board.post(gated("scan", commit, false));
+    };
+    expect(fail("a", "a1").map((m) => m.type)).toEqual(["tool.gated"]);
+    const second = fail("a", "a2");
+    expect(second.map((m) => m.type)).toEqual(["tool.gated", "item.reopened"]);
+    expect(second[1]!.payload).toEqual({ item: "tool-scan", previousOwner: "a", commit: "a2" });
+    expect(board.state.items["tool-scan"]).toMatchObject({ status: "open", exhaustedBy: ["a"] });
+    board.reject(claim("a", "tool-scan", ["tools/scan/**"]), /already spent item tool-scan/, "NOT_ALLOWED");
+    board.post(claim("b", "tool-scan", ["tools/scan/**"]));
+    fail("b", "b1");
+    expect(fail("b", "b2").map((m) => m.type)).toEqual(["tool.gated", "item.reopened"]);
+    board.post(claim("c", "tool-scan", ["tools/scan/**"]));
+    fail("c", "c1");
+    // Bounded: after two reopenings the last builder keeps it (the tool is unavailable to waiters).
+    expect(fail("c", "c2").map((m) => m.type)).toEqual(["tool.gated"]);
+    expect(board.state.items["tool-scan"]).toMatchObject({ status: "claimed", owner: "c", exhaustedBy: ["a", "b"] });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("the digest tells a claim which covering tools it must not wait for: rejected, failed its gate, or not published in time", () => {
+    const board = seeded();
+    board.post(msg("a", "tool.proposed", { tool: "t-fix", capability: "fix", kind: "codemod", inputs: ["src/**"], outputs: ["edits"] }, { rationale: "repeated change" }));
+    board.post(msg("lead", "item.accepted", { item: "tool-fix" }));
+    board.post(claim("b", "one", ["src/b/**"]));
+    const unavailable = () => boardDigest(board.state, [], "b", board.state.lastSeq).claims.find((c) => c.item === "one")?.toolUnavailable;
+    expect(unavailable()).toBeUndefined();
+    board.post(claim("a", "tool-fix", ["tools/fix/**"]));
+    board.post(msg("a", "tool.built", { capability: "fix", commit: "f1", paths: ["tools/fix/run.mjs"] }));
+    board.post(gated("fix", "f1", false));
+    expect(unavailable()).toEqual([{ capability: "fix", reason: "its own gate failed 1 time(s)" }]);
+
+    const slow = seeded();
+    slow.post(msg("a", "tool.proposed", { tool: "t-fix", capability: "fix", kind: "codemod", inputs: ["src/**"], outputs: ["edits"] }, { rationale: "repeated change" }));
+    slow.post(claim("b", "one", ["src/b/**"]));
+    for (let i = 0; i < 61; i += 1) {
+      slow.post(msg("lead", "item.proposed", { item: `filler-${i}`, objective: `filler ${i}`, acceptance: [], scopeHint: [`docs/${i}.md`] }));
+    }
+    expect(boardDigest(slow.state, [], "b", slow.state.lastSeq).claims[0]!.toolUnavailable).toEqual([
+      { capability: "fix", reason: "not published within 60 board messages of its proposal" },
+    ]);
+    // A claim the tool does not cover is never told about it.
+    slow.post(claim("c", "two", ["docs/x.md"]));
+    expect(boardDigest(slow.state, [], "c", slow.state.lastSeq).claims[0]!.toolUnavailable).toBeUndefined();
+  });
+
+  it("replay rejects a forged publication: tool.published only follows a passing tool.gated", () => {
+    const board = seeded();
+    publishTool(board, "a", "scan", "scanner");
+    const forged = board.log.map((m) => (m.type === "tool.gated" ? { ...m, payload: { ...m.payload, passed: false, checks: checks(false) } } : m)) as BoardMessage[];
+    expect(() => reduceBoard(forged)).toThrow(/not produced by arbitration|does not match arbitration/);
   });
 });
+
+/** Propose (as `agent`), accept, and claim a tool item. */
+function claimedTool(board: TestBoard, agent: string, capability: string, kind: string): void {
+  board.post(
+    msg(agent, "tool.proposed", { tool: `t-${capability}`, capability, kind, inputs: ["src/**"], outputs: ["findings"] }, { rationale: "a repeated change" }),
+  );
+  board.post(msg("lead", "item.accepted", { item: `tool-${capability}` }));
+  board.post(claim(agent, `tool-${capability}`, [`tools/${capability}/**`]));
+}
+
+/** Propose, accept, claim, build, and pass the gate of a tool: it is published as version 1. */
+function publishTool(board: TestBoard, agent: string, capability: string, kind: string): BoardMessage[] {
+  claimedTool(board, agent, capability, kind);
+  board.post(msg(agent, "tool.built", { capability, commit: `build-${capability}`, paths: [`tools/${capability}/run.mjs`] }));
+  return board.post(
+    msg("engine", "tool.gated", {
+      capability,
+      commit: `build-${capability}`,
+      passed: true,
+      checks: [{ check: "tests", passed: true, detail: "passed" }],
+      repo: "change--tools",
+      usage: `node tools/${capability}/run.mjs`,
+    }),
+  );
+}
 
 describe("replay, fold, and verification", () => {
   function busyBoard(): TestBoard {
@@ -1261,10 +1452,9 @@ describe("replay, fold, and verification", () => {
 
   it("foldBoard is linear: a long log folds quickly", () => {
     const board = seeded();
-    board.post(msg("a", "tool.proposed", { tool: "t1", capability: "scan" }));
-    board.post(msg("a", "tool.published", { tool: "t1", capability: "scan", version: "1", repo: "r", commit: "c", verified: true }));
+    publishTool(board, "a", "scan", "scanner");
     for (let i = 0; i < 3000; i += 1) {
-      board.post(msg(i % 2 === 0 ? "b" : "c", "tool.used", { capability: "scan", version: "1" }));
+      board.post(msg("engine", "tool.used", { capability: "scan", version: "1", by: i % 2 === 0 ? "b" : "c" }));
     }
     const started = Date.now();
     const folded = foldBoard(board.log);
@@ -1359,7 +1549,7 @@ describe("scripted agents through the endpoint (join, tokens, routes)", () => {
     const second = await run("formation");
     expect(JSON.stringify(first.log)).toBe(JSON.stringify(second.log));
     expect(first.log).toEqual(first.endpoint.log());
-    expect(first.rejected.map((r) => r.code)).toEqual(["NOT_ALLOWED", "INVALID_STATE"]);
+    expect(first.rejected.map((r) => r.code)).toEqual(["NOT_ALLOWED", "NOT_ALLOWED", "NOT_ALLOWED"]);
     expect(first.log.filter((m) => m.type === "rebase.needed").map((m) => m.payload)).toEqual([
       { agent: "agent-c", n: 2, paths: ["src/core/errors.ts"] },
     ]);
@@ -1376,8 +1566,8 @@ describe("scripted agents through the endpoint (join, tokens, routes)", () => {
     expect(first.log.find((m) => m.type === "help.offered")?.to).toEqual(["agent-a"]);
     expect(first.board).toEqual(reduceBoard(first.log));
     expect(summarizeBoard(first.board)).toMatchObject({
-      items: { proposed: 0, rejected: 0, open: 0, claimed: 1, contested: 0, split: 0, done: 4 },
-      toolsPublished: 1,
+      items: { proposed: 0, rejected: 1, open: 0, claimed: 1, contested: 0, split: 0, done: 4 },
+      toolsPublished: 0,
       integratedRev: 3,
     });
   });

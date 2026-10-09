@@ -5,6 +5,8 @@ import {
   appendDecisionRecorded,
   appendDiscoveredUnits,
   appendIntegratedRev,
+  appendToolGated,
+  appendToolUsed,
   applyBoardEscalations,
   BoardError,
   boardDigest,
@@ -60,6 +62,15 @@ import {
 } from "./cloud-integration.ts";
 import type { DrivenPhase } from "./integration-driver.ts";
 import type { Env } from "./env.ts";
+
+/** The Change's tools repo (a name and clone URL, never a credential). */
+export interface ToolsRepoRecord {
+  readonly workspaceName: string;
+  readonly gitUrl: string;
+  readonly defaultBranch: string;
+  readonly backend: string;
+  readonly fallback: boolean;
+}
 
 /**
  * The Change-level lifecycle status, distinct from a WorkUnit's status. It lets
@@ -1073,7 +1084,7 @@ export class ChangeState extends DurableObject<Env> {
     await this.ctx.storage.put("boardTokens", {} as Record<string, string>);
     // Integration on Cloudflare (per run): its configuration, the Workflow
     // bookkeeping, every revision attempt, and the agents' repo identities.
-    await this.ctx.storage.delete(["cloudIntegrationConfig", "cloudIntegrationRun", "cloudRevisions", "cloudAttribution", "boardRepos"]);
+    await this.ctx.storage.delete(["cloudIntegrationConfig", "cloudIntegrationRun", "cloudRevisions", "cloudAttribution", "boardRepos", "toolsRepo"]);
     return superseded;
   }
 
@@ -1269,6 +1280,34 @@ export class ChangeState extends DurableObject<Env> {
     return this.boardOutcome(() =>
       this.appendToBoard((state) => appendDecisionRecorded(state, input, new Date().toISOString())),
     );
+  }
+
+  /**
+   * Record a tool's OWN gate result (the operator's route, after it ran the
+   * gate on the latest build): the engine appends tool.gated, and on a pass
+   * tool.published and the tool item's completion. Agents cannot post it.
+   */
+  async recordToolGate(input: unknown): Promise<BoardAppendResponse> {
+    return this.boardOutcome(() => this.appendToBoard((state) => appendToolGated(state, input, new Date().toISOString())));
+  }
+
+  /**
+   * Record a run of a PINNED, published tool version the operator's runtime
+   * executed in a consumer's own repo: the engine appends tool.used. Agents
+   * cannot post a use.
+   */
+  async recordToolUse(input: unknown): Promise<BoardAppendResponse> {
+    return this.boardOutcome(() => this.appendToBoard((state) => appendToolUsed(state, input, new Date().toISOString())));
+  }
+
+  /** The Change's tools repo, once provisioned (one per Change). */
+  async getToolsRepo(): Promise<ToolsRepoRecord | undefined> {
+    return this.ctx.storage.get<ToolsRepoRecord>("toolsRepo");
+  }
+
+  /** Remember the Change's tools repo (provisioned once, on the first tool build). */
+  async recordToolsRepo(repo: ToolsRepoRecord): Promise<void> {
+    await this.ctx.storage.put("toolsRepo", repo);
   }
 
   // -------------------------------------------------------------------------

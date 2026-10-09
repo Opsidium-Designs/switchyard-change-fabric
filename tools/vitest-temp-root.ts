@@ -9,6 +9,10 @@
  * and the teardown removes the whole root, so `make check` leaves nothing in
  * the system temp directory. Set SCF_KEEP_TEST_TMP=1 to keep the root for
  * debugging; its path is printed.
+ *
+ * Tests never read the developer's `.env`: SCF_ENV_FILE points at an empty
+ * file, so a CLI a test spawns loads no credential and stays offline (a test
+ * that needs one passes its own SCF_ENV_FILE).
  */
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -18,7 +22,14 @@ export default async function setup(): Promise<() => Promise<void>> {
   const previous = process.env.TMPDIR;
   const root = await mkdtemp(join(tmpdir(), "scf-test-run-"));
   process.env.TMPDIR = root;
+  const previousEnvFile = process.env.SCF_ENV_FILE;
+  process.env.SCF_ENV_FILE = "/dev/null";
   return async () => {
+    if (previousEnvFile === undefined) {
+      delete process.env.SCF_ENV_FILE;
+    } else {
+      process.env.SCF_ENV_FILE = previousEnvFile;
+    }
     if (previous === undefined) {
       delete process.env.TMPDIR;
     } else {

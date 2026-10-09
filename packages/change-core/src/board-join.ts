@@ -56,3 +56,17 @@ export const BOARD_AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 export function boardAgentWorkspaceName(changeId: string, agent: string): string {
   return `${changeId}--board-${agent}`.replace(/[^A-Za-z0-9._-]+/g, "-");
 }
+
+/**
+ * The Change's TOOLS repo: one per Change (`<changeId>--tools`), provisioned
+ * once, on the first tool build. Each tool lives in `tools/<capability>/` on
+ * its own branch (`tools/<capability>`), so builders never race each other.
+ */
+export function toolsWorkspaceName(changeId: string): string {
+  return `${changeId}--tools`.replace(/[^A-Za-z0-9._-]+/g, "-");
+}
+
+/** The branch of the tools repo a tool is built on. */
+export function toolBranch(capability: string): string {
+  return `tools/${capability}`;
+}

@@ -10,7 +10,8 @@
   "exports": {
     ".": "./src/index.ts",
     "./graph-model": "./src/graph-model.ts",
-    "./board-graph": "./src/board-graph.ts"
+    "./board-graph": "./src/board-graph.ts",
+    "./credentials": "./src/credentials.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

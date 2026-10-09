@@ -208,7 +208,11 @@ export type {
 } from "./board-agent.ts";
 export { BoardAgent, listRepoFiles, resolveIntentFiles, RunTurnBudget } from "./board-agent.ts";
 
-export { createGenericBoardPolicy } from "./board-policy.ts";
+export { coveredByOutstanding, createGenericBoardPolicy } from "./board-policy.ts";
+export { selectToolFiller } from "./executor-select.ts";
+export type { SelectedToolFiller } from "./executor-select.ts";
+export type { ToolAuthor, ToolAuthorRequest, ToolBenchOptions, ToolGateRecord } from "./board-tools.ts";
+export { executorToolAuthor, regionToolAuthor, templateToolAuthor, toolContract, ToolBench, ToolUseError } from "./board-tools.ts";
 
 export type {
   BoardAgentRepo,
@@ -245,6 +249,7 @@ export {
   ContinuousBoardIntegrator,
   describeWorkspace,
   formatBoardRunSummary,
+  formatToolRegistry,
   formatBoardTranscript,
   integrateBoardRevision,
   pendingPushKey,
@@ -255,7 +260,7 @@ export { deriveProtectedPaths, isRunnerConfig, isTestShaped, RUNNER_CONFIG_FILES
 export { promoteVerifiedIntegration, redeployIfPreviouslyDeployed } from "./run-live.ts";
 export type { LocalChangeControlOptions } from "./local-control.ts";
 export type { RunBoardOfflineOptions } from "./run-board-offline.ts";
-export { FirstAttemptFailingGate, OFFLINE_BOARD_EPOCH, OFFLINE_GATE_FIXTURE_COMMAND, offlineFixtureGateLabel, runBoardOffline } from "./run-board-offline.ts";
+export { FirstAttemptFailingGate, OFFLINE_BOARD_EPOCH, OFFLINE_GATE_FIXTURE_COMMAND, OFFLINE_TOOL_AUTHOR_LABEL, offlineFixtureGateLabel, runBoardOffline } from "./run-board-offline.ts";
 
 export { ChildProcessCommandRunner } from "@switchyard-change/verification";
 export {
@@ -301,3 +306,15 @@ export {
   revVerdictLabel,
 } from "./board-graph.ts";
 export { finishWorkRoot, isDisposableWorkRoot, KEEP_WORK_ROOT_FLAG, pruneWorkRoot } from "./work-root.ts";
+
+export {
+  credentialKeysIn,
+  initialEnvironmentCredentialKeys,
+  isCredentialKey,
+  loadDotEnvFile,
+  parseDotEnv,
+  runtimeCredentialNames,
+  runtimeEnv,
+  setRuntimeCredentials,
+  withoutCredentials as withoutCredentialEnv,
+} from "./credentials.ts";

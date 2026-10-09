@@ -11,7 +11,7 @@
 #   make doctor    run the readiness check (switchyard-change doctor)
 #   make jev-smoke live check of the decision model's question types and contract triage (needs .env; not in check)
 #   make demo      run the example audit-logging Change end to end (offline)
-#   make demo-board  agents form around a goal on the Change board (offline, deterministic)
+#   make demo-board  agents form around a goal on the Change board and build tools for each other (offline, deterministic)
 #   make run-board   live board run against a running Worker (needs the AI Gateway in .env)
 #   make run-live-watch  watchable live run: stable id, escalation fires, repos left up
 #   make run-live-service  live run of the MODULAR service-api app (carries the blueprint)
@@ -57,13 +57,13 @@ dev-containers:
 console:
 	npm -w apps/console run dev
 
-# Run the Worker and the console together (Ctrl-C stops both). Sources .env so
-# the Worker's remote Artifacts binding authenticates with CLOUDFLARE_API_TOKEN
-# (the same as the `dev` target); without it `wrangler dev` cannot establish the
-# remote proxy session in a non-interactive shell.
+# Run the Worker and the console together (Ctrl-C stops both). Sources .env for
+# the Worker ONLY, so its remote Artifacts binding authenticates with
+# CLOUDFLARE_API_TOKEN (the same as the `dev` target); the console and the runs
+# its launcher spawns never get it in their environment (the CLI reads .env
+# into memory itself).
 dev-all:
-	set -a; [ -f .env ] && . ./.env; set +a; \
-	npm -w apps/worker run dev & \
+	(set -a; [ -f .env ] && . ./.env; set +a; npm -w apps/worker run dev) & \
 	npm -w apps/console run dev & \
 	wait
 
@@ -81,21 +81,25 @@ LAN_IP ?= $(shell hostname -I 2>/dev/null | awk '{print $$1}')
 dev-all-lan:
 	@echo "LAN console: http://$(LAN_IP):5173  (Worker: http://$(LAN_IP):8787)"
 	@echo "Set SWITCHYARD_API_TOKEN (apps/worker/.dev.vars + the same value in .env) to require a bearer on Worker mutations; otherwise the Worker is unauthenticated. The console launcher is open to the LAN: trusted networks only."
-	set -a; [ -f .env ] && . ./.env; set +a; \
-	export WRANGLER_DEV_IP=0.0.0.0; \
-	export VITE_WORKER_URL=http://$(LAN_IP):8787; \
-	npm -w apps/worker run dev & \
+	(set -a; [ -f .env ] && . ./.env; set +a; WRANGLER_DEV_IP=0.0.0.0 npm -w apps/worker run dev) & \
 	VITE_WORKER_URL=http://$(LAN_IP):8787 npm -w apps/console run dev & \
 	wait
 
+# Credentials and the CLI: no target exports .env into the CLI's environment.
+# Code the CLI runs (app gates, agent-built tools) could read a parent's
+# initial environment (/proc/<pid>/environ), so the CLI reads .env itself into
+# memory and passes each credential only to the code that needs it.
+# `make cli ARGS=env-check` confirms its environment holds no credential.
+# Targets that run wrangler or curl themselves (dev, deploy, infra-*) still
+# source .env for those processes only; dev-all gives it to the Worker alone.
+#
 # Run the switchyard-change CLI, e.g. `make cli ARGS="doctor"`.
 cli:
 	npm -w apps/cli run dev -- $(ARGS)
 
-# Check local prerequisites and print a readiness report. Sources .env when
-# present so the live-Artifacts reachability probe sees CLOUDFLARE_API_TOKEN.
+# Check local prerequisites and print a readiness report. The CLI reads .env
+# into memory, so the live-Artifacts reachability probe sees CLOUDFLARE_API_TOKEN.
 doctor:
-	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- doctor
 
 # Run the example audit-logging Change end to end, deterministically and
@@ -130,8 +134,19 @@ demo:
 # revision is promoted to local Git. Every agent turn is taken by a generic,
 # goal-agnostic policy standing in for the turn model, so the printed board
 # transcript is identical run to run. No credentials, no network.
+# Agents also build tools for each other: when the planned items repeat one
+# mechanical change across several files, one worker proposes a scanner and
+# another a codemod; the lead accepts them, their proposers build them in the
+# Change's tools repo (the deterministic offline template author writes them),
+# each passes its OWN gate on the original code before the engine publishes it,
+# and other agents run the pinned versions in their own repos (the engine
+# records every use). A second run, on the multi-resource example app, shows a
+# scanner finding places no item covers: its builder proposes that work, the
+# lead accepts it, and it completes through the normal gate.
 BOARD_GOAL = $(CURDIR)/examples/goals/audit-logging.goal.txt
 BOARD_PROJECT = $(CURDIR)/examples/demo-project
+TOOLS_GOAL = $(CURDIR)/examples/goals/service-api-validation-auth.goal.txt
+TOOLS_PROJECT = $(CURDIR)/examples/apps/service-api
 
 # The human's answer to contract changes on the original tests during the demo
 # (accept or reject); the demo rejects, so the tests item adds a NEW test file.
@@ -139,6 +154,11 @@ DECIDE_CONTRACTS ?= reject
 
 demo-board:
 	npm -w apps/cli run dev -- run-board --offline --fixture-gate --decide-contracts $(DECIDE_CONTRACTS) --goal-file "$(BOARD_GOAL)" --project "$(BOARD_PROJECT)" \
+	  --min $(MIN) --max $(MAX)
+	@echo ""
+	@echo "=== Agents build tools for each other: a scanner's findings become work ==="
+	@echo ""
+	npm -w apps/cli run dev -- run-board --offline --fixture-gate --decide-contracts $(DECIDE_CONTRACTS) --goal-file "$(TOOLS_GOAL)" --project "$(TOOLS_PROJECT)" \
 	  --min $(MIN) --max $(MAX)
 
 # Decompose a goal against a target project into a WorkGraph and print the plan
@@ -189,7 +209,6 @@ recruit:
 WORKER ?= http://127.0.0.1:8787
 
 recruit-live:
-	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- recruit-live "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" --min $(MIN) --max $(MAX)
 
 # The full live headline run against a running Worker (start it with `make dev`
@@ -205,7 +224,6 @@ recruit-live:
 OWNER ?=
 
 run-live:
-	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- run-live "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" \
 	  --min $(MIN) --max $(MAX) $(if $(OWNER),--owner $(OWNER),)
 
@@ -215,7 +233,6 @@ run-live:
 # model the command refuses. Each worker joins with its own Artifact repo and a
 # short-lived write token. Override GOAL / PROJECT / MIN / MAX as needed.
 run-board:
-	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- run-board "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" \
 	  --min $(MIN) --max $(MAX) $(if $(INTEGRATOR),--integrator $(INTEGRATOR),)
 
@@ -233,7 +250,6 @@ SERVICE_GOAL = $(CURDIR)/examples/goals/service-api-validation-auth.goal.txt
 SERVICE_PROJECT = $(CURDIR)/examples/apps/service-api
 
 run-live-service:
-	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- run-live --goal-file "$(SERVICE_GOAL)" --project "$(SERVICE_PROJECT)" \
 	  --worker "$(WORKER)" --min $(MIN) --max $(MAX) $(if $(OWNER),--owner $(OWNER),)
 
@@ -252,7 +268,6 @@ DEMO_PROJECT = $(CURDIR)/examples/demo-project
 CHANGE_ID ?= change-audit-logging
 
 run-live-watch:
-	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- run-live --change "$(AUDIT_CHANGE)" --project "$(DEMO_PROJECT)" \
 	  --worker "$(WORKER)" --min $(MIN) --max $(MAX) --watch $(if $(OWNER),--owner $(OWNER),)
 
@@ -266,14 +281,12 @@ run-live-watch:
 # Gateway URL/token for real inference; unset means the deterministic noop).
 # Tear the real repos down afterwards with `make clean-live`.
 demo-live:
-	set -a; [ -f .env ] && . ./.env; set +a; \
 	bash tools/demo-live.sh
 
 # Tear down the real Artifact repos a watch-mode run (make run-live-watch) left
 # in place, through the running Worker. Override CHANGE_ID if you watched a
 # different Change id.
 clean-live:
-	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- cleanup-live --change-id "$(CHANGE_ID)" --worker "$(WORKER)"
 
 # Seed the example audit-logging Change into a running Worker so the console
@@ -372,7 +385,6 @@ delete-app:
 # is caught at once instead of surfacing as silently skipped decisions. Needs
 # EXECUTOR=ai-gateway with the gateway and account credentials in .env.
 jev-smoke:
-	set -a; [ -f .env ] && . ./.env; set +a; \
 	npm -w apps/cli run dev -- jev-smoke
 
 build:

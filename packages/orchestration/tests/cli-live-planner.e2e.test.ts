@@ -22,7 +22,8 @@ const DEAD_WORKER = "http://127.0.0.1:9";
 
 /** Run the CLI with no executor/gateway env; resolve its exit code and output. */
 function runCli(args: readonly string[]): Promise<{ code: number; stderr: string }> {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  // No .env either: the CLI reads it into memory itself, so point it at an empty file.
+  const env: NodeJS.ProcessEnv = { ...process.env, SCF_ENV_FILE: "/dev/null" };
   for (const key of [
     "EXECUTOR",
     "CLOUDFLARE_AI_GATEWAY_URL",

@@ -52,6 +52,18 @@ export interface JoinedWorkspace {
   readonly tokenExpiresAt: string;
 }
 
+/** The Change's tools repo and a token for it (returned once). */
+export interface ToolsRepoAccess {
+  readonly workspaceName: string;
+  readonly gitUrl: string;
+  readonly defaultBranch: string;
+  readonly backend: string;
+  readonly fallback: boolean;
+  readonly tokenId: string;
+  readonly token: string;
+  readonly tokenExpiresAt: string;
+}
+
 /** A successful join. */
 export interface BoardJoined {
   readonly ok: true;
@@ -220,6 +232,48 @@ export class BoardOperatorClient {
   async revokeReadToken(agent: string, tokenId: string): Promise<boolean> {
     const { res } = await this.post("/board/read-token/revoke", { agent, tokenId });
     return res.status < 400;
+  }
+
+  /**
+   * Provision the Change's tools repo (once; a repeat call returns the same
+   * repo with a fresh token) and a short-lived write token for it.
+   */
+  async toolsWorkspace(ttlSeconds: number): Promise<({ readonly ok: true } & ToolsRepoAccess) | BoardRejection> {
+    const { res, body } = await this.post("/tools/workspace", { ttlSeconds });
+    if (res.status !== 201 || typeof body.token !== "string" || typeof body.gitUrl !== "string") {
+      return rejection(res, body);
+    }
+    return { ok: true, ...(body as unknown as ToolsRepoAccess) };
+  }
+
+  /** A short-lived read or write token for the tools repo. */
+  async toolsToken(
+    scope: "read" | "write",
+    ttlSeconds: number,
+  ): Promise<{ readonly ok: true; readonly token: string; readonly tokenId: string; readonly workspaceName: string } | BoardRejection> {
+    const { res, body } = await this.post("/tools/token", { scope, ttlSeconds });
+    if (res.status !== 201 || typeof body.token !== "string") {
+      return rejection(res, body);
+    }
+    return { ok: true, token: body.token, tokenId: String(body.tokenId ?? ""), workspaceName: String(body.workspaceName ?? "") };
+  }
+
+  /** Revoke a tools-repo token the operator is done with. */
+  async revokeToolsToken(tokenId: string): Promise<boolean> {
+    const { res } = await this.post("/tools/token/revoke", { tokenId });
+    return res.status < 400;
+  }
+
+  /** Record a tool's own gate result: the engine appends tool.gated (and, on a pass, tool.published). */
+  async recordToolGate(input: BoardPayloads["tool.gated"]): Promise<BoardPostOutcome> {
+    const { res, body } = await this.post("/tools/gate", input);
+    return res.status === 201 ? { ok: true, appended: (body.appended as BoardMessage[] | undefined) ?? [] } : rejection(res, body);
+  }
+
+  /** Record a run of a pinned tool version in a consumer's repo: the engine appends tool.used. */
+  async recordToolUse(input: BoardPayloads["tool.used"]): Promise<BoardPostOutcome> {
+    const { res, body } = await this.post("/tools/used", input);
+    return res.status === 201 ? { ok: true, appended: (body.appended as BoardMessage[] | undefined) ?? [] } : rejection(res, body);
   }
 
   /** The public board view. */

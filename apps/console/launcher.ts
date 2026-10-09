@@ -55,6 +55,8 @@ import { dirname, join, resolve } from "node:path";
 
 import type { Connect, Plugin } from "vite";
 
+import { loadDotEnvFile, withoutCredentials } from "@switchyard-change/orchestration/credentials";
+
 import { boardCapable, boardGoalFileOf, TEMPLATES, templateById, type ContractPolicy, type LaunchMode, type Template } from "./src/templates";
 
 /** The repo root, two levels up from apps/console. */
@@ -431,12 +433,12 @@ export async function readDeployedUrls(
 function launch(template: Template, dial: LaunchDial, options: LaunchOptions): LaunchedRun {
   const changeId = freshChangeId(template);
   const args = launchArgs(template, changeId, dial, options);
-  // Inherit the dev process environment (already sourced from .env by the make
-  // target), so the Workers AI executor and the Artifacts token are present
-  // without the launcher ever reading or forwarding the secret itself.
+  // The spawned CLI reads .env into memory itself: no credential is forwarded
+  // through its environment (code it runs could read a parent's environ).
   const child = spawn("npm", args, {
     cwd: REPO_ROOT,
-    env: process.env,
+    // Never pass a credential through a spawned run's environment: the CLI reads .env into memory itself.
+    env: withoutCredentials(process.env),
     stdio: ["ignore", "pipe", "pipe"],
   });
   const run: LaunchedRun = {
@@ -544,7 +546,8 @@ export function launcherPlugin(): Plugin {
           const child = spawn(
             "npm",
             ["-w", "apps/cli", "run", "dev", "--", "deploy-app", "--app", app, "--worker", WORKER_URL],
-            { cwd: REPO_ROOT, env: process.env, stdio: ["ignore", "pipe", "pipe"] },
+            { cwd: REPO_ROOT, // Never pass a credential through a spawned run's environment: the CLI reads .env into memory itself.
+    env: withoutCredentials(process.env), stdio: ["ignore", "pipe", "pipe"] },
           );
           const out: string[] = [];
           child.stdout?.on("data", (d: Buffer) => out.push(d.toString("utf8")));
@@ -609,7 +612,7 @@ export function launcherPlugin(): Plugin {
             body,
             contentType: String(req.headers["content-type"] ?? ""),
             workerUrl: WORKER_URL,
-            token: process.env.SWITCHYARD_API_TOKEN,
+            token: process.env.SWITCHYARD_API_TOKEN ?? loadDotEnvFile(join(REPO_ROOT, ".env"))?.SWITCHYARD_API_TOKEN,
           });
           res.statusCode = proxied.status;
           res.setHeader("content-type", proxied.contentType);
@@ -656,7 +659,8 @@ export function launcherPlugin(): Plugin {
           }
           const child = spawn("npm", cleanupArgs, {
             cwd: REPO_ROOT,
-            env: process.env,
+            // Never pass a credential through a spawned run's environment: the CLI reads .env into memory itself.
+    env: withoutCredentials(process.env),
             stdio: ["ignore", "pipe", "pipe"],
           });
           const out: string[] = [];

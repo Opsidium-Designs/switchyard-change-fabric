@@ -30,14 +30,19 @@
  * the agent's intents, and the repo it is given, nothing else.
  */
 
-import { cp, lstat, mkdir, readdir, readFile, rm, stat } from "node:fs/promises";
+import { cp, lstat, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 import {
+  detectBoardToolNeed,
   hasWildcard,
   intentPath,
   isAcceptedItem,
   LEAD_ROLE,
+  toolBranch,
+  toolItemId,
+  toolUnavailableReason,
+  toolScope,
   type BoardDigest,
   type BoardMessage,
   type BoardState,
@@ -53,8 +58,10 @@ import type {
 } from "@switchyard-change/model-adapters";
 import { AGENT_ACTION_TYPES } from "@switchyard-change/model-adapters";
 import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
-import { authenticatedRemote, clone, commitAll, push, type GitIdentity } from "@switchyard-change/local-runner";
-import { matchesGlob, partitionByScope } from "@switchyard-change/verification";
+import { authenticatedRemote, clone, push, type GitIdentity } from "@switchyard-change/local-runner";
+import { matchesGlob, partitionByScope, toolSkeleton } from "@switchyard-change/verification";
+
+import { ToolUseError, type ToolAuthor, type ToolBench } from "./board-tools.ts";
 
 import { redactSecrets } from "./redact.ts";
 import {
@@ -158,6 +165,13 @@ export interface BoardAgentOptions {
    */
   readonly escalationModels?: readonly string[];
   readonly onTurn?: (record: AgentTurnRecord) => void;
+  /**
+   * The operator's tool bench (the tools repo, tool gates, pinned tool runs,
+   * engine-recorded uses). Without it build_tool and use_tool are refused.
+   */
+  readonly tools?: ToolBench;
+  /** Who writes a tool's files on build_tool (default: the agent's executor). */
+  readonly toolAuthor?: ToolAuthor;
   /** How many of the agent's past turns its capsule carries (default 12). */
   readonly historyLimit?: number;
 }
@@ -175,7 +189,6 @@ const CONTEXT_ONLY_TYPES: ReadonlySet<string> = new Set([
   "contract.proposed",
   "contract.accepted",
   "contract.rejected",
-  "tool.published",
   "item.completed",
 ]);
 
@@ -190,6 +203,8 @@ const MAX_PENDING_MESSAGES = 200;
  * engine never proposes done on an agent's behalf.
  */
 export const MAX_DONE_CUES = 5;
+/** How many times a free agent that waited is told to claim the open items. */
+export const MAX_CLAIM_NUDGES = 3;
 /** The failing gate output a fix edit hands the executor, in characters. */
 const MAX_FIX_EVIDENCE = 4000;
 
@@ -268,6 +283,38 @@ function bounded(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
 
+/** Git's empty tree (the base of a first build). */
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+
+/** Commit exactly what is staged (never `git add -A`); returns the commit. */
+async function commitStaged(dir: string, message: string, identity: GitIdentity): Promise<string> {
+  await gitOut(dir, ["-c", `user.name=${identity.name}`, "-c", `user.email=${identity.email}`, "commit", "--no-verify", "-q", "-m", message]);
+  return (await gitOut(dir, ["rev-parse", "HEAD"])).trim();
+}
+
+/**
+ * Every path with an uncommitted change in a worktree (modified, deleted, or
+ * untracked, each untracked file listed), from Git's own status.
+ */
+async function worktreeChanges(dir: string): Promise<string[]> {
+  const out = await gitOut(dir, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  const paths = new Set<string>();
+  for (const entry of out.split("\0")) {
+    if (entry.length > 3) {
+      paths.add(entry.slice(3));
+    }
+  }
+  return [...paths].sort();
+}
+
+/** A failing tool gate's evidence as one bounded text (the checks, then the output). */
+function toolGateEvidence(gate: { readonly checks: readonly { readonly check: string; readonly passed: boolean; readonly detail: string }[]; readonly output?: string }): string {
+  return bounded(
+    [...gate.checks.filter((c) => !c.passed).map((c) => `${c.check}: ${c.detail}`), ...(gate.output ? [gate.output] : [])].join("\n"),
+    4000,
+  );
+}
+
 /** The item an action is about, for the per-item turn budget. */
 function actionItem(action: AgentAction, digest: BoardDigest): string | undefined {
   switch (action.type) {
@@ -280,6 +327,10 @@ function actionItem(action: AgentAction, digest: BoardDigest): string | undefine
       return digest.contests.find((c) => c.id === action.contestId)?.item;
     case "message":
       return action.payload.itemId;
+    case "build_tool":
+      return toolItemId(action.capability);
+    case "use_tool":
+      return action.itemId;
     default:
       return undefined;
   }
@@ -314,10 +365,22 @@ export class BoardAgent {
   private readonly inherited = new Map<string, { readonly from: string; readonly commit: string; seeded: boolean }>();
   /** Done cues delivered per set of passed pushes (see observeAndAct). */
   private readonly doneCues = new Map<string, number>();
-  /** True while a step is running (the driver's quiescence check reads it). */
+  /** True while a step is running (observing or acting). */
   private stepping = false;
+  /** True only while the agent is taking a TURN (the driver's quiescence check reads it). */
+  private acting = false;
+  /** The tools this agent's claims may not wait for, as last seen (a change wakes it). */
+  private lastUnavailable = "";
+  /** Nudges to claim open work after waiting while free, per set of open items (bounded). */
+  private readonly claimNudges = new Map<string, number>();
   /** Lead: the undecided worker proposals it last saw (a change wakes it). */
   private lastProposals = "";
+  /** Items (and tool items) this agent proposed: their decision wakes it. */
+  private readonly proposedItems = new Set<string>();
+  /** Capabilities this agent built: a passing revision is its cue to re-run its scanner. */
+  private readonly builtTools = new Set<string>();
+  /** The latest failing gate evidence of each tool this agent builds (fed to a rebuild). */
+  private readonly toolGateFailures = new Map<string, string>();
 
   constructor(private readonly options: BoardAgentOptions) {
     this.id = options.id;
@@ -330,9 +393,13 @@ export class BoardAgent {
     return this.stop;
   }
 
-  /** True while the agent is observing or acting (not idle between steps). */
+  /**
+   * True only while the agent is taking a turn. Observing (reading its digest
+   * while idle) is not activity: counting it kept a board where every agent
+   * waits from ever looking quiet, because idle agents poll.
+   */
   get busy(): boolean {
-    return this.stepping;
+    return this.acting;
   }
 
   /** The agent's workspace (its own repo), once joined. */
@@ -426,6 +493,10 @@ export class BoardAgent {
       if (m.type === "help.requested") {
         this.requests.set(m.payload.request, { seq: m.seq, by: m.from });
       }
+      // Any failed tool gate (a reopened tool's next builder needs the evidence too).
+      if (m.type === "tool.gated" && !m.payload.passed) {
+        this.toolGateFailures.set(m.payload.capability, toolGateEvidence(m.payload));
+      }
       if (m.type === "handoff" && m.payload.to === this.id && m.payload.capsule.commit !== undefined) {
         this.inherited.set(m.payload.item, { from: m.from, commit: m.payload.capsule.commit, seeded: false });
       }
@@ -476,6 +547,14 @@ export class BoardAgent {
       if (m.to?.includes(this.id)) {
         return true;
       }
+      // The lead's decision on something this agent proposed (an item or a tool).
+      if ((m.type === "item.accepted" || m.type === "item.rejected") && this.proposedItems.has(m.payload.item)) {
+        return true;
+      }
+      // A passing revision is new code a tool this agent built may have something to say about.
+      if (m.type === "integrated.rev" && m.payload.gate === "pass" && this.builtTools.size > 0) {
+        return true;
+      }
       // The decision on a contract change this agent proposed.
       if ((m.type === "contract.accepted" || m.type === "contract.rejected") && m.payload.contract.startsWith(`${this.id}-contract-`)) {
         return true;
@@ -485,7 +564,27 @@ export class BoardAgent {
       }
       return !CONTEXT_ONLY_TYPES.has(m.type);
     });
-    if (!(this.followUp || relevant || nudged || (freeKey !== undefined && freeKey !== this.lastFreeKey))) {
+    // A tool this agent's claims were waiting for became unavailable: it must
+    // edit by hand now, so that is a reason to take a turn.
+    const unavailableKey = digest.claims
+      .flatMap((c) => (c.toolUnavailable ?? []).map((t) => `${c.item}:${t.capability}`))
+      .join(",");
+    const newlyUnavailable = unavailableKey !== "" && unavailableKey !== this.lastUnavailable;
+    this.lastUnavailable = unavailableKey;
+    // A free agent whose last turn was a wait while open items exist is told,
+    // a bounded number of times, to claim one: nothing on the board waits for
+    // a tool (a model that waits "for the tool" left every item unclaimed).
+    const lastTurn = this.history.at(-1);
+    const nudgeKey = free && digest.openItems.length > 0 && lastTurn?.action.type === "wait" ? digest.openItems.map((i) => i.item).join(",") : "";
+    const claimNudge = nudgeKey !== "" && (this.claimNudges.get(nudgeKey) ?? 0) < MAX_CLAIM_NUDGES;
+    if (claimNudge && !this.followUp && !relevant && !nudged) {
+      const count = (this.claimNudges.get(nudgeKey) ?? 0) + 1;
+      this.claimNudges.set(nudgeKey, count);
+      this.evidence.push(
+        `I hold no item and ${digest.openItems.length} open item(s) can be claimed: claim one now. Tools are accelerators, never prerequisites: when a tool is published use_tool it, otherwise edit by hand; never wait for a tool.`,
+      );
+    }
+    if (!(this.followUp || relevant || nudged || newlyUnavailable || claimNudge || (freeKey !== undefined && freeKey !== this.lastFreeKey))) {
       return "idle";
     }
     // A cue counts as delivered only on a turn it caused by itself (not a
@@ -563,8 +662,30 @@ export class BoardAgent {
     this.seeded = true;
     this.turns += 1;
     this.options.runBudget.used += 1;
-    const items = await this.options.seed();
+    const planned = await this.options.seed();
     const client = this.requireClient();
+    // The structural rule is the lead's trigger when it seeds: planned items
+    // that repeat one mechanical change across several files get a scanner
+    // and a codemod, proposed by the lead (open at once), and the items the
+    // codemod covers say so. Goal-agnostic: ids, scopes, and the file listing.
+    const need = this.options.tools
+      ? detectBoardToolNeed(
+          planned.map((i) => ({ item: i.item, scopeHint: i.scopeHint, status: "open", objective: i.objective })),
+          await listRepoFiles(this.baseDir),
+          { protected: (await client.state()).protected },
+        )
+      : undefined;
+    const items = planned.map((item) =>
+      need && need.items.includes(item.item)
+        ? {
+            ...item,
+            objective: bounded(
+              `${item.objective} (claim this item now; if the codemod ${need.codemod} is published, run it with use_tool after the scanner ${need.scanner}, otherwise edit by hand; never wait for a tool)`,
+              500,
+            ),
+          }
+        : item,
+    );
     for (const item of items) {
       const action: AgentAction = {
         type: "propose_item",
@@ -583,6 +704,25 @@ export class BoardAgent {
         this.record({ turn: this.turns, action, outcome: "rejected", code: outcome.code, error: outcome.error });
       }
     }
+    if (need) {
+      const why = `${need.items.length} planned items (${need.items.join(", ")}) repeat the same "${need.editKind}" change across ${need.files.length} files`;
+      const tools: Extract<AgentAction, { type: "propose_tool" }>[] = [
+        { type: "propose_tool", capability: need.scanner, kind: "scanner", why: `${why}: a scanner finds every place in the repository that needs it, including any the plan missed`, inputs: [], outputs: ["findings"] },
+        { type: "propose_tool", capability: need.codemod, kind: "codemod", why: `${why}: one codemod applies it the same way everywhere instead of hand edits`, inputs: [...need.scope], outputs: ["edits"] },
+      ];
+      for (const action of tools) {
+        const outcome = await client.post({
+          type: "tool.proposed",
+          payload: { tool: this.nextId("tool"), capability: action.capability, kind: action.kind, inputs: action.inputs, outputs: action.outputs },
+          rationale: action.why,
+        });
+        this.record(
+          outcome.ok
+            ? { turn: this.turns, action, outcome: "seeded", seqs: outcome.appended.map((m) => m.seq) }
+            : { turn: this.turns, action, outcome: "rejected", code: outcome.code, error: outcome.error },
+        );
+      }
+    }
     this.followUp = false;
   }
 
@@ -595,6 +735,15 @@ export class BoardAgent {
     }
     budget.used += 1;
     this.turns += 1;
+    this.acting = true;
+    try {
+      await this.takeTurn(digest, state);
+    } finally {
+      this.acting = false;
+    }
+  }
+
+  private async takeTurn(digest: BoardDigest, state: BoardState): Promise<void> {
     const input = await this.turnInput(digest, state);
     const outcome = await this.options.transport(input);
     const action = outcome.action;
@@ -629,19 +778,56 @@ export class BoardAgent {
         ...(c.item !== undefined ? { item: c.item } : {}),
         ...(c.guarded ? { protected: true } : {}),
       }));
-    // The lead decides workers' proposals against the items already on the Change.
-    const lead = this.role === "lead";
-    const pendingItems = lead
-      ? Object.values(state.items)
-          .filter((i) => i.status === "proposed")
-          .map((i) => ({ item: i.id, objective: i.objective, scopeHint: [...i.scopeHint], proposedBy: i.proposedBy }))
-      : [];
-    const acceptedItems = lead
-      ? Object.values(state.items)
-          .filter((i) => isAcceptedItem(i))
-          .slice(0, 200)
-          .map((i) => ({ item: i.id, objective: i.objective, scopeHint: [...i.scopeHint], status: i.status }))
-      : [];
+    // The lead decides workers' proposals against the items already on the
+    // Change; every agent sees them, so a tool's findings are compared with
+    // what outstanding items already cover.
+    const pendingItems = Object.values(state.items)
+      .filter((i) => i.status === "proposed")
+      .slice(0, 200)
+      .map((i) => ({
+        item: i.id,
+        objective: i.objective,
+        scopeHint: [...i.scopeHint],
+        proposedBy: i.proposedBy,
+        ...(i.tool ? { tool: i.tool.capability } : {}),
+        ...(i.fromTool ? { fromTool: { ...i.fromTool } } : {}),
+      }));
+    const acceptedItems = Object.values(state.items)
+      .filter((i) => isAcceptedItem(i))
+      .slice(0, 200)
+      .map((i) => ({
+        item: i.id,
+        objective: i.objective,
+        scopeHint: [...i.scopeHint],
+        status: i.status,
+        ...(i.status === "claimed" && i.intent ? { write: [...i.intent.write] } : {}),
+        ...(i.tool ? { tool: i.tool.capability } : {}),
+        ...(i.fromTool ? { fromTool: { ...i.fromTool } } : {}),
+        // Planned work (the lead's or a human's items), as opposed to a worker's proposal.
+        ...(i.proposedBy === "human" || state.agents[i.proposedBy]?.role === LEAD_ROLE ? { planned: true } : {}),
+      }));
+    const tools = Object.values(state.tools.proposed).map((t) => {
+      const item = state.items[t.item];
+      return {
+        capability: t.capability,
+        kind: t.kind,
+        item: t.item,
+        status: item?.status ?? "unknown",
+        proposedBy: t.proposedBy,
+        ...(item?.owner !== undefined ? { owner: item.owner } : {}),
+        inputs: [...t.inputs],
+        failedGates: t.failedGates,
+        ownerFailures: item?.toolFailures ?? 0,
+        reopened: item?.exhaustedBy?.length ?? 0,
+        ...((): { unavailable?: string } => {
+          const why = toolUnavailableReason(state, t.capability);
+          return why !== undefined ? { unavailable: why } : {};
+        })(),
+        versions: state.tools.published
+          .filter((v) => v.capability === t.capability)
+          .map((v) => ({ version: v.version, commit: v.commit, usage: v.usage, publishedBy: v.publishedBy })),
+      };
+    });
     const files = await listRepoFiles(this.baseDir);
     const excerpts = await this.excerpts(digest, files);
     return {
@@ -660,7 +846,7 @@ export class BoardAgent {
         decisions: [...this.history],
         evidence: this.evidence.slice(-12),
       },
-      board: { liveClaims, pendingContracts, ...(lead ? { pendingItems, items: acceptedItems } : {}) },
+      board: { liveClaims, pendingContracts, pendingItems, items: acceptedItems, tools },
       repo: { files, excerpts },
       ...(this.lastRejection ? { lastRejection: this.lastRejection } : {}),
       allowed: this.role === "lead" ? LEAD_ACTIONS : WORKER_ACTIONS,
@@ -768,18 +954,22 @@ export class BoardAgent {
       case "claim":
         await posted({ type: "item.claimed", payload: { item: action.itemId, intent: action.intent }, ...rationale(action.rationale) });
         return;
-      case "propose_item":
+      case "propose_item": {
+        const item = this.nextId("item");
+        this.proposedItems.add(item);
         await posted({
           type: "item.proposed",
           payload: {
-            item: this.nextId("item"),
+            item,
             objective: action.objective,
             acceptance: action.acceptance,
             scopeHint: action.scopeHint,
+            ...(action.fromTool !== undefined ? { fromTool: action.fromTool } : {}),
           },
           ...rationale(action.rationale),
         });
         return;
+      }
       case "split":
         await posted({
           type: "item.split",
@@ -812,10 +1002,21 @@ export class BoardAgent {
       case "message":
         await this.message(action, posted);
         return;
-      case "edit":
+      case "edit": {
+        // A tool item is built in the tools repo, never edited in the agent's own repo.
+        const tool = state.items[action.itemId]?.tool;
+        if (tool) {
+          await this.buildTool({ type: "build_tool", capability: tool.capability, rationale: action.instruction.slice(0, 500) }, digest, state, local, posted);
+          return;
+        }
         await this.edit(action.itemId, action.instruction, digest, local, posted);
         return;
+      }
       case "propose_done": {
+        if (state.items[action.itemId]?.tool) {
+          local("TOOL_ITEM", `${action.itemId} builds a tool: it completes when its build passes its own gate (use build_tool)`);
+          return;
+        }
         const claim = digest.claims.find((c) => c.item === action.itemId);
         await posted({
           type: "done.proposed",
@@ -825,11 +1026,22 @@ export class BoardAgent {
         return;
       }
       case "propose_tool":
+        this.proposedItems.add(toolItemId(action.capability));
         await posted({
           type: "tool.proposed",
-          payload: { tool: this.nextId("tool"), capability: action.capability, inputs: [], outputs: [] },
+          payload: { tool: this.nextId("tool"), capability: action.capability, kind: action.kind, inputs: action.inputs, outputs: action.outputs },
           rationale: action.why,
         });
+        return;
+      case "build_tool":
+        await this.buildTool(action, digest, state, local, posted);
+        return;
+      case "use_tool":
+        if (action.itemId !== undefined && state.items[action.itemId]?.tool) {
+          local("TOOL_ITEM", `${action.itemId} builds a tool: use build_tool for it (a tool is run on the items it serves)`);
+          return;
+        }
+        await this.useTool(action, digest, state, local);
         return;
       case "decide_item":
         if (this.role !== "lead" || !state.agents[this.id]) {
@@ -956,6 +1168,22 @@ export class BoardAgent {
     return view;
   }
 
+  /**
+   * Before this agent changes its worktree: anything uncommitted there was not
+   * written by this agent's current operation (another process could have
+   * written into it), so it is reset and cleaned, and logged, never pushed.
+   */
+  private async cleanStray(worktree: string, head: string | undefined, why: string): Promise<void> {
+    const stray = await worktreeChanges(worktree).catch(() => [] as string[]);
+    if (stray.length === 0) {
+      return;
+    }
+    await this.discard(worktree, head);
+    this.evidence.push(
+      bounded(`discarded ${stray.length} uncommitted change(s) found in my worktree before ${why} (nobody announced them; never pushed): ${stray.join(", ")}`, 500),
+    );
+  }
+
   /** Discard uncommitted work in the worktree (back to its last commit, or empty). */
   private async discard(worktree: string, head: string | undefined): Promise<void> {
     if (head) {
@@ -990,15 +1218,7 @@ export class BoardAgent {
     // writes (or a failing revision asks this agent for a fix): fetch the latest
     // passing revision once, before this edit, and read from it from now on.
     const fix = claim.fix;
-    const wantsRebase = (digest.rebaseTo !== null && digest.rebaseTo > this.rebasedTo) || fix !== undefined;
-    if (wantsRebase && digest.integrated && digest.integrated.n > this.rebasedTo && this.options.fetchRevision) {
-      const dir = await this.options.fetchRevision(digest.integrated.n, digest.integrated.commit);
-      if (dir !== undefined) {
-        this.baseDir = dir;
-        this.rebasedTo = digest.integrated.n;
-        this.evidence.push(`rebased onto integrated revision ${digest.integrated.n} (${digest.integrated.commit})`);
-      }
-    }
+    await this.rebaseIfNeeded(digest, fix !== undefined);
     let worktree: string;
     try {
       worktree = await this.ensureWorktree();
@@ -1007,6 +1227,7 @@ export class BoardAgent {
       return;
     }
     const head = (await gitOut(worktree, ["rev-parse", "--verify", "-q", "HEAD"]).catch(() => "")).trim() || undefined;
+    await this.cleanStray(worktree, head, `editing ${itemId}`);
     const writeGlobs = [...new Set(claim.intent.write.map(intentPath))];
     // A handed-off item starts from the previous owner's latest pushed version
     // of its files: copy them into this agent's worktree before the first edit.
@@ -1060,17 +1281,41 @@ export class BoardAgent {
       await rm(view, { recursive: true, force: true });
     }
 
-    // What actually changed is read from Git, not taken from the executor.
-    await gitOut(worktree, ["add", "-A"]);
-    const changed = (await gitOut(worktree, ["diff", "--cached", "--name-only", ...(head ? [head] : [])]))
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l !== "")
-      .sort();
+    const pushed = await this.commitPushAnnounce(itemId, worktree, head, writeGlobs, result.commitMessage, local, posted, `the edit for ${itemId}`);
+    if (pushed === undefined) {
+      return;
+    }
+    this.evidence.push(
+      `pushed ${pushed.commit} for ${itemId}: ${pushed.changed.join(", ")}` +
+        (fix !== undefined ? ` (fix attempt ${fix.attempt} for revision ${fix.n}${model !== undefined ? ` on ${model}` : ""})` : ""),
+    );
+  }
+
+  /**
+   * Read what changed in the worktree from Git (never from whoever changed
+   * it), refuse symlinks, dependency-tree files, and anything outside the
+   * write intent, then commit, push to the agent's own repo, and announce the
+   * push. A refused announcement rolls the repo back. Returns the commit and
+   * the changed paths, or undefined (already recorded) when nothing shipped.
+   */
+  private async commitPushAnnounce(
+    itemId: string,
+    worktree: string,
+    head: string | undefined,
+    writeGlobs: readonly string[],
+    message: string,
+    local: (code: string, error: string) => void,
+    posted: (draft: Record<string, unknown>) => Promise<boolean>,
+    what: string,
+  ): Promise<{ readonly commit: string; readonly changed: readonly string[] } | undefined> {
+    // What changed is read from Git's status (never `git add -A`, never the
+    // executor's word); only these paths are ever staged, and only after they
+    // all lie inside the write intent.
+    const changed = await worktreeChanges(worktree);
     if (changed.length === 0) {
       await this.discard(worktree, head);
-      local("NO_CHANGE", `the edit for ${itemId} changed nothing`);
-      return;
+      local("NO_CHANGE", `${what} changed nothing`);
+      return undefined;
     }
     // Never push a symlink or anything inside a dependency or tool tree: the
     // integrator would refuse it, so refuse it here, before it leaves the agent.
@@ -1084,30 +1329,39 @@ export class BoardAgent {
     }
     if (unsafe.length > 0) {
       await this.discard(worktree, head);
-      local("UNSAFE_PATH", `the edit wrote symlinks or dependency-tree files, which are never pushed: ${unsafe.join(", ")}`);
-      return;
+      local("UNSAFE_PATH", `${what} wrote symlinks or dependency-tree files, which are never pushed: ${unsafe.join(", ")}`);
+      return undefined;
     }
     const { outOfScope } = partitionByScope(changed, writeGlobs);
     if (outOfScope.length > 0) {
       await this.discard(worktree, head);
-      local("OUTSIDE_INTENT", `the edit touched paths outside the write intent: ${outOfScope.join(", ")}`);
-      return;
+      this.evidence.push(bounded(`discarded every uncommitted change (reset and clean) because ${what} touched paths outside my write intent: ${outOfScope.join(", ")}`, 500));
+      local("OUTSIDE_INTENT", `${what} touched paths outside the write intent: ${outOfScope.join(", ")}`);
+      return undefined;
     }
-    const identity = this.options.identity ?? {
-      name: `Switchyard Agent ${this.id}`,
-      email: `${this.id.replace(/[^A-Za-z0-9._-]+/g, "-")}@agents.switchyard.local`,
-    };
+    await gitOut(worktree, ["add", "--", ...changed.map((p) => `:(literal)${p}`)]);
+    const staged = (await gitOut(worktree, ["diff", "--cached", "--name-only", ...(head ? [head] : [])]))
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l !== "");
+    const unexpected = staged.filter((p) => !changed.includes(p));
+    if (unexpected.length > 0) {
+      await this.discard(worktree, head);
+      local("OUTSIDE_INTENT", `the staged change holds paths that were not listed as changed: ${unexpected.join(", ")}`);
+      return undefined;
+    }
+    const identity = this.identity();
     const branch = this.workspace?.defaultBranch ?? "main";
     let commit: string;
     try {
-      commit = await commitAll(worktree, bounded(`${itemId}: ${result.commitMessage}`, 200), identity);
+      commit = await commitStaged(worktree, bounded(`${itemId}: ${message}`, 200), identity);
       await push(worktree, this.remote, branch);
     } catch (error) {
       // A push that fails (an expired token, an unreachable repo) is the
       // agent's problem to report, never a crash of the run.
       await this.discard(worktree, head).catch(() => undefined);
       local("PUSH_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
-      return;
+      return undefined;
     }
     const ok = await posted({
       type: "push.announced",
@@ -1129,13 +1383,329 @@ export class BoardAgent {
         // Best-effort: the integrator also checks each repo's head against its
         // latest announced push and excludes a repo that diverged.
       }
-      return;
+      return undefined;
     }
     this.followUp = true;
-    this.evidence.push(
-      `pushed ${commit} for ${itemId}: ${changed.join(", ")}` +
-        (fix !== undefined ? ` (fix attempt ${fix.attempt} for revision ${fix.n}${model !== undefined ? ` on ${model}` : ""})` : ""),
+    return { commit, changed };
+  }
+
+  private identity(): GitIdentity {
+    return (
+      this.options.identity ?? {
+        name: `Switchyard Agent ${this.id}`,
+        email: `${this.id.replace(/[^A-Za-z0-9._-]+/g, "-")}@agents.switchyard.local`,
+      }
     );
+  }
+
+  /**
+   * Before reading the shared baseline for a change: fetch the latest passing
+   * revision once when the board told this agent to rebase (or `always`).
+   */
+  private async rebaseIfNeeded(digest: BoardDigest, always: boolean): Promise<void> {
+    const wanted = always || (digest.rebaseTo !== null && digest.rebaseTo > this.rebasedTo);
+    if (wanted && digest.integrated && digest.integrated.n > this.rebasedTo && this.options.fetchRevision) {
+      const dir = await this.options.fetchRevision(digest.integrated.n, digest.integrated.commit);
+      if (dir !== undefined) {
+        this.baseDir = dir;
+        this.rebasedTo = digest.integrated.n;
+        this.evidence.push(`rebased onto integrated revision ${digest.integrated.n} (${digest.integrated.commit})`);
+      }
+    }
+  }
+
+  /**
+   * build_tool: write the tool (its author: the executor live, the template
+   * offline) into the tool's own directory of the Change's tools repo, on its
+   * own branch, inside the tool item's write intent; commit, push, announce
+   * the build (tool.built); then the operator runs the tool's OWN gate and
+   * records it. Only a pass is published, by the engine.
+   */
+  private async buildTool(
+    action: Extract<AgentAction, { type: "build_tool" }>,
+    digest: BoardDigest,
+    state: BoardState,
+    local: (code: string, error: string, note?: Record<string, string>) => void,
+    posted: (draft: Record<string, unknown>, note?: Record<string, string>) => Promise<boolean>,
+  ): Promise<void> {
+    const capability = action.capability;
+    const itemId = toolItemId(capability);
+    const claim = digest.claims.find((c) => c.item === itemId);
+    const proposal = Object.values(state.tools.proposed).find((t) => t.capability === capability);
+    if (!claim || !proposal) {
+      local("NOT_OWNER", `${this.id} does not hold the tool item ${itemId}`);
+      return;
+    }
+    const bench = this.options.tools;
+    const author = this.options.toolAuthor;
+    if (!bench || !author) {
+      local("NOT_ALLOWED", "this run has no tool bench: tools cannot be built");
+      return;
+    }
+    const writeGlobs = [...new Set(claim.intent.write.map(intentPath))];
+    this.edits += 1;
+    const dir = join(this.options.workRoot, "tool-builds", `${this.id.replace(/[^A-Za-z0-9._-]+/g, "-")}-${capability}-${this.edits}`);
+    const branch = `refs/heads/${toolBranch(capability)}`;
+    try {
+      await rm(dir, { recursive: true, force: true });
+      await mkdir(dirname(dir), { recursive: true });
+      const remote = await bench.remote("write");
+      await runGit(["init", "-q", dir]);
+      const fetched = await runGit(["-C", dir, "fetch", "-q", remote, branch]).then(() => true, () => false);
+      if (fetched) {
+        await runGit(["-C", dir, "-c", "advice.detachedHead=false", "checkout", "-q", "--detach", "FETCH_HEAD"]);
+      }
+      const head = fetched ? (await gitOut(dir, ["rev-parse", "HEAD"])).trim() : undefined;
+      // A tool's first build starts from the runtime's skeleton (committed
+      // first on the tool's branch): an executor that only makes anchored
+      // edits cannot create files, so it completes the skeleton's FILL regions.
+      // An unfilled skeleton fails the tool's own gate.
+      if (!(await exists(join(dir, "tools", capability, "run.mjs")))) {
+        const skeleton = toolSkeleton(proposal.kind, capability, proposal.inputs);
+        const written: string[] = [];
+        for (const [name, body] of Object.entries(skeleton)) {
+          const rel = `tools/${capability}/${name}`;
+          await mkdir(dirname(join(dir, rel)), { recursive: true });
+          await writeFile(join(dir, rel), body, "utf8");
+          written.push(rel);
+        }
+        await gitOut(dir, ["add", "--", ...written.map((p) => `:(literal)${p}`)]);
+        await commitStaged(dir, `${itemId}: skeleton of the ${proposal.kind} ${capability}`, this.identity());
+      }
+      const gateFailure = this.toolGateFailures.get(capability);
+      await author({
+        agent: this.id,
+        capability,
+        kind: proposal.kind,
+        inputs: proposal.inputs,
+        outputs: proposal.outputs,
+        worktreeDir: dir,
+        projectDir: this.baseDir,
+        goal: this.options.goal,
+        ...(gateFailure !== undefined ? { gateFailure } : {}),
+      });
+      const changed = await worktreeChanges(dir);
+      if (changed.length === 0) {
+        local("NO_CHANGE", `the build of ${capability} changed nothing`);
+        return;
+      }
+      // One writer per tool path: the build may write only inside the tool
+      // item's write intent, itself inside tools/<capability>/.
+      const outside = changed.filter((f) => !partitionByScope([f], writeGlobs).inScope.length || !matchesGlob(f, toolScope(capability)));
+      if (outside.length > 0) {
+        local("OUTSIDE_INTENT", `the build of ${capability} touched paths outside ${toolScope(capability)}: ${outside.join(", ")}`);
+        return;
+      }
+      for (const rel of changed) {
+        if ((await lstat(join(dir, rel)).catch(() => undefined))?.isSymbolicLink()) {
+          local("UNSAFE_PATH", `the build of ${capability} wrote a symlink (${rel}), which is never pushed`);
+          return;
+        }
+      }
+      // Stage exactly the listed in-scope paths (never `git add -A`).
+      await gitOut(dir, ["add", "--", ...changed.map((p) => `:(literal)${p}`)]);
+      const commit = await commitStaged(dir, `${itemId}: build ${capability}`, this.identity());
+      // The build is everything since the last announced build (the skeleton included).
+      const paths = (await gitOut(dir, ["diff", "--name-only", head ?? EMPTY_TREE, commit]))
+        .split("\n")
+        .map((l) => l.trim())
+        .filter((l) => l !== "")
+        .sort();
+      const strayPaths = paths.filter((f) => !partitionByScope([f], writeGlobs).inScope.length || !matchesGlob(f, toolScope(capability)));
+      if (strayPaths.length > 0) {
+        local("OUTSIDE_INTENT", `the build of ${capability} holds paths outside the write intent: ${strayPaths.join(", ")}`);
+        return;
+      }
+      await runGit(["-C", dir, "push", "-q", remote, `HEAD:${branch}`]);
+      const ok = await posted(
+        { type: "tool.built", payload: { capability, commit, paths }, ...(action.rationale !== undefined ? { rationale: action.rationale } : {}) },
+        { capability },
+      );
+      if (!ok) {
+        // A refused announcement: the branch goes back to the last announced build.
+        await runGit(["-C", dir, "push", "-q", "--force", remote, head ? `${head}:${branch}` : `:${branch}`]).catch(() => undefined);
+        return;
+      }
+      this.builtTools.add(capability);
+      // The operator runs the tool's OWN gate on the original code and records
+      // it; the engine publishes only a pass.
+      const gated = await bench.gate(await this.requireClient().state(), capability, commit);
+      const failed = gated.checks.filter((c) => !c.passed).map((c) => `${c.check}: ${c.detail}`);
+      if (gated.passed) {
+        this.toolGateFailures.delete(capability);
+      } else {
+        // The next build (the fix flow) sees exactly what failed.
+        this.toolGateFailures.set(capability, bounded([...failed, gated.output ?? ""].filter((l) => l !== "").join("\n"), 4000));
+      }
+      this.evidence.push(
+        gated.passed && gated.version !== undefined
+          ? `built ${capability} at ${commit}: its own gate passed; published as ${capability}@${gated.version}`
+          : `built ${capability} at ${commit}: its own gate FAILED (${bounded(failed.join("; ") || gated.error || "not recorded", 300)})`,
+      );
+      this.followUp = true;
+    } catch (error) {
+      local("TOOL_BUILD_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
+    } finally {
+      await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * use_tool: run a PINNED, published tool version over a copy of this
+   * agent's own view (the shared baseline, or the revision it rebased onto,
+   * with its own pushed files on top), isolated like a gate. A codemod's
+   * changes are kept only when they all lie inside the write intent of the
+   * item named, then committed, pushed, and announced like an edit; any other
+   * tool changes nothing (whatever it wrote in its copy is discarded). The
+   * ENGINE records the use (the operator route), never the agent.
+   */
+  private async useTool(
+    action: Extract<AgentAction, { type: "use_tool" }>,
+    digest: BoardDigest,
+    state: BoardState,
+    plainLocal: (code: string, error: string, note?: Record<string, string>) => void,
+  ): Promise<void> {
+    const turn = this.turns;
+    const bench = this.options.tools;
+    const note: Record<string, string> = { capability: action.capability, version: action.version, rev: String(digest.integrated?.n ?? 0) };
+    const local = (code: string, error: string) => plainLocal(code, error, note);
+    if (!bench) {
+      local("NOT_ALLOWED", "this run has no tool bench: tools cannot be run");
+      return;
+    }
+    const tool = state.tools.published.find((t) => t.capability === action.capability && t.version === action.version);
+    if (!tool) {
+      local("UNKNOWN_REF", `${action.capability}@${action.version} is not a published tool version (pin one from board.tools)`);
+      return;
+    }
+    const claim = action.itemId !== undefined ? digest.claims.find((c) => c.item === action.itemId) : undefined;
+    if (action.itemId !== undefined && !claim) {
+      local("NOT_OWNER", `${this.id} does not hold a granted claim on item ${action.itemId}`);
+      return;
+    }
+    if (tool.kind === "codemod" && !claim) {
+      local("BAD_ACTION", "a codemod changes files: name the item you hold (itemId) whose write intent bounds its changes");
+      return;
+    }
+    if (claim) {
+      note.item = claim.item;
+    }
+    // A sweep (no item) reads the latest passing revision; a use on an item
+    // reads what this agent's next edit would read.
+    await this.rebaseIfNeeded(digest, claim === undefined || claim.fix !== undefined);
+    let worktree: string | undefined;
+    if (claim) {
+      try {
+        worktree = await this.ensureWorktree();
+      } catch (error) {
+        local("CLONE_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
+        return;
+      }
+    }
+    let ran;
+    try {
+      ran = await bench.run(state, {
+        capability: tool.capability,
+        version: tool.version,
+        args: action.args,
+        layers: [this.baseDir, ...(worktree !== undefined ? [worktree] : [])],
+      });
+    } catch (error) {
+      local(error instanceof ToolUseError ? error.code : "TOOL_RUN_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
+      return;
+    }
+    const { result } = ran;
+    try {
+      if (result.stopped !== undefined || result.exit === null) {
+        local("TOOL_STOPPED", bounded(`${tool.capability}@${tool.version} was stopped: ${result.stopped ?? "no exit code"}`, 300));
+        return;
+      }
+      let commit: string | undefined;
+      let changedFiles: readonly string[] = [];
+      if (tool.kind === "codemod") {
+        if (result.exit !== 0) {
+          local("TOOL_FAILED", bounded(`${tool.capability}@${tool.version} exited ${result.exit}: ${this.scrub(result.stderr).slice(0, 200)}`, 300));
+          return;
+        }
+        if (result.deleted.length > 0) {
+          local("OUTSIDE_INTENT", `the codemod deleted ${result.deleted.slice(0, 5).join(", ")}; a codemod may not delete files`);
+          return;
+        }
+        const touched = [...result.modified, ...result.created];
+        const writeGlobs = [...new Set(claim!.intent.write.map(intentPath))];
+        const { outOfScope } = partitionByScope(touched, writeGlobs);
+        if (outOfScope.length > 0) {
+          // Path scope is enforced before anything is kept: the whole run is discarded.
+          local("OUTSIDE_INTENT", `the codemod changed paths outside item ${claim!.item}'s write intent: ${outOfScope.slice(0, 8).join(", ")}`);
+          return;
+        }
+        if (touched.length > 0) {
+          const head = (await gitOut(worktree!, ["rev-parse", "--verify", "-q", "HEAD"]).catch(() => "")).trim() || undefined;
+          await this.cleanStray(worktree!, head, `applying ${tool.capability}`);
+          for (const rel of touched) {
+            await mkdir(dirname(join(worktree!, rel)), { recursive: true });
+            await writeFile(join(worktree!, rel), await result.read(rel));
+          }
+          const pushed = await this.commitPushAnnounce(
+            claim!.item,
+            worktree!,
+            head,
+            writeGlobs,
+            `ran ${tool.capability}@${tool.version}`,
+            local,
+            async (draft) => {
+              const outcome = await this.requireClient().post(draft);
+              if (!outcome.ok) {
+                this.lastRejection = { code: outcome.code, error: outcome.error, action: action.type };
+                this.followUp = true;
+                this.record({ turn, action, outcome: "rejected", code: outcome.code, error: outcome.error }, { turn, action, outcome: "rejected", code: outcome.code, error: outcome.error, note });
+              }
+              return outcome.ok;
+            },
+            `the codemod ${tool.capability}`,
+          );
+          if (pushed === undefined) {
+            return;
+          }
+          commit = pushed.commit;
+          changedFiles = pushed.changed;
+        }
+      }
+      // Only the engine records a use (through the operator's route).
+      const findings = tool.kind === "codemod" ? [] : result.findings;
+      const recorded = await bench.recordUse({
+        capability: tool.capability,
+        version: tool.version,
+        by: this.id,
+        ...(claim ? { item: claim.item } : {}),
+        ...(commit !== undefined ? { commit } : {}),
+        changedFiles,
+        ...(findings.length > 0 ? { findings } : {}),
+        exit: result.exit,
+      });
+      note.changed = String(changedFiles.length);
+      note.findings = String(findings.length);
+      const files = [...new Set(findings.map((f) => f.path))];
+      if (files.length > 0) {
+        note.files = files.slice(0, 32).join(",");
+      }
+      this.followUp = true;
+      if (!recorded.ok) {
+        this.lastRejection = { code: recorded.code, error: recorded.error, action: action.type };
+        this.record({ turn, action, outcome: "rejected", code: recorded.code, error: recorded.error }, { turn, action, outcome: "rejected", code: recorded.code, error: recorded.error, note });
+        return;
+      }
+      this.record({ turn, action, outcome: "posted", seqs: recorded.appended.map((m) => m.seq) }, { turn, action, outcome: "posted", note });
+      this.evidence.push(
+        tool.kind === "codemod"
+          ? changedFiles.length > 0
+            ? `ran ${tool.capability}@${tool.version} for ${claim!.item}: pushed ${commit} changing ${changedFiles.join(", ")}`
+            : `ran ${tool.capability}@${tool.version} for ${claim!.item}: it changed nothing in my write intent`
+          : `ran ${tool.capability}@${tool.version}: ${findings.length} finding(s)${files.length > 0 ? ` in ${files.slice(0, 8).join(", ")}` : ""} (exit ${result.exit})`,
+      );
+    } finally {
+      await result.dispose();
+    }
   }
 
   /**

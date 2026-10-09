@@ -63,6 +63,35 @@ export {
 } from "./dependency-install.ts";
 
 export { matchesAny, matchesGlob, partitionByScope } from "./pathscope.ts";
+export type {
+  RunToolOptions,
+  SkeletonRegion,
+  ToolFinding,
+  ToolGateCheck,
+  ToolGateKind,
+  ToolGateOptions,
+  ToolGateResult,
+  ToolRunLimits,
+  ToolRunResult,
+} from "./tool-gate.ts";
+export {
+  DEFAULT_TOOL_TIMEOUT_MS,
+  materializeToolTree,
+  MAX_TOOL_FINDINGS,
+  parseToolFindings,
+  runToolGate,
+  runToolInCopy,
+  syntaxProblem,
+  TOOL_ENTRY,
+  TOOL_SKELETON_MARKER,
+  toolEntryPath,
+  toolSkeleton,
+  RegionSpliceError,
+  skeletonRegions,
+  spliceRegions,
+  toolUsage,
+  validToolArg,
+} from "./tool-gate.ts";
 export { gateFailureLine } from "./gate-failure.ts";
 
 export type { GitIdentity } from "./git.ts";

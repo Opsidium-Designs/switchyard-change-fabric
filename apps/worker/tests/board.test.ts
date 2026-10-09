@@ -143,9 +143,9 @@ describe("Worker board routes", () => {
     expect(snapshot.body.board).toEqual({
       messages: log.length,
       agents: 4,
-      items: { proposed: 0, rejected: 0, open: 0, claimed: 1, contested: 0, split: 0, done: 4 },
+      items: { proposed: 0, rejected: 1, open: 0, claimed: 1, contested: 0, split: 0, done: 4 },
       contests: { open: 0, escalated: 0, resolved: 2 },
-      toolsPublished: 1,
+      toolsPublished: 0,
       integratedRev: 3,
     });
   });
@@ -470,5 +470,59 @@ describe("Worker board contest escalation", () => {
     expect(after.body.messages.map((m) => `${m.from}:${m.type}`)).toEqual(["human:claim.resolved", "engine:claim.granted"]);
     const list = await h.json<{ escalations: { status: string; decision?: string }[] }>("GET", `/changes/${ID}/escalations`);
     expect(list.body.escalations[0]).toMatchObject({ status: "resolved", decision: "agent-b" });
+  });
+});
+
+describe("Worker tool routes (agents build tools for each other)", () => {
+  it("only the operator records a tool's gate and its uses; agents cannot; a pass publishes, the registry pins versions", async () => {
+    const h = await created({ apiToken: "op-secret-123" });
+    const bearer = { authorization: "Bearer op-secret-123" };
+    const token = await withAgent(h, bearer);
+    const agent = { [TOKEN_HEADER]: token };
+    const lead = await httpEndpoint(h, bearer).join("lead", { role: "lead" });
+    const leadToken = lead.ok ? lead.token : "";
+    const post = (path: string, body: unknown, headers: Record<string, string>) => h.json<Reply & { workspaceName?: string; gitUrl?: string; token?: string }>("POST", `/changes/${ID}${path}`, body, headers);
+
+    expect((await post("/board", { type: "tool.proposed", payload: { tool: "t1", capability: "scan-x", kind: "scanner" }, rationale: "find every place" }, agent)).status).toBe(201);
+    expect((await post("/board", { type: "item.accepted", payload: { item: "tool-scan-x" } }, { [TOKEN_HEADER]: leadToken })).status).toBe(201);
+    expect((await post("/board", { type: "item.claimed", payload: { item: "tool-scan-x", intent: { write: ["tools/scan-x/**"] } } }, agent)).status).toBe(201);
+    expect((await post("/board", { type: "tool.built", payload: { capability: "scan-x", commit: "b1", paths: ["tools/scan-x/run.mjs"] } }, agent)).status).toBe(201);
+
+    const gate = { capability: "scan-x", commit: "b1", passed: true, checks: [{ check: "finds", passed: true, detail: "found 2 place(s)" }], repo: `${ID}--tools`, usage: "node tools/scan-x/run.mjs" };
+    // An agent can never claim its tool passed: not through its own route...
+    const forged = await post("/board", { type: "tool.gated", payload: gate }, agent);
+    expect(forged.status).toBe(400);
+    expect(forged.body.code).toBe("NOT_ALLOWED");
+    // ...and the operator routes need the bearer it does not hold.
+    expect((await post("/tools/gate", gate, agent)).status).toBe(401);
+    expect((await post("/tools/used", { capability: "scan-x", version: "1", by: "a" }, agent)).status).toBe(401);
+
+    const gated = await post("/tools/gate", gate, bearer);
+    expect(gated.status).toBe(201);
+    expect(gated.body.appended!.map((m) => m.type)).toEqual(["tool.gated", "tool.published", "item.completed"]);
+    expect((await post("/tools/used", { capability: "scan-x", version: "2", by: "a" }, bearer)).body.code).toBe("UNKNOWN_REF");
+    const used = await post("/tools/used", { capability: "scan-x", version: "1", by: "a", findings: [{ path: "src/a.ts", line: 1, message: "m" }] }, bearer);
+    expect(used.status).toBe(201);
+    expect(used.body.appended![0]).toMatchObject({ from: "engine", type: "tool.used", payload: { by: "a" } });
+    const board = await h.json<BoardBody>("GET", `/changes/${ID}/board`);
+    expect(board.body.state.tools.published.map((t) => `${t.capability}@${t.version}:${t.uses}`)).toEqual(["scan-x@1:1"]);
+    expect((await h.json<{ ok: boolean }>("GET", `/changes/${ID}/board/verify`)).body.ok).toBe(true);
+  });
+
+  it("provisions the Change's tools repo once (a repeat returns the same repo with a fresh token) and issues scoped tokens", async () => {
+    const h = await created();
+    expect((await h.json<{ code?: string }>("POST", `/changes/${ID}/tools/token`, { scope: "read", ttlSeconds: 600 })).body.code).toBe("INVALID_STATE");
+    const first = await h.json<{ workspaceName: string; gitUrl: string; token: string; tokenId: string }>("POST", `/changes/${ID}/tools/workspace`, { ttlSeconds: 600 });
+    expect(first.status).toBe(201);
+    expect(first.body.workspaceName).toBe(`${ID}--tools`);
+    const again = await h.json<{ workspaceName: string; gitUrl: string; token: string }>("POST", `/changes/${ID}/tools/workspace`, { ttlSeconds: 600 });
+    expect(again.status).toBe(201);
+    expect(again.body.workspaceName).toBe(first.body.workspaceName);
+    expect(again.body.gitUrl).toBe(first.body.gitUrl);
+    const read = await h.json<{ workspaceName: string; token: string }>("POST", `/changes/${ID}/tools/token`, { scope: "read", ttlSeconds: 600 });
+    expect(read.status).toBe(201);
+    expect(read.body.workspaceName).toBe(first.body.workspaceName);
+    expect((await h.json("POST", `/changes/${ID}/tools/workspace`, { ttlSeconds: 5 })).status).toBe(400);
+    expect((await h.json("POST", `/changes/${ID}/tools/token/revoke`, { tokenId: first.body.tokenId })).status).toBe(200);
   });
 });

@@ -12,6 +12,8 @@ import {
   appendBoardMessage,
   appendDecisionRecorded,
   appendIntegratedRev,
+  appendToolGated,
+  appendToolUsed,
   emptyBoard,
   type BoardAppendResult,
   type BoardMessage,
@@ -56,6 +58,16 @@ export class FixtureBoard {
 
   decision(input: Record<string, unknown>): readonly BoardMessage[] {
     return this.take(appendDecisionRecorded(this.state, input, AT));
+  }
+
+  /** The operator records a tool's own gate result (the engine publishes a pass). */
+  toolGate(input: Record<string, unknown>): readonly BoardMessage[] {
+    return this.take(appendToolGated(this.state, input, AT));
+  }
+
+  /** The operator records a use the runtime ran (agents never post one). */
+  toolUse(input: Record<string, unknown>): readonly BoardMessage[] {
+    return this.take(appendToolUsed(this.state, input, AT));
   }
 
   lastSeqOf(type: string): number {
@@ -142,18 +154,31 @@ export function missionControlLog(): BoardMessage[] {
     rev: 1,
     parsed: ["orders"],
   });
-  // Tools: a scanner is proposed, passes its own gate, and is reused.
+  // Tools: a scanner is proposed, accepted, built, passes its own gate, and is reused.
   b.agent("ag-4", {
     type: "tool.proposed",
-    payload: { tool: "route-scan", capability: "scan-unguarded-routes", inputs: ["source-tree"], outputs: ["route-list"] },
+    payload: { tool: "route-scan", capability: "scan-unguarded-routes", kind: "scanner", inputs: ["src/**"], outputs: ["findings"] },
     rationale: "every resource repeats the same check",
   });
+  b.agent("lead", { type: "item.accepted", payload: { item: "tool-scan-unguarded-routes" }, rationale: "a scanner beats hand checks" });
+  b.agent("ag-4", { type: "item.claimed", payload: { item: "tool-scan-unguarded-routes", intent: { read: [], write: ["tools/scan-unguarded-routes/**"] } } });
   b.agent("ag-4", {
-    type: "tool.published",
-    payload: { tool: "route-scan", capability: "scan-unguarded-routes", version: "1.0.0", repo: "tools", commit: "t00l001", verified: true },
+    type: "tool.built",
+    payload: { capability: "scan-unguarded-routes", commit: "t00l001", paths: ["tools/scan-unguarded-routes/run.mjs", "tools/scan-unguarded-routes/test.mjs"] },
+  });
+  b.toolGate({
+    capability: "scan-unguarded-routes",
+    commit: "t00l001",
+    passed: true,
+    checks: [
+      { check: "tests", passed: true, detail: "its own tests passed (2 test(s))" },
+      { check: "finds", passed: true, detail: "found 4 place(s) in 4 file(s) on the baseline" },
+    ],
+    repo: "change--tools",
+    usage: "node tools/scan-unguarded-routes/run.mjs [paths...]",
   });
   for (const user of ["ag-1", "ag-2", "ag-2"]) {
-    b.agent(user, { type: "tool.used", payload: { capability: "scan-unguarded-routes", version: "1.0.0", changedFiles: [] } });
+    b.toolUse({ capability: "scan-unguarded-routes", version: "1", by: user, findings: [{ path: "src/orders.js", line: 3, message: "route without auth" }] });
   }
   b.agent("ag-2", { type: "push.announced", payload: { item: "orders", commit: "b2b2b2b", paths: ["src/orders.js"] }, rationale: "requireAuth before the body check" });
   // auth pushes and proposes done, but the next revision does not merge it: a hollow check.

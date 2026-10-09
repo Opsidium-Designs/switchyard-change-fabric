@@ -123,6 +123,7 @@ export type {
   AgentMessagePayload,
   AgentRepoExcerpt,
   AgentReviewFinding,
+  AgentToolKind,
   AgentTurnHistoryEntry,
   AgentTurnInput,
   AgentTurnOutcome,
@@ -133,6 +134,7 @@ export {
   AGENT_ACTION_LIMITS,
   AGENT_ACTION_TYPES,
   AGENT_MESSAGE_KINDS,
+  AGENT_TOOL_KINDS,
   AGENT_TURN_JSON_SCHEMA,
   AGENT_TURN_MAX_CONTEXT_CHARS,
   AGENT_TURN_SCHEMA_NAME,
@@ -142,6 +144,17 @@ export {
   createAiGatewayAgentTurnInvoke,
   DEFAULT_AGENT_TURN_MAX_TOKENS,
   parseAgentAction,
+  slugifyNeed,
   UNTRUSTED_CLOSE,
   UNTRUSTED_OPEN,
 } from "./agent-turn.ts";
+
+export type { AiGatewayToolRegionOptions, ToolRegionFill, ToolRegionFiller, ToolRegionRequest, ToolRegionSpec } from "./tool-regions.ts";
+export {
+  buildToolRegionMessages,
+  createAiGatewayToolRegionFiller,
+  MAX_REGION_CODE,
+  parseToolRegionFills,
+  TOOL_REGIONS_JSON_SCHEMA,
+  ToolRegionError,
+} from "./tool-regions.ts";

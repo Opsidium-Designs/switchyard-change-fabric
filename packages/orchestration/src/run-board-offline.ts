@@ -33,6 +33,7 @@ import type { AgentTurnTransport, ExecutorProvider } from "@switchyard-change/mo
 import { NO_DEPENDENCY_INSTALL, type CommandOutcome, type CommandRunner as VerificationCommandRunner } from "@switchyard-change/verification";
 
 import { createGenericBoardPolicy } from "./board-policy.ts";
+import { templateToolAuthor, type ToolAuthor } from "./board-tools.ts";
 import { decomposeGoal } from "./decompose-goal.ts";
 import { LocalChangeControl } from "./local-control.ts";
 import {
@@ -52,6 +53,10 @@ export const OFFLINE_BOARD_EPOCH = "2026-01-01T00:00:00.000Z";
 export function offlineFixtureGateLabel(declared: readonly string[]): string {
   return `offline fixture gate replaces the project's declared gate (${declared.join(" ")}); this demo shows coordination, not a real fix`;
 }
+
+/** How the offline run labels its tool author. */
+export const OFFLINE_TOOL_AUTHOR_LABEL =
+  "the deterministic offline template author (the noop executor cannot write a tool; each tool still passes its own gate)";
 
 /** The argv the offline gate fixture is wired as (it is never executed as a process). */
 export const OFFLINE_GATE_FIXTURE_COMMAND: readonly string[] = ["node", "--offline-gate-fixture"];
@@ -141,6 +146,13 @@ export interface RunBoardOfflineOptions {
   /** The human's decision on contract changes to the original tests (see RunBoardOptions.resolveContract). */
   readonly resolveContract?: RunBoardOptions["resolveContract"];
   readonly workRoot?: string;
+  /**
+   * Who writes agent-built tools (default: the deterministic offline template
+   * author; the noop executor cannot write a tool). Tools still pass their own gate.
+   */
+  readonly toolAuthor?: ToolAuthor;
+  /** The limit on one tool run (and its tests), in ms (see RunBoardOptions.toolTimeoutMs). */
+  readonly toolTimeoutMs?: number;
   /** Pin Git author and committer dates for the run so commit ids repeat (default true). */
   readonly fixedGitDates?: boolean;
   readonly onEvent?: (event: BoardRunEvent) => void;
@@ -202,6 +214,9 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       ...(options.resolveContract ? { resolveContract: options.resolveContract } : {}),
       ...(options.jev ? { jev: options.jev } : {}),
       ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
+      toolAuthor: options.toolAuthor ?? templateToolAuthor,
+      ...(options.toolTimeoutMs !== undefined ? { toolTimeoutMs: options.toolTimeoutMs } : {}),
+      ...(options.toolAuthor === undefined ? { toolAuthorLabel: OFFLINE_TOOL_AUTHOR_LABEL } : {}),
       ...(options.onEvent ? { onEvent: options.onEvent } : {}),
     });
     // The whole scratch directory: the offline control's repos and the run's work root.

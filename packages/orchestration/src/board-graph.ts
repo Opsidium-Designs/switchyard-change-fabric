@@ -37,6 +37,7 @@
 import {
   contractTriageRecommendation,
   foldBoard,
+  toolItemId,
   type BoardItemStatus,
   type BoardMessage,
   type BoardMessageOf,
@@ -114,7 +115,7 @@ export interface ItemNodeDetail {
   readonly children: readonly string[];
   /** The owner proposed done: a hollow check until a passing revision completes it. */
   readonly doneProposed: boolean;
-  readonly completed?: { readonly n: number; readonly via: "integrated" | "children" };
+  readonly completed?: { readonly n?: number; readonly via: "integrated" | "children" | "tool"; readonly version?: string };
   readonly fixAttempts: number;
   readonly fixRequested?: number;
   readonly fixExhausted: boolean;
@@ -148,13 +149,29 @@ export interface ToolNodeDetail {
   readonly kind: "tool";
   readonly capability: string;
   readonly proposedBy?: string;
+  /** The tool kind (scanner, codemod, check, ...). */
+  readonly toolKind?: string;
+  readonly inputs?: readonly string[];
+  /** The board item that builds it, and its current owner (the builder). */
+  readonly item?: string;
+  readonly builder?: string;
   readonly versions: readonly {
     readonly version: string;
     readonly tool: string;
     readonly publishedBy: string;
     readonly seq: number;
     readonly uses: number;
+    readonly commit?: string;
+    readonly repo?: string;
+    readonly usage?: string;
+    /** The tool.gated message whose checks it passed (its gate evidence). */
+    readonly gateSeq?: number;
+    readonly joinsGate?: false;
   }[];
+  /** Every gate run of its builds: the evidence, pass or fail. */
+  readonly gates?: readonly { readonly seq: number; readonly commit: string; readonly passed: boolean; readonly checks: readonly { readonly check: string; readonly passed: boolean; readonly detail: string }[] }[];
+  /** Who used it, from the engine's tool.used records. */
+  readonly users?: readonly { readonly agent: string; readonly uses: number }[];
   readonly uses: number;
   /** Published (passed its own gate), or only proposed so far. */
   readonly published: boolean;
@@ -347,6 +364,8 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     case "decision.resolved":
       return "decision";
     case "tool.proposed":
+    case "tool.built":
+    case "tool.gated":
     case "tool.published":
     case "tool.used":
       return "tool";
@@ -408,6 +427,10 @@ export function messageItems(message: BoardMessage, state?: BoardState): string[
   const out: string[] = [];
   if (typeof payload.item === "string") {
     out.push(payload.item);
+  }
+  // A tool proposal creates (and a build or gate concerns) the tool's item.
+  if ((isType(message, "tool.proposed") || isType(message, "tool.built") || isType(message, "tool.gated")) && typeof payload.capability === "string") {
+    out.push(toolItemId(payload.capability));
   }
   if (typeof payload.ownerItem === "string" && payload.ownerItem !== payload.item) {
     out.push(payload.ownerItem);
@@ -541,7 +564,12 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
   // Items (hulls). The creating message is the proposal, discovery, or split.
   const itemOrigin = new Map<string, BoardMessage>();
   for (const m of messages) {
-    if (isType(m, "item.proposed") || isType(m, "item.discovered")) {
+    if (isType(m, "tool.proposed")) {
+      // A tool proposal creates the item that builds the tool.
+      if (!itemOrigin.has(toolItemId(m.payload.capability))) {
+        itemOrigin.set(toolItemId(m.payload.capability), m);
+      }
+    } else if (isType(m, "item.proposed") || isType(m, "item.discovered")) {
       if (!itemOrigin.has(m.payload.item)) {
         itemOrigin.set(m.payload.item, m);
       }
@@ -583,7 +611,9 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
     const ownerText = item.owner !== undefined ? `, owner ${item.owner}` : "";
     const doneText =
       item.status === "done"
-        ? `, done at rev ${item.completed?.n ?? "?"}`
+        ? item.completed?.via === "tool"
+          ? `, done: its tool passed its own gate and was published (v${item.completed.version ?? "?"})`
+          : `, done at rev ${item.completed?.n ?? "?"}`
         : item.doneProposed
           ? ", done proposed (not yet on a passing revision)"
           : item.status === "proposed"
@@ -731,6 +761,9 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
   // Fix requests and reopenings: ladder control flow from a failing revision to an item.
   for (const m of messages) {
     if (isType(m, "fix.requested") || isType(m, "fix.exhausted") || isType(m, "item.reopened")) {
+      if (m.payload.n === undefined) {
+        continue; // a tool item reopened after its builds failed their own gate (no revision)
+      }
       const rev = boardRevNodeId(m.payload.n);
       const item = boardItemNodeId(m.payload.item);
       if (nodeIds.has(rev) && nodeIds.has(item)) {
@@ -753,18 +786,24 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
     }
   }
 
-  // Tools: one node per capability; consumed-tool edges aggregated per user.
+  // Tools: one node per capability (the registry), backed by its proposal and
+  // every gate and publication; consumed-tool edges aggregated per user,
+  // backed by the ENGINE's tool.used records only.
   const toolFirst = new Map<string, BoardMessage>();
   const toolUses = new Map<string, Map<string, number[]>>();
+  const toolGates = new Map<string, BoardMessageOf<"tool.gated">[]>();
   for (const m of messages) {
     if ((isType(m, "tool.proposed") || isType(m, "tool.published")) && !toolFirst.has(m.payload.capability)) {
       toolFirst.set(m.payload.capability, m);
     }
+    if (isType(m, "tool.gated")) {
+      toolGates.set(m.payload.capability, [...(toolGates.get(m.payload.capability) ?? []), m]);
+    }
     if (isType(m, "tool.used")) {
       const users = toolUses.get(m.payload.capability) ?? new Map<string, number[]>();
-      const list = users.get(m.from) ?? [];
+      const list = users.get(m.payload.by) ?? [];
       list.push(m.seq);
-      users.set(m.from, list);
+      users.set(m.payload.by, list);
       toolUses.set(m.payload.capability, users);
     }
   }
@@ -772,25 +811,62 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
     const versions = state.tools.published.filter((t) => t.capability === capability);
     const proposal = Object.values(state.tools.proposed).find((t) => t.capability === capability);
     const uses = versions.reduce((sum, v) => sum + v.uses, 0);
-    const seqs = [first.seq, ...versions.map((v) => v.seq)];
+    const gates = toolGates.get(capability) ?? [];
+    const lastGate = gates.at(-1);
+    const seqs = [first.seq, ...gates.map((g) => g.seq), ...versions.map((v) => v.seq)];
+    const item = proposal ? state.items[proposal.item] : undefined;
+    const status = versions.length > 0 ? "published" : lastGate && !lastGate.payload.passed ? "gate-failed" : item?.status === "claimed" ? "building" : item?.status === "rejected" ? "rejected" : "proposed";
     push({
       id: boardToolNodeId(capability),
       kind: "tool",
       label: capability,
-      status: versions.length > 0 ? "published" : "proposed",
+      status,
       seqs: [...new Set(seqs)].sort((a, b) => a - b),
       tooltip:
-        `tool ${capability}: ${versions.length > 0 ? `published v${versions[versions.length - 1]!.version}, used x${uses}` : "proposed, not published"} ` +
-        backingSuffix(first),
+        `tool ${capability}${proposal ? ` (${proposal.kind})` : ""}: ${
+          versions.length > 0
+            ? `published v${versions[versions.length - 1]!.version} by ${versions[versions.length - 1]!.publishedBy}, used x${uses}`
+            : lastGate && !lastGate.payload.passed
+              ? `its own gate failed (${lastGate.payload.checks.filter((c) => !c.passed).map((c) => c.check).join(", ")}): not published`
+              : "proposed, not published"
+        } ` + backingSuffix(first),
       detail: {
         kind: "tool",
         capability,
-        ...(proposal ? { proposedBy: proposal.proposedBy } : {}),
-        versions: versions.map((v) => ({ version: v.version, tool: v.tool, publishedBy: v.publishedBy, seq: v.seq, uses: v.uses })),
+        ...(proposal ? { proposedBy: proposal.proposedBy, toolKind: proposal.kind, inputs: proposal.inputs, item: proposal.item } : {}),
+        ...(item?.owner !== undefined ? { builder: item.owner } : {}),
+        versions: versions.map((v) => ({
+          version: v.version,
+          tool: v.tool,
+          publishedBy: v.publishedBy,
+          seq: v.seq,
+          uses: v.uses,
+          commit: v.commit,
+          repo: v.repo,
+          usage: v.usage,
+          gateSeq: v.gateSeq,
+          ...(v.joinsGate === false ? { joinsGate: false as const } : {}),
+        })),
+        gates: gates.map((g) => ({ seq: g.seq, commit: g.payload.commit, passed: g.payload.passed, checks: g.payload.checks })),
+        users: [...(toolUses.get(capability) ?? new Map<string, number[]>()).entries()].map(([agent, useSeqs]) => ({ agent, uses: useSeqs.length })),
         uses,
         published: versions.length > 0,
       },
     });
+    // The tool item's passing build published the tool (control flow: a trigger).
+    const publishedMessage = versions.length > 0 ? bySeq.get(versions[0]!.seq) : undefined;
+    if (proposal && publishedMessage && nodeIds.has(boardItemNodeId(proposal.item))) {
+      edges.push({
+        id: `trigger:item:${proposal.item}->tool:${capability}`,
+        kind: "trigger",
+        from: boardItemNodeId(proposal.item),
+        to: boardToolNodeId(capability),
+        seqs: [publishedMessage.seq],
+        type: publishedMessage.type,
+        count: 1,
+        tooltip: `${proposal.item}'s build passed the tool's own gate and was published ${backingSuffix(publishedMessage)}`,
+      });
+    }
     for (const [user, useSeqs] of toolUses.get(capability) ?? []) {
       const to = boardAgentNodeId(user);
       if (!nodeIds.has(to)) {
@@ -805,6 +881,26 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
         type: "tool.used",
         count: useSeqs.length,
         tooltip: `${user} used ${capability} x${useSeqs.length} ${backingSuffix(bySeq.get(useSeqs[useSeqs.length - 1]!)!)}`,
+      });
+    }
+  }
+  // Work a tool's findings generated: tool -> item (a trigger, backed by the proposal citing it).
+  for (const m of messages) {
+    if (!isType(m, "item.proposed") || m.payload.fromTool === undefined) {
+      continue;
+    }
+    const from = boardToolNodeId(m.payload.fromTool.capability);
+    const to = boardItemNodeId(m.payload.item);
+    if (nodeIds.has(from) && nodeIds.has(to)) {
+      edges.push({
+        id: `trigger:${from}->${to}`,
+        kind: "trigger",
+        from,
+        to,
+        seqs: [m.seq],
+        type: m.type,
+        count: 1,
+        tooltip: `${m.payload.fromTool.capability}@${m.payload.fromTool.version} findings became ${m.payload.item} ${backingSuffix(m)}`,
       });
     }
   }
@@ -1126,7 +1222,7 @@ const NODE_BACKING_TYPES: Record<BoardGraphNodeKind, readonly BoardMessageType[]
   goal: ["goal.posted"],
   lead: ["agent.joined"],
   agent: ["agent.joined"],
-  item: ["item.proposed", "item.discovered", "item.split"],
+  item: ["item.proposed", "item.discovered", "item.split", "tool.proposed"],
   rev: ["integrated.rev"],
   tool: ["tool.proposed", "tool.published"],
   jev: ["decision.recorded"],

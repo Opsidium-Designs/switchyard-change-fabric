@@ -101,11 +101,16 @@ export type {
 } from "./recruit.ts";
 export { DEFAULT_DIAL, normalizeDial, recruit } from "./recruit.ts";
 
-export type { EditKind, ToolNeedOptions, ToolRequirement } from "./toolneed.ts";
+export type { BoardToolNeed, BoardToolNeedItem, EditKind, ToolNeedOptions, ToolRequirement } from "./toolneed.ts";
 export {
   capabilityId,
   defaultEditKindOf,
+  detectBoardToolNeed,
+  objectiveChangeWords,
+  OBJECTIVE_OVERLAP,
+  OBJECTIVE_SIMILARITY,
   detectToolRequirement,
+  toolCapabilityFor,
   toolUnitId,
 } from "./toolneed.ts";
 
@@ -146,14 +151,19 @@ export type {
   BoardRules,
   BoardState,
   BoardSummary,
+  BoardToolFinding,
+  BoardToolGateCheck,
   BoardToolProposal,
   ContestResolution,
+  ToolKind,
   IntegratedRevInput,
 } from "./board.ts";
 export {
   appendBoardMessage,
   appendDecisionRecorded,
   appendIntegratedRev,
+  appendToolGated,
+  appendToolUsed,
   applyBoardEscalations,
   applyBoardMessage,
   arbitrate,
@@ -169,6 +179,7 @@ export {
   boardContractDecision,
   boardDigest,
   isAcceptedItem,
+  isChangeItem,
   boardErrorStatus,
   boardEscalationRequests,
   boardMessagesAfter,
@@ -185,6 +196,12 @@ export {
   reduceBoard,
   releasedTargets,
   summarizeBoard,
+  TOOL_CAPABILITY_PATTERN,
+  TOOL_KINDS,
+  TOOLS_DIR,
+  toolItemId,
+  toolScope,
+  toolUnavailableReason,
   verifyBoard,
   withContractTriage,
 } from "./board.ts";
@@ -231,6 +248,8 @@ export {
   BOARD_WORKSPACE_TTL_BOUNDS,
   boardAgentWorkspaceName,
   parseBoardJoinWorkspace,
+  toolBranch,
+  toolsWorkspaceName,
 } from "./board-join.ts";
 
 export type { BoardIntegrationPlan, BoardIntegrationUnitPlan } from "./board-integration-plan.ts";

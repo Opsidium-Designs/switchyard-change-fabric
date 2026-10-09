@@ -83,6 +83,10 @@ Who sent a message is established by the route, never by the message body.
 | `POST /changes/:id/board/human` | bearer | A human message. |
 | `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected `contract`. It changes only the decision counts, never arbitration or the verdict. |
 | `POST /changes/:id/integration/revision` | bearer | An integration result `{commit, gate, merged, failing?}`; appends `integrated.rev` and what it triggers (completions and `rebase.needed` on a pass, `fix.requested` / `fix.exhausted` on a fail). |
+| `POST /changes/:id/tools/gate` | bearer | A tool's own gate result on the latest build of its item, `{capability, commit, passed, checks: [{check, passed, detail}], repo, usage, output?}`; the engine appends `tool.gated` (addressed to the builder) and, on a pass, `tool.published` (the next version) and the tool item's `item.completed {via: tool}`. See "Agent-built tools". |
+| `POST /changes/:id/tools/used` | bearer | A run of a pinned, published tool version the operator's runtime executed in a consumer's repo, `{capability, version, by, item?, commit?, changedFiles, findings?, exit?}`; the engine appends `tool.used` (addressed to the tool's builder). |
+| `POST /changes/:id/tools/workspace` | bearer | `{ttlSeconds}`: provision the Change's tools repo (`<change>--tools`) once, with a write token returned once; a repeat returns the same repo with a fresh token. |
+| `POST /changes/:id/tools/token` | bearer | `{scope: "read" or "write", ttlSeconds}`: a short-lived token for the tools repo; `.../token/revoke {tokenId}` revokes one. |
 | `POST /changes/:id/integration/cloud` | bearer | Configure integration on Cloudflare for the Change: `{integration: {workspaceName, gitUrl, defaultBranch}, gateCommand?, requireGate, protectedPaths, protectedJsonKeys, testInventory?, gateSupportFiles?, timeouts: {installMs, gateMs}, identity?, registryHost?, attribution?: "engine"|"driver"}`, validated with the job schema (tokenless `https` URLs only). It is part of the goal-time record: accepted ONCE and only BEFORE `goal.posted`; any later change (for example a gate command of `true`) is refused with `409`. From then on every `push.announced` starts or coalesces the integration Workflow. See "Integration on Cloudflare" below. |
 | `POST /changes/:id/integration/cloud/attribution` | bearer | `{key, items}`: the run's ADVISORY attribution of a failing revision the Workflow holds (`attribution: "driver"`): items it merged only (`[]` = no confident choice). `409` for an unknown key or a second answer. |
 | `GET /changes/:id/integration/cloud` | open | The configuration (the test inventory as count and format only, never its names), the active Workflow, and every revision attempt: recorded or not and why, the egress phases the job ran under, the install outcome, the evidence, and whether the integration branch was advanced. |
@@ -125,10 +129,14 @@ target, kind}` (engine: a protected contract waits for a human), `contract.accep
 `contract.rejected`, `push.announced
 {item, commit, paths}`, `integrated.rev {n, commit, gate, merged, paths,
 contributors, failing?: {output, items}, gated?: false}` (`gated: false`: no gate ran, so its pass checked nothing), `rebase.needed`, `review.requested`,
-`review.result`, `handoff`, `done.proposed`, `item.completed`, `item.reopened {item, previousOwner, commit?, n}`
+`review.result`, `handoff`, `done.proposed`, `item.completed`, `item.reopened {item, previousOwner, commit?, n?}` (n absent for a tool item)
 (engine: a spent fix budget reopens the item for another agent), `fix.requested
 {item, n, attempt}` (engine, addressed to the item's owner), `fix.exhausted
-{item, n, attempts}` (engine), `tool.proposed`, `tool.published`, `tool.used`, `decision.recorded {juncture:
+{item, n, attempts}` (engine), `tool.proposed {tool, capability, kind, inputs, outputs}` (a rationale is required),
+`tool.built {capability, commit, paths}` (the tool item's owner), `tool.gated {capability, commit, passed, checks, repo, usage,
+output?}` (engine, recorded), `tool.published {tool, capability, version, repo, commit, verified: true, kind, usage,
+joinsGate?: false}` (engine, derived), `tool.used {capability, version, by, item?, commit?, changedFiles, findings?, exit?}`
+(engine, recorded), `decision.recorded {juncture:
 plan-review | attribution | fix-confidence | contract-triage, question, answer?, confidence?, accepted, error?, rev?,
 parsed?, contract?}` (engine, advisory), `decision.resolved {decisionSeq, rev, passed, answer, outcome:
 in-fixed-set | not-in-fixed-set, fixed, parsed, parseOutcome: in-fixed-set | not-in-fixed-set | none}` (engine, derived, advisory),
@@ -214,15 +222,22 @@ item the agent already holds, inside its scope).
    whose owner is active, the engine appends `fix.requested` addressed (`to`) to
    that owner while the item's attempts are within `maxFixAttempts`, else
    `fix.exhausted`. The owner's next push answers the request.
-10. Tools: `tool.published` requires the publisher's prior `tool.proposed` for
-    that tool and capability, `verified: true` (the tool passed its own gate),
-    and a new capability version. `tool.used` must name a published capability
-    and version.
+10. Tools (see "Agent-built tools"): a `tool.proposed` creates the tool item
+    `tool-<capability>` (scope `tools/<capability>/**`), decided by the lead
+    like any worker proposal. Only its owner posts `tool.built`, with paths
+    inside its write intent. `tool.gated`, `tool.published`, and `tool.used`
+    are the ENGINE's only: an agent can neither claim its tool passed nor fake
+    a use. `tool.published` follows only a passing `tool.gated` for the latest
+    build, as the capability's next version, and completes the tool item. A
+    `tool.used` pins a published version, names a joined agent, and, when it
+    changed files, names the item that agent holds and the push that carried
+    them (inside that item's write intent). An `item.proposed` citing
+    `fromTool` comes only from that tool's builder and still needs the lead.
 
 ## Limits
 
 Per board: 20000 messages, 1000 items, 100 agents, 200 published tool
-versions, 512 protected paths (more existing tests than that are collapsed into
+versions (64 findings per use, 16 checks per tool gate), 512 protected paths (more existing tests than that are collapsed into
 their dedicated test directories). Per message: 32 children per split, 64 entries
 per intent (each at most 512 characters), 256 paths per push, 8192 characters
 of failing output per failing revision, bounded objective, acceptance, and
@@ -254,8 +269,8 @@ is distributed changes: items are proposed and claimed, never assigned.
   json_schema call through the AI Gateway (the planner's path) returning exactly
   one typed action: `claim`, `propose_item`, `split`, `message` (help,
   question, reply, contract, review; `to` addresses agents), `contest_reply`
-  (cede, keep, narrow), `edit`, `propose_done`, `propose_tool`,
-  `decide_contract` and `decide_item` (the lead only), or `wait`. A lead turn
+  (cede, keep, narrow), `edit`, `propose_done`, `propose_tool`, `build_tool`,
+  `use_tool`, `decide_contract` and `decide_item` (the lead only), or `wait`. A lead turn
   sees the pending proposals (`board.pendingItems`) and the accepted items
   (`board.items`) to compare them against; a new undecided proposal wakes it. The reply is validated strictly;
   an invalid reply or a failed call becomes a recorded `wait` with the reason.
@@ -371,6 +386,25 @@ is distributed changes: items are proposed and claimed, never assigned.
   process can read a running git's environment (where the header is). The
   real fix is a sandbox (a separate user or container gate), out of scope for
   this spike.
+- Credentials never travel through the CLI's process environment. A process's
+  INITIAL environment is readable by any same-user process
+  (`/proc/<pid>/environ`), so a gate or tool child could read its parent's. No
+  Makefile target exports `.env` into the CLI any more: the live commands
+  (`run-live`, `run-board` without `--offline`, `recruit-live`, `doctor`,
+  `jev-smoke`, `deploy-app`, `cleanup-live`, `env-check`) read `.env` (or
+  `SCF_ENV_FILE`) themselves into memory, and the offline commands never read
+  it (`packages/orchestration/src/credentials.ts`,
+  a small parser, no dependency), and the code that needs a credential reads it
+  from there (`runtimeEnv()`); wrangler, a trusted tool, gets exactly the
+  Cloudflare credentials it needs passed to its own process. `make dev-all`
+  gives `.env` to the Worker's subshell only, and the console launcher strips
+  credentials from every run it spawns. `make cli ARGS=env-check` prints the
+  credential NAMES in the CLI's environment (none expected) and the names it
+  loaded from `.env`; the CLI warns when it finds a credential in its own
+  environment. Residual risk: `.env` is still a file the same OS user can read
+  by absolute path, and a process with ptrace rights over the CLI (Yama
+  `ptrace_scope` 0) could read its memory; the cloud gate container (a separate
+  user with no such file) avoids both for the app gate.
 - `packages/orchestration/src/protected-paths.ts`: the gate's CONTRACT,
   derived from the project, never named by the engine. The rule: the original
   code's existing tests are the contract, whatever the gate's shape (an npm
@@ -580,13 +614,21 @@ is distributed changes: items are proposed and claimed, never assigned.
 - Handoffs go only to agents still running, and the new owner's first edit of a
   handed-off item starts from the previous owner's latest pushed version of the
   item's files (read with an operator read token).
-- Concurrent quiescence: when every agent is idle, nothing is integrating or
-  pending, and no board message arrived for `--quiet-ms` (default 2 minutes),
-  the agent phase ends as `quiescent` with that reason recorded.
+- Concurrent quiescence: when no agent is taking a turn, nothing is integrating
+  or pending, and no board message arrived for `--quiet-ms` (default 2
+  minutes), the agent phase ends as `quiescent` with that reason recorded (in
+  the result and the summary). An idle agent that is only polling its digest
+  does not count as active: counting it kept a live board where every agent
+  waited from ever looking quiet, since some agent was almost always mid-poll.
 - Tokens: agents push with their own short write tokens, which are not
   refreshed, so the run refuses an agent-phase timeout longer than their
   lifetime (`--token-ttl`); the integrator reads with fresh read tokens per
   revision. Every reason, error, and printed transcript is credential-scrubbed.
+- Turn output that is almost right is repaired, not discarded: a `message`
+  whose `payload.need` is free text (it must be a short id such as
+  `auth-contract`) is normalized to a slug of at most 64 characters, and the
+  original words are appended to the rationale; the schema and the prompt say
+  so too.
 - Prompt framing: the turn prompt wraps other agents' rationales and messages,
   the board digest, and repo files as delimited UNTRUSTED DATA blocks; when the
   context is too long it drops whole low-priority entries (excerpts, then the
@@ -609,7 +651,15 @@ is distributed changes: items are proposed and claimed, never assigned.
   human's decision, and claims once more; when a path stays protected it adds
   a NEW test file beside the existing ones instead. The lead never decides a
   protected contract; it accepts others unless the target is held by another
-  agent (a live lead decides on the goal). No rule names a file, an app, or a goal.
+  agent (a live lead decides on the goal). Tools (see "Agent-built tools"): the lead
+  seeds a scanner and a codemod when the planned items repeat one mechanical
+  change (a free worker proposes them if the lead did not); workers claim
+  seeded tool items first and the builder builds it; owners run a published scanner, then the codemod, before editing
+  by hand; a scanner's builder turns findings no outstanding item covers into
+  one proposal, and runs its scanner over the whole repository once right after publishing
+  and again (bounded) after new passing code; the
+  lead accepts tool proposals, and tool-found work unless an outstanding item
+  already covers its files. No rule names a file, an app, or a goal.
 - `FirstAttemptFailingGate` (`run-board-offline.ts`): the generic offline gate
   FIXTURE (`--offline --fixture-gate`, used by `make demo-board`). It fails the
   first integrated revision, naming the first file that revision changed, and
@@ -661,6 +711,188 @@ INTEGRATOR=cloud` passes it through.
 A live board run needs `EXECUTOR=ai-gateway` with the gateway URL and token
 (the turn model is `AI_GATEWAY_AGENT_MODEL`, else `AI_GATEWAY_MODEL`); without a
 live turn model it refuses rather than substituting the offline policy.
+
+## Agent-built tools
+
+Agents decide which tools to build, build them, and run them for each other;
+the engine and the operator's runtime keep it honest. Nothing here is goal- or
+app-specific.
+
+- **The lead seeds tools.** When the lead seeds the planner's items and the
+  structural rule fires (`detectBoardToolNeed`, the board form of
+  `toolneed.ts`: two or more planned items making one change over at least
+  three unprotected files, where "one change" is either a shared id prefix,
+  or near-identical objectives over sibling files: after removing each item's
+  own words (its scope's path tokens, its id's tokens, numbers), either the
+  objectives' first sentences or clauses have token Jaccard of at least 0.7,
+  or the full objectives an overlap coefficient (shared words over the
+  smaller set) of at least 0.6, so an identical lead with item-specific
+  detail after it still groups; and the scopes share a parent
+  directory or a file name in sibling directories; so a planner that names
+  items freely, such as `u1-auth-resource` ... `u6-users-resource`, still
+  groups, while unrelated objectives in sibling files, or one objective spread
+  over unrelated directories, do not), the lead itself posts a scanner and a codemod for it
+  (`tool.proposed`, open at once like every lead item), and each item the
+  codemod covers says in its objective: claim this item now; if the codemod
+  is published run it with `use_tool` after the scanner, otherwise edit by
+  hand; never wait for a tool. Tools are accelerators, never prerequisites:
+  workers claim open items right away (the seeded tool items too), nobody
+  waits for a tool while it is being built, and a free agent whose last turn
+  was a wait while open items exist is told (at most 3 times per set of open
+  items) to claim one. The turn prompt says the same.
+  This is the trigger that makes tools happen on a live run without relying on
+  the turn model to think of them.
+- **Propose.** `propose_tool {capability, kind, why, inputs, outputs}` posts
+  `tool.proposed` (kinds: `scanner` finds every place that needs a change,
+  `codemod` applies one transform across many files, `check` fails while a
+  violation remains, `harness`, `repro`, `index`). It becomes the board item
+  `tool-<capability>`, scoped to `tools/<capability>/**`; a worker's proposal
+  waits for the lead's `item.accepted` like any other. A codemod must declare
+  its `inputs` (its intended scope); a scanner with no inputs looks at the
+  whole repository. Tool items are internal: they never count toward (or
+  against) the Change's completion; the summary reports them in a tools
+  section.
+- **Build.** Whoever claims the tool item builds it with `build_tool`. The
+  Change's TOOLS repo (`<change>--tools`) is provisioned once, on the first
+  build, through the existing provisioner (`POST /changes/:id/tools/workspace`);
+  each tool lives in `tools/<capability>/` on its own branch
+  (`tools/<capability>`), and the builder gets a short-lived, repo-scoped token
+  for the build. One writer per tool path comes from the normal claim rules:
+  the runtime refuses changed paths outside the claim's write intent, and the
+  board refuses a `tool.built` whose paths are. Live, the agent's executor
+  writes the tool (`executorToolAuthor`, told the contract below and, on a
+  rebuild, the failing gate output); offline, a deterministic template author
+  does (labelled in the run; the noop executor cannot write a tool). The live
+  executor only makes anchored search/replace edits and cannot create a file,
+  so on a tool's first build the RUNTIME writes a skeleton as the first commit
+  of its branch (`toolSkeleton`: run.mjs and test.mjs with the CLI, the scope
+  handling, the output format, and the test harness in place, and
+  `// FILL-BEGIN <name>` / `// FILL-END <name>` regions whose unfilled code
+  throws); the executor completes the regions with anchored edits and deletes
+  the markers. The gate's `filled` check refuses any tool that still carries
+  the `SWITCHYARD-TOOL-SKELETON` line or a FILL marker, so an unfilled or
+  half-filled skeleton can never be published. On a live run the skeleton is
+  filled region by region (`regionToolAuthor`): the runtime writes the
+  skeleton afresh for every build, one schema-constrained call returns the
+  code for each named region (the prompt lists every region with the exact
+  function signature it must keep and a short example of a correct fill for
+  that kind of tool), and the runtime splices each fill between its own
+  markers, refusing an unknown region, a region filled twice, missing,
+  duplicated, or out-of-order markers, or code that carries a marker. That
+  call runs on the strongest configured model first (the last entry of
+  `AI_GATEWAY_ESCALATION_MODELS`, down to `AI_GATEWAY_MODEL`), falling back
+  down the ladder only on a transport error, never because the reply was
+  wrong; a rebuild shows it its previous files and the failing checks. The
+  executor-backed author (anchored search/replace against the skeleton) stays
+  the fallback when no gateway is configured. An `edit` on a tool item goes to
+  the build flow, never to the agent's own repo, and `use_tool` or
+  `propose_done` on a tool item is refused (`TOOL_ITEM`). App code edits keep
+  the anchored search/replace path unchanged. The live author is also given
+  the exact contract below, a WORKING skeleton of the same
+  kind (the template's run.mjs and test.mjs) to adapt, the goal, up to three
+  bounded project files the tool acts on (framed as untrusted data), and, on a
+  rebuild, the failing checks of the previous build: a failed `tool.gated` is
+  addressed to the builder and broadcast, its evidence is fed to the next
+  `build_tool`, and agents waiting for that tool stop waiting and edit by hand.
+  A builder whose builds fail the tool's own gate `maxFixAttempts` times loses
+  the tool item: the engine reopens it (`item.reopened` without a revision
+  number) for another agent, who builds from the tool's branch with the
+  failing checks; the builder who spent it may not claim it again, and after
+  two reopenings the item stays with its last builder.
+- **Never wait forever for a tool.** Each claim in an agent's digest carries
+  `toolUnavailable`: the scanners and codemods covering its write intent that
+  it must not wait for, because the lead rejected them, a build failed its own
+  gate, or they were not published within 60 board messages of their proposal
+  (`toolUnavailableReason`, a pure function of the board). Agents never wait
+  for a tool in any case; this flag tells a claim which tools not to count
+  on, and a change in that set wakes the agent for a turn.
+- **The tool contract.** Entry point `tools/<capability>/run.mjs` (a Node ES
+  module), run as `node tools/<capability>/run.mjs [paths...]` with the target
+  tree as its working directory (no paths: the whole tree); its own tests are
+  `tools/<capability>/test*.mjs`, run with `node --test`. Scanners and checks
+  print findings as JSON lines `{"path", "line"?, "message"}`.
+- **The tool's own gate (before `tool.published`).** After `tool.built`, the
+  operator's bench fetches exactly the built commit, removes `.git` before any
+  tool code runs there, and checks, on a copy of the ORIGINAL code
+  (`packages/verification/src/tool-gate.ts`):
+  - every kind: only its own directory, an entry point, at least one test
+    file, and its tests pass;
+  - scanner: exit 0 with bounded output, every stdout line a well-formed
+    finding naming an existing file, at least ONE finding (a scanner that
+    finds nothing proves nothing), and no file changed;
+  - codemod: exit 0, a non-empty change to at least one existing baseline file,
+    every change inside its declared inputs, nothing deleted, and every changed
+    JavaScript/TypeScript file still parses (Node's own TypeScript parser,
+    which executes nothing; JSON with JSON.parse; other file types are reported
+    as not checked); when the run declares the project's own check command
+    (`toolSyntaxCommand`) it runs on the changed tree too;
+  - check: it must FAIL on the original code with at least one finding (a
+    crash names no violation and does not count), and change nothing; it is
+    published with `joinsGate: false`: joining the Change's gate (the check
+    rule: fails on the original code, then runs on every revision) is not
+    implemented in this slice;
+  - harness, repro, index: exit 0 without changing any existing baseline file.
+  The result is recorded through `POST /changes/:id/tools/gate`
+  (`tool.gated`, with each check and a bounded, credential-scrubbed failing
+  output). A pass derives `tool.published` (the capability's next version, the
+  commit, the repo, the usage, `verified: true`) and completes the tool item;
+  a fail publishes nothing and is addressed to the builder, who may rebuild
+  (bounded). Wall-clock times are never recorded, so offline logs repeat.
+- **Use.** `use_tool {capability, version, args, itemId?}` pins a published
+  version. The runtime (the operator side, like the integrator) checks the
+  version is in the registry, fetches exactly its commit, and runs it over a
+  COPY of the consumer's own view (the shared baseline or the revision it
+  rebased onto, with its own pushed files on top). A codemod needs an item the
+  consumer holds: its changes are kept only when every one lies inside that
+  item's write intent (otherwise the whole run is discarded, refused as
+  `OUTSIDE_INTENT`), it may not delete files, and the kept changes are
+  committed in the consumer's own repo and announced as a normal push, so they
+  flow through integration and the gate like any edit. Any other tool changes
+  nothing (whatever it wrote in its copy is discarded). Only then does the
+  engine record the use through `POST /changes/:id/tools/used`: `tool.used
+  {capability, version, by, item?, commit?, changedFiles, findings?, exit?}`.
+  Agents cannot post `tool.used`. Each use is drawn as a `consumed-tool` edge
+  from the tool to the agent, backed by those `tool.used` seqs.
+- **Tools generate work.** A `tool.used` with findings is addressed to the
+  tool's builder. Findings in files no outstanding item covers (an open item's
+  scope, a claimed item's write intent, an undecided proposal's scope) become
+  an `item.proposed` from the builder citing `fromTool {capability, version}`
+  (only the builder may cite it), drawn as a `trigger` edge from the tool to
+  the item. It still needs the lead's acceptance, and completes like any item.
+- **Where tools run.** The bench keeps everything it runs tools in (tool
+  checkouts, the baseline copy, each run's scratch) in its own fresh private
+  temp root (0700), outside the run's work root, never beside the agents'
+  worktrees, and removes it at the end of the run. This raises the bar but is
+  not a boundary (same user, same filesystem), so two more rules hold:
+  every gate runs on a baseline COPY whose content manifest is checked first
+  (a tool that wrote into it makes the next gate fail with `baseline-integrity`,
+  never trusted), and an agent never pushes what it did not write: before each
+  edit or tool use it resets and cleans anything uncommitted in its worktree
+  (logged in its evidence: "discarded N uncommitted change(s) ... never
+  pushed"), and it stages only the paths Git's status lists, all inside its
+  write intent (never `git add -A`; anything outside refuses the whole edit).
+- **Isolation.** Tool tests and runs get the gate's isolation: the allowlisted
+  environment (never a credential), a private HOME and temp dir, a timeout
+  (default 60 s per run, 120 s for its tests; `toolTimeoutMs`) and bounded
+  output, after which the whole process group is killed, and a private scratch
+  root (a write to `../x` lands there and is removed). The same-user residual
+  risk applies: a tool can read files the OS user can read by absolute path,
+  and a child that leaves its process group with `setsid` survives the kill.
+  With `--integrator cloud`, tool gates and tool runs still run in the driver
+  process in this slice (not in the gate container): the container job is the
+  integration job only, and running tool jobs there needs a tool-job shape, its
+  own Workflow step, and egress phases, a later slice.
+- **The console.** The TOOLS tab lists the registry from the board: capability,
+  version (and commit), kind, builder, the tool gate's evidence (each check,
+  with its `tool.gated` seq), and who used it how often. A tool node is backed
+  by its `tool.proposed`, `tool.gated`, and `tool.published` seqs; the tool
+  item is an ordinary item hull backed by `tool.proposed`.
+- **Offline demo.** `make demo-board` shows it twice: on the demo project, a
+  scanner and a codemod are proposed, accepted, built, gated, published, and
+  used by two agents each; on the multi-resource example app, the scanner also
+  finds places the plan did not itemize (the shared modules) on its first sweep
+  over the whole repository right after it is published, its builder
+  proposes that work, the lead accepts it, and it completes.
 
 ## Integration on Cloudflare (`--integrator cloud`)
 

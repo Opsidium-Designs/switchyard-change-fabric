@@ -20,7 +20,7 @@ Requires Node.js 20+ and Git.
 make install
 make check   # typecheck + build + test, offline and deterministic
 make demo    # the whole flow end to end with the noop executor, no Cloudflare
-make demo-board  # agents form around a goal on the Change board (offline, deterministic)
+make demo-board  # agents form around a goal on the Change board and build tools for each other (offline, deterministic)
 ```
 
 ## Live run
@@ -106,7 +106,11 @@ edit, and push; every push is integrated continuously into the next gated
 revision (the original code's tests and the gate's configuration are a
 contract no agent changes alone), a failing revision asks the
 implicated owners for a fix, and only the last revision, when it passed, is
-promoted (`make demo-board` offline, `make run-board` live). With
+promoted (`make demo-board` offline, `make run-board` live). Agents also build
+tools for each other on the board (scanners, codemods, checks): a proposed tool
+is an item the lead accepts, it is built in the Change's tools repo, published
+only after it passes its own gate on the original code, and every use is
+recorded by the engine (see "Agent-built tools" in docs/BOARD.md). With
 `--integrator cloud` the integration runs on Cloudflare instead of in the
 driver: a Workflow gates each revision in a Cloudflare Container with phased
 egress (`make dev-containers` locally, Docker required). See
