@@ -514,6 +514,78 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     expect(result.incompleteItems).toEqual([]);
   });
 
+  it("an owner that never proposes done is cued at most MAX_DONE_CUES times (the last explicitly); the summary says why the item is partial, and nothing completes it on its behalf", async () => {
+    const projectDir = await project();
+    const policy = createGenericBoardPolicy();
+    const cuesSeen: string[] = [];
+    // The api owner never proposes done; everyone else follows the policy.
+    const silent: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      const action = (await policy(input)).action;
+      if (input.role === "worker" && action.type === "propose_done" && action.itemId === "api") {
+        cuesSeen.push(...input.capsule.evidence.filter((e) => /propose.?done/i.test(e) && !cuesSeen.includes(e)));
+        return { action: { type: "wait", reason: "not proposing" } };
+      }
+      return { action };
+    };
+    const result = await offline({ goal: GOAL, projectDir, seed, transport: silent });
+    expect(result.incompleteItems).toEqual(["api"]);
+    // Never auto-completed: no done.proposed for api exists, and it is not completed.
+    expect(of(result.log, "done.proposed").some((m) => m.payload.item === "api")).toBe(false);
+    expect(result.state.items.api?.status).toBe("claimed");
+    const n = result.state.items.api!.lastPush!.integratedIn!;
+    expect(result.incompleteReasons).toEqual([`item api: its push passed in rev ${n} but its owner did not propose done (owner ${result.state.items.api!.owner})`]);
+    const summary = formatBoardRunSummary(result);
+    expect(summary).toContain(`not completed: item api: its push passed in rev ${n} but its owner did not propose done`);
+    expect(summary).toMatch(/partial: 1 item\(s\) not completed: api/);
+    expect(cuesSeen.some((e) => e.startsWith("FINAL CUE:"))).toBe(true);
+    expect(boardRunExitCode(result)).toBe(1);
+  });
+
+  it("a worker's late proposal waits for the lead: a duplicate is rejected (not counted), new work is accepted and completed", async () => {
+    const projectDir = await project();
+    const policy = createGenericBoardPolicy();
+    const proposals = [
+      // Duplicates the planner's api item (same scope): finished work.
+      { objective: "Add input validation for the api resource", acceptance: ["gate passes"], scopeHint: ["src/api/**"] },
+      // New work no item covers.
+      { objective: "Write the status report notes", acceptance: ["notes exist"], scopeHint: ["docs/status.md"] },
+    ];
+    let next = 0;
+    const proposer: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      const action = (await policy(input)).action;
+      // Late: once its own push passed, before proposing its item done.
+      if (input.role === "worker" && input.agent === "agent-2" && action.type === "propose_done" && next < proposals.length) {
+        const p = proposals[next++]!;
+        return { action: { type: "propose_item", ...p, rationale: "found more work" } };
+      }
+      return { action };
+    };
+    const result = await offline({ goal: GOAL, projectDir, seed, transport: proposer });
+    const proposed = of(result.log, "item.proposed").filter((m) => m.from === "agent-2");
+    expect(proposed).toHaveLength(2);
+    const [dup, fresh] = proposed.map((m) => m.payload.item);
+    const rejected = of(result.log, "item.rejected");
+    expect(rejected).toHaveLength(1);
+    expect(rejected[0]).toMatchObject({ from: "lead", payload: { item: dup } });
+    expect(rejected[0]!.rationale).toMatch(/duplicates item api/);
+    expect(of(result.log, "item.accepted")).toEqual([expect.objectContaining({ from: "lead", payload: { item: fresh } })]);
+    // No claim on the proposal before the lead accepted it.
+    const accepted = of(result.log, "item.accepted")[0]!.seq;
+    expect(of(result.log, "claim.granted").filter((m) => m.payload.item === fresh).every((m) => m.seq > accepted)).toBe(true);
+    expect(of(result.log, "claim.granted").some((m) => m.payload.item === dup)).toBe(false);
+    // The accepted proposal is completed; the rejected one does not make the run partial.
+    expect(result.state.items[fresh!]?.status).toBe("done");
+    expect(result.state.items[dup!]?.status).toBe("rejected");
+    expect(result.stopReason).toBe("all-items-done");
+    expect(result.incompleteItems).toEqual([]);
+    expect(result.proposals).toMatchObject({ undecided: [], rejected: [{ item: dup, by: "lead" }] });
+    const summary = formatBoardRunSummary(result);
+    expect(summary).toContain("items completed: 5 of 5 (1 worker proposal(s) rejected: not counted)");
+    expect(summary).toContain(`proposal rejected: ${dup} by lead: ${dup} duplicates item api`);
+    expect(summary).not.toMatch(/partial/);
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  });
+
   it("wakes an owner whose push passed so it proposes done", async () => {
     const projectDir = await project();
     const policy = createGenericBoardPolicy();

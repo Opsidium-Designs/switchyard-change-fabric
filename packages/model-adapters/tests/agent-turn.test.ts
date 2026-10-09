@@ -97,6 +97,12 @@ describe("parseAgentAction", () => {
     expect(parseAgentAction({ type: "decide_contract", contractId: "k1", decision: "accept" })).toMatchObject({
       decision: "accept",
     });
+    expect(parseAgentAction({ type: "decide_item", itemId: "agent-2-item-1", decision: "reject", rationale: "duplicates api" })).toEqual({
+      type: "decide_item",
+      itemId: "agent-2-item-1",
+      decision: "reject",
+      rationale: "duplicates api",
+    });
     expect(parseAgentAction(JSON.stringify({ action: { type: "wait", reason: "nothing to do" } }))).toEqual({
       type: "wait",
       reason: "nothing to do",
@@ -115,6 +121,8 @@ describe("parseAgentAction", () => {
     [{ type: "message", kind: "shout", payload: {}, rationale: "r" }, /kind must be one of/],
     [{ type: "edit", itemId: "i1", instruction: "x".repeat(3000) }, /at most/],
     [{ type: "wait" }, /reason/],
+    [{ type: "decide_item", itemId: "i1", decision: "accept" }, /rationale/],
+    [{ type: "decide_item", itemId: "i1", decision: "maybe", rationale: "r" }, /decision must be one of/],
   ])("rejects %j", (raw, pattern) => {
     expect(() => parseAgentAction(raw)).toThrow(pattern);
   });

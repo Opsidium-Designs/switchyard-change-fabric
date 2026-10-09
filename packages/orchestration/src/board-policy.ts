@@ -7,7 +7,9 @@
  * past decisions, the public board facts, and the repo listing) and applies
  * generic rules, in priority order:
  *   1. the lead decides pending contracts (accept unless the target overlaps a
- *      write intent held by someone other than the proposer), else waits;
+ *      write intent held by someone other than the proposer), then workers'
+ *      proposed items (accept unless the proposal duplicates an existing
+ *      item's scope or objective, see `duplicateOf`), else waits;
  *   2. answer an open contest: as the claimant, narrow the overlapping part of
  *      the write intent to the concrete files nobody else holds (cede when
  *      nothing is left); as the owner, keep once;
@@ -80,6 +82,54 @@ function narrowed(input: Input, write: readonly string[], overlap: readonly stri
   return out;
 }
 
+/** Lower-case word tokens of at least 3 characters (a goal-agnostic bag of words). */
+function words(text: string): Set<string> {
+  return new Set(text.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w.length >= 3));
+}
+
+/** Jaccard similarity of two word sets. */
+function similarity(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) {
+    return 0;
+  }
+  let shared = 0;
+  for (const w of a) {
+    if (b.has(w)) shared += 1;
+  }
+  return shared / (a.size + b.size - shared);
+}
+
+/** Objectives at least this similar (word Jaccard) duplicate each other. */
+export const DUPLICATE_OBJECTIVE_SIMILARITY = 0.6;
+
+/**
+ * Why a proposal should be rejected, if it should. Generic rules: a proposal
+ * with no scope can never be claimed; one whose every scope entry overlaps a
+ * single existing item's scope duplicates that item's scope; one whose
+ * objective is nearly the same words as an existing item's duplicates its
+ * objective. `item` names the duplicated item (absent for the no-scope case).
+ */
+export function duplicateOf(
+  proposal: { readonly objective: string; readonly scopeHint: readonly string[] },
+  items: readonly { readonly item: string; readonly objective: string; readonly scopeHint: readonly string[] }[],
+): { readonly item?: string; readonly why: string } | undefined {
+  if (proposal.scopeHint.length === 0) {
+    return { why: "it declares no scope, so it could never be claimed" };
+  }
+  for (const existing of items) {
+    if (existing.scopeHint.length > 0 && proposal.scopeHint.every((p) => existing.scopeHint.some((e) => entriesOverlap(p, e)))) {
+      return { item: existing.item, why: `its scope (${proposal.scopeHint.join(", ")}) is already inside that item's scope` };
+    }
+  }
+  const mine = words(proposal.objective);
+  for (const existing of items) {
+    if (similarity(mine, words(existing.objective)) >= DUPLICATE_OBJECTIVE_SIMILARITY) {
+      return { item: existing.item, why: "its objective restates that item's objective" };
+    }
+  }
+  return undefined;
+}
+
 function decide(input: Input): AgentAction {
   const d = input.digest;
   const me = input.agent;
@@ -102,7 +152,22 @@ function decide(input: Input): AgentAction {
           : `${contract.target} is not held by anyone but the proposer`,
       };
     }
-    return { type: "wait", reason: "no contract awaits a decision" };
+    const proposal = input.board.pendingItems?.[0];
+    if (proposal) {
+      const dup = duplicateOf(proposal, input.board.items ?? []);
+      return {
+        type: "decide_item",
+        itemId: proposal.item,
+        decision: dup === undefined ? "accept" : "reject",
+        rationale:
+          dup === undefined
+            ? `${proposal.item} adds work no existing item covers`
+            : dup.item !== undefined
+              ? `${proposal.item} duplicates item ${dup.item}: ${dup.why}`
+              : `${proposal.item} is not taken: ${dup.why}`,
+      };
+    }
+    return { type: "wait", reason: "no contract or proposed item awaits a decision" };
   }
 
   // 2. Contests the agent is party to.

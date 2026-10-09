@@ -1354,7 +1354,10 @@ body {
 
 .mc-hull-bar { fill: rgba(139, 148, 158, 0.08); stroke: none; pointer-events: none; }
 .mc-hull-title { fill: var(--text); font-size: calc(15px * var(--mc-t, 1)); font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.mc-hull-status { fill: var(--muted); font-size: calc(12px * var(--mc-t, 1)); }
+.mc-hull-status { fill: var(--muted); font-size: calc(12px * var(--mc-t, 1)); pointer-events: none; }
+.mc-hull rect.mc-hull-badge { fill: rgba(139, 148, 158, 0.16); stroke: none; pointer-events: none; }
+.mc-hull.status-proposed rect { stroke-dasharray: 6 4; }
+.mc-hull.status-rejected rect { stroke-dasharray: 2 4; opacity: 0.55; }
 .mc-hull-count { fill: var(--muted); font-size: calc(15px * var(--mc-t, 1)); }
 .mc-check.is-filled { fill: #238636; }
 .mc-check.is-hollow { fill: none; stroke: #3fb950; stroke-dasharray: 3 2; stroke-width: 1.5; }

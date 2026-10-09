@@ -22,6 +22,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   boardRunExitCode,
+  finishWorkRoot,
+  KEEP_WORK_ROOT_FLAG,
   formatDependencyInstall,
   offlineFixtureGateLabel,
   changeToSpecYaml,
@@ -152,7 +154,7 @@ const commands: Command[] = [
   {
     name: "run",
     summary: "Run a Change end to end and print a readable summary.",
-    usage: `${CLI_NAME} run <change.yaml> [--project <dir>]`,
+    usage: `${CLI_NAME} run <change.yaml> [--project <dir>] [--keep-work-root]`,
     async run(args) {
       const specPath = args[0];
       if (!specPath) {
@@ -200,6 +202,8 @@ const commands: Command[] = [
 
       console.log("");
       console.log(formatRunSummary(result));
+      // An offline run's scratch work root is removed unless asked to keep it.
+      console.log(await finishWorkRoot({ workRoot: result.workRoot, keepAll: hasFlag(args, KEEP_WORK_ROOT_FLAG) }));
       return result.promotion.committed ? 0 : 1;
     },
   },
@@ -250,7 +254,7 @@ const commands: Command[] = [
   {
     name: "run-goal",
     summary: "Decompose a goal and run the resulting Change end to end offline.",
-    usage: `${CLI_NAME} run-goal "<goal>" --project <dir>  |  ${CLI_NAME} run-goal --goal-file <file> --project <dir>`,
+    usage: `${CLI_NAME} run-goal "<goal>" --project <dir> [--keep-work-root]  |  ${CLI_NAME} run-goal --goal-file <file> --project <dir> [--keep-work-root]`,
     async run(args) {
       const goal = await resolveGoal(args);
       if (goal === undefined) {
@@ -286,6 +290,7 @@ const commands: Command[] = [
         enableToolBuild: true,
       });
       console.log(formatRunSummary(result));
+      console.log(await finishWorkRoot({ workRoot: result.workRoot, keepAll: hasFlag(args, KEEP_WORK_ROOT_FLAG) }));
       return result.promotion.committed ? 0 : 1;
     },
   },
@@ -371,7 +376,7 @@ const commands: Command[] = [
     name: "run-live",
     summary:
       "Full live run: decompose -> recruit real agents (Workers AI) -> escalate -> verify -> integrate -> promote -> cleanup.",
-    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--id <changeId>] [--watch] [--await-escalation] [--gate|--no-gate] [--max-model-retries N] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--id <changeId>] [--watch] [--await-escalation] [--gate|--no-gate] [--max-model-retries N] [--keep-work-root] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
@@ -823,6 +828,11 @@ const commands: Command[] = [
         console.log(`  when done watching, tear the real repos down with:`);
         console.log(`    make clean-live   (or: ${CLI_NAME} cleanup-live --change-id ${result.changeId} --worker ${result.workerUrl})`);
       }
+      // A live run keeps its promoted repo (printed above, used to verify the
+      // run) and removes the rest of its scratch work root.
+      console.log(
+        await finishWorkRoot({ workRoot: result.workRoot, keepAll: hasFlag(args, KEEP_WORK_ROOT_FLAG), keep: [result.sourceRepoDir] }),
+      );
       return result.promotion.committed && result.completed.length === change.work.length ? 0 : 1;
     },
   },
@@ -832,7 +842,7 @@ const commands: Command[] = [
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
       `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--id <changeId>] ` +
-      `[--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--lockstep] [--gate|--no-gate] [--watch] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+      `[--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const goal = await resolveGoal(args);
@@ -963,6 +973,8 @@ const commands: Command[] = [
         console.log(redactSecrets(formatBoardTranscript(result.log)));
         console.log("");
         console.log(redactSecrets(formatBoardRunSummary(result)));
+        // The offline demo's scratch work root is removed unless asked to keep it.
+        console.log(await finishWorkRoot({ workRoot: result.scratchRoot ?? result.workRoot, keepAll: hasFlag(args, KEEP_WORK_ROOT_FLAG) }));
         // Non-zero unless a gate ran and passed and every item completed.
         return boardRunExitCode(result);
       }
@@ -1117,6 +1129,14 @@ const commands: Command[] = [
       console.log(redactSecrets(formatBoardTranscript(result.log)));
       console.log("");
       console.log(redactSecrets(formatBoardRunSummary(result)));
+      // A live run keeps its promoted repo and removes the rest of its work root.
+      console.log(
+        await finishWorkRoot({
+          workRoot: result.workRoot,
+          keepAll: hasFlag(args, KEEP_WORK_ROOT_FLAG),
+          ...(result.sourceRepoDir ? { keep: [result.sourceRepoDir] } : {}),
+        }),
+      );
       // Non-zero unless a gate ran and passed, every item completed, and it was promoted.
       return boardRunExitCode(result, { requirePromotion: true });
     },
@@ -1190,7 +1210,7 @@ const commands: Command[] = [
   {
     name: "promote",
     summary: "Run a Change and promote the verified result into local Git.",
-    usage: `${CLI_NAME} promote <change.yaml> [--project <dir>]`,
+    usage: `${CLI_NAME} promote <change.yaml> [--project <dir>] [--keep-work-root]`,
     async run(args) {
       const specPath = args[0];
       if (!specPath) {
@@ -1201,6 +1221,8 @@ const commands: Command[] = [
       const projectDir = resolveProjectDir(specPath, args);
       const result = await runChange({ specYaml, projectDir });
       console.log(formatRunSummary(result));
+      // The promoted repo is the point of this command: keep it, drop the rest.
+      console.log(await finishWorkRoot({ workRoot: result.workRoot, keepAll: hasFlag(args, KEEP_WORK_ROOT_FLAG), keep: [result.sourceRepoDir] }));
       if (!result.promotion.committed) {
         console.error("Nothing was promoted (the Change produced no changes).");
         return 1;

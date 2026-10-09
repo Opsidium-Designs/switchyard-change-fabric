@@ -37,6 +37,7 @@
 import {
   contractTriageRecommendation,
   foldBoard,
+  type BoardItemStatus,
   type BoardMessage,
   type BoardMessageOf,
   type BoardMessageType,
@@ -101,8 +102,10 @@ export interface ItemNodeDetail {
   readonly objective: string;
   readonly acceptance: readonly string[];
   readonly scopeHint: readonly string[];
-  readonly status: "open" | "claimed" | "contested" | "split" | "done";
+  readonly status: BoardItemStatus;
   readonly proposedBy: string;
+  /** The lead's (or a human's) decision on a worker's proposal. */
+  readonly triage?: { readonly decision: "accepted" | "rejected"; readonly by: string; readonly seq: number };
   readonly owner?: string;
   readonly claimant?: string;
   readonly write: readonly string[];
@@ -255,10 +258,12 @@ export interface BoardTicker {
   readonly rebasing: readonly string[];
   readonly agents: { readonly active: number; readonly joined: number };
   readonly jev: { readonly calls: number; readonly accepted: number; readonly errors: number; readonly label: string };
-  readonly items: { readonly open: number; readonly claimed: number; readonly contested: number; readonly done: number };
+  readonly items: { readonly proposed: number; readonly open: number; readonly claimed: number; readonly contested: number; readonly done: number };
 }
 
 export interface BoardColumns {
+  /** Workers' proposals awaiting the lead (not claimable); rejected proposals are in no column. */
+  readonly proposed: readonly string[];
   readonly open: readonly string[];
   readonly claimed: readonly string[];
   readonly contested: readonly string[];
@@ -308,6 +313,8 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     case "goal.posted":
       return "goal";
     case "item.proposed":
+    case "item.accepted":
+    case "item.rejected":
     case "item.discovered":
     case "item.split":
     case "item.completed":
@@ -571,6 +578,7 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
     const seqs = new Set<number>([origin.seq]);
     if (item.grantedSeq !== undefined) seqs.add(item.grantedSeq);
     if (item.lastPush) seqs.add(item.lastPush.seq);
+    if (item.triage) seqs.add(item.triage.seq);
     const status = contestedItems.has(item.id) && item.status !== "done" ? "contested" : item.status;
     const ownerText = item.owner !== undefined ? `, owner ${item.owner}` : "";
     const doneText =
@@ -578,7 +586,11 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
         ? `, done at rev ${item.completed?.n ?? "?"}`
         : item.doneProposed
           ? ", done proposed (not yet on a passing revision)"
-          : "";
+          : item.status === "proposed"
+            ? `, proposed by ${item.proposedBy}: awaiting the lead's decision (not claimable)`
+            : item.triage !== undefined
+              ? `, ${item.triage.decision} by ${item.triage.by}`
+              : "";
     push({
       id: boardItemNodeId(item.id),
       kind: "item",
@@ -594,6 +606,7 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
         scopeHint: item.scopeHint,
         status,
         proposedBy: item.proposedBy,
+        ...(item.triage !== undefined ? { triage: item.triage } : {}),
         ...(item.owner !== undefined ? { owner: item.owner } : {}),
         ...(item.claimant !== undefined ? { claimant: item.claimant.agent } : {}),
         write: item.intent?.write ?? [],
@@ -1039,7 +1052,7 @@ function buildTicker(
   rebasing: Set<string>,
 ): BoardTicker {
   const agents = Object.values(state.agents);
-  const counts = { open: 0, claimed: 0, contested: 0, done: 0 };
+  const counts = { proposed: 0, open: 0, claimed: 0, contested: 0, done: 0 };
   const contested = new Set<string>();
   for (const c of Object.values(state.contests)) {
     if (c.status !== "resolved") {
@@ -1048,7 +1061,9 @@ function buildTicker(
     }
   }
   for (const item of Object.values(state.items)) {
-    if (item.status === "done") counts.done += 1;
+    if (item.status === "rejected") continue;
+    if (item.status === "proposed") counts.proposed += 1;
+    else if (item.status === "done") counts.done += 1;
     else if (item.status === "contested" || contested.has(item.id)) counts.contested += 1;
     else if (item.status === "open") counts.open += 1;
     else counts.claimed += 1;
@@ -1086,18 +1101,21 @@ function buildColumns(order: readonly string[], nodes: readonly BoardGraphNode[]
       status.set(n.detail.item, n.status);
     }
   }
+  const proposed: string[] = [];
   const open: string[] = [];
   const claimed: string[] = [];
   const contested: string[] = [];
   const done: string[] = [];
   for (const id of order) {
     const s = status.get(id);
-    if (s === "open") open.push(id);
+    if (s === "rejected") continue;
+    if (s === "proposed") proposed.push(id);
+    else if (s === "open") open.push(id);
     else if (s === "contested") contested.push(id);
     else if (s === "done") done.push(id);
     else if (s !== undefined) claimed.push(id);
   }
-  return { open, claimed, contested, done };
+  return { proposed, open, claimed, contested, done };
 }
 
 // ---------------------------------------------------------------------------

@@ -90,14 +90,33 @@ export function classifyChangeResponse(
   return "error";
 }
 
+/** npm's own wrapper lines around a failed script (`npm error ...`, `npm ERR! ...`): never the run's reason. */
+const NPM_BOILERPLATE = /^\s*npm (?:error|ERR!|warn|WARN)\b/;
+
 /**
- * The lines worth showing when a launched run exits non-zero: the last few log
- * lines, with the last `Error:` line pulled in first when it scrolled out of
- * that tail. The log is the launcher's already-redacted rolling CLI output.
+ * The run's OWN verdict and summary lines (as the CLI prints them), and any
+ * error line: what a non-zero exit actually means.
  */
-export function runFailureLines(log: readonly string[], max = 6): string[] {
-  const tail = log.slice(-max);
-  const errorLine = [...log].reverse().find((line) => /\b\w*Error:/.test(line));
+const RUN_SUMMARY_LINE =
+  /^\s*(?:verdict:|items completed:|failure:|promoted(?: unverified \(no gate\))?:|not promoted:|partial:|not completed:|proposal rejected:|proposal undecided\b|\w*Error:)/;
+
+/**
+ * The lines worth showing when a launched run exits non-zero: the run's own
+ * verdict and summary lines (`verdict:`, `items completed:`, `failure:`,
+ * `promoted:`, the partial reasons, `Error:`), never npm's `npm error ...`
+ * boilerplate. With no such line, the last few non-npm log lines (the last
+ * `Error:` line pulled in first when it scrolled out of that tail). The log
+ * is the launcher's already-redacted rolling CLI output; the raw log stays
+ * one toggle away in the panel.
+ */
+export function runFailureLines(log: readonly string[], max = 12): string[] {
+  const own = log.filter((line) => !NPM_BOILERPLATE.test(line));
+  const summary = own.filter((line) => RUN_SUMMARY_LINE.test(line)).map((line) => line.trim());
+  if (summary.length > 0) {
+    return [...new Set(summary)].slice(-max);
+  }
+  const tail = own.slice(-max);
+  const errorLine = [...own].reverse().find((line) => /\b\w*Error:/.test(line));
   if (errorLine === undefined || tail.includes(errorLine)) {
     return tail;
   }
@@ -963,10 +982,17 @@ export function RunStatus({
       ) : null}
       {failed && launchStatus ? (
         <div className="run-failure" role="alert">
-          <p className="error">The run exited with code {launchStatus.exitCode ?? "?"}. Last log lines:</p>
+          <p className="error">The run exited with code {launchStatus.exitCode ?? "?"}. The run's own summary:</p>
           <pre className="detail-pre">
-            {runFailureLines(launchStatus.log).join("\n") || "(no output captured)"}
+            {runFailureLines(launchStatus.log).join("\n") ||
+              (launchStatus.log.length > 0 ? "(the run printed no summary line; see the raw log)" : "(no output captured)")}
           </pre>
+          {launchStatus.log.length > 0 ? (
+            <details className="run-raw-log">
+              <summary>show raw log</summary>
+              <pre className="detail-pre">{launchStatus.log.join("\n")}</pre>
+            </details>
+          ) : null}
         </div>
       ) : null}
     </div>

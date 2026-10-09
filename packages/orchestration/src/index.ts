@@ -300,3 +300,4 @@ export {
   pendingEscalations,
   revVerdictLabel,
 } from "./board-graph.ts";
+export { finishWorkRoot, isDisposableWorkRoot, KEEP_WORK_ROOT_FLAG, pruneWorkRoot } from "./work-root.ts";

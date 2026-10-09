@@ -26,6 +26,10 @@ import { mergeBoardLog, pullBoard, resolveEscalation } from "../src/board-data.t
 import {
   agentShortLabel,
   boardShortLabels,
+  ellipsizeToWidth,
+  hullHeader,
+  HULL_STATUS_FONT,
+  HULL_TITLE_FONT,
   placeCaptions,
   textBoost,
   BoardNodeDetail,
@@ -380,6 +384,59 @@ describe("real-run naming (agent-N, lead, planner unit ids)", () => {
     );
     expect(agentShortLabel("agent-12")).toBe("agent-12");
     expect(agentShortLabel("an-unusually-long-agent-id")).toBe("an-unusually-...");
+  });
+
+  it("shortens real live ids: u-/unit-/item- prefixes, commons over the SEED items only, agent-proposed ids left whole", () => {
+    const seeds = ["u-users-validate-auth", "u-orders-validate-auth", "u-notifications-validate-auth"];
+    const ids = [...seeds, "agent-2-item-1"];
+    const labels = boardShortLabels(ids, { seeds });
+    expect(ids.map((id) => labels.get(id))).toEqual(["users", "orders", "notifications", "agent-2-item-1"]);
+    // Without the seed set, the agent-proposed id would block every common token.
+    expect(boardShortLabels(ids).get("u-users-validate-auth")).toBe("users-validate-auth");
+    // Mixed short prefixes still share their commons.
+    const mixed = boardShortLabels(["unit-users-guard", "item-orders-guard", "u-search-guard"]);
+    expect([...mixed.values()]).toEqual(["users", "orders", "search"]);
+    // A single seed keeps its body; two ids never collapse to one label.
+    expect(boardShortLabels(["u-users-validate-auth"]).get("u-users-validate-auth")).toBe("users-validate-auth");
+    const clash = boardShortLabels(["unit-a-x", "item-a-x", "u-b-x"], { seeds: ["unit-a-x", "item-a-x", "u-b-x"] });
+    expect(new Set(clash.values()).size).toBe(3);
+  });
+
+  it("the hull header ellipsizes the title to the width left of the status badge (no overlap at any status)", () => {
+    for (const boost of [1, 1.6]) {
+      for (const status of ["open", "contested / fix 2", "proposed"]) {
+        for (const width of [180, 260, 420]) {
+          const header = hullHeader({ title: "notifications-validate-auth-and-rate-limit", status, width, boost });
+          const titleRight = 14 + header.title.length * HULL_TITLE_FONT * boost * 0.62;
+          expect(titleRight).toBeLessThanOrEqual(header.badge.x);
+          expect(header.badge.w).toBeGreaterThanOrEqual(header.status.length * HULL_STATUS_FONT * boost * 0.62);
+          expect(header.badge.x + header.badge.w).toBeLessThanOrEqual(width);
+          expect(header.title.length).toBeGreaterThan(0);
+        }
+      }
+    }
+    expect(hullHeader({ title: "users", status: "open", width: 400 }).title).toBe("users");
+    expect(ellipsizeToWidth("abcdefghijklmnop", 10 * 15 * 0.62, 15)).toBe("abcdefg...");
+  });
+
+  it("renders the status as a badge, a long title ellipsized, and a worker's proposal in the PROPOSED column", () => {
+    const b = new FixtureBoard();
+    b.human({ type: "goal.posted", payload: { objective: "guard every resource", rules: { maxContestTurns: 3, contestIdleMessages: 25 } } });
+    b.join("lead", "lead");
+    const seeds = ["u-users-validate-auth", "u-notifications-validate-auth-and-rate-limiting-for-every-route"];
+    for (const [i, item] of seeds.entries()) {
+      b.agent("lead", { type: "item.proposed", payload: { item, objective: `guard ${item}`, acceptance: [], scopeHint: [`src/r${i}.js`] } });
+    }
+    b.join("agent-2");
+    b.agent("agent-2", { type: "item.proposed", payload: { item: "agent-2-item-1", objective: "more", acceptance: [], scopeHint: ["src/x.js"] } });
+    const markup = render({ log: b.log });
+    expect(markup).toMatch(/<text class="mc-hull-title"[^>]*>users-validate[^<]*<\/text>/);
+    expect(markup).toMatch(/<text class="mc-hull-title"[^>]*>agent-2-item-1<\/text>/);
+    expect(markup).toMatch(/<rect class="mc-hull-badge"/);
+    expect(markup).toMatch(/<text class="mc-hull-status"[^>]*text-anchor="middle"[^>]*>proposed<\/text>/);
+    const long = /<text class="mc-hull-title"[^>]*>(notif[^<]*)<\/text>/.exec(markup)![1]!;
+    expect(long.endsWith("...")).toBe(true);
+    expect(markup).toContain("PROPOSED");
   });
 
   it("renders a real-shaped board with short hull titles, agent-N labels, and the lead", () => {

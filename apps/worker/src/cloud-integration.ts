@@ -24,6 +24,7 @@
 
 import {
   attributeFailure,
+  combineAttribution,
   BOARD_LIMITS,
   intentPath,
   pendingPushItems,
@@ -406,16 +407,15 @@ export function decideCloudRevision(plan: CloudJobPlan, result: IntegrateJobResu
   const mergedViews = mergedItems.map((i) => ({ unitId: i.item, paths: i.paths }));
   const parse = attributeFailure(mergedViews, raw);
   const parsed = parse.attributed ? parse.units.map((u) => u.unitId) : [];
-  let implicated: string[] = parse.units.map((u) => u.unitId);
-  let source: AttributionSource = parse.attributed ? "parse" : "all";
   // The driver's advisory choice narrows like the local integrator's (only
-  // items this revision merged; a choice naming anything else is ignored).
+  // items this revision merged; a choice naming anything else is ignored), with
+  // the same combination and label (combineAttribution): an unattributed parse
+  // narrows to the pick alone.
   const choice = driver && driver.key === plan.key ? driver.items.filter((i) => integratedItems.includes(i)) : [];
-  if (choice.length > 0 && choice.length === (driver?.items.length ?? 0)) {
-    implicated = parse.attributed ? [...new Set([...implicated, ...choice])] : [...choice];
-    source = "jev";
-  }
-  const ordered = integratedItems.filter((i) => implicated.includes(i));
+  const valid = choice.length > 0 && choice.length === (driver?.items.length ?? 0);
+  const combined = combineAttribution({ merged: integratedItems, parsed, attributed: parse.attributed, picks: valid ? choice : [] });
+  const ordered = [...combined.items];
+  const source: AttributionSource = combined.source;
   return {
     kind: "record",
     input: { commit: result.commit, gate: "fail", merged, failing: { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: ordered } },

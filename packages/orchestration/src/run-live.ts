@@ -199,6 +199,8 @@ export interface RunFullLiveResult {
   readonly promotion: PromotionResult;
   /** Absolute path to the local source repository the result was promoted into. */
   readonly sourceRepoDir: string;
+  /** The run's work root (the promoted repo above lives inside it). */
+  readonly workRoot: string;
   /** Workspace names the fabric archived (deleted) on cleanup. */
   readonly cleanedUp: readonly string[];
   /**
@@ -1417,6 +1419,7 @@ export async function runFullLive(options: RunFullLiveOptions): Promise<RunFullL
     ...(dependencyInstall ? { dependencyInstall } : {}),
     promotion,
     sourceRepoDir,
+    workRoot,
     cleanedUp,
     ...(tool ? { tool } : {}),
     ...(deployment ? { deployment } : {}),

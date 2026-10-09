@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+
 import { defineConfig } from "vitest/config";
 
 // The console's offline tests are PURE: the pan/zoom interaction logic is plain
@@ -9,6 +11,9 @@ export default defineConfig({
     jsx: "automatic",
   },
   test: {
+    // One private temp root per run (TMPDIR), removed at the end: tests never
+    // leave work directories behind in the system temp directory.
+    globalSetup: [fileURLToPath(new URL("../../tools/vitest-temp-root.ts", import.meta.url))],
     include: ["tests/**/*.test.ts", "tests/**/*.test.tsx"],
     environment: "node",
   },

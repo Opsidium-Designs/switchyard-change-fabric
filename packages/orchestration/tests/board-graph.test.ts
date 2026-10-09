@@ -243,7 +243,7 @@ describe("ticker and labels", () => {
   });
 
   it("sorts items into the board columns", () => {
-    expect(full.columns).toEqual({ open: [], claimed: ["tests"], contested: ["auth", "search"], done: ["users", "orders", "products"] });
+    expect(full.columns).toEqual({ proposed: [], open: [], claimed: ["tests"], contested: ["auth", "search"], done: ["users", "orders", "products"] });
   });
 
   it("pins the escalations waiting on a human, with the contract's advisory triage", () => {

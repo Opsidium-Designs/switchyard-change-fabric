@@ -235,7 +235,7 @@ export function Ticker({ ticker, live, k, lastSeq }: { ticker: BoardTicker; live
         {ticker.agents.active}/{ticker.agents.joined} agents
       </span>
       <span className="mc-items">
-        {ticker.items.open} open, {ticker.items.claimed} claimed, {ticker.items.contested} contested, {ticker.items.done} done
+        {ticker.items.open} open, {ticker.items.claimed} claimed, {ticker.items.contested} contested, {ticker.items.done} done{ticker.items.proposed > 0 ? `, ${ticker.items.proposed} awaiting the lead` : ""}
       </span>
       <span className="mc-jev advisory">{ticker.jev.label}</span>
       {!live ? (
@@ -383,8 +383,10 @@ export function BoardPane({
   onResolve: (id: string, decision: string) => void | Promise<void>;
 }) {
   const byItem = new Map(model.nodes.filter((n) => n.kind === "item").map((n) => [n.label, n]));
-  const labels = boardShortLabels([...byItem.keys()]);
+  const labels = boardShortLabels([...byItem.keys()], { seeds: seedItemIds(model) });
   const columns: [string, readonly string[]][] = [
+    // Workers' proposals awaiting the lead: shown only while there are any.
+    ...(model.columns.proposed.length > 0 ? ([["PROPOSED", model.columns.proposed]] as [string, readonly string[]][]) : []),
     ["CONTESTED", model.columns.contested],
     ["OPEN", model.columns.open],
     ["CLAIMED", model.columns.claimed],
@@ -474,37 +476,116 @@ function selectedNodeId(selection: BoardSelection | null, log: readonly BoardMes
   }
 }
 
+/** Short planner prefixes dropped from item ids (`u-`, `unit-`, `item-`). */
+const SHORT_ID_PREFIX = /^(?:unit|item|u)-(?=[A-Za-z0-9])/;
+
 /**
  * Short display labels for item ids. Planner ids look like
- * `unit-users-auth-validate`: the `unit-` prefix and the dash tokens EVERY id
- * shares at the start and the end are dropped (as the run-live view does), so
- * siblings read by what tells them apart. A label is never emptied, and a long
- * one is truncated; the full id stays in the tooltip and the detail pane.
+ * `unit-users-auth-validate` or `u-users-validate-auth`: a short planner prefix
+ * (`u-`, `unit-`, `item-`) is dropped, then the dash tokens every SEED item (the
+ * planner's, `seeds`; default every id) shares at the start and the end, so
+ * siblings read by what tells them apart. An id outside that shape (an
+ * agent-proposed `agent-2-item-1`) never widens or blocks the commons and keeps
+ * its own tokens. A label is never emptied, two ids never share a label, and a
+ * long one is truncated; the full id stays in the tooltip and the detail pane.
  */
-export function boardShortLabels(ids: readonly string[], max = 24): Map<string, string> {
-  const base = ids.map((id) => {
-    const stripped = id.replace(/^unit-/, "");
+export function boardShortLabels(
+  ids: readonly string[],
+  options: { readonly max?: number; readonly seeds?: readonly string[] } = {},
+): Map<string, string> {
+  const max = options.max ?? 24;
+  const strip = (id: string) => {
+    const stripped = id.replace(SHORT_ID_PREFIX, "");
     return stripped === "" ? id : stripped;
-  });
-  const tokens = [...new Set(base)].map((b) => b.split("-"));
-  let prefix = 0;
-  let suffix = 0;
+  };
+  const seeds = options.seeds ?? ids;
+  const tokens = [...new Set(seeds.map(strip))].map((b) => b.split("-"));
+  let common: { head: string[]; tail: string[] } = { head: [], tail: [] };
   if (tokens.length >= 2) {
     const shortest = Math.min(...tokens.map((t) => t.length));
+    let prefix = 0;
+    let suffix = 0;
     while (prefix < shortest - 1 && tokens.every((t) => t[prefix] === tokens[0]![prefix])) prefix += 1;
     while (
       suffix < shortest - prefix - 1 &&
       tokens.every((t) => t[t.length - 1 - suffix] === tokens[0]![tokens[0]!.length - 1 - suffix])
     )
       suffix += 1;
+    common = { head: tokens[0]!.slice(0, prefix), tail: tokens[0]!.slice(tokens[0]!.length - suffix) };
   }
+  const core = (id: string): string => {
+    const base = strip(id);
+    let t = base.split("-");
+    const { head, tail } = common;
+    if (head.length > 0 && t.length > head.length && head.every((h, i) => t[i] === h)) t = t.slice(head.length);
+    if (tail.length > 0 && t.length > tail.length && tail.every((h, i) => t[t.length - tail.length + i] === h)) t = t.slice(0, t.length - tail.length);
+    return t.join("-") || base;
+  };
+  const cores = ids.map(core);
+  // Two ids reduced to one label keep their prefix-stripped ids instead, and
+  // their full ids when even those collide.
+  const tally = (labels: readonly string[]) => {
+    const counts = new Map<string, number>();
+    for (const c of labels) counts.set(c, (counts.get(c) ?? 0) + 1);
+    return counts;
+  };
+  const coreCounts = tally(cores);
+  const stripped = ids.map((id, i) => ((coreCounts.get(cores[i]!) ?? 0) > 1 ? strip(id) : cores[i]!));
+  const strippedCounts = tally(stripped);
   const out = new Map<string, string>();
   ids.forEach((id, i) => {
-    const t = base[i]!.split("-");
-    const core = t.slice(prefix, t.length - suffix).join("-") || base[i]!;
-    out.set(id, core.length > max ? `${core.slice(0, max - 3)}...` : core);
+    const label = (strippedCounts.get(stripped[i]!) ?? 0) > 1 ? id : stripped[i]!;
+    out.set(id, label.length > max ? `${label.slice(0, max - 3)}...` : label);
   });
   return out;
+}
+
+/**
+ * The planner's seed items of a board model: items the lead (or a human)
+ * proposed. Agent-proposed items are left out, so their ids never decide the
+ * commons the short labels drop.
+ */
+export function seedItemIds(model: BoardGraphModel): string[] {
+  const leads = new Set(["human", ...model.nodes.flatMap((n) => (n.detail.kind === "agent" && n.detail.role === "lead" ? [n.detail.agent] : []))]);
+  return model.nodes.flatMap((n) => (n.detail.kind === "item" && leads.has(n.detail.proposedBy) ? [n.detail.item] : []));
+}
+
+/** The approximate advance of one character, as a fraction of the font size (monospace about 0.6). */
+const CHAR_EM = 0.62;
+
+/** Ellipsize `text` to fit `width` px at `fontPx` (an estimate by character advance; never empty). */
+export function ellipsizeToWidth(text: string, width: number, fontPx: number): string {
+  const fits = Math.max(1, Math.floor(width / (fontPx * CHAR_EM)));
+  if (text.length <= fits) return text;
+  return fits <= 3 ? text.slice(0, fits) : `${text.slice(0, fits - 3)}...`;
+}
+
+/** The base font sizes of a hull's title and its status badge (styles.css), before the zoom boost. */
+export const HULL_TITLE_FONT = 15;
+export const HULL_STATUS_FONT = 12;
+
+/**
+ * Lay out a hull's header: the status is a badge at the right of the bar (at
+ * most half the bar, its text ellipsized to fit), and the title is ellipsized
+ * to the width left of it, so the two never overlap.
+ */
+export function hullHeader(input: { readonly title: string; readonly status: string; readonly width: number; readonly boost?: number }): {
+  readonly title: string;
+  readonly status: string;
+  readonly badge: { readonly x: number; readonly w: number };
+} {
+  const boost = input.boost ?? 1;
+  const pad = 14;
+  const gap = 8;
+  const inner = Math.max(0, input.width - pad * 2);
+  const statusPx = HULL_STATUS_FONT * boost;
+  const badgeW = Math.min(Math.ceil(input.status.length * statusPx * CHAR_EM + 14), Math.floor(inner / 2));
+  const status = ellipsizeToWidth(input.status, Math.max(0, badgeW - 14), statusPx);
+  return {
+    title: ellipsizeToWidth(input.title, Math.max(0, inner - badgeW - gap), HULL_TITLE_FONT * boost),
+    status,
+    badge: { x: input.width - pad - badgeW, w: badgeW },
+  };
 }
 
 /** A short agent label (live ids are `agent-N` and `lead`; anything long is truncated). */
@@ -661,7 +742,10 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
       points.set(node.id, p);
     }
   }
-  const itemLabels = boardShortLabels(model.nodes.filter((n) => n.kind === "item").map((n) => n.label));
+  const itemLabels = boardShortLabels(
+    model.nodes.filter((n) => n.kind === "item").map((n) => n.label),
+    { seeds: seedItemIds(model) },
+  );
   // Declared structure stays quiet: goal -> item edges show only for a selected
   // item, and item -> revision edges for the latest revision or a selection.
   // This hides drawn lines; it never adds one.
@@ -741,6 +825,8 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                 const rect = layout.items.get(d.item);
                 if (!rect) return null;
                 const isSel = selected === node.id;
+                const statusText = `${node.status}${d.fixRequested !== undefined ? ` / fix ${d.fixAttempts}` : ""}`;
+                const header = hullHeader({ title: itemLabels.get(d.item) ?? d.item, status: statusText, width: rect.w, boost });
                 return (
                   <g
                     key={node.id}
@@ -753,11 +839,11 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                     <rect x={rect.x} y={rect.y} width={rect.w} height={rect.h} rx={16} />
                     <rect className="mc-hull-bar" x={rect.x} y={rect.y} width={rect.w} height={HULL_TITLE_H} rx={16} />
                     <text className="mc-hull-title" x={rect.x + 14} y={rect.y + 22}>
-                      {itemLabels.get(d.item) ?? d.item}
+                      {header.title}
                     </text>
-                    <text className="mc-hull-status" x={rect.x + rect.w - 14} y={rect.y + 22} textAnchor="end">
-                      {node.status}
-                      {d.fixRequested !== undefined ? ` / fix ${d.fixAttempts}` : ""}
+                    <rect className="mc-hull-badge" x={rect.x + header.badge.x} y={rect.y + 7} width={header.badge.w} height={HULL_TITLE_H - 14} rx={9} />
+                    <text className="mc-hull-status" x={rect.x + header.badge.x + header.badge.w / 2} y={rect.y + 21} textAnchor="middle">
+                      {header.status}
                     </text>
                     {d.completed !== undefined ? (
                       <circle className="mc-check is-filled" cx={rect.x + rect.w - 22} cy={rect.y + rect.h - 22} r={11} />

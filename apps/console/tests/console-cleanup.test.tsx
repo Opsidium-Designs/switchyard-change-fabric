@@ -192,13 +192,60 @@ describe("cost and run-exit display", () => {
     expect(markup).not.toContain("<dd>0</dd>");
   });
 
-  it("pulls the Error: line in with the log tail on a non-zero exit", () => {
+  it("shows the run's own Error: line on a non-zero exit, and the log tail when there is no summary line", () => {
     const log = ["Error: planner returned no plan", ...Array.from({ length: 10 }, (_, i) => `line ${i}`)];
-    const lines = runFailureLines(log, 4);
-    expect(lines[0]).toBe("Error: planner returned no plan");
-    expect(lines).toHaveLength(4);
-    expect(lines.at(-1)).toBe("line 9");
+    expect(runFailureLines(log, 4)).toEqual(["Error: planner returned no plan"]);
     expect(runFailureLines(["a", "b"])).toEqual(["a", "b"]);
+    expect(runFailureLines(Array.from({ length: 10 }, (_, i) => `line ${i}`), 4)).toEqual(["line 6", "line 7", "line 8", "line 9"]);
+  });
+
+  it("shows the run's verdict and summary lines, never npm's error boilerplate", () => {
+    const log = [
+      "Board run for change-x",
+      "  integrated revision 3: gate fail, commit abc, merged 2 push(es) (items a, b)",
+      "    failure: not ok 4 - users: rejects a bad body",
+      "  items completed: 4 of 6 (1 worker proposal(s) rejected: not counted)",
+      "    proposal rejected: agent-2-item-1 by lead: agent-2-item-1 duplicates item u-notifications",
+      "    not completed: item u-users: its push passed in rev 2 but its owner did not propose done (owner agent-1)",
+      "  verdict: verified (partial: 2 item(s) not completed: u-users, u-orders; the Change is not complete) (the gate of the last revision, 3)",
+      "    partial: the last revision passed, but 1 announced push(es) were never gated (items u-orders): a partial result is not verified",
+      "  not promoted: nothing was integrated",
+      "npm error Lifecycle script `dev` failed with error:",
+      "npm error code 1",
+      "npm error path /somewhere/apps/cli",
+      "npm error workspace @switchyard-change/cli@0.0.0",
+      "npm error command failed",
+    ];
+    const lines = runFailureLines(log);
+    expect(lines).toEqual([
+      "failure: not ok 4 - users: rejects a bad body",
+      "items completed: 4 of 6 (1 worker proposal(s) rejected: not counted)",
+      "proposal rejected: agent-2-item-1 by lead: agent-2-item-1 duplicates item u-notifications",
+      "not completed: item u-users: its push passed in rev 2 but its owner did not propose done (owner agent-1)",
+      "verdict: verified (partial: 2 item(s) not completed: u-users, u-orders; the Change is not complete) (the gate of the last revision, 3)",
+      "partial: the last revision passed, but 1 announced push(es) were never gated (items u-orders): a partial result is not verified",
+      "not promoted: nothing was integrated",
+    ]);
+    expect(lines.some((l) => l.startsWith("npm error"))).toBe(false);
+    // Only npm boilerplate: nothing of it is shown as the reason.
+    expect(runFailureLines(["npm error code 1", "npm error command failed"])).toEqual([]);
+    const markup = renderToStaticMarkup(
+      createElement(RunStatus, {
+        changeId: "c",
+        template: null,
+        launchStatus: { status: "exited", exitCode: 1, log },
+        redeployed: false,
+        dial: { min: 1, max: 3 },
+        busy: false,
+        onTearDown: () => {},
+      }),
+    );
+    const [summaryPart, rawPart] = markup.split("show raw log");
+    expect(summaryPart).toContain("verdict: verified (partial");
+    expect(summaryPart).not.toContain("npm error");
+    // The raw log is one toggle away, untouched.
+    expect(markup).toContain('<details class="run-raw-log"><summary>show raw log</summary>');
+    expect(rawPart).toContain("npm error code 1");
   });
 
   it("shows the failure reason and only the template name in the run panel", () => {

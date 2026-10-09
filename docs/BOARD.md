@@ -51,10 +51,11 @@ Who sent a message is established by the route, never by the message body.
   never holds a credential that could act as the human or the integrator.
 - **The lead** is an agent like any other: it joins with role `lead` and gets a
   token. Only one active lead at a time. The lead (or the human) accepts or
-  rejects contract proposals.
+  rejects contract proposals, and accepts or rejects the items WORKERS propose
+  (`item.accepted`, `item.rejected` with a rationale).
 - **The human** posts through `POST /changes/:id/board/human` (bearer):
-  `goal.posted`, `item.proposed`, `claim.resolved` (a decision),
-  `contract.accepted`, `contract.rejected`. The existing escalation resolve route
+  `goal.posted`, `item.proposed`, `item.accepted`, `item.rejected`,
+  `claim.resolved` (a decision), `contract.accepted`, `contract.rejected`. The existing escalation resolve route
   is the other human path.
 - **The integrator** (the operator side, under the bearer) records revisions
   and reads agents' repos with short-lived read tokens the Worker issues it
@@ -113,7 +114,8 @@ bounded fields that define an item.
 
 ## Vocabulary
 
-`goal.posted {objective, rules, protected?, protectedKeys?, testInventory?}`, `item.proposed`, `item.claimed {item, intent:
+`goal.posted {objective, rules, protected?, protectedKeys?, testInventory?}`, `item.proposed`, `item.accepted {item}`,
+`item.rejected {item}` (the lead or a human; a rationale is required), `item.claimed {item, intent:
 {read, write}}`, `claim.granted`, `claim.contested`, `claim.ceded`,
 `claim.kept`, `claim.narrowed {contest, write}`, `claim.resolved`,
 `claim.escalated {..., reason: turns | idle}`, `item.split {item, children}`,
@@ -146,6 +148,17 @@ the CONTRACT (`protected`: the existing tests and gate configuration no agent
 may change alone; `protectedKeys`: gate-defining keys inside editable files,
 shown for visibility and restored by the integrator), so a log is
 self-describing.
+
+Proposals come first. An item the lead or a human proposes is `open` at once.
+An item a WORKER proposes (`item.proposed` or `item.discovered`) is `proposed`:
+not claimable (`ITEM_NOT_OPEN`), not offered in digests as open work, and not
+counted toward the Change, until the lead (or a human) posts `item.accepted`
+(it becomes `open`) or `item.rejected` (it becomes `rejected` for good). A
+decision is made once (`INVALID_STATE` after). A run's completion and its
+partial accounting count only accepted items: a rejected or undecided proposal
+never makes a passing run partial, and the summary lists each one (with the
+lead's rationale for a rejection). Split children stay open (they divide an
+item the agent already holds, inside its scope).
 
 0. Scope and contract. A claim's write intent must lie within the item's
    `scopeHint` (`OUTSIDE_SCOPE`; an item with no scope hint cannot be claimed),
@@ -242,7 +255,9 @@ is distributed changes: items are proposed and claimed, never assigned.
   one typed action: `claim`, `propose_item`, `split`, `message` (help,
   question, reply, contract, review; `to` addresses agents), `contest_reply`
   (cede, keep, narrow), `edit`, `propose_done`, `propose_tool`,
-  `decide_contract` (the lead only), or `wait`. The reply is validated strictly;
+  `decide_contract` and `decide_item` (the lead only), or `wait`. A lead turn
+  sees the pending proposals (`board.pendingItems`) and the accepted items
+  (`board.items`) to compare them against; a new undecided proposal wakes it. The reply is validated strictly;
   an invalid reply or a failed call becomes a recorded `wait` with the reason.
 - `packages/orchestration/src/board-agent.ts`: one runtime per agent in the
   driver process. A worker joins with its own repo. It reads its digest after
@@ -280,7 +295,16 @@ is distributed changes: items are proposed and claimed, never assigned.
   recorded (a verdict the control plane refused stops the run before
   promotion); only that revision, when it passed, is promoted (and redeployed in
   place), and promotion refuses unless the promoted tree is exactly that
-  revision's gated commit tree.
+  revision's gated commit tree. A worker's proposal awaiting the lead keeps the
+  phase open (`all-items-done` waits for the lead's decision).
+- Work roots: the CLI's offline commands (`run`, `run-goal`, `run-board
+  --offline`) remove their whole scratch work root when they finish
+  (`work root removed: <path>`); a live run (`run-live`, `run-board`) and
+  `promote` keep only the promoted repo (the printed `repo:` path) and remove the
+  rest. `--keep-work-root` keeps everything and prints the path. Only a run's
+  own `scf-` scratch directory is ever removed. The tests run under one private
+  temp root per `vitest` run (`tools/vitest-temp-root.ts` points TMPDIR at it
+  and removes it at the end; `SCF_KEEP_TEST_TMP=1` keeps it).
 - Test inventory: at goal time the gate runs once on the baseline and the
   tests it executed are read from the runner's own output (node --test spec
   and TAP, go test -json and -v, pytest -v and its summary, vitest, jest; no
@@ -436,7 +460,13 @@ is distributed changes: items are proposed and claimed, never assigned.
   `<path>:<line>`, which may be absolute paths in the gate's checkout, are
   preferred when present); then a CONFIDENT
   typed-decision choice when configured (advisory narrowing only); else every
-  item the revision merged. The board then asks each implicated owner for a fix.
+  item the revision merged. Parse and pick combine the same way locally and in
+  the integration Workflow (`combineAttribution` in change-core): an
+  unattributed parse ("all") with a confident pick implicates the pick ALONE
+  (`jev`); an attributed parse that already names the pick stays `parse`; a pick
+  outside an attributed parse is added to it (`jev`). The driver sends the
+  Workflow only its pick, never its own combination, so the pick is never
+  unioned with every item. The board then asks each implicated owner for a fix.
   A failure that names files of already COMPLETED items is a regression this
   revision's pushes caused (the tree passed before them): the evidence says
   which completed items regressed, and the fix is asked of the owners of the
@@ -472,7 +502,12 @@ is distributed changes: items are proposed and claimed, never assigned.
   completed: ...; the Change is not complete)` and the CLI exits non-zero. An
   owner whose push a passing revision merged is woken for a turn so it can
   propose done, and cued again at its next opportunities if it ignores the cue
-  (up to 3 times; a turn it was taking anyway does not use one up). A failing
+  (up to 5 times, the last one stating plainly that the item cannot complete
+  otherwise; a turn it was taking anyway does not use one up). The engine never
+  proposes done on an owner's behalf: an item whose push passed but whose owner
+  never proposed done stays incomplete, and the summary says exactly that
+  (`not completed: item X: its push passed in rev N but its owner did not
+  propose done`), with a reason line for every other incomplete item too. A failing
   revision's reason is shown as its first full line(s), at most 300 characters
   (`failure:` in the summary and the CLI), and the full bounded evidence stays
   on the board. The
@@ -509,8 +544,9 @@ is distributed changes: items are proposed and claimed, never assigned.
   a controlled accuracy measure: ...; parse among them: ...; pick differed from
   parse: D (pick only, parse only, both, neither), biased toward whichever was
   asked to fix)`. It is NOT an accuracy measure: attribution decides whose owner
-  is asked for a fix (a confident pick together with the parse's items,
-  otherwise the parse's items alone), and the asked items tend to be the ones
+  is asked for a fix (a confident pick together with the parse's items, the
+  pick alone when the parse attributed nothing, otherwise the parse's items
+  alone), and the asked items tend to be the ones
   that change. The one comparison with some signal is where the pick differed
   from the parse (the parse attributed items and the pick is not among them):
   which of the two landed in the fixed set. It is still biased toward
@@ -560,7 +596,10 @@ is distributed changes: items are proposed and claimed, never assigned.
   board clock and fixed Git commit dates); `concurrent` runs each agent's own
   loop with idle backoff (live).
 - `packages/orchestration/src/board-policy.ts`: the deterministic,
-  goal-agnostic stand-in for the turn model used offline. It answers contests
+  goal-agnostic stand-in for the turn model used offline. As the lead it decides
+  workers' proposed items (`decide_item`): it rejects one that duplicates an
+  existing item (every scope entry overlaps that item's scope, or the objective
+  is nearly the same words) or that declares no scope, and accepts the rest. It answers contests
   (a claimant narrows an overlapping glob to the concrete files nobody else
   holds, or cedes; an owner keeps once), replies to questions addressed to it,
   asks the other party after a narrowing, fixes an item a failing revision asked
@@ -607,11 +646,11 @@ Usage:
 
 ```bash
 make demo-board                     # offline: local control, generic policy, noop executor, fixture gate
-switchyard-change run-board --offline [--fixture-gate] [--decide-contracts accept|reject] --goal-file <goal.txt> --project <dir> [--min N] [--max N]
+switchyard-change run-board --offline [--fixture-gate] [--decide-contracts accept|reject] --goal-file <goal.txt> --project <dir> [--min N] [--max N] [--keep-work-root]
 switchyard-change run-board "<goal>" --project <dir> --worker <url> [--min N] [--max N] \
   [--id <changeId>] [--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] \
   [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] \
-  [--lockstep] [--gate|--no-gate] [--watch] [--allow-heuristic-planner]
+  [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [--allow-heuristic-planner]
 ```
 
 `--integrator local` (the default) integrates in the driver process;

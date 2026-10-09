@@ -143,7 +143,7 @@ describe("Worker board routes", () => {
     expect(snapshot.body.board).toEqual({
       messages: log.length,
       agents: 4,
-      items: { open: 0, claimed: 1, contested: 0, split: 0, done: 4 },
+      items: { proposed: 0, rejected: 0, open: 0, claimed: 1, contested: 0, split: 0, done: 4 },
       contests: { open: 0, escalated: 0, resolved: 2 },
       toolsPublished: 1,
       integratedRev: 3,

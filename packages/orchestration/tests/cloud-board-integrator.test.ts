@@ -173,7 +173,9 @@ describe("CloudBoardIntegrator advisory attribution", () => {
       pollMs: 1,
       attribute: async (r) => {
         expect(r.key).toBe("ij-f");
-        return { items: ["fix-b"], source: "jev", decisions: [{ juncture: "attribution", question: "Which item?", answer: "fix-b", confidence: 0.9, accepted: true, parsed: [] }] };
+        // The driver's own combination may be wider; only the PICK is sent, so
+        // the Workflow cannot union it again with an unattributed parse.
+        return { items: ["fix-a", "fix-b"], source: "jev", pick: "fix-b", decisions: [{ juncture: "attribution", question: "Which item?", answer: "fix-b", confidence: 0.9, accepted: true, parsed: [] }] };
       },
       recordDecision: async (d) => {
         recorded.push(d);

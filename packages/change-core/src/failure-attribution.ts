@@ -198,3 +198,44 @@ function pathCoversRelative(declared: string, file: string): boolean {
   // Directory/prefix match: the declared path is a parent directory of the file.
   return f === d || f.startsWith(`${d}/`);
 }
+
+/** How a failing revision's implicated items were chosen. */
+export type ImplicationSource = "parse" | "jev" | "all";
+
+/**
+ * Combine the parse with an advisory typed-decision pick into the implicated
+ * set and its HONEST source label. Shared by the local integrator and the
+ * integration Workflow on Cloudflare so both record the same set and label:
+ *   - no confident pick: the parse (`parse`), or every merged item when the
+ *     parse attributed nothing (`all`);
+ *   - an unattributed parse ("all") and a confident pick: the pick ALONE
+ *     (`jev`), never the pick unioned with every item;
+ *   - an attributed parse and a pick it already contains: the parse (`parse`:
+ *     the pick changed nothing);
+ *   - an attributed parse and a pick outside it: the parse plus the pick (`jev`).
+ * Picks naming items outside `merged` are ignored. The result keeps `merged`'s order.
+ */
+export function combineAttribution(input: {
+  readonly merged: readonly string[];
+  /** The parse's implicated items (every merged item when it attributed nothing). */
+  readonly parsed: readonly string[];
+  readonly attributed: boolean;
+  /** The confident typed-decision pick(s); empty for none. */
+  readonly picks: readonly string[];
+}): { readonly items: readonly string[]; readonly source: ImplicationSource } {
+  const picks = input.picks.filter((p) => input.merged.includes(p));
+  const ordered = (set: ReadonlySet<string>) => input.merged.filter((id) => set.has(id));
+  if (picks.length === 0) {
+    return input.attributed
+      ? { items: ordered(new Set(input.parsed)), source: "parse" }
+      : { items: [...input.merged], source: "all" };
+  }
+  if (!input.attributed) {
+    return { items: ordered(new Set(picks)), source: "jev" };
+  }
+  const parsed = new Set(input.parsed);
+  if (picks.every((p) => parsed.has(p))) {
+    return { items: ordered(parsed), source: "parse" };
+  }
+  return { items: ordered(new Set([...parsed, ...picks])), source: "jev" };
+}

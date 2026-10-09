@@ -36,6 +36,7 @@ import { dirname, join } from "node:path";
 import {
   hasWildcard,
   intentPath,
+  isAcceptedItem,
   LEAD_ROLE,
   type BoardDigest,
   type BoardMessage,
@@ -162,11 +163,11 @@ export interface BoardAgentOptions {
 }
 
 /** The action types each role may return. */
-const LEAD_ACTIONS: readonly AgentActionType[] = ["decide_contract", "propose_item", "message", "wait"];
-const WORKER_ACTIONS: readonly AgentActionType[] = AGENT_ACTION_TYPES.filter((t) => t !== "decide_contract");
+const LEAD_ACTIONS: readonly AgentActionType[] = ["decide_contract", "decide_item", "propose_item", "message", "wait"];
+const WORKER_ACTIONS: readonly AgentActionType[] = AGENT_ACTION_TYPES.filter((t) => t !== "decide_contract" && t !== "decide_item");
 
 /** Message types that matter to an agent only while it is free to take new work. */
-const NEW_WORK_TYPES: ReadonlySet<string> = new Set(["item.proposed", "item.discovered", "item.split"]);
+const NEW_WORK_TYPES: ReadonlySet<string> = new Set(["item.proposed", "item.accepted", "item.discovered", "item.split"]);
 /** Board-wide messages that are context, never a reason by themselves to take a turn. */
 const CONTEXT_ONLY_TYPES: ReadonlySet<string> = new Set([
   "goal.posted",
@@ -183,8 +184,12 @@ const MAX_LISTED_FILES = 2000;
 const MAX_EXCERPTS = 6;
 const MAX_EXCERPT_CHARS = 3000;
 const MAX_PENDING_MESSAGES = 200;
-/** How many times a passed push is cued for propose_done if the agent ignores it. */
-const MAX_DONE_CUES = 3;
+/**
+ * How many times a passed push is cued for propose_done if the agent ignores
+ * it. The last cue says plainly that the item cannot complete otherwise: the
+ * engine never proposes done on an agent's behalf.
+ */
+export const MAX_DONE_CUES = 5;
 /** The failing gate output a fix edit hands the executor, in characters. */
 const MAX_FIX_EVIDENCE = 4000;
 
@@ -311,6 +316,8 @@ export class BoardAgent {
   private readonly doneCues = new Map<string, number>();
   /** True while a step is running (the driver's quiescence check reads it). */
   private stepping = false;
+  /** Lead: the undecided worker proposals it last saw (a change wakes it). */
+  private lastProposals = "";
 
   constructor(private readonly options: BoardAgentOptions) {
     this.id = options.id;
@@ -437,7 +444,14 @@ export class BoardAgent {
       const state = await client.state();
       const undecided = Object.values(state.contracts).some((c) => c.status === "proposed");
       const addressed = fresh.some((m) => m.to?.includes(this.id));
-      if (!(this.followUp || addressed || (undecided && fresh.some((m) => m.type === "contract.proposed")))) {
+      // Workers' proposals wait for the lead: a new undecided set is a reason to take a turn.
+      const proposals = Object.values(state.items)
+        .filter((i) => i.status === "proposed")
+        .map((i) => i.id)
+        .join(",");
+      const newProposals = proposals !== "" && proposals !== this.lastProposals;
+      this.lastProposals = proposals;
+      if (!(this.followUp || addressed || newProposals || (undecided && fresh.some((m) => m.type === "contract.proposed")))) {
         return "idle";
       }
       await this.turn(digest, state);
@@ -481,7 +495,12 @@ export class BoardAgent {
       this.doneCues.set(passedKey, cues + 1);
     }
     if (nudged) {
-      this.evidence.push(`a passing revision merged my push for ${passed.map((c) => `${c.item} (rev ${c.lastPush!.integratedIn})`).join(", ")}: propose done`);
+      const which = passed.map((c) => `${c.item} (rev ${c.lastPush!.integratedIn})`).join(", ");
+      this.evidence.push(
+        cues + 1 >= MAX_DONE_CUES
+          ? `FINAL CUE: a passing revision merged my push for ${which}. The item cannot complete unless I return propose_done for it now; nobody proposes done on my behalf, and without it the run ends partial.`
+          : `a passing revision merged my push for ${which}: propose done`,
+      );
     }
     if (free) {
       this.lastFreeKey = freeKey;
@@ -610,6 +629,19 @@ export class BoardAgent {
         ...(c.item !== undefined ? { item: c.item } : {}),
         ...(c.guarded ? { protected: true } : {}),
       }));
+    // The lead decides workers' proposals against the items already on the Change.
+    const lead = this.role === "lead";
+    const pendingItems = lead
+      ? Object.values(state.items)
+          .filter((i) => i.status === "proposed")
+          .map((i) => ({ item: i.id, objective: i.objective, scopeHint: [...i.scopeHint], proposedBy: i.proposedBy }))
+      : [];
+    const acceptedItems = lead
+      ? Object.values(state.items)
+          .filter((i) => isAcceptedItem(i))
+          .slice(0, 200)
+          .map((i) => ({ item: i.id, objective: i.objective, scopeHint: [...i.scopeHint], status: i.status }))
+      : [];
     const files = await listRepoFiles(this.baseDir);
     const excerpts = await this.excerpts(digest, files);
     return {
@@ -628,7 +660,7 @@ export class BoardAgent {
         decisions: [...this.history],
         evidence: this.evidence.slice(-12),
       },
-      board: { liveClaims, pendingContracts },
+      board: { liveClaims, pendingContracts, ...(lead ? { pendingItems, items: acceptedItems } : {}) },
       repo: { files, excerpts },
       ...(this.lastRejection ? { lastRejection: this.lastRejection } : {}),
       allowed: this.role === "lead" ? LEAD_ACTIONS : WORKER_ACTIONS,
@@ -797,6 +829,17 @@ export class BoardAgent {
           type: "tool.proposed",
           payload: { tool: this.nextId("tool"), capability: action.capability, inputs: [], outputs: [] },
           rationale: action.why,
+        });
+        return;
+      case "decide_item":
+        if (this.role !== "lead" || !state.agents[this.id]) {
+          local("NOT_ALLOWED", "only the lead decides proposed items");
+          return;
+        }
+        await posted({
+          type: action.decision === "accept" ? "item.accepted" : "item.rejected",
+          payload: { item: action.itemId },
+          rationale: action.rationale,
         });
         return;
       case "decide_contract":

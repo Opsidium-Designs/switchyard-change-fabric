@@ -328,7 +328,7 @@ describe("the lead", () => {
     const token = w.ok ? w.token : "";
     await env.rawPost(token, { type: "contract.proposed", payload: { contract: "k1", target: "src/shared.ts", kind: "modify" } });
     expect(await lead.step()).toBe("acted");
-    expect(calls[0]!.allowed).toEqual(["decide_contract", "propose_item", "message", "wait"]);
+    expect(calls[0]!.allowed).toEqual(["decide_contract", "decide_item", "propose_item", "message", "wait"]);
     expect(calls[0]!.board.pendingContracts).toEqual([{ contract: "k1", target: "src/shared.ts", kind: "modify", proposedBy: "w9" }]);
     expect((await env.log()).messages.find((m) => m.type === "contract.accepted")).toMatchObject({ from: "lead", payload: { contract: "k1" } });
   });

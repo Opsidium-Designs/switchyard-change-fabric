@@ -55,6 +55,8 @@ import {
   type BoardDecisionJuncture,
   type BoardDigest,
   type BoardItem,
+  combineAttribution,
+  isAcceptedItem,
   type BoardMessage,
   type BoardRules,
   type BoardState,
@@ -366,6 +368,14 @@ export interface RunBoardResult {
    * PARTIAL result: the gate passed, but the Change is not complete.
    */
   readonly incompleteItems: readonly string[];
+  /**
+   * Why each incomplete item did not complete, stated from board state (for
+   * example "item X: its push passed in rev N but its owner did not propose
+   * done"). The engine never completes an item on an owner's behalf.
+   */
+  readonly incompleteReasons?: readonly string[];
+  /** Workers' proposals the lead rejected (with its rationale) or never decided: not counted. */
+  readonly proposals?: ReturnType<typeof proposalOutcomes>;
   /** The test inventory the baseline gate run recorded, as a readable line (with its dependency install). */
   readonly testInventory: string;
   /** Set when the gate is not the project's own (the offline fixture gate): what ran instead. */
@@ -376,6 +386,8 @@ export interface RunBoardResult {
   readonly sourceRepoDir?: string;
   readonly deployment?: { readonly url: string; readonly app: string };
   readonly workRoot: string;
+  /** The run's whole scratch directory when it is wider than `workRoot` (the offline run's control repos too). */
+  readonly scratchRoot?: string;
   readonly cleanedUp: readonly string[];
 }
 
@@ -508,7 +520,7 @@ export async function attributeRevisionFailure(input: {
   readonly jevThreshold?: number;
   /** Record the typed decision's outcome (accepted, low-confidence, or an error): never silent. */
   readonly onDecision?: (decision: BoardDecisionRecord) => Promise<unknown>;
-}): Promise<{ readonly items: readonly string[]; readonly source: "parse" | "jev" | "all" }> {
+}): Promise<{ readonly items: readonly string[]; readonly source: "parse" | "jev" | "all"; readonly pick?: string }> {
   const units: GatedUnitInput[] = input.items.map((i) => ({
     unitId: i.id,
     objective: i.objective,
@@ -518,9 +530,8 @@ export async function attributeRevisionFailure(input: {
     requiredExports: [],
   }));
   const parsed = attributeImplicatedUnits(units, input.output);
-  let implicated = parsed.units.map((u) => u.unitId);
-  const parsedItems = parsed.attributed ? inOrder(implicated, input.items) : [];
-  let source: "parse" | "jev" | "all" = parsed.attributed ? "parse" : "all";
+  const parsedItems = parsed.attributed ? inOrder(parsed.units.map((u) => u.unitId), input.items) : [];
+  let pick: string | undefined;
   if (input.jev && units.length > 1) {
     const ids = units.map((u) => u.unitId);
     const question = "Which item does this failure implicate?";
@@ -554,8 +565,7 @@ export async function attributeRevisionFailure(input: {
         parsed: parsedItems,
       });
       if (confident) {
-        implicated = parsed.attributed ? [...new Set([...implicated, answer!.choice!])] : [answer!.choice!];
-        source = "jev";
+        pick = answer!.choice!;
       }
     } catch (error) {
       // Advisory only: a decision-transport error leaves the parse result, and
@@ -563,7 +573,15 @@ export async function attributeRevisionFailure(input: {
       await input.onDecision?.({ juncture: "attribution", question, accepted: false, error: jevErrorReason(error) });
     }
   }
-  return { items: inOrder(implicated, input.items), source };
+  // The same combination (and label) as the integration Workflow on Cloudflare:
+  // an unattributed parse narrows to the pick alone.
+  const combined = combineAttribution({
+    merged: input.items.map((i) => i.id),
+    parsed: parsedItems,
+    attributed: parsed.attributed,
+    picks: pick !== undefined ? [pick] : [],
+  });
+  return { items: combined.items, source: combined.source, ...(pick !== undefined ? { pick } : {}) };
 }
 
 /** Keep `chosen` in the items' order. */
@@ -1006,9 +1024,58 @@ export class ContinuousBoardIntegrator {
   }
 }
 
-/** Items still owed work: neither split (its children carry it) nor done. */
+/**
+ * Items still owed work: ACCEPTED items (a worker's proposal counts only once
+ * the lead accepted it) that are neither split (its children carry it) nor done.
+ */
 function outstanding(state: BoardState): BoardItem[] {
-  return Object.values(state.items).filter((i) => i.status !== "split" && i.status !== "done");
+  return Object.values(state.items).filter((i) => isAcceptedItem(i) && i.status !== "split" && i.status !== "done");
+}
+
+/**
+ * Why each outstanding item is not completed, stated from board state alone.
+ * The engine never completes an item on an owner's behalf: an item whose push
+ * passed but whose owner never proposed done stays incomplete, and this says so.
+ */
+export function incompleteItemReasons(state: BoardState): string[] {
+  return outstanding(state).map((i) => {
+    const push = i.lastPush;
+    if (i.status === "claimed" && i.owner !== undefined) {
+      if (push?.integratedIn !== undefined && !i.doneProposed) {
+        return `item ${i.id}: its push passed in rev ${push.integratedIn} but its owner did not propose done (owner ${i.owner})`;
+      }
+      if (i.doneProposed && push !== undefined && push.integratedIn === undefined) {
+        return `item ${i.id}: its owner proposed done, but no passing revision merged its latest push (owner ${i.owner})`;
+      }
+      if (push === undefined || push.agent !== i.owner) {
+        return `item ${i.id}: its owner never pushed for it (owner ${i.owner})`;
+      }
+      return `item ${i.id}: not completed (owner ${i.owner})`;
+    }
+    if (i.status === "contested") {
+      return `item ${i.id}: its claim was still contested`;
+    }
+    return i.fixExhausted
+      ? `item ${i.id}: reopened after its fix budget was spent; nobody completed it`
+      : `item ${i.id}: nobody claimed it`;
+  });
+}
+
+/** Workers' proposals the lead rejected or never decided (neither counts toward completion). */
+export function proposalOutcomes(
+  state: BoardState,
+  log: readonly BoardMessage[],
+): { readonly rejected: readonly { readonly item: string; readonly by: string; readonly rationale?: string }[]; readonly undecided: readonly string[] } {
+  const rejected = Object.values(state.items)
+    .filter((i) => i.status === "rejected")
+    .map((i) => {
+      const message = log.find((m) => m.type === "item.rejected" && m.payload.item === i.id);
+      return { item: i.id, by: i.triage?.by ?? "?", ...(message?.rationale !== undefined ? { rationale: message.rationale } : {}) };
+    });
+  const undecided = Object.values(state.items)
+    .filter((i) => i.status === "proposed")
+    .map((i) => i.id);
+  return { rejected, undecided };
 }
 
 /** Drive a board run end to end. */
@@ -1334,7 +1401,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
                   ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
                   onDecision: async (decision) => void decisions.push(decision),
                 });
-                return { items: result.items, source: result.source, decisions };
+                return { items: result.items, source: result.source, ...(result.pick !== undefined ? { pick: result.pick } : {}), decisions };
               },
               recordDecision,
             }
@@ -1534,7 +1601,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     const started = Date.now();
     const check = (state: BoardState): BoardStopReason | undefined => {
       const owed = outstanding(state);
-      if (Object.keys(state.items).length > 0 && owed.length === 0) {
+      // A worker's proposal awaiting the lead keeps the phase open (the lead
+      // decides it next); once decided, only accepted items count.
+      const awaitingLead = Object.values(state.items).some((i) => i.status === "proposed");
+      if (Object.values(state.items).some(isAcceptedItem) && owed.length === 0 && !awaitingLead) {
         return "all-items-done";
       }
       // Every outstanding item was spent by every agent still running: nobody
@@ -1658,6 +1728,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   let verdict: "verified" | "failed" = "failed";
   let partial: string | undefined;
   let incompleteItems: string[] = [];
+  let incompleteReasons: string[] = [];
   let evidence: EvidenceSummary | undefined;
   try {
     // 4. The last integration: anything still pending is integrated once more,
@@ -1681,6 +1752,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     // refused, unreadable) is a PARTIAL result: never reported or promoted as
     // verified.
     incompleteItems = outstanding(finalState).map((i) => i.id);
+    incompleteReasons = incompleteItemReasons(finalState);
     const ungated = pendingPushItems(finalState);
     if (verdict === "verified" && ungated.length > 0) {
       verdict = "failed";
@@ -1688,7 +1760,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       emit({ kind: "promotion-skipped", reason: partial });
     }
     const integratedItems = verdict === "verified" ? Object.values(finalState.items).filter((i) => i.lastPush?.integratedIn !== undefined).map((i) => i.id) : [];
-    const excludedItems = Object.keys(finalState.items).filter((i) => !integratedItems.includes(i));
+    const excludedItems = Object.values(finalState.items)
+      .filter((i) => isAcceptedItem(i) && !integratedItems.includes(i.id))
+      .map((i) => i.id);
     // A pass no gate checked is recorded as such (the control plane keeps the
     // flag; the run reports it as unverified).
     const ungatedPass = verdict === "verified" && last !== undefined && !last.gated;
@@ -1806,6 +1880,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     verdict: verdict === "verified" && last !== undefined && !last.gated ? "unverified" : verdict,
     ...(partial !== undefined ? { partial } : {}),
     incompleteItems,
+    incompleteReasons,
+    proposals: proposalOutcomes(final.state, final.messages),
     testInventory: inventoryLabel,
     ...(options.gateLabel !== undefined ? { gateLabel: options.gateLabel } : {}),
     ...(evidence ? { evidence } : {}),
@@ -1913,6 +1989,9 @@ function payloadSummary(m: BoardMessage): string {
     case "contract.accepted":
     case "contract.rejected":
       return String(p.contract);
+    case "item.accepted":
+    case "item.rejected":
+      return String(p.item);
     case "fix.requested":
       return `${String(p.item)} (rev ${String(p.n)}, attempt ${String(p.attempt)})`;
     case "fix.exhausted":
@@ -1960,7 +2039,9 @@ export function boardRunExitCode(
 
 /** A readable summary of a board run. */
 export function formatBoardRunSummary(result: RunBoardResult): string {
-  const items = Object.values(result.state.items);
+  // Only accepted items count: a worker's proposal the lead rejected (or never
+  // decided) is not part of the Change.
+  const items = Object.values(result.state.items).filter(isAcceptedItem);
   const done = items.filter((i) => i.status === "done").length;
   const waits = result.turns.filter((t) => t.action.type === "wait").length;
   const invalid = result.turns.filter((t) => t.invalid !== undefined).length;
@@ -2018,7 +2099,21 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     // Advisory accuracy, decided by what changed before the next passing gate.
     lines.push(`  ${formatAttributionTally(boardAttributionTally(result.state))}`);
   }
-  lines.push(`  items completed: ${done} of ${items.length}`);
+  const proposals = result.proposals ?? proposalOutcomes(result.state, result.log);
+  const notCounted = [
+    ...(proposals.rejected.length > 0 ? [`${proposals.rejected.length} worker proposal(s) rejected`] : []),
+    ...(proposals.undecided.length > 0 ? [`${proposals.undecided.length} undecided`] : []),
+  ];
+  lines.push(`  items completed: ${done} of ${items.length}${notCounted.length > 0 ? ` (${notCounted.join(", ")}: not counted)` : ""}`);
+  for (const r of proposals.rejected) {
+    lines.push(`    proposal rejected: ${r.item} by ${r.by}${r.rationale ? `: ${r.rationale.slice(0, 200)}` : ""}`);
+  }
+  for (const id of proposals.undecided) {
+    lines.push(`    proposal undecided (the lead never accepted or rejected it): ${id}`);
+  }
+  for (const reason of result.incompleteReasons ?? []) {
+    lines.push(`    not completed: ${reason}`);
+  }
   const incomplete =
     result.verdict !== "failed" && result.incompleteItems.length > 0
       ? ` (partial: ${result.incompleteItems.length} item(s) not completed: ${result.incompleteItems.join(", ")}; the Change is not complete)`

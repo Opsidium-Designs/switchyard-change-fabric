@@ -23,6 +23,7 @@
  * produces the same promoted result.
  */
 
+import { mkdtempSync, rmSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
@@ -98,6 +99,8 @@ export interface RunChangeResult {
   readonly cleanup: CleanupResult;
   /** Absolute path to the local source repository the result was promoted into. */
   readonly sourceRepoDir: string;
+  /** The run's work root (its clones, worktrees, and the source repo above). */
+  readonly workRoot: string;
   /**
    * The agent-built tool for this Change, when the work needed a capability the
    * repo lacked and one was built; otherwise undefined. The tool is built in its
@@ -356,6 +359,7 @@ export async function runChange(options: RunChangeOptions): Promise<RunChangeRes
     promotion,
     cleanup,
     sourceRepoDir,
+    workRoot,
     ...(tool ? { tool } : {}),
     leasePlan,
   };
@@ -366,10 +370,15 @@ export function describeChange(specYaml: string): {
   readonly change: Change;
   readonly waves: readonly (readonly string[])[];
 } {
-  const control = new LocalChangeControl(
-    new LocalFilesystemWorkspaceProvider({ rootDir: join(tmpdir(), "scf-describe-unused") }),
-  );
-  const change = control.createChange(specYaml);
+  // Nothing is provisioned; the provider's (empty) root is removed right away.
+  const unused = mkdtempSync(join(tmpdir(), "scf-describe-"));
+  let change: Change;
+  try {
+    const control = new LocalChangeControl(new LocalFilesystemWorkspaceProvider({ rootDir: unused }));
+    change = control.createChange(specYaml);
+  } finally {
+    rmSync(unused, { recursive: true, force: true });
+  }
   // Compute the scheduling waves without provisioning anything.
   const waves: string[][] = [];
   const completed = new Set<string>();

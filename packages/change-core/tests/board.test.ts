@@ -137,6 +137,8 @@ function complete(board: TestBoard, agent: string, item: string, commit: string,
 const VALID: Record<BoardMessageType, { from: string; payload: Record<string, unknown> }> = {
   "goal.posted": { from: "human", payload: { objective: "o" } },
   "item.proposed": { from: "lead", payload: { item: "i", objective: "o", acceptance: ["x"], scopeHint: ["src/**"] } },
+  "item.accepted": { from: "lead", payload: { item: "i" } },
+  "item.rejected": { from: "lead", payload: { item: "i" } },
   "item.claimed": { from: "a", payload: { item: "i", intent: { read: ["src/x.ts"], write: ["src/**"] } } },
   "claim.granted": { from: "engine", payload: { item: "i", agent: "a", intent: { read: [], write: ["src/**"] } } },
   "claim.contested": {
@@ -183,6 +185,8 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
 const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "goal.posted": { objective: "", rules: { maxContestTurns: 0 } },
   "item.proposed": { item: "bad id!", objective: "o" },
+  "item.accepted": { item: "bad id!" },
+  "item.rejected": {},
   "item.claimed": { item: "i", intent: { read: [], write: ["../escape"] } },
   "claim.granted": { item: "i", agent: "a" },
   "claim.contested": { contest: "c", item: "i", claimant: "a", owner: "b", ownerItem: "j", overlap: "src" },
@@ -222,7 +226,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(36);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(38);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -656,6 +660,43 @@ describe("board arbitration", () => {
   });
 });
 
+describe("worker proposals wait for the lead (item.accepted / item.rejected)", () => {
+  it("a worker's proposal is not claimable until the lead accepts it; the lead's and the human's items are open at once", () => {
+    const board = seeded();
+    expect(board.state.items.one?.status).toBe("open");
+    board.post(msg("human", "item.proposed", { item: "h1", objective: "a human item", scopeHint: ["src/h/**"] }));
+    expect(board.state.items.h1?.status).toBe("open");
+    board.post(msg("a", "item.proposed", { item: "a-item-1", objective: "more work", scopeHint: ["src/x/**"] }));
+    expect(board.state.items["a-item-1"]?.status).toBe("proposed");
+    board.reject(claim("b", "a-item-1", ["src/x/y.ts"]), /is proposed and cannot be claimed/, "ITEM_NOT_OPEN");
+    // Nobody but the lead or a human decides it.
+    board.reject(msg("b", "item.accepted", { item: "a-item-1" }), /cannot be sent by/, "NOT_ALLOWED");
+    board.reject(msg("a", "item.accepted", { item: "a-item-1" }), /cannot be sent by/, "NOT_ALLOWED");
+    // The digest does not offer it as open work.
+    expect(boardDigest(board.state, board.log, "b", 0).openItems.map((i) => i.item)).not.toContain("a-item-1");
+    expect(summarizeBoard(board.state).items.proposed).toBe(1);
+    expect(board.types({ ...msg("lead", "item.accepted", { item: "a-item-1" }), rationale: "new work" })).toEqual(["item.accepted"]);
+    expect(board.state.items["a-item-1"]).toMatchObject({ status: "open", triage: { decision: "accepted", by: "lead" } });
+    expect(board.types(claim("b", "a-item-1", ["src/x/y.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+    // A decision is made once.
+    board.reject(msg("lead", "item.accepted", { item: "a-item-1" }), /not a proposal awaiting a decision/, "INVALID_STATE");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a rejection needs a rationale; a rejected proposal can never be claimed", () => {
+    const board = seeded();
+    board.post(msg("a", "item.discovered", { item: "dup", objective: "do one again", reason: "found more", scopeHint: ["src/**"] }));
+    expect(board.state.items.dup?.status).toBe("proposed");
+    board.reject(msg("lead", "item.rejected", { item: "dup" }), /needs a rationale/, "BAD_PAYLOAD");
+    expect(board.types({ ...msg("lead", "item.rejected", { item: "dup" }), rationale: "duplicates item one" })).toEqual(["item.rejected"]);
+    expect(board.state.items.dup).toMatchObject({ status: "rejected", triage: { decision: "rejected", by: "lead" } });
+    board.reject(claim("a", "dup", ["src/a.ts"]), /is rejected and cannot be claimed/, "ITEM_NOT_OPEN");
+    board.reject(msg("human", "item.accepted", { item: "dup" }), /not a proposal awaiting a decision/, "INVALID_STATE");
+    expect(summarizeBoard(board.state).items).toMatchObject({ proposed: 0, rejected: 1, open: 3 });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
 describe("completion is derived from a passing revision", () => {
   it("needs done.proposed AND the owner's latest push merged by a passing revision, in either order", () => {
     const board = seeded();
@@ -784,7 +825,7 @@ describe("scope, protected paths, and push containment", () => {
 
   it("items may be scoped over protected paths (claims enforce them); split children stay inside the parent", () => {
     const board = guarded();
-    expect(board.types(msg("a", "item.proposed", { item: "g", objective: "o", scopeHint: ["gate/**"] }))).toEqual(["item.proposed"]);
+    expect(board.types(msg("human", "item.proposed", { item: "g", objective: "o", scopeHint: ["gate/**"] }))).toEqual(["item.proposed"]);
     board.reject(claim("a", "g", ["gate/**"]), /contract change/, "PROTECTED");
     board.post(claim("a", "one", ["src/a/**"]));
     board.reject(
@@ -1238,7 +1279,7 @@ describe("replay, fold, and verification", () => {
     expect(summarizeBoard(board.state)).toEqual({
       messages: board.log.length,
       agents: 4,
-      items: { open: 1, claimed: 2, contested: 0, split: 0, done: 0 },
+      items: { proposed: 0, rejected: 0, open: 1, claimed: 2, contested: 0, split: 0, done: 0 },
       contests: { open: 0, escalated: 0, resolved: 1 },
       toolsPublished: 0,
       integratedRev: 1,
@@ -1335,7 +1376,7 @@ describe("scripted agents through the endpoint (join, tokens, routes)", () => {
     expect(first.log.find((m) => m.type === "help.offered")?.to).toEqual(["agent-a"]);
     expect(first.board).toEqual(reduceBoard(first.log));
     expect(summarizeBoard(first.board)).toMatchObject({
-      items: { open: 0, claimed: 1, contested: 0, split: 0, done: 4 },
+      items: { proposed: 0, rejected: 0, open: 0, claimed: 1, contested: 0, split: 0, done: 4 },
       toolsPublished: 1,
       integratedRev: 3,
     });

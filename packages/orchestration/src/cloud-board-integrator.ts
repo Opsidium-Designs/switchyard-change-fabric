@@ -263,11 +263,15 @@ export class CloudBoardIntegrator implements BoardIntegratorLike {
       /**
        * The run's advisory attribution of a failing revision the Workflow holds
        * (the parse plus a confident typed decision, as the local integrator
-       * does). Only a typed-decision choice is sent; otherwise "no choice".
+       * does). Only the typed decision's confident PICK is sent (the Workflow
+       * combines it with its own parse exactly as the local integrator does);
+       * otherwise "no choice".
        */
       readonly attribute?: (request: CloudAttributionRequest) => Promise<{
         readonly items: readonly string[];
         readonly source: "parse" | "jev" | "all";
+        /** The confident typed-decision pick, when there was one. */
+        readonly pick?: string;
         readonly decisions: readonly BoardDecisionRecord[];
       }>;
       /** Records the advisory decisions on the board (linked to the revision once it is recorded). */
@@ -416,7 +420,9 @@ export class CloudBoardIntegrator implements BoardIntegratorLike {
   private async answer(request: CloudAttributionRequest): Promise<void> {
     const attributed = await this.options.attribute!(request);
     this.attributed.set(request.key, attributed.decisions);
-    const items = attributed.source === "jev" ? attributed.items : [];
+    // The pick alone: sending the driver's union would let the Workflow union
+    // it again with an unattributed ("all") parse.
+    const items = attributed.pick !== undefined ? [attributed.pick] : [];
     const res = await postJson(this.options.fetchFn, `${this.route()}/attribution`, { key: request.key, items });
     if (res.status !== 201 && res.status !== 409) {
       throw new Error(`HTTP ${res.status}: ${String(res.body.error ?? "")}`);

@@ -162,7 +162,7 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
     process.env.GIT_COMMITTER_DATE = OFFLINE_BOARD_EPOCH;
   }
   try {
-    return await runBoard({
+    const result = await runBoard({
       goal: options.goal,
       projectDir: options.projectDir,
       changeId: options.changeId ?? "change-board-offline",
@@ -204,6 +204,8 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
       ...(options.onEvent ? { onEvent: options.onEvent } : {}),
     });
+    // The whole scratch directory: the offline control's repos and the run's work root.
+    return { ...result, scratchRoot: workRoot };
   } finally {
     if (pinDates) {
       for (const [key, value] of [

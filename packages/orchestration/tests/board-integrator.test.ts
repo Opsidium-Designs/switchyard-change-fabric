@@ -467,11 +467,19 @@ describe("attributeRevisionFailure", () => {
   });
 
   it("a confident typed decision narrows an unattributable failure; a low-confidence one changes nothing", async () => {
-    expect(await attributeRevisionFailure({ items, output: "boom", changeId: "c", jev: jev("b", 0.9) })).toEqual({ items: ["b"], source: "jev" });
+    // An unattributed ("all") parse narrows to the confident pick ALONE.
+    expect(await attributeRevisionFailure({ items, output: "boom", changeId: "c", jev: jev("b", 0.9) })).toEqual({ items: ["b"], source: "jev", pick: "b" });
     expect(await attributeRevisionFailure({ items, output: "boom", changeId: "c", jev: jev("b", 0.2) })).toEqual({ items: ["a", "b"], source: "all" });
     expect(await attributeRevisionFailure({ items, output: "FAIL src/a/x.ts", changeId: "c", jev: jev("b", 0.9) })).toEqual({
       items: ["a", "b"],
       source: "jev",
+      pick: "b",
+    });
+    // A pick the parse already named changes nothing: the source stays the parse.
+    expect(await attributeRevisionFailure({ items, output: "FAIL src/a/x.ts", changeId: "c", jev: jev("a", 0.9) })).toEqual({
+      items: ["a"],
+      source: "parse",
+      pick: "a",
     });
   });
 });

@@ -181,6 +181,14 @@ export interface BoardPayloads {
     readonly acceptance: readonly string[];
     readonly scopeHint: readonly string[];
   };
+  /**
+   * The lead (or a human) accepts an item a WORKER proposed: it becomes open
+   * (claimable). Until then a worker's proposal is `proposed`, not claimable,
+   * and not counted toward the run's completion.
+   */
+  "item.accepted": { readonly item: string };
+  /** The lead (or a human) rejects a worker's proposed item (a rationale is required). */
+  "item.rejected": { readonly item: string };
   "item.claimed": { readonly item: string; readonly intent: BoardIntent };
   "claim.granted": { readonly item: string; readonly agent: string; readonly intent: BoardIntent };
   "claim.contested": {
@@ -348,6 +356,8 @@ export type BoardMessageType = keyof BoardPayloads;
 export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "goal.posted",
   "item.proposed",
+  "item.accepted",
+  "item.rejected",
   "item.claimed",
   "claim.granted",
   "claim.contested",
@@ -463,7 +473,17 @@ function fail(code: BoardErrorCode, message: string): never {
 // State
 // ---------------------------------------------------------------------------
 
-export type BoardItemStatus = "open" | "claimed" | "contested" | "split" | "done";
+/**
+ * `proposed`: a worker proposed the item and the lead has not decided it (not
+ * claimable); `rejected`: the lead (or a human) rejected that proposal. Neither
+ * counts toward a run's completion.
+ */
+export type BoardItemStatus = "proposed" | "rejected" | "open" | "claimed" | "contested" | "split" | "done";
+
+/** True for an item that counts toward the Change: neither an undecided nor a rejected proposal. */
+export function isAcceptedItem(item: Pick<BoardItem, "status">): boolean {
+  return item.status !== "proposed" && item.status !== "rejected";
+}
 
 /** The latest push announced for an item, and the revision that merged it. */
 export interface BoardItemPush {
@@ -485,6 +505,8 @@ export interface BoardItem {
   readonly parent?: string;
   children: string[];
   readonly discovered?: { readonly by: string; readonly reason: string };
+  /** The lead's (or a human's) decision on a worker's proposal. */
+  triage?: { readonly decision: "accepted" | "rejected"; readonly by: string; readonly seq: number };
   /** The agent holding the claim (kept after completion for attribution). */
   owner?: string;
   /** The live intent of the claim, while it is held. */
@@ -1062,6 +1084,9 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
     case "contract.accepted":
     case "contract.rejected":
       return { contract: id(raw, "contract") };
+    case "item.accepted":
+    case "item.rejected":
+      return { item: id(raw, "item") };
     case "push.announced":
       return { item: id(raw, "item"), commit: id(raw, "commit"), paths: pathList(raw, "paths", { concrete: true }) };
     case "integrated.rev": {
@@ -1261,6 +1286,8 @@ type Senders = "human" | "engine" | "agent" | "lead";
 const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "goal.posted": ["human"],
   "item.proposed": ["human", "agent"],
+  "item.accepted": ["lead", "human"],
+  "item.rejected": ["lead", "human"],
   "item.claimed": ["agent"],
   "claim.granted": ["engine"],
   "claim.contested": ["engine"],
@@ -1432,6 +1459,17 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       if (draft.type === "item.discovered" && draft.payload.parent !== undefined) {
         requireItem(state, draft.payload.parent);
+      }
+      return;
+    }
+    case "item.accepted":
+    case "item.rejected": {
+      const item = requireItem(state, draft.payload.item);
+      if (item.status !== "proposed") {
+        fail("INVALID_STATE", `item ${item.id} is ${item.status}, not a proposal awaiting a decision`);
+      }
+      if (draft.type === "item.rejected" && (draft.rationale === undefined || draft.rationale.trim() === "")) {
+        fail("BAD_PAYLOAD", "item.rejected needs a rationale (why the proposal is not taken)");
       }
       return;
     }
@@ -1874,6 +1912,17 @@ export function applyBoardMessage(previous: BoardState, message: BoardMessage): 
   return state;
 }
 
+/**
+ * The status a new item starts in: the lead's (and a human's) items are open
+ * at once; a WORKER's proposal waits for the lead to accept or reject it.
+ */
+function proposalStatus(state: BoardState, from: string): BoardItemStatus {
+  if (from === BOARD_HUMAN || from === BOARD_ENGINE) {
+    return "open";
+  }
+  return state.agents[from]?.role === LEAD_ROLE ? "open" : "proposed";
+}
+
 /** Apply one message by mutating `state`. */
 function applyInPlace(state: BoardState, message: BoardMessage): void {
   state.lastSeq = message.seq;
@@ -1892,7 +1941,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         objective: message.payload.objective,
         acceptance: message.payload.acceptance,
         scopeHint: message.payload.scopeHint,
-        status: "open",
+        status: proposalStatus(state, from),
         proposedBy: from,
         proposedSeq: message.seq,
         children: [],
@@ -1906,7 +1955,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         objective: p.objective,
         acceptance: [],
         scopeHint: p.scopeHint ?? [],
-        status: "open",
+        status: proposalStatus(state, from),
         proposedBy: from,
         proposedSeq: message.seq,
         ...(p.parent !== undefined ? { parent: p.parent } : {}),
@@ -1914,6 +1963,14 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         discovered: { by: from, reason: p.reason },
         doneProposed: false,
       };
+      break;
+    }
+    case "item.accepted":
+    case "item.rejected": {
+      const item = state.items[message.payload.item]!;
+      const accepted = message.type === "item.accepted";
+      item.status = accepted ? "open" : "rejected";
+      item.triage = { decision: accepted ? "accepted" : "rejected", by: from, seq: message.seq };
       break;
     }
     case "item.claimed":
@@ -2895,7 +2952,7 @@ export interface BoardSummary {
 }
 
 export function summarizeBoard(state: BoardState): BoardSummary {
-  const items: Record<BoardItemStatus, number> = { open: 0, claimed: 0, contested: 0, split: 0, done: 0 };
+  const items: Record<BoardItemStatus, number> = { proposed: 0, rejected: 0, open: 0, claimed: 0, contested: 0, split: 0, done: 0 };
   for (const item of Object.values(state.items)) {
     items[item.status] += 1;
   }
@@ -2965,6 +3022,8 @@ export interface BoardDigest {
 const BROADCAST_TYPES: ReadonlySet<BoardMessageType> = new Set([
   "goal.posted",
   "item.proposed",
+  "item.accepted",
+  "item.rejected",
   "item.discovered",
   "item.split",
   "integrated.rev",
