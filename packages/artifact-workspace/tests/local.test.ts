@@ -44,9 +44,13 @@ describe("LocalFilesystemWorkspaceProvider", () => {
     await run("git", ["-C", work, "push", "-q", "origin", "HEAD:main"]);
     const head = (await run("git", ["-C", work, "rev-parse", "HEAD"])).stdout.trim();
 
-    const { ref, token } = await provider.fork(source, "helper-fork", 120);
+    const { ref, token, realizedBase, expectedBase, baseMismatch } = await provider.fork(source, "helper-fork", 120);
     expect(ref).toMatchObject({ name: "helper-fork", backend: "local-filesystem", fallback: true });
     expect(token.scope).toBe("write");
+    // The head the fork really has is read back, not assumed.
+    expect(realizedBase).toBe(head);
+    expect(expectedBase).toBe(head);
+    expect(baseMismatch).toBeUndefined();
     const clone = join(rootDir, "fork-clone");
     await run("git", ["clone", "-q", ref.gitUrl, clone]);
     expect((await run("git", ["-C", clone, "rev-parse", "HEAD"])).stdout.trim()).toBe(head);
@@ -56,7 +60,9 @@ describe("LocalFilesystemWorkspaceProvider", () => {
     await expect(provider.inspect(source)).resolves.toMatchObject({ name: "requester" });
     // A fork of an empty repo is empty.
     const empty = await provider.create("empty");
-    await expect(provider.fork(empty, "empty-fork")).resolves.toMatchObject({ ref: { name: "empty-fork" } });
+    const emptyFork = await provider.fork(empty, "empty-fork");
+    expect(emptyFork.ref.name).toBe("empty-fork");
+    expect(emptyFork.realizedBase).toBeUndefined();
   });
 
   it("issues and revokes scoped tokens labelled as local placeholders", async () => {

@@ -26,6 +26,7 @@ export type {
   EvidenceSummary,
   IntegrationResult,
   OutputRef,
+  PromotionPush,
   VerificationContract,
   Verdict,
   WorkUnitVerification,
@@ -108,11 +109,23 @@ export type {
 export { VerificationProvider } from "./verifier.ts";
 
 export type {
+  AdvanceBranchOptions,
   IntegrateOptions,
   IntegratorOptions,
+  PromotionRefusalReason,
   VerifiedWorkspace,
 } from "./integrator.ts";
-export { advanceIntegrationBranch, GATED_REF_PREFIX, gatedRef, Integrator, recordBaselineInventory } from "./integrator.ts";
+export {
+  advanceIntegrationBranch,
+  GATED_REF_PREFIX,
+  gatedRef,
+  Integrator,
+  isPromotionRefused,
+  PromotionRefusedError,
+  recordBaselineInventory,
+} from "./integrator.ts";
+export type { ClashHead, ClashOutcome, ClashPair, ClashPrediction, PredictClashesInput } from "./clash.ts";
+export { CLASH_DEFAULTS, predictClashes } from "./clash.ts";
 export type { TestInventory, TestProgress } from "./test-inventory.ts";
 export { inventoryAfterContracts, inventoryShortfall, labelGateProgress, readStreamInventory, readTestInventory, readTestProgress } from "./test-inventory.ts";
 export type { GateProgress, TestSuiteProgress } from "./test-inventory.ts";

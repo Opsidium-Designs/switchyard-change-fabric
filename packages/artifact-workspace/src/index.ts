@@ -31,16 +31,24 @@ export { DEFAULT_TOKEN_TTL_SECONDS } from "./types.ts";
 
 export type {
   ArtifactsBinding,
+  ArtifactsCommitHead,
   ArtifactsCreateOptions,
   ArtifactsCreateRepoResult,
   ArtifactsCreateTokenResult,
   ArtifactsForkOptions,
+  ArtifactsForkResult,
   ArtifactsImportParams,
   ArtifactsRepoHandle,
   ArtifactsRepoInfo,
+  CloudflareProviderOptions,
+  ForkReadBackOptions,
+  ReadinessOptions,
+  ReadinessReport,
 } from "./cloudflare.ts";
 export {
   BindingUnavailableError,
   CloudflareArtifactWorkspaceProvider,
   isBindingUnavailable,
+  READINESS_DEFAULTS,
+  RepoNotReadyError,
 } from "./cloudflare.ts";

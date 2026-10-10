@@ -96,18 +96,42 @@ export class LocalFilesystemWorkspaceProvider implements WorkspaceProvider {
    * Fork an existing workspace into a new one (the offline counterpart of the
    * Artifacts repo fork): the new bare repo gets a copy of every branch of the
    * source, so a clone starts from the source's current state. Returns the new
-   * ref and a write token (a local placeholder, like every token here).
+   * ref and a write token (a local placeholder, like every token here), plus
+   * the head the fork really has (`realizedBase`, read back from the fork) and
+   * the source head read just before (`expectedBase`), with `baseMismatch`
+   * when they differ, as the Artifacts fork reports. Both are absent for an
+   * empty source.
    */
-  async fork(ref: WorkspaceRef, targetName: string, ttlSeconds = DEFAULT_TOKEN_TTL_SECONDS): Promise<{ ref: WorkspaceRef; token: ScopedToken }> {
+  async fork(
+    ref: WorkspaceRef,
+    targetName: string,
+    ttlSeconds = DEFAULT_TOKEN_TTL_SECONDS,
+  ): Promise<{
+    ref: WorkspaceRef;
+    token: ScopedToken;
+    realizedBase?: string;
+    expectedBase?: string;
+    baseMismatch?: { expected: string; realized: string };
+  }> {
     const source = this.require(ref.name);
     if (this.repos.has(targetName)) {
       throw new Error(`local workspace already exists: ${targetName}`);
     }
+    const expectedBase = await branchHead(source.repoDir, ref.defaultBranch);
     const forked = await this.create(targetName, { defaultBranch: ref.defaultBranch });
     const target = this.require(forked.name);
     // An empty source has no branch yet: the fork is empty too.
     await runGit(["-C", target.repoDir, "fetch", "-q", source.repoDir, "+refs/heads/*:refs/heads/*"]);
-    return { ref: forked, token: await this.issueWriteToken(forked, ttlSeconds) };
+    const realizedBase = await branchHead(target.repoDir, forked.defaultBranch);
+    return {
+      ref: forked,
+      token: await this.issueWriteToken(forked, ttlSeconds),
+      ...(realizedBase !== undefined ? { realizedBase } : {}),
+      ...(expectedBase !== undefined ? { expectedBase } : {}),
+      ...(realizedBase !== undefined && expectedBase !== undefined && realizedBase !== expectedBase
+        ? { baseMismatch: { expected: expectedBase, realized: realizedBase } }
+        : {}),
+    };
   }
 
   async issueReadToken(ref: WorkspaceRef, ttlSeconds = DEFAULT_TOKEN_TTL_SECONDS): Promise<ScopedToken> {
@@ -189,6 +213,17 @@ export class LocalFilesystemWorkspaceProvider implements WorkspaceProvider {
       throw new Error(`unknown local workspace: ${name}`);
     }
     return record;
+  }
+}
+
+/** The commit a bare repo's branch points at, or undefined when it has none. */
+async function branchHead(repoDir: string, branch: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await runGit(["-C", repoDir, "rev-parse", "--verify", "-q", `refs/heads/${branch}^{commit}`]);
+    const sha = stdout.trim();
+    return sha === "" ? undefined : sha;
+  } catch {
+    return undefined;
   }
 }
 

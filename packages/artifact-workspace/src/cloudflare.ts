@@ -122,6 +122,108 @@ export interface ArtifactsRepoHandle {
   info(): Promise<ArtifactsRepoInfo>;
   /** Fork this repo to a new repo; returns the new repo with its one-time token. */
   fork?(name: string, opts?: ArtifactsForkOptions): Promise<ArtifactsCreateRepoResult>;
+  /**
+   * First-parent history, newest first (the real `ArtifactsRepo.log`). Optional
+   * here: the fork read-back uses it when present to learn the head a fork
+   * really has; a handle without it leaves the realized base unknown.
+   */
+  log?(opts?: { readonly ref?: string; readonly limit?: number; readonly offset?: number }): Promise<readonly ArtifactsCommitHead[]>;
+}
+
+/** The part of the real `ArtifactsCommitMetadata` the fork read-back reads. */
+export interface ArtifactsCommitHead {
+  readonly hash: string;
+}
+
+/**
+ * How long, and how, the provider waits for a new repo to become usable after
+ * create, import, or fork. The real binding has no readiness field on `info()`
+ * or `list()`; a repo still being built makes `get(name)` throw with code
+ * `CREATE_IN_PROGRESS` / `IMPORT_IN_PROGRESS` / `FORK_IN_PROGRESS`. The wait
+ * polls `get(name).info()` with a small backoff until it answers. A binding
+ * that never reports in-progress resolves on the first probe, so behavior with
+ * such a binding is unchanged.
+ */
+export interface ReadinessOptions {
+  /** Total time to wait before failing (default 30s). */
+  readonly timeoutMs?: number;
+  /** The first backoff delay (default 100ms); doubled each poll up to maxDelayMs. */
+  readonly initialDelayMs?: number;
+  /** The largest backoff delay (default 2s). */
+  readonly maxDelayMs?: number;
+  /** Injectable sleep (tests pass a fake). */
+  readonly sleep?: (ms: number) => Promise<void>;
+  /** Injectable clock in milliseconds (tests pass a fake). */
+  readonly now?: () => number;
+}
+
+/** Options for constructing the Cloudflare provider. */
+export interface CloudflareProviderOptions {
+  readonly readiness?: ReadinessOptions;
+}
+
+/** Defaults for the readiness wait. */
+export const READINESS_DEFAULTS = { timeoutMs: 30_000, initialDelayMs: 100, maxDelayMs: 2_000 } as const;
+
+/** How long a readiness wait took. */
+export interface ReadinessReport {
+  readonly attempts: number;
+  readonly waitedMs: number;
+}
+
+/**
+ * Thrown when a new repo did not become usable within the readiness timeout.
+ * Names the repo and the last not-ready code seen, so the failure is honest
+ * rather than a token issued against a repo an agent cannot clone yet.
+ */
+export class RepoNotReadyError extends Error {
+  readonly repo: string;
+  readonly attempts: number;
+  readonly waitedMs: number;
+  readonly lastCode?: string;
+  constructor(repo: string, attempts: number, waitedMs: number, lastCode?: string) {
+    super(
+      `Artifacts repo ${repo} was not ready after ${waitedMs}ms (${attempts} probe(s)` +
+        `${lastCode ? `, last: ${lastCode}` : ""}); no token was issued for it`,
+    );
+    this.name = "RepoNotReadyError";
+    this.repo = repo;
+    this.attempts = attempts;
+    this.waitedMs = waitedMs;
+    if (lastCode !== undefined) {
+      this.lastCode = lastCode;
+    }
+  }
+}
+
+/** Options for the fork read-back (not passed to the binding). */
+export interface ForkReadBackOptions {
+  /**
+   * The source head the caller expects the fork to start from. When omitted,
+   * the source's head read just before the fork (when the handle can report
+   * it) is the expected value.
+   */
+  readonly expectedBase?: string;
+}
+
+/** What a fork produced, including the head the fork actually has. */
+export interface ArtifactsForkResult {
+  readonly ref: WorkspaceRef;
+  /** The fork's one-time creation token. */
+  readonly token: string;
+  /**
+   * The head commit the fork really has, read back from the fork after it
+   * became ready. Absent when the binding cannot report it (unknown, never
+   * assumed equal to the source).
+   */
+  readonly realizedBase?: string;
+  /** The head the fork was expected to start from, when known. */
+  readonly expectedBase?: string;
+  /**
+   * Set when both heads are known and differ (for example the source moved
+   * between the read and the fork): recorded, never silently passed.
+   */
+  readonly baseMismatch?: { readonly expected: string; readonly realized: string };
 }
 
 /** Thrown when the Artifacts binding is wired but cannot reach the service. */
@@ -136,7 +238,14 @@ export class BindingUnavailableError extends Error {
 
 /** WorkspaceProvider over the real Cloudflare Artifacts binding. */
 export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
-  constructor(private readonly binding: ArtifactsBinding) {}
+  private readonly readiness: ReadinessOptions;
+
+  constructor(
+    private readonly binding: ArtifactsBinding,
+    options: CloudflareProviderOptions = {},
+  ) {
+    this.readiness = options.readiness ?? {};
+  }
 
   async create(name: string, opts?: CreateWorkspaceOptions): Promise<WorkspaceRef> {
     const result = await this.call(() =>
@@ -146,6 +255,7 @@ export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
         setDefaultBranch: opts?.defaultBranch,
       }),
     );
+    await this.waitUntilReady(result.name);
     return this.toRef(result);
   }
 
@@ -159,6 +269,7 @@ export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
         target: { name: ref.name },
       }),
     );
+    await this.waitUntilReady(ref.name);
   }
 
   /**
@@ -167,19 +278,76 @@ export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
    * (`get(name).fork(target)`); a fake without `fork` reports it as unsupported.
    * This is an additive capability over the portable WorkspaceProvider contract,
    * used by the live Artifacts path; non-forking backends simply do not expose it.
+   *
+   * The fork is returned only once it is usable (see waitUntilReady), and with
+   * the head it REALLY has, read back from the fork, never assumed to equal
+   * the source head. A known expected head that differs is recorded as
+   * `baseMismatch`.
    */
   async fork(
     ref: WorkspaceRef,
     targetName: string,
     opts?: ArtifactsForkOptions,
-  ): Promise<{ ref: WorkspaceRef; token: string }> {
-    return this.withRepo(ref.name, async (repo) => {
+    readBack: ForkReadBackOptions = {},
+  ): Promise<ArtifactsForkResult> {
+    const { result, sourceHead } = await this.withRepo(ref.name, async (repo) => {
       if (typeof repo.fork !== "function") {
         throw new Error("the Artifacts binding handle does not support fork");
       }
-      const result = await repo.fork(targetName, opts);
-      return { ref: this.toRef(result), token: result.token };
+      const head = readBack.expectedBase === undefined ? await headOf(repo) : undefined;
+      return { result: await repo.fork(targetName, opts), sourceHead: head };
     });
+    await this.waitUntilReady(result.name);
+    const realizedBase = await this.withRepo(result.name, (repo) => headOf(repo)).catch(() => undefined);
+    const expectedBase = readBack.expectedBase ?? sourceHead;
+    return {
+      ref: this.toRef(result),
+      token: result.token,
+      ...(realizedBase !== undefined ? { realizedBase } : {}),
+      ...(expectedBase !== undefined ? { expectedBase } : {}),
+      ...(realizedBase !== undefined && expectedBase !== undefined && realizedBase !== expectedBase
+        ? { baseMismatch: { expected: expectedBase, realized: realizedBase } }
+        : {}),
+    };
+  }
+
+  /**
+   * Wait until a repo just created, imported, or forked is usable: poll
+   * `get(name).info()` with a bounded backoff while the binding reports the
+   * repo is still being built (an *_IN_PROGRESS code, or NOT_FOUND, which a
+   * just-created repo can briefly return). Any other error is thrown as is
+   * (binding-unavailable translated, as everywhere). Resolves on the first
+   * answer, so a binding with no readiness signal is never delayed. Throws
+   * RepoNotReadyError, naming the repo, once the total timeout is spent.
+   */
+  async waitUntilReady(name: string): Promise<ReadinessReport> {
+    const timeoutMs = this.readiness.timeoutMs ?? READINESS_DEFAULTS.timeoutMs;
+    const maxDelayMs = this.readiness.maxDelayMs ?? READINESS_DEFAULTS.maxDelayMs;
+    const sleep = this.readiness.sleep ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+    const now = this.readiness.now ?? Date.now;
+    const started = now();
+    let delay = this.readiness.initialDelayMs ?? READINESS_DEFAULTS.initialDelayMs;
+    let attempts = 0;
+    for (;;) {
+      attempts += 1;
+      let code: string;
+      try {
+        await this.withRepo(name, (repo) => repo.info());
+        return { attempts, waitedMs: now() - started };
+      } catch (error) {
+        const pending = notReadyCode(error);
+        if (pending === undefined) {
+          throw error;
+        }
+        code = pending;
+      }
+      const waited = now() - started;
+      if (waited >= timeoutMs) {
+        throw new RepoNotReadyError(name, attempts, waited, code);
+      }
+      await sleep(Math.min(delay, timeoutMs - waited));
+      delay = Math.min(delay * 2, maxDelayMs);
+    }
   }
 
   async issueReadToken(ref: WorkspaceRef, ttlSeconds = DEFAULT_TOKEN_TTL_SECONDS): Promise<ScopedToken> {
@@ -274,6 +442,36 @@ export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
       }
       throw error;
     }
+  }
+}
+
+/** The codes the binding uses for a repo that exists but is not usable yet. */
+const NOT_READY_CODES = new Set(["CREATE_IN_PROGRESS", "IMPORT_IN_PROGRESS", "FORK_IN_PROGRESS", "NOT_FOUND"]);
+
+/**
+ * The not-ready code of a binding error, or undefined when the error means
+ * something else. The code is read from `.code`, falling back to the message
+ * (an RPC hop can drop the property but keep the text).
+ */
+function notReadyCode(error: unknown): string | undefined {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && NOT_READY_CODES.has(code)) {
+    return code;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return /\b(CREATE|IMPORT|FORK)_IN_PROGRESS\b/.exec(message)?.[0];
+}
+
+/** The head commit a repo handle reports, or undefined when it cannot say. */
+async function headOf(repo: ArtifactsRepoHandle): Promise<string | undefined> {
+  if (typeof repo.log !== "function") {
+    return undefined;
+  }
+  try {
+    const hash = (await repo.log({ limit: 1 }))[0]?.hash;
+    return typeof hash === "string" && /^[0-9a-f]{40,64}$/.test(hash) ? hash : undefined;
+  } catch {
+    return undefined;
   }
 }
 

@@ -104,6 +104,10 @@ describe("integration job schema", () => {
     const advance = { version: 1, kind: "advance", integration: job().integration, commit: SHA_A };
     expect(parseGateJob(advance)).toEqual({ ok: true, value: advance });
     expect(parseGateJob({ ...advance, commit: "HEAD" }).ok).toBe(false);
+    // The compare-and-swap base is optional and must be a FULL commit id.
+    const leased = { ...advance, expectedBase: "b".repeat(40) };
+    expect(parseGateJob(leased)).toEqual({ ok: true, value: leased });
+    expect(parseGateJob({ ...advance, expectedBase: "bbbbbbb" }).ok).toBe(false);
   });
 
   it("checks a result's shape before anything records it", () => {

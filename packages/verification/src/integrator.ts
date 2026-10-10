@@ -38,7 +38,7 @@ import {
 } from "./git.ts";
 import { matchesAny } from "./pathscope.ts";
 import { inventoryShortfall, readStreamInventory, readTestProgress, type TestInventory } from "./test-inventory.ts";
-import type { CheckResult, IntegrationResult, OutputRef, Verdict } from "./types.ts";
+import type { CheckResult, IntegrationResult, OutputRef, PromotionPush, Verdict } from "./types.ts";
 
 /** One verified WorkUnit's workspace to feed into integration. */
 export interface VerifiedWorkspace {
@@ -202,6 +202,13 @@ export class Integrator {
 
     try {
       await clone(authenticated(integrationRef.gitUrl, options.integrationToken), integrationDir);
+      // The trunk value this integration builds on: the branch head at clone
+      // time (empty when the branch does not exist yet). The final push is a
+      // compare-and-swap against exactly this value, read before any agent
+      // code runs in the checkout.
+      const expectedBase = (
+        await git(integrationDir, ["rev-parse", "--verify", "-q", `refs/remotes/origin/${integrationRef.defaultBranch}^{commit}`]).catch(() => "")
+      ).trim();
       if (options.baseCommit !== undefined) {
         // The base is the last RECORDED passing revision: candidate refs hold
         // gated commits the branch has not (yet) been advanced to.
@@ -285,6 +292,16 @@ export class Integrator {
       await runGit(["init", "-q", "--bare", trusted]);
       if (gated !== "") {
         await safeGit(trusted, ["fetch", "-q", integrationDir, `+HEAD:${gatedRef(gated)}`]);
+        if (expectedBase !== "") {
+          // The expected trunk object too, so the ancestry check before the
+          // push runs in the trusted repo, never in the gate's checkout.
+          await safeGit(trusted, [
+            "fetch",
+            "-q",
+            integrationDir,
+            `+refs/remotes/origin/${integrationRef.defaultBranch}:${EXPECTED_BASE_REF}`,
+          ]);
+        }
       }
 
       const ranGate = await this.runIntegrationGate(
@@ -342,14 +359,20 @@ export class Integrator {
 
       // Push the gated commit only on a verified verdict, from the trusted repo
       // (hooks off, minimal environment), so gated tree == pushed tree and no
-      // hook or config the gate's code planted can see the credential.
+      // hook or config the gate's code planted can see the credential. The
+      // branch push is a compare-and-swap against the trunk value read at clone
+      // time: a trunk that moved meanwhile throws PromotionRefusedError
+      // ("trunk-moved") and the branch is left as the other writer set it. A
+      // deferred push goes to the commit's own candidate ref (named by the
+      // commit, so there is nothing to race on).
+      let promotion: PromotionPush | undefined;
       if (committed && verdict === "verified") {
-        await safeGit(trusted, [
-          "push",
-          "-q",
-          authenticated(integrationRef.gitUrl, options.integrationToken),
-          options.deferBranchPush ? `${commit}:${gatedRef(commit)}` : `${commit}:refs/heads/${integrationRef.defaultBranch}`,
-        ]);
+        const remote = authenticated(integrationRef.gitUrl, options.integrationToken);
+        if (options.deferBranchPush) {
+          await safeGit(trusted, ["push", "-q", remote, `${commit}:${gatedRef(commit)}`]);
+        } else {
+          promotion = await compareAndSwapBranch(trusted, remote, integrationRef.defaultBranch, commit, expectedBase === "" ? null : expectedBase);
+        }
       }
 
       return {
@@ -363,6 +386,7 @@ export class Integrator {
         finalCheck,
         ...(commit !== "" ? { commit } : {}),
         ...(protectedViolations.length > 0 ? { protectedViolations } : {}),
+        ...(promotion !== undefined ? { promotion } : {}),
       };
     } finally {
       await rm(integrationDir, { recursive: true, force: true });
@@ -603,36 +627,182 @@ export function gatedRef(commit: string): string {
   return `${GATED_REF_PREFIX}${commit}`;
 }
 
+/** Where the trusted repo keeps the expected trunk object for the ancestry check. */
+const EXPECTED_BASE_REF = "refs/switchyard/expected-base";
+
+/** Why a compare-and-swap branch push was refused. */
+export type PromotionRefusalReason = "trunk-moved" | "not-descendant";
+
+/**
+ * A branch promotion that did not happen, for a named reason, instead of a
+ * generic git error:
+ *   - "trunk-moved": the branch is no longer at the value this promotion was
+ *     built on (another writer advanced it); `actual` is what it holds now when
+ *     it could be read. Nothing was pushed; do not retry blindly, rebuild on
+ *     the new trunk.
+ *   - "not-descendant": the commit does not descend from the expected trunk
+ *     value, so pushing it would move the branch sideways. Nothing was pushed.
+ * Carries only ref names and commit ids (never a credential).
+ */
+export class PromotionRefusedError extends Error {
+  readonly reason: PromotionRefusalReason;
+  readonly ref: string;
+  readonly commit: string;
+  readonly expected: string | null;
+  readonly actual?: string | null;
+  constructor(input: {
+    readonly reason: PromotionRefusalReason;
+    readonly ref: string;
+    readonly commit: string;
+    readonly expected: string | null;
+    readonly actual?: string | null;
+  }) {
+    const expected = input.expected ?? "(absent)";
+    super(
+      input.reason === "trunk-moved"
+        ? `promotion refused (trunk-moved): ${input.ref} is no longer at ${expected}` +
+            `${input.actual !== undefined ? ` (now ${input.actual ?? "(absent)"})` : ""}; ${input.commit} was not pushed`
+        : `promotion refused (not-descendant): ${input.commit} does not descend from ${expected} on ${input.ref}; nothing was pushed`,
+    );
+    this.name = "PromotionRefusedError";
+    this.reason = input.reason;
+    this.ref = input.ref;
+    this.commit = input.commit;
+    this.expected = input.expected;
+    if (input.actual !== undefined) {
+      this.actual = input.actual;
+    }
+  }
+}
+
+/** Is `error` a refused promotion (optionally for one reason)? */
+export function isPromotionRefused(error: unknown, reason?: PromotionRefusalReason): error is PromotionRefusedError {
+  return error instanceof PromotionRefusedError && (reason === undefined || error.reason === reason);
+}
+
+/**
+ * Move `refs/heads/<branch>` on `remote` from exactly `expected` (null: the
+ * branch must not exist) to `commit`, as a compare-and-swap:
+ *   1. locally (in `dir`, which holds both objects), `commit` must descend
+ *      from `expected` (`merge-base --is-ancestor`), so the move is a
+ *      fast-forward of the value the caller built on;
+ *   2. the push carries an explicit lease naming `expected`, which the server
+ *      checks against the ref in the same push, so a concurrent advance makes
+ *      the push fail instead of being overwritten.
+ * A failed push whose ref no longer reads `expected` is "trunk-moved". The
+ * pushed value is always `commit` itself (gate-equals-deploy holds). Never
+ * retries.
+ */
+async function compareAndSwapBranch(
+  dir: string,
+  remote: string,
+  branch: string,
+  commit: string,
+  expected: string | null,
+): Promise<PromotionPush> {
+  const ref = `refs/heads/${branch}`;
+  if (expected !== null) {
+    try {
+      await safeGit(dir, ["merge-base", "--is-ancestor", expected, commit]);
+    } catch (error) {
+      if ((error as { code?: unknown }).code === 1) {
+        throw new PromotionRefusedError({ reason: "not-descendant", ref, commit, expected });
+      }
+      throw new Error(`promotion refused: could not check that ${commit} descends from ${expected} (${errorText(error)})`);
+    }
+  }
+  try {
+    await safeGit(dir, ["push", "-q", `--force-with-lease=${ref}:${expected ?? ""}`, remote, `${commit}:${ref}`]);
+  } catch (error) {
+    const actual = await remoteRefValue(dir, remote, ref).catch(() => undefined);
+    if (actual !== undefined && actual !== expected) {
+      throw new PromotionRefusedError({ reason: "trunk-moved", ref, commit, expected, actual });
+    }
+    throw error;
+  }
+  return { ref, commit, expectedOld: expected };
+}
+
+/** What `ref` holds on `remote` now (null when it does not exist). */
+async function remoteRefValue(dir: string, remote: string, ref: string): Promise<string | null> {
+  const listed = await safeGit(dir, ["ls-remote", remote, ref]);
+  for (const line of listed.split("\n")) {
+    const [sha, name] = line.trim().split(/\s+/);
+    if (name === ref && sha !== undefined) {
+      return sha;
+    }
+  }
+  return null;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** Options for advancing the integration branch. */
+export interface AdvanceBranchOptions {
+  /**
+   * The trunk value the caller built the recorded revision on. When given, the
+   * branch must still hold exactly this value or the advance is refused as
+   * "trunk-moved" without pushing. Omitted, the branch value read at the start
+   * of the advance is the expected value (still a compare-and-swap: a writer
+   * that moves the branch between that read and the push makes it fail).
+   */
+  readonly expectedBase?: string;
+}
+
 /**
  * Advance the integration branch to a gated commit a deferred integration left
- * on its candidate ref (call this only after the revision was recorded).
+ * on its candidate ref (call this only after the revision was recorded). The
+ * move is a compare-and-swap fast-forward (see compareAndSwapBranch): it
+ * throws PromotionRefusedError ("trunk-moved" or "not-descendant") instead of
+ * a generic git error when another writer got there first. A branch already at
+ * `commit` is left as is.
  */
 export async function advanceIntegrationBranch(
   integrationRef: WorkspaceRef,
   token: string,
   commit: string,
   workRoot: string = tmpdir(),
-): Promise<void> {
+  options: AdvanceBranchOptions = {},
+): Promise<PromotionPush> {
   if (!/^[0-9a-f]{7,64}$/.test(commit)) {
     throw new Error(`not a commit id: ${commit}`);
   }
+  if (options.expectedBase !== undefined && !/^[0-9a-f]{40,64}$/.test(options.expectedBase)) {
+    throw new Error(`not a full commit id: ${options.expectedBase}`);
+  }
   const remote = authenticated(integrationRef.gitUrl, token);
+  const branchRef = `refs/heads/${integrationRef.defaultBranch}`;
   const dir = await mkdtemp(join(workRoot, "scf-advance-"));
   try {
     await git(dir, ["init", "-q", "--bare"]);
+    // The branch value now (the expected old value unless the caller named one).
+    const observed = await git(dir, ["fetch", "-q", remote, `+${branchRef}:${EXPECTED_BASE_REF}`])
+      .then(async () => (await git(dir, ["rev-parse", "--verify", "-q", `${EXPECTED_BASE_REF}^{commit}`])).trim())
+      .catch(() => null);
     await git(dir, ["fetch", "-q", remote, `${gatedRef(commit)}:${gatedRef(commit)}`]).catch(async () => {
       // Already on the branch (nothing was committed for it): fetch the branch.
-      await git(dir, ["fetch", "-q", remote, `+refs/heads/${integrationRef.defaultBranch}:refs/heads/${integrationRef.defaultBranch}`]);
+      await git(dir, ["fetch", "-q", remote, `+${branchRef}:${branchRef}`]);
     });
-    // A fast-forward only: the branch must be an ancestor of the recorded
-    // commit (no force), so it can never be moved sideways.
-    await git(dir, ["push", "-q", remote, `${commit}:refs/heads/${integrationRef.defaultBranch}`]);
+    let promotion: PromotionPush;
+    if (observed !== null && observed.startsWith(commit)) {
+      promotion = { ref: branchRef, commit: observed, expectedOld: observed };
+    } else {
+      if (options.expectedBase !== undefined && observed !== options.expectedBase) {
+        throw new PromotionRefusedError({ reason: "trunk-moved", ref: branchRef, commit, expected: options.expectedBase, actual: observed });
+      }
+      // A fast-forward only, leased on the value read above: the branch can
+      // never be moved sideways, nor over a concurrent advance.
+      promotion = await compareAndSwapBranch(dir, remote, integrationRef.defaultBranch, commit, observed);
+    }
     // Prune candidate refs: the recorded commit is on the branch now, and any
     // other candidate was a discarded result.
     const listed = await git(dir, ["ls-remote", remote, `${GATED_REF_PREFIX}*`]).catch(() => "");
     for (const ref of listed.split("\n").map((l) => l.trim().split(/\s+/)[1]).filter((r): r is string => !!r)) {
       await git(dir, ["push", "-q", remote, `:${ref}`]).catch(() => "");
     }
+    return promotion;
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

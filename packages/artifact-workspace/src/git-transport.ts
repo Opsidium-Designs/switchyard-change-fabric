@@ -49,6 +49,8 @@ export interface RunGitOptions {
   /** Extra environment (for example GIT_INDEX_FILE); never a credential. */
   readonly env?: Readonly<Record<string, string>>;
   readonly maxBuffer?: number;
+  /** Kill git (SIGKILL) after this many milliseconds; the call then rejects. Unset: no limit. */
+  readonly timeoutMs?: number;
 }
 
 /** What git printed. */
@@ -153,6 +155,7 @@ async function spawnGit(
     const { stdout, stderr } = await exec("git", [...args], {
       env,
       maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
+      ...(options.timeoutMs !== undefined ? { timeout: options.timeoutMs, killSignal: "SIGKILL" as const } : {}),
     });
     return { stdout, stderr };
   } finally {

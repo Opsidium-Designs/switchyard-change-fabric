@@ -40,6 +40,7 @@ import {
   type Change,
   type ToolRequirement,
 } from "@switchyard-change/change-core";
+import { boundedRepoName } from "@switchyard-change/change-core/repo-name";
 import {
   LocalFilesystemWorkspaceProvider,
 } from "@switchyard-change/artifact-workspace/local";
@@ -160,10 +161,7 @@ async function buildAndConsumeTool(
   const consumerIds = requirement.consumers.filter((id) => id !== builderUnitId);
 
   // 1. The tool-builder agent provisions its OWN workspace (its own repo).
-  const toolWorkspaceName = `${options.change.id}--${builderUnitId}`.replace(
-    /[^A-Za-z0-9._-]+/g,
-    "-",
-  );
+  const toolWorkspaceName = boundedRepoName(`${options.change.id}--${builderUnitId}`);
   const ref = await options.workspaces.create(toolWorkspaceName, { defaultBranch: "main" });
   const token = await options.workspaces.issueWriteToken(ref);
 

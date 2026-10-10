@@ -10,6 +10,7 @@ import {
   parseChangeSpec,
   type BoardErrorCode,
 } from "@switchyard-change/change-core";
+import { boundedRepoName } from "@switchyard-change/change-core/repo-name";
 import type { DiscoveredWorkUnit } from "@switchyard-change/change-core";
 
 import { configuredApiToken, hasValidBearer, requiresAuth } from "./auth.ts";
@@ -85,7 +86,7 @@ export function workspaceNameFor(changeId: string, unitId: string, round?: numbe
     round !== undefined && Number.isFinite(round) && round > 0
       ? `${changeId}--${unitId}--r${Math.floor(round)}`
       : `${changeId}--${unitId}`;
-  return base.replace(/[^A-Za-z0-9._-]+/g, "-");
+  return boundedRepoName(base);
 }
 
 /**
@@ -1933,7 +1934,7 @@ function errorMessage(error: unknown): string {
 
 /** The integration repo of a Change run integrated on Cloudflare. */
 export function integrationWorkspaceName(changeId: string): string {
-  return `${changeId}--integration`.replace(/[^A-Za-z0-9._-]+/g, "-");
+  return boundedRepoName(`${changeId}--integration`);
 }
 
 /** What asking for integration on Cloudflare did. */

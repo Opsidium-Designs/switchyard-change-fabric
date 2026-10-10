@@ -111,6 +111,12 @@ export interface AdvanceJob {
   readonly kind: "advance";
   readonly integration: { readonly repoUrl: string; readonly defaultBranch: string };
   readonly commit: string;
+  /**
+   * The branch value the caller expects (a full commit id). When given, a
+   * branch at any other value refuses the advance as "trunk-moved" without
+   * pushing; omitted, the value read at the start of the job is leased.
+   */
+  readonly expectedBase?: string;
 }
 
 export type GateJob = IntegrateJob | AdvanceJob;
@@ -174,6 +180,16 @@ export interface AdvanceJobResult {
   readonly commit: string;
   readonly phases: readonly JobPhaseRecord[];
   readonly error?: string;
+  /**
+   * Set when the compare-and-swap push was refused (not a generic failure):
+   * "trunk-moved" (another writer advanced the branch; `actual` is its value
+   * when it could be read) or "not-descendant". Nothing was pushed.
+   */
+  readonly refused?: {
+    readonly reason: "trunk-moved" | "not-descendant";
+    readonly expected: string | null;
+    readonly actual?: string | null;
+  };
   readonly durationMs: number;
 }
 
@@ -235,6 +251,14 @@ function strList(value: unknown, where: string, check?: (s: string) => boolean):
 function commit(value: unknown, where: string): string {
   if (typeof value !== "string" || !COMMIT.test(value)) {
     throw new JobError(`${where} must be a commit id`);
+  }
+  return value;
+}
+
+/** A full (unabbreviated) commit id: what a compare-and-swap compares against. */
+function fullCommit(value: unknown, where: string): string {
+  if (typeof value !== "string" || !/^[0-9a-f]{40,64}$/.test(value)) {
+    throw new JobError(`${where} must be a full commit id`);
   }
   return value;
 }
@@ -447,10 +471,16 @@ export function parseGateJob(raw: unknown): Parsed<GateJob> {
       return { ok: true, value: parseIntegrate(raw) };
     }
     if (raw.kind === "advance") {
-      only(raw, ["version", "kind", "integration", "commit"], "the job");
+      only(raw, ["version", "kind", "integration", "commit", "expectedBase"], "the job");
       return {
         ok: true,
-        value: { version: INTEGRATE_JOB_VERSION, kind: "advance", integration: integration(raw.integration, "integration"), commit: commit(raw.commit, "commit") },
+        value: {
+          version: INTEGRATE_JOB_VERSION,
+          kind: "advance",
+          integration: integration(raw.integration, "integration"),
+          commit: commit(raw.commit, "commit"),
+          ...(raw.expectedBase !== undefined ? { expectedBase: fullCommit(raw.expectedBase, "expectedBase") } : {}),
+        },
       };
     }
     throw new JobError('a job kind must be "integrate" or "advance"');

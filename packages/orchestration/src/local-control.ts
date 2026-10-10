@@ -68,6 +68,7 @@ import {
   type RecruitDecision,
   type WorkUnitStatus,
 } from "@switchyard-change/change-core";
+import { boundedRepoName } from "@switchyard-change/change-core/repo-name";
 import type {
   LocalFilesystemWorkspaceProvider,
 } from "@switchyard-change/artifact-workspace/local";
@@ -2538,7 +2539,7 @@ export function workspaceNameFor(changeId: string, unitId: string, round?: numbe
     round !== undefined && Number.isFinite(round) && round > 0
       ? `${changeId}--${unitId}--r${Math.floor(round)}`
       : `${changeId}--${unitId}`;
-  return base.replace(/[^A-Za-z0-9._-]+/g, "-");
+  return boundedRepoName(base);
 }
 
 /** The map key for a round-N agent instance, keyed by (unitId, round). */

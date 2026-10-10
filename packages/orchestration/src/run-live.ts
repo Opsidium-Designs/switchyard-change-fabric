@@ -47,6 +47,7 @@ import {
   type ConcurrencyDial,
   type LeaseDecision,
 } from "@switchyard-change/change-core";
+import { boundedRepoName } from "@switchyard-change/change-core/repo-name";
 import type { ExecutorProvider } from "@switchyard-change/model-adapters";
 import { ScopedNoopExecutor } from "@switchyard-change/model-adapters";
 import type { AskJev, JevAnswer } from "@switchyard-change/model-adapters";
@@ -2876,7 +2877,7 @@ export async function createIntegrationWorkspace(
   const artifactsRoot = join(workRoot, "integration-artifacts");
   await mkdir(artifactsRoot, { recursive: true });
   const workspaces = new LocalFilesystemWorkspaceProvider({ rootDir: artifactsRoot });
-  const name = `${changeId}--integration`.replace(/[^A-Za-z0-9._-]+/g, "-");
+  const name = boundedRepoName(`${changeId}--integration`);
   const integrationRef = await workspaces.create(name, { defaultBranch: "main" });
   const token = await workspaces.issueWriteToken(integrationRef);
   await seedFromProject(integrationRef, projectDir, join(workRoot, "seed"), identity);

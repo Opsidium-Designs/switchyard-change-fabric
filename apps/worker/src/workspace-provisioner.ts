@@ -34,6 +34,15 @@ export interface ProvisionedWorkspace {
   readonly tokenId: string;
   readonly token: string;
   readonly tokenExpiresAt: string;
+  /**
+   * A fork only: the head the fork really has, read back from the fork once it
+   * was ready (absent when the backend cannot report it; never assumed).
+   */
+  readonly realizedBase?: string;
+  /** A fork only: the head the fork was expected to start from, when known. */
+  readonly expectedBase?: string;
+  /** A fork only: both heads known and different (recorded, never silently passed). */
+  readonly baseMismatch?: { readonly expected: string; readonly realized: string };
 }
 
 /** Options for one provisioning. */
@@ -44,6 +53,11 @@ export interface ProvisionOptions {
    * omitted keeps the default lifetime the lease routes always used.
    */
   readonly ttlSeconds?: number;
+  /**
+   * A fork only: the source head the caller expects the fork to start from.
+   * Omitted, the source head read just before the fork is the expected value.
+   */
+  readonly expectedBase?: string;
 }
 
 /** A short-lived read token for an existing workspace (plaintext returned once). */
@@ -114,6 +128,8 @@ class CloudflareProvisioner implements WorkspaceProvisioner {
 
   async provision(workspaceName: string, options: ProvisionOptions = {}): Promise<ProvisionedWorkspace> {
     try {
+      // create resolves only once the new repo is usable (the provider's
+      // readiness wait), so the token is never issued for a repo still building.
       const ref = await this.provider.create(workspaceName);
       const token = await this.provider.issueWriteToken(ref, options.ttlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS);
       this.refs.set(workspaceName, { name: ref.name });
@@ -138,7 +154,16 @@ class CloudflareProvisioner implements WorkspaceProvisioner {
 
   async fork(sourceName: string, targetName: string, options: ProvisionOptions = {}): Promise<ProvisionedWorkspace> {
     try {
-      const { ref, token: creation } = await this.provider.fork(this.refByName(sourceName), targetName);
+      // The provider returns the fork only once it is ready, with the head it
+      // really has read back (realizedBase), so the write token below is never
+      // issued against a repo an agent cannot clone yet.
+      const forked = await this.provider.fork(
+        this.refByName(sourceName),
+        targetName,
+        undefined,
+        options.expectedBase !== undefined ? { expectedBase: options.expectedBase } : {},
+      );
+      const { ref, token: creation } = forked;
       const token = await this.provider.issueWriteToken(ref, options.ttlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS);
       // The fork's creation token is never handed out: only the short one is.
       await this.provider.revokeToken(ref, creation).catch(() => false);
@@ -153,6 +178,9 @@ class CloudflareProvisioner implements WorkspaceProvisioner {
         tokenId: token.id,
         token: token.token,
         tokenExpiresAt: token.expiresAt,
+        ...(forked.realizedBase !== undefined ? { realizedBase: forked.realizedBase } : {}),
+        ...(forked.expectedBase !== undefined ? { expectedBase: forked.expectedBase } : {}),
+        ...(forked.baseMismatch !== undefined ? { baseMismatch: forked.baseMismatch } : {}),
       };
     } catch (error) {
       if (error instanceof BindingUnavailableError) {

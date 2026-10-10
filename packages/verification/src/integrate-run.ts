@@ -53,7 +53,7 @@ import {
   type DependencyInstallOutcome,
 } from "./dependency-install.ts";
 import { gateFailureLine } from "./gate-failure.ts";
-import { advanceIntegrationBranch } from "./integrator.ts";
+import { advanceIntegrationBranch, isPromotionRefused } from "./integrator.ts";
 import {
   INTEGRATE_JOB_VERSION,
   scrubJobText,
@@ -362,6 +362,7 @@ export async function runAdvanceJob(job: AdvanceJob, options: RunGateJobOptions)
       "",
       job.commit,
       options.workRoot,
+      job.expectedBase !== undefined ? { expectedBase: job.expectedBase } : {},
     );
     return { version: INTEGRATE_JOB_VERSION, kind: "advance", advanced: true, commit: job.commit, phases: tracker.phases, durationMs: now() - started };
   } catch (error) {
@@ -372,6 +373,16 @@ export async function runAdvanceJob(job: AdvanceJob, options: RunGateJobOptions)
       commit: job.commit,
       phases: tracker.phases,
       error: message(error),
+      // A lost compare-and-swap is a named outcome, not a generic error.
+      ...(isPromotionRefused(error)
+        ? {
+            refused: {
+              reason: error.reason,
+              expected: error.expected,
+              ...(error.actual !== undefined ? { actual: error.actual } : {}),
+            },
+          }
+        : {}),
       durationMs: now() - started,
     };
   }

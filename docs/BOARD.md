@@ -701,8 +701,9 @@ is distributed changes: items are proposed and claimed, never assigned.
   is; only that revision's candidate ref is fetched), restore the contract from
   the baseline, and run the gate. The gated commit is left on a candidate ref;
   the integration branch advances to it only after the board recorded the
-  revision, as a fast-forward (never forced), and the candidate refs are
-  pruned, so a result that is discarded never moves the branch. A unit's
+  revision, as a compare-and-swap fast-forward (see "Repos and promotion
+  safety" below), and the candidate refs are pruned, so a result that is
+  discarded never moves the branch. A unit's
   symlinks, files inside dependency or tool trees (`node_modules`, `.git`,
   `.bin`, `vendor/bin`), reads whose directory resolves outside the unit's
   checkout, and writes that would resolve outside the integration checkout
@@ -1322,7 +1323,9 @@ integrator code:
 - **Advance.** After a recorded pass, a second, git-only job fast-forwards the
   integration branch to the gated commit and prunes the candidate refs
   (`advanceIntegrationBranch`), so promotion clones a branch whose head is the
-  gated tree.
+  gated tree. A branch another writer moved meanwhile is a named refusal in
+  the job result (`refused: {reason: "trunk-moved", expected, actual}`), not a
+  generic error, and nothing is pushed.
 - **Promote (local).** The driver follows the attempts (`GET
   /changes/:id/integration/cloud`), turns recorded ones into its revisions
   (with their evidence), waits for the Workflow to settle at the end, and
@@ -1358,6 +1361,44 @@ gate run as another user (`scfgate`, uid 64321, via `setpriv`), so they cannot
 read the integrator's trusted repo, its memory, or its protocol streams, and
 cannot forge a phase change. The phases each revision ran under are recorded
 with the attempt.
+
+## Repos and promotion safety
+
+- **Bounded repo names.** Every Artifact repo name (`<change>--<unit>`,
+  `<change>--board-<agent>`, `<change>--help-<request>`, `<change>--tools`,
+  `<change>--integration`) goes through `boundedRepoName`
+  (`@switchyard-change/change-core/repo-name`): a name within the 63-character
+  Artifacts limit is unchanged; a longer one keeps a readable prefix and ends
+  with `-<8 hex>`, a hash of the full name, so two long names that share a
+  prefix never collide. Deterministic, the same on every substrate.
+- **Readiness.** The Artifacts provider returns a created, imported, or forked
+  repo only once it is usable: it polls `get(name).info()` with a small
+  backoff (30 s cap) while the binding reports `CREATE_IN_PROGRESS`,
+  `IMPORT_IN_PROGRESS`, `FORK_IN_PROGRESS`, or a brief `NOT_FOUND`, so no
+  token is issued for a repo an agent cannot clone yet. A timeout is a
+  `RepoNotReadyError` naming the repo. A binding that never reports
+  in-progress is not delayed.
+- **Fork read-back.** A fork reports the head it really has
+  (`realizedBase`, read from the fork's log), the head it was expected to
+  start from (`expectedBase`: the caller's, or the source head read just
+  before the fork), and `baseMismatch` when both are known and differ. Absent
+  when the backend cannot say: never assumed equal to the source.
+- **Compare-and-swap promotion.** The integrator records the integration
+  branch value at clone time. The branch push checks locally that the gated
+  commit descends from it (`merge-base --is-ancestor`), then pushes with an
+  explicit lease on that value (`--force-with-lease=refs/heads/<b>:<sha>`), so
+  the server rejects the push if the branch moved. A lost race throws
+  `PromotionRefusedError` (`reason: "trunk-moved"`, with expected and actual;
+  `"not-descendant"` for a sideways move), never retried; the pushed commit
+  is always the gated one. `advanceIntegrationBranch` does the same, leasing
+  the caller's `expectedBase` or the value it read.
+- **Clash prediction** (`predictClashes`, verification): for each pair of
+  agent heads over a base, clean (`disjoint` changed files, or a clean
+  `git merge-tree --write-tree`), conflict (the paths; scoped `shared` when
+  `isSharedPath` calls one shared, else `local`), or unknown (error, timeout,
+  pair limit). Read-only on the repo (merged trees go to a scratch object
+  store); `unavailable`, never clean, on a git older than 2.38. Advisory
+  input only: the gate on the integrated tree stays authoritative.
 
 Posture: the integration routes sit behind the same optional
 `SWITCHYARD_API_TOKEN` bearer as every other mutating route. With the bearer

@@ -7,8 +7,11 @@
  * offline local workspace backend) creates the agent's repo and a repo-scoped,
  * short-lived write token, returned once with the board token. These helpers
  * keep the request validation and the repo naming identical on both
- * substrates. Pure: no I/O, no clock.
+ * substrates. Pure: no I/O, no clock. Every repo name is bounded to the
+ * Artifacts name limit (see repo-name.ts): a name that fits is unchanged.
  */
+
+import { boundedRepoName } from "./repo-name.ts";
 
 /** The shortest and longest write-token lifetime a join may ask for, in seconds. */
 export const BOARD_WORKSPACE_TTL_BOUNDS = { min: 60, max: 3600 } as const;
@@ -54,7 +57,7 @@ export const BOARD_AGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
  * `<changeId>--<unitId>` repo for an ordinary unit id.
  */
 export function boardAgentWorkspaceName(changeId: string, agent: string): string {
-  return `${changeId}--board-${agent}`.replace(/[^A-Za-z0-9._-]+/g, "-");
+  return boundedRepoName(`${changeId}--board-${agent}`);
 }
 
 /**
@@ -63,7 +66,7 @@ export function boardAgentWorkspaceName(changeId: string, agent: string): string
  * its own branch (`tools/<capability>`), so builders never race each other.
  */
 export function toolsWorkspaceName(changeId: string): string {
-  return `${changeId}--tools`.replace(/[^A-Za-z0-9._-]+/g, "-");
+  return boundedRepoName(`${changeId}--tools`);
 }
 
 /** The branch of the tools repo a tool is built on. */
@@ -77,5 +80,5 @@ export function toolBranch(capability: string): string {
  * from the requester's in-progress state. One fork per request (one grantee).
  */
 export function boardHelpForkWorkspaceName(changeId: string, request: string): string {
-  return `${changeId}--help-${request}`.replace(/[^A-Za-z0-9._-]+/g, "-");
+  return boundedRepoName(`${changeId}--help-${request}`);
 }

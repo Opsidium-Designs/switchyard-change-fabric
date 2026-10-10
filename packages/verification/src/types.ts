@@ -146,6 +146,25 @@ export interface IntegrationResult {
    * presence fails the integration verdict. Absent when nothing protected changed.
    */
   readonly protectedViolations?: readonly string[];
+  /**
+   * The compare-and-swap push that moved the integration branch to `commit`:
+   * the ref and the old value the push leased (null when the branch did not
+   * exist). Absent when the branch was not pushed (a failed verdict, nothing
+   * committed, or a deferred push to a candidate ref).
+   */
+  readonly promotion?: PromotionPush;
+}
+
+/**
+ * A compare-and-swap branch push that landed: the ref moved from exactly
+ * `expectedOld` to `commit` (the gated commit), with the old value checked by
+ * the server in the same push.
+ */
+export interface PromotionPush {
+  readonly ref: string;
+  readonly commit: string;
+  /** The value the ref was leased at (null: the ref had to be absent). */
+  readonly expectedOld: string | null;
 }
 
 /**
