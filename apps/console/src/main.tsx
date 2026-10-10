@@ -3,6 +3,10 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { ReplayApp } from "./ReplayApp";
 import "./styles.css";
+import { applyTheme, initialTheme } from "./theme";
+
+// Apply the remembered (or URL-forced) theme before the first paint.
+applyTheme(initialTheme());
 
 const container = document.getElementById("root");
 if (!container) {

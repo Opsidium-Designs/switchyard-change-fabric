@@ -1,12 +1,69 @@
 :root {
-  color-scheme: dark;
-  --bg: #0d1117;
-  --panel: #161b22;
-  --border: #30363d;
-  --text: #e6edf3;
-  --muted: #8b949e;
-  --accent: #58a6ff;
+  /* The palette: every color is a variable written with light-dark(LIGHT, DARK),
+     so the page follows prefers-color-scheme until a theme is chosen
+     (data-theme on the root element, set by the theme toggle). */
+  color-scheme: light dark;
+  --bg: light-dark(#f6f8fa, #0d1117);
+  --panel: light-dark(#ffffff, #161b22);
+  --surface-2: light-dark(#ffffff, #1c2128);
+  --deep: light-dark(#eef1f4, #0a0e14);
+  --border: light-dark(#d0d7de, #30363d);
+  --text: light-dark(#1f2328, #e6edf3);
+  --muted: light-dark(#59636e, #8b949e);
+  --accent: light-dark(#0969da, #58a6ff);
+  /* Ink on a saturated fill (an accent button, a node outline). */
+  --ink-on: light-dark(#ffffff, #0d1117);
+  --ok: light-dark(#1a7f37, #3fb950);
+  --ok-strong: light-dark(#1f883d, #238636);
+  --bad: light-dark(#cf222e, #f85149);
+  --bad-text: light-dark(#cf222e, #ff7b72);
+  --bad-strong: light-dark(#cf222e, #da3633);
+  --warn: light-dark(#9a6700, #d29922);
+  --yellow: light-dark(#9a6700, #e3b341);
+  --await: light-dark(#9a6700, #f5d547);
+  --await-2: light-dark(#7d4e00, #ffdf5d);
+  --info: light-dark(#0969da, #79c0ff);
+  --blue: light-dark(#0969da, #388bfd);
+  --blue-strong: light-dark(#0969da, #1f6feb);
+  --violet: light-dark(#8250df, #d2a8ff);
+  --purple: light-dark(#8250df, #a371f7);
+  --purple-strong: light-dark(#8250df, #8957e5);
+  --orange: light-dark(#bc4c00, #f0883e);
+  --orange-2: light-dark(#953800, #ffa657);
+  --jev-fill: light-dark(#d18616, #e3883e);
+  --advisory: light-dark(#656d76, #9aa0a6);
+  --grey: light-dark(#8c959f, #6e7681);
+  --grey-border: light-dark(#afb8c1, #484f58);
+  --edge: light-dark(#8c959f, #5a6472);
+  --node-idle: light-dark(#d8dee4, #21262d);
+  --node-agent: light-dark(#7aa7e0, #30497a);
+  --trigger: light-dark(#9a6700, #d9a441);
+  --lead: light-dark(#1b9e8f, #2bb3a3);
+  --pink: light-dark(#bf3989, #f0a8d0);
+  --replay-border: light-dark(#afb8c1, #3d4b5c);
+  --tooltip-bg: light-dark(rgba(255, 255, 255, 0.95), rgba(22, 27, 34, 0.9));
+  /* The agent-talk overlay: its own teal, apart from every graph edge color. */
+  --talk: light-dark(#0a7f86, #39d0d8);
+  --talk-bg: light-dark(#e3f6f7, #0f2a2d);
+  /* Message families (ticks and type chips). */
+  --fam-goal: var(--accent);
+  --fam-item: var(--muted);
+  --fam-claim: var(--blue);
+  --fam-contest: var(--bad);
+  --fam-rev: var(--ok);
+  --fam-contract: var(--violet);
+  --fam-decision: var(--advisory);
+  --fam-tool: var(--orange);
+  --fam-agent: var(--grey);
   font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
 }
 
 * {
@@ -87,7 +144,7 @@ body {
 .load-row button {
   padding: 0.45rem 0.9rem;
   background: var(--accent);
-  color: #0d1117;
+  color: var(--ink-on);
   border: 1px solid var(--accent);
   border-radius: 6px;
   font-weight: 600;
@@ -103,7 +160,7 @@ body {
 
 .error {
   margin-top: 0.75rem;
-  color: #ff7b72;
+  color: var(--bad-text);
   font-size: 0.9rem;
 }
 
@@ -172,14 +229,14 @@ body {
 
 .badge-runnable {
   background: rgba(63, 185, 80, 0.15);
-  border-color: #3fb950;
-  color: #3fb950;
+  border-color: var(--ok);
+  color: var(--ok);
 }
 
 .badge-waiting {
   background: rgba(210, 153, 34, 0.15);
-  border-color: #d29922;
-  color: #e3b341;
+  border-color: var(--warn);
+  color: var(--yellow);
 }
 
 .badge-running {
@@ -197,8 +254,8 @@ body {
 
 .badge-failed {
   background: rgba(248, 81, 73, 0.15);
-  border-color: #f85149;
-  color: #ff7b72;
+  border-color: var(--bad);
+  color: var(--bad-text);
 }
 
 .work-objective {
@@ -251,9 +308,9 @@ body {
 .detail-warning {
   margin: 0.75rem 0;
   padding: 0.5rem 0.75rem;
-  border-left: 3px solid #d29922;
+  border-left: 3px solid var(--warn);
   background: rgba(210, 153, 34, 0.12);
-  color: #e3b341;
+  color: var(--yellow);
   font-size: 0.9rem;
 }
 
@@ -278,7 +335,7 @@ body {
 
 .graph-reset {
   padding: 0.3rem 0.65rem;
-  background: rgba(22, 27, 34, 0.9);
+  background: var(--tooltip-bg);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -295,7 +352,7 @@ body {
   width: 100%;
   height: auto;
   display: block;
-  background: #0a0e14;
+  background: var(--deep);
   border: 1px solid var(--border);
   border-radius: 8px;
   /* Mouse-first navigation: wheel to zoom, drag to pan. The grab cursor hints
@@ -340,7 +397,7 @@ body {
 }
 
 .node.is-escalated circle {
-  stroke: #ffdf5d;
+  stroke: var(--await-2);
   stroke-width: 3;
 }
 
@@ -348,7 +405,7 @@ body {
    red outline, so it reads clearly as a dead node, never a stuck-green or
    perpetually-running one. */
 .node.is-failed circle {
-  stroke: #f85149;
+  stroke: var(--bad);
   stroke-width: 3;
 }
 
@@ -360,19 +417,19 @@ body {
    retry hexagons, tool square) covers all node shapes. */
 .node.is-selected circle,
 .node.is-selected polygon {
-  stroke: #e6edf3;
+  stroke: var(--text);
   stroke-width: 3;
 }
 
 .node-label {
-  fill: #e6edf3;
+  fill: var(--text);
   font-size: 0.8rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   pointer-events: none;
   /* A dark halo keeps the label legible where it sits over an edge or another
      node's neighbourhood, since labels now render outside the circles. */
   paint-order: stroke;
-  stroke: #0a0e14;
+  stroke: var(--deep);
   stroke-width: 3px;
   stroke-linejoin: round;
 }
@@ -384,7 +441,7 @@ body {
   letter-spacing: 0.04em;
   pointer-events: none;
   paint-order: stroke;
-  stroke: #0a0e14;
+  stroke: var(--deep);
   stroke-width: 3px;
   stroke-linejoin: round;
 }
@@ -397,12 +454,12 @@ body {
    model" hop, read from state. A magenta fill ties it to the edge; a dark halo
    keeps it legible over edges and nodes, as the node labels do. */
 .edge-escalation-label {
-  fill: #f0a8d0;
+  fill: var(--pink);
   font-size: 0.62rem;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   pointer-events: none;
   paint-order: stroke;
-  stroke: #0a0e14;
+  stroke: var(--deep);
   stroke-width: 3px;
   stroke-linejoin: round;
 }
@@ -429,11 +486,12 @@ body {
   height: 0.9rem;
   border-radius: 50%;
   display: inline-block;
-  border: 1px solid #0d1117;
+  border: 1px solid var(--ink-on);
 }
 
 /* Shape swatches are NEUTRAL: shape encodes the node kind, while color encodes
    status (the status key below), so the legend never contradicts the graph. */
+/* Legend swatches stay literal: they key the run-live graph's inline node fills (graph-view.tsx), which do not change with the theme. */
 .sw-neutral { background: #8b949e; }
 /* The status key, mirroring graph-view nodeFill. */
 .sw-verified { background: #238636; }
@@ -459,7 +517,7 @@ body {
   width: 0.8rem;
   height: 0.8rem;
   display: inline-block;
-  border: 1px solid #0d1117;
+  border: 1px solid var(--ink-on);
 }
 
 
@@ -496,7 +554,7 @@ body {
   height: 0.8rem;
   display: inline-block;
   transform: rotate(45deg);
-  border: 1px solid #0d1117;
+  border: 1px solid var(--ink-on);
 }
 
 
@@ -518,15 +576,15 @@ body {
   border-top-style: solid;
 }
 
-.ln-dependency { border-top-color: #5a6472; }
-.ln-spawn { border-top-color: #d2a8ff; border-top-style: dashed; }
+.ln-dependency { border-top-color: var(--edge); }
+.ln-spawn { border-top-color: var(--violet); border-top-style: dashed; }
 /* A trigger edge is the ladder's control-flow (re-plan / retry): a GOLD dashed
    line, mirroring the graph-view trigger stroke, clearly distinct from the
    violet event-driven spawn dash and the grey dependency line. */
-.ln-trigger { border-top-color: #d9a441; border-top-style: dashed; }
+.ln-trigger { border-top-color: var(--trigger); border-top-style: dashed; }
 /* A consumed-tool edge is a SOLID amber line, mirroring the graph-view edge
    styling exactly, so the legend reads the same as the graph. */
-.ln-tool { border-top-color: #f0883e; border-top-style: solid; }
+.ln-tool { border-top-color: var(--orange); border-top-style: solid; }
 
 /* --- Dial control --- */
 
@@ -574,7 +632,7 @@ body {
 .dial-row button {
   padding: 0.4rem 0.85rem;
   background: var(--accent);
-  color: #0d1117;
+  color: var(--ink-on);
   border: 1px solid var(--accent);
   border-radius: 6px;
   font-weight: 600;
@@ -649,12 +707,12 @@ body {
 }
 
 .ladder-detail .verdict-pass {
-  color: #3fb950;
+  color: var(--ok);
   font-weight: 600;
 }
 
 .ladder-detail .verdict-fail {
-  color: #ff7b72;
+  color: var(--bad-text);
   font-weight: 600;
 }
 
@@ -683,7 +741,7 @@ body {
 }
 
 .planner-objective {
-  color: var(--muted, #8b949e);
+  color: var(--muted);
 }
 
 /* --- Rich click-detail: prompt, proposed edit, tokens/cost --- */
@@ -759,22 +817,22 @@ body {
    reds, so the log's end state matches the node. */
 .activity-step.phase-verified,
 .activity-step.phase-pushed {
-  border-left-color: #3fb950;
+  border-left-color: var(--ok);
 }
 
 .activity-step.phase-verified .activity-phase,
 .activity-step.phase-pushed .activity-phase {
-  color: #3fb950;
+  color: var(--ok);
 }
 
 .activity-step.phase-failed,
 .activity-step.phase-not-integrated {
-  border-left-color: #f85149;
+  border-left-color: var(--bad);
 }
 
 .activity-step.phase-failed .activity-phase,
 .activity-step.phase-not-integrated .activity-phase {
-  color: #ff7b72;
+  color: var(--bad-text);
 }
 
 /* Human escalation panel: the pending decisions the engine is waiting on. A
@@ -867,14 +925,14 @@ body {
 
 .template-badge.escalates {
   background: rgba(248, 81, 73, 0.15);
-  border-color: #f85149;
-  color: #ff7b72;
+  border-color: var(--bad);
+  color: var(--bad-text);
 }
 
 .template-badge.autonomous {
   background: rgba(63, 185, 80, 0.15);
-  border-color: #3fb950;
-  color: #3fb950;
+  border-color: var(--ok);
+  color: var(--ok);
 }
 
 .template-desc {
@@ -922,7 +980,7 @@ body {
   margin-top: 0.4rem;
   padding: 0.45rem 0.9rem;
   background: var(--accent);
-  color: #0d1117;
+  color: var(--ink-on);
   border: 1px solid var(--accent);
   border-radius: 6px;
   font-weight: 600;
@@ -985,7 +1043,7 @@ body {
 }
 
 .run-state.is-failed {
-  color: #ff7b72;
+  color: var(--bad-text);
 }
 
 .run-failure .detail-pre {
@@ -1103,12 +1161,12 @@ body {
 
 .mc button.is-active {
   background: var(--accent);
-  color: #0d1117;
+  color: var(--ink-on);
   border-color: var(--accent);
 }
 
 .advisory {
-  color: #9aa0a6;
+  color: var(--advisory);
   font-style: italic;
 }
 
@@ -1116,8 +1174,8 @@ body {
   display: inline-block;
   padding: 0 0.4rem;
   border-radius: 999px;
-  border: 1px solid #484f58;
-  color: #9aa0a6;
+  border: 1px solid var(--grey-border);
+  color: var(--advisory);
   font-style: italic;
   font-size: 0.72rem;
 }
@@ -1147,12 +1205,12 @@ body {
   font-size: 0.82rem;
 }
 
-.mc-rev-chip.is-pass { border-color: #238636; color: #3fb950; }
-.mc-rev-chip.is-fail { border-color: #da3633; color: #ff7b72; }
-.mc-rev-chip.is-nogate { border-color: #d29922; color: #d29922; border-style: dashed; }
-.mc-rebasing { color: #d29922; }
+.mc-rev-chip.is-pass { border-color: var(--ok-strong); color: var(--ok); }
+.mc-rev-chip.is-fail { border-color: var(--bad-strong); color: var(--bad-text); }
+.mc-rev-chip.is-nogate { border-color: var(--warn); color: var(--warn); border-style: dashed; }
+.mc-rebasing { color: var(--warn); }
 .mc-agents, .mc-items { color: var(--muted); }
-.mc-replaying { color: #d2a8ff; font-weight: 600; }
+.mc-replaying { color: var(--violet); font-weight: 600; }
 
 /* Board pane */
 .mc-board {
@@ -1192,10 +1250,10 @@ body {
   background: var(--bg);
 }
 
-.mc-card.status-claimed { border-left-color: #388bfd; }
-.mc-card.status-contested { border-left-color: #f5d547; }
-.mc-card.status-done { border-left-color: #238636; }
-.mc-card.status-split { border-left-color: #a371f7; }
+.mc-card.status-claimed { border-left-color: var(--blue); }
+.mc-card.status-contested { border-left-color: var(--await); }
+.mc-card.status-done { border-left-color: var(--ok-strong); }
+.mc-card.status-split { border-left-color: var(--purple); }
 .mc-card.is-selected { outline: 2px solid var(--accent); }
 
 .mc .mc-card-main {
@@ -1220,13 +1278,13 @@ body {
 }
 
 .mc-tag.is-clash {
-  border-color: #d29922;
-  color: #e3b341;
+  border-color: var(--warn);
+  color: var(--yellow);
 }
 
 .mc-tag.is-clash.is-shared {
-  border-color: #f0883e;
-  color: #ffa657;
+  border-color: var(--orange);
+  color: var(--orange-2);
 }
 
 /* One short line: why a card is waiting (derived from the board). */
@@ -1234,19 +1292,19 @@ body {
   display: block;
   margin-top: 0.2rem;
   font-size: 0.72rem;
-  color: #d29922;
+  color: var(--warn);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
 .mc-card-wait.is-waiting-for-human {
-  color: #f0883e;
+  color: var(--orange);
 }
 
 .mc-card-wait.is-unclaimed,
 .mc-card-wait.is-lease-lapsed {
-  color: #79c0ff;
+  color: var(--info);
 }
 
 .mc-card-tags {
@@ -1260,13 +1318,13 @@ body {
   padding: 0 0.4rem;
   border-radius: 999px;
   font-size: 0.72rem;
-  border-color: #388bfd;
-  color: #79c0ff;
+  border-color: var(--blue);
+  color: var(--info);
 }
 
 .mc .mc-agent-chip.is-waiting {
-  border-color: #f5d547;
-  color: #f5d547;
+  border-color: var(--await);
+  color: var(--await);
 }
 
 .mc-tag {
@@ -1277,7 +1335,7 @@ body {
   color: var(--muted);
 }
 
-.mc-tag.is-fix { border-color: #da3633; color: #ff7b72; }
+.mc-tag.is-fix { border-color: var(--bad-strong); color: var(--bad-text); }
 
 .mc-done {
   display: inline-block;
@@ -1290,11 +1348,11 @@ body {
   font-size: 0.7rem;
 }
 
-.mc-done.is-filled { background: #238636; color: #fff; border: 1px solid #238636; }
-.mc-done.is-hollow { border: 1px dashed #3fb950; color: #3fb950; background: transparent; }
+.mc-done.is-filled { background: var(--ok-strong); color: #fff; border: 1px solid var(--ok-strong); }
+.mc-done.is-hollow { border: 1px dashed var(--ok); color: var(--ok); background: transparent; }
 
 .mc-escalation {
-  border: 1px solid #f5d547;
+  border: 1px solid var(--await);
   background: rgba(245, 213, 71, 0.08);
   border-radius: 6px;
   padding: 0.5rem;
@@ -1304,12 +1362,12 @@ body {
 
 .mc-escalation p { margin: 0 0 0.35rem; }
 .mc-escalation-head { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
-.mc-escalation-head strong { color: #f5d547; }
+.mc-escalation-head strong { color: var(--await); }
 .mc-escalation-options { display: flex; gap: 0.4rem; flex-wrap: wrap; }
 
 .mc .mc-escalation-options button {
-  border-color: #f5d547;
-  color: #f5d547;
+  border-color: var(--await);
+  color: var(--await);
   font-weight: 600;
 }
 
@@ -1371,16 +1429,16 @@ body {
 
 .mc-hull rect {
   fill: rgba(56, 139, 253, 0.05);
-  stroke: #30363d;
+  stroke: var(--border);
   stroke-width: 1.5;
   cursor: pointer;
 }
 
-.mc-hull.status-claimed rect { stroke: #388bfd; }
-.mc-hull.status-contested rect { stroke: #f5d547; fill: rgba(245, 213, 71, 0.06); }
-.mc-hull.status-done rect { stroke: #238636; fill: rgba(35, 134, 54, 0.07); }
-.mc-hull.status-split rect { stroke: #a371f7; }
-.mc-hull.is-selected rect { stroke: #e6edf3; stroke-width: 2.5; }
+.mc-hull.status-claimed rect { stroke: var(--blue); }
+.mc-hull.status-contested rect { stroke: var(--await); fill: rgba(245, 213, 71, 0.06); }
+.mc-hull.status-done rect { stroke: var(--ok-strong); fill: rgba(35, 134, 54, 0.07); }
+.mc-hull.status-split rect { stroke: var(--purple); }
+.mc-hull.is-selected rect { stroke: var(--text); stroke-width: 2.5; }
 
 .mc-hull-bar { fill: rgba(139, 148, 158, 0.08); stroke: none; pointer-events: none; }
 .mc-hull-title { fill: var(--text); font-size: calc(15px * var(--mc-t, 1)); font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -1389,31 +1447,31 @@ body {
 .mc-hull.status-proposed rect { stroke-dasharray: 6 4; }
 .mc-hull.status-rejected rect { stroke-dasharray: 2 4; opacity: 0.55; }
 .mc-hull-count { fill: var(--muted); font-size: calc(15px * var(--mc-t, 1)); }
-.mc-check.is-filled { fill: #238636; }
-.mc-check.is-hollow { fill: none; stroke: #3fb950; stroke-dasharray: 3 2; stroke-width: 1.5; }
-.mc-check-mark { fill: #e6edf3; font-size: 13px; pointer-events: none; }
+.mc-check.is-filled { fill: var(--ok-strong); }
+.mc-check.is-hollow { fill: none; stroke: var(--ok); stroke-dasharray: 3 2; stroke-width: 1.5; }
+.mc-check-mark { fill: #fff; font-size: 13px; pointer-events: none; }
 
 .mc-edge line { stroke-width: 1.4; cursor: pointer; }
-.mc-edge.kind-dependency line { stroke: #5a6472; opacity: 0.5; }
-.mc-edge.kind-trigger line { stroke: #d9a441; stroke-dasharray: 6 4; }
-.mc-edge.kind-consumed-tool line { stroke: #f0883e; }
-.mc-edge.kind-contest line { stroke: #f85149; stroke-width: 3; }
-.mc-edge.kind-contest.contest-escalated line { stroke: #f5d547; animation: mc-pulse 1.4s ease-in-out infinite; }
-.mc-edge.kind-message line { stroke: #79c0ff; stroke-dasharray: 2 4; opacity: 0.6; }
+.mc-edge.kind-dependency line { stroke: var(--edge); opacity: 0.5; }
+.mc-edge.kind-trigger line { stroke: var(--trigger); stroke-dasharray: 6 4; }
+.mc-edge.kind-consumed-tool line { stroke: var(--orange); }
+.mc-edge.kind-contest line { stroke: var(--bad); stroke-width: 3; }
+.mc-edge.kind-contest.contest-escalated line { stroke: var(--await); animation: mc-pulse 1.4s ease-in-out infinite; }
+.mc-edge.kind-message line { stroke: var(--info); stroke-dasharray: 2 4; opacity: 0.6; }
 /* Formation on the dependency vocabulary: fork lineage (requester -> helper) and a sub-lead's merge (child -> split item). */
-.mc-edge.kind-dependency.label-fork line { stroke: #a371f7; stroke-dasharray: 8 3; opacity: 0.9; stroke-width: 1.8; }
-.mc-edge.kind-dependency.label-merged line { stroke: #3fb950; opacity: 0.8; }
+.mc-edge.kind-dependency.label-fork line { stroke: var(--purple); stroke-dasharray: 8 3; opacity: 0.9; stroke-width: 1.8; }
+.mc-edge.kind-dependency.label-merged line { stroke: var(--ok); opacity: 0.8; }
 .mc-edge-tag { font-size: calc(11px * var(--mc-t, 1)); pointer-events: none; }
-.mc-edge.label-fork .mc-edge-tag { fill: #a371f7; }
-.mc-edge.label-merged .mc-edge-tag { fill: #3fb950; }
+.mc-edge.label-fork .mc-edge-tag { fill: var(--purple); }
+.mc-edge.label-merged .mc-edge-tag { fill: var(--ok); }
 /* A split child is drawn nested inside its parent's hull; the sub-lead sits on the parent's border. */
 .mc-hull.is-nested > rect:first-of-type { stroke-dasharray: 4 3; }
-.mc-node.kind-agent.is-sub-lead .shape { stroke: #3fb950; stroke-width: 3; stroke-dasharray: 5 3; }
+.mc-node.kind-agent.is-sub-lead .shape { stroke: var(--ok); stroke-width: 3; stroke-dasharray: 5 3; }
 .mc-edge.is-related line { opacity: 1; stroke-width: 2.2; }
 .mc-edge.is-transient { animation: mc-fade 4s ease-out forwards; }
-.mc-msg-dot { fill: #79c0ff; }
-.mc-tool-uses { fill: #f0883e; font-weight: 600; }
-.mc-edge-label { fill: #f0883e; font-size: calc(12px * var(--mc-t, 1)); }
+.mc-msg-dot { fill: var(--info); }
+.mc-tool-uses { fill: var(--orange); font-weight: 600; }
+.mc-edge-label { fill: var(--orange); font-size: calc(12px * var(--mc-t, 1)); }
 
 @keyframes mc-pulse {
   0%, 100% { opacity: 1; }
@@ -1426,37 +1484,37 @@ body {
 }
 
 .mc-node { cursor: pointer; transition: transform 600ms ease; }
-.mc-node .shape { stroke: #0d1117; stroke-width: 1.5; }
-.mc-node.is-selected .shape { stroke: #e6edf3; stroke-width: 3; }
-.mc-node.kind-goal .shape { fill: #1f6feb; }
-.mc-node.kind-lead .shape { fill: #2bb3a3; }
-.mc-node.kind-agent .shape { fill: #30497a; }
-.mc-node.kind-agent.status-working .shape { fill: #388bfd; }
-.mc-node.kind-agent.status-rebasing .shape { fill: #388bfd; stroke: #d29922; stroke-width: 3; stroke-dasharray: 4 3; }
-.mc-node.kind-agent.status-left .shape { fill: #21262d; opacity: 0.5; }
-.mc-node.kind-rev.status-pass .shape { fill: #238636; }
-.mc-node.kind-rev.status-fail .shape { fill: #da3633; }
-.mc-node.kind-rev.status-no-gate .shape { fill: #21262d; stroke: #d29922; stroke-dasharray: 4 3; }
-.mc-node.kind-tool .shape { fill: #e3b341; }
-.mc-node.kind-jev .shape { fill: #6e7681; }
-.mc-node.kind-human .shape { fill: #30363d; }
-.mc-node.kind-human.status-awaiting .shape { fill: #f5d547; }
+.mc-node .shape { stroke: var(--ink-on); stroke-width: 1.5; }
+.mc-node.is-selected .shape { stroke: var(--text); stroke-width: 3; }
+.mc-node.kind-goal .shape { fill: var(--blue-strong); }
+.mc-node.kind-lead .shape { fill: var(--lead); }
+.mc-node.kind-agent .shape { fill: var(--node-agent); }
+.mc-node.kind-agent.status-working .shape { fill: var(--blue); }
+.mc-node.kind-agent.status-rebasing .shape { fill: var(--blue); stroke: var(--warn); stroke-width: 3; stroke-dasharray: 4 3; }
+.mc-node.kind-agent.status-left .shape { fill: var(--node-idle); opacity: 0.5; }
+.mc-node.kind-rev.status-pass .shape { fill: var(--ok-strong); }
+.mc-node.kind-rev.status-fail .shape { fill: var(--bad-strong); }
+.mc-node.kind-rev.status-no-gate .shape { fill: var(--node-idle); stroke: var(--warn); stroke-dasharray: 4 3; }
+.mc-node.kind-tool .shape { fill: var(--yellow); }
+.mc-node.kind-jev .shape { fill: var(--grey); }
+.mc-node.kind-human .shape { fill: var(--border); }
+.mc-node.kind-human.status-awaiting .shape { fill: var(--await); }
 .mc-node-label { fill: var(--text); font-size: calc(13px * var(--mc-t, 1)); pointer-events: none; }
 .mc-node-label.is-center { font-weight: 700; }
 .mc-node-sub { fill: var(--muted); font-size: calc(13px * var(--mc-t, 1)); font-weight: 600; pointer-events: none; }
 .mc-node-chip { font-size: calc(12px * var(--mc-t, 1)); pointer-events: none; }
-.mc-node.kind-rev.status-pass .mc-node-sub { fill: #3fb950; }
-.mc-node.kind-rev.status-fail .mc-node-sub { fill: #ff7b72; }
-.mc-node.kind-rev.status-no-gate .mc-node-sub { fill: #d29922; }
-.mc-node-sub.advisory, .mc-node-chip.advisory { fill: #9aa0a6; font-style: italic; }
+.mc-node.kind-rev.status-pass .mc-node-sub { fill: var(--ok); }
+.mc-node.kind-rev.status-fail .mc-node-sub { fill: var(--bad-text); }
+.mc-node.kind-rev.status-no-gate .mc-node-sub { fill: var(--warn); }
+.mc-node-sub.advisory, .mc-node-chip.advisory { fill: var(--advisory); font-style: italic; }
 
 .mc-caption { animation: mc-fade 3s ease-out forwards; pointer-events: none; }
-.mc-caption rect { fill: #1c2128; stroke: #79c0ff; }
-.mc-caption text { fill: #e6edf3; font-size: calc(12px * var(--mc-t, 1)); }
+.mc-caption rect { fill: var(--surface-2); stroke: var(--info); }
+.mc-caption text { fill: var(--text); font-size: calc(12px * var(--mc-t, 1)); }
 
 .mc-legend { margin-top: 0.4rem; }
-.ln-contest { border-top-color: #f85149; border-top-width: 3px; }
-.ln-message { border-top-color: #79c0ff; border-top-style: dotted; }
+.ln-contest { border-top-color: var(--bad); border-top-width: 3px; }
+.ln-message { border-top-color: var(--info); border-top-style: dotted; }
 
 /* Right pane */
 .mc-right {
@@ -1478,18 +1536,18 @@ body {
 }
 
 .mc-msg.is-selected { outline: 1px solid var(--accent); }
-.mc-msg.fam-contest { border-left-color: #f85149; }
-.mc-msg.fam-rev { border-left-color: #3fb950; }
-.mc-msg.fam-claim { border-left-color: #388bfd; }
-.mc-msg.fam-decision { border-left-color: #6e7681; }
-.mc-msg.fam-tool { border-left-color: #f0883e; }
-.mc-msg.fam-contract { border-left-color: #d2a8ff; }
+.mc-msg.fam-contest { border-left-color: var(--bad); }
+.mc-msg.fam-rev { border-left-color: var(--ok); }
+.mc-msg.fam-claim { border-left-color: var(--blue); }
+.mc-msg.fam-decision { border-left-color: var(--grey); }
+.mc-msg.fam-tool { border-left-color: var(--orange); }
+.mc-msg.fam-contract { border-left-color: var(--violet); }
 .mc-msg-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem; }
 .mc-type { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; }
 .mc .mc-sender { padding: 0 0.4rem; border-radius: 999px; font-size: 0.72rem; }
 .mc .mc-sender.sender-engine { color: var(--muted); }
-.mc .mc-sender.sender-human { border-color: #f5d547; color: #f5d547; }
-.mc .mc-sender.sender-agent { border-color: #388bfd; color: #79c0ff; }
+.mc .mc-sender.sender-human { border-color: var(--await); color: var(--await); }
+.mc .mc-sender.sender-agent { border-color: var(--blue); color: var(--info); }
 .mc-msg-body { margin-top: 0.15rem; overflow-wrap: anywhere; }
 .mc-rationale { display: block; margin-top: 0.15rem; color: var(--muted); font-style: italic; }
 .mc-detail .meta { grid-template-columns: 1fr; gap: 0.3rem; }
@@ -1498,10 +1556,10 @@ body {
 .mc-tools { width: 100%; border-collapse: collapse; font-size: 0.85em; }
 .mc-tools th, .mc-tools td { text-align: left; padding: 0.25rem 0.4rem; border-bottom: 1px solid rgba(127, 127, 127, 0.25); vertical-align: top; }
 .mc-tool-checks { margin: 0.2rem 0 0.6rem; padding-left: 1rem; font-size: 0.85em; }
-.mc-tool-checks .is-fail { color: #f85149; }
+.mc-tool-checks .is-fail { color: var(--bad); }
 /* Speculative candidates of a revision (records backing it, never nodes) */
 .mc-candidates { margin: 0.2rem 0 0.6rem; padding-left: 1.2rem; font-size: 0.85em; }
-.mc-candidates .is-fail { color: #f85149; }
+.mc-candidates .is-fail { color: var(--bad); }
 .mc-candidates .is-this { font-weight: 600; }
 
 /* Replay */
@@ -1525,7 +1583,7 @@ body {
 .mc-scrub input { width: 100%; margin: 0; }
 .mc-seq { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; color: var(--muted); }
 .mc .mc-live-pill { border-radius: 999px; }
-.mc .mc-live-pill.is-live { background: #da3633; border-color: #da3633; color: #fff; font-weight: 700; }
+.mc .mc-live-pill.is-live { background: var(--bad-strong); border-color: var(--bad-strong); color: #fff; font-weight: 700; }
 
 @media (max-width: 1100px) {
   .mc {
@@ -1539,8 +1597,8 @@ body {
 }
 
 /* A struggling item (its owner reported it going badly): idle agents may volunteer. */
-.mc-struggling circle { fill: rgba(245, 213, 71, 0.18); stroke: #f5d547; stroke-width: 1.5; }
-.mc-struggling text { fill: #f5d547; font-weight: 700; font-size: calc(13px * var(--mc-t, 1)); pointer-events: none; }
+.mc-struggling circle { fill: rgba(245, 213, 71, 0.18); stroke: var(--await); stroke-width: 1.5; }
+.mc-struggling text { fill: var(--await); font-weight: 700; font-size: calc(13px * var(--mc-t, 1)); pointer-events: none; }
 .mc-volunteers { fill: var(--muted); font-size: calc(11px * var(--mc-t, 1)); pointer-events: none; }
 
 /* --- Legibility (shared by the live console and the replay page) --- */
@@ -1576,7 +1634,7 @@ body {
 .mc .mc-play {
   background: var(--accent);
   border-color: var(--accent);
-  color: #0d1117;
+  color: var(--ink-on);
   font-weight: 700;
   min-width: 5.5rem;
 }
@@ -1593,7 +1651,7 @@ body {
   padding: 0.4rem 0.55rem;
   background: var(--bg);
   border: 1px solid var(--border);
-  border-left: 3px solid #f0883e;
+  border-left: 3px solid var(--orange);
   border-radius: 6px;
 }
 .mc-right .mc-tools td { display: block; border: none; padding: 0.1rem 0; }
@@ -1615,7 +1673,7 @@ body {
 }
 
 .mc.is-recorded .mc-replay {
-  border-color: #3d4b5c;
+  border-color: var(--replay-border);
 }
 
 @media (max-width: 1100px) {
@@ -1645,8 +1703,8 @@ body {
   font-weight: 700;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: #d2a8ff;
-  border: 1px solid #8957e5;
+  color: var(--violet);
+  border: 1px solid var(--purple-strong);
   border-radius: 999px;
   padding: 0.1rem 0.55rem;
 }
@@ -1659,7 +1717,7 @@ body {
 .replay-banner {
   margin: 0.9rem 0 0;
   padding: 0.55rem 0.9rem;
-  border: 1px solid #8957e5;
+  border: 1px solid var(--purple-strong);
   border-left-width: 4px;
   border-radius: 6px;
   background: rgba(137, 87, 229, 0.12);
@@ -1668,7 +1726,7 @@ body {
   line-height: 1.45;
 }
 
-.replay-banner strong { color: #d2a8ff; }
+.replay-banner strong { color: var(--violet); }
 
 .replay-shell.is-wide .replay-banner { margin-top: 0.6rem; }
 
@@ -1689,7 +1747,7 @@ body {
 .replay-shell .replay-open {
   background: var(--accent);
   border-color: var(--accent);
-  color: #0d1117;
+  color: var(--ink-on);
   font-weight: 700;
 }
 
@@ -1713,9 +1771,9 @@ body {
   border-radius: 8px;
 }
 
-.replay-card.is-verified { border-top-color: #238636; }
-.replay-card.is-failed { border-top-color: #da3633; }
-.replay-card.is-unverified { border-top-color: #d29922; }
+.replay-card.is-verified { border-top-color: var(--ok-strong); }
+.replay-card.is-failed { border-top-color: var(--bad-strong); }
+.replay-card.is-unverified { border-top-color: var(--warn); }
 
 .replay-card h3 { margin: 0; font-size: 1.02rem; line-height: 1.35; }
 .replay-card-desc { margin: 0; color: var(--muted); font-size: 0.88rem; line-height: 1.5; flex: 1; }
@@ -1731,9 +1789,9 @@ body {
   border: 1px solid var(--border);
 }
 
-.replay-outcome.is-verified { color: #3fb950; border-color: #238636; background: rgba(35, 134, 54, 0.15); }
-.replay-outcome.is-failed { color: #ff7b72; border-color: #da3633; background: rgba(218, 54, 51, 0.15); }
-.replay-outcome.is-unverified, .replay-outcome.is-unknown { color: #d29922; border-color: #d29922; }
+.replay-outcome.is-verified { color: var(--ok); border-color: var(--ok-strong); background: rgba(35, 134, 54, 0.15); }
+.replay-outcome.is-failed { color: var(--bad-text); border-color: var(--bad-strong); background: rgba(218, 54, 51, 0.15); }
+.replay-outcome.is-unverified, .replay-outcome.is-unknown { color: var(--warn); border-color: var(--warn); }
 
 .replay-app {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1783,12 +1841,12 @@ body {
   border-radius: 4px;
 }
 
-.replay-verdict.is-verified { border-color: #238636; background: rgba(35, 134, 54, 0.12); }
-.replay-verdict.is-verified .replay-verdict-word { background: #238636; color: #fff; }
-.replay-verdict.is-failed { border-color: #da3633; background: rgba(218, 54, 51, 0.1); }
-.replay-verdict.is-failed .replay-verdict-word { background: #da3633; color: #fff; }
-.replay-verdict.is-unverified, .replay-verdict.is-none { border-color: #d29922; }
-.replay-verdict.is-unverified .replay-verdict-word, .replay-verdict.is-none .replay-verdict-word { background: #d29922; color: #0d1117; }
+.replay-verdict.is-verified { border-color: var(--ok-strong); background: rgba(35, 134, 54, 0.12); }
+.replay-verdict.is-verified .replay-verdict-word { background: var(--ok-strong); color: #fff; }
+.replay-verdict.is-failed { border-color: var(--bad-strong); background: rgba(218, 54, 51, 0.1); }
+.replay-verdict.is-failed .replay-verdict-word { background: var(--bad-strong); color: #fff; }
+.replay-verdict.is-unverified, .replay-verdict.is-none { border-color: var(--warn); }
+.replay-verdict.is-unverified .replay-verdict-word, .replay-verdict.is-none .replay-verdict-word { background: var(--warn); color: var(--ink-on); }
 
 .replay-guide { font-size: 0.86rem; color: var(--muted); }
 .replay-guide summary { cursor: pointer; color: var(--accent); }
@@ -1807,16 +1865,16 @@ body {
 }
 
 .mc-proof-status.is-proven {
-  color: #3fb950;
+  color: var(--ok);
 }
 
 .mc-proof-status.is-not-proven {
-  color: #f85149;
+  color: var(--bad);
 }
 
 .mc-proof-reasons {
   margin: 0 0 0.5rem 1rem;
-  color: #f85149;
+  color: var(--bad);
 }
 
 .mc-proof-facts {
@@ -1839,6 +1897,236 @@ body {
   font-size: 0.7rem;
   border: none;
   background: none;
-  color: #79c0ff;
+  color: var(--info);
   cursor: pointer;
 }
+
+/* --- Theme toggle --- */
+
+.theme-toggle {
+  flex: none;
+  padding: 0.2rem 0.65rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.theme-toggle:hover { color: var(--text); border-color: var(--muted); }
+
+.app-header-row,
+.replay-shell .replay-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+}
+
+/* --- Mission control grid: ticker, gate timeline, panes, replay --- */
+
+.mc {
+  grid-template-rows: auto auto minmax(560px, calc(100vh - 290px)) auto;
+  grid-template-areas:
+    "ticker ticker ticker"
+    "gate gate gate"
+    "board graph right"
+    "replay replay replay";
+}
+
+.mc.is-recorded {
+  grid-template-rows: auto auto auto minmax(520px, calc(100vh - 150px));
+  grid-template-areas:
+    "ticker ticker ticker"
+    "replay replay replay"
+    "gate gate gate"
+    "board graph right";
+}
+
+/* The graph refused to draw at this seq: the guard and the replay controls, so the viewer can scrub away. */
+.mc.is-guarded,
+.mc.is-guarded.is-recorded {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  grid-template-areas: "ticker" "replay";
+}
+
+.mc-guard { grid-area: ticker; padding: 0.6rem 0.9rem; }
+.mc-guard .error { margin: 0; }
+
+/* More room for the graph at laptop widths. */
+@media (max-width: 1440px) {
+  .mc { grid-template-columns: 250px minmax(0, 1fr) 310px; }
+  .mc.is-recorded { grid-template-columns: 238px minmax(0, 1fr) 300px; }
+  .app-shell.is-wide { padding: 0.8rem 0.75rem; }
+}
+
+@media (max-width: 1100px) {
+  .mc,
+  .mc.is-recorded {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+  }
+  .mc { grid-template-areas: "ticker" "gate" "board" "graph" "right" "replay"; }
+  .mc.is-recorded { grid-template-areas: "ticker" "replay" "gate" "graph" "board" "right"; }
+}
+
+/* --- The replay bar: one line from 1100px up --- */
+
+.mc-replay { gap: 0.35rem; }
+.mc-speeds, .mc-next { display: inline-flex; align-items: center; gap: 0.2rem; }
+.mc-next .muted { font-size: 0.75rem; margin-right: 0.1rem; }
+.mc .mc-speeds button, .mc .mc-next button { padding: 0.22rem 0.45rem; }
+.mc-moments { max-width: 14rem; }
+
+@media (min-width: 1101px) {
+  .mc-replay { flex-wrap: nowrap; }
+  .mc-scrub { flex: 1 1 8rem; min-width: 6rem; }
+  .mc-replay > * { flex-shrink: 0; }
+  .mc-replay > .mc-scrub, .mc-replay > .mc-moments { flex-shrink: 1; }
+  .mc-moments { min-width: 8rem; }
+}
+
+/* --- The gate timeline and the progress charts --- */
+
+.mc-gate {
+  grid-area: gate;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.9rem;
+  padding: 0.35rem 0.8rem;
+}
+
+.mc-gate-title {
+  font-size: 0.74rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.mc-gate-empty { font-size: 0.8rem; }
+
+.mc-gate-row {
+  list-style: none;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.2rem;
+  margin: 0;
+  padding: 0;
+}
+
+.mc-gate-row li { display: flex; align-items: center; gap: 0.2rem; }
+.mc-gate-row li + li::before {
+  content: "";
+  width: 0.45rem;
+  height: 1px;
+  background: var(--muted);
+}
+
+.mc .mc-gate-marker {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 3.1rem;
+  padding: 0.12rem 0.35rem;
+  line-height: 1.12;
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.7rem;
+}
+
+.mc .mc-gate-marker.is-pass { border-color: var(--ok-strong); color: var(--ok); background: rgba(35, 134, 54, 0.12); }
+.mc .mc-gate-marker.is-fail { border-color: var(--bad-strong); color: var(--bad-text); background: rgba(218, 54, 51, 0.08); }
+.mc .mc-gate-marker.is-no-gate { border-color: var(--warn); border-style: dashed; color: var(--warn); }
+.mc .mc-gate-marker.is-landed { box-shadow: 0 0 0 2px var(--ok); }
+.mc .mc-gate-marker.is-focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+.mc-gate-n { font-weight: 700; }
+.mc-gate-verdict { font-size: 0.6rem; font-weight: 800; letter-spacing: 0.05em; }
+.mc-gate-count.is-gap { color: var(--muted); }
+
+.mc-gate > figure:first-of-type { margin-left: auto; }
+
+.mc-chart { margin: 0; display: flex; flex-direction: column; gap: 0.05rem; }
+.mc-chart figcaption { font-size: 0.72rem; white-space: nowrap; }
+.mc-chart-name { font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); font-size: 0.66rem; }
+.mc-chart-story { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mc-chart-note { color: var(--advisory); font-style: italic; font-size: 0.66rem; }
+.mc-chart-svg { display: block; width: 196px; height: 52px; overflow: visible; }
+.mc-chart-total { stroke: var(--muted); stroke-dasharray: 3 3; stroke-width: 1; }
+.mc-chart-base { stroke: var(--border); stroke-width: 1; }
+.mc-chart-focus { stroke: var(--accent); stroke-width: 1; opacity: 0.6; }
+.mc-chart-line { fill: none; stroke: var(--accent); stroke-width: 1.6; }
+.mc-chart-pt { stroke: var(--panel); stroke-width: 1; }
+.mc-chart-pt.is-pass { fill: var(--ok-strong); }
+.mc-chart-pt.is-fail { fill: var(--bad-strong); }
+.mc-chart-pt.is-no-gate { fill: var(--panel); stroke: var(--warn); }
+.mc-chart-pt.is-landed { stroke: var(--ok); stroke-width: 2; }
+.mc-chart-gap { fill: none; stroke: var(--muted); stroke-width: 1; stroke-dasharray: 2 1.5; }
+.mc-chart-cand { fill: none; stroke-width: 1.2; }
+.mc-chart-cand.is-pass { stroke: var(--ok); }
+.mc-chart-cand.is-fail { stroke: var(--bad); }
+
+/* --- A focused revision's links in the graph (hovered on the timeline, or selected) --- */
+
+.mc-rev-focus .mc-edge path { fill: none; stroke-width: 2.2; cursor: pointer; }
+.mc-rev-focus .mc-edge.kind-dependency path { stroke: var(--muted); }
+.mc-rev-focus.status-pass .mc-edge.kind-dependency path { stroke: var(--ok); }
+.mc-rev-focus.status-fail .mc-edge.kind-dependency path { stroke: var(--bad); }
+.mc-rev-focus .mc-edge.kind-trigger path { stroke: var(--trigger); stroke-dasharray: 6 4; }
+.mc-hull.is-rev-focus > rect:first-of-type { stroke: var(--accent); stroke-width: 2.4; }
+
+/* --- The agent-talk overlay: curved teal arrows with a verb (an annotation, not a graph edge) --- */
+
+.mc-talk-arrow, .mc-talk-mark { cursor: pointer; transition: opacity 400ms ease; }
+.mc-talk-arrow path { fill: none; stroke: var(--talk); stroke-width: 2.4; stroke-linecap: round; }
+.mc-talk-arrow.is-new path { stroke-width: 3.2; }
+.mc-talk-head { fill: var(--talk); }
+.mc-talk-arrow rect, .mc-talk-mark rect { fill: var(--talk-bg); stroke: var(--talk); stroke-width: 1; }
+.mc-talk-arrow text, .mc-talk-mark text { fill: var(--talk); font-size: calc(11.5px * var(--mc-t, 1)); font-weight: 700; pointer-events: none; }
+.ln-talk { border-top-color: var(--talk); border-top-width: 3px; border-radius: 3px; }
+
+/* --- Advisory decisions (Jev): grey and italic, never a verdict --- */
+
+.mc-jev-panel {
+  margin-top: 0.3rem;
+  padding-top: 0.3rem;
+  border-top: 1px dashed var(--border);
+  font-size: 0.78rem;
+  color: var(--advisory);
+}
+
+.mc-jev-panel summary { cursor: pointer; font-style: italic; }
+.mc-jev-panel summary .muted { font-size: 0.74rem; }
+
+.mc-jev-list {
+  list-style: none;
+  margin: 0.3rem 0 0;
+  padding: 0;
+  max-height: 9.5rem;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.mc .mc-jev-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.1rem 0.5rem;
+  width: 100%;
+  text-align: left;
+  border: 1px dashed var(--grey-border);
+  color: var(--advisory);
+  font-style: italic;
+  font-size: 0.74rem;
+}
+
+.mc .mc-jev-row.is-selected { outline: 1px solid var(--advisory); }
+.mc .mc-jev-row.is-error { border-color: var(--warn); }
+.mc-jev-type { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-style: normal; font-weight: 600; }
+.mc-jev-outcome { color: var(--text); }
+.mc-jev-seq { margin-left: auto; color: var(--muted); font-style: normal; }

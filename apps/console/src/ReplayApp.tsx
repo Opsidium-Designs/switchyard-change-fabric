@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { MissionControl } from "./mission-control";
+import { ThemeToggle } from "./theme";
 import {
   finalVerdict,
   loadReplay,
@@ -112,6 +113,7 @@ export function ReplayApp() {
             </p>
           ) : null}
         </div>
+        <ThemeToggle />
       </header>
 
       <p className="replay-banner" role="status">
@@ -192,9 +194,14 @@ function ReadingGuide() {
           overlapping claims are <em>contested</em>.
         </li>
         <li>
-          <strong>Graph</strong> (middle): each rounded box is an item with the agents working in it; hexagons are integrated
-          revisions, green when the gate passed and red when it failed; orange squares are tools agents built for each other; grey
-          pentagons are advisory model decisions.
+          <strong>Gate</strong> (under the ticker): one marker per integrated revision, green when the gate passed and red when it
+          failed, with its acceptance count, beside a small chart of acceptance over revisions. Hover a marker to see which items
+          that revision merged.
+        </li>
+        <li>
+          <strong>Graph</strong> (middle): each rounded box is an item with the agents working in it; orange squares are tools agents
+          built for each other. Short curved teal arrows show who just proposed to, asked, handed off to, or contested whom; they
+          fade over the next few messages. Advisory model decisions (Jev) are listed in their own panel under the graph.
         </li>
         <li>
           <strong>Thread</strong> (right): the raw board messages. Click any item, agent, or revision to filter to its messages.

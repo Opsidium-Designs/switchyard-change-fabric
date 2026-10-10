@@ -25,6 +25,26 @@ import {
 import type { EscalationSnapshot } from "@switchyard-change/orchestration/graph-model";
 import { buildProofBundle, type ProofBundle } from "@switchyard-change/orchestration/proof-bundle";
 
+import {
+  COMM_WINDOW,
+  commCurve,
+  commOpacity,
+  communicationArrows,
+  gateTimeline,
+  jevRows,
+  progressChart,
+  revisionLinks,
+  seriesStory,
+  smartItemTitles,
+  speculativeLanded,
+  drawingExtent,
+  type CommArrow,
+  type GateMarker,
+  type JevRow,
+  type LandedPart,
+  type ProgressChart,
+  type SuiteSeries,
+} from "./board-overlay";
 import { IDENTITY_VIEW, shouldZoomOnWheel, zoomAt, type ViewTransform } from "./graph-interactions";
 import { keyMoments, MOMENT_GROUPS, type MomentKind } from "./replay-data";
 
@@ -128,17 +148,21 @@ export function escalationCards(
   return out;
 }
 
-/** Tick and chip colors per message family (decisions are grey: advisory). */
+/**
+ * Tick and chip colors per message family (decisions are grey: advisory), as
+ * theme variables (styles.css defines each for the light and the dark theme).
+ * Use them as CSS (`style`), never as SVG presentation attributes.
+ */
 export const FAMILY_COLORS: Record<BoardMessageFamily, string> = {
-  goal: "#58a6ff",
-  item: "#8b949e",
-  claim: "#388bfd",
-  contest: "#f85149",
-  rev: "#3fb950",
-  contract: "#d2a8ff",
-  decision: "#9aa0a6",
-  tool: "#f0883e",
-  agent: "#6e7681",
+  goal: "var(--fam-goal)",
+  item: "var(--fam-item)",
+  claim: "var(--fam-claim)",
+  contest: "var(--fam-contest)",
+  rev: "var(--fam-rev)",
+  contract: "var(--fam-contract)",
+  decision: "var(--fam-decision)",
+  tool: "var(--fam-tool)",
+  agent: "var(--fam-agent)",
 };
 
 function clip(text: string, max: number): string {
@@ -353,6 +377,186 @@ export function Ticker({
 }
 
 // ---------------------------------------------------------------------------
+// Gate timeline and progress
+// ---------------------------------------------------------------------------
+
+const GATE_WORD: Record<GateMarker["verdict"], string> = { pass: "PASS", fail: "FAIL", "no-gate": "NO GATE" };
+
+/**
+ * The gate timeline: one marker per integrated revision at K (number, verdict,
+ * acceptance count), beside the acceptance-over-revisions charts. Hovering or
+ * selecting a marker draws that revision's links in the graph.
+ */
+export function GateStrip({
+  markers,
+  chart,
+  focus,
+  onHover,
+  onSelect,
+}: {
+  markers: readonly GateMarker[];
+  chart: ProgressChart;
+  focus: number | null;
+  onHover: (n: number | null) => void;
+  onSelect: (n: number) => void;
+}) {
+  return (
+    <div className="mc-gate" aria-label="Gate timeline">
+      <span className="mc-gate-title" title="Every integrated revision; the gate on the integrated tree decides">
+        GATE
+      </span>
+      {markers.length === 0 ? (
+        <span className="muted mc-gate-empty">no integrated revision yet</span>
+      ) : (
+        <ol className="mc-gate-row">
+          {markers.map((m) => (
+            <li key={m.n}>
+              <button
+                type="button"
+                className={`mc-gate-marker is-${m.verdict}${m.landed ? " is-landed" : ""}${focus === m.n ? " is-focus" : ""}`}
+                aria-label={`revision ${m.n}: ${m.verdictLabel}${m.count ? `, ${m.count}` : ""}`}
+                title={m.tooltip}
+                onMouseEnter={() => onHover(m.n)}
+                onMouseLeave={() => onHover(null)}
+                onFocus={() => onHover(m.n)}
+                onBlur={() => onHover(null)}
+                onClick={() => onSelect(m.n)}
+              >
+                <span className="mc-gate-n">r{m.n}</span>
+                <span className="mc-gate-verdict">{GATE_WORD[m.verdict]}</span>
+                {m.count ? (
+                  <span className={`mc-gate-count${m.acceptanceNotRun !== undefined ? " is-gap" : ""}`}>{m.count}</span>
+                ) : null}
+              </button>
+            </li>
+          ))}
+        </ol>
+      )}
+      {chart.series.map((series) => (
+        <SuiteChart key={series.suite} series={series} landed={chart.landed} focus={focus} />
+      ))}
+    </div>
+  );
+}
+
+const CHART_W = 196;
+const CHART_H = 52;
+
+/**
+ * One suite's count over revisions: a step line through the recorded counts,
+ * a dashed line at the largest recorded total, a hollow gap marker where the
+ * suite did not run (never a zero), the landed revision ringed, and
+ * speculative candidates as small diamonds. Every mark cites its seq.
+ */
+export function SuiteChart({ series, landed, focus = null }: { series: SuiteSeries; landed?: number | undefined; focus?: number | null }) {
+  const pad = { l: 6, r: 8, t: 6, b: 8 };
+  const n = series.points.length;
+  const step = n > 1 ? (CHART_W - pad.l - pad.r) / (n - 1) : 0;
+  const xOf = (i: number) => (n > 1 ? pad.l + i * step : CHART_W / 2);
+  const indexOf = new Map(series.points.map((p, i) => [p.n, i]));
+  const total = Math.max(1, series.total);
+  const yOf = (v: number) => pad.t + (1 - v / total) * (CHART_H - pad.t - pad.b);
+  // The step line breaks at every gap.
+  let d = "";
+  let open = false;
+  series.points.forEach((p, i) => {
+    if (p.passed === undefined) {
+      open = false;
+      return;
+    }
+    const x = xOf(i).toFixed(1);
+    const y = yOf(p.passed).toFixed(1);
+    d += open ? ` H ${x} V ${y}` : ` M ${x} ${y}`;
+    open = true;
+  });
+  const story = seriesStory(series);
+  return (
+    <figure className={`mc-chart suite-${series.suite}`} aria-label={`${series.suite} over revisions`}>
+      <figcaption>
+        <span className="mc-chart-name">{series.suite}</span> <span className="mc-chart-story">{story}</span>
+        <span className="mc-chart-note" title="Counts are advisory, parsed from the gate's output; the gate alone decides">
+          {" "}advisory
+        </span>
+      </figcaption>
+      <svg className="mc-chart-svg" viewBox={`0 0 ${CHART_W} ${CHART_H}`} role="img" aria-label={`${series.suite}: ${story}`}>
+        <line className="mc-chart-total" x1={pad.l} x2={CHART_W - pad.r} y1={yOf(total)} y2={yOf(total)}>
+          <title>{`all ${series.total} checks of the ${series.suite} suite (the most recorded)`}</title>
+        </line>
+        <line className="mc-chart-base" x1={pad.l} x2={CHART_W - pad.r} y1={yOf(0)} y2={yOf(0)} />
+        {focus !== null && indexOf.has(focus) ? (
+          <line className="mc-chart-focus" x1={xOf(indexOf.get(focus)!)} x2={xOf(indexOf.get(focus)!)} y1={pad.t - 4} y2={CHART_H - 2} />
+        ) : null}
+        {d ? <path className="mc-chart-line" d={d.trim()} /> : null}
+        {series.candidates.map((c) => {
+          const i = indexOf.get(c.n);
+          if (i === undefined) return null;
+          const x = xOf(i) + 5 + c.index * 2;
+          const y = yOf(c.passed);
+          return (
+            <polygon key={c.seq} className={`mc-chart-cand is-${c.verdict}`} points={`${x},${y - 3.5} ${x + 3.5},${y} ${x},${y + 3.5} ${x - 3.5},${y}`}>
+              <title>{`speculative candidate C${c.index} (round ${c.round}): ${c.passed}/${c.total}, gate ${c.verdict}, ${c.outcome} (seq ${c.seq}, candidate.gated)`}</title>
+            </polygon>
+          );
+        })}
+        {series.points.map((p, i) =>
+          p.passed === undefined ? (
+            <rect key={p.seq} className="mc-chart-gap" x={xOf(i) - 3.5} y={yOf(0) - 7} width={7} height={7}>
+              <title>{`rev ${p.n}: ${p.gap ?? "no count"} (seq ${p.seq}, integrated.rev)`}</title>
+            </rect>
+          ) : (
+            <circle
+              key={p.seq}
+              className={`mc-chart-pt is-${p.verdict}${p.n === landed ? " is-landed" : ""}`}
+              cx={xOf(i)}
+              cy={yOf(p.passed)}
+              r={p.n === landed ? 4.5 : 3}
+            >
+              <title>{`rev ${p.n}: ${series.suite} ${p.passed}/${p.total}, gate ${GATE_WORD[p.verdict]}${p.n === landed ? " (the passing revision)" : ""} (seq ${p.seq}, integrated.rev)`}</title>
+            </circle>
+          ),
+        )}
+      </svg>
+    </figure>
+  );
+}
+
+/**
+ * The advisory decisions (Jev), grouped in a collapsible panel: type, what it
+ * answered, its confidence, and the mechanical outcome once resolved. Grey and
+ * italic, never styled like a verdict: they never change one.
+ */
+export function JevPanel({ rows, selected, onSelect }: { rows: readonly JevRow[]; selected: string | null; onSelect: (node: string) => void }) {
+  if (rows.length === 0) return null;
+  const confident = rows.filter((r) => r.confident).length;
+  return (
+    <details className="mc-jev-panel">
+      <summary>
+        Advisory decisions (Jev){" "}
+        <span className="muted">
+          {rows.length} recorded, {confident} confident; advisory only, never a verdict
+        </span>
+      </summary>
+      <ol className="mc-jev-list">
+        {rows.map((r) => (
+          <li key={r.node}>
+            <button type="button" className={`mc-jev-row${selected === r.node ? " is-selected" : ""}${r.error ? " is-error" : ""}`} onClick={() => onSelect(r.node)}>
+              <span className="mc-jev-type">{r.juncture}</span>
+              <span className="mc-jev-answer">
+                {r.error ? "call failed" : `answer: ${r.recommendation}`}
+                {r.confidence !== undefined ? ` (${r.confidence.toFixed(2)}${r.confident ? "" : ", not confident"})` : ""}
+              </span>
+              {r.about !== undefined ? <span className="mc-jev-about">on {r.about}</span> : null}
+              {r.outcome !== undefined ? <span className="mc-jev-outcome">{r.outcome}</span> : null}
+              <span className="mc-jev-seq">seq {r.seq}</span>
+            </button>
+          </li>
+        ))}
+      </ol>
+    </details>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Board pane
 // ---------------------------------------------------------------------------
 
@@ -493,6 +697,7 @@ export function BoardPane({
   busy,
   onSelect,
   onResolve,
+  log,
 }: {
   model: BoardGraphModel;
   cards: readonly EscalationCardData[];
@@ -500,9 +705,12 @@ export function BoardPane({
   busy: boolean;
   onSelect: (selection: BoardSelection) => void;
   onResolve: (id: string, decision: string) => void | Promise<void>;
+  /** The board log: when given, seam and tool items read by their recorded origin. */
+  log?: readonly BoardMessage[];
 }) {
   const byItem = new Map(model.nodes.filter((n) => n.kind === "item").map((n) => [n.label, n]));
-  const labels = boardShortLabels([...byItem.keys()], { seeds: seedItemIds(model) });
+  const short = boardShortLabels([...byItem.keys()], { seeds: seedItemIds(model) });
+  const labels = log ? smartItemTitles(boardPrefix(log, model.k), short) : short;
   const columns: [string, readonly string[]][] = [
     // Workers' proposals awaiting the lead: shown only while there are any.
     ...(model.columns.proposed.length > 0 ? ([["PROPOSED", model.columns.proposed]] as [string, readonly string[]][]) : []),
@@ -702,6 +910,8 @@ export function hullHeader(input: { readonly title: string; readonly status: str
   readonly title: string;
   readonly status: string;
   readonly badge: { readonly x: number; readonly w: number };
+  /** Below 1 when the title is set smaller to fit whole (never below HULL_TITLE_MIN_SCALE). */
+  readonly scale?: number;
 } {
   const boost = input.boost ?? 1;
   const pad = 14;
@@ -712,12 +922,21 @@ export function hullHeader(input: { readonly title: string; readonly status: str
   const statusNeed = Math.ceil(input.status.length * statusPx * CHAR_EM + 14);
   const fits = input.status.length > 0 && inner - statusNeed - gap >= titleKeep;
   const badgeW = fits ? statusNeed : 0;
+  const room = Math.max(0, inner - (fits ? badgeW + gap : 0));
+  // A title a little too long is set smaller rather than cut (`billing-invoices`, not `billing-in...`).
+  const need = input.title.length * HULL_TITLE_FONT * boost * CHAR_EM;
+  // One unit of slack and a scale rounded down, so a title scaled to fit is never cut by a rounding step.
+  const scale = need <= room || need === 0 ? 1 : Math.max(HULL_TITLE_MIN_SCALE, Math.floor((Math.max(0, room - 1) / need) * 1000) / 1000);
   return {
-    title: ellipsizeToWidth(input.title, Math.max(0, inner - (fits ? badgeW + gap : 0)), HULL_TITLE_FONT * boost),
+    title: ellipsizeToWidth(input.title, room, HULL_TITLE_FONT * boost * scale),
     status: fits ? input.status : "",
     badge: { x: input.width - pad - badgeW, w: badgeW },
+    ...(scale < 1 ? { scale } : {}),
   };
 }
+
+/** The smallest a hull title is set (a fraction of its size) before it is ellipsized instead. */
+export const HULL_TITLE_MIN_SCALE = 0.72;
 
 /** A short agent label (live ids are `agent-N` and `lead`; anything long is truncated). */
 export function agentShortLabel(id: string, max = 16): string {
@@ -788,14 +1007,18 @@ export interface BoardGraphViewProps {
   /** Captions to float over senders (newest first, at most three). */
   readonly captions: readonly { readonly seq: number; readonly node: string; readonly text: string }[];
   readonly onSelect: (selection: BoardSelection) => void;
+  /** The communication overlay at K (annotations over the graph, never graph edges). */
+  readonly arrows?: readonly CommArrow[];
+  /** The revision whose links are drawn (hovered on the gate timeline, or selected). */
+  readonly focusRev?: number | null;
 }
 
 /** Padding around the drawing inside the fitted viewBox. */
 const FIT_PAD = 16;
-/** The longest revision label the graph leaves room for (`GATE FAIL acceptance 128/129 (+12)`). */
-const REV_LABEL_CHARS = 34;
 /** Text never renders below its CSS size; it grows by at most this much when the drawing is scaled down. */
 const MAX_TEXT_BOOST = 1.8;
+/** Where a focused revision is drawn: above the hulls, at the right of the drawing. */
+const REV_ANCHOR_Y = 122;
 
 /** The text boost that keeps labels at their minimum on-screen size at a given drawing scale. */
 export function textBoost(drawingScale: number): number {
@@ -803,22 +1026,25 @@ export function textBoost(drawingScale: number): number {
   return Math.min(MAX_TEXT_BOOST, Math.max(1, 1 / drawingScale));
 }
 
-export function BoardGraphView({ model, layout, selection, log, messageMode, recentSeqs, captions, onSelect }: BoardGraphViewProps) {
+/**
+ * The board graph. Revisions live on the gate timeline and advisory decisions
+ * in their own panel, so the drawing holds the goal, the lead, the human, the
+ * item hulls with their agents, the bench, and the tools; a revision is drawn
+ * (with its merged-item and fix links) only while it is hovered on the
+ * timeline or selected. Agent-to-agent communication is an overlay of short
+ * curved arrows over the graph, derived from recorded messages, styled apart
+ * from every graph edge.
+ */
+export function BoardGraphView({ model, layout, selection, log, messageMode, recentSeqs, captions, onSelect, arrows = [], focusRev = null }: BoardGraphViewProps) {
   const selected = selectedNodeId(selection, log);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [view, setView] = useState<ViewTransform>(IDENTITY_VIEW);
   const [stage, setStage] = useState<{ w: number; h: number } | null>(null);
   const drag = useRef<{ x: number; y: number; tx: number; ty: number; moved: boolean } | null>(null);
-  const vbH = layout.height + 2 * FIT_PAD;
-  // Room on the right for the revision labels (`GATE FAIL acceptance 35/129`),
-  // which start beside the hexagons and grow with the text boost: without it
-  // they are clipped at the pane edge. Sized from the fitted scale (not the
-  // zoom), so zooming never shifts the drawing.
-  const revPad = (b: number) => (layout.revs.size > 0 ? Math.max(0, Math.ceil(32 + REV_LABEL_CHARS * 13 * b * CHAR_EM - 222)) : 0);
-  const fitFor = (w: number) => (stage ? Math.min(stage.w / w, stage.h / vbH) : 1);
-  const baseW = layout.width + 2 * FIT_PAD;
-  const vbW = baseW + revPad(textBoost(fitFor(baseW + revPad(1))));
+  const extent = drawingExtent(layout);
+  const vbW = extent.width + 2 * FIT_PAD;
+  const vbH = extent.height + 2 * FIT_PAD;
 
   // Track the pane size so labels keep a minimum on-screen size however the drawing is fitted.
   useEffect(() => {
@@ -857,7 +1083,7 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
     return () => svg.removeEventListener("wheel", onWheel);
   }, [toSvg]);
   const zoomBy = (factor: number) =>
-    setView((prev) => zoomAt(prev, layout.width / 2, layout.height / 2, -Math.log(factor) / 0.0015));
+    setView((prev) => zoomAt(prev, extent.width / 2, extent.height / 2, -Math.log(factor) / 0.0015));
   const choose = (next: BoardSelection) => {
     if (drag.current?.moved) return;
     onSelect(next);
@@ -870,8 +1096,16 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
       collapsed.add(node.detail.item);
     }
   }
+  // The revision drawn now (only while focused), at its anchor above the hulls.
+  const focusNode = focusRev !== null ? model.nodes.find((n) => n.id === `rev:${focusRev}`) : undefined;
+  const revAnchor = { x: extent.width - 34, y: REV_ANCHOR_Y };
   const points = new Map<string, BoardPoint>();
   for (const node of model.nodes) {
+    if (node.kind === "rev") {
+      if (node === focusNode) points.set(node.id, revAnchor);
+      continue;
+    }
+    if (node.kind === "jev") continue;
     const p = boardNodePoint(layout, node);
     if (!p) continue;
     if (node.detail.kind === "agent" && node.detail.hull !== undefined && collapsed.has(node.detail.hull)) {
@@ -882,31 +1116,38 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
       points.set(node.id, p);
     }
   }
-  const itemLabels = boardShortLabels(
-    model.nodes.filter((n) => n.kind === "item").map((n) => n.label),
-    { seeds: seedItemIds(model) },
+  const itemLabels = smartItemTitles(
+    boardPrefix(log, model.k),
+    boardShortLabels(
+      model.nodes.filter((n) => n.kind === "item").map((n) => n.label),
+      { seeds: seedItemIds(model) },
+    ),
   );
   // Declared structure stays quiet: goal -> item edges show only for a selected
-  // item, and item -> revision edges for the latest revision or a selection.
+  // item; revision edges only for the focused revision (from the timeline).
   // This hides drawn lines; it never adds one.
-  const latestRev = model.ticker.rev ? `rev:${model.ticker.rev.n}` : null;
+  const onRevOrJev = (id: string) => id.startsWith("rev:") || id.startsWith("jev:");
   const persistent = model.edges.filter((e) => {
     if (e.kind === "message") return false;
+    if (onRevOrJev(e.from) || onRevOrJev(e.to)) return false;
     if (e.kind !== "dependency") return true;
     const related = selected !== null && (e.from === selected || e.to === selected);
     if (e.from === "goal") return related;
-    if (e.from.startsWith("item:") && e.to.startsWith("rev:")) return related || e.to === latestRev;
     return true;
   });
-  const messages =
+  const revLinks = focusNode && focusNode.detail.kind === "rev" ? revisionLinks(model, focusNode.detail.n) : [];
+  const messages = (
     messageMode === "off"
       ? []
       : messageMode === "all"
         ? aggregateMessageEdges(model.edges)
-        : model.edges.filter((e) => e.kind === "message" && recentSeqs.has(e.seqs[e.seqs.length - 1]!));
+        : model.edges.filter((e) => e.kind === "message" && recentSeqs.has(e.seqs[e.seqs.length - 1]!))
+  ).filter((e) => !onRevOrJev(e.from) && !onRevOrJev(e.to));
   const selectEdge = (edge: BoardGraphEdge) => choose({ kind: "seq", seq: edge.seqs[edge.seqs.length - 1]! });
-  const placedCaptions = placeCaptions(captions, points, layout, boost);
+  const placedCaptions = placeCaptions(captions, points, { ...layout, width: extent.width }, boost);
   const transformed = view.k !== 1 || view.tx !== 0 || view.ty !== 0;
+  // Overlay marks on one sender stack upward, so two marks never sit on each other.
+  const markSlots = new Map<string, number>();
 
   return (
     <div className="mc-graph-stage" ref={stageRef}>
@@ -954,6 +1195,11 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
           drag.current = null;
         }}
       >
+        <defs>
+          <marker id="mc-talk-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path className="mc-talk-head" d="M 0 0 L 10 5 L 0 10 z" />
+          </marker>
+        </defs>
         <g transform={`translate(${view.tx}, ${view.ty}) scale(${view.k})`}>
           {/* Item hulls. */}
           <g className="mc-hulls">
@@ -967,10 +1213,11 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                 const isSel = selected === node.id;
                 const statusText = `${node.status}${d.fixRequested !== undefined ? ` / fix ${d.fixAttempts}` : ""}`;
                 const header = hullHeader({ title: itemLabels.get(d.item) ?? d.item, status: statusText, width: rect.w, boost });
+                const inFocus = focusNode?.detail.kind === "rev" ? revLinks.some((e) => e.from === node.id || e.to === node.id) : false;
                 return (
                   <g
                     key={node.id}
-                    className={`mc-hull status-${node.status}${isSel ? " is-selected" : ""}${rect.parent !== undefined ? " is-nested" : ""}`}
+                    className={`mc-hull status-${node.status}${isSel ? " is-selected" : ""}${rect.parent !== undefined ? " is-nested" : ""}${inFocus ? " is-rev-focus" : ""}`}
                     role="button"
                     tabIndex={0}
                     aria-label={`item ${d.item} (${node.status})`}
@@ -978,7 +1225,12 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                   >
                     <rect x={rect.x} y={rect.y} width={rect.w} height={rect.h} rx={16} />
                     <rect className="mc-hull-bar" x={rect.x} y={rect.y} width={rect.w} height={HULL_TITLE_H} rx={16} />
-                    <text className="mc-hull-title" x={rect.x + 14} y={rect.y + 22}>
+                    <text
+                      className="mc-hull-title"
+                      x={rect.x + 14}
+                      y={rect.y + 22}
+                      {...(header.scale !== undefined ? { style: { fontSize: `calc(15px * var(--mc-t, 1) * ${header.scale})` } } : {})}
+                    >
                       {header.title}
                     </text>
                     {header.badge.w > 0 ? (
@@ -1049,6 +1301,34 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
             })}
           </g>
 
+          {/* The focused revision's own edges (merged items, fix asked), to the top of each hull. */}
+          {focusNode && focusNode.detail.kind === "rev" ? (
+            <g className={`mc-rev-focus status-${focusNode.status}`} aria-label={`revision ${focusNode.detail.n} links`}>
+              {revLinks.map((edge) => {
+                const item = (edge.from.startsWith("item:") ? edge.from : edge.to).slice("item:".length);
+                const rect = layout.items.get(item);
+                if (!rect) return null;
+                const curve = commCurve(revAnchor, { x: rect.x + rect.w / 2, y: rect.y }, 0.12, 22);
+                return (
+                  <g key={edge.id} className={`mc-edge kind-${edge.kind} is-related`} onClick={() => selectEdge(edge)}>
+                    <path d={curve.d} />
+                    <title>{edge.tooltip}</title>
+                  </g>
+                );
+              })}
+              <g className={`mc-node kind-rev status-${focusNode.status}`} style={{ transform: `translate(${revAnchor.x}px, ${revAnchor.y}px)` }} onClick={() => choose({ kind: "node", id: focusNode.id })}>
+                <polygon className="shape" points={hexagon(18)} />
+                <text className="mc-node-label is-center" textAnchor="middle" y={5}>
+                  {focusNode.detail.n}
+                </text>
+                <text className="mc-node-sub" textAnchor="end" x={-26} y={5}>
+                  {focusNode.detail.verdictLabel}
+                </text>
+                <title>{focusNode.tooltip}</title>
+              </g>
+            </g>
+          ) : null}
+
           {/* Message edges: transient (a dot travels and fades), all (aggregated), or off. */}
           <g className="mc-messages">
             {messages.map((edge) => {
@@ -1077,10 +1357,10 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
             })}
           </g>
 
-          {/* Nodes (agents tween between hulls via a CSS transform transition). */}
+          {/* Nodes (agents tween between hulls via a CSS transform transition). Revisions and decisions live outside the drawing. */}
           <g className="mc-nodes">
             {model.nodes
-              .filter((n) => n.kind !== "item")
+              .filter((n) => n.kind !== "item" && n.kind !== "rev" && n.kind !== "jev")
               .map((node) => {
                 const p = points.get(node.id);
                 if (!p) return null;
@@ -1106,6 +1386,44 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                   </g>
                 );
               })}
+          </g>
+
+          {/* The communication overlay: who addressed whom in the last few seqs (an annotation, not a graph edge). */}
+          <g className="mc-talk" aria-label="Agent communication overlay">
+            {arrows.map((arrow) => {
+              const a = points.get(arrow.from);
+              if (!a) return null;
+              const b = arrow.to !== null ? points.get(arrow.to) : undefined;
+              const opacity = commOpacity(arrow.age, COMM_WINDOW);
+              const labelW = arrow.verb.length * 7.2 * boost + 12;
+              const labelH = 17 * boost;
+              if (!b || (Math.abs(a.x - b.x) < 1 && Math.abs(a.y - b.y) < 1)) {
+                // No drawn target: a mark above the sender, stacked when it has several.
+                const slot = markSlots.get(arrow.from) ?? 0;
+                markSlots.set(arrow.from, slot + 1);
+                const y = a.y - 30 - labelH - slot * (labelH + 3);
+                return (
+                  <g key={arrow.id} className="mc-talk-mark" style={{ opacity }} onClick={() => choose({ kind: "seq", seq: arrow.seq })}>
+                    <rect x={a.x - labelW / 2} y={y} width={labelW} height={labelH} rx={labelH / 2} />
+                    <text x={a.x} y={y + labelH * 0.72} textAnchor="middle">
+                      {arrow.verb}
+                    </text>
+                    <title>{arrow.tooltip}</title>
+                  </g>
+                );
+              }
+              const curve = commCurve(a, b);
+              return (
+                <g key={arrow.id} className={`mc-talk-arrow${arrow.age === 0 ? " is-new" : ""}`} style={{ opacity }} onClick={() => choose({ kind: "seq", seq: arrow.seq })}>
+                  <path d={curve.d} markerEnd="url(#mc-talk-head)" />
+                  <rect x={curve.mid.x - labelW / 2} y={curve.mid.y - labelH / 2} width={labelW} height={labelH} rx={labelH / 2} />
+                  <text x={curve.mid.x} y={curve.mid.y + labelH * 0.22} textAnchor="middle">
+                    {arrow.verb}
+                  </text>
+                  <title>{arrow.tooltip}</title>
+                </g>
+              );
+            })}
           </g>
 
           {/* Captions above the senders of newly landed messages (at most three, stacked clear of hull titles). */}
@@ -1366,7 +1684,7 @@ export function Thread({
   );
 }
 
-export function BoardNodeDetail({ node }: { node: BoardGraphNode }) {
+export function BoardNodeDetail({ node, landed }: { node: BoardGraphNode; landed?: LandedPart | undefined }) {
   const d = node.detail;
   const row = (label: string, value: ReactNode) =>
     value === undefined || value === null || value === "" ? null : (
@@ -1424,8 +1742,12 @@ export function BoardNodeDetail({ node }: { node: BoardGraphNode }) {
           <>
             {row("Gate", d.verdictLabel)}
             {row("Commit", <code>{d.commit}</code>)}
-            {row("Merged pushes", String(d.merged.length))}
-            {row("Contributors", list(d.contributors))}
+            {row("Merged pushes", landed ? `${d.merged.length} (${landed.commits.length} already landed in rev ${landed.rev})` : String(d.merged.length))}
+            {row(
+              landed ? "Contributors to the failure" : "Contributors",
+              list(landed ? d.contributors.filter((a) => !landed.agents.includes(a) || landed.failingAgents.includes(a)) : d.contributors),
+            )}
+            {landed ? row(`Landed in rev ${landed.rev}`, `${list(landed.items)}: passed in the round's landed candidate (seq ${landed.seq}, candidate.gated), not part of this failure`) : null}
             {row("Paths", list(d.paths))}
             {row("Dependency install", d.install)}
             {row("Implicated items", d.failing ? list(d.failing.items) : undefined)}
@@ -1619,15 +1941,17 @@ export function ReplayBar({
       <button type="button" className="mc-play" onClick={onPlay} disabled={lastSeq === 0}>
         {playing ? "Pause" : recorded && live ? "Play from start" : "Play"}
       </button>
-      {REPLAY_SPEEDS.map((s) => (
-        <button key={s} type="button" className={`mc-speed${speed === s ? " is-active" : ""}`} onClick={() => onSpeed(s)}>
-          {s}x
-        </button>
-      ))}
+      <span className="mc-speeds" role="group" aria-label="Replay speed">
+        {REPLAY_SPEEDS.map((s) => (
+          <button key={s} type="button" className={`mc-speed${speed === s ? " is-active" : ""}`} onClick={() => onSpeed(s)}>
+            {s}x
+          </button>
+        ))}
+      </span>
       <div className="mc-scrub">
         <svg className="mc-ticks" viewBox={`0 0 ${Math.max(1, lastSeq)} 10`} preserveAspectRatio="none" aria-hidden="true">
           {ticks.map(([family, d]) => (
-            <path key={family} d={d.join("")} stroke={FAMILY_COLORS[family]} strokeWidth={Math.max(0.4, lastSeq / 600)} />
+            <path key={family} d={d.join("")} style={{ stroke: FAMILY_COLORS[family] }} strokeWidth={Math.max(0.4, lastSeq / 600)} />
           ))}
         </svg>
         <input
@@ -1665,20 +1989,23 @@ export function ReplayBar({
           );
         })}
       </select>
-      <button type="button" disabled={nextClaim === undefined} onClick={() => nextClaim !== undefined && onSeek(nextClaim)}>
-        next claim
-      </button>
-      <button type="button" disabled={nextContract === undefined} onClick={() => nextContract !== undefined && onSeek(nextContract)}>
-        next contract
-      </button>
-      {nextContest !== undefined || !recorded ? (
-        <button type="button" disabled={nextContest === undefined} onClick={() => nextContest !== undefined && onSeek(nextContest)}>
-          next contest
+      <span className="mc-next" role="group" aria-label="Jump to the next">
+        <span className="muted">next</span>
+        <button type="button" title="the next claim" disabled={nextClaim === undefined} onClick={() => nextClaim !== undefined && onSeek(nextClaim)}>
+          claim
         </button>
-      ) : null}
-      <button type="button" disabled={nextRev === undefined} onClick={() => nextRev !== undefined && onSeek(nextRev)}>
-        next rev
-      </button>
+        <button type="button" title="the next contract change" disabled={nextContract === undefined} onClick={() => nextContract !== undefined && onSeek(nextContract)}>
+          contract
+        </button>
+        {nextContest !== undefined || !recorded ? (
+          <button type="button" title="the next contest" disabled={nextContest === undefined} onClick={() => nextContest !== undefined && onSeek(nextContest)}>
+            contest
+          </button>
+        ) : null}
+        <button type="button" title="the next integrated revision" disabled={nextRev === undefined} onClick={() => nextRev !== undefined && onSeek(nextRev)}>
+          rev
+        </button>
+      </span>
       {recorded ? (
         <button type="button" className="mc-end-pill" disabled={live} onClick={onLive}>
           end: final verdict
@@ -1738,22 +2065,25 @@ export function MissionControl({
   const [messageMode, setMessageMode] = useState<MessageMode>("live");
   const [selection, setSelection] = useState<BoardSelection | null>(initialSelection ?? null);
   const [tab, setTab] = useState<RightTab>(initialTab ?? "thread");
+  const [talk, setTalk] = useState(true);
+  const [hoverRev, setHoverRev] = useState<number | null>(null);
   const live = cursor === "live" || cursor >= lastSeq;
   const k = cursor === "live" ? lastSeq : Math.min(cursor, lastSeq);
   useEffect(() => {
     onSeqChange?.(live ? null : k);
   }, [k, live, onSeqChange]);
 
-  const layout = useMemo(() => boardLayout(log), [log]);
+  // Every projection of the log is guarded: a message the fold cannot read refuses the view at
+  // that seq (with the replay controls kept), never a blank page.
+  const layoutResult = useMemo(() => attempt(() => boardLayout(log)), [log]);
+  const layout = layoutResult.value;
   // The proof of the final revision at K, from the log alone (works the same in replay).
-  const proof = useMemo(() => buildProofBundle(boardPrefix(log, k)), [log, k]);
+  const proofResult = useMemo(() => attempt(() => buildProofBundle(boardPrefix(log, k))), [log, k]);
   const { model, error } = useMemo((): { model: BoardGraphModel | null; error: string | null } => {
-    try {
-      return { model: buildBoardGraph(log, k), error: null };
-    } catch (err) {
-      return { model: null, error: err instanceof Error ? err.message : String(err) };
-    }
-  }, [log, k]);
+    if (layoutResult.error !== null) return { model: null, error: layoutResult.error };
+    const built = attempt(() => buildBoardGraph(log, k));
+    return { model: built.value, error: built.error ?? proofResult.error };
+  }, [log, k, layoutResult, proofResult]);
 
   // Arrival times of the seqs the cursor moved over (forward only), for the
   // transient message edges and the captions.
@@ -1821,10 +2151,47 @@ export function MissionControl({
     setTab((t) => (t === "tools" ? "thread" : t));
   }, []);
 
-  if (error || !model) {
+  // The overlays at K: the talk arrows, the gate timeline, the progress chart, the advisory decisions.
+  const arrows = useMemo(() => (talk ? (attempt(() => communicationArrows(log, k)).value ?? []) : []), [log, k, talk]);
+  const chart = useMemo(() => attempt(() => progressChart(log, k)).value ?? { series: [] }, [log, k]);
+
+  // The replay controls render even when the graph refuses to draw, so a bad seq never strands the viewer.
+  const replayBar = (
+    <ReplayBar
+      log={log}
+      k={k}
+      live={live}
+      playing={playing}
+      speed={speed}
+      recorded={recorded}
+      onSeek={(seq) => {
+        setPlaying(false);
+        setCursor(seq >= lastSeq ? "live" : seq);
+      }}
+      onLive={() => {
+        setPlaying(false);
+        setCursor("live");
+      }}
+      onPlay={() => {
+        if (!playing && live) {
+          setCursor(0);
+        }
+        setPlaying((p) => !p);
+      }}
+      onSpeed={setSpeed}
+    />
+  );
+
+  if (error || !model || !layout || !proofResult.value) {
     return (
-      <section className="app-panel" aria-label="Honesty guard">
-        <p className="error">Refusing to render the board graph: {error}. The graph only draws elements backed by recorded board messages.</p>
+      <section className={`mc is-guarded${recorded ? " is-recorded" : ""}`} aria-label="Mission control">
+        <div className="mc-guard" role="alert" aria-label="Honesty guard">
+          <p className="error">
+            Refusing to render the board graph at seq {k}: {error}. The graph only draws elements backed by recorded board messages. Scrub to
+            another seq with the replay controls.
+          </p>
+        </div>
+        {replayBar}
       </section>
     );
   }
@@ -1843,11 +2210,25 @@ export function MissionControl({
   const selectedId = selectedNodeId(selection, log);
   const selectedNode = selectedId ? model.nodes.find((n) => n.id === selectedId) : undefined;
   const selectedSeq = selection?.kind === "seq" ? selection.seq : null;
+  const markers = gateTimeline(model, log);
+  const selectedRev = selectedId?.startsWith("rev:") ? Number(selectedId.slice(4)) : null;
+  const focusRev = hoverRev ?? selectedRev;
+  const landed = selectedNode?.detail.kind === "rev" ? speculativeLanded(log, k, selectedNode.detail.n) : undefined;
 
   return (
     <section className={`mc${recorded ? " is-recorded" : ""}`} aria-label="Mission control">
       <Ticker ticker={model.ticker} live={live} k={k} lastSeq={lastSeq} recorded={recorded} />
-      <BoardPane model={model} cards={cards} selection={selection} busy={busy} onSelect={select} onResolve={onResolve} />
+      <GateStrip
+        markers={markers}
+        chart={chart}
+        focus={focusRev}
+        onHover={setHoverRev}
+        onSelect={(n) => {
+          select({ kind: "node", id: `rev:${n}` });
+          setTab("node");
+        }}
+      />
+      <BoardPane model={model} cards={cards} selection={selection} busy={busy} onSelect={select} onResolve={onResolve} log={log} />
       <div className="mc-graph" aria-label="Graph">
         <div className="mc-graph-controls">
           <strong>GRAPH</strong>
@@ -1869,6 +2250,15 @@ export function MissionControl({
               {mode === "live" ? "as they land" : mode}
             </button>
           ))}
+          <button
+            type="button"
+            className={`mc-talk-toggle${talk ? " is-active" : ""}`}
+            aria-pressed={talk}
+            onClick={() => setTalk((t) => !t)}
+            title={`agent talk: who proposed to, asked, handed off to, or contested whom in the last ${COMM_WINDOW} seqs (an overlay from recorded messages, not graph edges)`}
+          >
+            talk {talk ? "on" : "off"}
+          </button>
           {selection ? (
             <button type="button" className="secondary" onClick={() => setSelection(null)}>
               clear selection
@@ -1884,8 +2274,18 @@ export function MissionControl({
           recentSeqs={recentSeqs}
           captions={captions}
           onSelect={select}
+          arrows={arrows}
+          focusRev={focusRev}
         />
         <BoardLegend />
+        <JevPanel
+          rows={jevRows(model)}
+          selected={selectedId}
+          onSelect={(node) => {
+            select({ kind: "node", id: node });
+            setTab("node");
+          }}
+        />
       </div>
       <div className="mc-right" aria-label="Details">
         <div className="mc-tabs" role="tablist">
@@ -1905,41 +2305,28 @@ export function MissionControl({
           />
         ) : tab === "node" ? (
           selectedNode ? (
-            <BoardNodeDetail node={selectedNode} />
+            <BoardNodeDetail node={selectedNode} landed={landed} />
           ) : (
             <p className="muted mc-empty">Select an item, agent, revision, tool, or decision.</p>
           )
         ) : tab === "proof" ? (
-          <ProofPanel bundle={proof} onSelectSeq={(seq) => select({ kind: "seq", seq })} />
+          <ProofPanel bundle={proofResult.value} onSelectSeq={(seq) => select({ kind: "seq", seq })} />
         ) : (
           <ToolsRegistry model={model} />
         )}
       </div>
-      <ReplayBar
-        log={log}
-        k={k}
-        live={live}
-        playing={playing}
-        speed={speed}
-        recorded={recorded}
-        onSeek={(seq) => {
-          setPlaying(false);
-          setCursor(seq >= lastSeq ? "live" : seq);
-        }}
-        onLive={() => {
-          setPlaying(false);
-          setCursor("live");
-        }}
-        onPlay={() => {
-          if (!playing && live) {
-            setCursor(0);
-          }
-          setPlaying((p) => !p);
-        }}
-        onSpeed={setSpeed}
-      />
+      {replayBar}
     </section>
   );
+}
+
+/** Run a projection, catching what it throws (the message, for the honesty guard). */
+function attempt<T>(fn: () => T): { readonly value: T | null; readonly error: string | null } {
+  try {
+    return { value: fn(), error: null };
+  } catch (err) {
+    return { value: null, error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 function boardPrefix(log: readonly BoardMessage[], k: number): readonly BoardMessage[] {
@@ -1954,8 +2341,8 @@ function BoardLegend() {
       <li><span className="line ln-tool" /> consumed tool</li>
       <li><span className="line ln-contest" /> contest (until resolved)</li>
       <li><span className="line ln-message" /> message</li>
-      <li><span className="swatch-hex sw-neutral" aria-hidden="true" /> revision (gate verdicts only here)</li>
-      <li><span className="swatch-pentagon sw-neutral" aria-hidden="true" /> Jev (advisory)</li>
+      <li><span className="line ln-talk" /> agent talk (overlay from recorded messages, not a graph edge)</li>
+      <li><span className="swatch-hex sw-neutral" aria-hidden="true" /> revision: on the gate timeline; hover one for its links</li>
     </ul>
   );
 }

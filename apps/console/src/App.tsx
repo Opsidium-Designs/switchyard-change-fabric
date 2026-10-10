@@ -18,6 +18,7 @@ import type { BoardMessage } from "@switchyard-change/orchestration/board-graph"
 import { pullBoard, resolveEscalation } from "./board-data";
 import { GraphView, changeHasPassed } from "./graph-view";
 import { MissionControl, type BoardEscalationRecord } from "./mission-control";
+import { ThemeToggle } from "./theme";
 import { boardCapable, TEMPLATES, type ContractPolicy, type LaunchMode, type Template } from "./templates";
 import { postToWorker } from "./worker-post";
 
@@ -578,7 +579,10 @@ export function App() {
   return (
     <main className={`app-shell${boardMode ? " is-wide" : ""}`}>
       <header className="app-header">
-        <h1>Switchyard Change Fabric</h1>
+        <div className="app-header-row">
+          <h1>Switchyard Change Fabric</h1>
+          <ThemeToggle />
+        </div>
         <p className="tagline">A living work graph, every node backed by real state</p>
       </header>
 

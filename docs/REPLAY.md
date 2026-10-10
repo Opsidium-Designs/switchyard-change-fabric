@@ -31,6 +31,34 @@ make replay-preview   # build, then serve on http://127.0.0.1:4180 (REPLAY_PORT=
   commit is that revision's commit; otherwise each reason. Item cards carry
   one line saying why a waiting item is not moving (derived from the board),
   and clash predictions are tagged on the cards.
+- The GATE row (under the ticker) has one marker per integrated revision
+  (number, PASS or FAIL, acceptance count; `--` where the acceptance suite did
+  not run) beside a small chart per suite (acceptance, developer) of the
+  recorded, advisory counts over revisions: a dashed line at the suite's total,
+  the passing revision ringed, speculative candidates as small diamonds, and a
+  hollow gap marker (never a zero) where a suite did not run. Revisions are not
+  drawn in the graph: hovering or selecting a marker draws that revision with
+  its links to the items it merged and asked to fix.
+- Agent coordination is an overlay on the graph (toggle: `talk on/off`):
+  short curved teal arrows labelled with a verb (proposes, accepts, asks help,
+  volunteers, hands off, contests, clash, re-plans, ...) from the acting
+  participant to the one it addressed or concerned, for the messages of the
+  last 10 seqs, fading as they age. It is derived from the recorded messages at
+  the current seq (`communicationArrows` in `apps/console/src/board-overlay.ts`),
+  every arrow cites its seq, and it is not a graph edge: the edge kinds are
+  unchanged.
+- Advisory decisions (Jev) are listed in a collapsible panel under the graph:
+  type, answer, confidence, and the mechanical outcome once resolved; grey,
+  never styled like a verdict.
+- A seam item reads `seam: <file>` (its contract's recorded target) and a tool
+  item `tool: <capability>`; the full id stays in the tooltip and the detail.
+- Theme: light and dark, following the system until chosen with the toggle in
+  the header (remembered in localStorage); `&theme=light` or `&theme=dark`
+  forces one for a link or a screenshot.
+- Each recorded run is checked on load by the board's own reducer
+  (`reduceBoard`): a file it refuses is not shown, with the reason. If the
+  graph cannot be drawn at some seq, the view says so and keeps the replay
+  controls, so the viewer can scrub away.
 - Live-only controls are gone: no launcher, templates, deploy, or dial, and a
   pending escalation is shown read-only ("recorded run: decided during the live
   run, not here").

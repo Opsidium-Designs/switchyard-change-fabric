@@ -9,6 +9,7 @@
  * Pure apart from the injected fetch, so it is tested offline.
  */
 
+import { reduceBoard } from "@switchyard-change/change-core";
 import type { BoardMessage } from "@switchyard-change/orchestration/board-graph";
 
 type FetchFn = (input: string, init?: RequestInit) => Promise<Response>;
@@ -66,10 +67,15 @@ export async function loadReplayIndex(fetchFn: FetchFn): Promise<ReplayIndexEntr
   );
 }
 
+/** The prefix of the error a recorded run that the board reducer refuses fails with. */
+export const REPLAY_INVALID = "failed validation";
+
 /**
  * Load one recorded run (`replays/<id>.json`) and check it is a whole board
- * log (seq 1, 2, 3, ... with no gap), so the fold replays exactly what was
- * recorded.
+ * log (seq 1, 2, 3, ... with no gap) that the board's own reducer accepts
+ * (`reduceBoard`: every agent post legal, every engine message one arbitration
+ * would derive), so the fold replays exactly what a real board recorded. A
+ * file the reducer refuses is never rendered.
  */
 export async function loadReplay(fetchFn: FetchFn, id: string): Promise<ReplayRun> {
   const res = await fetchFn(replayPath(`${id}.json`));
@@ -81,6 +87,13 @@ export async function loadReplay(fetchFn: FetchFn, id: string): Promise<ReplayRu
   messages.forEach((m, i) => {
     if (m.seq !== i + 1) throw new Error(`${id}: the board log is not contiguous at seq ${m.seq}`);
   });
+  try {
+    reduceBoard(messages);
+  } catch (err) {
+    throw new Error(
+      `${id} ${REPLAY_INVALID}: the board reducer refused it (${err instanceof Error ? err.message : String(err)}). It is not shown, because every message on this page must be one a real board accepted.`,
+    );
+  }
   return {
     changeId: typeof body.changeId === "string" ? body.changeId : id,
     messages,

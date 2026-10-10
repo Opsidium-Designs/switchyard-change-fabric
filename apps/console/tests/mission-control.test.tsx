@@ -30,6 +30,7 @@ import {
   ellipsizeToWidth,
   hullHeader,
   HULL_STATUS_FONT,
+  HULL_TITLE_MIN_SCALE,
   HULL_TITLE_FONT,
   placeCaptions,
   textBoost,
@@ -118,11 +119,16 @@ describe("mission control at the live head", () => {
     expect(markup).toContain(" used x3</tspan>");
   });
 
-  it("shows gate verdicts only on revisions and the ticker, and Jev as grey advisory chips", () => {
-    expect(markup).toContain("contract-triage (advisory)");
-    // Outside the revision hexagons, the ticker, and the thread (where a row IS the integrated.rev message).
+  it("shows gate verdicts only on revisions (the gate timeline) and the ticker, and Jev in a grey advisory panel", () => {
+    // Decisions are grouped in their labelled, collapsible panel, not floating in the graph.
+    expect(markup).toMatch(/<details class="mc-jev-panel"><summary>Advisory decisions \(Jev\)/);
+    expect(markup).toContain("advisory only, never a verdict");
+    expect(markup).toMatch(/<span class="mc-jev-type">contract-triage<\/span><span class="mc-jev-answer">answer: accept \(0\.86\)<\/span>/);
+    expect(markup).not.toContain('class="mc-node kind-jev');
+    // Outside the gate timeline (one marker per revision), the ticker, and the thread (where a row IS the integrated.rev message).
     const outsideRevs = markup
       .replace(/<g class="mc-node kind-rev[\s\S]*?<\/g>/g, "")
+      .replace(/<div class="mc-gate"[\s\S]*?<div class="mc-board"/, "")
       .replace(/<div class="mc-ticker"[\s\S]*?<\/div>/, "")
       .replace(/<div class="mc-right"[\s\S]*?<div class="mc-replay"/, "");
     expect(outsideRevs).not.toMatch(/GATE (PASS|FAIL)/);
@@ -461,7 +467,9 @@ describe("real-run naming (agent-N, lead, planner unit ids)", () => {
       for (const status of ["open", "contested / fix 2", "proposed"]) {
         for (const width of [180, 260, 420]) {
           const header = hullHeader({ title: "notifications-validate-auth-and-rate-limit", status, width, boost });
-          const titleRight = 14 + header.title.length * HULL_TITLE_FONT * boost * 0.62;
+          // A title set smaller to fit (scale below 1) is measured at its set size.
+          const titleRight = 14 + header.title.length * HULL_TITLE_FONT * boost * (header.scale ?? 1) * 0.62;
+          expect(header.scale ?? 1).toBeGreaterThanOrEqual(HULL_TITLE_MIN_SCALE);
           expect(titleRight).toBeLessThanOrEqual(header.badge.x);
           expect(header.badge.w).toBeGreaterThanOrEqual(header.status.length * HULL_STATUS_FONT * boost * 0.62);
           expect(header.badge.x + header.badge.w).toBeLessThanOrEqual(width);
