@@ -14,7 +14,7 @@ import { promisify } from "node:util";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { runGit, splitCredential } from "../src/git-transport.ts";
+import { guardTransferArgs, runGit, splitCredential } from "../src/git-transport.ts";
 import { installRecordingGit, type RecordingGit } from "./fake-git.ts";
 
 const run = promisify(execFile);
@@ -123,5 +123,49 @@ describe("hardened git transport", () => {
     );
     expect(failed).not.toBe("");
     expect(failed).not.toContain(TOKEN);
+  });
+
+  it("puts -- before a transfer's positional arguments, and it still clones, fetches, lists, and pushes", async () => {
+    const { dir, sha } = await workWithCommit();
+    await runGit(["-C", dir, "push", "-q", AUTHENTICATED, "HEAD:refs/heads/main"]);
+    const push = (await fake.calls()).find((c) => c.argv.includes(" push "));
+    expect(push!.argv).toContain(` push -q -- ${REMOTE} HEAD:refs/heads/main`);
+    const target = join(root, "checkout");
+    await runGit(["clone", "-q", AUTHENTICATED, target]);
+    await runGit(["-C", target, "fetch", "-q", AUTHENTICATED, "+refs/heads/main:refs/remotes/x/main"]);
+    expect((await runGit(["ls-remote", AUTHENTICATED, "refs/heads/main"])).stdout).toContain(sha);
+    await runGit(["-C", dir, "push", "-q", `--force-with-lease=refs/heads/other:`, AUTHENTICATED, "HEAD:refs/heads/other"]);
+    expect(await refs(real)).toContain("refs/heads/other");
+  });
+
+  it("refuses a remote or URL that starts with -, before git runs", async () => {
+    const { dir } = await workWithCommit();
+    const before = (await fake.calls()).length;
+    for (const args of [
+      ["-C", dir, "fetch", "--upload-pack=touch /tmp/pwned", "x"],
+      ["-C", dir, "push", "-q", "-oProxyCommand=evil", "HEAD:refs/heads/main"],
+      ["clone", "--config=core.sshCommand=evil", "x", join(root, "c2")],
+      ["ls-remote", "--upload-pack=evil"],
+    ]) {
+      await expect(runGit(args)).rejects.toThrow(/starts with "-"/);
+    }
+    expect((await fake.calls()).length).toBe(before);
+  });
+});
+
+describe("guardTransferArgs", () => {
+  it("inserts -- before the first positional argument of a transfer, and leaves other commands alone", () => {
+    expect(guardTransferArgs(["-C", "/d", "fetch", "-q", "origin", "main"])).toEqual(["-C", "/d", "fetch", "-q", "--", "origin", "main"]);
+    expect(guardTransferArgs(["clone", "https://h/x.git", "/t"])).toEqual(["clone", "--", "https://h/x.git", "/t"]);
+    expect(guardTransferArgs(["-C", "/d", "-c", "a.b=c", "push", "-q", "--force", "r", ":refs/heads/x"])).toEqual(["-C", "/d", "-c", "a.b=c", "push", "-q", "--force", "--", "r", ":refs/heads/x"]);
+    expect(guardTransferArgs(["-C", "/d", "fetch", "--", "r", "x"])).toEqual(["-C", "/d", "fetch", "--", "r", "x"]);
+    expect(guardTransferArgs(["-C", "/d", "rev-parse", "--verify", "HEAD"])).toEqual(["-C", "/d", "rev-parse", "--verify", "HEAD"]);
+    // A refspec after the remote that starts with - is past the --: never an option.
+    expect(guardTransferArgs(["-C", "/d", "fetch", "r", "-x"])).toEqual(["-C", "/d", "fetch", "--", "r", "-x"]);
+  });
+
+  it("refuses an unknown option in front of the positional arguments", () => {
+    expect(() => guardTransferArgs(["-C", "/d", "fetch", "--upload-pack=x", "r"])).toThrow(/starts with "-"/);
+    expect(() => guardTransferArgs(["push", "-"])).toThrow(/starts with "-"/);
   });
 });

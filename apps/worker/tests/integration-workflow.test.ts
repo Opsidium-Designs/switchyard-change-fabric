@@ -22,6 +22,7 @@ import { describe, expect, it } from "vitest";
 import type { BoardMessage, BoardState } from "@switchyard-change/change-core";
 import type { IntegrateJobResult } from "@switchyard-change/verification/integrate-job";
 
+import { decideCloudRevision } from "../src/cloud-integration.ts";
 import type { GateRunOutcome, GateRunRequest } from "../src/gate-runner.ts";
 import { runIntegrationLoop, workerIntegrationPorts, type IntegrationSteps } from "../src/integration-workflow.ts";
 import type { ProvisionedWorkspace } from "../src/workspace-provisioner.ts";
@@ -479,6 +480,154 @@ describe("integration on Cloudflare", () => {
     await s.push(PIN_2);
     expect(s.workflow.created).toHaveLength(2);
     expect(s.workflow.created[1]!.id).not.toBe(first);
+  });
+
+  it("keeps the active Workflow when its status cannot be read (never a second Workflow)", async () => {
+    const runner = fakeRunner((request) => ({ key: request.key, result: passResult(), phases: [] }));
+    const s = await setup(runner);
+    await s.push(PIN_1);
+    expect(s.workflow.created).toHaveLength(1);
+    const first = s.workflow.created[0]!.id;
+    // The instance exists, but reading its status fails (a transient error).
+    const realGet = s.workflow.binding.get;
+    s.workflow.binding.get = async (id: string) => {
+      await realGet(id);
+      return {
+        status: async () => {
+          throw new Error("the Workflows API timed out");
+        },
+      };
+    };
+    await s.push(PIN_2);
+    expect(s.workflow.created).toHaveLength(1);
+    const kicked = await s.h.json<{ started: boolean; coalesced: boolean; instanceId: string }>("POST", `/changes/${ID}/integration/cloud/kick`);
+    expect(kicked.body).toMatchObject({ started: false, coalesced: true, instanceId: first });
+    expect(s.workflow.created).toHaveLength(1);
+    // A positively unknown instance (not found) is replaced.
+    s.workflow.binding.get = async () => {
+      throw new Error("instance.not_found");
+    };
+    await s.push("3".repeat(40));
+    expect(s.workflow.created).toHaveLength(2);
+  });
+
+  it("never advances the integration branch to an UNGATED pass", async () => {
+    const runner = fakeRunner((request) => ({
+      key: request.key,
+      result:
+        request.job.kind === "advance"
+          ? { version: 1, kind: "advance", advanced: true, commit: request.job.commit, phases: [], durationMs: 1 }
+          : { ...passResult(), gated: false },
+      phases: [],
+    }));
+    const s = await setup(runner);
+    await s.push(PIN_1);
+    const result = await runIntegrationLoop(workerIntegrationPorts(s.h.env, ID), fakeSteps(), s.workflow.created[0]!.id);
+    expect(result.recorded[0]).toMatchObject({ recorded: true, gate: "pass" });
+    const rev = (await s.board()).messages.find((m) => m.type === "integrated.rev");
+    expect(rev?.type === "integrated.rev" && rev.payload.gated).toBe(false);
+    expect(runner.requests.some((r) => r.job.kind === "advance")).toBe(false);
+    expect((await s.h.state(ID).getCloudIntegration()).revisions[0]).toMatchObject({ gated: false });
+    expect((await s.h.state(ID).getCloudIntegration()).revisions[0]!.advanced).toBeUndefined();
+  });
+
+  it("keys the advance by the repo, the base, the commit, and the revision", async () => {
+    const runner = fakeRunner((request) => ({
+      key: request.key,
+      result: request.job.kind === "advance" ? { version: 1, kind: "advance", advanced: true, commit: request.job.commit, phases: [], durationMs: 1 } : passResult(),
+      phases: [],
+    }));
+    const s = await setup(runner);
+    await s.push(PIN_1);
+    await runIntegrationLoop(workerIntegrationPorts(s.h.env, ID), fakeSteps(), s.workflow.created[0]!.id);
+    const advance = runner.requests.find((r) => r.job.kind === "advance")!;
+    expect(advance.key).toMatch(/^aj-[0-9a-f]{32}$/);
+    expect(advance.key).not.toBe(`advance-${GATED}`);
+  });
+
+  it("a re-created Change (or a different gate) never replays a prior run's stored outcome", async () => {
+    // A runner that caches finished outcomes by key, like the real GateRunner.
+    const cache = new Map<string, GateRunOutcome>();
+    const runner = fakeRunner((request) => {
+      const hit = cache.get(request.key);
+      if (hit) {
+        return { ...hit, cached: true };
+      }
+      const outcome: GateRunOutcome = {
+        key: request.key,
+        result: request.job.kind === "advance" ? { version: 1, kind: "advance", advanced: true, commit: request.job.commit, phases: [], durationMs: 1 } : passResult(),
+        phases: [],
+      };
+      cache.set(request.key, outcome);
+      return outcome;
+    });
+    const s = await setup(runner);
+    await s.push(PIN_1);
+    await runIntegrationLoop(workerIntegrationPorts(s.h.env, ID), fakeSteps(), s.workflow.created[0]!.id);
+    const firstKey = runner.requests.find((r) => r.job.kind === "integrate")!.key;
+
+    // The same Change id re-created, configured with ANOTHER gate, and the same pin pushed again.
+    expect((await s.h.json("POST", "/changes", specYaml(ID))).status).toBe(201);
+    expect((await s.h.json("POST", `/changes/${ID}/integration/cloud`, config({ gateCommand: ["npm", "run", "other-gate"] }))).status).toBe(201);
+    expect((await s.h.json("POST", `/changes/${ID}/board/human`, { type: "goal.posted", payload: { objective: "make a equal 2" } })).status).toBe(201);
+    const lead = await s.h.json<{ token: string }>("POST", `/changes/${ID}/board/join`, { agent: "lead", role: "lead" });
+    await s.h.json("POST", `/changes/${ID}/board`, { type: "item.proposed", payload: { item: "fix-a", objective: "fix a", scopeHint: ["src/a.js"] } }, { [TOKEN_HEADER]: lead.body.token });
+    const agent = await s.h.json<{ token: string }>("POST", `/changes/${ID}/board/join`, { agent: "agent-1", workspace: { ttlSeconds: 600 } });
+    await s.h.json("POST", `/changes/${ID}/board`, { type: "item.claimed", payload: { item: "fix-a", intent: { read: [], write: ["src/a.js"] } } }, { [TOKEN_HEADER]: agent.body.token });
+    await s.h.json("POST", `/changes/${ID}/board`, { type: "push.announced", payload: { item: "fix-a", commit: PIN_1, paths: ["src/a.js"] } }, { [TOKEN_HEADER]: agent.body.token });
+    const planned = await s.h.state(ID).planCloudIntegration();
+    expect(planned.kind).toBe("job");
+    const secondKey = planned.kind === "job" ? planned.plan.key : "";
+    expect(secondKey).not.toBe(firstKey);
+    expect(cache.has(secondKey)).toBe(false);
+  });
+
+  it("records each revision with the base it was built on, so the board refuses a stale one (STALE_BASE)", async () => {
+    const runner = fakeRunner((request) => ({
+      key: request.key,
+      result: request.job.kind === "advance" ? { version: 1, kind: "advance", advanced: true, commit: request.job.commit, phases: [], durationMs: 1 } : passResult(),
+      phases: [],
+    }));
+    const s = await setup(runner);
+    await s.push(PIN_1);
+    const planned = await s.h.state(ID).planCloudIntegration();
+    expect(planned.kind).toBe("job");
+    if (planned.kind !== "job") {
+      return;
+    }
+    const state = (await s.board()).state;
+    // Built on the integrated head (the job's base commit): that base is recorded.
+    const onBase = { ...planned.plan, job: { ...planned.plan.job, baseCommit: "b".repeat(40) } };
+    const decided = decideCloudRevision(onBase, passResult(), state);
+    expect(decided.kind === "record" && decided.input.base).toBe("b".repeat(40));
+    const failing = decideCloudRevision(onBase, failResult(), state);
+    expect(failing.kind === "record" && failing.input.base).toBe("b".repeat(40));
+    // Built on the branch head before any pass: the goal's baseline.
+    expect(decideCloudRevision(planned.plan, passResult(), { ...state, baseline: "a".repeat(40) })).toMatchObject({ kind: "record", input: { base: "a".repeat(40) } });
+    // Revision 1 passes; then a job built on anything but its commit is stale.
+    await runIntegrationLoop(workerIntegrationPorts(s.h.env, ID), fakeSteps(), s.workflow.created[0]!.id);
+    expect((await s.board()).state.integrated?.commit).toBe(GATED);
+    await s.push(PIN_2);
+    const next = await s.h.state(ID).planCloudIntegration();
+    expect(next.kind === "job" && next.plan.job.baseCommit).toBe(GATED);
+    if (next.kind !== "job") {
+      return;
+    }
+    const stale = { ...next.plan, job: { ...next.plan.job, baseCommit: "b".repeat(40) } };
+    const record = await s.h.state(ID).recordCloudRevision({ plan: stale, result: passResult("8".repeat(40)), phases: [] });
+    expect(record.recorded).toBe(false);
+    expect(record.reason).toMatch(/STALE_BASE/);
+    expect((await s.board()).messages.filter((m) => m.type === "integrated.rev")).toHaveLength(1);
+  });
+
+  it("refuses a configuration whose job could outlive its one-hour Artifact tokens", async () => {
+    const h = createHarness({ provisioner: new HttpsProvisioner() });
+    expect((await h.json("POST", "/changes", specYaml(ID))).status).toBe(201);
+    const tooLong = await h.json<{ error: string }>("POST", `/changes/${ID}/integration/cloud`, config({ timeouts: { installMs: 30 * 60_000, gateMs: 60 * 60_000 } }));
+    expect(tooLong.status).toBe(400);
+    expect(tooLong.body.error).toMatch(/tokens live at most 60 min.*keep installMs \+ gateMs at or under 53 min/);
+    // 53 minutes of install + gate (58 with the overhead) fits under the token lifetime minus its margin.
+    expect((await h.json("POST", `/changes/${ID}/integration/cloud`, config({ timeouts: { installMs: 23 * 60_000, gateMs: 30 * 60_000 } }))).status).toBe(201);
   });
 
   it("does nothing on a push when integration on Cloudflare is not configured", async () => {

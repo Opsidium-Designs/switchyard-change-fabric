@@ -17,7 +17,7 @@ const SHA_A = "a".repeat(40);
 const SHA_B = "b".repeat(40);
 
 /** A fake binding: `get(name)` reports CREATE_IN_PROGRESS for the first `pending` probes of a repo. */
-function fakeBinding(pending: number, heads: Record<string, string>): ArtifactsBinding & { events: string[] } {
+function fakeBinding(pending: number, heads: Record<string, string>, options: { readonly tokenFails?: boolean } = {}): ArtifactsBinding & { events: string[] } {
   const events: string[] = [];
   const probes = new Map<string, number>();
   const created = (name: string) => ({
@@ -42,10 +42,15 @@ function fakeBinding(pending: number, heads: Record<string, string>): ArtifactsB
       }
       return {
         async createToken(scope = "write") {
+          if (options.tokenFails) {
+            events.push(`token-failed ${name}`);
+            throw new Error("token service down");
+          }
           events.push(`token ${name}`);
           return { id: `tok-${name}`, plaintext: `plain-${name}`, scope, expiresAt: "2099-01-01T00:00:00.000Z" };
         },
-        async revokeToken() {
+        async revokeToken(tokenOrId: string) {
+          events.push(`revoke ${name} ${tokenOrId}`);
           return true;
         },
         async info() {
@@ -64,7 +69,8 @@ function fakeBinding(pending: number, heads: Record<string, string>): ArtifactsB
     async import() {
       throw new Error("unused");
     },
-    async delete() {
+    async delete(name: string) {
+      events.push(`delete ${name}`);
       return true;
     },
   };
@@ -79,7 +85,22 @@ describe("CloudflareProvisioner readiness and fork read-back", () => {
     const binding = fakeBinding(1, {});
     const provisioned = await selectProvisioner(envWith(binding)).provision("chg--board-a", { ttlSeconds: 120 });
     expect(provisioned.token).toBe("plain-chg--board-a");
-    expect(binding.events).toEqual(["create chg--board-a", "not-ready chg--board-a", "token chg--board-a"]);
+    expect(binding.events).toEqual(["create chg--board-a", "not-ready chg--board-a", "token chg--board-a", "revoke chg--board-a creation-chg--board-a"]);
+  });
+
+  it("revokes the repo's creation token once the scoped token is issued (only the scoped one is handed out)", async () => {
+    const binding = fakeBinding(0, {});
+    const provisioned = await selectProvisioner(envWith(binding)).provision("chg--u", { ttlSeconds: 120 });
+    expect(provisioned.token).toBe("plain-chg--u");
+    expect(provisioned.tokenId).toBe("tok-chg--u");
+    expect(binding.events).toContain("revoke chg--u creation-chg--u");
+    expect(binding.events.indexOf("token chg--u")).toBeLessThan(binding.events.indexOf("revoke chg--u creation-chg--u"));
+  });
+
+  it("deletes the new repo when the scoped token cannot be issued, and rethrows", async () => {
+    const binding = fakeBinding(0, {}, { tokenFails: true });
+    await expect(selectProvisioner(envWith(binding)).provision("chg--u", { ttlSeconds: 120 })).rejects.toThrow(/token service down/);
+    expect(binding.events).toEqual(["create chg--u", "token-failed chg--u", "delete chg--u"]);
   });
 
   it("returns the fork's realized base, and records a mismatch against the expected head", async () => {

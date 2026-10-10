@@ -2270,11 +2270,18 @@ export class LocalChangeControl {
     }
     // A help fork (`help`): the operator reads the granted helper's fork to
     // pull its delivered commit into the requester's repo (the grant decides,
-    // even after the helper left).
+    // even after the helper left). A WRITE token for the fork also needs the
+    // helper still joined: a helper that left never writes again.
     if (body.help !== undefined) {
       const request = typeof body.help === "string" ? record.boardState.help[body.help] : undefined;
       if (!request || request.grant === undefined || request.grant.agent !== agent) {
         return json({ code: "NOT_ALLOWED", error: `${agent} holds no granted help fork for ${String(body.help)}` }, 400);
+      }
+      if (scope === "write") {
+        const helper = record.boardState.agents[agent];
+        if (helper === undefined || helper.leftSeq !== undefined) {
+          return json({ code: "UNKNOWN_AGENT", error: `${agent} is not a joined agent of this board: no write token for its help fork` }, 400);
+        }
       }
       const forkName = boardHelpForkWorkspaceName(changeId, request.request);
       const fork = this.boardWorkspaces.get(forkName);

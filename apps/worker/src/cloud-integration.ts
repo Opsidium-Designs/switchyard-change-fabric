@@ -56,6 +56,11 @@ export interface BoardRepoRecord {
   readonly workspaceName: string;
   readonly gitUrl: string;
   readonly defaultBranch: string;
+  /**
+   * The id (never the plaintext) of the write token the join provisioned with
+   * the repo, so a re-created Change revokes it. Board agents' repos only.
+   */
+  readonly tokenId?: string;
 }
 
 /** What a run configures for integration on Cloudflare. */
@@ -90,6 +95,17 @@ export const JOB_OVERHEAD_MS = 5 * 60 * 1000;
 export function jobDeadlineMs(config: Pick<CloudIntegrationConfig, "timeouts">): number {
   return config.timeouts.installMs + config.timeouts.gateMs + JOB_OVERHEAD_MS;
 }
+
+/** The longest lifetime of the Artifact tokens the Workflow mints for one job. */
+export const MAX_JOB_TOKEN_TTL_SECONDS = 3600;
+/** How long a job's tokens outlive its deadline (the push at the very end must still authenticate). */
+export const JOB_TOKEN_MARGIN_SECONDS = 120;
+/**
+ * The longest job deadline a configuration may ask for: the tokens are minted
+ * once, before the job starts, so a job that could outlive them would reach
+ * its push phase with an expired token.
+ */
+export const MAX_JOB_DEADLINE_MS = (MAX_JOB_TOKEN_TTL_SECONDS - JOB_TOKEN_MARGIN_SECONDS) * 1000;
 
 type Parsed<T> = { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: string };
 
@@ -147,6 +163,16 @@ export function parseCloudIntegrationConfig(raw: unknown, at: string): Parsed<Cl
     return { ok: false, error: probe.error };
   }
   const job = probe.value as IntegrateJob;
+  const deadline = jobDeadlineMs(job);
+  if (deadline > MAX_JOB_DEADLINE_MS) {
+    return {
+      ok: false,
+      error:
+        `timeouts.installMs + timeouts.gateMs + ${JOB_OVERHEAD_MS / 60_000} min of overhead is ${Math.ceil(deadline / 60_000)} min, ` +
+        `but a job's Artifact tokens live at most ${MAX_JOB_TOKEN_TTL_SECONDS / 60} min and must outlast it by ${JOB_TOKEN_MARGIN_SECONDS / 60} min: ` +
+        `keep installMs + gateMs at or under ${(MAX_JOB_DEADLINE_MS - JOB_OVERHEAD_MS) / 60_000} min`,
+    };
+  }
   return {
     ok: true,
     value: {
@@ -259,7 +285,9 @@ export async function planCloudJob(input: {
   if (!checked.ok) {
     return { kind: "idle", reason: `the planned job is invalid: ${checked.error}`, pendingKey: plan.key };
   }
-  const key = await integrationJobKey(job);
+  // Keyed by every gate-defining field and the configuration time (a run
+  // nonce): a re-created Change, or a different gate, never replays a stored outcome.
+  const key = await integrationJobKey(job, config.configuredAt);
   if (input.attempted(key)) {
     return { kind: "idle", reason: "this set of pushes was already integrated", pendingKey: plan.key };
   }
@@ -350,6 +378,8 @@ export type CloudRevisionDecision =
         readonly progress?: BoardRevProgress;
         readonly failing?: { readonly output: string; readonly items: readonly string[] };
         readonly gated?: false;
+        /** The commit the revision was built on (the board refuses a stale one: STALE_BASE). */
+        readonly base?: string;
       };
       readonly integratedItems: readonly string[];
       readonly excludedItems: readonly string[];
@@ -417,10 +447,15 @@ export function decideCloudRevision(plan: CloudJobPlan, result: IntegrateJobResu
   const integratedItems = mergedItems.map((i) => i.item);
   const excludedItems = plan.items.filter((i) => !mergedAgents.has(i.agent)).map((i) => i.item);
   const check = result.evidence.integration.finalCheck;
+  // The commit the job was built on: its base commit, else the branch head it
+  // cloned, which is the goal's baseline while no revision passed. The board
+  // refuses a revision whose base is not its integrated head NOW (STALE_BASE).
+  const builtOn = plan.job.baseCommit ?? stateNow.baseline;
+  const withBase = builtOn !== undefined ? { base: builtOn } : {};
   if (result.gate === "pass") {
     return {
       kind: "record",
-      input: { commit: result.commit, gate: "pass", merged, ...(result.gated === false ? { gated: false as const } : {}), ...withUnverified, ...withProgress },
+      input: { commit: result.commit, gate: "pass", merged, ...(result.gated === false ? { gated: false as const } : {}), ...withUnverified, ...withProgress, ...withBase },
       integratedItems,
       excludedItems,
       excludedAgents,
@@ -445,7 +480,7 @@ export function decideCloudRevision(plan: CloudJobPlan, result: IntegrateJobResu
   const source: AttributionSource = combined.source;
   return {
     kind: "record",
-    input: { commit: result.commit, gate: "fail", merged, failing: { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: ordered }, ...withUnverified, ...withProgress },
+    input: { commit: result.commit, gate: "fail", merged, failing: { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: ordered }, ...withUnverified, ...withProgress, ...withBase },
     integratedItems,
     excludedItems,
     excludedAgents,

@@ -1,6 +1,7 @@
 /**
- * Optional bearer auth on the Worker control plane (offline):
- *   - unset: every route behaves as before (local dev);
+ * Fail-closed bearer auth on the Worker control plane (offline):
+ *   - unset: every mutating route is refused unless the explicit local-dev
+ *     opt-in SWITCHYARD_ALLOW_UNAUTHENTICATED=1 is set (reads stay open);
  *   - set: every mutating route (and so every route that returns a plaintext
  *     Artifact token) requires `authorization: Bearer <token>`, while the
  *     read-only snapshot GETs stay open;
@@ -16,17 +17,37 @@ const TOKEN = "test-api-token-value";
 const AUTH = { authorization: `Bearer ${TOKEN}` };
 
 describe("Worker bearer auth", () => {
-  it("is off when SWITCHYARD_API_TOKEN is unset (unchanged local-dev behavior)", async () => {
-    const h = createHarness();
+  it("is fail-closed when SWITCHYARD_API_TOKEN is unset: a mutation is refused without the explicit opt-in", async () => {
+    const h = createHarness({ allowUnauthenticated: false });
+    const refused = await h.json<{ error: string }>("POST", "/changes", specYaml(ID));
+    expect(refused.status).toBe(401);
+    expect(refused.body.error).toMatch(/no SWITCHYARD_API_TOKEN set.*SWITCHYARD_ALLOW_UNAUTHENTICATED=1/);
+    expect((await h.request("POST", `/changes/${ID}/work/a/lease`)).status).toBe(401);
+    expect((await h.request("DELETE", `/workspaces/${ID}--a`)).status).toBe(401);
+    expect(h.provisioner.issued).toEqual([]);
+    // Reads stay open.
+    expect((await h.request("GET", "/")).status).toBe(200);
+    expect((await h.request("GET", `/changes/${ID}`)).status).toBe(404);
+  });
+
+  it("allows mutations with no token only under SWITCHYARD_ALLOW_UNAUTHENTICATED=1 (the local-dev opt-in)", async () => {
+    const h = createHarness({ allowUnauthenticated: true });
+    expect(h.env.SWITCHYARD_ALLOW_UNAUTHENTICATED).toBe("1");
     expect((await h.json("POST", "/changes", specYaml(ID))).status).toBe(201);
     const lease = await h.json<{ token: string }>("POST", `/changes/${ID}/work/a/lease`);
     expect(lease.status).toBe(201);
     expect(lease.body.token).toMatch(/^secret-/);
   });
 
-  it("is off when the token is blank", async () => {
-    const h = createHarness({ apiToken: "   " });
-    expect((await h.json("POST", "/changes", specYaml(ID))).status).toBe(201);
+  it("treats a blank token as unset: refused without the opt-in, allowed with it", async () => {
+    expect((await createHarness({ apiToken: "   " }).json("POST", "/changes", specYaml(ID))).status).toBe(401);
+    expect((await createHarness({ apiToken: "   ", allowUnauthenticated: true }).json("POST", "/changes", specYaml(ID))).status).toBe(201);
+  });
+
+  it("a set token always applies, even with the opt-in", async () => {
+    const h = createHarness({ apiToken: TOKEN, allowUnauthenticated: true });
+    expect((await h.request("POST", "/changes", specYaml(ID))).status).toBe(401);
+    expect((await h.request("POST", "/changes", specYaml(ID), AUTH)).status).toBe(201);
   });
 
   it("rejects every mutating route without a valid bearer, and never leaks a lease token", async () => {

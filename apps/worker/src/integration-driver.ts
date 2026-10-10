@@ -20,6 +20,9 @@
  *      as the evidence recorded them.
  * Before every phase that opens credentialed egress (fetch, push) the driver
  * itself checks, from outside the CLI, that no sandbox-user process is alive.
+ * At the start of the gate phase (before it is acknowledged) it runs a cheap
+ * deny-all probe: a short raw TCP connect to a public IP as the sandbox user;
+ * if that connects, the job is refused ("egress not isolated").
  * A deadline bounds the whole job (exec has no timeout of its own): the CLI is
  * wrapped in `timeout --kill-after`, and the driver kills it and closes the
  * egress when the deadline passes.
@@ -63,6 +66,12 @@ export interface GateContainerPort {
   assertClean(): Promise<void>;
   /** Throw if any process of the sandbox user is alive (checked before credentialed egress opens). */
   assertNoSandboxProcesses(): Promise<void>;
+  /**
+   * The deny-all probe at the start of the gate phase: as the sandbox user,
+   * try a short raw TCP connect to a public IP. Throw (naming what connected)
+   * if it succeeds: the container's egress is not isolated.
+   */
+  assertEgressDenied(): Promise<void>;
   /** Put an egress policy in force for every intercepted host. */
   setEgress(props: GateEgressProps): Promise<void>;
   spawn(argv: readonly string[], env: Readonly<Record<string, string>>): Promise<GateProcess>;
@@ -165,6 +174,15 @@ export async function driveGateJob(port: GateContainerPort, input: DriveJobInput
               }
             }
             await enter(parsed.phase);
+            if (parsed.phase === "gate") {
+              // The gate runs agent code: before it may start, check from
+              // outside the CLI that the sandbox user really reaches nothing.
+              try {
+                await port.assertEgressDenied();
+              } catch (error) {
+                return { error: `egress not isolated: refused before the gate phase (${error instanceof Error ? error.message : String(error)})`, phases };
+              }
+            }
           }
           current = parsed.phase;
           await running.writeLine(ackLine(parsed.phase));
@@ -177,6 +195,9 @@ export async function driveGateJob(port: GateContainerPort, input: DriveJobInput
       const said = scrubJobText(running.diagnostics?.() ?? "").trim().split("\n").slice(-3).join(" | ").slice(0, 400);
       return { error: `the job ended without a result (exit ${code}${code === 124 || code === 137 ? ": timed out" : ""})${said ? `: ${said}` : ""}`, phases };
     })();
+    // When the deadline wins the race, a session that rejects later must not
+    // surface as an unhandled rejection (the race still sees an earlier one).
+    session.catch(() => undefined);
     const settled = await Promise.race([session, deadline]);
     if ("timedOut" in settled) {
       running.kill();

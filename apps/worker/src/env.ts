@@ -25,12 +25,20 @@ export interface Env {
    * Optional bearer token for the control plane (a Worker secret, never a
    * committed var). When set, every mutating route and every route that returns
    * a plaintext Artifact token requires `authorization: Bearer <token>`; the
-   * read-only snapshot GETs stay open. When unset or blank, the Worker behaves
-   * as an unauthenticated local-dev control plane. Set it with
+   * read-only snapshot GETs stay open. When unset or blank, mutating routes are
+   * refused unless SWITCHYARD_ALLOW_UNAUTHENTICATED opts in. Set it with
    * `wrangler secret put SWITCHYARD_API_TOKEN` (deploy) or a gitignored
    * `apps/worker/.dev.vars` (wrangler dev). See src/auth.ts.
    */
   readonly SWITCHYARD_API_TOKEN?: string;
+  /**
+   * Explicit opt-in to an UNAUTHENTICATED control plane while no
+   * SWITCHYARD_API_TOKEN is set ("1"). Without it, a Worker with no token
+   * refuses every mutating route (fail-closed). The local-dev Makefile targets
+   * pass it to `wrangler dev` (`--var SWITCHYARD_ALLOW_UNAUTHENTICATED:1`);
+   * never set it on a deployed Worker. See src/auth.ts.
+   */
+  readonly SWITCHYARD_ALLOW_UNAUTHENTICATED?: string;
   /**
    * Integration on Cloudflare (optional): the Durable Object that owns the gate
    * container, and the Workflow that integrates a board's announced pushes in

@@ -13,8 +13,10 @@ import { describe, expect, it } from "vitest";
 
 import { phaseLine, resultLine, type GateJob, type IntegrateJobResult } from "@switchyard-change/verification/integrate-job";
 
+import { GateRunner, OUTCOMES_KEPT } from "../src/gate-runner.ts";
 import { cliArgv, driveGateJob, type GateContainerPort, type GateProcess } from "../src/integration-driver.ts";
 import { decideEgress, egressLabel, repoPathOf, type GateEgressProps } from "../src/integration-egress.ts";
+import { MemoryStorage } from "./harness.ts";
 
 const HOST = "acct.artifacts.cloudflare.net";
 const INTEGRATION = `https://${HOST}/git/ns/change-x--integration.git`;
@@ -102,6 +104,8 @@ class FakeContainer implements GateContainerPort {
   /** When the sandbox check reports a live sandbox process ("start" = before the job, "push" = before the push). */
   sandboxAliveAt: "start" | "push" | undefined;
   dirty = false;
+  /** The deny-all probe connects (the container's egress is not isolated). */
+  egressOpen = false;
 
   constructor(
     private readonly script: readonly string[],
@@ -125,6 +129,13 @@ class FakeContainer implements GateContainerPort {
     this.log.push(`sandbox-check@${at}`);
     if (this.sandboxAliveAt === at) {
       throw new Error("a sandbox process is alive (sandbox_processes=1)");
+    }
+  }
+
+  async assertEgressDenied(): Promise<void> {
+    this.log.push(`egress-probe@${this.egress.at(-1)?.phase ?? "none"}`);
+    if (this.egressOpen) {
+      throw new Error("the sandbox user connected to 1.1.1.1:443");
     }
   }
 
@@ -201,7 +212,7 @@ describe("gate job driver", () => {
       "closed:deny-all",
     ]);
     // Each acknowledgement is written only after its policy is in force.
-    const order = port.log.filter((l) => /^(egress:|stdin:ack|started|destroyed|reset-none|clean-check|sandbox-check)/.test(l));
+    const order = port.log.filter((l) => /^(egress:|egress-probe|stdin:ack|started|destroyed|reset-none|clean-check|sandbox-check)/.test(l));
     expect(order).toEqual([
       "reset-none",
       "started",
@@ -212,6 +223,7 @@ describe("gate job driver", () => {
       "egress:deps",
       "stdin:ack deps",
       "egress:gate",
+      "egress-probe@gate",
       "stdin:ack gate",
       "sandbox-check@push",
       "egress:push",
@@ -288,6 +300,69 @@ describe("gate job driver", () => {
     // The next job starts a fresh container, not the one the hung job ran in.
     const next = await drive(new FakeContainer([phaseLine("fetch"), resultLine(RESULT)]));
     expect(next.error).toBeUndefined();
+  });
+
+  it("refuses the job when the deny-all probe connects at the start of the gate phase (egress not isolated)", async () => {
+    const port = new FakeContainer([phaseLine("fetch"), phaseLine("deps"), phaseLine("gate"), phaseLine("push"), resultLine(RESULT)]);
+    port.egressOpen = true;
+    const outcome = await drive(port);
+    expect(outcome.result).toBeUndefined();
+    expect(outcome.error).toMatch(/^egress not isolated: .*connected to 1\.1\.1\.1:443/);
+    // The gate was never acknowledged (no agent code ran), and nothing credentialed opened after.
+    expect(port.stdin).not.toContain("ack gate");
+    expect(port.egress.map((p) => p.phase)).toEqual(["fetch", "deps", "gate", "closed"]);
+    expect(port.log.at(-1)).toBe("destroyed");
+  });
+
+  it("a session that fails after the deadline won is not an unhandled rejection", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const port = new FakeContainer([phaseLine("fetch")]);
+      // A process whose stdout fails only after the deadline already passed.
+      port.spawn = async () => ({
+        lines: (async function* () {
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          yield* [] as string[];
+          throw new Error("stdout broke late");
+        })(),
+        async writeLine() {},
+        async closeInput() {},
+        exitCode: Promise.resolve(0),
+        kill() {},
+      });
+      const outcome = await driveGateJob(port, { job: JOB, artifactsHost: HOST, registryHost: "registry.npmjs.org", repos: TOKENS, deadlineMs: -9_990 });
+      expect(outcome.error).toMatch(/did not finish/);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  it("GateRunner: replays a stored outcome by key, clears it on request (a re-created Change), and keeps a bounded number", async () => {
+    const storage = new MemoryStorage();
+    // No container bound: a job that is not cached reports that, and is not stored.
+    const runner = new GateRunner({ storage } as never, {} as never);
+    const request = (key: string) => ({ key, job: JOB, artifactsHost: HOST, registryHost: "registry.npmjs.org", repos: {}, deadlineMs: 60_000 });
+    const remember = (key: string) => (runner as unknown as { remember(k: string, r: unknown): Promise<void> }).remember(key, { key, result: RESULT, phases: [] });
+    await remember("ij-one");
+    expect(await runner.runJob(request("ij-one"))).toMatchObject({ key: "ij-one", cached: true, result: RESULT });
+    expect((await runner.runJob(request("ij-two"))).error).toMatch(/without the gate container/);
+    expect(await runner.clearCache()).toEqual({ cleared: 1 });
+    const after = await runner.runJob(request("ij-one"));
+    expect(after.cached).toBeUndefined();
+    expect(after.error).toMatch(/without the gate container/);
+    // Bounded: only the newest OUTCOMES_KEPT outcomes stay.
+    for (let i = 0; i < OUTCOMES_KEPT + 5; i += 1) {
+      await remember(`ij-${i}`);
+    }
+    const kept = await storage.list({ prefix: "gate-job:" });
+    expect(kept.size).toBe(OUTCOMES_KEPT);
+    expect(kept.has("gate-job:ij-0")).toBe(false);
+    expect(kept.has(`gate-job:ij-${OUTCOMES_KEPT + 4}`)).toBe(true);
+    expect((await storage.get<string[]>("gate-job-index"))!).toHaveLength(OUTCOMES_KEPT);
   });
 
   it("bounds the CLI with timeout(1)", () => {

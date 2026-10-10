@@ -47,12 +47,20 @@ install:
 
 # --- local dev loop ---
 
+# The Worker's control plane is fail-closed: with no SWITCHYARD_API_TOKEN it
+# refuses every mutating route unless SWITCHYARD_ALLOW_UNAUTHENTICATED=1 opts
+# in. The local dev targets below opt in (a var passed to `wrangler dev` only,
+# never to a deploy), so the local loop needs no credential. A token set in a
+# gitignored apps/worker/.dev.vars still applies: the opt-in only matters
+# while no token is set. Override WORKER_DEV_VARS= to run local dev closed.
+WORKER_DEV_VARS ?= --var SWITCHYARD_ALLOW_UNAUTHENTICATED:1
+
 # Run the Cloudflare Worker locally under wrangler dev. The Artifacts binding is
 # configured with remote=true, so authenticate first: either `wrangler login`,
 # or put a scoped CLOUDFLARE_API_TOKEN in a gitignored .env (sourced below).
 dev:
 	set -a; [ -f .env ] && . ./.env; set +a; \
-	npm -w apps/worker run dev
+	npm -w apps/worker run dev -- $(WORKER_DEV_VARS)
 
 # Run the Worker locally WITH the integration gate container (Cloudflare
 # Containers under wrangler dev build the image with Docker): what
@@ -60,7 +68,7 @@ dev:
 # needed); integration then stays with the local driver.
 dev-containers:
 	set -a; [ -f .env ] && . ./.env; set +a; \
-	WRANGLER_ENABLE_CONTAINERS=true npm -w apps/worker run dev
+	WRANGLER_ENABLE_CONTAINERS=true npm -w apps/worker run dev -- $(WORKER_DEV_VARS)
 
 # Run the local console (Vite dev server).
 console:
@@ -72,7 +80,7 @@ console:
 # its launcher spawns never get it in their environment (the CLI reads .env
 # into memory itself).
 dev-all:
-	(set -a; [ -f .env ] && . ./.env; set +a; npm -w apps/worker run dev) & \
+	(set -a; [ -f .env ] && . ./.env; set +a; npm -w apps/worker run dev -- $(WORKER_DEV_VARS)) & \
 	npm -w apps/console run dev & \
 	wait
 
@@ -83,14 +91,15 @@ dev-all:
 # 127.0.0.1. Override LAN_IP=... to pick a specific interface. AUTH: set
 # SWITCHYARD_API_TOKEN (the Worker secret, via a gitignored apps/worker/.dev.vars,
 # and the same value in .env) to require a bearer on every Worker mutation;
-# without it the Worker control plane is unauthenticated. The console launcher
+# without it the Worker control plane is unauthenticated (this target opts in
+# with WORKER_DEV_VARS, like every dev target). The console launcher
 # (launch runs, spend AI/Artifacts, deploy) has no auth of its own either way,
 # so only use this on a trusted network.
 LAN_IP ?= $(shell hostname -I 2>/dev/null | awk '{print $$1}')
 dev-all-lan:
 	@echo "LAN console: http://$(LAN_IP):5173  (Worker: http://$(LAN_IP):8787)"
 	@echo "Set SWITCHYARD_API_TOKEN (apps/worker/.dev.vars + the same value in .env) to require a bearer on Worker mutations; otherwise the Worker is unauthenticated. The console launcher is open to the LAN: trusted networks only."
-	(set -a; [ -f .env ] && . ./.env; set +a; WRANGLER_DEV_IP=0.0.0.0 npm -w apps/worker run dev) & \
+	(set -a; [ -f .env ] && . ./.env; set +a; WRANGLER_DEV_IP=0.0.0.0 npm -w apps/worker run dev -- $(WORKER_DEV_VARS)) & \
 	VITE_WORKER_URL=http://$(LAN_IP):8787 npm -w apps/console run dev & \
 	wait
 

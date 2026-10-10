@@ -130,8 +130,19 @@ class CloudflareProvisioner implements WorkspaceProvisioner {
     try {
       // create resolves only once the new repo is usable (the provider's
       // readiness wait), so the token is never issued for a repo still building.
-      const ref = await this.provider.create(workspaceName);
-      const token = await this.provider.issueWriteToken(ref, options.ttlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS);
+      const { ref, token: creation } = await this.provider.createWithToken(workspaceName);
+      let token: Awaited<ReturnType<CloudflareArtifactWorkspaceProvider["issueWriteToken"]>>;
+      try {
+        token = await this.provider.issueWriteToken(ref, options.ttlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS);
+      } catch (error) {
+        // No scoped token, no repo: nothing is left behind holding only the
+        // long-lived creation token.
+        await this.provider.archive(ref).catch(() => undefined);
+        throw error;
+      }
+      // The creation token is never handed out: only the short, scoped one is
+      // (as with a fork).
+      await this.provider.revokeToken(ref, creation).catch(() => false);
       this.refs.set(workspaceName, { name: ref.name });
       return {
         workspaceId: ref.id,

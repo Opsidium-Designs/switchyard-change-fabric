@@ -10,12 +10,15 @@
     "enabled": true
   },
 
-  // Optional control-plane auth: the SWITCHYARD_API_TOKEN Worker SECRET. It is
+  // Control-plane auth: the SWITCHYARD_API_TOKEN Worker SECRET. It is
   // deliberately NOT declared under "vars" (vars are plaintext in this file).
   // When set, every mutating route (and every route that returns a plaintext
   // Artifact token) requires `authorization: Bearer <token>`; read-only snapshot
-  // GETs stay open. When unset, the Worker is the unauthenticated local-dev
-  // control plane it has always been. Set it out of band, never in the repo:
+  // GETs stay open. When unset, mutating routes are REFUSED (fail-closed)
+  // unless the var SWITCHYARD_ALLOW_UNAUTHENTICATED=1 opts in: the local-dev
+  // Makefile targets pass it to `wrangler dev` with --var; it is deliberately
+  // not declared here, so a deploy never inherits it. Set the token out of
+  // band, never in the repo:
   //   deploy:      npx wrangler secret put SWITCHYARD_API_TOKEN
   //   wrangler dev: SWITCHYARD_API_TOKEN=<value> in a gitignored apps/worker/.dev.vars
   // It is typed in src/env.ts; see src/auth.ts and docs/LIVE-DEPLOY.md.

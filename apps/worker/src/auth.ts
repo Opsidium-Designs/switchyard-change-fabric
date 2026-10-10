@@ -1,5 +1,5 @@
 /**
- * Optional bearer auth for the Worker control plane.
+ * Bearer auth for the Worker control plane, fail-closed.
  *
  * When the `SWITCHYARD_API_TOKEN` secret is set on the Worker (`wrangler secret
  * put SWITCHYARD_API_TOKEN` for a deploy, or a gitignored `apps/worker/.dev.vars`
@@ -11,8 +11,12 @@
  * stay open: the state projection carries token ids only, never a plaintext
  * token, so the console can poll without holding a credential.
  *
- * When the secret is unset (or empty), the Worker behaves exactly as before, so
- * the local-dev loop and the offline tests need no credential.
+ * When the secret is unset (or empty), mutating requests are REFUSED unless the
+ * Worker explicitly opts in to running unauthenticated with the var
+ * `SWITCHYARD_ALLOW_UNAUTHENTICATED=1`. The local-dev targets (`make dev`,
+ * `make dev-all`, `make dev-all-lan`, `make dev-containers`) pass it to
+ * `wrangler dev`, and the offline test harness sets it, so the local loop needs
+ * no credential; a deployed Worker without the secret is closed by default.
  *
  * The Queue consumer is not an HTTP route and is not gated here: it is only
  * reachable from the bound Cloudflare Queue.
@@ -21,10 +25,20 @@
 /** The methods that never mutate state and so stay open under auth. */
 const READ_ONLY_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
-/** The configured API token, or undefined when auth is off (unset or blank). */
+/** The configured API token, or undefined when none is set (unset or blank). */
 export function configuredApiToken(env: { readonly SWITCHYARD_API_TOKEN?: string }): string | undefined {
   const token = env.SWITCHYARD_API_TOKEN;
   return typeof token === "string" && token.trim() !== "" ? token : undefined;
+}
+
+/**
+ * Whether the Worker explicitly opted in to an unauthenticated control plane
+ * (`SWITCHYARD_ALLOW_UNAUTHENTICATED` is "1" or "true"). It only matters while
+ * no API token is set: a set token always applies.
+ */
+export function allowsUnauthenticated(env: { readonly SWITCHYARD_ALLOW_UNAUTHENTICATED?: string }): boolean {
+  const value = env.SWITCHYARD_ALLOW_UNAUTHENTICATED;
+  return typeof value === "string" && ["1", "true"].includes(value.trim().toLowerCase());
 }
 
 /** Whether a request with this method must be authenticated when auth is on. */

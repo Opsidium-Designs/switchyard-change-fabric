@@ -571,23 +571,102 @@ export function phaseTransitionAllowed(current: EgressPhase, next: EgressPhase):
   return EGRESS_PHASES.indexOf(next) >= EGRESS_PHASES.indexOf(current);
 }
 
-/**
- * The idempotency material of an integrate job: the Change, the base commit,
- * and every unit's pinned commit. The same pending pushes on the same base are
- * the same revision, however often a retry asks for it.
- */
-export function integrationJobKeyMaterial(job: Pick<IntegrateJob, "changeId" | "baseCommit" | "units">): string {
-  const pins = [...job.units].map((u) => `${u.agent}@${u.commit}`).sort();
-  return [`change:${job.changeId}`, `base:${job.baseCommit ?? "baseline"}`, ...pins].join("\n");
+/** The fields of an integrate job its idempotency key covers. */
+export type IntegrationJobKeyInput = Pick<
+  IntegrateJob,
+  | "changeId"
+  | "baseCommit"
+  | "units"
+  | "integration"
+  | "gateCommand"
+  | "requireGate"
+  | "protectedPaths"
+  | "protectedJsonKeys"
+  | "testInventory"
+  | "acceptedContracts"
+  | "gateSupportFiles"
+  | "timeouts"
+  | "identity"
+>;
+
+/** JSON with object keys sorted (a stable encoding of a value for hashing). */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => canonicalJson(v)).join(",")}]`;
+  }
+  if (isRecord(value)) {
+    return `{${Object.keys(value)
+      .filter((k) => value[k] !== undefined)
+      .sort()
+      .map((k) => `${JSON.stringify(k)}:${canonicalJson(value[k])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value ?? null);
 }
 
-/** A short, stable id for the material (SHA-256, hex, 32 characters, "ij-" prefixed). */
-export async function integrationJobKey(job: Pick<IntegrateJob, "changeId" | "baseCommit" | "units">): Promise<string> {
-  const bytes = new TextEncoder().encode(integrationJobKeyMaterial(job));
-  // Web Crypto, present in Node and in Workers (typed structurally: no DOM lib here).
+/**
+ * The idempotency material of an integrate job: the Change, the base commit,
+ * every unit's pinned commit, and EVERY field that defines what the gate
+ * checks (the integration repo and branch, the gate command and whether a gate
+ * is required, the protected contract, the baseline test inventory, the
+ * accepted contracts, the gate support files, the timeouts, and the commit
+ * identity), plus an optional run nonce (the configuration's time, so a
+ * re-created Change never replays a prior run's outcome). The same pending
+ * pushes on the same base under the same gate are the same revision, however
+ * often a retry asks for it; a different gate is a different job.
+ */
+export function integrationJobKeyMaterial(job: IntegrationJobKeyInput, nonce?: string): string {
+  const pins = [...job.units].map((u) => `${u.agent}@${u.commit}`).sort();
+  const gate = canonicalJson({
+    integration: job.integration,
+    gateCommand: job.gateCommand ?? null,
+    requireGate: job.requireGate,
+    protectedPaths: [...job.protectedPaths].sort(),
+    protectedJsonKeys: job.protectedJsonKeys,
+    testInventory: job.testInventory ?? null,
+    acceptedContracts: [...(job.acceptedContracts ?? [])].sort(),
+    gateSupportFiles: [...(job.gateSupportFiles ?? [])].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)),
+    timeouts: job.timeouts,
+    identity: job.identity ?? null,
+  });
+  return [`change:${job.changeId}`, `base:${job.baseCommit ?? "baseline"}`, ...pins, `gate:${gate}`, ...(nonce !== undefined ? [`run:${nonce}`] : [])].join("\n");
+}
+
+/** SHA-256 of text, hex, cut to 32 characters (Web Crypto: present in Node and in Workers). */
+async function shortDigest(text: string): Promise<string> {
+  const bytes = new TextEncoder().encode(text);
+  // Typed structurally: no DOM lib here.
   const { subtle } = (globalThis as unknown as { readonly crypto: { readonly subtle: { digest(algorithm: string, data: Uint8Array): Promise<ArrayBuffer> } } }).crypto;
   const digest = new Uint8Array(await subtle.digest("SHA-256", bytes));
-  return `ij-${[...digest].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32)}`;
+  return [...digest].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+}
+
+/** A short, stable id for the material ("ij-" prefixed). */
+export async function integrationJobKey(job: IntegrationJobKeyInput, nonce?: string): Promise<string> {
+  return `ij-${await shortDigest(integrationJobKeyMaterial(job, nonce))}`;
+}
+
+/**
+ * The idempotency key of an advance job ("aj-" prefixed): the integration
+ * repo and branch, the base the revision was built on (the value the branch is
+ * expected to move from), the commit to advance to, and the revision's own key
+ * (which carries the run nonce). The same commit under another repo, base, or
+ * run is a different advance.
+ */
+export async function advanceJobKey(input: {
+  readonly integration: { readonly repoUrl: string; readonly defaultBranch: string };
+  readonly expectedBase?: string;
+  readonly commit: string;
+  readonly revisionKey?: string;
+}): Promise<string> {
+  const material = [
+    `repo:${input.integration.repoUrl}`,
+    `branch:${input.integration.defaultBranch}`,
+    `base:${input.expectedBase ?? "branch-head"}`,
+    `commit:${input.commit}`,
+    `revision:${input.revisionKey ?? ""}`,
+  ].join("\n");
+  return `aj-${await shortDigest(material)}`;
 }
 
 /** Text with any URL userinfo and bearer value removed (defense in depth: jobs carry no credentials). */

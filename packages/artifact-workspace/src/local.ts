@@ -89,7 +89,11 @@ export class LocalFilesystemWorkspaceProvider implements WorkspaceProvider {
     // file:// or https baseline both work with the git CLI. If the baseline is
     // unreachable, the caller falls back to the runner's first push.
     const record = this.require(ref.name);
-    await runGit(["-C", record.repoDir, "fetch", baselineRemote, "+refs/heads/*:refs/heads/*"]);
+    if (baselineRemote.startsWith("-")) {
+      throw new Error(`refusing to seed ${ref.name}: the baseline remote ${JSON.stringify(baselineRemote.slice(0, 80))} starts with "-"`);
+    }
+    // `--`: the remote and the refspec are never parsed as options.
+    await runGit(["-C", record.repoDir, "fetch", "--", baselineRemote, "+refs/heads/*:refs/heads/*"]);
   }
 
   /**
@@ -121,7 +125,7 @@ export class LocalFilesystemWorkspaceProvider implements WorkspaceProvider {
     const forked = await this.create(targetName, { defaultBranch: ref.defaultBranch });
     const target = this.require(forked.name);
     // An empty source has no branch yet: the fork is empty too.
-    await runGit(["-C", target.repoDir, "fetch", "-q", source.repoDir, "+refs/heads/*:refs/heads/*"]);
+    await runGit(["-C", target.repoDir, "fetch", "-q", "--", source.repoDir, "+refs/heads/*:refs/heads/*"]);
     const realizedBase = await branchHead(target.repoDir, forked.defaultBranch);
     return {
       ref: forked,

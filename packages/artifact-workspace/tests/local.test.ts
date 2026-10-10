@@ -35,6 +35,19 @@ describe("LocalFilesystemWorkspaceProvider", () => {
     await run("git", ["clone", ref.gitUrl, cloneDir]);
   });
 
+  it("seeds from a baseline remote, and refuses one that starts with - (never read as an option)", async () => {
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir });
+    const baseline = await provider.create("baseline");
+    const work = join(rootDir, "seed-work");
+    await run("git", ["clone", "-q", baseline.gitUrl, work]);
+    await run("git", ["-C", work, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base"]);
+    await run("git", ["-C", work, "push", "-q", "origin", "HEAD:main"]);
+    const target = await provider.create("seeded");
+    await provider.seed(target, baseline.gitUrl);
+    expect((await provider.inspect(target)).lastPushAt).not.toBeNull();
+    await expect(provider.seed(target, "--upload-pack=touch /tmp/pwned")).rejects.toThrow(/starts with "-"/);
+  });
+
   it("forks a workspace: the fork starts from the source's commits and diverges independently", async () => {
     const provider = new LocalFilesystemWorkspaceProvider({ rootDir });
     const source = await provider.create("requester");

@@ -261,6 +261,12 @@ describe("LocalChangeControl board routes (parity with the Worker)", () => {
     expect((await read()).body.code).toBe("NOT_ALLOWED");
     expect((await as("w2", { type: "help.offered", payload: { request: "h1", forkOf: "w1", fork: `${ID}--help-h1` }, to: ["w1"] })).status).toBe(201);
     expect((await read()).body).toMatchObject({ workspaceName: `${ID}--help-h1` });
+    // A WRITE token for the fork needs the helper still joined; a read does not.
+    const write = () => call<{ code?: string; workspaceName?: string }>(c, "POST", `/changes/${ID}/board/agent-token`, { agent: "w2", help: "h1", ttlSeconds: 120 });
+    expect((await write()).status).toBe(201);
+    expect((await as("w2", { type: "agent.left" })).status).toBe(201);
+    expect((await write()).body.code).toBe("UNKNOWN_AGENT");
+    expect((await read()).body).toMatchObject({ workspaceName: `${ID}--help-h1` });
     // Archived at cleanup, once.
     expect((await call(c, "DELETE", `/workspaces/${ID}--help-h1`)).status).toBe(200);
     expect((await call(c, "DELETE", `/workspaces/${ID}--help-h1`)).status).toBe(404);

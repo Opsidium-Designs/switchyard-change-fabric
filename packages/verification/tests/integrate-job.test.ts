@@ -22,6 +22,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   ackLine,
+  advanceJobKey,
   EGRESS_PHASES,
   integrationJobKey,
   integrationJobKeyMaterial,
@@ -136,6 +137,44 @@ describe("integration job idempotency key", () => {
     expect(await integrationJobKey(job())).not.toBe(await integrationJobKey(one));
     // Things that do not change what is gated do not change the key.
     expect(await integrationJobKey({ ...one, units: one.units.map((u) => ({ ...u, scope: ["other/**"] })) })).toBe(await integrationJobKey(one));
+  });
+
+  it("covers every gate-defining field: the same pins under another gate are another job", async () => {
+    const base = job();
+    const key = await integrationJobKey(base);
+    const variants: Record<string, Partial<typeof base>> = {
+      gateCommand: { gateCommand: ["true"] },
+      requireGate: { requireGate: !base.requireGate },
+      protectedPaths: { protectedPaths: [...base.protectedPaths, "other/**"] },
+      protectedJsonKeys: { protectedJsonKeys: [{ file: "package.json", keys: [["scripts", "other"]] }] },
+      testInventory: { testInventory: { format: "node-spec", count: 1, names: ["a"] } },
+      acceptedContracts: { acceptedContracts: ["test/a.test.js"] },
+      gateSupportFiles: { gateSupportFiles: [{ name: "h.mjs", content: "x" }] },
+      integration: { integration: { ...base.integration, repoUrl: "https://artifacts.example/other.git" } },
+      timeouts: { timeouts: { ...base.timeouts, gateMs: base.timeouts.gateMs + 1000 } },
+      identity: { identity: { name: "other", email: "o@example.invalid" } },
+    };
+    for (const [field, change] of Object.entries(variants)) {
+      expect(await integrationJobKey({ ...base, ...change }), field).not.toBe(key);
+    }
+    // Accepting a contract changes the key; the order of accepted targets does not.
+    const two = { ...base, acceptedContracts: ["a", "b"] };
+    expect(await integrationJobKey(two)).not.toBe(key);
+    expect(await integrationJobKey({ ...base, acceptedContracts: ["b", "a"] })).toBe(await integrationJobKey(two));
+    // A run nonce (the configuration time) separates two runs of the same Change.
+    expect(await integrationJobKey(base, "2026-01-01T00:00:00.000Z")).not.toBe(await integrationJobKey(base, "2026-01-02T00:00:00.000Z"));
+    expect(await integrationJobKey(base, "2026-01-01T00:00:00.000Z")).not.toBe(key);
+  });
+
+  it("keys an advance by the repo, the branch, the base, the commit, and the revision", async () => {
+    const input = { integration: job().integration, expectedBase: SHA_A, commit: SHA_B, revisionKey: "ij-1" };
+    const key = await advanceJobKey(input);
+    expect(key).toMatch(/^aj-[0-9a-f]{32}$/);
+    expect(await advanceJobKey({ ...input })).toBe(key);
+    expect(await advanceJobKey({ ...input, integration: { ...input.integration, repoUrl: "https://artifacts.example/other.git" } })).not.toBe(key);
+    expect(await advanceJobKey({ ...input, integration: { ...input.integration, defaultBranch: "trunk" } })).not.toBe(key);
+    expect(await advanceJobKey({ ...input, expectedBase: undefined })).not.toBe(key);
+    expect(await advanceJobKey({ ...input, revisionKey: "ij-2" })).not.toBe(key);
   });
 });
 

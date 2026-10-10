@@ -11,8 +11,10 @@
  * and reaches only what the current phase's handler relays.
  *
  * Every job is idempotent by its key: a finished job's outcome is stored and
- * returned again to a retry. A Durable Object reset or a hot reload kills the
- * container; the next job starts it again.
+ * returned again to a retry. The key covers every gate-defining field and the
+ * run's configuration time, the stored outcomes are bounded (the oldest are
+ * pruned), and a re-created Change clears them (clearCache). A Durable Object
+ * reset or a hot reload kills the container; the next job starts it again.
  */
 
 import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
@@ -47,6 +49,22 @@ const CLEAN_CHECK = [
   `echo sandbox_owned=$(find /tmp /var/tmp /dev/shm /run/lock /work -xdev -user ${SANDBOX_UID} 2>/dev/null | wc -l)`,
   `echo home_extra=$(find ${SANDBOX_HOME} -mindepth 1 -maxdepth 1 ! -name .bashrc ! -name .bash_logout ! -name .profile 2>/dev/null | wc -l)`,
 ].join("; ");
+
+/** Public endpoints the deny-all probe tries to reach (raw TCP, by IP: no DNS, no intercepted host). */
+export const EGRESS_PROBE_TARGETS = ["1.1.1.1:443", "8.8.8.8:53"] as const;
+
+/**
+ * The deny-all probe: as the sandbox user, a raw TCP connect to each target
+ * with a 3 s limit. Prints `egress_open=<target>` for any that connected; a
+ * refused, unreachable, or timed-out connect prints nothing.
+ */
+const EGRESS_PROBE = EGRESS_PROBE_TARGETS.map((target) => {
+  const [ip, port] = target.split(":");
+  return (
+    `if timeout -k 1 3 setpriv --reuid=${SANDBOX_UID} --regid=${SANDBOX_UID} --clear-groups -- ` +
+    `bash -c 'exec 3<>/dev/tcp/${ip}/${port}' 2>/dev/null; then echo egress_open=${target}; fi`
+  );
+}).join("; ");
 
 /** One job for the runner. */
 export interface GateRunRequest {
@@ -120,6 +138,17 @@ class CloudflareGatePort implements GateContainerPort {
     const report = await this.shell(SANDBOX_PROCESS_CHECK);
     if (report.trim() !== "sandbox_processes=0") {
       throw new Error(`a sandbox process is alive (${report.trim()})`);
+    }
+  }
+
+  async assertEgressDenied(): Promise<void> {
+    const report = (await this.shell(EGRESS_PROBE)).trim();
+    const open = report
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.startsWith("egress_open="));
+    if (open.length > 0) {
+      throw new Error(`the sandbox user connected to ${open.map((l) => l.slice("egress_open=".length)).join(", ")}`);
     }
   }
 
@@ -265,6 +294,10 @@ async function* readLines(stream: ReadableStream | null): AsyncIterable<string> 
 }
 
 const OUTCOME_PREFIX = "gate-job:";
+/** The stored outcomes' keys, oldest first (what pruning drops first). */
+const OUTCOME_INDEX = "gate-job-index";
+/** The most finished outcomes a runner keeps for replay (older ones are pruned). */
+export const OUTCOMES_KEPT = 64;
 
 export class GateRunner extends DurableObject<Env> {
   private queue: Promise<unknown> = Promise.resolve();
@@ -279,6 +312,33 @@ export class GateRunner extends DurableObject<Env> {
   /** Whether the container is running (for status and cleanup). */
   async status(): Promise<{ readonly available: boolean; readonly running: boolean }> {
     return { available: this.ctx.container !== undefined, running: this.ctx.container?.running ?? false };
+  }
+
+  /**
+   * Forget every stored outcome (a re-created Change is a fresh run: nothing a
+   * prior run finished may be replayed into it). Returns how many were dropped.
+   */
+  async clearCache(): Promise<{ readonly cleared: number }> {
+    const listed = await this.ctx.storage.list({ prefix: OUTCOME_PREFIX });
+    const keys = [...listed.keys()];
+    for (let i = 0; i < keys.length; i += 128) {
+      await this.ctx.storage.delete(keys.slice(i, i + 128));
+    }
+    await this.ctx.storage.delete(OUTCOME_INDEX);
+    return { cleared: keys.length };
+  }
+
+  /** Store a finished outcome for replay, keeping at most OUTCOMES_KEPT (oldest dropped first). */
+  private async remember(key: string, result: GateRunOutcome): Promise<void> {
+    const storageKey = `${OUTCOME_PREFIX}${key}`;
+    const index = ((await this.ctx.storage.get<string[]>(OUTCOME_INDEX)) ?? []).filter((k) => k !== storageKey);
+    index.push(storageKey);
+    const dropped = index.length > OUTCOMES_KEPT ? index.splice(0, index.length - OUTCOMES_KEPT) : [];
+    await this.ctx.storage.put(storageKey, result);
+    await this.ctx.storage.put(OUTCOME_INDEX, index);
+    for (let i = 0; i < dropped.length; i += 128) {
+      await this.ctx.storage.delete(dropped.slice(i, i + 128));
+    }
   }
 
   /** Stop the container (cleanup). */
@@ -321,7 +381,7 @@ export class GateRunner extends DurableObject<Env> {
       !(outcome.result.kind === "advance" && !outcome.result.advanced);
     if (finished) {
       // Only a finished job is replayed; a failure to run (or to advance) is retried.
-      await this.ctx.storage.put(`${OUTCOME_PREFIX}${request.key}`, result);
+      await this.remember(request.key, result);
     }
     return result;
   }

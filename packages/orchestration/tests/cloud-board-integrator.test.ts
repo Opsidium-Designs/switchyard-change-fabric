@@ -17,7 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { emptyBoard, type BoardState } from "@switchyard-change/change-core";
 
-import { CloudBoardIntegrator, gateSupportFilesFor } from "../src/cloud-board-integrator.ts";
+import { CloudBoardIntegrator, createCloudIntegrationWorkspace, gateSupportFilesFor } from "../src/cloud-board-integrator.ts";
 
 const BASE = "http://worker.test";
 const ID = "change-cloud";
@@ -202,6 +202,49 @@ describe("CloudBoardIntegrator advisory attribution", () => {
     await integrator.poll();
     await integrator.poll();
     expect(worker.answers).toEqual([{ key: "ij-g", items: [] }]);
+  });
+});
+
+describe("createCloudIntegrationWorkspace", () => {
+  let root: string;
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), "scf-seed-"));
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("revokes the issued token and archives the repo when seeding fails, then rethrows", async () => {
+    const calls: { method: string; url: string; body?: unknown }[] = [];
+    const fetchFn = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      calls.push({ method, url, ...(init?.body !== undefined ? { body: JSON.parse(String(init.body)) } : {}) });
+      if (url === `${BASE}/changes/${ID}/integration/cloud/workspace`) {
+        return new Response(
+          JSON.stringify({ workspaceId: "w1", workspaceName: `${ID}--integration`, gitUrl: `https://artifacts.test/git/ns/${ID}--integration.git`, defaultBranch: "main", backend: "cloudflare-artifacts", fallback: false, tokenId: "tok-seed", token: "seed-secret" }),
+          { status: 201 },
+        );
+      }
+      return new Response("{}", { status: 200 });
+    }) as typeof fetch;
+    // A project directory that does not exist: the seed fails before any push (offline).
+    await expect(
+      createCloudIntegrationWorkspace({
+        fetchFn,
+        base: BASE,
+        changeId: ID,
+        projectDir: join(root, "missing-project"),
+        workRoot: root,
+        ttlSeconds: 600,
+        identity: { name: "t", email: "t@example.invalid" },
+      }),
+    ).rejects.toThrow();
+    expect(calls.slice(1)).toEqual([
+      { method: "POST", url: `${BASE}/changes/${ID}/integration/cloud/token/revoke`, body: { tokenId: "tok-seed" } },
+      { method: "DELETE", url: `${BASE}/workspaces/${ID}--integration` },
+    ]);
+    expect(JSON.stringify(calls)).not.toContain("seed-secret");
   });
 });
 

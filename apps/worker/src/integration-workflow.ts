@@ -9,8 +9,10 @@
  * iteration is a few durable steps:
  *
  *   plan     the next revision's job from the board (idle when nothing new is
- *            pending): its key is the Change, the base commit, and the pinned
- *            commits, so a retried step never integrates anything else;
+ *            pending): its key is the Change, the base commit, the pinned
+ *            commits, every gate-defining field, and the run's configuration
+ *            time, so a retried step never integrates anything else and a
+ *            re-created Change never replays a prior run;
  *   run      mint short-lived Artifact tokens Worker-side (a read token per
  *            agent repo, a write token for the integration repo), run the job
  *            in the GateRunner's container under the phased egress policy,
@@ -21,8 +23,10 @@
  *   record   record the result on the board through the same append path as
  *            the integration revision route (idempotent by the key), with the
  *            parse attribution (and the run's choice, when it answered);
- *   advance  after a recorded pass, fast-forward the integration branch to the
- *            gated commit (a second, git-only job in the container).
+ *   advance  after a recorded GATED pass (never an ungated one), fast-forward
+ *            the integration branch to the gated commit (a second, git-only
+ *            job in the container, keyed by the repo, the base, the commit,
+ *            and the revision).
  * Promotion stays with the driver: it pins and verifies the gated commit from
  * the integration repo, exactly as with the local integrator.
  */
@@ -30,9 +34,9 @@
 import { WorkflowEntrypoint } from "cloudflare:workers";
 import type { WorkflowEvent, WorkflowStep } from "cloudflare:workers";
 
-import { INTEGRATE_JOB_VERSION } from "@switchyard-change/verification/integrate-job";
+import { advanceJobKey, INTEGRATE_JOB_VERSION } from "@switchyard-change/verification/integrate-job";
 
-import { DRIVER_ATTRIBUTION_WAIT_MS, type CloudJobPlan, type CloudPlanOutcome, type CloudRevisionRecord, type BoardRepoRecord } from "./cloud-integration.ts";
+import { DRIVER_ATTRIBUTION_WAIT_MS, JOB_TOKEN_MARGIN_SECONDS, MAX_JOB_TOKEN_TTL_SECONDS, type CloudJobPlan, type CloudPlanOutcome, type CloudRevisionRecord, type BoardRepoRecord } from "./cloud-integration.ts";
 import type { IntegrateJobResult } from "@switchyard-change/verification/integrate-job";
 import type { GateRunOutcome } from "./gate-runner.ts";
 import { repoHostOf, repoPathOf, DEFAULT_REGISTRY_HOST } from "./integration-egress.ts";
@@ -58,8 +62,15 @@ export interface IntegrationPorts {
   /** Mint tokens, run the job in the container, revoke the tokens. */
   run(plan: CloudJobPlan, context: { readonly deadlineMs: number; readonly registryHost: string; readonly integration: BoardRepoRecord }): Promise<GateRunOutcome>;
   record(input: { readonly plan: CloudJobPlan; readonly outcome?: GateRunOutcome; readonly error?: string; readonly transient?: boolean }): Promise<CloudRevisionRecord>;
-  /** Fast-forward the integration branch to `commit`. */
-  advance(commit: string, context: { readonly registryHost: string; readonly integration: BoardRepoRecord }): Promise<{ readonly advanced: boolean; readonly error?: string }>;
+  /**
+   * Fast-forward the integration branch to `commit`. `base` is the commit the
+   * revision was built on and `revisionKey` the revision's job key: both are
+   * part of the advance's own idempotency key.
+   */
+  advance(
+    commit: string,
+    context: { readonly registryHost: string; readonly integration: BoardRepoRecord; readonly base?: string; readonly revisionKey?: string },
+  ): Promise<{ readonly advanced: boolean; readonly error?: string }>;
   recordAdvance(key: string, outcome: { readonly advanced: boolean; readonly error?: string }): Promise<void>;
   /** A failing result: should the loop wait for the run's attribution? */
   requestAttribution(plan: CloudJobPlan, result: IntegrateJobResult): Promise<{ readonly waiting: boolean }>;
@@ -136,12 +147,15 @@ export async function runIntegrationLoop(ports: IntegrationPorts, steps: Integra
       await steps.do(`finish-${i}`, NO_RETRY, () => ports.finish(instanceId, true));
       return { iterations: i + 1, recorded, stop: "failed" };
     }
-    if (record.recorded && record.gate === "pass" && record.commit) {
+    // Only a GATED pass moves the integration branch: an ungated "pass" (no
+    // gate ran) checked nothing and is never what the branch advances to.
+    if (record.recorded && record.gate === "pass" && record.gated !== false && record.commit) {
       const commit = record.commit;
+      const advanceContext = { ...context, ...(plan.job.baseCommit !== undefined ? { base: plan.job.baseCommit } : {}), revisionKey: plan.key };
       let advanced: { readonly advanced: boolean; readonly error?: string };
       try {
         advanced = await steps.do(`advance-${plan.key}`, { retries: { limit: 2, delay: 5000, backoff: "exponential" }, timeout: 5 * 60 * 1000 }, async () => {
-          const done = await ports.advance(commit, context);
+          const done = await ports.advance(commit, advanceContext);
           if (!done.advanced) {
             throw new Error(done.error ?? "the integration branch was not advanced");
           }
@@ -192,7 +206,9 @@ export function workerIntegrationPorts(env: EnvWithProvisioner, changeId: string
       }
     }
   };
-  const ttlFor = (deadlineMs: number) => Math.min(3600, Math.max(120, Math.ceil(deadlineMs / 1000) + 120));
+  // The configuration's deadline is bounded (parseCloudIntegrationConfig) so
+  // this never clamps below the job's own deadline plus the margin.
+  const ttlFor = (deadlineMs: number) => Math.min(MAX_JOB_TOKEN_TTL_SECONDS, Math.max(120, Math.ceil(deadlineMs / 1000) + JOB_TOKEN_MARGIN_SECONDS));
   return {
     plan: () => state().planCloudIntegration() as Promise<PlannedCloudJob>,
     async run(plan, context) {
@@ -230,9 +246,16 @@ export function workerIntegrationPorts(env: EnvWithProvisioner, changeId: string
       const outcome = await withTokens(
         [{ workspaceName: context.integration.workspaceName, gitUrl: context.integration.gitUrl, scope: "write" }],
         ttlFor(deadlineMs),
-        (repos) =>
+        async (repos) =>
           runner().runJob({
-            key: `advance-${commit}`,
+            // Keyed by the repo, the branch, the base, the commit, and the
+            // revision (which carries the run nonce): never a prior run's advance.
+            key: await advanceJobKey({
+              integration: { repoUrl: context.integration.gitUrl, defaultBranch: context.integration.defaultBranch },
+              ...(context.base !== undefined ? { expectedBase: context.base } : {}),
+              commit,
+              ...(context.revisionKey !== undefined ? { revisionKey: context.revisionKey } : {}),
+            }),
             job: {
               version: INTEGRATE_JOB_VERSION,
               kind: "advance",

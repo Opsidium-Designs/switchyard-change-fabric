@@ -128,6 +128,11 @@ export interface Harness {
 export function createHarness(
   options: {
     readonly apiToken?: string;
+    /**
+     * Set SWITCHYARD_ALLOW_UNAUTHENTICATED=1 (the local-dev opt-in). Default:
+     * on when no apiToken is given (the dev targets' behavior), off otherwise.
+     */
+    readonly allowUnauthenticated?: boolean;
     readonly provisioner?: RecordingProvisioner;
     /** Extra bindings (for example a fake INTEGRATION_WORKFLOW). */
     readonly env?: Record<string, unknown>;
@@ -137,6 +142,7 @@ export function createHarness(
   const objects = new Map<string, ChangeState>();
   const env = {
     ...(options.apiToken !== undefined ? { SWITCHYARD_API_TOKEN: options.apiToken } : {}),
+    ...((options.allowUnauthenticated ?? options.apiToken === undefined) ? { SWITCHYARD_ALLOW_UNAUTHENTICATED: "1" } : {}),
     WORKSPACE_PROVISIONER: provisioner,
     ...(options.env ?? {}),
   } as Record<string, unknown>;

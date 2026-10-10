@@ -133,16 +133,27 @@ reads it to decide whether to redeploy in place, and teardown clears it. The
 `switchyard-change cleanup-live --change-id <id> --app <name>` commands are the
 CLI equivalents the console launcher calls.
 
-## Protecting the control-plane Worker (optional API token)
+## Protecting the control-plane Worker (API token, fail-closed)
 
-The control-plane Worker (`apps/worker`) is unauthenticated by default, which is
-fine for `make dev-all` on localhost. Before you deploy it (`make deploy` /
-`make infra-up`) or expose it on a LAN, set the optional `SWITCHYARD_API_TOKEN`
-Worker secret. When it is set, every mutating route, including every route that
-returns a plaintext Artifact write token (lease, round lease, recruit, fail,
-repo-pushed), requires `authorization: Bearer <token>`; the read-only snapshot
-GETs stay open so the console can poll. When it is unset the Worker behaves as
-before.
+The control-plane Worker (`apps/worker`) is fail-closed: with no
+`SWITCHYARD_API_TOKEN` set it REFUSES every mutating route (401) unless the
+Worker var `SWITCHYARD_ALLOW_UNAUTHENTICATED=1` explicitly opts in to an
+unauthenticated control plane. The local dev targets (`make dev`, `make
+dev-containers`, `make dev-all`, `make dev-all-lan`) pass that opt-in to
+`wrangler dev` (`--var SWITCHYARD_ALLOW_UNAUTHENTICATED:1`, through the
+Makefile's `WORKER_DEV_VARS`; set `WORKER_DEV_VARS=` to run local dev closed),
+so the local loop on localhost needs no credential. It is deliberately not
+declared in `wrangler.jsonc`, so `make deploy` / `make infra-up` never inherit
+it: a deployed Worker without the token answers only the read-only GETs. Never
+set the opt-in on a deployed Worker.
+
+Before you deploy the Worker or expose it on a LAN, set the
+`SWITCHYARD_API_TOKEN` Worker secret. When it is set (whether or not the
+opt-in is), every mutating route, including every route that returns a
+plaintext Artifact write token (lease, round lease, recruit, fail,
+repo-pushed), requires `authorization: Bearer <token>`. The read-only snapshot
+GETs stay open either way, so the console can poll. An agent's own board post
+authenticates with its board token, not the bearer, in both modes.
 
 Set it out of band; it is a secret, never a committed value:
 
@@ -162,7 +173,8 @@ loads it: it sends its mutations (resolving an escalation) to the dev
 launcher's `/api/worker/changes/...` proxy, which reads `SWITCHYARD_API_TOKEN`
 from the dev process environment (`make dev-all` sources the root `.env`) and
 adds the bearer server-side. It falls back to posting the Worker directly only
-when no such proxy answers (which only works while the Worker's auth is off).
+when no such proxy answers (which only works while the Worker runs with no token
+and the local-dev opt-in).
 
 ## Integration on Cloudflare
 
@@ -179,7 +191,7 @@ operator's view.
   short-lived Artifact tokens Worker-side, run the integration job in a
   Cloudflare Container owned by the `GateRunner` Durable Object (one per
   Change), revoke the tokens, record the revision through the board's own
-  integration path, and fast-forward the integration branch after a pass.
+  integration path, and fast-forward the integration branch after a gated pass.
 - The container image (`apps/worker/containers/gate/Dockerfile`) is
   `node:24.21.0-bookworm-slim` with git, CA certificates, util-linux and
   coreutils, plus the repo's `verification`, `artifact-workspace`, and
@@ -210,12 +222,37 @@ operator's view.
 |---|---|
 | `fetch` | the Artifacts host, only the job's repos (token added by the handler) |
 | `deps` | the package registry only (GET/HEAD, no credential); `npm ci --ignore-scripts` as an unprivileged user |
-| `gate` | nothing; the gate runs as the unprivileged user |
+| `gate` | nothing; the gate runs as the unprivileged user, and only after the deny-all probe found no route out |
 | `push` | the Artifacts host again, after every process of the unprivileged user was killed: the gated commit is pushed to its candidate ref |
 | `closed` | nothing (between jobs) |
 
 Each revision attempt records the phases it ran under (`GET
 /changes/:id/integration/cloud`).
+
+At the start of the `gate` phase, before acknowledging it, the GateRunner runs
+a cheap deny-all probe inside the container: as the sandbox user, a raw TCP
+connect (3 s limit) to public IPs (`1.1.1.1:443`, `8.8.8.8:53`; by IP, so no DNS
+and no intercepted host is involved). If any connect succeeds, the job is
+refused before any agent code runs, with the reason "egress not isolated"; the
+Workflow treats it as a failure to run (retried, then recorded as transient),
+never as a verdict. The probe's logic is covered offline by the driver's fake
+container; the probe itself runs only in a real container.
+
+Every job is idempotent by its key: the Change, the base commit, the pinned
+commits, every gate-defining field (the integration repo and branch, the gate
+command, whether a gate is required, the protected paths and JSON keys, the
+baseline test inventory, the accepted contracts, the gate support files, the
+timeouts, the identity), and the configuration's time as a run nonce. The
+advance is keyed by the integration repo and branch, the base the revision was
+built on, the commit, and the revision's key. The GateRunner keeps at most 64
+finished outcomes for replay (the oldest are pruned), and a re-created Change
+clears them.
+
+The Workflow mints a job's Artifact tokens once, before the job starts, with a
+lifetime of the job's deadline plus 2 minutes, capped at one hour. A
+configuration whose deadline (`installMs + gateMs` plus 5 minutes of overhead)
+would outlive that is refused when it is posted: keep `installMs + gateMs` at
+or under 53 minutes.
 
 ### Local development (Docker)
 
@@ -285,9 +322,11 @@ their command lines; deployed containers have their own PID namespace.
 - No PID namespace: `unshare --pid` is not permitted in the container, so the
   sandbox is contained by its own uid, the process cap, `kill(-1)`, the
   survivor checks, and a fresh container per job.
-- With `SWITCHYARD_API_TOKEN` unset, anyone who can reach the Worker can use
-  these routes: keep it on localhost, or set the token before `make
-  dev-all-lan` or a deploy (see "Protecting the control-plane Worker").
+- With `SWITCHYARD_API_TOKEN` unset, these routes are refused unless the
+  local-dev opt-in (`SWITCHYARD_ALLOW_UNAUTHENTICATED=1`, which the dev
+  targets set) is on; with it on, anyone who can reach the Worker can use
+  them: keep it on localhost, or set the token before `make dev-all-lan` or a
+  deploy (see "Protecting the control-plane Worker").
 - What stays local: the planner, the agents' turns and edits, the baseline
   test inventory (the driver runs the gate once on the baseline and posts the
   inventory with the configuration), the final verdict post, promotion (pin

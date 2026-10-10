@@ -10,13 +10,14 @@ import {
   parseChangeSpec,
   type BoardErrorCode,
 } from "@switchyard-change/change-core";
-import { boundedRepoName } from "@switchyard-change/change-core/repo-name";
+import { ARTIFACT_REPO_NAME_MAX, boundedRepoName } from "@switchyard-change/change-core/repo-name";
 import type { DiscoveredWorkUnit } from "@switchyard-change/change-core";
 
-import { configuredApiToken, hasValidBearer, requiresAuth } from "./auth.ts";
+import { allowsUnauthenticated, configuredApiToken, hasValidBearer, requiresAuth } from "./auth.ts";
 import type { EscalationKind, IntegrationVerdict, JevDecisionView, JevJuncture, LeaseWorkspace, PlanningChangeHeader, RefanSource, SupersededLease, UnitDetail, WorkspaceIdentity } from "./change-state.ts";
 import { BOARD_PAGE_DEFAULT, BOARD_PAGE_MAX, STATUS_CONFLICT_PREFIX } from "./change-state.ts";
 import type { ChangeState } from "./change-state.ts";
+import type { IntegrationWorkflowParams } from "./integration-workflow.ts";
 import type { EnvWithProvisioner } from "./workspace-provisioner.ts";
 import { selectProvisioner } from "./workspace-provisioner.ts";
 
@@ -107,18 +108,32 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     return corsPreflight();
   }
 
-  // Optional bearer auth (see auth.ts): when SWITCHYARD_API_TOKEN is set, every
-  // mutating request must present it. Read-only GETs stay open.
+  // Bearer auth, fail-closed (see auth.ts): when SWITCHYARD_API_TOKEN is set,
+  // every mutating request must present it; when it is unset, mutating
+  // requests are refused unless SWITCHYARD_ALLOW_UNAUTHENTICATED=1 (local dev).
+  // Read-only GETs stay open.
   // The one exception is an agent's own board post: it authenticates with the
   // agent's board token (issued by the bearer-protected join route), so an
   // agent process never needs the shared bearer, which would let it act as the
   // human or record integration results.
   const apiToken = configuredApiToken(env);
   const agentBoardPost = request.method === "POST" && /^\/changes\/[^/]+\/board$/.test(url.pathname);
-  if (apiToken !== undefined && requiresAuth(request.method) && !agentBoardPost && !hasValidBearer(request, apiToken)) {
-    return json({ error: "unauthorized: this route requires a bearer token" }, 401, {
-      "www-authenticate": 'Bearer realm="switchyard-change-fabric"',
-    });
+  if (requiresAuth(request.method) && !agentBoardPost) {
+    if (apiToken === undefined && !allowsUnauthenticated(env)) {
+      return json(
+        {
+          error:
+            "unauthorized: this Worker has no SWITCHYARD_API_TOKEN set, so mutating routes are closed; set the token, or set SWITCHYARD_ALLOW_UNAUTHENTICATED=1 for local development",
+        },
+        401,
+        { "www-authenticate": 'Bearer realm="switchyard-change-fabric"' },
+      );
+    }
+    if (apiToken !== undefined && !hasValidBearer(request, apiToken)) {
+      return json({ error: "unauthorized: this route requires a bearer token" }, 401, {
+        "www-authenticate": 'Bearer realm="switchyard-change-fabric"',
+      });
+    }
   }
 
   // Health / readiness probe.
@@ -269,6 +284,7 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     };
     try {
       const record = await stub.recordLease(unitId, workspace);
+      await rememberWorkspaceRoute(env, changeId, provisioned.workspaceName);
       // The plaintext token is returned once to the runner and never persisted.
       return json({ ...record, token: provisioned.token }, 201);
     } catch (error) {
@@ -765,6 +781,7 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     };
     try {
       const record = await stub.recordRoundLease(unitId, round, workspace);
+      await rememberWorkspaceRoute(env, changeId, provisioned.workspaceName);
       // The plaintext token is returned once to the runner and never persisted.
       return json({ ...record, token: provisioned.token }, 201);
     } catch (error) {
@@ -1237,7 +1254,8 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
               { role: join.role, rationale: join.rationale },
               {
                 withWorkspace: true,
-                repo: { workspaceName: provisioned.workspaceName, gitUrl: provisioned.gitUrl, defaultBranch: provisioned.defaultBranch },
+                // The token's id (never its plaintext), so a re-create revokes it.
+                repo: { workspaceName: provisioned.workspaceName, gitUrl: provisioned.gitUrl, defaultBranch: provisioned.defaultBranch, tokenId: provisioned.tokenId },
               },
             );
           } catch (error) {
@@ -1247,6 +1265,7 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
           if (!outcome.ok) {
             await undo();
           } else {
+            await rememberWorkspaceRoute(env, changeId, provisioned.workspaceName);
             return json({ ...outcome, workspace: provisioned }, 201);
           }
         }
@@ -1369,7 +1388,8 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     if (help !== undefined && (typeof help !== "string" || !BOARD_AGENT_ID_PATTERN.test(help))) {
       return json({ code: "BAD_PAYLOAD", error: "help, when present, names a help request id" }, 400);
     }
-    const allowed = typeof help === "string" ? await stub.checkBoardHelpRead(help, agent) : await stub.checkBoardRepoAgent(agent);
+    // A write token for a help fork also needs the helper still joined.
+    const allowed = typeof help === "string" ? await stub.checkBoardHelpRead(help, agent, scope) : await stub.checkBoardRepoAgent(agent);
     if (!allowed.ok) {
       return json({ code: allowed.code, error: allowed.error }, 400);
     }
@@ -1424,6 +1444,7 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
     try {
       const forked = await provisioner.fork(boardAgentWorkspaceName(changeId, allowed.requester), boardHelpForkWorkspaceName(changeId, wanted.request), { ttlSeconds: ttl });
+      await rememberWorkspaceRoute(env, changeId, forked.workspaceName);
       return json({ ...forked, forkOf: allowed.requester }, 201);
     } catch (error) {
       return json({ code: "INVALID_STATE", error: `could not fork the requester's repo: ${errorMessage(error)}` }, 502);
@@ -1519,7 +1540,7 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         return json({ error: "invalid repo-pushed event body" }, 400);
       }
     }
-    const changeId = body.changeId ?? changeIdFromWorkspace(body.workspace ?? "");
+    const changeId = body.changeId ?? (await resolveChangeIdForWorkspace(env, body.workspace ?? ""));
     const workspace = body.workspace ?? "";
     if (changeId === "" || workspace === "") {
       return json({ error: "repo-pushed event requires changeId and workspace" }, 400);
@@ -1579,6 +1600,7 @@ async function provisionAndRecordWave(
     };
     try {
       const record = await stub.recordLease(unitId, workspace);
+      await rememberWorkspaceRoute(env, changeId, provisioned.workspaceName);
       recruited.push({
         unitId: record.unitId,
         objective: record.objective,
@@ -1683,14 +1705,63 @@ function isStringArray(value: unknown): value is string[] {
 }
 
 /**
- * Recover a Change id from a workspace name. Workspace names are
- * `<changeId>--<unitId>` (see workspaceNameFor), so the Change id is the part
- * before the last `--`. The real Artifacts repo.pushed event carries the repo
- * (workspace) name; this maps it back to the Change without a separate index.
+ * Recover a Change id from a workspace name, by its shape alone (empty when it
+ * cannot): `<changeId>--board-<agent>` and `<changeId>--help-<request>` (the
+ * Change is before the marker), `<changeId>--tools` and
+ * `<changeId>--integration`, and `<changeId>--<unitId>` with an optional
+ * `--r<round>` suffix (the Change is before the last `--` once the round is
+ * dropped). A bounded name that was cut and hashed (see boundedRepoName) no
+ * longer carries the whole id: it parses to empty, and only a route recorded at
+ * provision time (resolveChangeIdForWorkspace) maps it back.
  */
-function changeIdFromWorkspace(workspace: string): string {
-  const idx = workspace.lastIndexOf("--");
-  return idx === -1 ? "" : workspace.slice(0, idx);
+export function changeIdFromWorkspace(workspace: string): string {
+  if (workspace.length === ARTIFACT_REPO_NAME_MAX && /-[0-9a-f]{8}$/.test(workspace)) {
+    return "";
+  }
+  for (const marker of ["--board-", "--help-"]) {
+    const at = workspace.indexOf(marker);
+    if (at > 0) {
+      return workspace.slice(0, at);
+    }
+  }
+  for (const suffix of ["--tools", "--integration"]) {
+    if (workspace.endsWith(suffix) && workspace.length > suffix.length) {
+      return workspace.slice(0, -suffix.length);
+    }
+  }
+  const unit = workspace.replace(/--r\d+$/, "");
+  const idx = unit.lastIndexOf("--");
+  return idx <= 0 ? "" : unit.slice(0, idx);
+}
+
+/** The routing instance of a workspace (a ChangeState named for the workspace, never a Change). */
+function workspaceRouteStub(env: EnvWithProvisioner, workspaceName: string) {
+  return env.CHANGE_STATE.get(env.CHANGE_STATE.idFromName(`workspace-route:${workspaceName}`));
+}
+
+/**
+ * Record which Change a just-provisioned workspace belongs to, when its name
+ * alone does not say (a hashed name, or ids that confuse the parse). Best
+ * effort: a failure leaves the parse as the only mapping.
+ */
+async function rememberWorkspaceRoute(env: EnvWithProvisioner, changeId: string, workspaceName: string): Promise<void> {
+  if (changeIdFromWorkspace(workspaceName) === changeId) {
+    return;
+  }
+  await workspaceRouteStub(env, workspaceName)
+    .recordWorkspaceRoute(changeId)
+    .catch(() => undefined);
+}
+
+/** The Change a repo-pushed event's workspace belongs to: a recorded route first, else its parsed name. */
+async function resolveChangeIdForWorkspace(env: EnvWithProvisioner, workspace: string): Promise<string> {
+  if (workspace === "") {
+    return "";
+  }
+  const routed = await workspaceRouteStub(env, workspace)
+    .getWorkspaceRoute()
+    .catch(() => undefined);
+  return typeof routed === "string" && routed !== "" ? routed : changeIdFromWorkspace(workspace);
 }
 
 interface CostBody {
@@ -1956,9 +2027,37 @@ export interface CloudIntegrationKick {
 }
 
 /**
+ * The statuses of an instance that will never finish its loop: only these
+ * clear the active instance so a new one may start. "missing" is an instance
+ * the binding positively reports it does not know (never a failed read).
+ */
+const DEAD_INSTANCE_STATUSES = new Set(["errored", "terminated", "complete", "missing"]);
+
+/**
+ * The active instance's status: its reported status, "missing" when the
+ * binding says there is no such instance, and "unknown" when the read failed
+ * for any other reason (treated as alive).
+ */
+async function activeInstanceStatus(workflow: Workflow<IntegrationWorkflowParams>, instanceId: string): Promise<string> {
+  let instance: WorkflowInstance;
+  try {
+    instance = await workflow.get(instanceId);
+  } catch (error) {
+    return /not[\s._-]?found|no such instance/i.test(errorMessage(error)) ? "missing" : "unknown";
+  }
+  try {
+    const status = (await instance.status()).status;
+    return typeof status === "string" ? status : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
+/**
  * Ask for integration on Cloudflare: start the Change's IntegrationWorkflow,
  * or coalesce into the active one. An active instance that ended without
- * finishing (errored, terminated) is cleared and replaced.
+ * finishing (errored, terminated, complete, or positively not found) is
+ * cleared and replaced; one whose status cannot be read is kept.
  */
 export async function kickCloudIntegration(env: EnvWithProvisioner, changeId: string): Promise<CloudIntegrationKick> {
   const workflow = env.INTEGRATION_WORKFLOW;
@@ -1978,15 +2077,14 @@ export async function kickCloudIntegration(env: EnvWithProvisioner, changeId: st
       }
     }
     if (request.coalesced && request.activeInstance) {
-      const status = await workflow
-        .get(request.activeInstance)
-        .then((instance) => instance.status())
-        .then((s) => s.status as string)
-        .catch(() => "missing");
-      if (["errored", "terminated", "complete", "missing"].includes(status)) {
+      const status = await activeInstanceStatus(workflow, request.activeInstance);
+      if (DEAD_INSTANCE_STATUSES.has(status)) {
         await stub.clearCloudIntegration(request.activeInstance);
         continue;
       }
+      // Running, waiting, or unknown (a status read that failed): the active
+      // instance stays; it was told to look again. A failed read never starts
+      // a second Workflow for the same Change.
       return { started: false, coalesced: true, instanceId: request.activeInstance };
     }
     return { started: false, ...(request.reason ? { reason: request.reason } : {}) };
@@ -2028,7 +2126,7 @@ export default {
           message.ack();
           continue;
         }
-        const changeId = body.changeId ?? changeIdFromWorkspace(workspace);
+        const changeId = body.changeId ?? (await resolveChangeIdForWorkspace(env, workspace));
         if (changeId === "") {
           message.ack();
           continue;

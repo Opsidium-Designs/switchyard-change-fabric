@@ -19,7 +19,11 @@
  *   - a fresh, private, empty HOME (and XDG_CONFIG_HOME) per call, removed
  *     after;
  *   - `GIT_TERMINAL_PROMPT=0`, no credential helper, hooks and fsmonitor off,
- *     and the `ext::` transport refused.
+ *     and the `ext::` transport refused;
+ *   - for a transfer (clone, fetch, push, pull, ls-remote): `--` before the
+ *     first positional argument, and an unknown option (a remote or URL that
+ *     starts with `-`) in front of it refused, so a remote, path, or refspec
+ *     is never parsed as an option.
  *
  * A credentialed call in an existing repository (`-C <dir>`) first refuses if
  * that repository's own config carries a key that could redirect the
@@ -133,6 +137,53 @@ function configEnv(entries: readonly (readonly [string, string])[]): NodeJS.Proc
   return env;
 }
 
+/** The subcommands whose positional arguments name a remote (a URL or a path) and refspecs. */
+const TRANSFER_SUBCOMMANDS = new Set(["clone", "fetch", "push", "pull", "ls-remote"]);
+
+/**
+ * The options the fabric passes to a transfer subcommand before its positional
+ * arguments: value-less flags, or flags whose value is attached with `=`.
+ * Anything else that starts with `-` in that position is refused (a remote or
+ * URL that starts with `-` would be read as an option).
+ */
+const KNOWN_TRANSFER_OPTION =
+  /^(-q|--quiet|-v|--verbose|-f|--force|-n|--no-checkout|--bare|--mirror|--no-tags|--tags|--prune|--atomic|--porcelain|--heads|--refs|--dry-run|--single-branch|--no-single-branch|--progress|--no-progress|--depth=\d+|--branch=[^\s]+|--force-with-lease(=[^\s]*)?|--recurse-submodules=no)$/;
+
+/**
+ * Harden a transfer command's argument list: refuse an unknown option (or a
+ * remote/URL) starting with `-` before the positional arguments, and insert
+ * `--` before the first positional one, so no remote, path, or refspec is ever
+ * parsed as an option. Other subcommands, and an argument list that already
+ * carries `--`, pass through.
+ */
+export function guardTransferArgs(args: readonly string[]): string[] {
+  let i = 0;
+  // Global options before the subcommand: `-C <dir>` and `-c <key=value>`.
+  while (i < args.length && (args[i] === "-C" || args[i] === "-c")) {
+    i += 2;
+  }
+  const sub = args[i];
+  if (sub === undefined || !TRANSFER_SUBCOMMANDS.has(sub)) {
+    return [...args];
+  }
+  const out = args.slice(0, i + 1);
+  for (let j = i + 1; j < args.length; j += 1) {
+    const arg = args[j]!;
+    if (arg === "--") {
+      return [...out, ...args.slice(j)];
+    }
+    if (arg.startsWith("-")) {
+      if (!KNOWN_TRANSFER_OPTION.test(arg)) {
+        throw new Error(`refusing git ${sub}: the argument ${JSON.stringify(arg.slice(0, 80))} starts with "-" (a remote, URL, or refspec must not)`);
+      }
+      out.push(arg);
+      continue;
+    }
+    return [...out, "--", ...args.slice(j)];
+  }
+  return out;
+}
+
 /** The repository a `-C <dir>` argument list runs in, if any. */
 function repoDirOf(args: readonly string[]): string | undefined {
   let dir: string | undefined;
@@ -170,14 +221,16 @@ async function spawnGit(
 export async function runGit(args: readonly string[], options: RunGitOptions = {}): Promise<RunGitResult> {
   const config: (readonly [string, string])[] = [...BASE_CONFIG];
   const tokens: string[] = [];
-  const clean = args.map((arg) => {
-    const { url, token } = splitCredential(arg);
-    if (token !== undefined) {
-      tokens.push(token);
-      config.push([`http.${url}.extraHeader`, `Authorization: Bearer ${token}`]);
-    }
-    return url;
-  });
+  const clean = guardTransferArgs(
+    args.map((arg) => {
+      const { url, token } = splitCredential(arg);
+      if (token !== undefined) {
+        tokens.push(token);
+        config.push([`http.${url}.extraHeader`, `Authorization: Bearer ${token}`]);
+      }
+      return url;
+    }),
+  );
   if (tokens.length > 0) {
     const repo = repoDirOf(clean);
     if (repo !== undefined) {

@@ -248,6 +248,15 @@ export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
   }
 
   async create(name: string, opts?: CreateWorkspaceOptions): Promise<WorkspaceRef> {
+    return (await this.createWithToken(name, opts)).ref;
+  }
+
+  /**
+   * Create a repo and return it with its one-time CREATION token (plaintext),
+   * so a caller that hands out a scoped token instead can revoke the creation
+   * token (as the fork path does). Resolves once the repo is usable.
+   */
+  async createWithToken(name: string, opts?: CreateWorkspaceOptions): Promise<{ readonly ref: WorkspaceRef; readonly token: string }> {
     const result = await this.call(() =>
       this.binding.create(name, {
         description: opts?.description,
@@ -256,7 +265,7 @@ export class CloudflareArtifactWorkspaceProvider implements WorkspaceProvider {
       }),
     );
     await this.waitUntilReady(result.name);
-    return this.toRef(result);
+    return { ref: this.toRef(result), token: result.token };
   }
 
   async seed(ref: WorkspaceRef, baselineRemote: string): Promise<void> {

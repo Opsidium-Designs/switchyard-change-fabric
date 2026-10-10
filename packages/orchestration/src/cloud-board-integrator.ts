@@ -78,14 +78,33 @@ export async function createCloudIntegrationWorkspace(input: {
     fallback: false,
   };
   // Seed: the project baseline as the branch head (the token travels as a header).
-  const work = await mkdtemp(join(input.workRoot, "cloud-seed-"));
+  const tokenId = String(b.tokenId ?? "");
+  let work: string | undefined;
   try {
+    work = await mkdtemp(join(input.workRoot, "cloud-seed-"));
     await cloneProjectForPromotion(input.projectDir, work);
     await runGit(["-C", work, "push", "-q", authenticatedRemote(integrationRef.gitUrl, b.token), `HEAD:refs/heads/${integrationRef.defaultBranch}`]);
+  } catch (error) {
+    // A repo that could not be seeded is never left behind with a live write
+    // token: revoke the token, archive the repo, then report the seed failure.
+    await discardCloudIntegrationWorkspace(input.fetchFn, input.base, input.changeId, b.workspaceName, tokenId);
+    throw error;
   } finally {
-    await rm(work, { recursive: true, force: true });
+    if (work !== undefined) {
+      await rm(work, { recursive: true, force: true });
+    }
   }
-  return { integrationRef, integrationToken: b.token, tokenId: String(b.tokenId ?? ""), workspaceName: b.workspaceName };
+  return { integrationRef, integrationToken: b.token, tokenId, workspaceName: b.workspaceName };
+}
+
+/** Revoke the integration repo's write token and archive the repo (best effort, each step independent). */
+async function discardCloudIntegrationWorkspace(fetchFn: typeof fetch, base: string, changeId: string, workspaceName: string, tokenId: string): Promise<void> {
+  if (tokenId !== "") {
+    await postJson(fetchFn, `${base}/changes/${encodeURIComponent(changeId)}/integration/cloud/token/revoke`, { tokenId }).catch(() => undefined);
+  }
+  await withWorkerAuth(fetchFn)(`${base}/workspaces/${encodeURIComponent(workspaceName)}`, { method: "DELETE" })
+    .then((res) => res.text())
+    .catch(() => undefined);
 }
 
 /**

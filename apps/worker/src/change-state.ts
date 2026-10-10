@@ -1089,8 +1089,26 @@ export class ChangeState extends DurableObject<Env> {
     await this.ctx.storage.put("boardTokens", {} as Record<string, string>);
     // Integration on Cloudflare (per run): its configuration, the Workflow
     // bookkeeping, every revision attempt, and the agents' repo identities.
-    await this.ctx.storage.delete(["cloudIntegrationConfig", "cloudIntegrationRun", "cloudRevisions", "cloudAttribution", "boardRepos", "toolsRepo"]);
+    // Which agents joined with a repo is per run too: a prior run's agent must
+    // never pass the read-token, agent-token, or help-fork checks of this one.
+    await this.ctx.storage.delete(["cloudIntegrationConfig", "cloudIntegrationRun", "cloudRevisions", "cloudAttribution", "boardRepos", "boardRepoAgents", "toolsRepo"]);
+    // The Change's gate runner keeps finished job outcomes for replay: a fresh
+    // run starts with none (the job keys carry a run nonce too).
+    await this.clearGateRunnerCache(change.id);
     return superseded;
+  }
+
+  /** Clear the Change's GateRunner outcome cache (best effort: no runner bound, or it is unreachable, is not a failure). */
+  private async clearGateRunnerCache(changeId: string): Promise<void> {
+    const runners = this.env.GATE_RUNNER;
+    if (!runners) {
+      return;
+    }
+    try {
+      await runners.get(runners.idFromName(changeId)).clearCache();
+    } catch {
+      // The new run's job keys differ anyway (they carry the configuration time).
+    }
   }
 
   /** Delete every stored board message (a re-created Change starts empty). */
@@ -1246,11 +1264,23 @@ export class ChangeState extends DurableObject<Env> {
     return { ok: true, requester };
   }
 
-  /** May the operator read the help fork of `request`? Only when `agent` holds its grant. */
-  async checkBoardHelpRead(request: string, agent: string): Promise<{ readonly ok: true } | BoardFailure> {
-    const help = (await this.loadBoardState()).help[request];
+  /**
+   * May the operator get a token for the help fork of `request`? Only when
+   * `agent` holds its grant. A READ token stays allowed after the helper left
+   * (the requester pulls the delivered commit); a WRITE token needs the helper
+   * still joined (a helper that left never writes again).
+   */
+  async checkBoardHelpRead(request: string, agent: string, scope: "read" | "write" = "read"): Promise<{ readonly ok: true } | BoardFailure> {
+    const state = await this.loadBoardState();
+    const help = state.help[request];
     if (!help || help.grant === undefined || help.grant.agent !== agent) {
       return { ok: false, code: "NOT_ALLOWED", error: `${agent} holds no granted help fork for ${request}` };
+    }
+    if (scope === "write") {
+      const record = state.agents[agent];
+      if (record === undefined || record.leftSeq !== undefined) {
+        return { ok: false, code: "UNKNOWN_AGENT", error: `${agent} is not a joined agent of this board: no write token for its help fork` };
+      }
     }
     return { ok: true };
   }
@@ -1718,6 +1748,14 @@ export class ChangeState extends DurableObject<Env> {
           workspaceName: agent.workspace.workspaceName,
           tokenId: agent.workspace.tokenId,
         });
+      }
+    }
+    // The write tokens board joins provisioned with the agents' repos (only
+    // their ids are stored): a re-created Change revokes them like a lease.
+    const repos = (await this.ctx.storage.get<Record<string, BoardRepoRecord>>("boardRepos")) ?? {};
+    for (const [agent, repo] of Object.entries(repos)) {
+      if (repo.tokenId !== undefined && repo.tokenId !== "") {
+        out.push({ unitId: `board:${agent}`, workspaceName: repo.workspaceName, tokenId: repo.tokenId });
       }
     }
     return out;
@@ -2700,6 +2738,21 @@ export class ChangeState extends DurableObject<Env> {
   /** Whether a Change has been created in this object yet. */
   async isInitialized(): Promise<boolean> {
     return (await this.ctx.storage.get<Change>("change")) !== undefined;
+  }
+
+  /**
+   * Workspace routing (on an instance named for a WORKSPACE, never a Change;
+   * see index.ts): remember which Change provisioned the workspace, so a
+   * repo-pushed event naming a repo whose name cannot be parsed back (a
+   * bounded, hashed name) still reaches its Change.
+   */
+  async recordWorkspaceRoute(changeId: string): Promise<void> {
+    await this.ctx.storage.put("workspaceRoute", changeId);
+  }
+
+  /** The Change a workspace was provisioned for, if a route was recorded. */
+  async getWorkspaceRoute(): Promise<string | undefined> {
+    return this.ctx.storage.get<string>("workspaceRoute");
   }
 
   private async view(): Promise<ChangeStateView> {

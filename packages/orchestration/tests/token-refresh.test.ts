@@ -82,11 +82,84 @@ describe("TokenRefresher (fake clock, fake provider)", () => {
       { type: "token.refreshed", payload: { agent: "agent-2", kind: "help-fork", request: "h1" } },
     ]);
     expect(JSON.stringify(calls.recorded)).not.toContain("secret");
-    // The old tokens are revoked on the NEXT tick (a git call in flight keeps working).
+    // The old tokens are revoked only after the grace period (default 60 s).
     expect(calls.revoked).toEqual([]);
+    expect(await refresher.tick([a.t, fork.t])).toBe(0);
+    expect(calls.revoked).toEqual([]);
+    now = at("2026-01-01T00:57:00.000Z");
     expect(await refresher.tick([a.t, fork.t])).toBe(0);
     expect(calls.revoked).toEqual([{ agent: "agent-1", tokenId: "old-agent-1" }, { agent: "agent-2", tokenId: "old-agent-2", help: "h1" }]);
     expect(refresher.refreshed).toBe(2);
+  });
+
+  it("never cuts an in-flight push window: a tick right after the swap does not revoke the old token", async () => {
+    const { operator, calls } = fakeOperator();
+    let clock = Date.parse("2026-01-01T00:59:00.000Z");
+    const refresher = new TokenRefresher({ operator, ttlSeconds: 3600, marginMs: 5 * 60_000, graceMs: 45_000, now: () => clock });
+    const a = token("agent-1", expiry);
+    expect(await refresher.tick([a.t])).toBe(1);
+    // A push started with the old token just before the swap is still running:
+    // ticks every few seconds inside the grace never revoke it.
+    for (const step of [1_000, 10_000, 20_000, 44_000]) {
+      clock = Date.parse("2026-01-01T00:59:00.000Z") + step;
+      await refresher.tick([a.t]);
+      expect(calls.revoked, `at +${step} ms`).toEqual([]);
+    }
+    clock = Date.parse("2026-01-01T00:59:00.000Z") + 45_000;
+    await refresher.tick([a.t]);
+    expect(calls.revoked).toEqual([{ agent: "agent-1", tokenId: "old-agent-1" }]);
+  });
+
+  it("flush revokes every replaced token at once, grace or not (the run is over)", async () => {
+    const { operator, calls } = fakeOperator();
+    const refresher = new TokenRefresher({ operator, ttlSeconds: 3600, now: at("2026-01-01T00:59:00.000Z") });
+    const a = token("agent-1", expiry);
+    await refresher.tick([a.t]);
+    expect(calls.revoked).toEqual([]);
+    await refresher.flush();
+    expect(calls.revoked).toEqual([{ agent: "agent-1", tokenId: "old-agent-1" }]);
+  });
+
+  it("a 60 s token is not refreshed on every tick: the margin is at most half the lifetime", async () => {
+    const { operator, calls } = fakeOperator();
+    const start = Date.parse("2026-01-01T00:00:00.000Z");
+    let clock = start;
+    const state = { tokenId: "t0", expiresAt: new Date(start + 60_000).toISOString() };
+    let n = 0;
+    const refresher = new TokenRefresher({
+      operator: {
+        ...operator,
+        agentToken: async (agent: string, ttl: number) => {
+          calls.minted.push({ agent, ttl });
+          n += 1;
+          return { ok: true as const, workspaceName: "ws", tokenId: `t${n}`, token: `s${n}`, tokenExpiresAt: new Date(clock + ttl * 1000).toISOString() };
+        },
+      },
+      ttlSeconds: 60,
+      now: () => clock,
+    });
+    const t: RefreshableToken = {
+      agent: "agent-1",
+      kind: "repo-write",
+      get tokenId() {
+        return state.tokenId;
+      },
+      get expiresAt() {
+        return state.expiresAt;
+      },
+      swap: (fresh) => {
+        state.tokenId = fresh.tokenId;
+        state.expiresAt = fresh.tokenExpiresAt;
+      },
+    };
+    // Tick every 5 s for 2 minutes: a refresh roughly every 30 s, not every tick.
+    for (let i = 0; i <= 24; i += 1) {
+      clock = start + i * 5_000;
+      await refresher.tick([t]);
+    }
+    expect(refresher.marginMs).toBe(30_000);
+    expect(calls.minted.length).toBeGreaterThanOrEqual(3);
+    expect(calls.minted.length).toBeLessThanOrEqual(5);
   });
 
   it("a failed refresh is reported, never thrown, and the old token stays in use", async () => {
@@ -100,9 +173,12 @@ describe("TokenRefresher (fake clock, fake provider)", () => {
     expect(calls.recorded).toEqual([]);
   });
 
-  it("the default margin is max(60 s, a fifth of the lifetime)", () => {
+  it("the default margin is max(60 s, a fifth of the lifetime), clamped to half the lifetime", () => {
     const { operator } = fakeOperator();
     expect(new TokenRefresher({ operator, ttlSeconds: 3600 }).marginMs).toBe(720_000);
-    expect(new TokenRefresher({ operator, ttlSeconds: 60 }).marginMs).toBe(60_000);
+    expect(new TokenRefresher({ operator, ttlSeconds: 60 }).marginMs).toBe(30_000);
+    expect(new TokenRefresher({ operator, ttlSeconds: 300, marginMs: 10 * 60_000 }).marginMs).toBe(150_000);
+    expect(new TokenRefresher({ operator, ttlSeconds: 3600 }).graceMs).toBe(60_000);
+    expect(new TokenRefresher({ operator, ttlSeconds: 3600, graceMs: 5_000 }).graceMs).toBe(5_000);
   });
 });

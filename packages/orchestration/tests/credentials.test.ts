@@ -113,7 +113,8 @@ describe("credentials: parsed into memory, never into a process environment", ()
     expect(leaking.map((r) => r.split(":")[0])).toEqual([]);
     // dev-all gives .env to the Worker's own subshell only.
     const devAll = recipes.find((r) => r.startsWith("dev-all:"))!;
-    expect(devAll).toMatch(/\(set -a; \[ -f \.env \] && \. \.\/\.env; set \+a; npm -w apps\/worker run dev\)/);
+    // (The local-dev auth opt-in, $(WORKER_DEV_VARS), may follow as wrangler dev arguments.)
+    expect(devAll).toMatch(/\(set -a; \[ -f \.env \] && \. \.\/\.env; set \+a; npm -w apps\/worker run dev(?: -- \$\(WORKER_DEV_VARS\))?\)/);
     expect(devAll).not.toMatch(/^\tset -a/m);
   });
 });
