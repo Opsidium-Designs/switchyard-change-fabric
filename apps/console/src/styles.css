@@ -1508,3 +1508,255 @@ body {
 .mc-struggling circle { fill: rgba(245, 213, 71, 0.18); stroke: #f5d547; stroke-width: 1.5; }
 .mc-struggling text { fill: #f5d547; font-weight: 700; font-size: calc(13px * var(--mc-t, 1)); pointer-events: none; }
 .mc-volunteers { fill: var(--muted); font-size: calc(11px * var(--mc-t, 1)); pointer-events: none; }
+
+/* --- Legibility (shared by the live console and the replay page) --- */
+
+/* The full goal lives in the run header; the ticker keeps two lines of it. */
+.mc-goal {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  max-width: 34rem;
+}
+
+/* Long item objectives read as three lines on a card; a selected card shows all. */
+.mc-card:not(.is-selected) .mc-card-objective {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.mc-moments {
+  max-width: 17rem;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.25rem 0.4rem;
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+.mc .mc-play {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0d1117;
+  font-weight: 700;
+  min-width: 5.5rem;
+}
+
+.mc .mc-end-pill { border-radius: 999px; }
+
+/* The tools registry in the narrow right pane: one card per tool, not a
+   six-column table squeezed into 340px. */
+.mc-right .mc-tools thead { display: none; }
+.mc-right .mc-tools, .mc-right .mc-tools tbody { display: block; }
+.mc-right .mc-tools tr {
+  display: block;
+  margin-bottom: 0.5rem;
+  padding: 0.4rem 0.55rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid #f0883e;
+  border-radius: 6px;
+}
+.mc-right .mc-tools td { display: block; border: none; padding: 0.1rem 0; }
+.mc-right .mc-tools td:nth-child(1) { font-size: 1.05em; }
+.mc-right .mc-tools td:nth-child(2)::before { content: "version "; color: var(--muted); }
+.mc-right .mc-tools td:nth-child(3)::before { content: "kind "; color: var(--muted); }
+.mc-right .mc-tools td:nth-child(4)::before { content: "built by "; color: var(--muted); }
+.mc-right .mc-tools td:nth-child(5)::before { content: "its own gate: "; color: var(--muted); }
+.mc-right .mc-tools td:nth-child(6)::before { content: "used by "; color: var(--muted); }
+
+/* A recorded run: the replay controls sit right under the ticker, in view. */
+.mc.is-recorded {
+  grid-template-columns: 270px minmax(0, 1fr) 340px;
+  grid-template-rows: auto auto minmax(520px, calc(100vh - 150px));
+  grid-template-areas:
+    "ticker ticker ticker"
+    "replay replay replay"
+    "board graph right";
+}
+
+.mc.is-recorded .mc-replay {
+  border-color: #3d4b5c;
+}
+
+@media (max-width: 1100px) {
+  .mc.is-recorded {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto;
+    grid-template-areas: "ticker" "replay" "graph" "board" "right";
+  }
+}
+
+/* --- The static replay page --- */
+
+.replay-shell .app-header h1 {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  font-size: 1.45rem;
+}
+
+.replay-shell .app-header h1 a {
+  color: var(--text);
+  text-decoration: none;
+}
+
+.replay-mark {
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #d2a8ff;
+  border: 1px solid #8957e5;
+  border-radius: 999px;
+  padding: 0.1rem 0.55rem;
+}
+
+.replay-shell .tagline {
+  max-width: 60rem;
+  line-height: 1.45;
+}
+
+.replay-banner {
+  margin: 0.9rem 0 0;
+  padding: 0.55rem 0.9rem;
+  border: 1px solid #8957e5;
+  border-left-width: 4px;
+  border-radius: 6px;
+  background: rgba(137, 87, 229, 0.12);
+  color: var(--text);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.replay-banner strong { color: #d2a8ff; }
+
+.replay-shell.is-wide .replay-banner { margin-top: 0.6rem; }
+
+.replay-shell button.secondary,
+.replay-shell .replay-open {
+  display: inline-block;
+  padding: 0.3rem 0.75rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.replay-shell .replay-open {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0d1117;
+  font-weight: 700;
+}
+
+.replay-list {
+  list-style: none;
+  margin: 1rem 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(18rem, 1fr));
+  gap: 0.9rem;
+}
+
+.replay-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 0.9rem 1rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-top: 4px solid var(--border);
+  border-radius: 8px;
+}
+
+.replay-card.is-verified { border-top-color: #238636; }
+.replay-card.is-failed { border-top-color: #da3633; }
+.replay-card.is-unverified { border-top-color: #d29922; }
+
+.replay-card h3 { margin: 0; font-size: 1.02rem; line-height: 1.35; }
+.replay-card-desc { margin: 0; color: var(--muted); font-size: 0.88rem; line-height: 1.5; flex: 1; }
+.replay-card-head, .replay-card-foot { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+
+.replay-outcome {
+  font-size: 0.72rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0.12rem 0.5rem;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+.replay-outcome.is-verified { color: #3fb950; border-color: #238636; background: rgba(35, 134, 54, 0.15); }
+.replay-outcome.is-failed { color: #ff7b72; border-color: #da3633; background: rgba(218, 54, 51, 0.15); }
+.replay-outcome.is-unverified, .replay-outcome.is-unknown { color: #d29922; border-color: #d29922; }
+
+.replay-app {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.05rem 0.5rem;
+}
+
+.replay-run-head { display: flex; flex-direction: column; gap: 0.5rem; }
+.replay-run-title { display: flex; flex-wrap: wrap; align-items: center; gap: 0.7rem; }
+.app-panel .replay-run-title h2 { margin: 0; font-size: 1.1rem; color: var(--text); }
+
+.replay-goal {
+  margin: 0;
+  line-height: 1.45;
+  font-size: 0.92rem;
+}
+
+.replay-label {
+  display: inline-block;
+  margin-right: 0.4rem;
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.replay-verdict {
+  display: flex;
+  align-items: center;
+  gap: 0.8rem;
+  padding: 0.5rem 0.8rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.replay-verdict-word {
+  flex: none;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  padding: 0.2rem 0.6rem;
+  border-radius: 4px;
+}
+
+.replay-verdict.is-verified { border-color: #238636; background: rgba(35, 134, 54, 0.12); }
+.replay-verdict.is-verified .replay-verdict-word { background: #238636; color: #fff; }
+.replay-verdict.is-failed { border-color: #da3633; background: rgba(218, 54, 51, 0.1); }
+.replay-verdict.is-failed .replay-verdict-word { background: #da3633; color: #fff; }
+.replay-verdict.is-unverified, .replay-verdict.is-none { border-color: #d29922; }
+.replay-verdict.is-unverified .replay-verdict-word, .replay-verdict.is-none .replay-verdict-word { background: #d29922; color: #0d1117; }
+
+.replay-guide { font-size: 0.86rem; color: var(--muted); }
+.replay-guide summary { cursor: pointer; color: var(--accent); }
+.replay-guide ul { margin: 0.4rem 0 0; padding-left: 1.2rem; line-height: 1.5; }
+.replay-guide strong { color: var(--text); }

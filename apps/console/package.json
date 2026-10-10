@@ -5,8 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:replay": "vite --mode replay",
     "build": "tsc --noEmit && vite build",
+    "build:replay": "tsc --noEmit && vite build --mode replay",
     "preview": "vite preview",
+    "preview:replay": "vite preview --mode replay",
+    "export-replay": "node --disable-warning=ExperimentalWarning --experimental-transform-types scripts/export-replay.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

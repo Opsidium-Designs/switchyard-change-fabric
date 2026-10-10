@@ -24,6 +24,21 @@ make demo-board  # agents form around a goal on the Change board and build tools
 make demo-board-storefront  # the same board on the larger multi-domain storefront app (offline, deterministic)
 ```
 
+## Replay recorded runs (static, no account)
+
+Real board runs, recorded from the Worker, played back in the browser with the
+same mission control as a live run: no Worker, no launcher, no credentials, no
+model calls. Failed runs are included on purpose.
+
+```bash
+make replay-preview   # build and serve the replay page on http://127.0.0.1:4180
+```
+
+Open a run with `?run=<id>` and a moment with `&seq=<n>`. Export another run
+with `make export-replay ID=<changeId>` (scrubs local paths and refuses anything
+token-like), and publish the page with `make deploy-replay` (a real deploy of
+static assets). See [docs/REPLAY.md](./docs/REPLAY.md).
+
 ## Live run
 
 1. **Configure `.env`** (gitignored; never commit it):

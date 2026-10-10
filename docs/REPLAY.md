@@ -1,0 +1,79 @@
+# The replay page
+
+A static, zero-cost public page that plays back REAL recorded board runs in the
+browser. It is the console's mission control (graph, board, threads, tools tab,
+progress, scrubber) built in a replay mode: the recorded board log is folded
+with the same `buildBoardGraph(log, k)` the live console uses, so the view at
+seq K is exactly what the board had recorded at K. Nothing runs: no Worker, no
+launcher, no polling, no credentials, no model calls. Every node is backed by a
+recorded message (the same `assertBoardBacked` guard), and the final verdict is
+shown exactly as the run recorded it (the integration verdict in the snapshot),
+never inferred from the replay position.
+
+## Use it
+
+```bash
+make replay-build     # apps/console/dist-replay (relative asset paths: root or subpath)
+make replay-preview   # build, then serve on http://127.0.0.1:4180 (REPLAY_PORT=...)
+```
+
+- `?run=<id>` opens a run at its end (the final state), `?run=<id>&seq=<n>` at
+  seq n, `&tab=tools` (or `thread`, `node`) opens a right pane tab. The address
+  bar follows the scrubber, so a link opens the moment being watched.
+- Play from the start, change speed (1x, 4x, 16x), scrub, or jump to a key
+  moment: claims, contests, contract changes, help and handoffs, tool
+  publications, gate passes and failures, completions, spent fix budgets, and
+  stalled seams. Every key moment is a recorded message.
+- Live-only controls are gone: no launcher, templates, deploy, or dial, and a
+  pending escalation is shown read-only ("recorded run: decided during the live
+  run, not here").
+
+## Export a run
+
+```bash
+make export-replay ID=<changeId> [WORKER=http://127.0.0.1:8787] [TITLE="..."] [APP=storefront] [DESCRIPTION="..."]
+```
+
+It pages the full board log (`GET /changes/:id/board?after=`) and the snapshot
+(`GET /changes/:id`) from a running Worker and writes
+`apps/console/public/replays/<id>.json` plus its entry in `index.json`
+(id, title, app, outcome, description). Before writing it:
+
+- keeps only an allow-listed slice of the snapshot (objective, status, dial,
+  integration verdict, planning failure, escalations, board counts): no
+  deployment URLs or repo identities;
+- scrubs local absolute paths: the repo root becomes repo-relative, a temp work
+  directory (`/tmp/scf-board-XXXX/worktrees/...`) becomes `<work>`, and a home
+  directory becomes `<home>`;
+- REFUSES to write (exit 1, nothing written, the finding's location named but
+  never its value) when anything token-like remains (a Bearer token, an
+  `art_v*` Artifact token, a provider key, URL credentials, a private key, a
+  long hex or base64 secret; 40-hex Git commit ids are allowed), or the value of
+  any env var whose name contains TOKEN, SECRET, KEY, or ACCOUNT, from the
+  process env and from the repo's `.env` (read into memory only).
+
+The scrubber and the refusal are unit-tested offline
+(`apps/console/tests/replay-export.test.ts`), and a test checks every published
+replay folds with every node backed and holds no secret or local path
+(`apps/console/tests/replay-data.test.tsx`).
+
+## Deploy it
+
+`apps/console/wrangler.replay.jsonc` serves `dist-replay/` as Workers static
+assets: no Worker code, no bindings, no secrets.
+
+```bash
+make deploy-replay    # a REAL deploy on the account in .env: confirm before running
+make delete-replay    # remove it again
+```
+
+## The recorded runs shipped here
+
+| id | outcome | what happened |
+| --- | --- | --- |
+| `board-live-reg3` | verified | service-api: 6 resource items, a codemod built and published, acceptance 10/20, 16/20, then 20/20 on revision 3 |
+| `board-live-sf7` | failed | storefront: contracts, help, handoffs, a scanner and a codemod; a shared Invoice change broke typecheck for revisions 2 to 9; best acceptance 40/129 |
+| `board-live-sf8` | failed | storefront: 7 contract proposals, 4 escalated to a human; acceptance peaked at 35/129; two seam items stalled |
+
+Promotion to local Git happens after the verdict is recorded and is not part of
+the exported board, so the page reports the recorded verdict, not promotion.

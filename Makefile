@@ -25,6 +25,11 @@
 #   make deploy    deploy the Worker to Cloudflare (wrangler deploy)
 #   make deploy-app APP=service-api  deploy an example web app to a live workers.dev URL
 #   make delete-app APP=service-api  tear that deployed example app down (stop billing)
+#   make export-replay ID=<changeId>  export a recorded board run from a Worker for the replay page (scrubbed)
+#   make replay-build    build the static replay page (recorded runs, no Worker, no credentials)
+#   make replay-preview  serve the replay build locally (REPLAY_PORT, default 4180)
+#   make deploy-replay   deploy the replay page as Workers static assets (a REAL deploy: confirm first)
+#   make delete-replay   delete that deployed replay page
 #   make infra-up      spin the hosted Cloudflare infra up (deploy + queue + subscription), idempotent
 #   make infra-status  read-only: what is live right now (am I paying for anything?)
 #   make infra-down    spin the hosted Cloudflare infra down (delete worker + queue + subscription + repos), idempotent
@@ -35,7 +40,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: export-replay replay-build replay-preview deploy-replay delete-replay jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -413,6 +418,60 @@ deploy-app:
 delete-app:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	name=$$(sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' examples/apps/$(APP)/wrangler.jsonc | head -1); \
+	echo "Deleting Worker $$name ..."; \
+	curl -sS -X DELETE \
+	  "https://api.cloudflare.com/client/v4/accounts/$$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$$name?force=true" \
+	  -H "Authorization: Bearer $$CLOUDFLARE_API_TOKEN" | \
+	  grep -qE '"success"[[:space:]]*:[[:space:]]*true|does not exist' \
+	  && echo "Teardown complete: $$name is not deployed." \
+	  || { echo "Teardown may have failed; check the account."; exit 1; }
+
+# --- the static replay page (recorded runs, zero cost to view) ---
+
+# Export a recorded board run for the replay page: pages the full board log
+# (GET /changes/:id/board?after=) and the snapshot from a running Worker, scrubs
+# local absolute paths (/tmp/..., /home/...) to repo-relative or <work>/
+# placeholders, REFUSES to write when anything token-like (Bearer, art_v*, long
+# hex/base64 secrets) or the value of any env var named *TOKEN*, *SECRET*, *KEY*,
+# or *ACCOUNT* remains, and writes apps/console/public/replays/<ID>.json plus its
+# index.json entry. The board GET is open: no credential is read or sent, and
+# .env is NOT sourced. TITLE / APP / DESCRIPTION set the index entry (kept from
+# a previous export otherwise).
+ID ?=
+TITLE ?=
+DESCRIPTION ?=
+export-replay:
+	@test -n "$(ID)" || { echo "usage: make export-replay ID=<changeId> [WORKER=$(WORKER)] [TITLE=...] [APP=...] [DESCRIPTION=...]"; exit 2; }
+	npm -w apps/console run export-replay -- --id "$(ID)" --worker "$(WORKER)" \
+	  $(if $(TITLE),--title "$(TITLE)",) $(if $(filter command line,$(origin APP)),--app "$(APP)",) $(if $(DESCRIPTION),--description "$(DESCRIPTION)",)
+
+# Build the static replay page into apps/console/dist-replay: the console's
+# mission control over the recorded runs in apps/console/public/replays, with no
+# launcher, no Worker, no polling, and relative asset paths (works from a
+# subpath or the root). Open a run with ?run=<id>, a moment with &seq=<n>.
+replay-build:
+	npm -w apps/console run build:replay
+
+# Serve the replay build locally (a static preview; nothing live runs).
+REPLAY_PORT ?= 4180
+replay-preview: replay-build
+	npm -w apps/console run preview:replay -- --host 127.0.0.1 --port $(REPLAY_PORT) --strictPort
+
+# Deploy the replay page to a live workers.dev URL as Workers static assets
+# (apps/console/wrangler.replay.jsonc: no Worker code, no bindings). This is a
+# REAL deploy on the account in .env (CLOUDFLARE_ACCOUNT_ID + a scoped
+# CLOUDFLARE_API_TOKEN, or `wrangler login`): confirm before running it. Static
+# asset requests are free on Workers, so viewing it costs nothing. Remove it
+# with `make delete-replay`. Uses the repo's pinned wrangler.
+deploy-replay: replay-build
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	cd apps/console && ../../node_modules/.bin/wrangler deploy -c wrangler.replay.jsonc
+
+# Delete the deployed replay page (same REST approach as delete-app, so a
+# narrowly scoped deploy token works). Idempotent: already gone is success.
+delete-replay:
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	name=$$(sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' apps/console/wrangler.replay.jsonc | head -1); \
 	echo "Deleting Worker $$name ..."; \
 	curl -sS -X DELETE \
 	  "https://api.cloudflare.com/client/v4/accounts/$$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$$name?force=true" \

@@ -25,6 +25,7 @@ import {
 import type { EscalationSnapshot } from "@switchyard-change/orchestration/graph-model";
 
 import { IDENTITY_VIEW, shouldZoomOnWheel, zoomAt, type ViewTransform } from "./graph-interactions";
+import { keyMoments, MOMENT_GROUPS, type MomentKind } from "./replay-data";
 
 /**
  * Mission control: the console view for a BOARD run (agents that form around
@@ -62,6 +63,8 @@ export interface EscalationCardData {
   readonly type?: string;
   /** Why it cannot be answered from here (replay, or no record yet). */
   readonly note?: string;
+  /** A recorded run: the options are shown as text, never as buttons. */
+  readonly recorded?: boolean;
 }
 
 const TRIAGE_SPLIT = "\nAdvisory triage";
@@ -75,10 +78,11 @@ export function escalationCards(
   model: BoardGraphModel,
   records: readonly BoardEscalationRecord[],
   live: boolean,
+  recorded = false,
 ): EscalationCardData[] {
   const out: EscalationCardData[] = [];
   const matched = new Set<string>();
-  if (live) {
+  if (live && !recorded) {
     for (const record of records) {
       if (record.status !== "pending") {
         continue;
@@ -112,7 +116,12 @@ export function escalationCards(
       ...(e.recommendation !== undefined ? { recommendation: e.recommendation } : {}),
       seq: e.seq,
       type: e.kind === "contest" ? "claim.escalated" : "contract.escalated",
-      note: live ? "waiting for the escalation record" : "replaying: answer from the live view",
+      ...(recorded ? { recorded: true } : {}),
+      note: recorded
+        ? "recorded run: this was decided (or left waiting) during the live run, not here"
+        : live
+          ? "waiting for the escalation record"
+          : "replaying: answer from the live view",
     });
   }
   return out;
@@ -216,8 +225,40 @@ export function payloadSummary(message: BoardMessage): string {
             ? `: ${(message.payload.findings ?? []).length} finding(s)`
             : ""
       }`;
+    case "item.accepted":
+      return `${message.payload.item} accepted onto the board`;
+    case "item.rejected":
+      return `${message.payload.item} rejected`;
+    case "item.split":
+      return `${message.payload.item} split into ${message.payload.children.map((c) => c.item).join(", ")}`;
+    case "item.struggling":
+      return `${message.payload.item} is going badly (${message.payload.reason}, ${message.payload.turnsSpent} turn(s)${
+        message.payload.failedEdits > 0 ? `, ${message.payload.failedEdits} failed edit(s)` : ""
+      }): idle agents may volunteer`;
+    case "item.reopened":
+      return `${message.payload.item} reopened for a different agent (was ${message.payload.previousOwner}${
+        message.payload.n !== undefined ? `, failing rev ${message.payload.n}` : ""
+      })`;
+    case "help.volunteered":
+      return `volunteers to help on ${message.payload.item}`;
+    case "help.declined":
+      return `declines ${message.payload.volunteer}'s help on ${message.payload.item}`;
+    case "help.delivered":
+      return `delivers ${message.payload.request}: ${message.payload.commit.slice(0, 7)} ${message.payload.paths.join(", ")}`;
+    case "help.closed":
+      return `${message.payload.request} closed (${message.payload.reason})`;
+    case "handoff":
+      return `hands ${message.payload.item} to ${message.payload.to}${message.payload.capsule.commit ? ` from ${message.payload.capsule.commit.slice(0, 7)}` : ""}`;
+    case "seam.stalled":
+      return `seam ${message.payload.item} stalled${message.payload.released ? ": released for another agent" : ""}`;
+    case "fix.exhausted":
+      return `${message.payload.item}: fix budget spent (${message.payload.attempts} attempt(s), rev ${message.payload.n})`;
+    case "review.requested":
+      return `${message.payload.review} on ${message.payload.item}`;
+    case "review.result":
+      return `${message.payload.review}: ${message.payload.findings.length} finding(s)`;
     default:
-      return clip(JSON.stringify(message.payload), 110);
+      return clip(JSON.stringify((message as BoardMessage).payload), 110);
   }
 }
 
@@ -225,14 +266,27 @@ export function payloadSummary(message: BoardMessage): string {
 // Ticker
 // ---------------------------------------------------------------------------
 
-export function Ticker({ ticker, live, k, lastSeq }: { ticker: BoardTicker; live: boolean; k: number; lastSeq: number }) {
+export function Ticker({
+  ticker,
+  live,
+  k,
+  lastSeq,
+  recorded = false,
+}: {
+  ticker: BoardTicker;
+  live: boolean;
+  k: number;
+  lastSeq: number;
+  recorded?: boolean;
+}) {
   const rev = ticker.rev;
   const gateClass = !rev ? "" : !rev.gated ? "is-nogate" : rev.gate === "pass" ? "is-pass" : "is-fail";
   return (
     <div className="mc-ticker" aria-label="Ticker">
-      <span className="mc-goal" title={ticker.goalSeq !== undefined ? `${ticker.goal ?? ""} (seq ${ticker.goalSeq}, goal.posted)` : undefined}>
+      {/* A recorded run shows its full goal in the run header above. */}
+      {recorded ? null : <span className="mc-goal" title={ticker.goalSeq !== undefined ? `${ticker.goal ?? ""} (seq ${ticker.goalSeq}, goal.posted)` : undefined}>
         {ticker.goal ?? "no goal posted yet"}
-      </span>
+      </span>}
       {rev ? (
         <span className={`mc-rev-chip ${gateClass}`} title={`(seq ${rev.seq}, integrated.rev)`}>
           rev {rev.n} [{rev.label}]
@@ -255,7 +309,12 @@ export function Ticker({ ticker, live, k, lastSeq }: { ticker: BoardTicker; live
         {ticker.items.open} open, {ticker.items.claimed} claimed, {ticker.items.contested} contested, {ticker.items.done} done{ticker.items.proposed > 0 ? `, ${ticker.items.proposed} awaiting the lead` : ""}
       </span>
       <span className="mc-jev advisory">{ticker.jev.label}</span>
-      {!live ? (
+      {recorded ? (
+        <span className="mc-replaying">
+          recorded run: seq {k}/{lastSeq}
+          {k >= lastSeq ? " (end)" : ""}
+        </span>
+      ) : !live ? (
         <span className="mc-replaying">
           replay: seq {k}/{lastSeq}
         </span>
@@ -283,7 +342,7 @@ export function EscalationCard({
   return (
     <div className="mc-escalation" role="group" aria-label="Pending human decision">
       <p className="mc-escalation-head">
-        <strong>Awaiting you</strong>{" "}
+        <strong>{card.recorded ? "Awaiting a human" : "Awaiting you"}</strong>{" "}
         <span className="muted">{card.kind === "contract" ? "contract change" : card.kind === "contest" ? "contest" : "decision"}</span>
         {card.seq !== undefined ? (
           <button type="button" className="mc-seq-link" onClick={() => onSelectSeq?.(card.seq!)}>
@@ -298,6 +357,9 @@ export function EscalationCard({
           <span className="mc-chip-advisory">advisory: you decide</span>
         </p>
       ) : null}
+      {card.recorded ? (
+        <p className="muted mc-escalation-options-text">options: {card.options.join(" / ")}</p>
+      ) : (
       <div className="mc-escalation-options">
         {card.options.map((option) => (
           <button
@@ -314,6 +376,7 @@ export function EscalationCard({
           </button>
         ))}
       </div>
+      )}
       {card.note ? <p className="muted mc-escalation-note">{card.note}</p> : null}
     </div>
   );
@@ -536,7 +599,9 @@ export function boardShortLabels(
     const { head, tail } = common;
     if (head.length > 0 && t.length > head.length && head.every((h, i) => t[i] === h)) t = t.slice(head.length);
     if (tail.length > 0 && t.length > tail.length && tail.every((h, i) => t[t.length - tail.length + i] === h)) t = t.slice(0, t.length - tail.length);
-    return t.join("-") || base;
+    const label = t.join("-") || base;
+    // A bare number (`unit-3` stripped to `3`) says nothing on its own: keep the id.
+    return /^\d+$/.test(label) ? id : label;
   };
   const cores = ids.map(core);
   // Two ids reduced to one label keep their prefix-stripped ids instead, and
@@ -564,7 +629,9 @@ export function boardShortLabels(
  */
 export function seedItemIds(model: BoardGraphModel): string[] {
   const leads = new Set(["human", ...model.nodes.flatMap((n) => (n.detail.kind === "agent" && n.detail.role === "lead" ? [n.detail.agent] : []))]);
-  return model.nodes.flatMap((n) => (n.detail.kind === "item" && leads.has(n.detail.proposedBy) ? [n.detail.item] : []));
+  // A tool's build item (`tool-<capability>`) is not a planner seed either, even when the lead files it.
+  const toolItems = new Set(model.nodes.flatMap((n) => (n.detail.kind === "tool" ? [`tool-${n.detail.capability}`] : [])));
+  return model.nodes.flatMap((n) => (n.detail.kind === "item" && leads.has(n.detail.proposedBy) && !toolItems.has(n.detail.item) ? [n.detail.item] : []));
 }
 
 /** The approximate advance of one character, as a fraction of the font size (monospace about 0.6). */
@@ -581,10 +648,16 @@ export function ellipsizeToWidth(text: string, width: number, fontPx: number): s
 export const HULL_TITLE_FONT = 15;
 export const HULL_STATUS_FONT = 12;
 
+/** The characters of a title that always fit (when it has them) before the status badge gets room. */
+const HULL_TITLE_MIN_CHARS = 12;
+
 /**
- * Lay out a hull's header: the status is a badge at the right of the bar (at
- * most half the bar, its text ellipsized to fit), and the title is ellipsized
- * to the width left of it, so the two never overlap.
+ * Lay out a hull's header: the title wins the space. The status is a badge at
+ * the right of the bar, shown in full only when the title still keeps its first
+ * 12 characters (all of a shorter one) beside it; otherwise the badge is hidden (the
+ * hull's color, the board column, and the tooltip still carry the status), so
+ * a zoomed-out graph reads `billing-tax`, not `bil... | cl...`. The title is
+ * ellipsized to the width left of the badge, so the two never overlap.
  */
 export function hullHeader(input: { readonly title: string; readonly status: string; readonly width: number; readonly boost?: number }): {
   readonly title: string;
@@ -596,11 +669,13 @@ export function hullHeader(input: { readonly title: string; readonly status: str
   const gap = 8;
   const inner = Math.max(0, input.width - pad * 2);
   const statusPx = HULL_STATUS_FONT * boost;
-  const badgeW = Math.min(Math.ceil(input.status.length * statusPx * CHAR_EM + 14), Math.floor(inner / 2));
-  const status = ellipsizeToWidth(input.status, Math.max(0, badgeW - 14), statusPx);
+  const titleKeep = Math.ceil(Math.min(input.title.length, HULL_TITLE_MIN_CHARS) * HULL_TITLE_FONT * boost * CHAR_EM);
+  const statusNeed = Math.ceil(input.status.length * statusPx * CHAR_EM + 14);
+  const fits = input.status.length > 0 && inner - statusNeed - gap >= titleKeep;
+  const badgeW = fits ? statusNeed : 0;
   return {
-    title: ellipsizeToWidth(input.title, Math.max(0, inner - badgeW - gap), HULL_TITLE_FONT * boost),
-    status,
+    title: ellipsizeToWidth(input.title, Math.max(0, inner - (fits ? badgeW + gap : 0)), HULL_TITLE_FONT * boost),
+    status: fits ? input.status : "",
     badge: { x: input.width - pad - badgeW, w: badgeW },
   };
 }
@@ -678,6 +753,8 @@ export interface BoardGraphViewProps {
 
 /** Padding around the drawing inside the fitted viewBox. */
 const FIT_PAD = 16;
+/** The longest revision label the graph leaves room for (`GATE FAIL acceptance 128/129 (+12)`). */
+const REV_LABEL_CHARS = 34;
 /** Text never renders below its CSS size; it grows by at most this much when the drawing is scaled down. */
 const MAX_TEXT_BOOST = 1.8;
 
@@ -694,8 +771,15 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
   const [view, setView] = useState<ViewTransform>(IDENTITY_VIEW);
   const [stage, setStage] = useState<{ w: number; h: number } | null>(null);
   const drag = useRef<{ x: number; y: number; tx: number; ty: number; moved: boolean } | null>(null);
-  const vbW = layout.width + 2 * FIT_PAD;
   const vbH = layout.height + 2 * FIT_PAD;
+  // Room on the right for the revision labels (`GATE FAIL acceptance 35/129`),
+  // which start beside the hexagons and grow with the text boost: without it
+  // they are clipped at the pane edge. Sized from the fitted scale (not the
+  // zoom), so zooming never shifts the drawing.
+  const revPad = (b: number) => (layout.revs.size > 0 ? Math.max(0, Math.ceil(32 + REV_LABEL_CHARS * 13 * b * CHAR_EM - 222)) : 0);
+  const fitFor = (w: number) => (stage ? Math.min(stage.w / w, stage.h / vbH) : 1);
+  const baseW = layout.width + 2 * FIT_PAD;
+  const vbW = baseW + revPad(textBoost(fitFor(baseW + revPad(1))));
 
   // Track the pane size so labels keep a minimum on-screen size however the drawing is fitted.
   useEffect(() => {
@@ -805,7 +889,7 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
         viewBox={`${-FIT_PAD} ${-FIT_PAD} ${vbW} ${vbH}`}
         role="img"
         aria-label="Board graph"
-        preserveAspectRatio="xMidYMid meet"
+        preserveAspectRatio="xMidYMin meet"
         style={{ ["--mc-t" as string]: boost.toFixed(3) }}
         onMouseDown={(event) => {
           if (event.button !== 0) return;
@@ -858,10 +942,14 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                     <text className="mc-hull-title" x={rect.x + 14} y={rect.y + 22}>
                       {header.title}
                     </text>
-                    <rect className="mc-hull-badge" x={rect.x + header.badge.x} y={rect.y + 7} width={header.badge.w} height={HULL_TITLE_H - 14} rx={9} />
-                    <text className="mc-hull-status" x={rect.x + header.badge.x + header.badge.w / 2} y={rect.y + 21} textAnchor="middle">
-                      {header.status}
-                    </text>
+                    {header.badge.w > 0 ? (
+                      <>
+                        <rect className="mc-hull-badge" x={rect.x + header.badge.x} y={rect.y + 7} width={header.badge.w} height={HULL_TITLE_H - 14} rx={9} />
+                        <text className="mc-hull-status" x={rect.x + header.badge.x + header.badge.w / 2} y={rect.y + 21} textAnchor="middle">
+                          {header.status}
+                        </text>
+                      </>
+                    ) : null}
                     {d.completed !== undefined ? (
                       <circle className="mc-check is-filled" cx={rect.x + rect.w - 22} cy={rect.y + rect.h - 22} r={11} />
                     ) : d.doneProposed ? (
@@ -1048,8 +1136,13 @@ function NodeLabel({ node, boost = 1 }: { node: BoardGraphNode; boost?: number }
   if (d.kind === "tool") {
     return (
       <text className="mc-node-label" textAnchor="middle" y={below(17)}>
-        {clip(d.capability, 26)}
-        {d.uses > 0 ? <tspan className="mc-tool-uses">{` used x${d.uses}`}</tspan> : null}
+        {ellipsizeToWidth(d.capability, 180, 13 * boost)}
+        {/* The use count on its own line, so neighbouring tools' labels never run together. */}
+        {d.uses > 0 ? (
+          <tspan className="mc-tool-uses" x={0} dy="1.2em">
+            {` used x${d.uses}`}
+          </tspan>
+        ) : null}
       </text>
     );
   }
@@ -1333,6 +1426,7 @@ export function ReplayBar({
   live,
   playing,
   speed,
+  recorded = false,
   onSeek,
   onLive,
   onPlay,
@@ -1343,6 +1437,8 @@ export function ReplayBar({
   live: boolean;
   playing: boolean;
   speed: number;
+  /** A recorded run: there is no live edge to follow, only the end of the log. */
+  recorded?: boolean;
   onSeek: (k: number) => void;
   onLive: () => void;
   onPlay: () => void;
@@ -1350,6 +1446,7 @@ export function ReplayBar({
 }) {
   const lastSeq = log.length === 0 ? 0 : log[log.length - 1]!.seq;
   const jumps = useMemo(() => boardJumpTargets(log), [log]);
+  const moments = useMemo(() => keyMoments(log), [log]);
   const ticks = useMemo(() => {
     const paths = new Map<BoardMessageFamily, string[]>();
     for (const m of log) {
@@ -1361,12 +1458,16 @@ export function ReplayBar({
     return [...paths.entries()];
   }, [log]);
   const next = (targets: readonly number[]) => targets.find((s) => s > k);
+  const nextOf = (...kinds: MomentKind[]) => next(moments.filter((m) => kinds.includes(m.kind)).map((m) => m.seq));
   const nextContest = next(jumps.contests);
   const nextRev = next(jumps.revs);
+  const nextClaim = nextOf("claim");
+  const nextContract = nextOf("contract");
+  const atMoment = moments.find((m) => m.seq === k);
   return (
     <div className="mc-replay" aria-label="Replay">
-      <button type="button" onClick={onPlay} disabled={lastSeq === 0}>
-        {playing ? "Pause" : "Play"}
+      <button type="button" className="mc-play" onClick={onPlay} disabled={lastSeq === 0}>
+        {playing ? "Pause" : recorded && live ? "Play from start" : "Play"}
       </button>
       {REPLAY_SPEEDS.map((s) => (
         <button key={s} type="button" className={`mc-speed${speed === s ? " is-active" : ""}`} onClick={() => onSpeed(s)}>
@@ -1391,15 +1492,52 @@ export function ReplayBar({
       <span className="mc-seq">
         seq {k}/{lastSeq}
       </span>
-      <button type="button" disabled={nextContest === undefined} onClick={() => nextContest !== undefined && onSeek(nextContest)}>
-        next contest
+      <select
+        className="mc-moments"
+        aria-label="Jump to a key moment"
+        value={atMoment ? String(atMoment.seq) : ""}
+        onChange={(event) => {
+          const seq = Number(event.target.value);
+          if (Number.isFinite(seq) && seq > 0) onSeek(seq);
+        }}
+      >
+        <option value="">jump to a key moment ({moments.length})</option>
+        {MOMENT_GROUPS.map((group) => {
+          const items = moments.filter((m) => m.kind === group.kind);
+          return items.length === 0 ? null : (
+            <optgroup key={group.kind} label={`${group.title} (${items.length})`}>
+              {items.map((m) => (
+                <option key={`${m.kind}-${m.seq}`} value={m.seq}>
+                  seq {m.seq}: {m.label}
+                </option>
+              ))}
+            </optgroup>
+          );
+        })}
+      </select>
+      <button type="button" disabled={nextClaim === undefined} onClick={() => nextClaim !== undefined && onSeek(nextClaim)}>
+        next claim
       </button>
+      <button type="button" disabled={nextContract === undefined} onClick={() => nextContract !== undefined && onSeek(nextContract)}>
+        next contract
+      </button>
+      {nextContest !== undefined || !recorded ? (
+        <button type="button" disabled={nextContest === undefined} onClick={() => nextContest !== undefined && onSeek(nextContest)}>
+          next contest
+        </button>
+      ) : null}
       <button type="button" disabled={nextRev === undefined} onClick={() => nextRev !== undefined && onSeek(nextRev)}>
         next rev
       </button>
-      <button type="button" className={`mc-live-pill${live ? " is-live" : ""}`} onClick={onLive}>
-        {live ? "LIVE" : "go live"}
-      </button>
+      {recorded ? (
+        <button type="button" className="mc-end-pill" disabled={live} onClick={onLive}>
+          end: final verdict
+        </button>
+      ) : (
+        <button type="button" className={`mc-live-pill${live ? " is-live" : ""}`} onClick={onLive}>
+          {live ? "LIVE" : "go live"}
+        </button>
+      )}
     </div>
   );
 }
@@ -1423,9 +1561,26 @@ export interface MissionControlProps {
   readonly initialSeq?: number;
   readonly initialSelection?: BoardSelection | null;
   readonly initialTab?: RightTab;
+  /**
+   * A RECORDED run (the static replay page): nothing is live, no escalation can
+   * be answered, and the end of the log is the end of the run.
+   */
+  readonly recorded?: boolean;
+  /** Called with the replay cursor (null at the end of the log), e.g. to keep a shareable URL. */
+  readonly onSeqChange?: (seq: number | null) => void;
 }
 
-export function MissionControl({ log, escalations, busy, onResolve, initialSeq, initialSelection, initialTab }: MissionControlProps) {
+export function MissionControl({
+  log,
+  escalations,
+  busy,
+  onResolve,
+  initialSeq,
+  initialSelection,
+  initialTab,
+  recorded = false,
+  onSeqChange,
+}: MissionControlProps) {
   const lastSeq = log.length === 0 ? 0 : log[log.length - 1]!.seq;
   const [cursor, setCursor] = useState<number | "live">(initialSeq ?? "live");
   const [playing, setPlaying] = useState(false);
@@ -1435,6 +1590,9 @@ export function MissionControl({ log, escalations, busy, onResolve, initialSeq, 
   const [tab, setTab] = useState<RightTab>(initialTab ?? "thread");
   const live = cursor === "live" || cursor >= lastSeq;
   const k = cursor === "live" ? lastSeq : Math.min(cursor, lastSeq);
+  useEffect(() => {
+    onSeqChange?.(live ? null : k);
+  }, [k, live, onSeqChange]);
 
   const layout = useMemo(() => boardLayout(log), [log]);
   const { model, error } = useMemo((): { model: BoardGraphModel | null; error: string | null } => {
@@ -1519,7 +1677,7 @@ export function MissionControl({ log, escalations, busy, onResolve, initialSeq, 
     );
   }
 
-  const cards = escalationCards(model, escalations, live);
+  const cards = escalationCards(model, escalations, live, recorded);
   const thread = selection ? boardThread(log, k, selection, model.state) : [...boardPrefix(log, k).slice(-40)].reverse();
   const threadTitle = !selection
     ? "Latest board messages (newest first)"
@@ -1535,16 +1693,28 @@ export function MissionControl({ log, escalations, busy, onResolve, initialSeq, 
   const selectedSeq = selection?.kind === "seq" ? selection.seq : null;
 
   return (
-    <section className="mc" aria-label="Mission control">
-      <Ticker ticker={model.ticker} live={live} k={k} lastSeq={lastSeq} />
+    <section className={`mc${recorded ? " is-recorded" : ""}`} aria-label="Mission control">
+      <Ticker ticker={model.ticker} live={live} k={k} lastSeq={lastSeq} recorded={recorded} />
       <BoardPane model={model} cards={cards} selection={selection} busy={busy} onSelect={select} onResolve={onResolve} />
       <div className="mc-graph" aria-label="Graph">
         <div className="mc-graph-controls">
           <strong>GRAPH</strong>
           <span className="muted">messages:</span>
           {(["live", "all", "off"] as const).map((mode) => (
-            <button key={mode} type="button" className={messageMode === mode ? "is-active" : ""} onClick={() => setMessageMode(mode)}>
-              {mode}
+            <button
+              key={mode}
+              type="button"
+              className={messageMode === mode ? "is-active" : ""}
+              onClick={() => setMessageMode(mode)}
+              title={
+                mode === "live"
+                  ? "show each message as it lands (a dot travels sender to receiver, then fades)"
+                  : mode === "all"
+                    ? "show every message edge up to this point, aggregated"
+                    : "hide message edges"
+              }
+            >
+              {mode === "live" ? "as they land" : mode}
             </button>
           ))}
           {selection ? (
@@ -1597,6 +1767,7 @@ export function MissionControl({ log, escalations, busy, onResolve, initialSeq, 
         live={live}
         playing={playing}
         speed={speed}
+        recorded={recorded}
         onSeek={(seq) => {
           setPlaying(false);
           setCursor(seq >= lastSeq ? "live" : seq);

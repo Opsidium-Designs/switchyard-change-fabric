@@ -1,0 +1,16 @@
+// The static REPLAY page as a Workers static-assets deployment: no Worker
+// code, no bindings, no secrets. It serves the output of
+// `npm -w apps/console run build:replay` (dist-replay/: the page plus the
+// recorded runs in replays/). Deploy with `make deploy-replay` and remove it
+// with `make delete-replay`; both act on the real Cloudflare account in .env.
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "switchyard-change-fabric-replay",
+  "compatibility_date": "2025-09-23",
+  "workers_dev": true,
+  "assets": {
+    "directory": "./dist-replay",
+    // ?run=<id>&seq=<n> deep links all load index.html.
+    "not_found_handling": "single-page-application"
+  }
+}

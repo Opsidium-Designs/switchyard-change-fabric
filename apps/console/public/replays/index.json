@@ -1,0 +1,29 @@
+{
+  "format": "switchyard-replay/v1",
+  "runs": [
+    {
+      "id": "board-live-reg3",
+      "title": "service-api: 6 items, gate passed on revision 3, verified",
+      "app": "service-api",
+      "outcome": "verified",
+      "description": "A lead and 3 workers fix a multi-resource API (input validation and auth on every resource). They claim 6 resource items, a codemod tool is built, gated, and published, and the integrated tree goes from acceptance 10/20 (revision 1) to 16/20 (revision 2) to 20/20: revision 3 passes the app's own gate. Recorded verdict: verified.",
+      "messages": 89
+    },
+    {
+      "id": "board-live-sf7",
+      "title": "storefront: failed honestly, best acceptance 40/129",
+      "app": "storefront",
+      "outcome": "failed",
+      "description": "A lead and 6 workers on a multi-domain storefront (exact money, payment limits, auth, input validation). They publish a scanner and a codemod, negotiate 3 contract changes (one decided by a human), ask for help, and hand items off, but a shared Invoice contract change breaks typecheck for revisions 2 to 9; revision 10 reaches acceptance 40/129. No revision passed the gate, so nothing was promoted. Recorded verdict: failed.",
+      "messages": 152
+    },
+    {
+      "id": "board-live-sf8",
+      "title": "storefront: failed honestly, stalled at 35/129",
+      "app": "storefront",
+      "outcome": "failed",
+      "description": "The same storefront goal with a lead and 6 workers: 7 contract proposals (6 accepted, 1 rejected by the lead, 4 escalated to a human), help requests, a volunteer, and handoffs. Acceptance peaks at 35/129 on revisions 6 and 7, later revisions fail typecheck, and two seam items stall. No revision passed the gate, so nothing was promoted. Recorded verdict: failed.",
+      "messages": 178
+    }
+  ]
+}
