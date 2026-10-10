@@ -559,7 +559,12 @@ export const PAGE = `<!doctype html>
     var chips = [];
     if (i && isCents(i.balanceCents) && i.balanceCents < 0) { chips.push("Balance due is " + cents(i.balanceCents) + ": the invoice was paid more than it is worth"); }
     if (i && isCents(i.totalCents) && isCents(i.paidCents) && isCents(i.balanceCents) && i.balanceCents !== i.totalCents - i.paidCents) {
-      chips.push("Balance due is " + cents(i.balanceCents) + ", but total minus paid is " + (i.totalCents - i.paidCents));
+      var refunded = isCents(i.refundedCents) ? i.refundedCents : 0;
+      if (refunded > 0 && i.balanceCents === i.totalCents - (i.paidCents - refunded)) {
+        chips.push("Paid shows " + cents(i.paidCents) + " but ignores " + cents(refunded) + " of refunds: paid should be payments minus refunds (" + cents(i.paidCents - refunded) + ")");
+      } else {
+        chips.push("Balance due is " + cents(i.balanceCents) + ", but invoice total minus paid is " + cents(i.totalCents - i.paidCents));
+      }
     }
     if (i && isCents(i.paidCents) && i.paidCents < 0) { chips.push("Paid is " + cents(i.paidCents) + ": more was refunded than was ever paid"); }
     fill($("pay-chips"), chips);
