@@ -113,7 +113,7 @@ import { recordPendingClashes, type PendingClashResult } from "./board-clash.ts"
 import { DEFAULT_SPECULATE, formatCandidates, integrateSpeculativeRound, MAX_SPECULATE, type CandidateOutcome, type SpeculativeRoundResult } from "./speculative-integration.ts";
 import { TokenRefresher } from "./token-refresh.ts";
 import { buildProofBundle, type ProofBundle } from "./proof-bundle.ts";
-import { meteredExecutor, meteredTransport, RunMeter, type RunCapReached, type RunCaps } from "./run-meter.ts";
+import { meteredExecutor, meteredJev, meteredToolAuthor, meteredTransport, RunMeter, type RunCapReached, type RunCaps } from "./run-meter.ts";
 import { scanRepoSnapshot } from "./scan-repo.ts";
 import { BoardAgent, listRepoFiles, resolveIntentFiles, RunTurnBudget, type AgentStop, type AgentTurnRecord, type BoardSeedItem } from "./board-agent.ts";
 import {
@@ -127,7 +127,7 @@ import {
 } from "./cloud-board-integrator.ts";
 import { BoardOperatorClient, type JoinedWorkspace } from "./board-client.ts";
 import { executorToolAuthor, ToolBench, type ToolAuthor, type ToolGateRecord } from "./board-tools.ts";
-import { readTargetExcerpt, triageContract } from "./contract-triage.ts";
+import { frameAttributionInput, readTargetExcerpt, triageContract } from "./contract-triage.ts";
 import { deriveProtectedPaths, type ProtectedPaths } from "./protected-paths.ts";
 import type { TestInventory } from "@switchyard-change/verification";
 import { redactSecrets } from "./redact.ts";
@@ -450,6 +450,8 @@ export interface RunBoardOptions {
    */
   readonly jev?: AskJev;
   readonly jevThreshold?: number;
+  /** The decision model's id, so its metered calls can be priced (`--price`); unset: counted unpriced, unlabelled. */
+  readonly jevModel?: string;
   readonly deployAppDir?: string;
   readonly deployAppName?: string;
   readonly deployApp?: DeployApp;
@@ -571,7 +573,14 @@ export interface RunBoardResult {
   /** The speculation the run used (K) and every speculative round's candidates, in order. */
   readonly speculation?: { readonly speculate: number; readonly rounds: readonly (readonly CandidateOutcome[])[] };
   /** Model calls and estimated spend the run's meter counted (unpriced calls are counted, never free). */
-  readonly usage?: { readonly calls: number; readonly spendUsd: number; readonly unpricedCalls: number; readonly capped: readonly RunCapReached[] };
+  readonly usage?: {
+    readonly calls: number;
+    readonly spendUsd: number;
+    readonly unpricedCalls: number;
+    readonly capped: readonly RunCapReached[];
+    /** What the meter warned about (an unpriced model under an active spend cap), once each. */
+    readonly warnings?: readonly string[];
+  };
 }
 
 /** The repo of one agent the integrator reads (no credential: it reads with fresh operator tokens). */
@@ -720,18 +729,18 @@ export async function attributeRevisionFailure(input: {
   if (input.jev && units.length > 1) {
     const ids = units.map((u) => u.unitId);
     const question = "Which item does this failure implicate?";
+    // The gate output and the objectives are untrusted (agent-written code and
+    // planner text): scrubbed, bounded, and delimited as data, never instructions.
+    const framed = frameAttributionInput(input.output, input.items, { changeId: input.changeId });
     try {
-      const answers = await input.jev(
-        [`Change: ${input.changeId}`, `Items in the failing revision: ${ids.join(", ")}`, "Failing gate evidence:", input.output.slice(0, 2000)].join("\n"),
-        {
-          attribution: {
-            type: "choice",
-            instructions: question,
-            criteria: ids,
-            descriptions: Object.fromEntries(input.items.map((i) => [i.id, i.objective.slice(0, 200)])),
-          },
+      const answers = await input.jev(framed.state, {
+        attribution: {
+          type: "choice",
+          instructions: question,
+          criteria: ids,
+          descriptions: framed.descriptions,
         },
-      );
+      });
       const answer = answers["attribution"];
       const confident =
         answer !== undefined &&
@@ -1573,6 +1582,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   const meter = new RunMeter(options.caps ?? {}, options.capsClock ?? Date.now);
   const executor = meteredExecutor(options.executor ?? new ScopedNoopExecutor(), meter);
   const transport = meteredTransport(options.transport, meter);
+  // Typed decisions are model calls too: every ask (the integrator's
+  // attribution, speculative candidates' included, the contract triage, the
+  // fix-confidence check) is counted, and refused past a run cap (advisory:
+  // the refusal is recorded as a decision error, the mechanical result stands).
+  const jev = options.jev ? meteredJev(options.jev, meter, options.jevModel) : undefined;
   const workRoot = options.workRoot ?? (await mkdtemp(join(tmpdir(), "scf-board-")));
   await mkdir(workRoot, { recursive: true });
   const worktreeRoot = join(workRoot, "worktrees");
@@ -1677,7 +1691,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       identity,
       // With a decision model, the Workflow holds each failing revision for
       // this run's advisory attribution (the parse alone otherwise).
-      attribution: options.jev ? "driver" : "engine",
+      attribution: jev ? "driver" : "engine",
     });
   }
   // Plan BEFORE the goal is posted: the fix budget the goal records, and the
@@ -1946,7 +1960,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     ...(options.toolSyntaxCommand ? { syntaxCommand: options.toolSyntaxCommand } : {}),
     onGate: (gate) => emit({ kind: "tool-gated", gate }),
   });
-  const toolAuthor = options.toolAuthor ?? executorToolAuthor(executor);
+  // A separate tool author's model calls are metered (and refused past a run
+  // cap); the default author edits through the already metered executor.
+  const toolAuthor = options.toolAuthor ? meteredToolAuthor(options.toolAuthor, meter) : executorToolAuthor(executor);
   const makeAgent = (id: string, role: "worker" | "lead") =>
     new BoardAgent({
       id,
@@ -2020,7 +2036,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         ...(options.cloudSettleTimeoutMs !== undefined ? { settleTimeoutMs: options.cloudSettleTimeoutMs } : {}),
         onRevision: (revision) => emit({ kind: "integrated", revision }),
         onFailure: (reason) => emit({ kind: "integration-not-recorded", reason }),
-        ...(options.jev
+        ...(jev
           ? {
               attribute: async (request) => {
                 const decisions: BoardDecisionRecord[] = [];
@@ -2028,7 +2044,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
                   items: request.items,
                   output: request.output,
                   changeId,
-                  jev: options.jev!,
+                  jev: jev!,
                   ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
                   onDecision: async (decision) => void decisions.push(decision),
                 });
@@ -2052,7 +2068,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     contract: guarded,
     ...(inventory ? { testInventory: inventory } : {}),
     onSettled: revokeReadTokens,
-    ...(options.jev ? { jev: options.jev } : {}),
+    ...(jev ? { jev } : {}),
     ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
     scrub,
     recordDecision,
@@ -2081,7 +2097,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   // decision model is configured), recorded on the board linked to the
   // contract; the escalation then shows its recommendation. It never decides.
   const triageContractFor = async (contractId: string): Promise<string | undefined> => {
-    if (!options.jev) {
+    if (!jev) {
       return undefined;
     }
     const page = await operator.log().catch(() => undefined);
@@ -2093,7 +2109,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     const item = contract.item !== undefined ? page.state.items[contract.item] : undefined;
     const failure = page.state.lastFailure;
     const decision = await triageContract({
-      ask: options.jev,
+      ask: jev,
       ...(options.jevThreshold !== undefined ? { threshold: options.jevThreshold } : {}),
       scrub,
       input: {
@@ -2132,7 +2148,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   // turn (pendingContracts[].triage). It never decides.
   const seamTriaged = new Set<string>();
   const triageSeamContracts = async (): Promise<void> => {
-    if (!options.jev) {
+    if (!jev) {
       return;
     }
     const state = (await operator.page(0, 1)).state;
@@ -2625,10 +2641,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
 
     // An ADVISORY fix-confidence decision on the final passing revision:
     // recorded only, it never gates promotion or the deploy.
-    if (verdict === "verified" && last && options.jev) {
+    if (verdict === "verified" && last && jev) {
       const question = "Is this fix acceptable?";
       try {
-        const answers = await options.jev(
+        const answers = await jev(
           [`Change: ${changeId}`, `Objective: ${objective}`, `Mechanical gate verdict (authoritative): ${verdict}`, `Integrated items: ${incompleteItems.length === 0 ? "all" : `all but ${incompleteItems.join(", ")}`}`].join("\n"),
           { "fix-confidence": { type: "noul", instructions: question } },
         );
@@ -2757,7 +2773,13 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     workRoot,
     cleanedUp,
     toolGates: [...toolBench.gates],
-    usage: { calls: meter.calls, spendUsd: Math.round(meter.spendUsd * 1e6) / 1e6, unpricedCalls: meter.unpricedCalls, capped: [...capsReached] },
+    usage: {
+      calls: meter.calls,
+      spendUsd: Math.round(meter.spendUsd * 1e6) / 1e6,
+      unpricedCalls: meter.unpricedCalls,
+      capped: [...capsReached],
+      ...(meter.warnings.length > 0 ? { warnings: [...meter.warnings] } : {}),
+    },
     ...(speculate > 1 ? { speculation: { speculate, rounds: integrator instanceof ContinuousBoardIntegrator ? [...integrator.rounds] : [] } } : {}),
     editModels: workers.flatMap((w) => w.editModels.map((e) => ({ agent: w.id, ...e }))),
     budgets: { items: planned.items.length, scopeFiles, ...effective, caps: capsLine },
@@ -3380,6 +3402,7 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
       ? [
           `  usage: ${result.usage.calls} model call(s), ${result.usage.spendUsd.toFixed(4)} USD estimated${result.usage.unpricedCalls > 0 ? ` (+${result.usage.unpricedCalls} unpriced call(s))` : ""}` +
             (result.usage.capped.length > 0 ? `; caps reached: ${result.usage.capped.map((c) => `${c.kind}${c.item ? ` (${c.item})` : ""} ${c.used} of ${c.limit}`).join(", ")}` : ""),
+          ...(result.usage.warnings ?? []).map((w) => `  meter warning: ${w}`),
         ]
       : []),
     ...(result.gateLabel !== undefined ? [`  gate: ${result.gateLabel}`] : []),

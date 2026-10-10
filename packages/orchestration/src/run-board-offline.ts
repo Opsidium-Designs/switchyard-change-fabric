@@ -148,6 +148,8 @@ export interface RunBoardOfflineOptions {
   /** A typed-decision caller (advisory; see RunBoardOptions.jev). Offline runs pass a fake. */
   readonly jev?: RunBoardOptions["jev"];
   readonly jevThreshold?: number;
+  /** The decision model's id for the meter (see RunBoardOptions.jevModel). */
+  readonly jevModel?: string;
   /** The human's decision on contract changes to the original tests (see RunBoardOptions.resolveContract). */
   readonly resolveContract?: RunBoardOptions["resolveContract"];
   readonly workRoot?: string;
@@ -233,6 +235,7 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       ...(options.resolveContract ? { resolveContract: options.resolveContract } : {}),
       ...(options.jev ? { jev: options.jev } : {}),
       ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
+      ...(options.jevModel !== undefined ? { jevModel: options.jevModel } : {}),
       toolAuthor: options.toolAuthor ?? templateToolAuthor,
       ...(options.toolTimeoutMs !== undefined ? { toolTimeoutMs: options.toolTimeoutMs } : {}),
       ...(options.toolAuthor === undefined ? { toolAuthorLabel: OFFLINE_TOOL_AUTHOR_LABEL } : {}),

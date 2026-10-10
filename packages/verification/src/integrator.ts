@@ -37,6 +37,12 @@ import {
   type GitIdentity,
 } from "./git.ts";
 import { matchesAny } from "./pathscope.ts";
+import {
+  readDependencySnapshot,
+  readDependencySnapshotFromDir,
+  runnerPackagesFromJsonKeys,
+  runnerResolutionViolations,
+} from "./runner-resolution.ts";
 import { inventoryShortfall, readStreamInventory, readTestProgress, type TestInventory } from "./test-inventory.ts";
 import type { CheckResult, IntegrationResult, OutputRef, PromotionPush, Verdict } from "./types.ts";
 
@@ -243,7 +249,17 @@ export class Integrator {
           appliedReleased,
         )),
       ];
-      const failOnProtected = (options.onProtectedChange ?? "fail") === "fail" && protectedViolations.length > 0;
+      // The gate's own toolchain: what its runner packages resolve to. A key
+      // list cannot catch everything (a nested lockfile entry that shadows a
+      // runner dependency, a new package claiming a runner's bin), so the
+      // applied tree's manifest and lockfiles are compared with the baseline
+      // (HEAD is still the baseline here: nothing is committed yet). Such a
+      // change cannot be restored key by key, so it always fails the
+      // revision, whatever `onProtectedChange` says.
+      const runnerViolations = await runnerResolutionCheck(integrationDir, options.protectedJsonKeys ?? []);
+      protectedViolations.push(...runnerViolations);
+      const failOnProtected =
+        ((options.onProtectedChange ?? "fail") === "fail" && protectedViolations.length > 0) || runnerViolations.length > 0;
 
       let committed = false;
       // Commit the combined result when the integration workspace changed. The
@@ -345,9 +361,13 @@ export class Integrator {
               passed: false,
               skipped: false,
               summary:
-                `integration refused: the verified units changed protected path(s) that define the gate ` +
-                `(${protectedViolations.join(", ")}); they were restored from the baseline for the gate run ` +
-                `and the revision fails. Gate on the restored tree: ${gateCheck.summary}`,
+                runnerViolations.length === 0
+                  ? `integration refused: the verified units changed protected path(s) that define the gate ` +
+                    `(${protectedViolations.join(", ")}); they were restored from the baseline for the gate run ` +
+                    `and the revision fails. Gate on the restored tree: ${gateCheck.summary}`
+                  : `integration refused: the verified units changed protected path(s) that define the gate ` +
+                    `(${protectedViolations.join(", ")}); a change to the gate's runner resolution cannot be restored ` +
+                    `key by key, so the revision fails whatever the gate said. Gate: ${gateCheck.summary}`,
               outputs: [
                 { stream: "summary", text: `protected paths changed: ${protectedViolations.join(", ")}` },
                 ...gateCheck.outputs,
@@ -942,6 +962,30 @@ async function restoreProtected(
     await git(dir, ["add", "-A"]);
   }
   return touched;
+}
+
+/**
+ * The runner-resolution violations of the applied tree in `dir` against its
+ * HEAD (the baseline, before the integration commit), for the runner packages
+ * the protected manifest keys name. Empty when the gate runs no packages.
+ * Blobs are read raw (`cat-file blob`, no textconv); git's default output
+ * buffer (64 MiB) holds a large lockfile.
+ */
+async function runnerResolutionCheck(
+  dir: string,
+  jsonKeys: readonly { readonly file: string; readonly keys: readonly (readonly string[])[] }[],
+): Promise<string[]> {
+  const runnerPackages = runnerPackagesFromJsonKeys(jsonKeys);
+  if (runnerPackages.length === 0) {
+    return [];
+  }
+  const baseline = await readDependencySnapshot((name) =>
+    git(dir, ["cat-file", "blob", `HEAD:${name}`]).then(
+      (text): string | undefined => text,
+      () => undefined,
+    ),
+  );
+  return runnerResolutionViolations(baseline, await readDependencySnapshotFromDir(dir), runnerPackages);
 }
 
 /**

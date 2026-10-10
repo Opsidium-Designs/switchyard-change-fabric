@@ -84,7 +84,7 @@ Who sent a message is established by the route, never by the message body.
 | `POST /changes/:id/board/human` | bearer | A human message. |
 | `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected or seam `contract` (kept on the contract as `triage` for whoever decides it). It changes only the decision counts and that advisory line, never arbitration or the verdict. |
 | `POST /changes/:id/board/record` | bearer | `{type, payload}`: an engine fact only the operator side observes, validated against the board before it is appended (`appendEngineRecord`): `claim.lapsed {item}` (a leased claim recorded `stalled` on a quiet board), `clash.predicted`, `trunk.moved`, `token.refreshed`, `revision.promoted`, `run.capped`. See "Stalls, re-plans, clashes, proofs, and caps". |
-| `POST /changes/:id/board/agent-token` | bearer | `{agent, ttlSeconds?, help?}` (60 to 3600): a REFRESHED, short-lived WRITE token for a joined agent's own repo (with `help`, the granted helper's fork), for runs longer than one token lifetime. `201 {workspaceName, tokenId, token, tokenExpiresAt}`, returned once; the old token is revoked through the read-token revoke route. Same checks as the read-token route. |
+| `POST /changes/:id/board/agent-token` | bearer | `{agent, ttlSeconds?, help?}` (60 to 3600): a REFRESHED, short-lived WRITE token for a joined agent's own repo (with `help`, the granted helper's fork), for runs longer than one token lifetime. `201 {workspaceName, tokenId, token, tokenExpiresAt}`, returned once; the old token is revoked through the read-token revoke route. Same checks as the read-token route. With `help`, a write token also requires the helper still joined (a read token does not). |
 | `POST /changes/:id/board/seam-stalled` | bearer | `{item}`: the board went quiet while this seam item held dependents; the engine appends `seam.stalled {item, released}` (the hold ends; with no push of its owner's the item is released). Refused unless the item holds a dependent. |
 | `POST /changes/:id/integration/revision` | bearer | An integration result `{commit, gate, merged, failing?}`; appends `integrated.rev` and what it triggers (completions and `rebase.needed` on a pass, `fix.requested` / `fix.exhausted` on a fail). |
 | `POST /changes/:id/tools/gate` | bearer | A tool's own gate result on the latest build of its item, `{capability, commit, passed, checks: [{check, passed, detail}], repo, usage, output?}`; the engine appends `tool.gated` (addressed to the builder) and, on a pass, `tool.published` (the next version) and the tool item's `item.completed {via: tool}`. See "Agent-built tools". |
@@ -148,7 +148,7 @@ joinsGate?: false}` (engine, derived), `tool.used {capability, version, by, item
 (engine, recorded), `claim.lapsed {item, agent, reason: no-progress | deadline | stalled, lastProgressSeq, deadlineSeq?, commit?}`
 (engine: derived under the lease rules, or recorded `stalled` on a quiet board), `claim.extended {item, reason}` (the lead or a human),
 `claim.overlap {item, agent, with, withAgent, files}` (engine, derived under the overlap rule, advisory),
-`item.replanned {item, reason: fix-budget-exhausted | stalled, action: split | rescope | merge, children, with?, rev?}` (the lead or a human),
+`item.replanned {item, reason: fix-budget-exhausted | stalled | item-cap, action: split | rescope | merge, children, with?, rev?}` (the lead or a human),
 `item.escalated {item, reason: replan-failed, replanOf}` (engine, derived), `clash.predicted {a, b, status: conflict | unknown | unavailable,
 paths?, scope?, reason?}` (engine, recorded, advisory), `trunk.moved {rev, commit, expected?, actual?}` (engine, recorded),
 `token.refreshed {agent, kind: repo-write | help-fork, request?}` (engine, recorded; never a token),
@@ -215,7 +215,8 @@ need no acceptance from the lead.
    name the protected path that the latest failing revision implicating the
    item names as its failing check (the CONTRACT CUE: a test that pins the
    behavior the goal changes); the owner's digest says so
-   (`claims[].contractCue`), and once a human accepts it the released path is
+   (`claims[].contractCue`, whose hint names the action to send: `message`
+   kind `contract {target, change: modify, itemId}`), and once a human accepts it the released path is
    writable for that item even outside its scope (its pushes may carry it and
    its integration unit applies it). New test files are never protected.
    TWO CLASSES: the IMMUTABLE acceptance gate (`goal.posted.immutable`: the
@@ -503,9 +504,10 @@ is distributed changes: items are proposed and claimed, never assigned.
   TS2339: ...` mismatch) is located in a frozen seam, or in a file of the
   implicated item that imports one (narrowed to the seam that exports the
   type the error names, such as `'Ctx'`), the owner's digest carries
-  `claims[].seamCue {seams, errors, hint}`: propose `contract.proposed
-  {target: the seam, kind, item, description: the exact change}` instead of
-  using undeclared fields or casts. Only the owner of the implicated item
+  `claims[].seamCue {seams, errors, hint}`: send `message` kind `contract
+  {target: the seam, change: modify, itemId, description: the exact change}`
+  (the agent action that becomes `contract.proposed`) instead of using
+  undeclared fields or casts. Only the owner of the implicated item
   proposes it, one pending per seam; a seam another item owns is refused
   (ask its owner). Bounded: one seam contract waiting per agent, three per
   Change, and one seam change per failing cause (a second one from the same
@@ -708,19 +710,22 @@ is distributed changes: items are proposed and claimed, never assigned.
   `optionalDependencies`, and `peerDependencies`, and the whole `overrides`,
   `resolutions`, and `pnpm` sections. In an npm lockfile the runner packages'
   entries and their transitive dependencies' entries (version, resolved,
-  integrity, link) are protected key by key, and the integrator can check the
-  gated tree against the baseline (`assertRunnerResolutionUnchanged` in
-  `packages/verification/src/runner-resolution.ts`: a changed or added closure
-  entry, a `file:`/link resolution, or a new package claiming a runner's bin is
-  refused); a pnpm or yarn lockfile, or an npm lockfile whose runner closure
-  is too large to list (over 400 entries), is protected whole. A dependency
-  change that moves a runner dependency's lockfile entry (a re-hoist) is
-  refused like any protected change. Other dependencies and
-  lockfile entries stay editable. That integration-time check is exported but
-  not yet called by the integrator: until it is, the claim-time keys (restored
-  and refused at integration) are the enforcement, and an entry the gated tree
-  ADDS inside the closure, or a new package claiming a runner bin, is not
-  caught. `tsconfig*.json` is
+  integrity, link) are protected key by key, and the integrator checks every
+  gated tree against the baseline before the gate runs
+  (`runnerResolutionViolations` in
+  `packages/verification/src/runner-resolution.ts`, called from the
+  integrator with the runner packages the protected manifest keys name: a
+  changed or added closure entry, such as a nested copy that would shadow a
+  runner dependency, a `file:`/link resolution, or a new package claiming a
+  runner's bin is refused as a protected violation). Such a change cannot be
+  restored key by key, so it fails the revision even where a protected change
+  would otherwise only be restored; the same integrator gates every
+  speculative candidate, so no candidate lands with a swapped runner either. A
+  pnpm or yarn lockfile, or an npm lockfile whose runner closure is too large
+  to list (over 400 entries), is protected whole. A dependency change that
+  moves a runner dependency's lockfile entry (a re-hoist) is refused like any
+  protected change. Other dependencies and lockfile entries stay editable.
+  `tsconfig*.json` is
   protected when the gate runs the type checker (`tsc`, `npx tsc`,
   `./node_modules/.bin/tsc`). Root runner configs (`pytest.ini`, `tox.ini`, `setup.cfg`,
   `pyproject.toml`, `conftest.py`, `noxfile.py`) are protected even when
@@ -1019,6 +1024,13 @@ switchyard-change run-board "<goal>" --project <dir> --worker <url> [--min N] [-
   [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] \
   [--speculate K] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [--allow-heuristic-planner]
 ```
+
+Flags are `--flag value` (two arguments): an inline `--flag=value` and a known
+flag with no value are refused with a clear error. The dial is integers
+`1 <= --min <= --max <= 16` (without `--max` the default 3 is raised to
+`--min`); `--token-ttl` is an integer from 60 to 3600 seconds; every numeric
+flag must be a plain decimal number (never coerced: `NaN`, `Infinity`, `1e3`,
+and `0x10` are refused).
 
 `--speculate K` (1 to 8; default 3 with the local integrator) sets speculative
 batch gating (see "Speculative batch gating" below); `--speculate 1` integrates
@@ -1414,12 +1426,18 @@ refused at startup (see "Speculative batch gating"):
   `planBoardIntegration`, exactly as the local integrator does (pins, includes,
   diff bases, write-intent scope, yielded files, released contract paths, the
   last recorded passing revision as the base). The job's idempotency key is the
-  Change, the base commit, and the pinned commits (`integrationJobKey`): every
-  later step is named by it, and a Workflow retry never integrates anything
-  else.
+  Change, the base commit, the pinned commits, every gate-defining field (the
+  integration repo and branch, the gate command, whether a gate is required,
+  the protected paths and JSON keys, the baseline inventory, the accepted
+  contracts, the gate support files, the timeouts, the identity), and the
+  configuration's time as a run nonce (`integrationJobKey`): every later step
+  is named by it, a Workflow retry never integrates anything else, and a
+  re-created Change never replays a prior run's outcome (it also clears the
+  GateRunner's bounded outcome cache).
 - **Run.** The run step mints short-lived Artifact tokens Worker-side (a READ
   token per agent repo, a WRITE token for the integration repo, TTL just over
-  the job's deadline), runs the job in the GateRunner's container, and revokes
+  the job's deadline; a configuration whose deadline would exceed the one-hour
+  token lifetime minus a 2-minute margin is refused when posted), runs the job in the GateRunner's container, and revokes
   the tokens in the same step. The step's timeout is the job's deadline
   (install + gate + 5 minutes) plus 2 minutes. A job that cannot run (the
   container, the tokens) is retried twice by the Workflow, then recorded as
@@ -1461,7 +1479,9 @@ refused at startup (see "Speculative batch gating"):
   set); a failing revision carries its bounded, credential-scrubbed output.
   Recording is idempotent by the job key (a replayed step returns the stored
   record and never appends a second revision).
-- **Advance.** After a recorded pass, a second, git-only job fast-forwards the
+- **Advance.** After a recorded GATED pass (never an ungated one), keyed by
+  the integration repo, the base, the commit, and the revision
+  (`advanceJobKey`), a second, git-only job fast-forwards the
   integration branch to the gated commit and prunes the candidate refs
   (`advanceIntegrationBranch`), so promotion clones a branch whose head is the
   gated tree. A branch another writer moved meanwhile is a named refusal in
@@ -1541,11 +1561,14 @@ with the attempt.
   store); `unavailable`, never clean, on a git older than 2.38. Advisory
   input only: the gate on the integrated tree stays authoritative.
 
-Posture: the integration routes sit behind the same optional
-`SWITCHYARD_API_TOKEN` bearer as every other mutating route. With the bearer
-unset (local `wrangler dev` on localhost) anyone who can reach the Worker can
-create a Change and configure its integration before its goal; set the token
-before exposing the Worker on a LAN (`make dev-all-lan`) or deploying it.
+Posture: the integration routes sit behind the same `SWITCHYARD_API_TOKEN`
+bearer as every other mutating route. The Worker is fail-closed: with the
+token unset, mutating routes are refused unless
+`SWITCHYARD_ALLOW_UNAUTHENTICATED=1` opts in (the local dev targets pass it to
+`wrangler dev`); with that opt-in on localhost anyone who can reach the Worker
+can create a Change and configure its integration before its goal. Set the
+token before exposing the Worker on a LAN (`make dev-all-lan`) or deploying
+it.
 
 Glob note: `**` matches whole path segments in both matchers (the path scope
 and intent overlap): `src/**/x` matches `src/x`, `src/a/x`, and `src/a/b/x`,
@@ -1620,8 +1643,11 @@ human, the lead, the gate, or another item is left alone.
 
 ### Re-plan instead of giving up (`item.replanned`, `item.escalated`)
 
-When an item spends its fix budget (it is reopened with `exhaustedBy`) or is
-released for not moving twice, the lead gets one bounded re-plan turn on it
+When an item spends its fix budget (it is reopened with `exhaustedBy`), is
+released for not moving twice, or reaches its per-item model-call cap (a
+recorded `run.capped {kind: item-calls, item}`; reason `item-cap`, open or
+still held, since no agent can make another call on it), the lead gets one
+bounded re-plan turn on it
 (`digest.replan`, with the failing files and test lines of its latest failing
 revision `rev`), once per situation (a new exhaustion or stall gives one more).
 It may `split` it (two or more children), `rescope` it (one replacement with a
@@ -1696,7 +1722,9 @@ Agents push with repo-scoped write tokens that expire. Before one expires
 clock), the driver mints a fresh token for the same agent and repo (the
 agent-token route; a helper's fork with `help`), swaps it into every later git
 call, records `token.refreshed {agent, kind}` (never the token), and revokes
-the old one on its next tick (a grace period for a git call in flight). So
+the old one only after a grace period (60 s by default) so a git call in
+flight is not cut off; the margin is clamped to at most half the token
+lifetime. So
 `--timeout-ms` may exceed `--token-ttl`; `--no-token-refresh` restores the
 refusal. Board agent tokens (`x-board-agent-token`) carry no expiry and are not
 rotated. The cloud integration repo's token is not refreshed in this slice:
@@ -1730,20 +1758,25 @@ renders it from the log alone, so a recorded run shows it too.
 The driver meters the model calls it routes through the meter: agent turns,
 executor edits (every paid attempt: a transient retry counts, and an edit that
 fails, for example on an unusable reply, counts the calls it made, at least
-one), and the planner. Wrappers for tool authoring (`meteredToolAuthor`, for a
-live region-filling author) and typed decisions (`meteredJev`) exist in
-`run-meter.ts` but are not yet wired into `run-board`, so those calls are not
-counted yet (the default tool author goes through the metered executor and is
-counted). Spend is estimated as tokens times the configured price per model
+one), the planner, a separate tool author (`meteredToolAuthor`, the live
+region-filling author; the default author goes through the metered executor),
+and the run's typed decisions (`meteredJev`: attribution, speculative
+candidates' included, contract triage, and the fix-confidence check; past a
+run cap a decision call is refused and recorded as a decision error, the
+mechanical result stands). The planner's own plan-review decision (asked
+inside the seed, before the meter exists) is not metered. Spend is estimated as tokens times the configured price per model
 (`--price <model>=<in>/<out>` USD per million tokens; `parsePrice` accepts
 only finite, non-negative amounts and one price per model) when usage is
 reported, else the executor's own estimate; a call with neither is counted
 UNPRICED, never free, and non-finite usage or prices are never added. A spend
 cap does not bound unpriced calls: under an active `--max-spend-usd` each
 unpriced model is recorded as a meter warning and the summary says the cap
-does not bound them, and `validateSpendCap` returns the configured models with
-no price so a caller can refuse the cap unless every model is priced (the CLI
-does not call it yet). Caps: `--max-calls` (default 10 per run turn), `--max-spend-usd`
+does not bound them. The CLI refuses `--max-spend-usd` unless every model the
+run calls has a `--price` (`validateSpendCap` over the agent turn model, the
+executor's base and escalation models, the planner's, the tool filler's, and
+the decision model's). The planner call and the decision calls report no
+token usage, so even priced they are counted unpriced and show as meter
+warnings: the cap cannot bound them. Caps: `--max-calls` (default 10 per run turn), `--max-spend-usd`
 (none unless set), `--max-wall-ms` (default twice the agent-phase timeout),
 and `--max-item-calls` (default 8 per item turn, across agents). Reaching a
 run cap records `run.capped {kind, limit, used}` once, stops new turns (the
@@ -1756,7 +1789,9 @@ their cap, with nothing else to act on, skips its turn without calling the
 model, and the agent whose own call took an item to its cap releases it
 through the item-budget path (a handoff to a running worker, else a help
 request; the agent then stops, as for a spent per-item turn budget). Another
-holder of a capped item only skips it. The board does not make a capped item
-eligible for a re-plan by itself; with claim leases on, a held capped item
-lapses like any stalled claim. The budgets line prints the caps; the summary prints
-the usage.
+holder of a capped item only skips it. A capped item is eligible for the
+lead's re-plan (reason `item-cap`, open or still held): its replacement
+children are new items with their own call counts. A replacement that reaches
+its own cap is not escalated to a human by that alone (escalation still
+follows a spent fix budget or two stalls). The budgets line prints the caps;
+the summary prints the usage and every meter warning.

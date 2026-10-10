@@ -495,7 +495,7 @@ export interface BoardPayloads {
    */
   "item.replanned": {
     readonly item: string;
-    readonly reason: "fix-budget-exhausted" | "stalled";
+    readonly reason: BoardReplanReason;
     readonly action: "split" | "rescope" | "merge";
     readonly children: readonly BoardChildItem[];
     readonly with?: string;
@@ -1131,7 +1131,7 @@ export interface BoardItem {
   /** The latest failing revision that asked for a fix on this item (or spent its budget): its failure attribution. */
   failedRev?: number;
   /** The lead's re-plan of this item (it is carried by its replacement children), or its merge into one. */
-  replanned?: { readonly seq: number; readonly by: string; readonly action: "split" | "rescope" | "merge"; readonly reason: "fix-budget-exhausted" | "stalled"; readonly into?: string };
+  replanned?: { readonly seq: number; readonly by: string; readonly action: "split" | "rescope" | "merge"; readonly reason: BoardReplanReason; readonly into?: string };
   /** A re-plan's replacement child: the item it re-plans (a second failure escalates, never re-plans again). */
   readonly replanOf?: string;
   /** A merge's replacement child: every item it replaces (each completes with it). */
@@ -1949,7 +1949,7 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
       const rev = raw.rev === undefined ? undefined : positiveInt(raw, "rev");
       return {
         item: id(raw, "item"),
-        reason: oneOf(raw, "reason", ["fix-budget-exhausted", "stalled"] as const),
+        reason: oneOf(raw, "reason", BOARD_REPLAN_REASONS),
         action: oneOf(raw, "action", ["split", "rescope", "merge"] as const),
         children: children(raw),
         ...(withItem !== undefined ? { with: withItem } : {}),
@@ -2999,22 +2999,36 @@ export function describeWaitReason(reason: BoardWaitReason): string {
   }
 }
 
+/** Why an item is re-planned (see replanEligible). */
+export const BOARD_REPLAN_REASONS = ["fix-budget-exhausted", "stalled", "item-cap"] as const;
+export type BoardReplanReason = (typeof BOARD_REPLAN_REASONS)[number];
+
 /**
- * Why the lead may RE-PLAN an item now (`item.replanned`), or undefined: an
- * open change item (not a tool or seam item, not itself a re-plan's child)
- * whose fix budget was spent by some agent, or that was released for not
- * moving `stallReleasesBeforeReplan` times. Once re-planned it is split (its
- * children carry it), so it is re-planned at most once. Pure.
+ * Why the lead may RE-PLAN an item now (`item.replanned`), or undefined: a
+ * change item (not a tool or seam item, not itself a re-plan's child) that is
+ * open and whose fix budget was spent by some agent, or that was released for
+ * not moving `stallReleasesBeforeReplan` times; or one, open or still held,
+ * whose per-item model-call cap was reached (a recorded `run.capped` of kind
+ * item-calls: no agent can make another call on it, so only a re-plan into
+ * new items moves it). Once re-planned it is split (its children carry it),
+ * so it is re-planned at most once. The reasons are checked in that order, so
+ * a recorded log keeps the reason it had. Pure.
  */
-export function replanEligible(state: BoardState, itemId: string): "fix-budget-exhausted" | "stalled" | undefined {
+export function replanEligible(state: BoardState, itemId: string): BoardReplanReason | undefined {
   const item = state.items[itemId];
-  if (!item || item.status !== "open" || item.tool !== undefined || item.fromContract !== undefined || item.replanOf !== undefined) {
+  if (!item || item.tool !== undefined || item.fromContract !== undefined || item.replanOf !== undefined) {
     return undefined;
   }
-  if ((item.exhaustedBy ?? []).length > 0) {
-    return "fix-budget-exhausted";
+  if (item.status === "open") {
+    if ((item.exhaustedBy ?? []).length > 0) {
+      return "fix-budget-exhausted";
+    }
+    if ((item.stallReleases ?? 0) >= BOARD_LIMITS.stallReleasesBeforeReplan) {
+      return "stalled";
+    }
   }
-  return (item.stallReleases ?? 0) >= BOARD_LIMITS.stallReleasesBeforeReplan ? "stalled" : undefined;
+  const capped = (state.capped ?? []).some((c) => c.kind === "item-calls" && c.item === item.id);
+  return capped && (item.status === "open" || item.status === "claimed") ? "item-cap" : undefined;
 }
 
 /** True when a re-plan's child failed again (fix budget spent, or stalled twice) and is not escalated yet. */
@@ -3501,7 +3515,11 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       const eligible = replanEligible(state, item.id);
       if (eligible === undefined) {
-        fail("INVALID_STATE", `item ${item.id} is ${item.status}: only an open item whose fix budget was spent, or that was released for not moving ${BOARD_LIMITS.stallReleasesBeforeReplan} times, is re-planned`);
+        fail(
+          "INVALID_STATE",
+          `item ${item.id} is ${item.status}: only an open item whose fix budget was spent, or that was released for not moving ${BOARD_LIMITS.stallReleasesBeforeReplan} times, ` +
+            "or an open or held item that reached its per-item call cap, is re-planned",
+        );
       }
       if (p.reason !== eligible) {
         fail("LOG_MISMATCH", `item ${item.id} is re-planned for ${eligible}, not ${p.reason}`);
@@ -6291,7 +6309,7 @@ export interface BoardDigest {
    */
   readonly replan?: readonly {
     readonly item: string;
-    readonly reason: "fix-budget-exhausted" | "stalled";
+    readonly reason: BoardReplanReason;
     readonly rev?: number;
     readonly objective: string;
     readonly scopeHint: readonly string[];
@@ -6532,7 +6550,7 @@ export function boardDigest(
           ? {
               contractCue: {
                 paths,
-                hint: `the failing check is in the protected test ${paths.join(", ")}; if it encodes the old behavior the goal changes, propose contract.proposed {target: ${paths[0]}, kind: modify, item: ${i.id}} (a human decides)`,
+                hint: `the failing check is in the protected test ${paths.join(", ")}; if it encodes the old behavior the goal changes, send message kind contract {target: ${paths[0]}, change: modify, itemId: ${i.id}} (a human decides)`,
               },
             }
           : {};
@@ -6546,7 +6564,7 @@ export function boardDigest(
                 errors: [...cue.errors],
                 hint:
                   `the failing type error involves the shared seam ${cue.seams.join(", ")}, which no item owns: do not use undeclared fields or casts; ` +
-                  `propose contract.proposed {target: ${cue.seams[0]}, kind: modify, item: ${i.id}, description: the exact change you need} (the lead decides; accepted, it becomes a seam item that goes first, then you rebase onto it)`,
+                  `send message kind contract {target: ${cue.seams[0]}, change: modify, itemId: ${i.id}, description: the exact change you need} (the lead decides; accepted, it becomes a seam item that goes first, then you rebase onto it)`,
               },
             }
           : {};

@@ -194,10 +194,13 @@ evidence). Edges are exactly four kinds:
 
 ## Security
 
-- The Worker optionally requires `authorization: Bearer <SWITCHYARD_API_TOKEN>`
+- The Worker requires `authorization: Bearer <SWITCHYARD_API_TOKEN>`
   on every mutating route (including those that return Artifact write tokens);
   read-only GETs stay open. Set it as a Worker secret (`wrangler secret put`, or
   `apps/worker/.dev.vars` locally) and the same value in the root `.env`.
+- With no token set it refuses every mutation unless
+  `SWITCHYARD_ALLOW_UNAUTHENTICATED=1` opts in; the local dev targets set that
+  opt-in, a deploy never does.
 - The browser never holds that token: console mutations go through the dev
   launcher's `/api/worker` proxy, which adds the bearer server-side.
 - CLI errors and run logs redact credentials (URL userinfo, Artifact tokens).

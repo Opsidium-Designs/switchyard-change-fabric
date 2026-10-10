@@ -21,6 +21,7 @@ import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-wo
 import type { WorkspaceRef } from "@switchyard-change/artifact-workspace";
 
 import { advanceIntegrationBranch, Integrator, recordBaselineInventory, type VerifiedWorkspace } from "../src/integrator.ts";
+import { readDependencySnapshotFromDir, runnerResolutionContract } from "../src/runner-resolution.ts";
 import { FakeCommandRunner, installRecordingGit } from "./helpers.ts";
 
 const run = promisify(execFile);
@@ -579,5 +580,98 @@ describe("Integrator", () => {
     await trackedAt(ref.gitUrl, check);
     expect((await run("git", ["-C", check, "rev-parse", "HEAD"])).stdout.trim()).toBe(baseline); // nothing pushed
   });
-});
 
+  describe("the gate's runner resolution (real local git)", () => {
+    const RUNNER_PACKAGES = {
+      "": { name: "app", devDependencies: { vitest: "2.1.8", "left-pad": "1.3.0" } },
+      "node_modules/vitest": {
+        version: "2.1.8",
+        resolved: "https://registry.npmjs.org/vitest/-/vitest-2.1.8.tgz",
+        integrity: "sha512-vitest",
+        dev: true,
+        dependencies: { vite: "^5.0.0" },
+        bin: { vitest: "vitest.mjs" },
+      },
+      "node_modules/vite": { version: "5.4.0", resolved: "https://registry.npmjs.org/vite/-/vite-5.4.0.tgz", integrity: "sha512-vite", dev: true },
+      "node_modules/left-pad": { version: "1.3.0", resolved: "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz", integrity: "sha512-leftpad", dev: true },
+    };
+    const lockText = (packages: Record<string, unknown>) => JSON.stringify({ name: "app", lockfileVersion: 3, requires: true, packages }, null, 2) + "\n";
+    const manifestText = (devDependencies: Record<string, string>) =>
+      JSON.stringify({ name: "app", scripts: { gate: "vitest run" }, devDependencies }, null, 2) + "\n";
+
+    /** Integrate a unit whose work commit rewrites the lockfile (and optionally the manifest), under the claim-time contract for vitest. */
+    async function integrateLockChange(packages: Record<string, unknown>, devDependencies?: Record<string, string>) {
+      const unitDir = join(root, "unit");
+      await mkdir(join(unitDir, "src"), { recursive: true });
+      await run("git", ["-C", unitDir, "init", "--initial-branch=main"]);
+      await writeFile(join(unitDir, "package.json"), manifestText({ vitest: "2.1.8", "left-pad": "1.3.0" }));
+      await writeFile(join(unitDir, "package-lock.json"), lockText(RUNNER_PACKAGES));
+      await writeFile(join(unitDir, "src", "app.js"), "export const x = 1;\n");
+      const baseline = await commit(unitDir, "baseline");
+      const contract = runnerResolutionContract(await readDependencySnapshotFromDir(unitDir), ["vitest"]);
+      await writeFile(join(unitDir, "package-lock.json"), lockText(packages));
+      if (devDependencies) {
+        await writeFile(join(unitDir, "package.json"), manifestText(devDependencies));
+      }
+      await writeFile(join(unitDir, "src", "app.js"), "export const x = 2;\n");
+      await commit(unitDir, "work");
+      const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+      const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+      const result = await new Integrator(provider, { commandRunner: new FakeCommandRunner([]) }).integrate({
+        integrationRef: ref,
+        integrationToken: token,
+        verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+        excludedUnits: [],
+        integrationGateCommand: ["npm", "run", "gate"],
+        requiresIntegrationGate: true,
+        protectedPaths: [],
+        protectedJsonKeys: contract.jsonKeys,
+        // Even in restore mode: a runner swap cannot be restored key by key.
+        onProtectedChange: "restore",
+        workRoot: root,
+      });
+      const branch = (await run("git", ["-C", fileURLToPath(ref.gitUrl), "rev-parse", "refs/heads/main"])).stdout.trim();
+      return { result, baseline, branch };
+    }
+
+    it("refuses a nested lockfile entry that shadows a runner dependency, even in restore mode, and pushes nothing", async () => {
+      const { result, baseline, branch } = await integrateLockChange({
+        ...RUNNER_PACKAGES,
+        "node_modules/vitest/node_modules/vite": { version: "0.0.1", resolved: "https://example.invalid/vite.tgz", integrity: "sha512-x" },
+      });
+      expect(result.verdict).toBe("failed");
+      expect(result.integratedUnits).toEqual([]);
+      expect(result.protectedViolations).toEqual([expect.stringMatching(/^package-lock\.json#packages\["node_modules\/vitest\/node_modules\/vite"\]: .*absent to version 0\.0\.1/)]);
+      expect(result.finalCheck.summary).toMatch(/runner resolution cannot be restored key by key/);
+      expect(branch).toBe(baseline);
+    });
+
+    it("refuses a new package that declares the vitest bin", async () => {
+      const { result, baseline, branch } = await integrateLockChange(
+        {
+          ...RUNNER_PACKAGES,
+          "": { name: "app", devDependencies: { vitest: "2.1.8", "left-pad": "1.3.0", innocent: "1.0.0" } },
+          "node_modules/innocent": { version: "1.0.0", resolved: "https://example.invalid/innocent.tgz", integrity: "sha512-i", dev: true, bin: { vitest: "shim.js" } },
+        },
+        { vitest: "2.1.8", "left-pad": "1.3.0", innocent: "1.0.0" },
+      );
+      expect(result.verdict).toBe("failed");
+      expect(result.protectedViolations).toEqual([expect.stringMatching(/node_modules\/innocent.*declares the gate's runner bin\(s\) vitest/)]);
+      expect(branch).toBe(baseline);
+    });
+
+    it("lets an unrelated dependency bump through", async () => {
+      const { result, branch } = await integrateLockChange(
+        {
+          ...RUNNER_PACKAGES,
+          "": { name: "app", devDependencies: { vitest: "2.1.8", "left-pad": "1.3.1" } },
+          "node_modules/left-pad": { version: "1.3.1", resolved: "https://registry.npmjs.org/left-pad/-/left-pad-1.3.1.tgz", integrity: "sha512-leftpad2", dev: true },
+        },
+        { vitest: "2.1.8", "left-pad": "1.3.1" },
+      );
+      expect(result.verdict).toBe("verified");
+      expect(result.protectedViolations).toBeUndefined();
+      expect(branch).toBe(result.commit);
+    });
+  });
+});

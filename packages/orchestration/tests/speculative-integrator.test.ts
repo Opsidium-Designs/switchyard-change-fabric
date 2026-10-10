@@ -20,7 +20,7 @@ import { describe, expect, it } from "vitest";
 
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 import type { BoardMessage } from "@switchyard-change/change-core";
-import type { CommandOutcome, CommandRunner } from "@switchyard-change/verification";
+import { readDependencySnapshotFromDir, runnerResolutionContract, type CommandOutcome, type CommandRunner } from "@switchyard-change/verification";
 
 import { BoardAgentClient, BoardOperatorClient } from "../src/board-client.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
@@ -33,7 +33,13 @@ const ID = "change-speculate";
 const BASE = "http://local-control";
 const IDENTITY = { name: "Test Integrator", email: "integrator@test.local" };
 
-async function setup() {
+/** Optional fixture extras: more project files, and extra write scope per item. */
+interface SetupOptions {
+  readonly files?: Readonly<Record<string, string>>;
+  readonly extraWrite?: Readonly<Record<string, readonly string[]>>;
+}
+
+async function setup(setupOptions: SetupOptions = {}) {
   const root = await mkdtemp(join(tmpdir(), "scf-speculate-"));
   const projectDir = join(root, "project");
   for (const [rel, body] of Object.entries({
@@ -42,6 +48,7 @@ async function setup() {
     "src/y/b.ts": "export const b = 0;\n",
     "src/z/c.ts": "export const c = 0;\n",
     "src/w/d.ts": "export const d = 0;\n",
+    ...setupOptions.files,
   })) {
     await mkdir(dirname(join(projectDir, rel)), { recursive: true });
     await writeFile(join(projectDir, rel), body);
@@ -55,7 +62,7 @@ async function setup() {
   const human = async (draft: unknown) => expect((await operator.postAsHuman(draft)).ok).toBe(true);
   await human({ type: "goal.posted", payload: { objective: "o", protected: ["package.json"], baseline: remote, rules: { speculate: 3 } } });
   for (const item of ["w", "x", "y", "z"]) {
-    await human({ type: "item.proposed", payload: { item, objective: `do ${item}`, scopeHint: [`src/${item}/**`] } });
+    await human({ type: "item.proposed", payload: { item, objective: `do ${item}`, scopeHint: [`src/${item}/**`, ...(setupOptions.extraWrite?.[item] ?? [])] } });
   }
   const agents = new Map<string, { client: BoardAgentClient; repo: BoardAgentRepo; dir: string }>();
   for (const id of ["a0", "a1", "a2", "a3"]) {
@@ -82,7 +89,7 @@ async function setup() {
     return outcome.appended;
   };
   for (const [id, item] of [["a0", "w"], ["a1", "x"], ["a2", "y"], ["a3", "z"]] as const) {
-    await post(id, { type: "item.claimed", payload: { item, intent: { read: [], write: [`src/${item}/**`] } } });
+    await post(id, { type: "item.claimed", payload: { item, intent: { read: [], write: [`src/${item}/**`, ...(setupOptions.extraWrite?.[item] ?? [])] } } });
   }
   /** Commit one file in the agent's repo, push it, and announce it for the item. */
   const push = async (id: string, item: string, rel: string, body: string): Promise<string> => {
@@ -136,7 +143,7 @@ async function setup() {
   };
   /** The revisions recorded after the warm-up one. */
   const revisions = async () => of(await log(), "integrated.rev").slice(1);
-  return { root, control, operator, push, integrator, log, branchHead, fileAt, remote, warm, revisions };
+  return { root, control, operator, push, integrator, log, branchHead, fileAt, remote, warm, revisions, projectDir };
 }
 
 /** A gate that fails while any file of the tree carries "BAD", naming that file (like a failing test's location). */
@@ -408,5 +415,47 @@ describe("speculative batch gating", () => {
     });
     expect(refused.ok).toBe(false);
     expect(refused.ok ? "" : refused.code).toBe("LOG_MISMATCH");
+  });
+
+  it("a candidate that swaps the gate's runner (a nested lockfile shadow) is refused as a protected violation and never lands", async () => {
+    const packages = {
+      "": { name: "p", devDependencies: { vitest: "2.1.8" } },
+      "node_modules/vitest": { version: "2.1.8", resolved: "https://registry.npmjs.org/vitest/-/vitest-2.1.8.tgz", integrity: "sha512-v", dev: true, dependencies: { vite: "^5.0.0" }, bin: { vitest: "vitest.mjs" } },
+      "node_modules/vite": { version: "5.4.0", resolved: "https://registry.npmjs.org/vite/-/vite-5.4.0.tgz", integrity: "sha512-vite", dev: true },
+    };
+    const lock = (p: Record<string, unknown>) => JSON.stringify({ name: "p", lockfileVersion: 3, requires: true, packages: p }, null, 2) + "\n";
+    const env = await setup({
+      files: { "package.json": JSON.stringify({ name: "p", scripts: { gate: "vitest run" }, devDependencies: { vitest: "2.1.8" } }) + "\n", "package-lock.json": lock(packages) },
+      extraWrite: { x: ["package-lock.json"] },
+    });
+    const contract = runnerResolutionContract(await readDependencySnapshotFromDir(env.projectDir), ["vitest"]);
+    expect(contract.jsonKeys.length).toBeGreaterThan(0);
+    await env.warm();
+    const p1 = await env.push(
+      "a1",
+      "x",
+      "package-lock.json",
+      lock({ ...packages, "node_modules/vitest/node_modules/vite": { version: "0.0.1", resolved: "https://example.invalid/vite.tgz", integrity: "sha512-x" } }),
+    );
+    const p2 = await env.push("a2", "y", "src/y/b.ts", "export const b = 1;\n");
+    const gate = new MarkerGate();
+    const integrator = env.integrator({ verifyCommandRunner: gate, candidateConcurrency: 2, contract: { restore: [], jsonKeys: contract.jsonKeys } });
+    integrator.kick();
+    await integrator.idle();
+
+    // The gate itself passes every tree: only the runner-resolution check refuses C1 and C2.
+    expect(integrator.rounds[0]!.map((c) => [c.index, c.gate, c.outcome])).toEqual([
+      [1, "fail", "blamed"],
+      [2, "fail", "retest"],
+    ]);
+    const revs = await env.revisions();
+    expect(revs.map((r) => [r.payload.gate, [...r.payload.merged]])).toEqual([
+      ["fail", [p1]],
+      ["pass", [p2]],
+    ]);
+    const landed = revs[1]!.payload.commit;
+    expect(await env.branchHead()).toBe(landed);
+    expect(await env.fileAt(landed, "package-lock.json")).toBe(lock(packages));
+    expect(integrator.revisions[0]!.failure).toMatch(/protected path\(s\).*node_modules\/vitest\/node_modules\/vite/);
   });
 });

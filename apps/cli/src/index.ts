@@ -29,6 +29,8 @@ import {
   OFFLINE_TOOL_AUTHOR_LABEL,
   regionToolAuthor,
   selectToolFiller,
+  parsePrices,
+  validateSpendCap,
   initialEnvironmentCredentialKeys,
   loadDotEnvFile,
   runtimeCredentialNames,
@@ -88,7 +90,7 @@ import {
   runToolSmoke,
   formatToolSmokeBuild,
 } from "@switchyard-change/orchestration";
-import { DiscoveringExecutor } from "@switchyard-change/model-adapters";
+import { DEFAULT_JEV_MODEL, DiscoveringExecutor } from "@switchyard-change/model-adapters";
 
 const CLI_NAME = "switchyard-change";
 const VERSION = "0.0.0";
@@ -172,8 +174,8 @@ const commands: Command[] = [
       }
       const kind = kindRaw as "codemod" | "scanner" | "check";
       const capability = optionValue(args, "--capability") ?? (kind === "codemod" ? "codemod-unit" : `${kind === "scanner" ? "scan" : "check"}-unit`);
-      const attempts = Number(optionValue(args, "--attempts") ?? "1");
-      const rebuilds = Number(optionValue(args, "--rebuilds") ?? "0");
+      const attempts = integerValue(optionValue(args, "--attempts") ?? "1");
+      const rebuilds = integerValue(optionValue(args, "--rebuilds") ?? "0");
       if (!Number.isInteger(attempts) || attempts < 1 || attempts > 20 || !Number.isInteger(rebuilds) || rebuilds < 0 || rebuilds > 5) {
         console.error("tool-smoke: --attempts must be 1..20 and --rebuilds 0..5");
         return 2;
@@ -940,9 +942,9 @@ const commands: Command[] = [
         if (raw === undefined) {
           return undefined;
         }
-        const value = Number(raw);
-        if (!Number.isInteger(value) || value < 1) {
-          throw new Error(`${flag} must be a positive integer`);
+        const value = /^[0-9]+$/.test(raw) ? Number(raw) : Number.NaN;
+        if (!Number.isSafeInteger(value) || value < 1) {
+          throw new Error(`${flag} must be a positive integer (got ${JSON.stringify(raw)})`);
         }
         return value;
       };
@@ -962,22 +964,15 @@ const commands: Command[] = [
         if (raw === undefined) {
           return undefined;
         }
-        const value = Number(raw);
+        const value = /^[0-9]+(\.[0-9]+)?$/.test(raw) ? Number(raw) : Number.NaN;
         if (!Number.isFinite(value) || value <= 0) {
-          throw new Error(`${flag} must be a positive number`);
+          throw new Error(`${flag} must be a positive number (got ${JSON.stringify(raw)})`);
         }
         return value;
       };
-      // --price <model>=<input USD per million tokens>/<output USD per million tokens>, repeatable.
-      const prices: Record<string, { inputPerMTok: number; outputPerMTok: number }> = {};
-      args.forEach((arg, i) => {
-        if (arg !== "--price") return;
-        const m = /^([^=]+)=([0-9.]+)\/([0-9.]+)$/.exec(args[i + 1] ?? "");
-        if (!m) {
-          throw new Error("--price must be <model>=<input USD per Mtok>/<output USD per Mtok>");
-        }
-        prices[m[1]!] = { inputPerMTok: Number(m[2]), outputPerMTok: Number(m[3]) };
-      });
+      // --price <model>=<input USD per million tokens>/<output USD per million tokens>,
+      // repeatable: finite, non-negative amounts, one price per model.
+      const prices = parsePrices(optionValues(args, "--price"));
       const caps = {
         ...(intFlag("--max-calls") !== undefined ? { maxCalls: intFlag("--max-calls")! } : {}),
         ...(numberFlag("--max-spend-usd") !== undefined ? { maxSpendUsd: numberFlag("--max-spend-usd")! } : {}),
@@ -986,7 +981,7 @@ const commands: Command[] = [
         ...(Object.keys(prices).length > 0 ? { prices } : {}),
       };
       const gateTimeoutRaw = optionValue(args, "--gate-timeout-ms");
-      const gateTimeoutMs = gateTimeoutRaw === undefined ? undefined : Number(gateTimeoutRaw);
+      const gateTimeoutMs = gateTimeoutRaw === undefined ? undefined : /^[0-9]+$/.test(gateTimeoutRaw) ? Number(gateTimeoutRaw) : Number.NaN;
       if (gateTimeoutMs !== undefined && (!Number.isInteger(gateTimeoutMs) || gateTimeoutMs < 1000)) {
         console.error("Error: --gate-timeout-ms must be an integer of at least 1000");
         return 1;
@@ -1006,7 +1001,7 @@ const commands: Command[] = [
       // 3 with the local integrator; 1 integrates every pending push as one
       // revision). The cloud integration Workflow gates one revision at a time.
       const speculateRaw = optionValue(args, "--speculate");
-      const speculate = speculateRaw === undefined ? undefined : Number(speculateRaw);
+      const speculate = speculateRaw === undefined ? undefined : /^[0-9]+$/.test(speculateRaw) ? Number(speculateRaw) : Number.NaN;
       if (speculate !== undefined && (!Number.isInteger(speculate) || speculate < 1 || speculate > MAX_SPECULATE)) {
         console.error(`Error: --speculate must be an integer from 1 to ${MAX_SPECULATE}`);
         return 1;
@@ -1147,6 +1142,34 @@ const commands: Command[] = [
       const deployAppName =
         optionValue(args, "--deploy-app-name") ?? (deployAppBase ? stableAppWorkerName(deployAppBase) : undefined);
       const ttlRaw = optionValue(args, "--token-ttl");
+      const ttl = ttlRaw === undefined ? undefined : integerValue(ttlRaw);
+      if (ttl !== undefined && (!Number.isInteger(ttl) || ttl < MIN_TOKEN_TTL_SECONDS || ttl > MAX_TOKEN_TTL_SECONDS)) {
+        console.error(`Error: --token-ttl must be an integer number of seconds from ${MIN_TOKEN_TTL_SECONDS} to ${MAX_TOKEN_TTL_SECONDS}`);
+        return 1;
+      }
+      // A spend cap is honest only when every model the run calls has a price:
+      // an unpriced call's spend is unknown, so the cap could not bound it.
+      if (caps.maxSpendUsd !== undefined) {
+        const tools = selectToolFiller();
+        const plannerModels = selectPlanner();
+        const jevLive = selectJev();
+        const models = [
+          turn.model,
+          selected.baseModel,
+          ...selected.escalationModels,
+          ...(plannerModels.live ? [plannerModels.baseModel, ...plannerModels.escalationModels] : []),
+          ...(tools.live ? tools.models : []),
+          ...(jevLive.live ? [DEFAULT_JEV_MODEL] : []),
+        ].filter((m) => m.trim() !== "");
+        const unpriced = validateSpendCap(models, prices);
+        if (unpriced.length > 0) {
+          console.error(
+            `Error: --max-spend-usd needs a --price for every model this run calls; unpriced: ${unpriced.join(", ")} ` +
+              "(an unpriced call's spend is unknown, so the cap could not bound it)",
+          );
+          return 1;
+        }
+      }
       console.log(`Board run for ${changeId} under dial min ${dial.minConcurrency}, max ${dial.maxConcurrency} against Worker ${workerUrl}`);
       console.log(`  agent turns: ${turn.description}`);
       console.log(`  executor: ${selected.description}`);
@@ -1182,7 +1205,7 @@ const commands: Command[] = [
           // The typed-decision layer, when live, only narrows failure
           // attribution (advisory); it never decides a verdict.
           const jev = selectJev();
-          return jev.live && jev.ask ? { jev: jev.ask, jevThreshold: jev.threshold } : {};
+          return jev.live && jev.ask ? { jev: jev.ask, jevThreshold: jev.threshold, jevModel: DEFAULT_JEV_MODEL } : {};
         })(),
         seed: async (text) => {
           const decomposition = await decomposeGoal({ goal: text, projectDir, ...(planner ? { planner } : {}) });
@@ -1194,7 +1217,7 @@ const commands: Command[] = [
         schedule: hasFlag(args, "--lockstep") ? "lockstep" : "concurrent",
         budgets,
         caps,
-        ...(ttlRaw !== undefined ? { workspaceTtlSeconds: Number(ttlRaw) } : {}),
+        ...(ttl !== undefined ? { workspaceTtlSeconds: ttl } : {}),
         // Agents' repo tokens are refreshed before they expire unless turned off.
         ...(hasFlag(args, "--no-token-refresh") ? { refreshTokens: false } : {}),
         ...gateOptions,
@@ -1419,17 +1442,75 @@ function printHelp(): void {
 
 /** Read the value following a flag like --project, or undefined. */
 function optionValue(args: readonly string[], flag: string): string | undefined {
+  refuseInlineValue(args, flag);
   const index = args.indexOf(flag);
-  if (index === -1 || index === args.length - 1) {
+  if (index === -1) {
     return undefined;
   }
-  return args[index + 1];
+  return valueAt(args, index, flag);
+}
+
+/** Every value of a repeatable flag (`--price a --price b`), in order. */
+function optionValues(args: readonly string[], flag: string): string[] {
+  refuseInlineValue(args, flag);
+  const out: string[] = [];
+  args.forEach((arg, index) => {
+    if (arg === flag) {
+      out.push(valueAt(args, index, flag));
+    }
+  });
+  return out;
+}
+
+/** The value after the flag at `index`; a missing one (the end, or another flag) is refused. */
+function valueAt(args: readonly string[], index: number, flag: string): string {
+  const value = args[index + 1];
+  if (value === undefined || value.startsWith("--")) {
+    throw new Error(`${flag} needs a value: pass ${flag} <value>`);
+  }
+  return value;
+}
+
+/** `--flag=value` is not parsed (it would be silently ignored): refuse it clearly. */
+function refuseInlineValue(args: readonly string[], flag: string): void {
+  const inline = args.find((arg) => arg.startsWith(`${flag}=`));
+  if (inline !== undefined) {
+    throw new Error(`${flag}=<value> is not supported: pass ${flag} <value> as two arguments`);
+  }
+}
+
+/**
+ * Refuse every `--name=value` argument: the CLI reads `--name value` only, so
+ * the inline form would be ignored without a word. (No flag value may start
+ * with `--` either, see valueAt, so this never refuses a real value.)
+ */
+function refuseInlineFlags(args: readonly string[]): void {
+  for (const arg of args) {
+    const match = /^(--[a-z][a-z0-9-]*)=/.exec(arg);
+    if (match) {
+      throw new Error(`${match[1]}=<value> is not supported: pass ${match[1]} <value> as two arguments`);
+    }
+  }
 }
 
 /** True when a boolean flag like --watch is present in the args. */
 function hasFlag(args: readonly string[], flag: string): boolean {
+  if (args.some((arg) => arg.startsWith(`${flag}=`))) {
+    throw new Error(`${flag} takes no value`);
+  }
   return args.includes(flag);
 }
+
+/** A decimal integer argument (digits only), else NaN: never a silently coerced value. */
+function integerValue(raw: string): number {
+  return /^[0-9]+$/.test(raw) ? Number(raw) : Number.NaN;
+}
+
+/** The agents' repo token lifetime bounds (seconds), as the Worker enforces them. */
+const MIN_TOKEN_TTL_SECONDS = 60;
+const MAX_TOKEN_TTL_SECONDS = 3600;
+/** The concurrency dial's upper bound. */
+const MAX_DIAL = 16;
 
 /**
  * Resolve the --gate / --no-gate toggle for the per-app gate. Returns true when
@@ -1450,9 +1531,10 @@ function gateFlagFromArgs(args: readonly string[]): boolean | undefined {
 
 /**
  * Parse the bounded max model-escalation retries from --max-model-retries,
- * defaulting to one (the base attempt, then one escalation retry). A missing,
- * non-finite, or negative value falls back to the default; the value is floored
- * to a whole number of retries.
+ * defaulting to one (the base attempt, then one escalation retry). An explicit
+ * flag must be a non-negative integer (anything else is refused); a missing,
+ * non-finite, or negative env value falls back to the default, floored to a
+ * whole number of retries.
  */
 function maxModelRetriesFromArgs(args: readonly string[], executorDefault?: number): number {
   // The flag wins; otherwise read WORKERS_AI_MAX_MODEL_RETRIES from the env, then
@@ -1464,7 +1546,15 @@ function maxModelRetriesFromArgs(args: readonly string[], executorDefault?: numb
     executorDefault !== undefined && Number.isFinite(executorDefault) && executorDefault >= 0
       ? Math.floor(executorDefault)
       : 3;
-  const raw = optionValue(args, "--max-model-retries") ?? runtimeEnv().WORKERS_AI_MAX_MODEL_RETRIES;
+  const flag = optionValue(args, "--max-model-retries");
+  if (flag !== undefined) {
+    const value = integerValue(flag);
+    if (!Number.isSafeInteger(value)) {
+      throw new Error(`--max-model-retries must be a non-negative integer (got ${JSON.stringify(flag)})`);
+    }
+    return value;
+  }
+  const raw = runtimeEnv().WORKERS_AI_MAX_MODEL_RETRIES;
   if (raw === undefined) {
     return fallback;
   }
@@ -1671,12 +1761,24 @@ async function resolveChange(
  * agents recruitment runs at once.
  */
 function dialFromArgs(args: readonly string[]): ConcurrencyDial {
-  const min = Number(optionValue(args, "--min") ?? "1");
-  const max = Number(optionValue(args, "--max") ?? "3");
-  return {
-    minConcurrency: Number.isFinite(min) ? min : 1,
-    maxConcurrency: Number.isFinite(max) ? max : 3,
-  };
+  const minRaw = optionValue(args, "--min");
+  const maxRaw = optionValue(args, "--max");
+  const min = minRaw === undefined ? 1 : integerValue(minRaw);
+  if (!Number.isInteger(min) || min < 1 || min > MAX_DIAL) {
+    throw new Error(`--min must be an integer from 1 to ${MAX_DIAL} (got ${JSON.stringify(minRaw)})`);
+  }
+  if (maxRaw === undefined) {
+    // No explicit max: 3, raised to the min so the dial stays min <= max.
+    return { minConcurrency: min, maxConcurrency: Math.max(3, min) };
+  }
+  const max = integerValue(maxRaw);
+  if (!Number.isInteger(max) || max < 1 || max > MAX_DIAL) {
+    throw new Error(`--max must be an integer from 1 to ${MAX_DIAL} (got ${JSON.stringify(maxRaw)})`);
+  }
+  if (min > max) {
+    throw new Error(`--min (${min}) must not exceed --max (${max})`);
+  }
+  return { minConcurrency: min, maxConcurrency: max };
 }
 
 /** True when `value` is the argument consumed by a preceding --flag. */
@@ -1853,6 +1955,7 @@ async function main(argv: string[]): Promise<number> {
   }
 
   try {
+    refuseInlineFlags(rest);
     return await command.run(rest);
   } catch (error) {
     console.error(`Error: ${redactSecrets(error instanceof Error ? error.message : String(error))}`);

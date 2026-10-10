@@ -325,6 +325,28 @@ describe("agents build tools for each other (offline, deterministic)", () => {
     expect(of(result.log, "tool.published").map((m) => `${m.payload.capability}@${m.payload.version}`)).toContain("scan-guard@1");
   });
 
+  it("a separate tool author's model calls are metered: its usage is priced into the run's spend and counted per call", async () => {
+    const projectDir = await project();
+    let built = 0;
+    const priced: ToolAuthor = async (request) => {
+      built += 1;
+      await templateToolAuthor(request);
+      return { model: "tool-m", attempts: 1, inputTokens: 1_000_000, outputTokens: 0 };
+    };
+    const result = await runBoardOffline({
+      goal: GOAL,
+      projectDir,
+      seed,
+      fixtureGate: true,
+      resolveContract: reject,
+      toolAuthor: priced,
+      caps: { prices: { "tool-m": { inputPerMTok: 2, outputPerMTok: 0 } } },
+    });
+    expect(built).toBeGreaterThan(0);
+    // Each authoring call costs 2 USD at the configured price; nothing else in the offline run is priced.
+    expect(result.usage!.spendUsd).toBe(2 * built);
+  });
+
   it("the live author is given the exact contract, a working skeleton, bounded project files, the goal, and a rebuild's failing checks", async () => {
     const contexts: ExecutorContext[] = [];
     const executor: ExecutorProvider = {

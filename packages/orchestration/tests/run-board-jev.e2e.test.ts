@@ -308,6 +308,29 @@ async function contractRun(jev: AskJev | undefined, resolve?: (request: BoardCon
   return { result, events, escalations };
 }
 
+describe("typed decisions are metered", () => {
+  it("every decision call is counted on the run's meter, labelled with the decision model, and an unpriced one under a spend cap is a visible warning", async () => {
+    const projectDir = await project();
+    let asks = 0;
+    const jev: AskJev = async (_state, questions) => {
+      asks += 1;
+      const out: Record<string, JevAnswer> = {};
+      for (const key of Object.keys(questions)) {
+        out[key] = key === "fix-confidence" ? { type: "noul", noul: "yes", confidence: 0.9 } : { type: "choice", choice: criteriaOf(questions, key)[0]!, confidence: 0.1 };
+      }
+      return out;
+    };
+    const base = { goal: GOAL, projectDir, seed, executor: new ModelStampingExecutor(), escalationModels: ["m1", "m2"], appGateCommand: ["gate"], resolveContract: async () => "reject" as const };
+    const without = await runBoardOffline({ ...base, verifyCommandRunner: new NeedsApiFixGate() });
+    const metered = await runBoardOffline({ ...base, verifyCommandRunner: new NeedsApiFixGate(), jev, jevModel: "typesafe/jev", caps: { maxSpendUsd: 1000 } });
+    expect(asks).toBeGreaterThan(0);
+    // The same deterministic run plus exactly one counted call per decision ask.
+    expect(metered.usage!.calls - without.usage!.calls).toBe(asks);
+    expect(metered.usage!.warnings).toContainEqual(expect.stringContaining("an unpriced model call (typesafe/jev) under the 1000 USD spend cap"));
+    expect(formatBoardRunSummary(metered)).toContain("meter warning: an unpriced model call (typesafe/jev)");
+  });
+});
+
 describe("contract triage for the human (advisory)", () => {
   it("records a triage linked to the contract, shows it with the escalation, and the human's opposite decision is what applies", async () => {
     const states: string[] = [];

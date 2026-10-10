@@ -2103,7 +2103,7 @@ describe("failures the plan missed, and the contract cue", () => {
     board.post(push("a", "tax", "c1", ["src/tax.ts"]));
     board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1"], failing: { output: "> s@0 gate\nAssertionError: expected 73 to be 72\n at tests/tax.test.ts:12:5", items: ["tax"] } }));
     const digest = boardDigest(board.state, board.log, "a", 0);
-    expect(digest.claims[0]!.contractCue).toMatchObject({ paths: ["tests/tax.test.ts"], hint: expect.stringMatching(/propose contract\.proposed \{target: tests\/tax\.test\.ts/) });
+    expect(digest.claims[0]!.contractCue).toMatchObject({ paths: ["tests/tax.test.ts"], hint: expect.stringMatching(/send message kind contract \{target: tests\/tax\.test\.ts, change: modify, itemId: tax\}/) });
     expect(digest.struggling ?? []).toEqual([{ item: "tax", turnsSpent: 0, failedEdits: 0, reason: "failing-revision", lastFailure: "AssertionError: expected 73 to be 72" }]);
     expect(board.types(msg("a", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "tax" }))).toEqual(["contract.proposed", "contract.escalated"]);
     board.reject(push("a", "tax", "c2", ["tests/tax.test.ts"]), /outside the claim's write intent/, "OUTSIDE_INTENT");
@@ -2209,6 +2209,7 @@ describe("seam contracts: a change to a frozen shared seam, decided by the lead"
     // `on type 'Ctx'` names src/store.ts's export: that seam only, not every seam cart.ts imports.
     expect(cue).toMatchObject({ seams: ["src/store.ts"], errors: ["src/orders/cart.ts(44,12): error TS2339: Property 'user' does not exist on type 'Ctx'."] });
     expect(cue!.hint).toMatch(/do not use undeclared fields/);
+    expect(cue!.hint).toMatch(/send message kind contract \{target: src\/store\.ts, change: modify, itemId: cart, description: the exact change you need\}/);
     expect(seamContractCue(board.state, "invoices")).toBeUndefined();
 
     // A seam contract needs the exact change, and comes from the owner of the item that needs it.
@@ -2892,6 +2893,53 @@ describe("re-plan an item instead of giving up (one bounded re-plan, then a huma
     expect(replanEligible(board.state, "one")).toBe("stalled");
     board.post(msg("lead", "item.replanned", { item: "one", reason: "stalled", action: "rescope", children: [{ item: "one-r", objective: "do one, smaller", acceptance: [], scopeHint: ["src/one/a.ts"] }] }));
     expect(board.state.items["one-r"]).toMatchObject({ status: "open", replanOf: "one" });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("an item whose per-item call cap was reached is re-plannable while still held (reason item-cap), and the children start fresh", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o" }));
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "one", objective: "do one", acceptance: [], scopeHint: ["src/one/**"] }));
+    board.post(msg("lead", "item.proposed", { item: "two", objective: "do two", acceptance: [], scopeHint: ["src/two/**"] }));
+    board.post(claim("a", "one", ["src/one/**"]));
+    expect(replanEligible(board.state, "one")).toBeUndefined();
+    // A run-wide cap is not an item's: only an item-calls cap of THIS item counts.
+    board.post(msg("engine", "run.capped", { kind: "model-calls", limit: 10, used: 10 }));
+    board.post(msg("engine", "run.capped", { kind: "item-calls", limit: 4, used: 5, item: "two" }));
+    expect(replanEligible(board.state, "one")).toBeUndefined();
+    board.post(msg("engine", "run.capped", { kind: "item-calls", limit: 4, used: 5, item: "one" }));
+    expect(board.state.items.one!.status).toBe("claimed");
+    expect(replanEligible(board.state, "one")).toBe("item-cap");
+    expect(replanEligible(board.state, "two")).toBe("item-cap");
+    expect(boardDigest(board.state, board.log, "lead", 0).replan?.map((r) => [r.item, r.reason])).toEqual([
+      ["one", "item-cap"],
+      ["two", "item-cap"],
+    ]);
+    board.reject(
+      msg("lead", "item.replanned", { item: "one", reason: "stalled", action: "rescope", children: [{ item: "one-r", objective: "o", scopeHint: ["src/one/**"] }] }),
+      /re-planned for item-cap, not stalled/,
+      "LOG_MISMATCH",
+    );
+    board.post(
+      msg("lead", "item.replanned", {
+        item: "one",
+        reason: "item-cap",
+        action: "split",
+        children: [
+          { item: "one-a", objective: "do one, part a", acceptance: [], scopeHint: ["src/one/a.ts"] },
+          { item: "one-b", objective: "do one, part b", acceptance: [], scopeHint: ["src/one/b.ts"] },
+        ],
+      }),
+    );
+    expect(board.state.items.one).toMatchObject({ status: "split", replanned: { reason: "item-cap", action: "split" } });
+    // The children are new items (their own call counts): claimable, and not re-plannable themselves.
+    expect(board.state.items["one-a"]).toMatchObject({ status: "open", replanOf: "one" });
+    expect(replanEligible(board.state, "one-a")).toBeUndefined();
+    board.post(claim("b", "one-a", ["src/one/a.ts"]));
+    // Re-planned once (split): never again, whatever its cap says.
+    expect(replanEligible(board.state, "one")).toBeUndefined();
     expect(reduceBoard(board.log)).toEqual(board.state);
   });
 

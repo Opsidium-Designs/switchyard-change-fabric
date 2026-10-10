@@ -241,6 +241,8 @@ export {
   itemWaitReason,
   describeWaitReason,
   replanEligible,
+  BOARD_REPLAN_REASONS,
+  type BoardReplanReason,
   scopeOverlaps,
   liveClashes,
   clashKey,
