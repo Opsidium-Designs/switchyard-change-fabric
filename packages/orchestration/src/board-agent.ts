@@ -1923,7 +1923,8 @@ export class BoardAgent {
       return;
     }
     // An edit answering a fix request remembers which revision it answers.
-    const fixNote = claim.fix !== undefined ? { fix: String(claim.fix.n) } : undefined;
+    const fixNote: Record<string, string> | undefined =
+      claim.fix !== undefined ? { fix: String(claim.fix.n) } : claim.excluded !== undefined ? { excluded: claim.excluded.commit } : undefined;
     const local = (code: string, error: string): void => plainLocal(code, error, fixNote);
     const posted = (draft: Record<string, unknown>): Promise<boolean> => plainPosted(draft, fixNote);
     if (!this.options.executor) {

@@ -115,7 +115,24 @@ export interface BoardRules {
    * on Cloudflare refuses K > 1. At most BOARD_LIMITS.maxSpeculate.
    */
   readonly speculate?: number;
+  /**
+   * The engine's ARBITRATION revision (absent: 1, how every board before it
+   * was arbitrated, so a recorded log replays exactly as it was recorded).
+   * Revision 2 (what a new run posts):
+   *   - a different agent granted (or handed) an item starts with a fresh fix
+   *     budget, whatever released the previous holder;
+   *   - a claim's deadline is not charged for the time its push waited for
+   *     the gate, and a fix request leaves its holder at least one lease
+   *     window before the deadline;
+   *   - the lease, deadline, lapse cooldown, contest idle, seam wait, and help
+   *     wait clocks count PARTICIPANT messages only (never engine records such
+   *     as clash predictions, candidates, or token refreshes).
+   */
+  readonly arbitration?: number;
 }
+
+/** The arbitration revision a new board run posts (see BoardRules.arbitration). */
+export const CURRENT_ARBITRATION = 2;
 
 export const DEFAULT_BOARD_RULES: BoardRules = { maxContestTurns: 3, contestIdleMessages: 25, maxFixAttempts: 2 };
 
@@ -527,6 +544,16 @@ export interface BoardPayloads {
    */
   "trunk.moved": { readonly rev: number; readonly commit: string; readonly expected?: string; readonly actual?: string };
   /**
+   * Engine (recorded by the operator), addressed to the holder: the
+   * integrator left `agent`'s pending push `commit` for `item` out of the
+   * integrated tree because it failed verification (out of its write scope,
+   * or the integrator refused the tree it alone added), so no gate ran on it.
+   * The push is not re-gated until the holder pushes again; meanwhile the
+   * claim's lease runs (it no longer waits for the gate) and the item's wait
+   * reason is `push-excluded`.
+   */
+  "push.excluded": { readonly item: string; readonly agent: string; readonly commit: string; readonly reason: string };
+  /**
    * Engine (recorded by the operator): before `agent`'s repo token expired,
    * the operator minted a fresh scoped token for the same repo (`repo-write`:
    * its own repo; `help-fork`: its fork for help request `request`), swapped
@@ -892,6 +919,7 @@ export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "revision.promoted",
   "run.capped",
   "candidate.gated",
+  "push.excluded",
   "item.discovered",
   "help.requested",
   "help.offered",
@@ -1050,6 +1078,10 @@ export interface BoardItemPush {
   /** A child's push: how many sub-lead pushes merged it, and whether a revision recorded it unverified. */
   mergedTimes?: number;
   unverifiedIn?: number;
+  /** The integrator left this push out (push.excluded): not re-gated until the holder pushes again. */
+  excluded?: { readonly seq: number; readonly reason: string };
+  /** Its board clock under arbitration revision 2. */
+  readonly tick?: number;
 }
 
 export interface BoardItem {
@@ -1077,6 +1109,10 @@ export interface BoardItem {
   intent?: BoardIntent;
   /** The seq of the grant that gave the current owner the claim. */
   grantedSeq?: number;
+  /** Under arbitration revision 2: the board clock of its latest grant, push, or (a seam item) proposal. */
+  activityTick?: number;
+  /** Under arbitration revision 2: the agent whose fix budget the item's counters hold. */
+  budgetHolder?: string;
   /** A claim waiting on a contest. */
   claimant?: { readonly agent: string; intent: BoardIntent; contest: string };
   doneProposed: boolean;
@@ -1123,9 +1159,9 @@ export interface BoardItem {
    * holder's latest progress on the item, its firm deadline, and the lead's
    * extensions so far. Cleared when the claim is released or completes.
    */
-  lease?: { progressSeq: number; deadlineSeq?: number; extensions: number };
+  lease?: { progressSeq: number; deadlineSeq?: number; extensions: number; progressTick?: number; deadlineTick?: number };
   /** The latest lapse of a claim on this item (cleared by the next grant). */
-  lastLapse?: { readonly seq: number; readonly agent: string; readonly reason: "no-progress" | "deadline" | "stalled"; readonly lastProgressSeq: number };
+  lastLapse?: { readonly seq: number; readonly agent: string; readonly reason: "no-progress" | "deadline" | "stalled"; readonly lastProgressSeq: number; readonly tick?: number };
   /** Claims on this item released for not moving: lapsed leases and seam stalls that released it. */
   stallReleases?: number;
   /** The latest failing revision that asked for a fix on this item (or spent its budget): its failure attribution. */
@@ -1155,6 +1191,8 @@ export interface BoardContest {
   readonly openedSeq: number;
   /** The seq of the last message a party posted on this contest. */
   lastActionSeq: number;
+  /** Its board clock under arbitration revision 2. */
+  lastActionTick?: number;
   how?: ContestResolution;
   winner?: string;
 }
@@ -1188,6 +1226,8 @@ export interface BoardHelpRequest {
   offers: string[];
   /** The seq of the request. */
   readonly seq?: number;
+  /** Its board clock under arbitration revision 2. */
+  readonly tick?: number;
   /** The sub-scope of the requester's write intent it grants (absent: a plain request). */
   readonly scope?: readonly string[];
   /** A grant addressed to these agents (for example a volunteer): only they may take it. */
@@ -1196,12 +1236,13 @@ export interface BoardHelpRequest {
   grant?: {
     readonly agent: string;
     readonly seq: number;
+    readonly tick?: number;
     readonly forkOf: string;
     readonly forkCommit?: string;
     readonly fork?: string;
   };
   /** The helper's latest delivered commit. */
-  delivered?: { readonly commit: string; readonly paths: readonly string[]; readonly seq: number };
+  delivered?: { readonly commit: string; readonly paths: readonly string[]; readonly seq: number; readonly tick?: number };
   /** The requester's push that pulled the delivered commit (the grant is closed). */
   pulledSeq?: number;
   /** The requester closed the grant without pulling (declined, or its pull failed). */
@@ -1287,6 +1328,8 @@ export interface BoardIntegratedRev {
  */
 export interface BoardState {
   lastSeq: number;
+  /** Under arbitration revision 2: participant (non-engine) messages so far, the board's clock. */
+  ticks?: number;
   goal: { readonly objective: string; readonly seq: number } | null;
   rules: BoardRules;
   agents: Record<string, BoardAgent>;
@@ -1710,6 +1753,7 @@ function rules(raw: Raw): BoardRules {
     ...(value.claimDeadlineMessages !== undefined ? { claimDeadlineMessages: positiveInt(value, "claimDeadlineMessages", 100000) } : {}),
     ...(value.claimOverlap !== undefined ? { claimOverlap: bool(value, "claimOverlap") } : {}),
     ...(value.speculate !== undefined ? { speculate: positiveInt(value, "speculate", BOARD_LIMITS.maxSpeculate) } : {}),
+    ...(value.arbitration !== undefined && value.arbitration !== 1 ? { arbitration: positiveInt(value, "arbitration", CURRENT_ARBITRATION) } : {}),
   };
 }
 
@@ -1994,6 +2038,8 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         ...(raw.progress !== undefined ? { progress: revProgress(raw.progress) } : {}),
       };
     }
+    case "push.excluded":
+      return { item: id(raw, "item"), agent: id(raw, "agent"), commit: id(raw, "commit"), reason: text(raw, "reason", L.maxRationale) };
     case "trunk.moved": {
       const expected = optionalId(raw, "expected");
       const actual = optionalId(raw, "actual");
@@ -2447,6 +2493,7 @@ const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "item.escalated": ["engine"],
   "clash.predicted": ["engine"],
   "trunk.moved": ["engine"],
+  "push.excluded": ["engine"],
   "token.refreshed": ["engine"],
   "revision.promoted": ["engine"],
   "run.capped": ["engine"],
@@ -2620,14 +2667,15 @@ export function helpGrantLive(state: BoardState, request: BoardHelpRequest): boo
   if (!item || item.status !== "claimed" || item.owner !== request.by || !activeAgent(state, request.by)) {
     return false;
   }
+  const now = boardClock(state);
   if (request.delivered !== undefined) {
     // Delivered work waits for the requester's pull, bounded too.
-    return state.lastSeq - request.delivered.seq <= BOARD_LIMITS.helpWaitMessages;
+    return now - anchorClock(state, request.delivered.seq, request.delivered.tick) <= BOARD_LIMITS.helpWaitMessages;
   }
   if (request.grant !== undefined) {
-    return activeAgent(state, request.grant.agent) && state.lastSeq - request.grant.seq <= BOARD_LIMITS.helpWaitMessages;
+    return activeAgent(state, request.grant.agent) && now - anchorClock(state, request.grant.seq, request.grant.tick) <= BOARD_LIMITS.helpWaitMessages;
   }
-  return state.lastSeq - (request.seq ?? 0) <= BOARD_LIMITS.helpWaitMessages;
+  return now - anchorClock(state, request.seq ?? 0, request.tick) <= BOARD_LIMITS.helpWaitMessages;
 }
 
 /**
@@ -2737,10 +2785,11 @@ export function seamItemHolding(state: BoardState, other: BoardItem): boolean {
     return false;
   }
   const activity = Math.max(other.grantedSeq ?? other.proposedSeq, other.lastPush?.seq ?? 0);
+  const waited = arbitrationV2(state) ? boardClock(state) - (other.activityTick ?? 0) : state.lastSeq - activity;
   // Once its push was GATED (merged into a revision, pass or fail), dependents
   // merge with it in every later revision: holding them longer only stalls
   // them on failures that are not the seam's.
-  return other.lastPush?.gatedIn === undefined && other.seamStalledSeq === undefined && state.lastSeq - activity <= BOARD_LIMITS.seamWaitMessages;
+  return other.lastPush?.gatedIn === undefined && other.seamStalledSeq === undefined && waited <= BOARD_LIMITS.seamWaitMessages;
 }
 
 /**
@@ -2802,6 +2851,30 @@ export function leasesOn(state: BoardState): boolean {
   return state.rules.claimLeaseMessages !== undefined || state.rules.claimDeadlineMessages !== undefined;
 }
 
+/** True under arbitration revision 2 or later (rules.arbitration, recorded in goal.posted). Pure. */
+export function arbitrationV2(state: BoardState): boolean {
+  return (state.rules.arbitration ?? 1) >= 2;
+}
+
+/**
+ * The board's clock now: participant (non-engine) messages so far under
+ * arbitration revision 2, else the board seq. Every clock (lease, deadline,
+ * lapse cooldown, contest idle, seam wait, help wait) is measured on it. Pure.
+ */
+export function boardClock(state: BoardState): number {
+  return arbitrationV2(state) ? (state.ticks ?? 0) : state.lastSeq;
+}
+
+/** An anchor's clock value: its tick under revision 2, else its seq. */
+function anchorClock(state: BoardState, seq: number, tick: number | undefined): number {
+  return arbitrationV2(state) ? (tick ?? 0) : seq;
+}
+
+/** The tick to stamp on an anchor the message being applied sets (revision 2 only). */
+function tickStamp(state: BoardState): { tick?: number } {
+  return arbitrationV2(state) ? { tick: state.ticks ?? 0 } : {};
+}
+
 /**
  * Why a held claim cannot lapse right now (its lease is SUSPENDED), or
  * undefined. A claim never lapses while the holder waits on someone else: its
@@ -2812,7 +2885,7 @@ export function leasesOn(state: BoardState): boolean {
  */
 export function leaseSuspension(state: BoardState, item: BoardItem): string | undefined {
   const push = item.lastPush;
-  if (push !== undefined && push.agent === item.owner && push.gatedIn === undefined) {
+  if (push !== undefined && push.agent === item.owner && push.gatedIn === undefined && push.excluded === undefined) {
     return "its push waits for the gate";
   }
   if (item.toolBuild !== undefined && item.toolBuild.gated !== true) {
@@ -2857,11 +2930,15 @@ export function leaseLapse(state: BoardState, itemId: string, now: number = stat
   if (leaseSuspension(state, item) !== undefined) {
     return undefined;
   }
-  if (lease.deadlineSeq !== undefined && now >= lease.deadlineSeq) {
+  // Revision 2 measures on participant messages: a look-ahead past the
+  // board's last seq counts as that many more of them (at most).
+  const clock = arbitrationV2(state) ? boardClock(state) + Math.max(0, now - state.lastSeq) : now;
+  const deadlineAt = arbitrationV2(state) ? lease.deadlineTick : lease.deadlineSeq;
+  if (lease.deadlineSeq !== undefined && deadlineAt !== undefined && clock >= deadlineAt) {
     return { reason: "deadline", lastProgressSeq: lease.progressSeq, deadlineSeq: lease.deadlineSeq };
   }
   const limit = state.rules.claimLeaseMessages;
-  if (limit !== undefined && now - lease.progressSeq >= limit && seamWaits(state, item.id).length === 0) {
+  if (limit !== undefined && clock - anchorClock(state, lease.progressSeq, lease.progressTick) >= limit && seamWaits(state, item.id).length === 0) {
     return { reason: "no-progress", lastProgressSeq: lease.progressSeq };
   }
   return undefined;
@@ -2875,7 +2952,47 @@ function lapseCooldown(state: BoardState): number {
 /** A fresh lease for a claim granted (or handed off) at `seq`, under the board's lease rules. */
 function newLease(state: BoardState, seq: number): BoardItem["lease"] {
   const deadline = state.rules.claimDeadlineMessages;
-  return { progressSeq: seq, ...(deadline !== undefined ? { deadlineSeq: seq + deadline } : {}), extensions: 0 };
+  const tick = arbitrationV2(state) ? (state.ticks ?? 0) : undefined;
+  return {
+    progressSeq: seq,
+    ...(deadline !== undefined ? { deadlineSeq: seq + deadline } : {}),
+    extensions: 0,
+    ...(tick !== undefined ? { progressTick: tick, ...(deadline !== undefined ? { deadlineTick: tick + deadline } : {}) } : {}),
+  };
+}
+
+/**
+ * Revision 2: push a held claim's deadline out by `seqs` board messages and
+ * `ticks` participant messages (time it was not charged for), and to at least
+ * one lease window from now when `window` is set (a fix request).
+ */
+function creditDeadline(state: BoardState, item: BoardItem, credit: { seqs: number; ticks: number } | undefined, window?: boolean): void {
+  const lease = item.lease;
+  if (!arbitrationV2(state) || lease?.deadlineSeq === undefined || lease.deadlineTick === undefined) {
+    return;
+  }
+  if (credit !== undefined) {
+    lease.deadlineSeq += Math.max(0, credit.seqs);
+    lease.deadlineTick += Math.max(0, credit.ticks);
+  }
+  if (window) {
+    const span = lapseCooldown(state);
+    lease.deadlineSeq = Math.max(lease.deadlineSeq, state.lastSeq + span);
+    lease.deadlineTick = Math.max(lease.deadlineTick, (state.ticks ?? 0) + span);
+  }
+}
+
+/** Revision 2: a different agent now holds the item, so it starts with a fresh fix budget. */
+function grantBudget(state: BoardState, item: BoardItem, agent: string): void {
+  if (!arbitrationV2(state)) {
+    return;
+  }
+  if (item.budgetHolder !== undefined && item.budgetHolder !== agent) {
+    item.fixAttempts = 0;
+    delete item.toolFailures;
+    delete item.fixExhausted;
+  }
+  item.budgetHolder = agent;
 }
 
 /** The holder's (or, `by` undefined, the engine's or a granted helper's) progress on a held item renews its lease. */
@@ -2883,6 +3000,9 @@ function renewLease(state: BoardState, itemId: string | undefined, seq: number, 
   const item = itemId !== undefined ? state.items[itemId] : undefined;
   if (item?.lease !== undefined && item.status === "claimed" && (by === undefined || by === item.owner)) {
     item.lease.progressSeq = seq;
+    if (arbitrationV2(state)) {
+      item.lease.progressTick = state.ticks ?? 0;
+    }
   }
 }
 
@@ -2905,6 +3025,8 @@ export type BoardWaitReason =
   | { readonly kind: "blocked-by"; readonly item: string }
   /** Its holder's latest push waits for an integrated revision to gate it (the revision has no number yet). */
   | { readonly kind: "waiting-for-gate"; readonly commit: string }
+  /** Its holder's latest push was left out of integration (push.excluded): the holder pushes again. */
+  | { readonly kind: "push-excluded"; readonly commit: string; readonly reason: string }
   /** Its fix budget was spent (by these agents): fresh eyes or a re-plan. */
   | { readonly kind: "fix-budget-exhausted"; readonly by: readonly string[] }
   /** Open and nothing holds it: any agent may claim it. */
@@ -2966,6 +3088,9 @@ export function itemWaitReason(state: BoardState, itemId: string): BoardWaitReas
     return { kind: "waiting-on-seam", item: seams[0]!.item, seams: [...seams[0]!.seams] };
   }
   const push = item.lastPush;
+  if (push !== undefined && push.agent === item.owner && push.gatedIn === undefined && push.excluded !== undefined) {
+    return { kind: "push-excluded", commit: push.commit, reason: push.excluded.reason };
+  }
   if (push !== undefined && push.agent === item.owner && push.gatedIn === undefined) {
     return routedToSubLead(state, item) ? { kind: "blocked-by", item: item.parent! } : { kind: "waiting-for-gate", commit: push.commit };
   }
@@ -2992,6 +3117,8 @@ export function describeWaitReason(reason: BoardWaitReason): string {
       return `blocked by ${reason.item}`;
     case "waiting-for-gate":
       return `push ${reason.commit.slice(0, 10)} waits for the gate`;
+    case "push-excluded":
+      return `push ${reason.commit.slice(0, 10)} was left out of integration (${reason.reason.slice(0, 160)}): its holder pushes again`;
     case "fix-budget-exhausted":
       return `fix budget spent${reason.by.length > 0 ? ` by ${reason.by.join(", ")}` : ""}: fresh eyes or a re-plan`;
     case "unclaimed":
@@ -3333,10 +3460,13 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       // A lapsed holder does not take the item straight back: another agent
       // gets it first, or the lease period passes (counted in board messages).
-      if (item.lastLapse?.agent === draft.from && state.lastSeq - item.lastLapse.seq < lapseCooldown(state)) {
+      const sinceLapse = item.lastLapse !== undefined ? boardClock(state) - anchorClock(state, item.lastLapse.seq, item.lastLapse.tick) : 0;
+      if (item.lastLapse?.agent === draft.from && sinceLapse < lapseCooldown(state)) {
         fail(
           "NOT_ALLOWED",
-          `${draft.from}'s claim on ${item.id} lapsed at seq ${item.lastLapse.seq}: another agent takes it first (or claim it again after seq ${item.lastLapse.seq + lapseCooldown(state)})`,
+          arbitrationV2(state)
+            ? `${draft.from}'s claim on ${item.id} lapsed at seq ${item.lastLapse.seq}: another agent takes it first (or claim it again after ${lapseCooldown(state) - sinceLapse} more participant message(s))`
+            : `${draft.from}'s claim on ${item.id} lapsed at seq ${item.lastLapse.seq}: another agent takes it first (or claim it again after seq ${item.lastLapse.seq + lapseCooldown(state)})`,
         );
       }
       // No hoarding: an agent at its active-claim cap finishes (or hands off)
@@ -3601,15 +3731,9 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       return;
     }
     case "revision.promoted": {
-      const p = draft.payload;
-      if (state.promoted !== undefined) {
-        fail("DUPLICATE", `revision ${state.promoted.rev} was already recorded promoted`);
-      }
-      if (state.integrated?.n !== p.rev || state.lastRevN !== p.rev) {
-        fail("INVALID_STATE", `revision ${p.rev} is not the board's latest revision, passing: only that one is promoted`);
-      }
-      if (state.integrated.commit !== p.gatedCommit) {
-        fail("LOG_MISMATCH", `the promoted gated commit ${p.gatedCommit.slice(0, 12)} is not revision ${p.rev}'s ${state.integrated.commit.slice(0, 12)}: gate-equals-deploy`);
+      const refused = promotionRefusal(state, draft.payload.rev, draft.payload.gatedCommit);
+      if (refused !== undefined) {
+        fail(refused.code, refused.reason);
       }
       return;
     }
@@ -3620,6 +3744,18 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       if (p.request !== undefined && state.help[p.request]?.grant?.agent !== p.agent) {
         fail("NOT_ALLOWED", `${p.agent} holds no granted help fork for ${p.request}`);
+      }
+      return;
+    }
+    case "push.excluded": {
+      const p = draft.payload;
+      const item = requireItem(state, p.item);
+      const push = item.lastPush;
+      if (push === undefined || push.commit !== p.commit || push.agent !== p.agent || item.owner !== p.agent || push.gatedIn !== undefined || push.integratedIn !== undefined) {
+        fail("INVALID_STATE", `${p.commit.slice(0, 12)} is not ${p.agent}'s pending, ungated push for ${item.id}`);
+      }
+      if (push.excluded !== undefined) {
+        fail("DUPLICATE", `${p.agent}'s push ${p.commit.slice(0, 12)} for ${item.id} is already recorded excluded`);
       }
       return;
     }
@@ -4429,6 +4565,9 @@ function proposalStatus(state: BoardState, from: string): BoardItemStatus {
 function applyInPlace(state: BoardState, message: BoardMessage): void {
   state.lastSeq = message.seq;
   const from = message.from;
+  if (arbitrationV2(state) && from !== BOARD_ENGINE) {
+    state.ticks = (state.ticks ?? 0) + 1;
+  }
   switch (message.type) {
     case "goal.posted":
       state.goal = { objective: message.payload.objective, seq: message.seq };
@@ -4469,6 +4608,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         doneProposed: false,
         ...(message.payload.fromTool !== undefined ? { fromTool: { ...message.payload.fromTool } } : {}),
         ...(message.payload.fromContract !== undefined ? { fromContract: message.payload.fromContract } : {}),
+        ...(arbitrationV2(state) ? { activityTick: state.ticks ?? 0 } : {}),
       };
       break;
     case "item.discovered": {
@@ -4513,11 +4653,15 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       if (leasesOn(state)) {
         item.lease = newLease(state, message.seq);
       }
+      if (arbitrationV2(state)) {
+        item.activityTick = state.ticks ?? 0;
+      }
+      grantBudget(state, item, message.payload.agent);
       break;
     }
     case "claim.lapsed": {
       const item = state.items[message.payload.item]!;
-      item.lastLapse = { seq: message.seq, agent: message.payload.agent, reason: message.payload.reason, lastProgressSeq: message.payload.lastProgressSeq };
+      item.lastLapse = { seq: message.seq, agent: message.payload.agent, reason: message.payload.reason, lastProgressSeq: message.payload.lastProgressSeq, ...tickStamp(state) };
       item.stallReleases = (item.stallReleases ?? 0) + 1;
       if (message.payload.commit !== undefined) {
         // The next owner may start from the holder's latest push.
@@ -4529,6 +4673,9 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
     case "claim.extended": {
       const lease = state.items[message.payload.item]!.lease!;
       lease.deadlineSeq = message.seq + (state.rules.claimDeadlineMessages ?? 0);
+      if (arbitrationV2(state)) {
+        lease.deadlineTick = (state.ticks ?? 0) + (state.rules.claimDeadlineMessages ?? 0);
+      }
       lease.extensions += 1;
       break;
     }
@@ -4548,6 +4695,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         turns: 0,
         openedSeq: message.seq,
         lastActionSeq: message.seq,
+        ...(arbitrationV2(state) ? { lastActionTick: state.ticks ?? 0 } : {}),
       };
       break;
     }
@@ -4555,6 +4703,9 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       const contest = state.contests[message.payload.contest]!;
       contest.turns += 1;
       contest.lastActionSeq = message.seq;
+      if (arbitrationV2(state)) {
+        contest.lastActionTick = state.ticks ?? 0;
+      }
       renewLease(state, contest.ownerItem, message.seq, from);
       break;
     }
@@ -4562,6 +4713,9 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       const contest = state.contests[message.payload.contest]!;
       contest.turns += 1;
       contest.lastActionSeq = message.seq;
+      if (arbitrationV2(state)) {
+        contest.lastActionTick = state.ticks ?? 0;
+      }
       renewLease(state, contest.ownerItem, message.seq, from);
       if (from === contest.owner) {
         const ownerItem = state.items[contest.ownerItem]!;
@@ -4575,6 +4729,9 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
     case "claim.ceded": {
       const contest = state.contests[message.payload.contest]!;
       contest.lastActionSeq = message.seq;
+      if (arbitrationV2(state)) {
+        contest.lastActionTick = state.ticks ?? 0;
+      }
       if (from === contest.owner) {
         releaseClaim(state.items[contest.ownerItem]!);
       } else {
@@ -4670,6 +4827,13 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
     case "trunk.moved":
       (state.trunkMoved ??= []).push(message.payload.rev);
       break;
+    case "push.excluded": {
+      const push = state.items[message.payload.item]!.lastPush!;
+      push.excluded = { seq: message.seq, reason: message.payload.reason };
+      // The holder must act now: its lease runs again from here.
+      renewLease(state, message.payload.item, message.seq);
+      break;
+    }
     case "token.refreshed":
       state.tokenRefreshes = (state.tokenRefreshes ?? 0) + 1;
       break;
@@ -4704,6 +4868,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         by: from,
         offers: [],
         seq: message.seq,
+        ...tickStamp(state),
         ...(message.payload.scope !== undefined ? { scope: [...message.payload.scope] } : {}),
         ...(message.payload.scope !== undefined && message.to !== undefined && message.to.length > 0 ? { to: [...message.to] } : {}),
       };
@@ -4755,6 +4920,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         request.grant = {
           agent: from,
           seq: message.seq,
+          ...tickStamp(state),
           forkOf: p.forkOf,
           ...(p.forkCommit !== undefined ? { forkCommit: p.forkCommit } : {}),
           ...(p.fork !== undefined ? { fork: p.fork } : {}),
@@ -4763,7 +4929,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       break;
     }
     case "help.delivered":
-      state.help[message.payload.request]!.delivered = { commit: message.payload.commit, paths: [...message.payload.paths], seq: message.seq };
+      state.help[message.payload.request]!.delivered = { commit: message.payload.commit, paths: [...message.payload.paths], seq: message.seq, ...tickStamp(state) };
       // A granted helper's delivery is progress on the item.
       renewLease(state, state.help[message.payload.request]!.item, message.seq);
       break;
@@ -4822,7 +4988,11 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         agent: from,
         paths: message.payload.paths,
         ...(message.payload.merges !== undefined ? { merges: message.payload.merges.map((m) => ({ ...m })) } : {}),
+        ...tickStamp(state),
       };
+      if (arbitrationV2(state)) {
+        item.activityTick = state.ticks ?? 0;
+      }
       // The owner answered any outstanding fix request with this push.
       delete item.fixRequested;
       renewLease(state, item.id, message.seq, from);
@@ -4871,6 +5041,10 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         const push = state.items[id]?.lastPush;
         if (push && push.commit === commit && push.gatedIn === undefined) {
           push.gatedIn = message.payload.n;
+          // Revision 2: the time the push waited for the gate is not charged to the deadline.
+          if (push.agent === state.items[id]!.owner) {
+            creditDeadline(state, state.items[id]!, { seqs: message.seq - push.seq, ticks: (state.ticks ?? 0) - (push.tick ?? state.ticks ?? 0) });
+          }
           // Its push was gated: progress on the item.
           renewLease(state, id, message.seq);
         }
@@ -4930,6 +5104,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
     case "handoff": {
       const item = state.items[message.payload.item]!;
       item.owner = message.payload.to;
+      grantBudget(state, item, message.payload.to);
       // The new owner proposes done for itself (and has not struggled yet).
       item.doneProposed = false;
       delete item.struggling;
@@ -4961,6 +5136,8 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       item.fixAttempts = message.payload.attempt;
       item.fixRequested = message.payload.n;
       item.failedRev = message.payload.n;
+      // Revision 2: the holder gets at least one lease window to answer before its deadline.
+      creditDeadline(state, item, undefined, true);
       break;
     }
     case "fix.exhausted": {
@@ -5576,7 +5753,8 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
   // Idle contests: escalate any open contest no party has acted on for the
   // idle limit, measured in board messages. Count-based, so deterministic.
   for (const contest of Object.values(work.contests)) {
-    if (contest.status === "open" && incoming.seq - contest.lastActionSeq >= rules.contestIdleMessages) {
+    const idle = arbitrationV2(work) ? boardClock(work) - (contest.lastActionTick ?? 0) : incoming.seq - contest.lastActionSeq;
+    if (contest.status === "open" && idle >= rules.contestIdleMessages) {
       escalate(contest, "idle");
     }
   }
@@ -5780,6 +5958,7 @@ const RECORDED_ENGINE_TYPES: ReadonlySet<BoardMessageType> = new Set([
   "revision.promoted",
   "run.capped",
   "candidate.gated",
+  "push.excluded",
 ]);
 
 /**
@@ -6048,8 +6227,35 @@ export function appendSeamStalled(state: BoardState, input: unknown, at: string)
   return appendChecked(state, { from: BOARD_ENGINE, type: "seam.stalled", payload: { item: item.id, released: seamReleasable(item) } }, at);
 }
 
+/**
+ * Why the board would refuse `revision.promoted {rev, gatedCommit}` on
+ * `state`, or undefined when it would accept it. Pure: a run checks it BEFORE
+ * promoting (and redeploying), so a tree the board will not back as its
+ * latest passing revision is never shipped (gate-equals-deploy); the rule
+ * applies the same check when the record is appended.
+ */
+export function promotionRefusal(
+  state: BoardState,
+  rev: number,
+  gatedCommit: string,
+): { readonly code: "DUPLICATE" | "INVALID_STATE" | "LOG_MISMATCH"; readonly reason: string } | undefined {
+  if (state.promoted !== undefined) {
+    return { code: "DUPLICATE", reason: `revision ${state.promoted.rev} was already recorded promoted` };
+  }
+  if (state.integrated?.n !== rev || state.lastRevN !== rev) {
+    return { code: "INVALID_STATE", reason: `revision ${rev} is not the board's latest revision, passing: only that one is promoted` };
+  }
+  if (state.integrated.commit !== gatedCommit) {
+    return {
+      code: "LOG_MISMATCH",
+      reason: `the promoted gated commit ${gatedCommit.slice(0, 12)} is not revision ${rev}'s ${state.integrated.commit.slice(0, 12)}: gate-equals-deploy`,
+    };
+  }
+  return undefined;
+}
+
 /** The engine messages the operator records through the engine-record route (`appendEngineRecord`). */
-export const ENGINE_RECORD_TYPES = ["claim.lapsed", "clash.predicted", "trunk.moved", "token.refreshed", "revision.promoted", "run.capped", "candidate.gated"] as const;
+export const ENGINE_RECORD_TYPES = ["claim.lapsed", "clash.predicted", "trunk.moved", "token.refreshed", "revision.promoted", "run.capped", "candidate.gated", "push.excluded"] as const;
 export type EngineRecordType = (typeof ENGINE_RECORD_TYPES)[number];
 
 /**
@@ -6071,6 +6277,10 @@ export type EngineRecordType = (typeof ENGINE_RECORD_TYPES)[number];
  *   - candidate.gated {round, index, of, prefix, commit, base?, verdict,
  *     outcome, rev?, blamed?, progress?}: one candidate of a speculative
  *     integration round; a landed one must be the latest passing revision.
+ *   - push.excluded {item, agent, commit, reason}: the integrator left the
+ *     holder's pending push out of the integrated tree (it failed
+ *     verification); addressed to the holder, it is not re-gated until the
+ *     holder pushes again.
  * Refused (nothing appended) when the record does not match the board.
  */
 export function appendEngineRecord(state: BoardState, input: unknown, at: string): BoardAppendResult {
@@ -6130,6 +6340,17 @@ export function appendEngineRecord(state: BoardState, input: unknown, at: string
         fail("BAD_PAYLOAD", "a token.refreshed record is {agent, kind, request?} (never a token)");
       }
       return appendChecked(state, { from: BOARD_ENGINE, type: "token.refreshed", payload: parsePayload("token.refreshed", raw) as BoardPayloads["token.refreshed"] }, at);
+    }
+    case "push.excluded": {
+      if (Object.keys(raw).some((k) => !["item", "agent", "commit", "reason"].includes(k))) {
+        fail("BAD_PAYLOAD", "a push.excluded record is {item, agent, commit, reason}");
+      }
+      const payload = parsePayload("push.excluded", raw) as BoardPayloads["push.excluded"];
+      return appendChecked(
+        state,
+        { from: BOARD_ENGINE, type: "push.excluded", payload, ...(activeAgent(state, payload.agent) ? { to: [payload.agent] } : {}) },
+        at,
+      );
     }
     case "trunk.moved": {
       if (Object.keys(raw).some((k) => !["rev", "commit", "expected", "actual"].includes(k))) {
@@ -6226,6 +6447,8 @@ export interface BoardDigest {
      * edits it (a done proposal does not complete it). `instruction` says so.
      */
     readonly fix?: { readonly n: number; readonly attempt: number; readonly instruction: string };
+    /** The integrator left this claim's latest push out (push.excluded): fix and push again. */
+    readonly excluded?: { readonly commit: string; readonly reason: string; readonly instruction: string };
     /** Seam-changing items this held item waits for before editing (bounded), then it rebases. */
     readonly waitsFor?: readonly string[];
     /** The failing check is in a protected path (the contract): propose a contract change if it pins old behavior. */
@@ -6529,6 +6752,17 @@ export function boardDigest(
             },
           }
         : {}),
+      ...(i.lastPush?.excluded !== undefined && i.lastPush.agent === agent && i.lastPush.gatedIn === undefined
+        ? {
+            excluded: {
+              commit: i.lastPush.commit,
+              reason: i.lastPush.excluded.reason,
+              instruction:
+                `your push ${i.lastPush.commit.slice(0, 10)} for this item was LEFT OUT of integration (${i.lastPush.excluded.reason}): no gate ran on it and it is not re-gated as it is. ` +
+                "Fix the cause (stay inside the write intent) and push again; you are not waiting for integration",
+            },
+          }
+        : {}),
       ...(i.fixRequested !== undefined
         ? {
             fix: {
@@ -6581,7 +6815,13 @@ export function boardDigest(
         }
         const limit = state.rules.claimLeaseMessages;
         const suspended = leaseSuspension(state, i);
-        const lapsesAt = limit !== undefined ? lease.progressSeq + limit : undefined;
+        // Revision 2 counts participant messages only: the earliest board seq it could lapse at.
+        const lapsesAt =
+          limit === undefined
+            ? undefined
+            : arbitrationV2(state)
+              ? state.lastSeq + Math.max(0, limit - (boardClock(state) - (lease.progressTick ?? 0)))
+              : lease.progressSeq + limit;
         return {
           lease: {
             lastProgressSeq: lease.progressSeq,
@@ -6591,7 +6831,9 @@ export function boardDigest(
             hint:
               suspended !== undefined
                 ? `your claim cannot lapse now (${suspended})`
-                : `your claim lapses${lapsesAt !== undefined ? ` at board seq ${lapsesAt} unless you make progress on ${i.id} first (edit and push, or a message naming it)` : ""}${lease.deadlineSeq !== undefined ? `${lapsesAt !== undefined ? ", and" : ""} at its deadline seq ${lease.deadlineSeq} unless the lead extends it` : ""}; then the item is open for another agent`,
+                : arbitrationV2(state)
+                  ? `your claim lapses${lapsesAt !== undefined ? ` after ${lapsesAt - state.lastSeq} more participant message(s) unless you make progress on ${i.id} first (edit and push, or a message naming it)` : ""}${lease.deadlineTick !== undefined ? `${lapsesAt !== undefined ? ", and" : ""} at its deadline (${Math.max(0, lease.deadlineTick - boardClock(state))} more participant message(s)) unless the lead extends it` : ""}; then the item is open for another agent`
+                  : `your claim lapses${lapsesAt !== undefined ? ` at board seq ${lapsesAt} unless you make progress on ${i.id} first (edit and push, or a message naming it)` : ""}${lease.deadlineSeq !== undefined ? `${lapsesAt !== undefined ? ", and" : ""} at its deadline seq ${lease.deadlineSeq} unless the lead extends it` : ""}; then the item is open for another agent`,
           },
         };
       })(),
@@ -6700,9 +6942,9 @@ export function boardDigest(
         if (i.status !== "claimed" || i.owner === undefined || lease?.deadlineSeq === undefined) {
           return [];
         }
-        const remaining = lease.deadlineSeq - state.lastSeq;
+        const remaining = arbitrationV2(state) ? (lease.deadlineTick ?? 0) - boardClock(state) : lease.deadlineSeq - state.lastSeq;
         return remaining <= Math.ceil(window / 4)
-          ? [{ item: i.id, owner: i.owner, deadlineSeq: lease.deadlineSeq, remaining, lastProgressSeq: lease.progressSeq, extensions: lease.extensions, progressing: state.lastSeq - lease.progressSeq < Math.ceil(pace / 2) }]
+          ? [{ item: i.id, owner: i.owner, deadlineSeq: lease.deadlineSeq, remaining, lastProgressSeq: lease.progressSeq, extensions: lease.extensions, progressing: boardClock(state) - anchorClock(state, lease.progressSeq, lease.progressTick) < Math.ceil(pace / 2) }]
           : [];
       });
       return near.length > 0 ? { deadlines: near } : {};

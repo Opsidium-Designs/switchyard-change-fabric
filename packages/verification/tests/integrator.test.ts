@@ -246,6 +246,88 @@ describe("Integrator", () => {
     expect(stdout.trim()).toBe(baseline); // a failed revision is never pushed
   });
 
+  it("an applied file the tree's ignore rules match is removed before the gate and fails the revision (gate-equals-deploy); an install's node_modules does not", async () => {
+    const unitDir = join(root, "unit");
+    await mkdir(unitDir, { recursive: true });
+    await run("git", ["-C", unitDir, "init", "--initial-branch=main"]);
+    await writeFile(join(unitDir, ".gitignore"), "dist/\nnode_modules/\n", "utf8");
+    await writeFile(join(unitDir, "app.js"), "broken\n", "utf8");
+    const baseline = await commit(unitDir, "baseline");
+    // The unit's repo commits an ignored build output (force-added) the gate would read.
+    await writeFile(join(unitDir, "app.js"), "fixed\n", "utf8");
+    await mkdir(join(unitDir, "dist"), { recursive: true });
+    await writeFile(join(unitDir, "dist", "out.js"), "the gate passes on me\n", "utf8");
+    await run("git", ["-C", unitDir, "add", "-f", "dist/out.js", "app.js"]);
+    await run("git", ["-C", unitDir, ...IDENTITY, "commit", "--no-verify", "-m", "work with an ignored file"]);
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+
+    const { access } = await import("node:fs/promises");
+    const seen: boolean[] = [];
+    const runner = {
+      async run(_argv: readonly string[], cwd: string) {
+        // An install creates node_modules (ignored) BEFORE the gate: never a violation.
+        await mkdir(join(cwd, "node_modules", "dep"), { recursive: true });
+        await writeFile(join(cwd, "node_modules", "dep", "index.js"), "installed\n", "utf8");
+        const present = await access(join(cwd, "dist", "out.js")).then(() => true, () => false);
+        seen.push(present);
+        return { code: present ? 0 : 1, stdout: "", stderr: present ? "" : "gate failed" };
+      },
+    };
+    const result = await new Integrator(provider, { commandRunner: runner }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+      excludedUnits: [],
+      integrationGateCommand: ["npm", "run", "gate"],
+      requiresIntegrationGate: true,
+      workRoot: root,
+    });
+    // The gate never saw the ignored file; the revision fails with a clear reason.
+    expect(seen).toEqual([false]);
+    expect(result.verdict).toBe("failed");
+    expect(result.protectedViolations).toEqual([expect.stringMatching(/^dist\/out\.js \(matched by the tree's ignore rules: the commit would omit it/)]);
+    expect(result.finalCheck.summary).toMatch(/applied file\(s\) the tree's ignore rules match/);
+    expect(result.finalCheck.summary).not.toMatch(/node_modules/);
+    // A failed revision is never pushed: the workspace stays at the baseline.
+    expect(result.commit).toMatch(/^[0-9a-f]{40}$/);
+    const check = join(root, "check");
+    await trackedAt(ref.gitUrl, check);
+    const { stdout } = await run("git", ["-C", check, "rev-parse", "HEAD"]);
+    expect(stdout.trim()).toBe(baseline);
+  });
+
+  it("without an ignored path the same unit integrates and passes (only applied paths are checked)", async () => {
+    const unitDir = join(root, "unit");
+    await mkdir(unitDir, { recursive: true });
+    await run("git", ["-C", unitDir, "init", "--initial-branch=main"]);
+    await writeFile(join(unitDir, ".gitignore"), "dist/\nnode_modules/\n", "utf8");
+    await writeFile(join(unitDir, "app.js"), "broken\n", "utf8");
+    const baseline = await commit(unitDir, "baseline");
+    await writeFile(join(unitDir, "app.js"), "fixed\n", "utf8");
+    await commit(unitDir, "work");
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+    const runner = {
+      async run(_argv: readonly string[], cwd: string) {
+        await mkdir(join(cwd, "node_modules", "dep"), { recursive: true });
+        await writeFile(join(cwd, "node_modules", "dep", "index.js"), "installed\n", "utf8");
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const result = await new Integrator(provider, { commandRunner: runner }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+      excludedUnits: [],
+      integrationGateCommand: ["npm", "run", "gate"],
+      requiresIntegrationGate: true,
+      workRoot: root,
+    });
+    expect(result.verdict).toBe("verified");
+    expect(result.protectedViolations).toBeUndefined();
+  });
+
   it("a deferred integration never moves the branch; the caller advances it after recording", async () => {
     const unitDir = join(root, "unit");
     const baseline = await unitThatDeletes(unitDir);

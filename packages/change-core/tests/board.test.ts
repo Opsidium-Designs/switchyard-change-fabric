@@ -55,6 +55,7 @@ import {
   narrowToSplitChildren,
   objectiveSubChanges,
   pendingPushItems,
+  integrablePushItems,
   splitCue,
   planBoardIntegration,
   decideSpeculativeLanding,
@@ -199,6 +200,7 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
   "item.replanned": { from: "lead", payload: { item: "i", reason: "stalled", action: "rescope", children: [{ item: "k", objective: "o", scopeHint: ["src/k.ts"] }], rev: 2 } },
   "item.escalated": { from: "engine", payload: { item: "k", reason: "replan-failed", replanOf: "i" } },
   "trunk.moved": { from: "engine", payload: { rev: 2, commit: "abc", expected: "def", actual: "fed" } },
+  "push.excluded": { from: "engine", payload: { item: "i", agent: "a", commit: "c1", reason: "failed verification (scope: src/q.ts is outside the write intent)" } },
   "token.refreshed": { from: "engine", payload: { agent: "a", kind: "help-fork", request: "r" } },
   "revision.promoted": { from: "engine", payload: { rev: 3, gatedCommit: "abc", commit: "def", branch: "switchyard/change-1" } },
   "run.capped": { from: "engine", payload: { kind: "spend", limit: 5, used: 5.25 } },
@@ -276,6 +278,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "item.escalated": { item: "k", reason: "replan-failed" },
   "clash.predicted": { a: { agent: "a", item: "i", sha: "c1" }, b: { agent: "b", item: "j", sha: "c2" }, status: "clean" },
   "trunk.moved": { rev: 0, commit: "abc" },
+  "push.excluded": { item: "i", agent: "a", commit: "c1" },
   "token.refreshed": { agent: "a", kind: "help-fork" },
   "revision.promoted": { rev: 3, gatedCommit: "abc", commit: "def", branch: "../etc" },
   "run.capped": { kind: "item-calls", limit: 5, used: 6 },
@@ -318,7 +321,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(57);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(58);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -3255,4 +3258,141 @@ describe("run caps are recorded once each", () => {
     ]);
     expect(reduceBoard(board.log)).toEqual(board.state);
   });
+});
+
+describe("push.excluded", () => {
+  function chatter(board: TestBoard, n: number): void {
+    for (let k = 0; k < n; k += 1) {
+      board.post(msg("b", "item.proposed", { item: `b-idea-${board.state.lastSeq}`, objective: "an idea", acceptance: [], scopeHint: ["docs/**"] }));
+    }
+  }
+
+  it("addressed to the holder: the push leaves the plan, the lease runs again, the wait reason and digest say so; a new push clears it", () => {
+    const board = seeded({ claimLeaseMessages: 4 });
+    board.post(claim("a", "one", ["src/one.ts"]));
+    board.post(push("a", "one", "c1", ["src/one.ts"]));
+    expect(leaseSuspension(board.state, board.state.items.one!)).toBe("its push waits for the gate");
+    const [excluded] = board.post(msg("engine", "push.excluded", { item: "one", agent: "a", commit: "c1", reason: "failed verification (scope)" }));
+    expect(excluded).toMatchObject({ from: "engine", type: "push.excluded", to: ["a"] });
+    expect(board.state.items.one!.lastPush!.excluded).toEqual({ seq: excluded!.seq, reason: "failed verification (scope)" });
+    expect(board.state.items.one!.lease!.progressSeq).toBe(excluded!.seq);
+    expect(leaseSuspension(board.state, board.state.items.one!)).toBeUndefined();
+    expect(itemWaitReason(board.state, "one")).toEqual({ kind: "push-excluded", commit: "c1", reason: "failed verification (scope)" });
+    expect(pendingPushItems(board.state).map((i) => i.id)).toEqual(["one"]);
+    expect(integrablePushItems(board.state)).toEqual([]);
+    expect(planBoardIntegration(board.log, board.state).units).toEqual([]);
+    const digest = boardDigest(board.state, board.log, "a", 0);
+    expect(digest.claims[0]!.excluded).toMatchObject({ commit: "c1", reason: "failed verification (scope)" });
+    expect(digest.messages.some((m) => m.type === "push.excluded")).toBe(true);
+    // Recorded once per push; never for a push that is not the holder's pending one.
+    board.reject(msg("engine", "push.excluded", { item: "one", agent: "a", commit: "c1", reason: "again" }), /already recorded excluded/, "DUPLICATE");
+    board.reject(msg("engine", "push.excluded", { item: "one", agent: "a", commit: "zz", reason: "x" }), /is not a's pending, ungated push/, "INVALID_STATE");
+    board.reject(msg("engine", "push.excluded", { item: "one", agent: "a", commit: "c1", reason: "x", extra: 1 }), /is \{item, agent, commit, reason\}/, "BAD_PAYLOAD");
+    // The holder does nothing: the lease lapses.
+    chatter(board, 4);
+    expect(board.state.items.one!.status).toBe("open");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+    expect(foldBoard(board.log)).toEqual(board.state);
+  });
+
+  it("the holder's next push clears it and is planned again", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/one.ts"]));
+    board.post(push("a", "one", "c1", ["src/one.ts"]));
+    board.post(msg("engine", "push.excluded", { item: "one", agent: "a", commit: "c1", reason: "failed verification" }));
+    board.post(push("a", "one", "c2", ["src/one.ts"]));
+    expect(board.state.items.one!.lastPush!.excluded).toBeUndefined();
+    expect(itemWaitReason(board.state, "one")).toEqual({ kind: "waiting-for-gate", commit: "c2" });
+    expect(planBoardIntegration(board.log, board.state).units.map((u) => u.commit)).toEqual(["c2"]);
+    // A gated push can no longer be excluded.
+    board.post(rev("fail", ["c2"], "r1"));
+    board.reject(msg("engine", "push.excluded", { item: "one", agent: "a", commit: "c2", reason: "x" }), /pending, ungated push/, "INVALID_STATE");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("arbitration revision 2 (rules.arbitration)", () => {
+  const failing = (merged: string[], items: string[], commit: string) =>
+    msg("engine", "integrated.rev", { commit, gate: "fail", merged, failing: { output: "not ok", items } });
+  function chatter(board: TestBoard, n: number): void {
+    for (let k = 0; k < n; k += 1) {
+      board.post(msg("c", "item.proposed", { item: `c-idea-${board.state.lastSeq}`, objective: "an idea", acceptance: [], scopeHint: ["docs/**"] }));
+    }
+  }
+
+  it("only revision 1 or 2 is accepted; revision 1 is the default and is not recorded", () => {
+    const one = seeded({ arbitration: 1 });
+    expect(one.state.rules.arbitration).toBeUndefined();
+    expect(one.log[0]!.type === "goal.posted" && one.log[0]!.payload.rules.arbitration).toBeUndefined();
+    const two = seeded({ arbitration: 2 });
+    expect(two.state.rules.arbitration).toBe(2);
+    const board = new TestBoard();
+    board.reject(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 3 } }), /arbitration/, "BAD_PAYLOAD");
+  });
+
+  for (const arbitration of [1, 2]) {
+    it(`a different agent granted the item after a lapse ${arbitration === 2 ? "starts with a fresh fix budget" : "inherits the spent fix attempts (revision 1)"}`, () => {
+      const board = seeded({ arbitration, claimLeaseMessages: 4, maxFixAttempts: 1 });
+      board.post(claim("a", "one", ["src/one.ts"]));
+      board.post(push("a", "one", "c1", ["src/one.ts"]));
+      board.post(failing(["c1"], ["one"], "r1"));
+      expect(board.state.items.one!.fixAttempts).toBe(1);
+      // a never answers: its claim lapses (no progress), and b takes the item.
+      chatter(board, 4);
+      expect(board.state.items.one!.status).toBe("open");
+      board.post(claim("b", "one", ["src/one.ts"]));
+      expect(board.state.items.one!.owner).toBe("b");
+      expect(board.state.items.one!.fixAttempts).toBe(arbitration === 2 ? 0 : 1);
+      board.post(push("b", "one", "c2", ["src/one.ts"]));
+      const types = board.types(failing(["c2"], ["one"], "r2"));
+      // Revision 2: b gets its own first attempt; revision 1: b's first failure spends the budget.
+      expect(types).toContain(arbitration === 2 ? "fix.requested" : "fix.exhausted");
+      expect(reduceBoard(board.log)).toEqual(board.state);
+    });
+  }
+
+  for (const arbitration of [1, 2]) {
+    it(`a fix request at the deadline ${arbitration === 2 ? "leaves the holder a lease window (gate wait not charged)" : "lapses in the same batch (revision 1)"}`, () => {
+      const board = seeded({ arbitration, claimDeadlineMessages: 6 });
+      board.post(claim("a", "one", ["src/one.ts"]));
+      board.post(push("a", "one", "c1", ["src/one.ts"]));
+      // The push waits for the gate (suspended) well past the deadline window.
+      chatter(board, 8);
+      expect(board.state.items.one!.status).toBe("claimed");
+      const appended = board.post(failing(["c1"], ["one"], "r1")).map((m) => m.type);
+      expect(appended).toContain("fix.requested");
+      if (arbitration === 2) {
+        expect(appended).not.toContain("claim.lapsed");
+        expect(board.state.items.one!.status).toBe("claimed");
+        // The holder answers within its window: the claim stays live.
+        board.post(push("a", "one", "c2", ["src/one.ts"]));
+        expect(board.state.items.one!.status).toBe("claimed");
+      } else {
+        expect(appended).toContain("claim.lapsed");
+        expect(board.state.items.one!.status).toBe("open");
+      }
+      expect(reduceBoard(board.log)).toEqual(board.state);
+    });
+  }
+
+  for (const arbitration of [1, 2]) {
+    it(`engine records ${arbitration === 2 ? "never advance the lease clock" : "advance the lease clock (revision 1)"}`, () => {
+      const board = seeded({ arbitration, claimLeaseMessages: 4 });
+      board.post(claim("a", "one", ["src/one.ts"]));
+      for (let k = 0; k < 6; k += 1) {
+        board.post(msg("engine", "token.refreshed", { agent: "b", kind: "repo-write" }));
+      }
+      expect(board.state.items.one!.status).toBe(arbitration === 2 ? "claimed" : "open");
+      if (arbitration === 2) {
+        expect(board.state.ticks).toBeGreaterThan(0);
+        const digest = boardDigest(board.state, board.log, "a", 0);
+        expect(digest.claims[0]!.lease!.hint).toMatch(/after \d+ more participant message\(s\)/);
+        // Participant messages do advance it.
+        chatter(board, 4);
+        expect(board.state.items.one!.status).toBe("open");
+      }
+      expect(reduceBoard(board.log)).toEqual(board.state);
+      expect(foldBoard(board.log)).toEqual(board.state);
+    });
+  }
 });

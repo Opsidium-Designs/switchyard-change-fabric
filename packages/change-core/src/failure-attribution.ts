@@ -78,7 +78,8 @@ function extractFailingNames(evidence: string): readonly string[] {
   // line start. Scan that message anywhere in the line for the leading resource
   // token that precedes a `must`/`:` so the name is recovered even when the
   // top-level `✖ <name>` line was not captured.
-  const assertionShape = /(?:Error|AssertionError)[^:]*:\s+([A-Za-z0-9_-]+)\s+(?:must\b|should\b)/;
+  // The error-class span is bounded so a long colon-free line stays linear.
+  const assertionShape = /(?:Error|AssertionError)[^:]{0,200}:\s+([A-Za-z0-9_-]+)\s+(?:must\b|should\b)/;
   for (const line of lines) {
     const colon = colonShape.exec(line);
     if (colon && colon[1]) {
@@ -138,13 +139,8 @@ function extractFailingFiles(evidence: string): readonly string[] {
   // name the file that failed; prefer them when there are any.
   const located = new Set<string>();
   // `<path>:<line>` (stack frames, most runners) and tsc's `<path>(<line>,<col>)`.
-  const at = /((?:[A-Za-z]:)?[A-Za-z0-9_./-]*\/?[A-Za-z0-9_.-]+\.[A-Za-z0-9]+)(?::\d+|\(\d+,\d+\))/g;
-  let match: RegExpExecArray | null;
-  while ((match = at.exec(text)) !== null) {
-    const raw = match[1]!.replace(/^file:\/\//, "");
-    if (!/^node:/.test(match[0]) && !raw.startsWith("node:") && raw.includes("/")) {
-      located.add(raw);
-    }
+  for (const raw of errorLocations(text)) {
+    located.add(raw);
   }
   if (located.size > 0) {
     return [...located];
@@ -152,14 +148,120 @@ function extractFailingFiles(evidence: string): readonly string[] {
   const found = new Set<string>();
   // Otherwise: path-shaped tokens, one or more segments separated by `/`,
   // ending in a file with an extension.
-  const re = /([A-Za-z0-9_.-]+\/[A-Za-z0-9/_.-]+\.[A-Za-z0-9]+)/g;
-  while ((match = re.exec(text)) !== null) {
-    const raw = match[1];
-    if (raw) {
-      found.add(raw);
-    }
+  for (const raw of pathTokens(text)) {
+    found.add(raw);
   }
   return [...found];
+}
+
+/**
+ * The longest path-shaped token attribution considers. Gate output is
+ * agent-influenced, so a token longer than any real path is ignored rather
+ * than walked (it names no file a unit declares).
+ */
+const MAX_PATH_TOKEN = 1024;
+
+/** A character a path token may contain. */
+const PATH_RUN = /[A-Za-z0-9_./-]+/g;
+
+/**
+ * The maximal runs of path characters in `text`, each with its start offset.
+ * One forward pass with a single-class, non-nested pattern: linear time, so a
+ * long unbroken token in a failing gate's output cannot stall the integrator.
+ * Runs longer than MAX_PATH_TOKEN are skipped.
+ */
+function pathRuns(text: string): Array<{ readonly run: string; readonly start: number }> {
+  const out: Array<{ run: string; start: number }> = [];
+  PATH_RUN.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = PATH_RUN.exec(text)) !== null) {
+    if (match[0].length <= MAX_PATH_TOKEN) {
+      out.push({ run: match[0], start: match.index });
+    }
+  }
+  return out;
+}
+
+/** Whether `segment` ends in a file extension: `<one or more chars>.<alnum>+`. */
+function hasExtension(segment: string): boolean {
+  const dot = segment.lastIndexOf(".");
+  return dot >= 1 && dot < segment.length - 1 && /^[A-Za-z0-9]+$/.test(segment.slice(dot + 1));
+}
+
+/**
+ * Error LOCATIONS in `text`: a path ending in a file with an extension,
+ * immediately followed by `:<line>` (stack frames, most runners) or tsc's
+ * `(<line>,<col>)`. A one-letter drive prefix (`C:`) is kept; `node:` internals
+ * and paths with no directory are dropped. Linear time (see pathRuns).
+ */
+function errorLocations(text: string): string[] {
+  const out: string[] = [];
+  for (const { run, start } of pathRuns(text)) {
+    const end = start + run.length;
+    const last = run.slice(run.lastIndexOf("/") + 1);
+    if (!hasExtension(last)) {
+      continue;
+    }
+    const next = text.charCodeAt(end + 1);
+    const lineFollows = text[end] === ":" && next >= 48 && next <= 57;
+    const tscFollows = text[end] === "(" && /^\(\d{1,9},\d{1,9}\)/.test(text.slice(end, end + 22));
+    if (!lineFollows && !tscFollows) {
+      continue;
+    }
+    if (text.slice(Math.max(0, start - 5), start) === "node:") {
+      continue;
+    }
+    const drive =
+      start >= 2 && text[start - 1] === ":" && /[A-Za-z]/.test(text[start - 2]!) && (start < 3 || !/[A-Za-z0-9_./-]/.test(text[start - 3]!))
+        ? text.slice(start - 2, start)
+        : "";
+    const raw = `${drive}${run}`;
+    if (raw.includes("/")) {
+      out.push(raw);
+    }
+  }
+  return out;
+}
+
+/**
+ * Path-shaped tokens in `text`: one or more segments separated by `/`, ending
+ * in a file with an extension (`src/a.js`, `pkg/lib/x.test.ts`). Per run of path
+ * characters the token starts at the first non-slash character that has a
+ * slash after it and ends at the furthest `.<alnum>+` extension after that
+ * slash with at least one character between them. Linear time.
+ */
+function pathTokens(text: string): string[] {
+  const out: string[] = [];
+  const isAlnum = (c: number) => (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+  for (const { run } of pathRuns(text)) {
+    let s = 0;
+    while (s < run.length && run[s] === "/") {
+      s += 1;
+    }
+    const slash = run.indexOf("/", s);
+    if (s >= run.length || slash < 0) {
+      continue;
+    }
+    // Walk back from the end over alphanumeric runs: the first one preceded by
+    // a dot far enough past the slash ends the token.
+    let e = run.length;
+    let found = -1;
+    while (e > slash + 2) {
+      let a = e;
+      while (a > slash + 1 && isAlnum(run.charCodeAt(a - 1))) {
+        a -= 1;
+      }
+      if (a < e && run[a - 1] === "." && a - 1 >= slash + 2) {
+        found = e;
+        break;
+      }
+      e = a < e ? a : e - 1;
+    }
+    if (found > 0) {
+      out.push(run.slice(s, found));
+    }
+  }
+  return out;
 }
 
 /**
@@ -275,9 +377,7 @@ export function failingRepoFiles(evidence: string, repoFiles: readonly string[])
     }
   }
   const lines = evidence.split(/\r?\n/).filter((line) => !/^\s*[>$] /.test(line));
-  const location = /((?:[A-Za-z]:)?[A-Za-z0-9_./-]*\/?[A-Za-z0-9_.-]+\.[A-Za-z0-9]+)(?::\d+|\(\d+,\d+\))/g;
-  const locationsIn = (line: string): string[] =>
-    [...line.matchAll(location)].map((m) => m[1]!).filter((raw) => !raw.startsWith("node:") && raw.includes("/"));
+  const locationsIn = (line: string): string[] => errorLocations(line);
   const nonFrame = new Set<string>();
   const callers = new Set<string>();
   let stack: string[] = [];

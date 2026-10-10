@@ -84,9 +84,9 @@ class Board {
   };
 }
 
-function boardWithPushes(heads: Record<string, { sha: string }>, baseline?: string): Board {
+function boardWithPushes(heads: Record<string, { sha: string }>, baseline?: string, rules?: Record<string, unknown>): Board {
   const board = new Board();
-  board.post({ kind: "human" }, { type: "goal.posted", payload: { objective: "o", ...(baseline !== undefined ? { baseline } : {}) } });
+  board.post({ kind: "human" }, { type: "goal.posted", payload: { objective: "o", ...(baseline !== undefined ? { baseline } : {}), ...(rules ? { rules } : {}) } });
   board.post({ kind: "join", agent: "lead" }, { type: "agent.joined", payload: { role: "lead" } });
   const scopes: Record<string, string[]> = { a: ["src/a/**", "src/common.ts"], b: ["src/b/**"], c: ["src/c/**"] };
   for (const agent of Object.keys(heads)) {
@@ -185,5 +185,25 @@ describe("clash alerts from real code (advisory)", () => {
       recorded: 0,
       conflicts: 0,
     });
+  });
+
+  it("arbitration revision 2: undecided pairs of one pass are ONE summary record, never one per pair", async () => {
+    const root = await mkdtemp(join(tmpdir(), "scf-clash-summary-"));
+    const { integration, heads } = await repos(root, {
+      a: { "src/a/x.ts": "export const x = 2;\n" },
+      b: { "src/b/y.ts": "export const y = 2;\n" },
+      c: { "src/c/z.ts": "export const z = 2;\n" },
+    });
+    // c's push cannot be read: two pairs (a,c) and (b,c) are undecided.
+    const readRemote = async (agent: string) => (agent === "c" ? join(root, "missing-repo") : heads[agent]!.dir);
+    const v1 = boardWithPushes(heads);
+    expect((await recordPendingClashes({ operator: v1.operator, integrationRemote: integration, integrationBranch: "main", readRemote, workRoot: join(root, "w1"), seen: new Set() })).recorded).toBe(2);
+    const v2 = boardWithPushes(heads, undefined, { arbitration: 2 });
+    const result = await recordPendingClashes({ operator: v2.operator, integrationRemote: integration, integrationBranch: "main", readRemote, workRoot: join(root, "w2"), seen: new Set() });
+    expect(result).toEqual({ pairs: 3, recorded: 1, conflicts: 0 });
+    const clashes = v2.log.filter((m) => m.type === "clash.predicted");
+    expect(clashes).toHaveLength(1);
+    expect(clashes[0]!.payload).toMatchObject({ status: "unknown", reason: expect.stringMatching(/^2 pair\(s\) could not be decided; the first: could not read c's push/) });
+    expect(reduceBoard(v2.log)).toEqual(v2.state);
   });
 });

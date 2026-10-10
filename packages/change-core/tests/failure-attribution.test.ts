@@ -95,3 +95,39 @@ describe("failingRepoFiles: the place a failure is IN, not a helper it called", 
     expect(failingRepoFiles("src/app.js:3\n  return x +;\n           ^\nSyntaxError: Unexpected token ';'", repo)).toEqual(["src/app.js"]);
   });
 });
+
+describe("attribution stays linear on hostile gate output", () => {
+  const units = [
+    { unitId: "u-users", paths: ["src/resources/users.js"] },
+    { unitId: "u-orders", paths: ["src/resources/orders.js"] },
+  ];
+  const n = 100_000;
+  const shapes: Record<string, string> = {
+    letters: "a".repeat(n),
+    "slashed segments": "a/".repeat(n / 2),
+    "dotted segments": "a.".repeat(n / 2),
+    "dotted path with a line suffix": `${"a/b.".repeat(n / 4)}:1`,
+    "repeated error class with no colon": "Error".repeat(n / 5),
+    "mixed path characters": "a-b_c.d/".repeat(n / 8),
+  };
+  for (const [name, token] of Object.entries(shapes)) {
+    it(`a 100k-char unbroken token line (${name}) finishes well under 200 ms`, () => {
+      const evidence = `not ok 1 - users: rejects\n${token}\n    at handle (/tmp/x/src/resources/users.js:3:1)\n`;
+      const started = performance.now();
+      const result = attributeFailure(units, evidence);
+      failingRepoFiles(evidence, ["src/resources/users.js", "src/resources/orders.js"]);
+      const elapsed = performance.now() - started;
+      expect(elapsed).toBeLessThan(200);
+      expect(result.units.map((u) => u.unitId)).toEqual(["u-users"]);
+    });
+  }
+
+  it("still finds a drive-prefixed location and a tsc location, and skips node internals", () => {
+    const evidence = [
+      "    at x (node:internal/modules/cjs/loader.js:1:1)",
+      "src/resources/orders.js(4,2): error TS2322",
+    ].join("\n");
+    expect(attributeFailure(units, evidence).units.map((u) => u.unitId)).toEqual(["u-orders"]);
+    expect(attributeFailure(units, "    at y (C:/work/src/resources/users.js:9:1)").units.map((u) => u.unitId)).toEqual(["u-users"]);
+  });
+});

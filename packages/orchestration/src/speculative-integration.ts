@@ -80,6 +80,8 @@ import { redactSecrets } from "./redact.ts";
 import {
   failingRevisionEvidence,
   flushAttributionDecisions,
+  keyWithout,
+  recordExcludedPushes,
   revisionFailure,
   verifySubLeadMerges,
   type BoardDecisionRecord,
@@ -164,6 +166,8 @@ interface BuiltCandidate {
   readonly mergedAgents: readonly string[];
   readonly excludedAgents: readonly { agent: string; reason: string }[];
   readonly skipped?: string;
+  /** The integrator refused to build this candidate's tree (it threw). */
+  readonly refused?: string;
 }
 
 /** The pushes of a stack prefix, as a candidate record names them. */
@@ -197,7 +201,7 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
   const board = await options.operator.log();
   const state = board.state;
   const plan = planBoardIntegration(board.messages, state);
-  const key = speculationStateKey(state);
+  let key = speculationStateKey(state);
   const pending = [...plan.pending];
   if (key === "") {
     return { requiresIntegrationGate, key, failure: "nothing is pending" };
@@ -294,7 +298,8 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
         identity: options.identity,
       });
     } catch (error) {
-      return { index, entries, mergedAgents: [], excludedAgents: [], skipped: scrub(`the integrator refused: ${error instanceof Error ? error.message : String(error)}`) };
+      const refused = scrub(`the integrator refused: ${error instanceof Error ? error.message : String(error)}`);
+      return { index, entries, mergedAgents: [], excludedAgents: [], skipped: refused, refused };
     }
     const excluded = evidence.units
       .filter((u) => u.verdict !== "verified")
@@ -347,6 +352,30 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
     return candidate;
   });
 
+  // Pushes the verifier left out of a candidate's tree (or that alone made the
+  // integrator refuse C1, the head plus that push only) are recorded excluded,
+  // addressed to their holders: they leave the stack until their holder pushes
+  // again, so the pushes behind them can land.
+  const excludedByVerification = new Map<string, string>();
+  for (const c of built) {
+    for (const e of c.excludedAgents) {
+      if (!excludedByVerification.has(e.agent)) {
+        excludedByVerification.set(e.agent, e.reason);
+      }
+    }
+  }
+  const firstBuilt = built[0];
+  if (firstBuilt?.refused !== undefined && firstBuilt.entries.length === 1 && !excludedByVerification.has(firstBuilt.entries[0]!.unit.agent)) {
+    excludedByVerification.set(firstBuilt.entries[0]!.unit.agent, firstBuilt.refused);
+  }
+  const excludedUnits = stack
+    .filter((e) => excludedByVerification.has(e.unit.agent))
+    .map((e) => ({ agent: e.unit.agent, items: [...e.unit.items], reason: excludedByVerification.get(e.unit.agent)! }));
+  const excludedPushes = await recordExcludedPushes(options.operator, excludedUnits);
+  if (excludedPushes > 0) {
+    key = keyWithout(key, excludedUnits);
+  }
+
   const landing = decideSpeculativeLanding(built.map((c) => ({ index: c.index, ...(c.gate !== undefined ? { gate: c.gate } : {}) })));
   const landed = landing.landed !== undefined ? built[landing.landed - 1]! : undefined;
   let blamed = landing.blamed !== undefined ? built[landing.blamed - 1]! : undefined;
@@ -359,11 +388,13 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
   const itemsOf = (c: BuiltCandidate): BoardItem[] => c.entries.filter((e) => c.mergedAgents.includes(e.unit.agent)).flatMap((e) => [...e.unit.items]);
 
   if (!landed && !blamed) {
-    // Nothing gated can be recorded: C1 could not be built or gated.
+    // Nothing gated can be recorded: C1 could not be built or gated. When a
+    // push was recorded excluded, the stack rebuilds without it next.
     const first = built[0]!;
     return {
       requiresIntegrationGate,
       key,
+      ...(excludedPushes > 0 ? { excludedPushes } : {}),
       ...(first.evidence ? { evidence: first.evidence } : {}),
       failure: first.skipped ?? "the first candidate could not be gated",
       candidates: built.map((c) => outcomeOf(c, undefined)),
@@ -516,10 +547,14 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
   if (landed) {
     const result = await record(landed);
     if (!result.revision) {
+      // The landed pass was refused, so the latest RECORDED revision (if any)
+      // is the blamed failure: its evidence is the round's, never the
+      // unrecorded candidate's (gate-equals-deploy: an unrecorded pass is
+      // never promoted or redeployed).
       return {
         requiresIntegrationGate,
         key,
-        evidence: landed.evidence!,
+        evidence: revisions.length > 0 ? blamed!.evidence! : landed.evidence!,
         ...(revisions.length > 0 ? { revision: revisions.at(-1)!, revisions } : {}),
         ...(result.stale ? { stale: true } : {}),
         failure: result.failure!,
@@ -566,7 +601,7 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
       .catch(() => undefined);
   }
   const lastEvidence = landed?.evidence ?? blamed!.evidence!;
-  return { revision: revisions.at(-1)!, revisions, evidence: lastEvidence, requiresIntegrationGate, key, candidates };
+  return { revision: revisions.at(-1)!, revisions, evidence: lastEvidence, requiresIntegrationGate, key, candidates, ...(excludedPushes > 0 ? { excludedPushes } : {}) };
 }
 
 /** A built candidate as the round reports it. */

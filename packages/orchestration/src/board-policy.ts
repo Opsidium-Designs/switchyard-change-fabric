@@ -889,6 +889,22 @@ function decide(input: Input, options: GenericBoardPolicyOptions = {}): AgentAct
       }
     }
   }
+  for (const claim of d.claims) {
+    // The integrator left this claim's latest push out (push.excluded): edit
+    // again (bounded), since that push is not re-gated as it is.
+    if (claim.excluded !== undefined && claim.fix === undefined) {
+      const failedEdits = decisions.filter(
+        (h) => h.action.type === "edit" && h.action.itemId === claim.item && h.outcome !== "posted" && h.note?.excluded === claim.excluded!.commit,
+      ).length;
+      if (failedEdits < 2) {
+        return {
+          type: "edit",
+          itemId: claim.item,
+          instruction: `My push ${claim.excluded.commit.slice(0, 10)} was left out of integration (${claim.excluded.reason}): fix that, staying inside the write intent, then push again: ${claim.objective}`,
+        };
+      }
+    }
+  }
   const toolItems = new Set((input.board.tools ?? []).map((t) => t.item));
   for (const claim of d.claims) {
     // A tool item is built (build_tool above), never edited or proposed done.

@@ -17,6 +17,10 @@
  *   - unknown (a pair could not be decided) or unavailable (no prediction
  *     could run, a push could not be read), with the reason: never clean;
  *   - a clean pair is not recorded.
+ * Under arbitration revision 2 the undecided pairs (unknown or unavailable)
+ * of one pass are recorded as ONE summary record (its first pair, the count
+ * in the reason), never one record per pair: engine records never flood the
+ * board.
  * Nothing here orders, holds, or blocks integration: a failure only records
  * an unavailable prediction. The gate on the integrated tree decides.
  */
@@ -24,7 +28,7 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 
-import { clashKey, entryWithin, intentPath, planBoardIntegration, type BoardClashHead, type BoardMessage, type BoardState } from "@switchyard-change/change-core";
+import { arbitrationV2, clashKey, entryWithin, intentPath, planBoardIntegration, type BoardClashHead, type BoardMessage, type BoardState } from "@switchyard-change/change-core";
 import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { predictClashes } from "@switchyard-change/verification";
 
@@ -110,12 +114,30 @@ export async function recordPendingClashes(input: PendingClashInput): Promise<Pe
   }
   let recorded = 0;
   let conflicts = 0;
-  const record = async (a: number, b: number, outcome: Record<string, unknown>): Promise<void> => {
+  const post = async (a: number, b: number, outcome: Record<string, unknown>): Promise<void> => {
     const strip = ({ scope: _scope, ...head }: (typeof heads)[number]) => head;
     const posted = await input.operator.recordEngine("clash.predicted", { a: strip(heads[a]!), b: strip(heads[b]!), ...outcome }).catch(() => undefined);
     if (posted?.ok) {
       recorded += 1;
     }
+  };
+  // Revision 2: undecided pairs are collected and summarized once (see the module comment).
+  const summarize = arbitrationV2(state);
+  const undecided: { a: number; b: number; status: string; reason: string }[] = [];
+  const record = async (a: number, b: number, outcome: Record<string, unknown>): Promise<void> => {
+    if (summarize && outcome.status !== "conflict") {
+      undecided.push({ a, b, status: String(outcome.status), reason: String(outcome.reason ?? "") });
+      return;
+    }
+    await post(a, b, outcome);
+  };
+  const flushUndecided = async (): Promise<void> => {
+    const first = undecided[0];
+    if (first === undefined) {
+      return;
+    }
+    const reason = undecided.length === 1 ? first.reason : `${undecided.length} pair(s) could not be decided; the first: ${first.reason}`;
+    await post(first.a, first.b, { status: first.status, reason: reason.slice(0, 300) });
   };
   for (const [a, b] of fresh) {
     input.seen.add(clashKey(heads[a]!.sha, heads[b]!.sha));
@@ -142,6 +164,7 @@ export async function recordPendingClashes(input: PendingClashInput): Promise<Pe
       for (const [a, b] of fresh) {
         await record(a, b, { status: "unavailable", reason });
       }
+      await flushUndecided();
       return { pairs: fresh.length, recorded, conflicts };
     }
     const readable = heads.map((_, i) => i).filter((i) => !unreadable.has(i));
@@ -200,12 +223,15 @@ export async function recordPendingClashes(input: PendingClashInput): Promise<Pe
       conflicts += 1;
       await record(a, b, { status: "conflict", paths, scope: paths.some((path) => seams.has(path)) ? "shared" : "local" });
     }
+    await flushUndecided();
     return { pairs: fresh.length, recorded, conflicts };
   } catch (error) {
     const reason = scrub(`no prediction: ${error instanceof Error ? error.message : String(error)}`).slice(0, 300);
+    undecided.length = 0;
     for (const [a, b] of fresh) {
       await record(a, b, { status: "unavailable", reason });
     }
+    await flushUndecided();
     return { pairs: fresh.length, recorded, conflicts };
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => undefined);

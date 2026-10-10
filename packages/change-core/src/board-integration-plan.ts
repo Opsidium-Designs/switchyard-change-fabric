@@ -67,6 +67,15 @@ export function pendingPushItems(state: BoardState): BoardItem[] {
   );
 }
 
+/**
+ * The pending pushes an integration may gate: every pending push except one
+ * the integrator recorded excluded (push.excluded), which waits for its
+ * holder's next push instead of being re-gated as it is. Pure.
+ */
+export function integrablePushItems(state: BoardState): BoardItem[] {
+  return pendingPushItems(state).filter((i) => i.lastPush!.excluded === undefined);
+}
+
 /** Children's pushes still waiting for their sub-lead to merge them (not pending integration). */
 export function awaitingSubLead(state: BoardState): BoardItem[] {
   return Object.values(state.items).filter((i) => {
@@ -78,9 +87,9 @@ export function awaitingSubLead(state: BoardState): BoardItem[] {
   });
 }
 
-/** A stable key for the set of pending pushes (what one integration would merge). */
+/** A stable key for the set of pending pushes one integration would merge (excluded pushes aside). */
 export function pendingPushKey(state: BoardState): string {
-  return pendingPushItems(state)
+  return integrablePushItems(state)
     .map((i) => i.lastPush!.commit)
     .sort()
     .join(",");
@@ -89,7 +98,7 @@ export function pendingPushKey(state: BoardState): string {
 /** Synthesize the next revision's units from the board (empty units when nothing is pending). */
 export function planBoardIntegration(messages: readonly BoardMessage[], state: BoardState): BoardIntegrationPlan {
   const key = pendingPushKey(state);
-  const pending = pendingPushItems(state);
+  const pending = integrablePushItems(state);
   if (pending.length === 0) {
     return { key, pending, units: [] };
   }
@@ -238,7 +247,7 @@ export function speculativeUnits(plan: BoardIntegrationPlan): BoardIntegrationUn
  * a push changes it, so the pushes behind that push are gated next.
  */
 export function speculationStateKey(state: BoardState): string {
-  const pending = pendingPushItems(state);
+  const pending = integrablePushItems(state);
   const held = new Set(pending.filter((i) => i.fixRequested !== undefined).map((i) => i.lastPush!.agent));
   return pending
     .filter((i) => !held.has(i.lastPush!.agent))

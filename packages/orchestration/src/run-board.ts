@@ -45,6 +45,8 @@ import {
   BOARD_LIMITS,
   boardAttributionTally,
   pendingPushItems,
+  promotionRefusal,
+  CURRENT_ARBITRATION,
   pendingPushKey,
   planBoardIntegration,
   speculationStateKey,
@@ -84,7 +86,7 @@ import type { AgentTurnTransport, AskJev, ExecutorProvider } from "@switchyard-c
 import { jevErrorReason, ScopedNoopExecutor } from "@switchyard-change/model-adapters";
 import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { authenticatedRemote, type GitIdentity } from "@switchyard-change/local-runner";
-import type { PromotionResult } from "@switchyard-change/git-promotion";
+import { defaultBranch, type PromotionResult } from "@switchyard-change/git-promotion";
 import {
   advanceIntegrationBranch,
   isPromotionRefused,
@@ -294,7 +296,8 @@ export function formatBudgetsLine(b: BoardRunEffectiveBudgets): string {
     (b.caps
       ? `; caps: ${b.caps.maxCalls !== undefined ? `${b.caps.maxCalls} model call(s)` : "no call cap"}, ${b.caps.maxSpendUsd !== undefined ? `${b.caps.maxSpendUsd} USD estimated spend` : "no spend cap"}, ` +
         `${b.caps.maxWallMs !== undefined ? `${Math.round(b.caps.maxWallMs / 1000)} s wall clock` : "no wall-clock cap"}, ${b.caps.maxCallsPerItem !== undefined ? `${b.caps.maxCallsPerItem} call(s) per item` : "no per-item cap"}`
-      : "")
+      : "") +
+    (b.warnings ?? []).map((w) => `; warning: ${w}`).join("")
   );
 }
 
@@ -650,6 +653,50 @@ export interface IntegrateBoardResult {
   readonly transient?: boolean;
   /** With `stale`: the agents whose pushes were superseded while the gate ran. */
   readonly supersededAgents?: readonly string[];
+  /**
+   * How many pending pushes this attempt recorded excluded (push.excluded):
+   * they leave the next plan, so the integrator runs again at once on what
+   * is left instead of waiting for a new push.
+   */
+  readonly excludedPushes?: number;
+}
+
+/**
+ * Record `push.excluded` for the pending pushes of every unit the integrator
+ * left out because it failed verification (or, alone, made the integrator
+ * refuse), addressed to its holder: each item's latest push, once. A refusal
+ * (the push was superseded meanwhile, or is already recorded) is ignored.
+ * Returns how many were recorded.
+ */
+export async function recordExcludedPushes(
+  operator: BoardOperatorClient,
+  excluded: readonly { readonly agent: string; readonly items: readonly BoardItem[]; readonly reason: string }[],
+): Promise<number> {
+  let recorded = 0;
+  for (const unit of excluded) {
+    for (const item of unit.items) {
+      if (item.lastPush === undefined || item.lastPush.excluded !== undefined) {
+        continue;
+      }
+      const outcome = await operator
+        .recordEngine("push.excluded", { item: item.id, agent: unit.agent, commit: item.lastPush.commit, reason: firstLines(unit.reason, 600) })
+        .catch(() => undefined);
+      if (outcome?.ok) {
+        recorded += 1;
+      }
+    }
+  }
+  return recorded;
+}
+
+/**
+ * A pending-push key (sorted commits, comma-joined) without the pushes of the
+ * excluded units: what the attempt actually decided, so a set is marked
+ * attempted as the board now plans it (an excluded push left the plan).
+ */
+export function keyWithout(key: string, excluded: readonly { readonly items: readonly BoardItem[] }[]): string {
+  const gone = new Set(excluded.flatMap((u) => u.items.flatMap((i) => (i.lastPush ? [i.lastPush.commit] : []))));
+  return gone.size === 0 ? key : key.split(",").filter((c) => c !== "" && !gone.has(c)).join(",");
 }
 
 /** A stable key for the set of pending pushes (what one integration would merge). */
@@ -983,7 +1030,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   // What the next revision merges, synthesized from the board (shared with the
   // integration Workflow on Cloudflare).
   const plan = planBoardIntegration(board.messages, state);
-  const key = plan.key;
+  let key = plan.key;
   const pending = [...plan.pending];
   if (pending.length === 0) {
     return { requiresIntegrationGate, key, failure: "nothing is pending" };
@@ -1080,11 +1127,19 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     // changed). No gate ran on any recordable tree, so no revision is posted.
     return { requiresIntegrationGate, key, failure: scrub(`the integrator refused: ${error instanceof Error ? error.message : String(error)}`) };
   }
+  const verificationExcluded: { agent: string; items: BoardItem[]; reason: string }[] = [];
   for (const u of evidence.units) {
     if (u.verdict !== "verified") {
       const failed = u.checks.filter((c) => !c.passed && !c.skipped).map((c) => `${c.kind}: ${c.summary}`);
-      excludedAgents.push({ agent: u.unitId, reason: scrub(`failed verification (${failed.join("; ") || "verdict failed"})`) });
+      const reason = scrub(`failed verification (${failed.join("; ") || "verdict failed"})`);
+      excludedAgents.push({ agent: u.unitId, reason });
+      verificationExcluded.push({ agent: u.unitId, items: itemsByAgent.get(u.unitId) ?? [], reason });
     }
+  }
+  // Tell each holder its push was left out (it is not re-gated as it is).
+  const excludedPushes = await recordExcludedPushes(options.operator, verificationExcluded);
+  if (excludedPushes > 0) {
+    key = keyWithout(key, verificationExcluded);
   }
   const mergedAgents = evidence.units.filter((u) => u.verdict === "verified").map((u) => u.unitId);
   const commit = evidence.integration.commit;
@@ -1093,6 +1148,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
       requiresIntegrationGate,
       key,
       evidence,
+      ...(excludedPushes > 0 ? { excludedPushes } : {}),
       failure:
         mergedAgents.length === 0
           ? `every pending push was excluded: ${excludedAgents.map((e) => `${e.agent}: ${e.reason}`).join("; ")}`
@@ -1451,12 +1507,49 @@ export class ContinuousBoardIntegrator {
       this.requested = true;
       return;
     }
+    if ((result.excludedPushes ?? 0) > 0) {
+      // Pushes were recorded excluded: they leave the plan, so integrate what
+      // is left now (never wait on a push that is not re-gated as it is).
+      this.requested = true;
+      return;
+    }
     this.attempted.add(tried);
     if (result.failure !== undefined && result.failure !== "nothing is pending") {
       this.failures.push(result.failure);
       this.options.onFailure?.(result.failure);
     }
   }
+}
+
+/**
+ * Why a board run must NOT promote (or redeploy) its last revision, or
+ * undefined when it may. Checked before acting, never after:
+ *   - the final verdict must be "verified" (the last revision passed, its
+ *     evidence verified, nothing pending was left ungated);
+ *   - the evidence must be the last recorded revision's: its gated commit is
+ *     exactly that revision's commit (a candidate the board refused to record
+ *     is never shipped);
+ *   - the board must accept `revision.promoted` for that revision.
+ */
+export function promotionBlocked(input: {
+  readonly verdict: "verified" | "failed";
+  readonly last: BoardRevision;
+  readonly evidence: EvidenceSummary;
+  readonly state: BoardState;
+}): string | undefined {
+  const { verdict, last, evidence, state } = input;
+  if (verdict !== "verified" || last.gate !== "pass" || evidence.integration.verdict !== "verified") {
+    const shown = evidence.integration.verdict === "verified" ? "failed" : evidence.integration.verdict;
+    return `integration verdict was "${shown}", not "verified": not promoting (no delivery branch was created)`;
+  }
+  if (evidence.integration.commit !== last.commit) {
+    return (
+      `the evidence's gated commit ${(evidence.integration.commit ?? "(none)").slice(0, 12)} is not revision ${last.n}'s recorded commit ` +
+      `${last.commit.slice(0, 12)}: gate-equals-deploy, not promoting (no delivery branch was created)`
+    );
+  }
+  const refused = promotionRefusal(state, last.n, last.commit);
+  return refused === undefined ? undefined : `the board would not record the promotion (${refused.code}: ${refused.reason}): not promoting (no delivery branch was created)`;
 }
 
 /**
@@ -1701,6 +1794,12 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     planned = await options.seed(objective);
     // The planner's decomposition is a model call too (usage unknown here: counted unpriced).
     meter.count(planned.model !== undefined ? { model: planned.model } : {});
+    // So is each plan-review decision the planner pass asked inside the seed
+    // (the chosen plan's and every earlier one's): metered after the fact,
+    // since the seed is the caller's and makes those calls itself.
+    for (let k = 0; k < (planned.priorReviews?.length ?? 0) + (planned.review !== undefined ? 1 : 0); k += 1) {
+      meter.count(options.jevModel !== undefined ? { model: options.jevModel } : {});
+    }
   } catch (error) {
     await failPlanningChange({
       workerUrl: base,
@@ -1719,7 +1818,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   const effective = scaledBudgets({
     items: planned.items.length,
     scopeFiles,
-    ...(options.budgets?.maxActiveClaims !== undefined ? { explicitActiveClaims: options.budgets.maxActiveClaims } : {}),
+    // An explicit claim cap (the goal rule, else the budget) is respected, never overwritten.
+    ...((options.rules?.maxActiveClaims ?? options.budgets?.maxActiveClaims) !== undefined
+      ? { explicitActiveClaims: (options.rules?.maxActiveClaims ?? options.budgets?.maxActiveClaims)! }
+      : {}),
     explicitFixAttempts: options.rules?.maxFixAttempts ?? options.budgets?.maxFixAttemptsPerItem,
     ...(options.budgets?.maxRunTurns !== undefined ? { explicitRunTurns: options.budgets.maxRunTurns } : {}),
     ...((options.rules?.claimLeaseMessages ?? options.budgets?.claimLeaseMessages) !== undefined
@@ -1761,6 +1863,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         claimOverlap: true,
         // Speculative batch gating (recorded only when on: absent is 1).
         ...(speculate > 1 ? { speculate } : {}),
+        // The current arbitration revision (fair clocks, fresh fix budgets per
+        // holder, deadline credits), unless the caller pinned revision 1.
+        ...(options.rules?.arbitration === 1 ? {} : { arbitration: options.rules?.arbitration ?? CURRENT_ARBITRATION }),
       },
       protected: guarded.paths,
       // The immutable acceptance gate: never contract-changeable.
@@ -2278,8 +2383,12 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           item.status !== "claimed" ||
           item.owner === undefined ||
           item.lease === undefined ||
-          // Released for not moving twice already: the lead re-plans it instead.
-          (item.stallReleases ?? 0) >= BOARD_LIMITS.stallReleasesBeforeReplan ||
+          // Released for not moving twice already: an item the lead may re-plan
+          // is released ONCE more (re-planning needs it open: replanEligible);
+          // one it may not (a tool, a seam item, a re-plan's child) is left.
+          ((item.stallReleases ?? 0) > BOARD_LIMITS.stallReleasesBeforeReplan ||
+            ((item.stallReleases ?? 0) === BOARD_LIMITS.stallReleasesBeforeReplan &&
+              (item.tool !== undefined || item.fromContract !== undefined || item.replanOf !== undefined || item.replanned !== undefined))) ||
           itemWaitReason(state, item.id) !== undefined ||
           leaseSuspension(state, item) !== undefined
         ) {
@@ -2416,10 +2525,17 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       }
       // Every outstanding item was spent by every agent still running: nobody
       // can take it again (reopening only hands it to fresh eyes).
+      // Judged on the LEAF items: a split (or re-planned) parent is carried by
+      // its children, so it is stuck exactly when a child it waits on is.
       const running = workers.filter((w) => !w.stopped).map((w) => w.id);
+      const leaves = owed.filter((i) => i.status !== "split");
+      const parentsWaitOnChildren = owed
+        .filter((i) => i.status === "split")
+        .every((i) => i.children.some((c) => state.items[c] !== undefined && state.items[c]!.status !== "done"));
       if (
-        owed.length > 0 &&
-        owed.every((i) => i.status === "open" && (i.exhaustedBy?.length ?? 0) > 0 && running.every((w) => i.exhaustedBy!.includes(w))) &&
+        leaves.length > 0 &&
+        parentsWaitOnChildren &&
+        leaves.every((i) => i.status === "open" && (i.exhaustedBy?.length ?? 0) > 0 && running.every((w) => i.exhaustedBy!.includes(w))) &&
         !integrator.wants(state) &&
         // The lead gets its one re-plan turn on each such item first.
         lead.replanPending(state).length === 0
@@ -2661,7 +2777,14 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       }
     }
 
-    if (last && evidence && partial === undefined) {
+    // Checked BEFORE acting: the verdict is verified, the evidence is exactly
+    // the last recorded revision's gated commit, and the board would back the
+    // promotion. Otherwise nothing is promoted or redeployed (gate-equals-deploy).
+    const blocked = last && evidence && partial === undefined ? promotionBlocked({ verdict, last, evidence, state: finalState }) : undefined;
+    if (last && evidence && partial === undefined && blocked !== undefined) {
+      promotion = { changeId, branch: defaultBranch(changeId), commit: "", deliveredPaths: [], removedPaths: [], committed: false, refusedReason: blocked };
+      emit({ kind: "promotion-skipped", reason: blocked });
+    } else if (last && evidence && partial === undefined) {
       // The promote step reads the verdict from the last revision's evidence
       // (the same gate result the board recorded) and refuses anything else.
       // The cloud integrator's repo is an Artifact repo: promotion reads it with
@@ -2879,6 +3002,8 @@ export interface ScaledBudgets {
   readonly leaseScaled: boolean;
   readonly claimDeadlineMessages: number;
   readonly deadlineScaled: boolean;
+  /** What the operator should know about these budgets (an empty plan, a capped turn budget). */
+  readonly warnings?: readonly string[];
 }
 
 /**
@@ -2910,6 +3035,16 @@ export function scaledBudgets(input: {
   // Generous: more agents post more messages between one holder's turns.
   const lease = input.explicitLease ?? Math.max(MIN_SCALED_LEASE_MESSAGES, LEASE_MESSAGES_PER_AGENT * Math.max(1, dialMax));
   const deadline = input.explicitDeadline ?? DEADLINE_LEASES * lease;
+  const warnings: string[] = [];
+  if (input.items === 0) {
+    warnings.push("the plan has no items: nothing can be claimed or completed, so the run never ends all-items-done (it ends when the board goes quiet)");
+  }
+  const wanted = RUN_TURNS_PER_ITEM * input.items + RUN_TURNS_PER_SCOPE_FILE * (input.scopeFiles ?? 0);
+  if (input.explicitRunTurns === undefined && wanted > MAX_SCALED_RUN_TURNS) {
+    warnings.push(
+      `the plan-scaled run-turn budget is capped at ${MAX_SCALED_RUN_TURNS} (the plan's size asks for ${wanted}${input.items > MAX_SCALED_RUN_TURNS ? `, and it has more items (${input.items}) than turns` : ""}): pass an explicit run-turn budget (--max-turns) to raise it`,
+    );
+  }
   return {
     maxFixAttempts: fix,
     fixAttemptsScaled: input.explicitFixAttempts === undefined,
@@ -2923,6 +3058,7 @@ export function scaledBudgets(input: {
     leaseScaled: input.explicitLease === undefined,
     claimDeadlineMessages: deadline,
     deadlineScaled: input.explicitDeadline === undefined,
+    ...(warnings.length > 0 ? { warnings } : {}),
   };
 }
 
@@ -3093,6 +3229,8 @@ function payloadSummary(m: BoardMessage): string {
         (c.blamed !== undefined ? `; blamed ${c.blamed.join(", ")}` : "")
       );
     }
+    case "push.excluded":
+      return `${String(p.agent)}'s push ${String(p.commit).slice(0, 10)} for ${String(p.item)} was left out of integration: ${String(p.reason).slice(0, 160)} (not re-gated until it pushes again)`;
     case "run.capped":
       return `${String(p.kind)} cap reached${p.item !== undefined ? ` for ${String(p.item)}` : ""}: ${String(p.used)} of ${String(p.limit)} (no new turns)`;
     case "revision.promoted":

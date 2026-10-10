@@ -166,6 +166,8 @@ export interface RunBoardOfflineOptions {
    * stays byte-identical run to run.
    */
   readonly speculate?: number;
+  /** Goal rules to post (see RunBoardOptions.rules); `{ arbitration: 1 }` pins the pre-revision arbitration. */
+  readonly rules?: RunBoardOptions["rules"];
   /** Pin Git author and committer dates for the run so commit ids repeat (default true). */
   readonly fixedGitDates?: boolean;
   readonly onEvent?: (event: BoardRunEvent) => void;
@@ -205,6 +207,7 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       // Candidates in order, one at a time: a deterministic log.
       candidateConcurrency: 1,
       ...(options.budgets ? { budgets: options.budgets } : {}),
+      ...(options.rules ? { rules: options.rules } : {}),
       ...(options.caps ? { caps: options.caps } : {}),
       ...(options.capsClock ? { capsClock: options.capsClock } : {}),
       workRoot: join(workRoot, "run"),

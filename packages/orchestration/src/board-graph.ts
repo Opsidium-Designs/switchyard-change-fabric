@@ -62,6 +62,9 @@ import {
 // ---------------------------------------------------------------------------
 
 export type { BoardMessage, BoardState } from "@switchyard-change/change-core";
+// Re-exported so the console can validate a recorded log with the board's own
+// reducer through its declared dependency on this package.
+export { reduceBoard } from "@switchyard-change/change-core";
 
 export type BoardGraphNodeKind = "goal" | "lead" | "agent" | "item" | "rev" | "tool" | "jev" | "human";
 
@@ -425,6 +428,7 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     case "trunk.moved":
     case "revision.promoted":
     case "candidate.gated":
+    case "push.excluded":
     case "fix.requested":
     case "fix.exhausted":
       return "rev";

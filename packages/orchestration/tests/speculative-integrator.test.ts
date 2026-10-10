@@ -19,13 +19,13 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
-import type { BoardMessage } from "@switchyard-change/change-core";
+import { integrablePushItems, itemWaitReason, leaseSuspension, type BoardMessage } from "@switchyard-change/change-core";
 import { readDependencySnapshotFromDir, runnerResolutionContract, type CommandOutcome, type CommandRunner } from "@switchyard-change/verification";
 
 import { BoardAgentClient, BoardOperatorClient } from "../src/board-client.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
 import { assertBoardBacked, boardRevNodeId, buildBoardGraph } from "../src/board-graph.ts";
-import { ContinuousBoardIntegrator, runBoard, type BoardAgentRepo } from "../src/run-board.ts";
+import { ContinuousBoardIntegrator, promotionBlocked, runBoard, type BoardAgentRepo } from "../src/run-board.ts";
 import { createIntegrationWorkspace } from "../src/run-live.ts";
 
 const git = promisify(execFile);
@@ -143,7 +143,17 @@ async function setup(setupOptions: SetupOptions = {}) {
   };
   /** The revisions recorded after the warm-up one. */
   const revisions = async () => of(await log(), "integrated.rev").slice(1);
-  return { root, control, operator, push, integrator, log, branchHead, fileAt, remote, warm, revisions, projectDir };
+  /** Leave a file outside every write intent in the agent's checkout: its next push commits it too. */
+  const stray = async (id: string, rel: string, body: string): Promise<void> => {
+    const { dir } = agent(id);
+    await mkdir(dirname(join(dir, rel)), { recursive: true });
+    await writeFile(join(dir, rel), body);
+  };
+  /** Remove that file in the agent's checkout (its next push deletes it). */
+  const unstray = async (id: string, rel: string): Promise<void> => {
+    await git("git", ["-C", agent(id).dir, "rm", "-q", rel]);
+  };
+  return { root, control, operator, push, integrator, log, branchHead, fileAt, remote, warm, revisions, projectDir, stray, unstray };
 }
 
 /** A gate that fails while any file of the tree carries "BAD", naming that file (like a failing test's location). */
@@ -375,6 +385,99 @@ describe("speculative batch gating", () => {
     expect(candidates[1]!.payload.commit).toBe(revs[0]!.payload.commit);
     expect(await env.branchHead()).toBe(revs[0]!.payload.commit);
   });
+
+  it("a landed pass the board refuses after the blamed failure was recorded: the round's evidence is the failure's, and nothing may be promoted", async () => {
+    const env = await setup();
+    await env.warm();
+    await env.push("a1", "x", "src/x/a.ts", "export const a = 1;\n");
+    await env.push("a2", "y", "src/y/b.ts", "export const b = 'BAD';\n");
+    // The board accepts the blamed failure, then refuses every passing
+    // revision (not a stale base: the round does not rebuild).
+    const refusedPasses: string[] = [];
+    const operator = new Proxy(env.operator, {
+      get(target, prop, receiver) {
+        if (prop === "recordRevision") {
+          return async (input: Parameters<BoardOperatorClient["recordRevision"]>[0]) => {
+            if (input.gate === "pass") {
+              refusedPasses.push(input.commit);
+              return { ok: false, status: 409, code: "INVALID_STATE", error: "refused for the test" };
+            }
+            return target.recordRevision(input);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const integrator = env.integrator({ operator, verifyCommandRunner: new MarkerGate(), candidateConcurrency: 1 });
+    integrator.kick();
+    await integrator.idle();
+
+    expect(refusedPasses.length).toBeGreaterThan(0);
+    const revs = await env.revisions();
+    expect(revs.map((r) => r.payload.gate)).toEqual(["fail"]);
+    const last = integrator.revisions.at(-1)!;
+    expect(last.gate).toBe("fail");
+    expect(last.commit).toBe(revs[0]!.payload.commit);
+    // The evidence is the RECORDED failure's, never the refused candidate's.
+    expect(integrator.lastEvidence!.integration.commit).toBe(last.commit);
+    expect(integrator.lastEvidence!.integration.verdict).not.toBe("verified");
+    expect(refusedPasses).not.toContain(integrator.lastEvidence!.integration.commit);
+    const state = (await env.operator.page(0, 1)).state;
+    expect(promotionBlocked({ verdict: "failed", last, evidence: integrator.lastEvidence!, state })).toMatch(/not "verified": not promoting/);
+    expect(of(await env.log(), "revision.promoted")).toEqual([]);
+  });
+
+  for (const speculate of [3, 1]) {
+    it(`a push that fails verification is recorded excluded to its holder, leaves the plan, and is re-gated only after a new push (speculate ${speculate})`, async () => {
+      const env = await setup();
+      if (speculate > 1) {
+        await env.warm();
+      }
+      // a1's push for x also commits a file outside its write intent: the verifier excludes it.
+      await env.stray("a1", "src/q/stray.ts", "export const q = 1;\n");
+      const p1 = await env.push("a1", "x", "src/x/a.ts", "export const a = 1;\n");
+      const p2 = await env.push("a2", "y", "src/y/b.ts", "export const b = 1;\n");
+      const p3 = await env.push("a3", "z", "src/z/c.ts", "export const c = 1;\n");
+      const integrator = env.integrator({ verifyCommandRunner: new MarkerGate(), candidateConcurrency: 1, speculate });
+      integrator.kick();
+      await integrator.idle();
+
+      const log = await env.log();
+      const excluded = of(log, "push.excluded");
+      expect(excluded.map((m) => [m.payload.item, m.payload.agent, m.payload.commit, m.to])).toEqual([["x", "a1", p1, ["a1"]]]);
+      expect(excluded[0]!.payload.reason).toMatch(/failed verification/);
+      // The others land (speculation rebuilt its stack without p1); p1 was never merged.
+      const revs = await env.revisions();
+      const landed = (speculate > 1 ? revs : of(log, "integrated.rev")).filter((r) => r.payload.gate === "pass").flatMap((r) => [...r.payload.merged]);
+      expect(landed.sort()).toEqual([p2, p3].sort());
+      expect(of(log, "integrated.rev").some((r) => r.payload.merged.includes(p1))).toBe(false);
+      let state = (await env.operator.page(0, 1)).state;
+      expect(state.items.x!.lastPush!.excluded).toBeDefined();
+      expect(itemWaitReason(state, "x")).toMatchObject({ kind: "push-excluded", commit: p1 });
+      // The claim no longer waits for the gate (a lease would run again).
+      expect(leaseSuspension(state, state.items.x!)).toBeUndefined();
+      expect(integrablePushItems(state).map((i) => i.id)).toEqual([]);
+      // Nothing is re-gated until the holder pushes again.
+      expect(integrator.wants(state)).toBe(false);
+      const gatedBefore = of(log, "integrated.rev").length;
+      integrator.kick();
+      await integrator.idle();
+      expect(of(await env.log(), "integrated.rev")).toHaveLength(gatedBefore);
+
+      // The holder's next push (the stray file removed) is gated and lands.
+      await env.unstray("a1", "src/q/stray.ts");
+      const fixed = await env.push("a1", "x", "src/x/a.ts", "export const a = 2;\n");
+      state = (await env.operator.page(0, 1)).state;
+      expect(state.items.x!.lastPush!.excluded).toBeUndefined();
+      expect(itemWaitReason(state, "x")).toMatchObject({ kind: "waiting-for-gate", commit: fixed });
+      integrator.kick();
+      await integrator.idle();
+      const last = of(await env.log(), "integrated.rev").at(-1)!;
+      expect([last.payload.gate, [...last.payload.merged]]).toEqual(["pass", [fixed]]);
+      expect(of(await env.log(), "push.excluded")).toHaveLength(1);
+    });
+  }
 
   it("speculation with the cloud integrator is refused at startup, before anything is provisioned", async () => {
     let calls = 0;

@@ -311,8 +311,11 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
       const later = of(result.log, "claim.granted").filter((g) => g.seq > m.seq && g.payload.item === m.payload.item);
       expect(later.every((g) => g.payload.agent !== m.payload.previousOwner)).toBe(true);
     }
-    // The phase ends when every outstanding item was spent by every running agent (or the run budget).
-    expect(["fix-budget", "run-budget", "quiescent"]).toContain(result.stopReason);
+    // The phase ends when every outstanding item was spent by every running
+    // agent, judged on the leaf items: the re-planned parents (split, carried
+    // by their children) never keep the fix-budget stop from firing.
+    expect(of(result.log, "item.replanned").length).toBeGreaterThan(0);
+    expect(result.stopReason).toBe("fix-budget");
     // The same pending set is never gated twice.
     const keys = result.revisions.map((r) => [...r.merged].sort().join(","));
     expect(new Set(keys).size).toBe(keys.length);
@@ -1232,6 +1235,26 @@ describe("budgets that scale with the plan (explicit values win)", () => {
     });
   });
 
+  it("says so when a plan is empty or the scaled turn budget is capped below what the plan asks", async () => {
+    const { scaledBudgets, formatBudgetsLine } = await import("../src/run-board.ts");
+    const dial = { minConcurrency: 1, maxConcurrency: 3 };
+    const empty = scaledBudgets({ items: 0, dial, scaleDial: false });
+    expect(empty.warnings).toEqual([expect.stringMatching(/the plan has no items: .*never ends all-items-done/)]);
+    const huge = scaledBudgets({ items: 900, dial, scaleDial: false });
+    expect(huge.maxRunTurns).toBe(800);
+    expect(huge.warnings).toEqual([expect.stringMatching(/capped at 800 \(the plan's size asks for 22500, and it has more items \(900\) than turns\): pass an explicit run-turn budget/)]);
+    expect(formatBudgetsLine({ ...huge, items: 900 })).toContain("; warning: the plan-scaled run-turn budget is capped at 800");
+    // An explicit budget silences it; a plan that fits has none.
+    expect(scaledBudgets({ items: 900, explicitRunTurns: 30000, dial, scaleDial: false }).warnings).toBeUndefined();
+    expect(scaledBudgets({ items: 10, dial, scaleDial: false }).warnings).toBeUndefined();
+  });
+
+  it("an explicit goal-rule claim cap is respected, never overwritten by the scaled one", async () => {
+    const result = await offline({ goal: GOAL, projectDir: await project(), seed, rules: { maxActiveClaims: 3 } });
+    expect(of(result.log, "goal.posted")[0]!.payload.rules).toMatchObject({ maxActiveClaims: 3 });
+    expect(formatBoardRunSummary(result)).toMatch(/claim cap 3 unfinished item\(s\) per agent \(explicit\)/);
+  });
+
   it("a run posts the scaled fix budget with its goal, recruits under the scaled dial, and prints the effective values", async () => {
     const projectDir = await project();
     const tenItems = async (): Promise<BoardSeed> => ({
@@ -1831,4 +1854,132 @@ describe("cost and time caps (demo safety)", () => {
     expect(new Set(itemCaps.map((m) => (m.payload as { item: string }).item)).size).toBe(itemCaps.length);
     expect(reduceBoard(result.log)).toEqual(result.state);
   });
+});
+
+describe("runBoard never promotes or redeploys a candidate the board did not record", () => {
+  /** An executor that stamps every in-scope file with the item and a run-wide attempt number. */
+  class AttemptStamp implements ExecutorProvider {
+    readonly name = "attempt-stamp";
+    private n = 0;
+    async execute(context: ExecutorContext): Promise<ExecutionResult> {
+      this.n += 1;
+      const written: string[] = [];
+      for (const path of context.paths.filter((p) => !/[*?]/.test(p))) {
+        await mkdir(dirname(join(context.worktreeDir, path)), { recursive: true });
+        await writeFile(join(context.worktreeDir, path), `// ${context.workUnitId} attempt ${this.n}\n`);
+        written.push(path);
+      }
+      return { status: "changed", changedPaths: written, logs: [], cost: { usd: 0 }, commitMessage: `edit ${context.workUnitId}` };
+    }
+  }
+  /** Fails while src/z.ts holds z's FIRST pushed content; passes everything else. */
+  class FirstZFails implements CommandRunner {
+    private firstZ: string | undefined;
+    async run(_argv: readonly string[], cwd: string): Promise<CommandOutcome> {
+      const z = await readFile(join(cwd, "src/z.ts"), "utf8").catch(() => "");
+      if (z.includes("attempt") && this.firstZ === undefined) {
+        this.firstZ = z;
+      }
+      return z.includes("attempt") && z === this.firstZ
+        ? { code: 1, stdout: "not ok 1 - z\n# src/z.ts:1:1 AssertionError\n", stderr: "" }
+        : { code: 0, stdout: "ok 1 - all\n", stderr: "" };
+    }
+  }
+
+  it("a speculative round whose landed pass is refused after its blamed failure was recorded: verdict failed, no promotion, no redeploy", async () => {
+    const root = await mkdtemp(join(tmpdir(), "scf-refused-landing-"));
+    const projectDir = join(root, "p");
+    for (const [rel, body] of Object.entries({ "package.json": '{"name":"p","scripts":{}}\n', "src/w.ts": "w\n", "src/x.ts": "x\n", "src/y.ts": "y\n", "src/z.ts": "z\n" })) {
+      await mkdir(dirname(join(projectDir, rel)), { recursive: true });
+      await writeFile(join(projectDir, rel), body);
+    }
+    const control = new LocalChangeControl(new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "repos") }));
+    const inner = control.fetch as unknown as typeof fetch;
+    // After the first accepted FAILING revision, the board refuses every
+    // passing revision (a refusal that is not a stale base: nothing rebuilds).
+    let failRecorded = false;
+    const refusedPasses: string[] = [];
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      if (String(url).endsWith("/integration/revision") && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as { gate: string; commit: string };
+        if (body.gate === "pass" && failRecorded) {
+          refusedPasses.push(body.commit);
+          return new Response(JSON.stringify({ code: "INVALID_STATE", error: "refused for the test" }), { status: 409, headers: { "content-type": "application/json" } });
+        }
+        const res = await inner(url as never, init);
+        if (body.gate === "fail" && res.status === 201) {
+          failRecorded = true;
+        }
+        return res;
+      }
+      return inner(url as never, init);
+    }) as unknown as typeof fetch;
+    const deploys: string[] = [];
+    const events: BoardRunEvent[] = [];
+    const result = await runBoard({
+      goal: GOAL,
+      changeId: "refused-landing",
+      workerUrl: "http://local-control",
+      fetchFn,
+      dial: { minConcurrency: 1, maxConcurrency: 2 },
+      transport: createGenericBoardPolicy(),
+      seed: async () => ({
+        source: "planner",
+        model: "fake-planner",
+        items: ["w", "x", "y", "z"].map((item) => ({ item, objective: `do ${item}`, acceptance: ["gate passes"], scopeHint: [`src/${item}.ts`] })),
+      }),
+      resolveContract: reject,
+      workRoot: join(root, "work"),
+      projectDir,
+      executor: new AttemptStamp(),
+      schedule: "lockstep",
+      speculate: 3,
+      candidateConcurrency: 1,
+      appGateCommand: ["gate"],
+      verifyCommandRunner: new FirstZFails(),
+      budgets: { maxFixAttemptsPerItem: 1, maxRunTurns: 200, maxRounds: 200 },
+      deployAppDir: projectDir,
+      deployAppName: "refused-landing-app",
+      deployApp: async ({ appName }) => {
+        deploys.push(appName);
+        return { url: `https://${appName}.example.workers.dev` };
+      },
+      appAlreadyDeployed: async ({ appName }) => `https://${appName}.example.workers.dev`,
+      onEvent: (e) => events.push(e),
+    });
+
+    // The branch was reached: a round recorded its blamed failure, then the
+    // board refused its landed pass.
+    expect(refusedPasses.length).toBeGreaterThan(0);
+    expect(result.revisions.map((r) => r.gate)).toEqual(["pass", "fail"]);
+    expect(result.integrationFailures.some((f) => /the board refused the revision \(INVALID_STATE\)/.test(f))).toBe(true);
+    // The last RECORDED revision is the blamed failure: the verdict says so.
+    expect(result.revision!.gate).toBe("fail");
+    expect(result.verdict).toBe("failed");
+    expect(result.evidence!.integration.commit).toBe(result.revision!.commit);
+    expect(refusedPasses).not.toContain(result.evidence!.integration.commit);
+    // Nothing promoted, nothing recorded promoted, nothing redeployed.
+    expect(result.promotion).toMatchObject({ committed: false });
+    expect(result.promotion!.refusedReason).toMatch(/not "verified": not promoting/);
+    expect(of(result.log, "revision.promoted")).toEqual([]);
+    expect(deploys).toEqual([]);
+    expect(result.deployment).toBeUndefined();
+    expect(events.some((e) => e.kind === "promoting")).toBe(false);
+    expect(result.proof?.status).not.toBe("proven");
+    expect(boardRunExitCode(result)).toBe(1);
+  }, 120_000);
+});
+
+describe("runBoard meters the planner pass's plan-review decisions", () => {
+  it("each plan review the seed carries (the chosen plan's and every earlier one's) counts as a model call", async () => {
+    const plain = await offline({ goal: GOAL, projectDir: await project(), seed });
+    const review = { question: "Does this plan cover the goal?", noul: "yes", confidence: 0.9, accepted: true };
+    const reviewed = await offline({
+      goal: GOAL,
+      projectDir: await project(),
+      seed: async () => ({ ...(await seed()), review, priorReviews: [{ ...review, accepted: false, confidence: 0.4, model: "m0", units: ["core"] }] }),
+    });
+    expect(of(reviewed.log, "decision.recorded").filter((m) => m.payload.juncture === "plan-review")).toHaveLength(2);
+    expect(reviewed.usage!.calls - plain.usage!.calls).toBe(2);
+  }, 120_000);
 });

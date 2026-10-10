@@ -502,13 +502,17 @@ describe("agents build tools for each other (offline, deterministic)", () => {
     });
     expect(result.stopReason).toBe("quiescent");
     expect(Date.now() - started).toBeLessThan(90_000);
-    // Claims nobody moved were recorded stalled on the quiet board (each item
-    // at most stallReleasesBeforeReplan times), and then the phase ended quiet.
+    // Claims nobody moved were recorded stalled on the quiet board: each item
+    // at most stallReleasesBeforeReplan times, plus once more when the lead may
+    // re-plan it (re-planning needs it open), and then the phase ended quiet.
     const stalled = result.log.filter((m) => m.type === "claim.lapsed");
     expect(stalled.length).toBeGreaterThan(0);
     for (const item of new Set(stalled.map((m) => (m.payload as { item: string }).item))) {
-      expect(stalled.filter((m) => (m.payload as { item: string }).item === item).length).toBeLessThanOrEqual(2);
+      const lapses = stalled.filter((m) => (m.payload as { item: string }).item === item);
+      expect(lapses.length).toBeLessThanOrEqual(item.startsWith("tool-") || item.includes(".r") ? 2 : 3);
     }
+    // The extra release made a re-plan possible, and the lead used it before the board went quiet.
+    expect(result.log.some((m) => m.type === "item.replanned")).toBe(true);
     expect(result.turns.some((t) => t.code === "TOOL_BUILD_FAILED")).toBe(true);
     const summary = formatBoardRunSummary(result);
     expect(result.stopDetail).toMatch(/every agent was idle \(none taking a turn\).*no board message arrived for 3 s/);

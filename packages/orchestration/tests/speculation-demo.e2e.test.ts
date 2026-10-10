@@ -1,9 +1,9 @@
 /**
  * Speculative batch gating on the offline demo board run (no network,
  * deterministic):
- *   - with speculation off (K = 1) the recorded board log is byte-for-byte
- *     the log the run recorded before speculation existed (a golden fixture
- *     captured from that code);
+ *   - with speculation off (K = 1) and arbitration revision 1 pinned, the
+ *     recorded board log is byte-for-byte the log the run recorded before
+ *     speculation existed (a golden fixture captured from that code);
  *   - with the default K the run still verifies, and its proof bundle names
  *     the speculative round that landed the final revision: the landed
  *     candidate's commit IS the revision's gated commit IS the promoted one.
@@ -21,7 +21,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, "..", "..", "..");
 
 /** The demo-board run of the audit-logging goal, as `make demo-board` runs it. */
-async function demo(speculate?: number) {
+async function demo(speculate?: number, rules?: Parameters<typeof runBoardOffline>[0]["rules"]) {
   const goal = (await readFile(join(REPO_ROOT, "examples", "goals", "audit-logging.goal.txt"), "utf8")).trim();
   return runBoardOffline({
     goal,
@@ -32,13 +32,15 @@ async function demo(speculate?: number) {
     replacesDeclaredGate: ["npm", "run", "gate"],
     resolveContract: async () => "reject",
     ...(speculate !== undefined ? { speculate } : {}),
+    ...(rules !== undefined ? { rules } : {}),
   });
 }
 
 describe("speculative batch gating on the offline demo board", () => {
-  it("K = 1 records exactly the board log of the run before speculation", async () => {
+  it("K = 1 (arbitration revision 1 pinned) records exactly the board log of the run before speculation", async () => {
     const golden = JSON.parse(await readFile(join(HERE, "fixtures", "board-audit-speculate1.log.json"), "utf8")) as unknown[];
-    const result = await demo(1);
+    // The golden log predates the arbitration revision rule: pinning revision 1 reproduces it byte for byte.
+    const result = await demo(1, { arbitration: 1 });
     expect(result.verdict).toBe("verified");
     expect(JSON.parse(JSON.stringify(result.log))).toEqual(golden);
     expect(result.speculation).toBeUndefined();
@@ -46,12 +48,13 @@ describe("speculative batch gating on the offline demo board", () => {
     expect(result.log.find((m) => m.type === "goal.posted")!.payload).not.toHaveProperty("rules.speculate");
   }, 120_000);
 
-  it("the default K still verifies; the proof ties the landed candidate to the gated and promoted commit", async () => {
+  it("the default run (K = 3, the current arbitration revision) still verifies; the proof ties the landed candidate to the gated and promoted commit", async () => {
     const result = await demo();
     expect(result.verdict).toBe("verified");
     expect(result.speculation?.speculate).toBe(3);
     const goal = result.log.find((m) => m.type === "goal.posted")!;
     expect(goal.type === "goal.posted" && goal.payload.rules.speculate).toBe(3);
+    expect(goal.type === "goal.posted" && goal.payload.rules.arbitration).toBe(2);
     const proof = result.proof!;
     expect(proof.status).toBe("proven");
     const landed = proof.speculation!.landed!;

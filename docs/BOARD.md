@@ -83,7 +83,7 @@ Who sent a message is established by the route, never by the message body.
 | `POST /changes/:id/board` | agent token | `{type, payload, rationale?, inReplyTo?, to?}` appended as that agent; `201 {appended, escalations}`. |
 | `POST /changes/:id/board/human` | bearer | A human message. |
 | `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected or seam `contract` (kept on the contract as `triage` for whoever decides it). It changes only the decision counts and that advisory line, never arbitration or the verdict. |
-| `POST /changes/:id/board/record` | bearer | `{type, payload}`: an engine fact only the operator side observes, validated against the board before it is appended (`appendEngineRecord`): `claim.lapsed {item}` (a leased claim recorded `stalled` on a quiet board), `clash.predicted`, `trunk.moved`, `token.refreshed`, `revision.promoted`, `run.capped`. See "Stalls, re-plans, clashes, proofs, and caps". |
+| `POST /changes/:id/board/record` | bearer | `{type, payload}`: an engine fact only the operator side observes, validated against the board before it is appended (`appendEngineRecord`): `claim.lapsed {item}` (a leased claim recorded `stalled` on a quiet board), `clash.predicted`, `trunk.moved`, `token.refreshed`, `revision.promoted`, `run.capped`, `candidate.gated`, `push.excluded {item, agent, commit, reason}` (addressed to the holder). See "Stalls, re-plans, clashes, proofs, and caps". |
 | `POST /changes/:id/board/agent-token` | bearer | `{agent, ttlSeconds?, help?}` (60 to 3600): a REFRESHED, short-lived WRITE token for a joined agent's own repo (with `help`, the granted helper's fork), for runs longer than one token lifetime. `201 {workspaceName, tokenId, token, tokenExpiresAt}`, returned once; the old token is revoked through the read-token revoke route. Same checks as the read-token route. With `help`, a write token also requires the helper still joined (a read token does not). |
 | `POST /changes/:id/board/seam-stalled` | bearer | `{item}`: the board went quiet while this seam item held dependents; the engine appends `seam.stalled {item, released}` (the hold ends; with no push of its owner's the item is released). Refused unless the item holds a dependent. |
 | `POST /changes/:id/integration/revision` | bearer | An integration result `{commit, gate, merged, failing?}`; appends `integrated.rev` and what it triggers (completions and `rebase.needed` on a pass, `fix.requested` / `fix.exhausted` on a fail). |
@@ -155,7 +155,9 @@ paths?, scope?, reason?}` (engine, recorded, advisory), `trunk.moved {rev, commi
 `revision.promoted {rev, gatedCommit, commit, branch}` (engine, recorded), `run.capped {kind: model-calls | spend | wall-clock |
 item-calls, limit, used, item?}` (engine, recorded), `candidate.gated {round, index, of, prefix: [{agent, items, commit}], commit,
 base?, verdict: pass | fail, outcome: landed | passed | blamed | retest, rev?, blamed?, progress?}` (engine, recorded: one
-speculative candidate; see "Speculative batch gating"), `decision.recorded {juncture:
+speculative candidate; see "Speculative batch gating"), `push.excluded {item, agent, commit, reason}` (engine,
+recorded, addressed to the holder: the integrator left its pending push out because it failed verification; see
+"Excluded pushes"), `decision.recorded {juncture:
 plan-review | attribution | fix-confidence | contract-triage, question, answer?, confidence?, accepted, error?, rev?,
 parsed?, contract?}` (engine, advisory), `decision.resolved {decisionSeq, rev, passed, answer, outcome:
 in-fixed-set | not-in-fixed-set, fixed, parsed, parseOutcome: in-fixed-set | not-in-fixed-set | none}` (engine, derived, advisory),
@@ -172,14 +174,41 @@ two symbols in one file contest.
 `goal.posted` records the rules the board runs under (`maxContestTurns`,
 default 3; `contestIdleMessages`, default 25; `maxFixAttempts`, default 2;
 the optional `maxActiveClaims`, `claimLeaseMessages`, `claimDeadlineMessages`,
-`claimOverlap`, and `speculate` (speculative batch gating, 1 to 8; absent
-means 1), each absent on a board posted before it, which then behaves as
+`claimOverlap`, `speculate` (speculative batch gating, 1 to 8; absent
+means 1), and `arbitration` (the arbitration revision, 1 or 2; absent means
+1), each absent on a board posted before it, which then behaves as
 before), the integration `baseline` commit and the `gateCommand`
 (both optional), and
 the CONTRACT (`protected`: the existing tests and gate configuration no agent
 may change alone; `protectedKeys`: gate-defining keys inside editable files,
 shown for visibility and restored by the integrator), so a log is
 self-describing.
+
+ARBITRATION REVISION (`rules.arbitration`). A recorded log replays under the
+rules it was recorded with, so arbitration changes that alter what a log
+derives sit behind this rule. Absent (revision 1) is how every earlier board
+was arbitrated; a new `run-board` posts revision 2 (pinning
+`rules: {arbitration: 1}` reproduces revision 1). Revision 2:
+- a DIFFERENT agent granted (or handed) an item starts with a fresh fix
+  budget (`fixAttempts`, `fixExhausted`, a tool's build failures), whatever
+  released the previous holder (a lapse, a released seam stall, a ceded
+  contest, a human decision); the same agent taking it back keeps its count;
+- a claim's deadline is not charged for the time its push waited for the
+  gate (the wait is credited when the push is gated), and a `fix.requested`
+  leaves the holder at least one lease window before the deadline, so a
+  deadline never lapses a claim in the same batch that asks it for a fix;
+- every clock (the lease, the deadline, the lapse cooldown, contest idle,
+  the seam wait, the help waits) counts PARTICIPANT messages only (the
+  board's `ticks`): engine records such as clash predictions, speculative
+  candidates, token refreshes, decisions, and excluded pushes never run a
+  holder's lease out. Digests then say "after N more participant
+  message(s)" instead of a board seq;
+- the local integrator records the undecided pairs of one clash-prediction
+  pass as ONE `clash.predicted` (the first pair; the count in the reason),
+  never one record per pair.
+The three published replays and the K = 1 golden demo log carry no
+`arbitration` and reduce (and fold at every seq) exactly as before
+(`recorded-replay-compat.test.ts` pins their state hashes).
 
 Proposals come first. An item the lead or a human proposes is `open` at once.
 An item a WORKER proposes (`item.proposed` or `item.discovered`) is `proposed`:
@@ -471,8 +500,11 @@ is distributed changes: items are proposed and claimed, never assigned.
   (at least the dial's min), without an explicit `--max-turns` the
   run-wide turn budget is min(800, max(200, 25 per planned item + 10 per file
   in the planned scopes)), and without an explicit `--claim-cap` the claim cap
-  is 1 (2 when planned items are at least three times the dial's max). The
-  effective values are printed (`budgets: ...`).
+  is 1 (2 when planned items are at least three times the dial's max). An
+  explicit claim cap (the goal rule or `--claim-cap`) is never overwritten. The
+  effective values are printed (`budgets: ...`), with a `warning:` when the
+  plan is empty (it can never end all-items-done) or the scaled turn budget is
+  capped at 800 below what the plan asks (pass `--max-turns`).
 - No claim hoarding (`goal.posted.rules.maxActiveClaims`): an agent may hold
   at most that many UNFINISHED change items (its latest push has not passed
   an integrated revision); a further claim, or a handoff to an agent at its
@@ -568,7 +600,14 @@ is distributed changes: items are proposed and claimed, never assigned.
   recorded (a verdict the control plane refused stops the run before
   promotion); only that revision, when it passed, is promoted (and redeployed in
   place), and promotion refuses unless the promoted tree is exactly that
-  revision's gated commit tree. A worker's proposal awaiting the lead keeps the
+  revision's gated commit tree. Before anything is promoted or redeployed
+  (never after), the run checks that the final verdict is verified, that the
+  evidence it would promote is exactly the last RECORDED revision's (its gated
+  commit is that revision's commit), and that the board would accept
+  `revision.promoted` for it (`promotionRefusal`); otherwise it promotes and
+  redeploys nothing and says why. A speculative round whose landed pass the
+  board refused after its blamed failure was recorded returns the failure's
+  evidence, never the unrecorded candidate's. A worker's proposal awaiting the lead keeps the
   phase open (`all-items-done` waits for the lead's decision).
 - Work roots: the CLI's offline commands (`run`, `run-goal`, `run-board
   --offline`) remove their whole scratch work root when they finish
@@ -740,6 +779,13 @@ is distributed changes: items are proposed and claimed, never assigned.
   on it without an accepted contract; and the integrator restores it from the
   baseline before every gate run (an added config is removed) and fails a
   board revision that changed an unreleased contract path or key.
+- Ignored files never reach the gate: a file a unit applied that the tree's
+  ignore rules match (`git ls-files --others --ignored --exclude-standard`)
+  would sit in the checkout the gate runs in, but the commit (`git add -A`)
+  would omit it, so what was tested would not be what ships. The integrator
+  checks the applied paths only, BEFORE any dependency install (an installed
+  `node_modules` is ignored and is never a unit's), removes such a file, and
+  fails the revision with a protected-style reason naming it.
 ### Continuous integration and the fix loop
 
 - `integrateBoardRevision` is a function of board state (the input synthesis,
@@ -793,7 +839,10 @@ is distributed changes: items are proposed and claimed, never assigned.
   which may be absolute paths in the gate's checkout, are preferred when
   present; a type error is also the revision's stated failing line); then a CONFIDENT
   typed-decision choice when configured (advisory narrowing only); else every
-  item the revision merged. Parse and pick combine the same way locally and in
+  item the revision merged. The parse is linear in the output (path tokens
+  are found by single-class scans, tokens longer than 1024 characters are
+  ignored), so a long unbroken token in agent-influenced gate output cannot
+  stall the integrator. Parse and pick combine the same way locally and in
   the integration Workflow (`combineAttribution` in change-core): an
   unattributed parse ("all") with a confident pick implicates the pick ALONE
   (`jev`); an attributed parse that already names the pick stays `parse`; a pick
@@ -1100,6 +1149,12 @@ round of PREFIX CANDIDATES instead (`integrateSpeculativeRound`,
   least its first candidate's push (it lands or is blamed), so a re-tested push
   is decided within as many rounds as there are pushes ahead of it. The
   integrator starts the next round itself after a recorded round.
+- **Excluded pushes.** A push the verifier leaves out of a candidate's tree
+  (out of its write intent, a pinned commit or included push missing), or the
+  only push of a C1 the integrator refused to build, is recorded
+  `push.excluded` to its holder and leaves the stack: when nothing could land
+  or be blamed, the round is rebuilt at once without it, so one bad push never
+  holds the pushes behind it.
 - **Records.** Every gated candidate is recorded after the revisions as
   `candidate.gated {round, index, of, prefix, commit, base, verdict, outcome,
   rev?, blamed?, progress?}` (engine, through the engine-record route):
@@ -1115,9 +1170,9 @@ round of PREFIX CANDIDATES instead (`integrateSpeculativeRound`,
   that landed the final revision with its landed candidate, whose commit must
   be the revision's gated commit and the promoted one (`formatProofSummary`
   prints it on one line). Recorded replays without candidates fold unchanged.
-- **K = 1** records exactly the board log of the integrator before this
-  feature (a golden test pins the offline demo's log), and the goal posts no
-  `speculate` rule.
+- **K = 1** with arbitration revision 1 pinned records exactly the board log
+  of the integrator before this feature (a golden test pins the offline demo's
+  log), and the goal posts no `speculate` rule.
 - **Cloud.** The integration Workflow on Cloudflare gates one revision at a
   time: with `--integrator cloud` the default is 1, and `--speculate` above 1
   is refused at startup (the CLI and `runBoard`), as is a goal with
@@ -1616,12 +1671,32 @@ recorded state only.
 - A QUIET board advances no message count, so the driver acts there: a leased,
   unsuspended claim with no stated wait reason whose holder sat the quiet
   period out is recorded stalled (the engine-record route, `claim.lapsed
-  {reason: stalled}`), at most `stallReleasesBeforeReplan` (2) times per item.
+  {reason: stalled}`), at most `stallReleasesBeforeReplan` (2) times per item,
+  plus ONCE more for an item the lead may re-plan (re-planning needs it open:
+  without that release a held, stalled item could never be re-planned and the
+  run would end quiet while a re-plan was possible); a tool, a seam item, or a
+  re-plan's child is not released a third time.
 - Seam items are leased like any item (an absent owner never blocks the
   seam's importers forever); tool items too (builds and tool gates renew them);
   a split item is not (its children are). Defaults (`scaledBudgets`): a lease
   of max(150, 40 per agent of the dial's max) board messages and a deadline of
   8 leases; `--lease-messages` and `--deadline-messages` override them.
+
+### Excluded pushes (`push.excluded`)
+
+A pending push the integrator leaves out of the integrated tree because it
+failed verification (both with and without speculation) is recorded through
+the engine-record route as `push.excluded {item, agent, commit, reason}`,
+addressed to its holder (refused unless it is still the holder's pending,
+ungated push, and once per push). From then on the push leaves every
+integration plan (`integrablePushItems`; it is still counted ungated, so a
+passing run that leaves it behind is PARTIAL, never verified), the claim's
+lease runs again from the exclusion (it no longer waits for the gate), the
+item's wait reason is `push-excluded`, and the holder's digest carries
+`claims[].excluded {commit, reason, instruction}`; the offline policy edits
+again. The holder's next push clears it and is gated as any push. The
+integrator runs again at once on what is left. The cloud integrator does not
+record exclusions in this slice.
 
 ### Every waiting item states why (`itemWaitReason`)
 
@@ -1632,7 +1707,9 @@ take it is at its cap), `lease-lapsed` (whose claim, why), `waiting-for-human`
 contract, or a worker's proposal), `blocked-by` (a contest's owner item, a
 split's unfinished child, a sub-lead), `waiting-for-gate` (the pending push's
 commit: the revision has no number yet, so none is invented),
-`fix-budget-exhausted` (by whom), or `unclaimed`. A moving item has none.
+`push-excluded` (the holder's latest push was left out of integration, with
+the reason: the holder pushes again), `fix-budget-exhausted` (by whom), or
+`unclaimed`. A moving item has none.
 Each agent's digest carries it on its claims and the open items (`wait`, with
 one short line), and the console shows the line on every card. On a quiet
 board the driver acts on the stated reason, one step per quiet period: a seam
@@ -1659,7 +1736,9 @@ it. An item is re-planned at most once, and a replacement never is: when a
 replacement spends its budget or stalls twice, arbitration records
 `item.escalated` and the Change raises a human escalation (it closes when the
 item completes). The driver does not end the phase on spent fix budgets while
-the lead has not had its re-plan turn. The offline lead re-scopes an item to
+the lead has not had its re-plan turn; the fix-budget stop is judged on the
+LEAF items (a re-planned or split parent is carried by its children, so it
+never keeps the stop from firing). The offline lead re-scopes an item to
 failing files no outstanding item covers, splits a multi-file item by its
 failing file, and otherwise lets fresh eyes go first (merging a single-file
 item with a neighbour in its directory, or re-scoping it to the failing tests,
@@ -1691,7 +1770,8 @@ another revision integrated is stale, not a clash, and a file an agent's repo
 does not hold was never touched by it), scoped `shared` (a seam) or `local`; an
 undecided pair is `unknown` and a prediction that could not run is
 `unavailable`, both with the reason, never clean; a clean pair is not
-recorded; one record per pair of commits. Digest cues: a shared conflict goes
+recorded; one record per pair of commits (under arbitration revision 2 the
+undecided pairs of one pass are one summary record). Digest cues: a shared conflict goes
 through the seam contract; a local one is rebased by the item claimed later.
 It never blocks or orders integration. The console tags the card and threads
 the message. (The cloud integrator does not predict in this slice.)
@@ -1763,8 +1843,10 @@ region-filling author; the default author goes through the metered executor),
 and the run's typed decisions (`meteredJev`: attribution, speculative
 candidates' included, contract triage, and the fix-confidence check; past a
 run cap a decision call is refused and recorded as a decision error, the
-mechanical result stands). The planner's own plan-review decision (asked
-inside the seed, before the meter exists) is not metered. Spend is estimated as tokens times the configured price per model
+mechanical result stands). The planner pass's plan-review decisions (asked
+inside the seed, which the caller supplies) are metered after the seed
+returns: one unpriced call per review the seed carries (the chosen plan's and
+every earlier one's). Spend is estimated as tokens times the configured price per model
 (`--price <model>=<in>/<out>` USD per million tokens; `parsePrice` accepts
 only finite, non-negative amounts and one price per model) when usage is
 reported, else the executor's own estimate; a call with neither is counted

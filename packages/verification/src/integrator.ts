@@ -233,8 +233,19 @@ export class Integrator {
       // writes that would leave the checkout) are never applied.
       const refused: string[] = [];
       const appliedReleased: string[] = [];
+      const applied: string[] = [];
       for (const unit of verified) {
-        await this.applyUnit(unit, integrationDir, workRoot, options.protectedPaths ?? [], refused, appliedReleased);
+        await this.applyUnit(unit, integrationDir, workRoot, options.protectedPaths ?? [], refused, appliedReleased, applied);
+      }
+      // Gate-equals-deploy: a file a unit applied that the tree's ignore rules
+      // match would sit in the checkout the gate runs in, but the commit (git
+      // add -A) would omit it, so what was tested is not what would ship.
+      // Checked now, BEFORE any dependency install (node_modules is ignored and
+      // is created by the install) and only over the paths the units applied.
+      // Such a file is removed from the checkout and always fails the revision.
+      const ignoredViolations = await ignoredAppliedPaths(integrationDir, applied);
+      for (const rel of ignoredViolations) {
+        await rm(join(integrationDir, rel), { recursive: true, force: true });
       }
 
       // Defense in depth: the files that define the gate always come from the
@@ -258,8 +269,12 @@ export class Integrator {
       // revision, whatever `onProtectedChange` says.
       const runnerViolations = await runnerResolutionCheck(integrationDir, options.protectedJsonKeys ?? []);
       protectedViolations.push(...runnerViolations);
+      const ignoredLabels = ignoredViolations.map(
+        (rel) => `${rel} (matched by the tree's ignore rules: the commit would omit it, so the gated tree would not be the shipped tree; never applied)`,
+      );
+      protectedViolations.push(...ignoredLabels);
       const failOnProtected =
-        ((options.onProtectedChange ?? "fail") === "fail" && protectedViolations.length > 0) || runnerViolations.length > 0;
+        ((options.onProtectedChange ?? "fail") === "fail" && protectedViolations.length > 0) || runnerViolations.length > 0 || ignoredLabels.length > 0;
 
       let committed = false;
       // Commit the combined result when the integration workspace changed. The
@@ -361,7 +376,11 @@ export class Integrator {
               passed: false,
               skipped: false,
               summary:
-                runnerViolations.length === 0
+                runnerViolations.length === 0 && ignoredLabels.length > 0 && ignoredLabels.length === protectedViolations.length
+                  ? `integration refused: the verified units applied file(s) the tree's ignore rules match ` +
+                    `(${protectedViolations.join(", ")}); they were removed before the gate ran and the revision fails. ` +
+                    `Gate on the tree without them: ${gateCheck.summary}`
+                  : runnerViolations.length === 0
                   ? `integration refused: the verified units changed protected path(s) that define the gate ` +
                     `(${protectedViolations.join(", ")}); they were restored from the baseline for the gate run ` +
                     `and the revision fails. Gate on the restored tree: ${gateCheck.summary}`
@@ -430,6 +449,7 @@ export class Integrator {
     protectedPaths: readonly string[],
     refused: string[],
     appliedReleased: string[],
+    applied: string[] = [],
   ): Promise<void> {
     const released = unit.releasedPaths ?? [];
     const root = await realpath(integrationDir);
@@ -495,6 +515,7 @@ export class Integrator {
           continue;
         }
         await cp(from, to, { recursive: true });
+        applied.push(rel);
       }
     } finally {
       await rm(unitDir, { recursive: true, force: true });
@@ -1082,4 +1103,33 @@ async function pathExists(path: string): Promise<boolean> {
 
 function sanitize(name: string): string {
   return name.replace(/[^A-Za-z0-9._-]+/g, "-");
+}
+
+/**
+ * The applied paths (or files under an applied directory) that the checkout's
+ * ignore rules match: untracked files `git add -A` would leave out of the
+ * commit. Only `applied` is considered (a checkout's own ignored files, such as
+ * an installed node_modules, are not the units'). Sorted, deduplicated.
+ */
+export async function ignoredAppliedPaths(checkoutDir: string, applied: readonly string[]): Promise<string[]> {
+  if (applied.length === 0) {
+    return [];
+  }
+  const out = await git(checkoutDir, ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"]);
+  const ignored = out.split("\0").filter((p) => p !== "");
+  const roots = new Set(applied);
+  const hits = new Set<string>();
+  for (const file of ignored) {
+    if (roots.has(file)) {
+      hits.add(file);
+      continue;
+    }
+    for (const root of roots) {
+      if (file.startsWith(`${root}/`)) {
+        hits.add(root);
+        break;
+      }
+    }
+  }
+  return [...hits].sort();
 }

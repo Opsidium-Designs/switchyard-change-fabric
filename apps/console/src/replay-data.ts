@@ -9,7 +9,7 @@
  * Pure apart from the injected fetch, so it is tested offline.
  */
 
-import { reduceBoard } from "@switchyard-change/change-core";
+import { reduceBoard } from "@switchyard-change/orchestration/board-graph";
 import type { BoardMessage } from "@switchyard-change/orchestration/board-graph";
 
 type FetchFn = (input: string, init?: RequestInit) => Promise<Response>;

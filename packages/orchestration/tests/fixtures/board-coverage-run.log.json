@@ -1,0 +1,1190 @@
+[
+  {
+    "from": "human",
+    "type": "goal.posted",
+    "payload": {
+      "objective": "o",
+      "rules": {
+        "maxContestTurns": 3,
+        "contestIdleMessages": 25,
+        "maxFixAttempts": 1,
+        "claimLeaseMessages": 12,
+        "claimDeadlineMessages": 400,
+        "claimOverlap": true,
+        "speculate": 3,
+        "arbitration": 2
+      },
+      "protected": [
+        "package.json"
+      ],
+      "baseline": "57ddadc5f4183e4e551441a18f219fcfe72fb816"
+    },
+    "seq": 1,
+    "at": "2026-01-01T00:00:00.000Z"
+  },
+  {
+    "from": "human",
+    "type": "item.proposed",
+    "payload": {
+      "item": "w",
+      "objective": "do w",
+      "acceptance": [],
+      "scopeHint": [
+        "src/w/**"
+      ]
+    },
+    "seq": 2,
+    "at": "2026-01-01T00:00:01.000Z"
+  },
+  {
+    "from": "human",
+    "type": "item.proposed",
+    "payload": {
+      "item": "x",
+      "objective": "do x",
+      "acceptance": [],
+      "scopeHint": [
+        "src/x/**",
+        "src/common.ts"
+      ]
+    },
+    "seq": 3,
+    "at": "2026-01-01T00:00:02.000Z"
+  },
+  {
+    "from": "human",
+    "type": "item.proposed",
+    "payload": {
+      "item": "y",
+      "objective": "do y",
+      "acceptance": [],
+      "scopeHint": [
+        "src/y/**"
+      ]
+    },
+    "seq": 4,
+    "at": "2026-01-01T00:00:03.000Z"
+  },
+  {
+    "from": "human",
+    "type": "item.proposed",
+    "payload": {
+      "item": "z",
+      "objective": "do z",
+      "acceptance": [],
+      "scopeHint": [
+        "src/z/**"
+      ]
+    },
+    "seq": 5,
+    "at": "2026-01-01T00:00:04.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "agent.joined",
+    "payload": {
+      "role": "lead"
+    },
+    "seq": 6,
+    "at": "2026-01-01T00:00:05.000Z"
+  },
+  {
+    "from": "a0",
+    "type": "agent.joined",
+    "payload": {},
+    "seq": 7,
+    "at": "2026-01-01T00:00:06.000Z"
+  },
+  {
+    "from": "a1",
+    "type": "agent.joined",
+    "payload": {},
+    "seq": 8,
+    "at": "2026-01-01T00:00:07.000Z"
+  },
+  {
+    "from": "a2",
+    "type": "agent.joined",
+    "payload": {},
+    "seq": 9,
+    "at": "2026-01-01T00:00:08.000Z"
+  },
+  {
+    "from": "a3",
+    "type": "agent.joined",
+    "payload": {},
+    "seq": 10,
+    "at": "2026-01-01T00:00:09.000Z"
+  },
+  {
+    "from": "a0",
+    "type": "item.claimed",
+    "payload": {
+      "item": "w",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/w/**"
+        ]
+      }
+    },
+    "seq": 11,
+    "at": "2026-01-01T00:00:10.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "claim.granted",
+    "payload": {
+      "item": "w",
+      "agent": "a0",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/w/**"
+        ]
+      }
+    },
+    "inReplyTo": 11,
+    "seq": 12,
+    "at": "2026-01-01T00:00:10.000Z"
+  },
+  {
+    "from": "a0",
+    "type": "push.announced",
+    "payload": {
+      "item": "w",
+      "commit": "f9f81f2f6c5cce552b64270644cb06ec04fa4079",
+      "paths": [
+        "src/w/d.ts"
+      ]
+    },
+    "seq": 13,
+    "at": "2026-01-01T00:00:11.000Z"
+  },
+  {
+    "from": "a0",
+    "type": "done.proposed",
+    "payload": {
+      "item": "w"
+    },
+    "seq": 14,
+    "at": "2026-01-01T00:00:12.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integrated.rev",
+    "payload": {
+      "n": 1,
+      "commit": "b6dc1865f3acce752014ebc7003a8b37fa4dc4e0",
+      "gate": "pass",
+      "merged": [
+        "f9f81f2f6c5cce552b64270644cb06ec04fa4079"
+      ],
+      "paths": [
+        "src/w/d.ts"
+      ],
+      "contributors": [
+        "a0"
+      ],
+      "progress": {
+        "passed": 1,
+        "failed": 0,
+        "total": 1
+      },
+      "base": "57ddadc5f4183e4e551441a18f219fcfe72fb816"
+    },
+    "seq": 15,
+    "at": "2026-01-01T00:00:13.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "item.completed",
+    "payload": {
+      "item": "w",
+      "n": 1,
+      "via": "integrated"
+    },
+    "inReplyTo": 15,
+    "seq": 16,
+    "at": "2026-01-01T00:00:13.000Z"
+  },
+  {
+    "from": "a1",
+    "type": "item.claimed",
+    "payload": {
+      "item": "x",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/x/**",
+          "src/common.ts"
+        ]
+      }
+    },
+    "seq": 17,
+    "at": "2026-01-01T00:00:14.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "claim.granted",
+    "payload": {
+      "item": "x",
+      "agent": "a1",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/x/**",
+          "src/common.ts"
+        ]
+      }
+    },
+    "inReplyTo": 17,
+    "seq": 18,
+    "at": "2026-01-01T00:00:14.000Z"
+  },
+  {
+    "from": "a2",
+    "type": "item.claimed",
+    "payload": {
+      "item": "y",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/y/**"
+        ]
+      }
+    },
+    "seq": 19,
+    "at": "2026-01-01T00:00:15.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "claim.granted",
+    "payload": {
+      "item": "y",
+      "agent": "a2",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/y/**"
+        ]
+      }
+    },
+    "inReplyTo": 19,
+    "seq": 20,
+    "at": "2026-01-01T00:00:15.000Z"
+  },
+  {
+    "from": "a3",
+    "type": "item.claimed",
+    "payload": {
+      "item": "z",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/z/**"
+        ]
+      }
+    },
+    "seq": 21,
+    "at": "2026-01-01T00:00:16.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "claim.granted",
+    "payload": {
+      "item": "z",
+      "agent": "a3",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/z/**"
+        ]
+      }
+    },
+    "inReplyTo": 21,
+    "seq": 22,
+    "at": "2026-01-01T00:00:16.000Z"
+  },
+  {
+    "from": "a1",
+    "type": "push.announced",
+    "payload": {
+      "item": "x",
+      "commit": "3da482671bcc3697a928da10f1ecfc7bb17a9287",
+      "paths": [
+        "src/x/a.ts",
+        "src/common.ts"
+      ]
+    },
+    "seq": 23,
+    "at": "2026-01-01T00:00:17.000Z"
+  },
+  {
+    "from": "a2",
+    "type": "push.announced",
+    "payload": {
+      "item": "y",
+      "commit": "130d518717f6d86fc8611e66087e074b58ae027e",
+      "paths": [
+        "src/y/b.ts"
+      ]
+    },
+    "seq": 24,
+    "at": "2026-01-01T00:00:18.000Z"
+  },
+  {
+    "from": "a3",
+    "type": "push.announced",
+    "payload": {
+      "item": "z",
+      "commit": "7824b8b10b5a28da90d7081c16d1a2f328e5ec3c",
+      "paths": [
+        "src/z/c.ts"
+      ]
+    },
+    "seq": 25,
+    "at": "2026-01-01T00:00:19.000Z"
+  },
+  {
+    "from": "a1",
+    "type": "done.proposed",
+    "payload": {
+      "item": "x"
+    },
+    "seq": 26,
+    "at": "2026-01-01T00:00:20.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "clash.predicted",
+    "payload": {
+      "a": {
+        "agent": "a1",
+        "item": "x",
+        "sha": "3da482671bcc3697a928da10f1ecfc7bb17a9287"
+      },
+      "b": {
+        "agent": "a2",
+        "item": "y",
+        "sha": "130d518717f6d86fc8611e66087e074b58ae027e"
+      },
+      "status": "conflict",
+      "paths": [
+        "src/common.ts"
+      ],
+      "scope": "local"
+    },
+    "to": [
+      "a1",
+      "a2"
+    ],
+    "seq": 27,
+    "at": "2026-01-01T00:00:21.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "push.excluded",
+    "payload": {
+      "item": "y",
+      "agent": "a2",
+      "commit": "130d518717f6d86fc8611e66087e074b58ae027e",
+      "reason": "failed verification (path-scope: changed 1 path(s) outside declared scope: src/common.ts)"
+    },
+    "to": [
+      "a2"
+    ],
+    "seq": 28,
+    "at": "2026-01-01T00:00:22.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integrated.rev",
+    "payload": {
+      "n": 2,
+      "commit": "bf8738d1158214f4802328ef840c4fba9a2e22e9",
+      "gate": "fail",
+      "merged": [
+        "3da482671bcc3697a928da10f1ecfc7bb17a9287",
+        "7824b8b10b5a28da90d7081c16d1a2f328e5ec3c"
+      ],
+      "paths": [
+        "src/x/a.ts",
+        "src/common.ts",
+        "src/z/c.ts"
+      ],
+      "contributors": [
+        "a1",
+        "a3"
+      ],
+      "failing": {
+        "output": "not ok 1 - z\nnot ok 1 - z\n# src/z/c.ts:1:1 AssertionError\nintegration app-gate failed over the promoted tree (exit 1)",
+        "items": [
+          "z"
+        ]
+      },
+      "progress": {
+        "passed": 0,
+        "failed": 1,
+        "total": 1
+      },
+      "base": "b6dc1865f3acce752014ebc7003a8b37fa4dc4e0"
+    },
+    "seq": 29,
+    "at": "2026-01-01T00:00:23.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "fix.requested",
+    "payload": {
+      "item": "z",
+      "n": 2,
+      "attempt": 1
+    },
+    "to": [
+      "a3"
+    ],
+    "inReplyTo": 29,
+    "seq": 30,
+    "at": "2026-01-01T00:00:23.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integrated.rev",
+    "payload": {
+      "n": 3,
+      "commit": "612465056029196cece18beb6b8b75bd9fc480c9",
+      "gate": "pass",
+      "merged": [
+        "3da482671bcc3697a928da10f1ecfc7bb17a9287"
+      ],
+      "paths": [
+        "src/x/a.ts",
+        "src/common.ts"
+      ],
+      "contributors": [
+        "a1"
+      ],
+      "progress": {
+        "passed": 1,
+        "failed": 0,
+        "total": 1
+      },
+      "base": "b6dc1865f3acce752014ebc7003a8b37fa4dc4e0"
+    },
+    "seq": 31,
+    "at": "2026-01-01T00:00:24.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "item.completed",
+    "payload": {
+      "item": "x",
+      "n": 3,
+      "via": "integrated"
+    },
+    "inReplyTo": 31,
+    "seq": 32,
+    "at": "2026-01-01T00:00:24.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "candidate.gated",
+    "payload": {
+      "round": 1,
+      "index": 1,
+      "of": 3,
+      "prefix": [
+        {
+          "agent": "a1",
+          "items": [
+            "x"
+          ],
+          "commit": "3da482671bcc3697a928da10f1ecfc7bb17a9287"
+        }
+      ],
+      "commit": "612465056029196cece18beb6b8b75bd9fc480c9",
+      "base": "b6dc1865f3acce752014ebc7003a8b37fa4dc4e0",
+      "verdict": "pass",
+      "outcome": "passed",
+      "progress": {
+        "passed": 1,
+        "failed": 0,
+        "total": 1
+      }
+    },
+    "seq": 33,
+    "at": "2026-01-01T00:00:25.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "candidate.gated",
+    "payload": {
+      "round": 1,
+      "index": 2,
+      "of": 3,
+      "prefix": [
+        {
+          "agent": "a1",
+          "items": [
+            "x"
+          ],
+          "commit": "3da482671bcc3697a928da10f1ecfc7bb17a9287"
+        },
+        {
+          "agent": "a2",
+          "items": [
+            "y"
+          ],
+          "commit": "130d518717f6d86fc8611e66087e074b58ae027e"
+        }
+      ],
+      "commit": "612465056029196cece18beb6b8b75bd9fc480c9",
+      "base": "b6dc1865f3acce752014ebc7003a8b37fa4dc4e0",
+      "verdict": "pass",
+      "outcome": "landed",
+      "rev": 3,
+      "progress": {
+        "passed": 1,
+        "failed": 0,
+        "total": 1
+      }
+    },
+    "seq": 34,
+    "at": "2026-01-01T00:00:26.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "candidate.gated",
+    "payload": {
+      "round": 1,
+      "index": 3,
+      "of": 3,
+      "prefix": [
+        {
+          "agent": "a1",
+          "items": [
+            "x"
+          ],
+          "commit": "3da482671bcc3697a928da10f1ecfc7bb17a9287"
+        },
+        {
+          "agent": "a2",
+          "items": [
+            "y"
+          ],
+          "commit": "130d518717f6d86fc8611e66087e074b58ae027e"
+        },
+        {
+          "agent": "a3",
+          "items": [
+            "z"
+          ],
+          "commit": "7824b8b10b5a28da90d7081c16d1a2f328e5ec3c"
+        }
+      ],
+      "commit": "bf8738d1158214f4802328ef840c4fba9a2e22e9",
+      "base": "b6dc1865f3acce752014ebc7003a8b37fa4dc4e0",
+      "verdict": "fail",
+      "outcome": "blamed",
+      "rev": 2,
+      "blamed": [
+        "z"
+      ],
+      "progress": {
+        "passed": 0,
+        "failed": 1,
+        "total": 1
+      }
+    },
+    "seq": 35,
+    "at": "2026-01-01T00:00:27.000Z"
+  },
+  {
+    "from": "a3",
+    "type": "push.announced",
+    "payload": {
+      "item": "z",
+      "commit": "b9d3a6a3aa41e66b28754ed2570e4fcda078f44b",
+      "paths": [
+        "src/z/c.ts"
+      ]
+    },
+    "seq": 36,
+    "at": "2026-01-01T00:00:28.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integrated.rev",
+    "payload": {
+      "n": 4,
+      "commit": "1dafe3a7b5dbdaa9933855fbd881b3caf9d7b6f4",
+      "gate": "fail",
+      "merged": [
+        "b9d3a6a3aa41e66b28754ed2570e4fcda078f44b"
+      ],
+      "paths": [
+        "src/z/c.ts"
+      ],
+      "contributors": [
+        "a3"
+      ],
+      "failing": {
+        "output": "not ok 1 - z\nnot ok 1 - z\n# src/z/c.ts:1:1 AssertionError\nintegration app-gate failed over the promoted tree (exit 1)",
+        "items": [
+          "z"
+        ]
+      },
+      "progress": {
+        "passed": 0,
+        "failed": 1,
+        "total": 1
+      },
+      "base": "612465056029196cece18beb6b8b75bd9fc480c9"
+    },
+    "seq": 37,
+    "at": "2026-01-01T00:00:29.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "fix.exhausted",
+    "payload": {
+      "item": "z",
+      "n": 4,
+      "attempts": 1
+    },
+    "inReplyTo": 37,
+    "seq": 38,
+    "at": "2026-01-01T00:00:29.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "item.reopened",
+    "payload": {
+      "item": "z",
+      "previousOwner": "a3",
+      "n": 4,
+      "commit": "b9d3a6a3aa41e66b28754ed2570e4fcda078f44b"
+    },
+    "inReplyTo": 37,
+    "seq": 39,
+    "at": "2026-01-01T00:00:29.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "candidate.gated",
+    "payload": {
+      "round": 2,
+      "index": 1,
+      "of": 1,
+      "prefix": [
+        {
+          "agent": "a3",
+          "items": [
+            "z"
+          ],
+          "commit": "b9d3a6a3aa41e66b28754ed2570e4fcda078f44b"
+        }
+      ],
+      "commit": "1dafe3a7b5dbdaa9933855fbd881b3caf9d7b6f4",
+      "base": "612465056029196cece18beb6b8b75bd9fc480c9",
+      "verdict": "fail",
+      "outcome": "blamed",
+      "rev": 4,
+      "blamed": [
+        "z"
+      ],
+      "progress": {
+        "passed": 0,
+        "failed": 1,
+        "total": 1
+      }
+    },
+    "seq": 40,
+    "at": "2026-01-01T00:00:30.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.replanned",
+    "payload": {
+      "item": "z",
+      "reason": "fix-budget-exhausted",
+      "action": "rescope",
+      "children": [
+        {
+          "item": "z.r1",
+          "objective": "make z pass",
+          "acceptance": [],
+          "scopeHint": [
+            "src/z/**"
+          ]
+        }
+      ]
+    },
+    "seq": 41,
+    "at": "2026-01-01T00:00:31.000Z"
+  },
+  {
+    "from": "a0",
+    "type": "item.claimed",
+    "payload": {
+      "item": "z.r1",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/z/**"
+        ]
+      }
+    },
+    "seq": 42,
+    "at": "2026-01-01T00:00:32.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "claim.granted",
+    "payload": {
+      "item": "z.r1",
+      "agent": "a0",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/z/**"
+        ]
+      }
+    },
+    "inReplyTo": 42,
+    "seq": 43,
+    "at": "2026-01-01T00:00:32.000Z"
+  },
+  {
+    "from": "a0",
+    "type": "push.announced",
+    "payload": {
+      "item": "z.r1",
+      "commit": "ca2d66333479aa6a7adeced976780d71f7b6664d",
+      "paths": [
+        "src/z/c.ts"
+      ]
+    },
+    "seq": 44,
+    "at": "2026-01-01T00:00:33.000Z"
+  },
+  {
+    "from": "a0",
+    "type": "done.proposed",
+    "payload": {
+      "item": "z.r1"
+    },
+    "seq": 45,
+    "at": "2026-01-01T00:00:34.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integrated.rev",
+    "payload": {
+      "n": 5,
+      "commit": "8c254e7f3c76915359f290b196bac7520248496e",
+      "gate": "pass",
+      "merged": [
+        "ca2d66333479aa6a7adeced976780d71f7b6664d"
+      ],
+      "paths": [
+        "src/z/c.ts"
+      ],
+      "contributors": [
+        "a0"
+      ],
+      "progress": {
+        "passed": 1,
+        "failed": 0,
+        "total": 1
+      },
+      "base": "612465056029196cece18beb6b8b75bd9fc480c9"
+    },
+    "seq": 46,
+    "at": "2026-01-01T00:00:35.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "item.completed",
+    "payload": {
+      "item": "z.r1",
+      "n": 5,
+      "via": "integrated"
+    },
+    "inReplyTo": 46,
+    "seq": 47,
+    "at": "2026-01-01T00:00:35.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "item.completed",
+    "payload": {
+      "item": "z",
+      "n": 5,
+      "via": "children"
+    },
+    "inReplyTo": 46,
+    "seq": 48,
+    "at": "2026-01-01T00:00:35.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "candidate.gated",
+    "payload": {
+      "round": 3,
+      "index": 1,
+      "of": 1,
+      "prefix": [
+        {
+          "agent": "a0",
+          "items": [
+            "z.r1"
+          ],
+          "commit": "ca2d66333479aa6a7adeced976780d71f7b6664d"
+        }
+      ],
+      "commit": "8c254e7f3c76915359f290b196bac7520248496e",
+      "base": "612465056029196cece18beb6b8b75bd9fc480c9",
+      "verdict": "pass",
+      "outcome": "landed",
+      "rev": 5,
+      "progress": {
+        "passed": 1,
+        "failed": 0,
+        "total": 1
+      }
+    },
+    "seq": 49,
+    "at": "2026-01-01T00:00:36.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "claim.extended",
+    "payload": {
+      "item": "y",
+      "reason": "its holder was told why its push was left out"
+    },
+    "seq": 50,
+    "at": "2026-01-01T00:00:37.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-0",
+      "objective": "a note 0",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-0.md"
+      ]
+    },
+    "seq": 51,
+    "at": "2026-01-01T00:00:38.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-1",
+      "objective": "a note 1",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-1.md"
+      ]
+    },
+    "seq": 52,
+    "at": "2026-01-01T00:00:39.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-2",
+      "objective": "a note 2",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-2.md"
+      ]
+    },
+    "seq": 53,
+    "at": "2026-01-01T00:00:40.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-3",
+      "objective": "a note 3",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-3.md"
+      ]
+    },
+    "seq": 54,
+    "at": "2026-01-01T00:00:41.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-4",
+      "objective": "a note 4",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-4.md"
+      ]
+    },
+    "seq": 55,
+    "at": "2026-01-01T00:00:42.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-5",
+      "objective": "a note 5",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-5.md"
+      ]
+    },
+    "seq": 56,
+    "at": "2026-01-01T00:00:43.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "claim.lapsed",
+    "payload": {
+      "item": "y",
+      "agent": "a2",
+      "reason": "no-progress",
+      "lastProgressSeq": 28,
+      "commit": "130d518717f6d86fc8611e66087e074b58ae027e"
+    },
+    "to": [
+      "a2"
+    ],
+    "inReplyTo": 56,
+    "seq": 57,
+    "at": "2026-01-01T00:00:43.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-6",
+      "objective": "a note 6",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-6.md"
+      ]
+    },
+    "seq": 58,
+    "at": "2026-01-01T00:00:44.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-7",
+      "objective": "a note 7",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-7.md"
+      ]
+    },
+    "seq": 59,
+    "at": "2026-01-01T00:00:45.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-8",
+      "objective": "a note 8",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-8.md"
+      ]
+    },
+    "seq": 60,
+    "at": "2026-01-01T00:00:46.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-9",
+      "objective": "a note 9",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-9.md"
+      ]
+    },
+    "seq": 61,
+    "at": "2026-01-01T00:00:47.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-10",
+      "objective": "a note 10",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-10.md"
+      ]
+    },
+    "seq": 62,
+    "at": "2026-01-01T00:00:48.000Z"
+  },
+  {
+    "from": "lead",
+    "type": "item.proposed",
+    "payload": {
+      "item": "note-11",
+      "objective": "a note 11",
+      "acceptance": [],
+      "scopeHint": [
+        "docs/note-11.md"
+      ]
+    },
+    "seq": 63,
+    "at": "2026-01-01T00:00:49.000Z"
+  },
+  {
+    "from": "a1",
+    "type": "item.claimed",
+    "payload": {
+      "item": "y",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/y/**"
+        ]
+      }
+    },
+    "seq": 64,
+    "at": "2026-01-01T00:00:50.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "claim.granted",
+    "payload": {
+      "item": "y",
+      "agent": "a1",
+      "intent": {
+        "read": [],
+        "write": [
+          "src/y/**"
+        ]
+      }
+    },
+    "inReplyTo": 64,
+    "seq": 65,
+    "at": "2026-01-01T00:00:50.000Z"
+  },
+  {
+    "from": "a1",
+    "type": "push.announced",
+    "payload": {
+      "item": "y",
+      "commit": "487c15b923e27a54d28b93189625220c1914cb9d",
+      "paths": [
+        "src/y/b.ts"
+      ]
+    },
+    "seq": 66,
+    "at": "2026-01-01T00:00:51.000Z"
+  },
+  {
+    "from": "a1",
+    "type": "done.proposed",
+    "payload": {
+      "item": "y"
+    },
+    "seq": 67,
+    "at": "2026-01-01T00:00:52.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integrated.rev",
+    "payload": {
+      "n": 6,
+      "commit": "62ee7c5e04c728f5e6b0cb4942f3e2b2312d701a",
+      "gate": "pass",
+      "merged": [
+        "487c15b923e27a54d28b93189625220c1914cb9d"
+      ],
+      "paths": [
+        "src/y/b.ts"
+      ],
+      "contributors": [
+        "a1"
+      ],
+      "progress": {
+        "passed": 1,
+        "failed": 0,
+        "total": 1
+      },
+      "base": "8c254e7f3c76915359f290b196bac7520248496e"
+    },
+    "seq": 68,
+    "at": "2026-01-01T00:00:53.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "item.completed",
+    "payload": {
+      "item": "y",
+      "n": 6,
+      "via": "integrated"
+    },
+    "inReplyTo": 68,
+    "seq": 69,
+    "at": "2026-01-01T00:00:53.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "candidate.gated",
+    "payload": {
+      "round": 4,
+      "index": 1,
+      "of": 1,
+      "prefix": [
+        {
+          "agent": "a1",
+          "items": [
+            "y"
+          ],
+          "commit": "487c15b923e27a54d28b93189625220c1914cb9d"
+        }
+      ],
+      "commit": "62ee7c5e04c728f5e6b0cb4942f3e2b2312d701a",
+      "base": "8c254e7f3c76915359f290b196bac7520248496e",
+      "verdict": "pass",
+      "outcome": "landed",
+      "rev": 6,
+      "progress": {
+        "passed": 1,
+        "failed": 0,
+        "total": 1
+      }
+    },
+    "seq": 70,
+    "at": "2026-01-01T00:00:54.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "revision.promoted",
+    "payload": {
+      "rev": 6,
+      "gatedCommit": "62ee7c5e04c728f5e6b0cb4942f3e2b2312d701a",
+      "commit": "efb7567f26e231a4d1ef612e88f378e5f79779e7",
+      "branch": "switchyard/change-coverage"
+    },
+    "seq": 71,
+    "at": "2026-01-01T00:00:55.000Z"
+  }
+]
