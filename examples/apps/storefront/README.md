@@ -29,7 +29,7 @@ The shared contracts:
 
 `src/store.ts` holds the seeded in-memory records, `src/index.ts` routes by the
 first path segment and exports `createStorefront()` (a fresh instance; the
-default export is the deployed one), and `src/ui.ts` is the tester page.
+default export is the deployed one), and `src/ui.ts` is the demo store page.
 
 ## The intended API
 
@@ -124,14 +124,29 @@ import), both vitest configs, `tsconfig.json`, and the `gate` and `typecheck`
 scripts in `package.json`. `src/` (including `src/contracts/*`) is application
 code, not part of it.
 
-## Tester page
+## Demo store page
 
-`GET /` serves an interactive tester (`src/ui.ts`, inline HTML/CSS/JS, no
-external scripts). It runs 16 representative checks per domain against the
-Worker it is served from (exact prices, tax rounding, invoice consistency,
-payment and refund caps, auth, input validation, pagination bounds) and shows
-expected vs actual, the request and response on click, and a score: about 1 of
-16 checks correct on the baseline, 16 of 16 after a correct fix.
+`GET /` serves a small demo store (`src/ui.ts`, inline HTML/CSS/JS, no external
+scripts or fonts, light and dark, phone-width friendly) that drives this
+Worker's real API with the demo token: a product grid from `GET /products`
+(each price shown as returned, with the raw cents beside it), a cart and
+checkout by region, the order's invoice compared line by line with the order
+(plus the plain-text receipt), and a payments and refunds panel that tries an
+overpayment and an over-refund and shows whether the API refused them.
+
+Wrong values get a warning chip in context, computed from the real responses
+against the intended behavior above (the seeded price tags, unit price times
+quantity, subtotal plus tax, tax rounded half up at the region's rate, invoice
+equals order, refused overpayments and over-refunds). Nothing is keyed to a
+specific planted gap, so the chips disappear on their own after a correct fix.
+
+A "Health checks" drawer keeps the 16 representative checks per domain (exact
+prices, tax rounding, invoice consistency, payment and refund caps, auth, input
+validation, pagination bounds) with expected vs actual, the request and
+response on click, and a score: about 1 of 16 on the baseline, 16 of 16 after a
+correct fix. `/#checks` opens the drawer on load and `/#run-checks` also runs
+every check. Every purchase, payment, refund, and check writes demo records into
+the Worker's memory.
 
 ## Deploy and tear down
 

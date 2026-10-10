@@ -9,8 +9,8 @@
 //   src/contracts/http.ts   json(), problem(), readBody()
 //   src/contracts/auth.ts   requireAuth(request)
 //
-// GET / serves a tester page (src/ui.ts) that runs representative checks per
-// domain against the Worker it is served from.
+// GET / serves a demo store page (src/ui.ts) that drives the real API and keeps
+// representative health checks per domain against the Worker it is served from.
 //
 // createStorefront() builds one instance over a fresh, seeded in-memory store;
 // the default export is the instance the deployed Worker serves.
