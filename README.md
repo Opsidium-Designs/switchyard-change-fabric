@@ -120,9 +120,10 @@ idempotent). `make infra-status` is read-only ("am I paying for anything?").
    wave (through the Worker's ingress locally, or the Artifacts subscription and
    Queue consumer when deployed; both hit one handler).
 4. **Verify every round.** The app's own gate runs on each round's integrated
-   edits. On every failing round, Jev records an advisory failure-attribution
-   decision and the planner re-plans which units re-run; those units retry on
-   an escalated model, fed the real gate evidence.
+   edits. On a failing round, when a decision model is configured, Jev records
+   an advisory failure-attribution decision (on the board, only when more than
+   one item is in the failing revision), and the planner re-plans which units
+   re-run; those units retry on an escalated model, fed the real gate evidence.
 5. **Integrate and promote.** A final authoritative integration gate runs on
    the integrated tree (Jev adds an advisory fix-confidence decision beside
    it). Only a `verified` verdict is promoted to a local Git
@@ -136,8 +137,10 @@ tools) with mechanical arbitration in the Durable Object. `run-live` does not
 use it; the separate `run-board` mode does: the lead's planner proposes items,
 worker agents join with their own repos, claim, contest, narrow, ask each other,
 edit, and push; every push is integrated continuously into the next gated
-revision (the original code's tests and the gate's configuration are a
-contract no agent changes alone), a failing revision asks the
+revision (the original code's tests, the gate's configuration, and the gate's
+own toolchain, meaning its runner packages' declarations and lockfile
+resolution, are a contract no agent changes alone; other dependencies stay
+editable), a failing revision asks the
 implicated owners for a fix, and only the last revision, when it passed, is
 promoted (`make demo-board` offline, `make run-board` live). Agents also build
 tools for each other on the board (scanners, codemods, checks): a proposed tool
@@ -152,7 +155,8 @@ moving: claims are leased (they lapse without real progress), every waiting
 item states why, an item that spends its fix budget gets one lead re-plan
 before a human is asked, overlapping scopes and predicted clashes are flagged,
 stale revisions are refused, agents' repo tokens are refreshed, cost and time
-caps stop new turns, and each run ends with a proof bundle of what it can
+caps stop new turns (only metered calls count, and a spend cap cannot bound
+unpriced calls), and each run ends with a proof bundle of what it can
 prove about the revision it shipped (see "Stalls, re-plans, clashes, proofs,
 and caps" in docs/BOARD.md). Once a revision has passed, the local integrator
 gates speculative prefix candidates of the pending pushes (`--speculate K`,

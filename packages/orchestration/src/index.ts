@@ -234,11 +234,13 @@ export type {
 export type { ContractTriageDecision, ContractTriageInput } from "./contract-triage.ts";
 export { formatAttributionTally, type AttributionTally } from "@switchyard-change/change-core";
 export {
+  ATTRIBUTION_INPUT_LIMITS,
   buildContractTriageState,
   CONTRACT_TRIAGE_KEY,
   CONTRACT_TRIAGE_LIMITS,
   CONTRACT_TRIAGE_QUESTION,
   CONTRACT_TRIAGE_QUESTIONS,
+  frameAttributionInput,
   readTargetExcerpt,
   scrubForDecision,
   triageContract,
@@ -258,7 +260,7 @@ export {
   runBoard,
 } from "./run-board.ts";
 export type { ModelPrice, RunCapReached, RunCaps } from "./run-meter.ts";
-export { meteredExecutor, meteredTransport, RunMeter } from "./run-meter.ts";
+export { meteredExecutor, meteredJev, meteredToolAuthor, meteredTransport, parsePrice, parsePrices, RunMeter, validateSpendCap } from "./run-meter.ts";
 export type { ProofBundle, ProofBundleOptions, ProofCandidate, ProofCount } from "./proof-bundle.ts";
 export { buildProofBundle, formatProofSpeculation, formatProofSummary } from "./proof-bundle.ts";
 export type { RefreshableToken, TokenRefresherOptions } from "./token-refresh.ts";
@@ -266,7 +268,7 @@ export { TokenRefresher } from "./token-refresh.ts";
 export type { PendingClashInput, PendingClashResult } from "./board-clash.ts";
 export { recordPendingClashes } from "./board-clash.ts";
 export type { ProtectedPaths } from "./protected-paths.ts";
-export { deriveProtectedPaths, isRunnerConfig, isTestShaped, RUNNER_CONFIG_FILES } from "./protected-paths.ts";
+export { deriveProtectedPaths, isRunnerConfig, isTestShaped, RUNNER_CONFIG_FILES, stepPrograms } from "./protected-paths.ts";
 export { promoteVerifiedIntegration, redeployIfPreviouslyDeployed } from "./run-live.ts";
 export type { LocalChangeControlOptions } from "./local-control.ts";
 export type { RunBoardOfflineOptions } from "./run-board-offline.ts";

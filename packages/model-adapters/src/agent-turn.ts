@@ -1070,6 +1070,76 @@ function fitBlocks(blocks: readonly ContextBlock[], max: number): string {
   return text;
 }
 
+/** A path list in the digest longer than this is sent as a count plus the in-scope subset (the full list in its own trimmable block). */
+export const DIGEST_INLINE_PATHS = 40;
+/** The most in-scope paths a digest path list carries inline. */
+const DIGEST_IN_SCOPE_PATHS = 100;
+
+/** The literal directory a scope entry covers (`src/a/**` covers `src/a`; a glob cuts at its first wildcard). */
+function scopeBase(entry: string): string {
+  const cut = entry.search(/[*?[{]/);
+  const literal = cut < 0 ? entry : entry.slice(0, cut);
+  return (cut < 0 ? literal : literal.slice(0, literal.lastIndexOf("/") + 1)).replace(/\/+$/, "");
+}
+
+/** True when a scope entry covers `path` (generously: a wildcard covers its whole literal directory). */
+function scopeCovers(entry: string, path: string): boolean {
+  if (entry === path) {
+    return true;
+  }
+  const base = scopeBase(entry);
+  return base === "" ? /[*?[{]/.test(entry) : path === base || path.startsWith(`${base}/`);
+}
+
+/** The scope entries a digest names for this agent: its claims' read and write intents and the open items' scope hints. */
+function digestScope(digest: Record<string, unknown>): string[] {
+  const out: string[] = [];
+  const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : []);
+  for (const claim of Array.isArray(digest.claims) ? digest.claims : []) {
+    const intent = (claim as { intent?: { read?: unknown; write?: unknown } } | null)?.intent;
+    out.push(...strings(intent?.write), ...strings(intent?.read));
+  }
+  for (const item of Array.isArray(digest.openItems) ? digest.openItems : []) {
+    out.push(...strings((item as { scopeHint?: unknown } | null)?.scopeHint));
+  }
+  return out;
+}
+
+/**
+ * The digest as the turn sends it: its own message list dropped (carried once,
+ * in the messages block), and each long path list (`protected`, `immutable`)
+ * replaced by its count and the paths inside this agent's scope (its claims,
+ * the open items), with the full list moved to its own block, in-scope paths
+ * first, that is trimmed entry by entry before anything of higher priority.
+ */
+function turnDigest(raw: unknown): { readonly digest: unknown; readonly blocks: ContextBlock[] } {
+  if (typeof raw !== "object" || raw === null) {
+    return { digest: raw, blocks: [] };
+  }
+  const digest: Record<string, unknown> = Object.fromEntries(Object.entries(raw as Record<string, unknown>).filter(([k]) => k !== "messages"));
+  const scope = digestScope(digest);
+  const blocks: ContextBlock[] = [];
+  for (const [key, title] of [
+    ["protected", "PROTECTED PATHS (digest.protected in full: in-scope paths first; the rest is trimmed first)"],
+    ["immutable", "IMMUTABLE ACCEPTANCE GATE PATHS (digest.immutable in full: in-scope paths first; the rest is trimmed first)"],
+  ] as const) {
+    const list = digest[key];
+    if (!Array.isArray(list) || list.length <= DIGEST_INLINE_PATHS) {
+      continue;
+    }
+    const paths = list.filter((p): p is string => typeof p === "string");
+    const inScope = paths.filter((p) => scope.some((e) => scopeCovers(e, p)));
+    digest[key] = {
+      count: paths.length,
+      inScope: inScope.slice(0, DIGEST_IN_SCOPE_PATHS),
+      note: `${paths.length} path(s): the ones inside your claims' and the open items' scopes are listed here; the full list is in the ${key === "protected" ? "PROTECTED PATHS" : "IMMUTABLE ACCEPTANCE GATE PATHS"} block`,
+    };
+    const rest = paths.filter((p) => !inScope.includes(p));
+    blocks.push({ title, untrusted: true, priority: 35, entries: [...inScope, ...rest], dropFrom: "end" });
+  }
+  return { digest, blocks };
+}
+
 /** Build the chat messages for one turn (goal-agnostic rules plus the agent's context). */
 export function buildAgentTurnMessages(input: AgentTurnInput): WorkersAiMessage[] {
   const system = [
@@ -1091,7 +1161,7 @@ export function buildAgentTurnMessages(input: AgentTurnInput): WorkersAiMessage[
     "- STRUGGLING: when digest.struggling lists an item of yours (failed edits, turns spent, or a failing revision implicating it) and digest.idleAgents is not empty, consider asking for help: message kind help {itemId, need, scope} grants part of it to a helper who forks your repo; or split it when board.cues.splittable lists it (a split is refused while your own push on the item is not yet integrated, and when the run integrates on Cloudflare; do not retry a refused split). A help grant blocks you only once a helper takes it (its fork offer); until then keep working. You decide; it is a cue, not an order.",
     "- IDLE: when you hold nothing and no item is open, digest.busyOwners lists owners whose items are going badly: offer_help {itemId, toAgent: the owner, why} volunteers (once per item until answered). When digest.volunteers lists a volunteer on your item, answer_volunteer {itemId, volunteer, accept: true, scope: files inside your write intent it takes over} (it forks your repo and delivers; you pull) or accept: false to decline.",
     "- A codemod being built (board.tools[] with no versions yet, not unavailable) that covers your item: you may spend at most two turns reading your files (wait) before editing; then edit by hand. Never wait longer for a tool.",
-    "- The original code's existing tests and the gate's configuration are the CONTRACT (digest.protected). A claim touching them is refused with PROTECTED. Changing one needs a HUMAN decision: send message kind contract {target: one exact path from digest.protected inside the item's scope, change, itemId}, wait, and claim again only if it is accepted. You may add NEW test files inside your scope freely (claim a new file path that is not in digest.protected).",
+    "- The original code's existing tests and the gate's configuration are the CONTRACT (digest.protected: the paths, or when the list is long its count and the paths inside your claims' and the open items' scopes, with the full list in the PROTECTED PATHS block). A claim touching them is refused with PROTECTED. Changing one needs a HUMAN decision: send message kind contract {target: one exact path from digest.protected inside the item's scope, change, itemId}, wait, and claim again only if it is accepted. You may add NEW test files inside your scope freely (claim a new file path that is not in digest.protected).",
     "- SEAM FIRST: an open item marked seam changes a shared seam other modules import: claim it first. An item whose waitsFor lists a seam item cannot be claimed (SEAM_FIRST) until that change is integrated (bounded); a held item with waitsFor should not be edited yet: wait, then the runtime rebases you onto the seam change before your edit.",
     "- ONE ITEM AT A TIME: you may hold only a few unfinished items (the claim cap). When digest.claimCap is set, do not claim another item (refused with CLAIM_CAP): finish what you hold (edit, push, let it pass an integrated revision, propose done) or hand it off; idle agents take the open items. Seam items are exempt.",
     "- WAITING ITEMS: openItems[].wait and claims[].wait say why an item is not moving (unclaimed, a lapsed claim, the claim cap, waiting on a seam change, the gate, a human or the lead, a spent fix budget). An unclaimed or lapsed item is open work: take it if you can move it. Never wait on an item whose wait names nobody else.",
@@ -1110,17 +1180,15 @@ export function buildAgentTurnMessages(input: AgentTurnInput): WorkersAiMessage[
     `Allowed actions this turn: ${input.allowed.join(", ")}.`,
   ].join("\n");
   // The digest's own message list duplicates `messages`; it is carried once,
-  // in the untrusted messages block.
-  const digest =
-    typeof input.digest === "object" && input.digest !== null
-      ? Object.fromEntries(Object.entries(input.digest as Record<string, unknown>).filter(([k]) => k !== "messages"))
-      : input.digest;
+  // in the untrusted messages block. Long path lists are trimmable (turnDigest).
+  const { digest, blocks: pathBlocks } = turnDigest(input.digest);
   const blocks: ContextBlock[] = [
     { title: "YOUR TURN", untrusted: false, priority: 100, value: { goal: input.goal, allowed: input.allowed, lastRejection: input.lastRejection ?? null } },
     { title: "YOUR CAPSULE (your own past decisions and evidence)", untrusted: false, priority: 60, value: { objective: input.capsule.objective, constraints: input.capsule.constraints, evidence: input.capsule.evidence } },
     { title: "YOUR RECENT DECISIONS", untrusted: false, priority: 50, entries: input.capsule.decisions, dropFrom: "start" },
     { title: "BOARD DIGEST (items and claims; objectives and failing output were written by others)", untrusted: true, priority: 90, value: digest },
     { title: "BOARD FACTS (live claims, pending contracts)", untrusted: true, priority: 40, value: input.board },
+    ...pathBlocks,
     { title: "BOARD MESSAGES FROM OTHER AGENTS (rationales are theirs)", untrusted: true, priority: 30, entries: input.messages, dropFrom: "start" },
     { title: "REPO FILE LISTING", untrusted: true, priority: 20, entries: input.repo.files, dropFrom: "end" },
     { title: "REPO FILE EXCERPTS", untrusted: true, priority: 10, entries: input.repo.excerpts, dropFrom: "end" },
@@ -1137,6 +1205,27 @@ export function buildAgentTurnMessages(input: AgentTurnInput): WorkersAiMessage[
 
 /** The default token ceiling for one turn reply (a turn is one small object). */
 export const DEFAULT_AGENT_TURN_MAX_TOKENS = 2048;
+/**
+ * The default ceiling for a REASONING model: its hidden reasoning tokens count
+ * against max_completion_tokens, so a small ceiling can be spent before any
+ * content is written (finish_reason "length", an empty reply).
+ */
+export const DEFAULT_REASONING_AGENT_TURN_MAX_TOKENS = 16384;
+/** Model ids treated as reasoning models (their reasoning counts against the completion ceiling). */
+const REASONING_MODEL = /(^|[/:])(o\d+(-[a-z]+)?|gpt-5[\w.-]*|deepseek-r1[\w.-]*|qwq[\w.-]*)$|reason|think/i;
+
+/**
+ * The completion-token ceiling for a turn on `model`: a per-model override
+ * when one is given (a positive integer), else the reasoning-model default
+ * for a reasoning model, else DEFAULT_AGENT_TURN_MAX_TOKENS.
+ */
+export function agentTurnMaxTokens(model: string, byModel: Readonly<Record<string, number>> = {}): number {
+  const override = Object.prototype.hasOwnProperty.call(byModel, model) ? byModel[model] : undefined;
+  if (override !== undefined && Number.isInteger(override) && override > 0) {
+    return override;
+  }
+  return REASONING_MODEL.test(model) ? DEFAULT_REASONING_AGENT_TURN_MAX_TOKENS : DEFAULT_AGENT_TURN_MAX_TOKENS;
+}
 
 /** Options for the live AI Gateway turn transport (holds the gateway credential). */
 export interface AiGatewayAgentTurnOptions {
@@ -1146,7 +1235,10 @@ export interface AiGatewayAgentTurnOptions {
   /** The model each turn runs on. */
   readonly model: string;
   readonly timeoutMs?: number;
+  /** The completion-token ceiling for every turn (wins over `maxTokensByModel` and the per-model default). */
   readonly maxTokens?: number;
+  /** Per-model completion-token ceilings (see agentTurnMaxTokens for the default). */
+  readonly maxTokensByModel?: Readonly<Record<string, number>>;
   readonly fetchFn?: typeof fetch;
 }
 
@@ -1160,7 +1252,7 @@ export interface AiGatewayAgentTurnOptions {
 export function createAiGatewayAgentTurnInvoke(options: AiGatewayAgentTurnOptions): AgentTurnTransport {
   const fetchFn = options.fetchFn ?? fetch;
   const timeoutMs = options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS;
-  const maxTokens = options.maxTokens ?? DEFAULT_AGENT_TURN_MAX_TOKENS;
+  const maxTokens = options.maxTokens ?? agentTurnMaxTokens(options.model, options.maxTokensByModel);
   return async (input) => {
     let reply;
     try {

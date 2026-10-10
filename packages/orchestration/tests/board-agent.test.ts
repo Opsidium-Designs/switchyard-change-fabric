@@ -28,6 +28,7 @@ import type {
 } from "@switchyard-change/model-adapters";
 
 import { BoardAgent, RunTurnBudget, type AgentTurnRecord, type BoardAgentOptions } from "../src/board-agent.ts";
+import { RunMeter, type RunCapReached } from "../src/run-meter.ts";
 import { BoardOperatorClient, type BoardPage } from "../src/board-client.ts";
 import { createGenericBoardPolicy } from "../src/board-policy.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
@@ -280,6 +281,79 @@ describe("BoardAgent budgets", () => {
     const handoff = (await env.log()).messages.find((m) => m.type === "handoff");
     expect(handoff).toMatchObject({ from: "w1", payload: { item: "i1", to: "w2" } });
     expect((await env.log()).state.items.i1!.owner).toBe("w2");
+  });
+
+  it("an item at its call cap: no model call while every held item is capped; the agent whose call reached the cap releases it (item-budget), the next holder only skips", async () => {
+    const env = await setup();
+    const meter = new RunMeter({ maxCallsPerItem: 1 });
+    const caps: RunCapReached[] = [];
+    let w1Calls = 0;
+    const w1Script = scripted([{ type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } }]);
+    const w1 = env.agent("w1", {
+      transport: async (input) => {
+        w1Calls += 1;
+        return w1Script(input);
+      },
+      meter,
+      onItemCap: (cap) => caps.push(cap),
+    });
+    let w2Calls = 0;
+    const w2Script = scripted([{ type: "claim", itemId: "i2", intent: { read: [], write: ["src/b/**"] } }]);
+    const w2 = env.agent("w2", {
+      transport: async (input) => {
+        w2Calls += 1;
+        return w2Script(input);
+      },
+      meter,
+    });
+    await w1.join();
+    await w2.join();
+    await w2.step(); // w2 claims i2 (1 call on i2: at its cap)
+    await w1.step(); // w1 claims i1 (1 call on i1: at its cap, reached by w1)
+    expect(w1Calls).toBe(1);
+    // Nothing else to act on (no open item): the next turn makes NO model call and releases i1.
+    await w1.step();
+    expect(w1Calls).toBe(1);
+    expect(env.turns.some((t) => t.code === "ITEM_CAP" && t.action.type === "wait")).toBe(true);
+    expect(caps).toEqual(expect.arrayContaining([{ kind: "item-calls", limit: 1, used: 1, item: "i1" }]));
+    expect(w1.stopped).toMatchObject({ reason: "item-budget" });
+    const handoff = (await env.log()).messages.find((m) => m.type === "handoff");
+    expect(handoff).toMatchObject({ from: "w1", payload: { item: "i1", to: "w2" } });
+    expect(handoff!.rationale).toMatch(/item i1 reached its call cap \(1 of 1\)/);
+    // w2 holds i1 now (capped under w1) and i2 (whose cap its own claim reached): no call, and it releases i2.
+    const before = w2Calls;
+    await w2.step();
+    expect(w2Calls).toBe(before);
+    expect(w2.stopped).toMatchObject({ reason: "item-budget", detail: expect.stringMatching(/item i2 reached its call cap/) });
+    expect(meter.itemCalls("i1")).toBe(1);
+  });
+
+  it("an item that reached its cap under another agent is only skipped: no model call, never released again by this agent", async () => {
+    const env = await setup();
+    const meter = new RunMeter({ maxCallsPerItem: 1 });
+    const caps: RunCapReached[] = [];
+    let calls = 0;
+    const script = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "claim", itemId: "i2", intent: { read: [], write: ["src/b/**"] } },
+    ]);
+    const w1 = env.agent("w1", {
+      transport: async (input) => {
+        calls += 1;
+        return script(input);
+      },
+      meter,
+      onItemCap: (cap) => caps.push(cap),
+    });
+    await w1.join();
+    // Calls an earlier agent made on i2 (it reached i2's cap there).
+    meter.noteItem("i2");
+    await w1.step(); // claims i1: 1 call, i1 at its cap (reached by w1)
+    await w1.step(); // claims i2: refused locally past the cap (ITEM_CAP after the call)
+    expect(calls).toBe(2);
+    expect(env.turns.at(-1)).toMatchObject({ code: "ITEM_CAP", action: { type: "claim", itemId: "i2" } });
+    expect(w1.stopped).toBeUndefined();
+    expect(caps).toEqual([{ kind: "item-calls", limit: 1, used: 2, item: "i2" }]);
   });
 
   it("an agent holding nothing leaves when the run budget is spent", async () => {

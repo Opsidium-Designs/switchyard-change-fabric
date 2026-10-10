@@ -679,20 +679,50 @@ is distributed changes: items are proposed and claimed, never assigned.
   bundlers do: the exact file, a `.js`/`.jsx`/`.mjs`/`.cjs` specifier naming its
   `.ts`/`.tsx`/`.mts`/`.cts` source, the path plus each extension, then
   `<path>/index.<ext>`, so `import ... from "./harness"` protects
-  `gate/harness.ts`): an imported file in the test tree (a directory
-  holding a gate-named or test file, or below one; the repo root only for files
-  directly in it) is harness, protected and followed; an imported file anywhere
-  else is application code, the code under test, neither protected nor
-  followed (a file it only syntax-checks, such as
-  `node --check src/index.js`, is code under test and never protected, and a
-  directory it names protects only the existing test files under it; a parent
-  directory is never protected wholesale, and no app module is protected for
-  being named like a helper); and in `package.json` only the KEYS that define
-  the run (the scripts the gate invokes, transitively, each with its `pre` and
-  `post` lifecycle scripts, and `type`, `packageManager`, `imports`, `exports`,
-  and the jest, mocha, ava, babel, c8, nyc, vitest sections): dependencies and
-  lockfiles stay editable. `tsconfig*.json` is protected when the gate runs the
-  type checker. Root runner configs (`pytest.ini`, `tox.ini`, `setup.cfg`,
+  `gate/harness.ts`): an imported file under a HARNESS ROOT is harness,
+  protected and followed. A harness root is a dedicated test directory
+  (`test`, `tests`, `__tests__`, `spec`, `specs` anywhere in its path), a
+  directory the gate names, or the directory of a file the gate runs (a gate
+  test, script, or runner config) unless that directory is colocated (it holds
+  the module a gate test is named after, `a.ts` beside `a.test.ts`); the repo
+  root counts only for files directly in it. A developer test outside a
+  dedicated test directory is not a root, so what a colocated test imports is
+  application code, the code under test, neither protected nor followed. A
+  file the gate only syntax-checks (`node --check src/index.js`, or `node -c`;
+  for any other program `-c` names a config) is code under test and never
+  protected. The acceptance gate's directories (a dedicated test directory, or
+  one named like the gate, holding a gate test or config, and any directory the
+  gate names) are protected WHOLE: fixtures, expected outputs, and setup files
+  in them are immutable too; another directory of a gate file protects only its
+  test files and configs, and no app module is protected for being named like
+  a helper. A runner config the gate reads (`--config f`, `-c f`,
+  `--config=f`, or the root default) has every repo file it names by a string
+  path (setupFiles, globalSetup, a reporter) protected as part of the gate. In
+  `package.json` only the KEYS that define the run are protected (the scripts
+  the gate invokes, transitively, each with its `pre` and `post` lifecycle
+  scripts; `type`, `packageManager`, `imports`, `exports`, and the jest, mocha,
+  ava, babel, c8, nyc, vitest sections), plus the gate's own toolchain: the
+  RUNNER packages (every program the gate runs, however it is reached: an npm
+  script, `npx`, `./node_modules/.bin/...`, a `node_modules/<pkg>` path, and
+  `typescript` when it runs `tsc`) in `dependencies`, `devDependencies`,
+  `optionalDependencies`, and `peerDependencies`, and the whole `overrides`,
+  `resolutions`, and `pnpm` sections. In an npm lockfile the runner packages'
+  entries and their transitive dependencies' entries (version, resolved,
+  integrity, link) are protected key by key, and the integrator can check the
+  gated tree against the baseline (`assertRunnerResolutionUnchanged` in
+  `packages/verification/src/runner-resolution.ts`: a changed or added closure
+  entry, a `file:`/link resolution, or a new package claiming a runner's bin is
+  refused); a pnpm or yarn lockfile, or an npm lockfile whose runner closure
+  is too large to list (over 400 entries), is protected whole. A dependency
+  change that moves a runner dependency's lockfile entry (a re-hoist) is
+  refused like any protected change. Other dependencies and
+  lockfile entries stay editable. That integration-time check is exported but
+  not yet called by the integrator: until it is, the claim-time keys (restored
+  and refused at integration) are the enforcement, and an entry the gated tree
+  ADDS inside the closure, or a new package claiming a runner bin, is not
+  caught. `tsconfig*.json` is
+  protected when the gate runs the type checker (`tsc`, `npx tsc`,
+  `./node_modules/.bin/tsc`). Root runner configs (`pytest.ini`, `tox.ini`, `setup.cfg`,
   `pyproject.toml`, `conftest.py`, `noxfile.py`) are protected even when
   absent, and such a config newly added anywhere is removed at gate time. A gate whose
   program is not a known test or build runner fails closed (the whole manifest,
@@ -890,10 +920,14 @@ is distributed changes: items are proposed and claimed, never assigned.
   the result and the summary). An idle agent that is only polling its digest
   does not count as active: counting it kept a live board where every agent
   waited from ever looking quiet, since some agent was almost always mid-poll.
-- Tokens: agents push with their own short write tokens, which are not
-  refreshed, so the run refuses an agent-phase timeout longer than their
-  lifetime (`--token-ttl`); the integrator reads with fresh read tokens per
-  revision. Every reason, error, and printed transcript is credential-scrubbed.
+- Tokens: agents push with their own short write tokens, which the driver
+  refreshes before they expire (see "Token refresh for runs over one token
+  lifetime"), so `--timeout-ms` may exceed `--token-ttl`; `--no-token-refresh`
+  restores the refusal of an agent-phase timeout longer than their lifetime.
+  The cloud integration repo's token is NOT refreshed, so `--integrator cloud`
+  refuses an agent phase longer than that token's lifetime. The integrator
+  reads with fresh read tokens per revision. Every reason, error, and printed
+  transcript is credential-scrubbed.
 - Turn output that is almost right is repaired, not discarded: a `message`
   whose `payload.need` is free text (it must be a short id such as
   `auth-contract`) is normalized to a slug of at most 64 characters, and the
@@ -1693,17 +1727,36 @@ renders it from the log alone, so a recorded run shows it too.
 
 ### Cost and time caps (demo safety)
 
-The driver meters every model call (agent turns, executor edits, the
-planner) and estimates spend: tokens times the configured price per model
-(`--price <model>=<in>/<out>` USD per million tokens) when usage is reported,
-else the executor's own estimate; a call with neither is counted UNPRICED,
-never free. Caps: `--max-calls` (default 10 per run turn), `--max-spend-usd`
+The driver meters the model calls it routes through the meter: agent turns,
+executor edits (every paid attempt: a transient retry counts, and an edit that
+fails, for example on an unusable reply, counts the calls it made, at least
+one), and the planner. Wrappers for tool authoring (`meteredToolAuthor`, for a
+live region-filling author) and typed decisions (`meteredJev`) exist in
+`run-meter.ts` but are not yet wired into `run-board`, so those calls are not
+counted yet (the default tool author goes through the metered executor and is
+counted). Spend is estimated as tokens times the configured price per model
+(`--price <model>=<in>/<out>` USD per million tokens; `parsePrice` accepts
+only finite, non-negative amounts and one price per model) when usage is
+reported, else the executor's own estimate; a call with neither is counted
+UNPRICED, never free, and non-finite usage or prices are never added. A spend
+cap does not bound unpriced calls: under an active `--max-spend-usd` each
+unpriced model is recorded as a meter warning and the summary says the cap
+does not bound them, and `validateSpendCap` returns the configured models with
+no price so a caller can refuse the cap unless every model is priced (the CLI
+does not call it yet). Caps: `--max-calls` (default 10 per run turn), `--max-spend-usd`
 (none unless set), `--max-wall-ms` (default twice the agent-phase timeout),
 and `--max-item-calls` (default 8 per item turn, across agents). Reaching a
 run cap records `run.capped {kind, limit, used}` once, stops new turns (the
 metered transport answers `wait` without calling the model), ends the agent
 phase as `capped`, lets the integrator finish what is in flight, and the
 verdict stays the gate's; a reached cap also stops new speculative candidates
-(each round then gates its first candidate only). An item at its cap gets no more turns (`ITEM_CAP`,
-recorded once per item). The budgets line prints the caps; the summary prints
+(each round then gates its first candidate only). An item at its cap gets no more model calls
+(`ITEM_CAP`, recorded once per item): a worker whose held items are all at
+their cap, with nothing else to act on, skips its turn without calling the
+model, and the agent whose own call took an item to its cap releases it
+through the item-budget path (a handoff to a running worker, else a help
+request; the agent then stops, as for a spent per-item turn budget). Another
+holder of a capped item only skips it. The board does not make a capped item
+eligible for a re-plan by itself; with claim leases on, a held capped item
+lapses like any stalled claim. The budgets line prints the caps; the summary prints
 the usage.

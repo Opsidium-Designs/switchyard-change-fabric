@@ -195,7 +195,11 @@ export interface BoardAgentOptions {
   readonly toolAuthor?: ToolAuthor;
   /** How many of the agent's past turns its capsule carries (default 12). */
   readonly historyLimit?: number;
-  /** The run's cost meter: a turn on an item past its per-item cap is refused (ITEM_CAP). */
+  /**
+   * The run's cost meter: a turn on an item past its per-item cap is refused
+   * (ITEM_CAP), and a worker whose held items are all at their cap (with
+   * nothing else to act on) skips its turn without calling the model.
+   */
   readonly meter?: RunMeter;
   /** Called when a turn hit its item's cap (the driver records run.capped once). */
   readonly onItemCap?: (cap: RunCapReached) => void;
@@ -417,6 +421,8 @@ export class BoardAgent {
   private lastFreeKey: string | undefined;
   private turns = 0;
   private readonly turnsByItem = new Map<string, number>();
+  /** Items whose per-item call cap THIS agent's own call reached (it releases them, once). */
+  private readonly capReachedHere = new Set<string>();
   private stop: AgentStop | undefined;
   private seeded = false;
   private rebasedTo = 0;
@@ -1068,6 +1074,9 @@ export class BoardAgent {
       await this.exhaust(digest, "run-budget", `the run's turn budget (${budget.maxTurns}) is spent`);
       return;
     }
+    if (await this.skipCappedTurn(digest)) {
+      return;
+    }
     budget.used += 1;
     this.turns += 1;
     this.acting = true;
@@ -1136,6 +1145,47 @@ export class BoardAgent {
     return reported;
   }
 
+  /**
+   * The per-item call cap BEFORE a model call: a worker whose every held item
+   * is at its cap (the next call on it would exceed it), with nothing else to
+   * act on (no claimable open item, no message addressed to it, no volunteer),
+   * skips the turn without calling the model (a local ITEM_CAP wait; no turn
+   * budget used). An item whose cap this agent's own call reached is released
+   * once through the item-budget exhaust path (handed off, or help requested
+   * when no agent can take it) instead of being held; an item that reached its
+   * cap under another agent is only skipped (handing it on again would not
+   * make another call on it possible).
+   */
+  private async skipCappedTurn(digest: BoardDigest): Promise<boolean> {
+    const meter = this.options.meter;
+    const limit = meter?.caps.maxCallsPerItem;
+    if (!meter || limit === undefined || this.role !== "worker") {
+      return false;
+    }
+    const held = digest.claims.filter((c) => !c.doneProposed || c.fix !== undefined).map((c) => c.item);
+    if (held.length === 0 || !held.every((item) => meter.itemCalls(item) >= limit)) {
+      return false;
+    }
+    const otherCue =
+      (digest.openItems.length > 0 && digest.claimCap === undefined) ||
+      this.pending.some((m) => m.to?.includes(this.id)) ||
+      (digest.volunteers ?? []).length > 0;
+    if (otherCue) {
+      return false;
+    }
+    const reason = `every item I hold is at its call cap (${held.map((i) => `${i}: ${meter.itemCalls(i)} of ${limit}`).join(", ")}): no model call`;
+    this.record({ turn: this.turns, action: { type: "wait", reason }, outcome: "local", code: "ITEM_CAP", error: reason });
+    for (const item of held) {
+      this.options.onItemCap?.({ kind: "item-calls", limit, used: meter.itemCalls(item), item });
+    }
+    const release = held.find((item) => this.capReachedHere.has(item));
+    if (release !== undefined) {
+      this.capReachedHere.clear();
+      await this.exhaust(digest, "item-budget", `item ${release} reached its call cap (${meter.itemCalls(release)} of ${limit})`, release);
+    }
+    return true;
+  }
+
   private async takeTurn(initialDigest: BoardDigest, initialState: BoardState): Promise<void> {
     let digest = initialDigest;
     let state = initialState;
@@ -1160,6 +1210,11 @@ export class BoardAgent {
       if (cap !== undefined) {
         this.record({ turn: this.turns, action, outcome: "local", code: "ITEM_CAP", error: `item ${item} reached its call cap (${cap.used} of ${cap.limit})` });
         this.options.onItemCap?.(cap);
+        if (this.capReachedHere.has(item) && this.role === "worker" && digest.claims.some((c) => c.item === item)) {
+          // First reached by this agent's own call: release it (item-budget) instead of holding it.
+          this.capReachedHere.clear();
+          await this.exhaust(digest, "item-budget", `item ${item} reached its call cap (${cap.used} of ${cap.limit})`, item);
+        }
         return;
       }
     }
@@ -1173,6 +1228,12 @@ export class BoardAgent {
       }
     }
     await this.act(action, digest, state, outcome.invalid);
+    const limit = this.options.meter?.caps.maxCallsPerItem;
+    if (item !== undefined && limit !== undefined && this.options.meter!.itemCalls(item) >= limit) {
+      // This turn (its call, and any edit's executor calls) brought the item to
+      // its cap: the next call on it is refused, and this agent releases it.
+      this.capReachedHere.add(item);
+    }
   }
 
   private async turnInput(digest: BoardDigest, state: BoardState): Promise<AgentTurnInput<BoardDigest, BoardMessage>> {

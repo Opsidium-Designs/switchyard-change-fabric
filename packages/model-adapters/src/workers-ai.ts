@@ -26,6 +26,7 @@
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
+import { withCallUsage } from "./call-usage.ts";
 import type {
   ExecutionResult,
   ExecutorContext,
@@ -228,7 +229,18 @@ const DEFAULT_MAX_FILE_BYTES = 8 * 1024;
 const DEFAULT_MAX_RETRIES = 2;
 const DEFAULT_RETRY_BACKOFF_MS = 500;
 
-/** Thrown when the model returns something the executor cannot use as an edit. */
+/** The model calls one execute() made so far (see WorkersAiExecutor.execute). */
+interface CallTrack {
+  attempts: number;
+  model?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}
+
+/**
+ * Thrown when the model returns something the executor cannot use as an edit.
+ * The executor attaches the paid calls it made (`executorCallUsage`).
+ */
 export class UnusableModelOutputError extends Error {
   constructor(message: string) {
     super(message);
@@ -305,7 +317,29 @@ export class WorkersAiExecutor implements ExecutorProvider {
     void options.fallbackModel;
   }
 
+  /**
+   * Run one edit. Every model call it makes is reported: the attempts (each
+   * transient retry is a paid call) and the successful call's usage, in
+   * `cost.attempts` on success and attached to the thrown error otherwise
+   * (`executorCallUsage`), so a cost meter never counts a failed step as free.
+   */
   async execute(context: ExecutorContext): Promise<ExecutionResult> {
+    const track: CallTrack = { attempts: 0 };
+    try {
+      return await this.run(context, track);
+    } catch (error) {
+      throw track.attempts > 0
+        ? withCallUsage(error, {
+            model: track.model ?? this.model,
+            attempts: track.attempts,
+            ...(track.inputTokens !== undefined ? { inputTokens: track.inputTokens } : {}),
+            ...(track.outputTokens !== undefined ? { outputTokens: track.outputTokens } : {}),
+          })
+        : error;
+    }
+  }
+
+  private async run(context: ExecutorContext, track: CallTrack): Promise<ExecutionResult> {
     const maxFiles = this.options.maxContextFiles ?? DEFAULT_MAX_CONTEXT_FILES;
     const maxBytes = this.options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
     const readScoped = this.options.readScopedFiles ?? defaultReadScopedFiles;
@@ -376,9 +410,11 @@ export class WorkersAiExecutor implements ExecutorProvider {
     // non-transient failure (for example a bad model reply) is thrown
     // immediately rather than retried. `usedModel` is always `baseModel`.
     const usedModel = baseModel;
+    track.model = usedModel;
 
     const invokeOnce = async (): Promise<WorkersAiInvokeResult> => {
       onStep({ phase: "model-call", message: `calling model ${baseModel}` });
+      track.attempts += 1;
       return this.options.invoke({ model: baseModel, messages }, stepCallbacks);
     };
 
@@ -407,6 +443,12 @@ export class WorkersAiExecutor implements ExecutorProvider {
     // After a successful break, result is assigned; the non-null assertion is
     // safe because the loop either assigns result and breaks or throws.
     result = result!;
+    if (result.usage?.inputTokens !== undefined) {
+      track.inputTokens = result.usage.inputTokens;
+    }
+    if (result.usage?.outputTokens !== undefined) {
+      track.outputTokens = result.usage.outputTokens;
+    }
 
     const parsed = parseEdits(result.text);
     if (parsed.edits.length === 0) {
@@ -491,6 +533,7 @@ export class WorkersAiExecutor implements ExecutorProvider {
         ...(inputTokens !== undefined ? { inputTokens } : {}),
         ...(outputTokens !== undefined ? { outputTokens } : {}),
         model: usedModel,
+        attempts: track.attempts,
       },
       commitMessage:
         parsed.commitMessage && parsed.commitMessage.trim() !== ""

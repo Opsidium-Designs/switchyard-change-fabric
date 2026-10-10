@@ -92,7 +92,7 @@ export async function callGatewayJsonSchema(call: GatewayJsonSchemaCall): Promis
   }
   const text = await res.text();
   let body: {
-    choices?: ReadonlyArray<{ message?: { content?: unknown } }>;
+    choices?: ReadonlyArray<{ message?: { content?: unknown }; finish_reason?: unknown }>;
     usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
   };
   try {
@@ -104,7 +104,14 @@ export async function callGatewayJsonSchema(call: GatewayJsonSchemaCall): Promis
   }
   const content = body.choices?.[0]?.message?.content;
   if (typeof content !== "string" || content.trim() === "") {
-    throw call.responseError(`AI Gateway ${call.label} reply had no message content for ${call.model}`);
+    // Why it stopped (a short provider token only, never reply text): "length"
+    // means the token ceiling was spent before any content (a reasoning model).
+    const raw = body.choices?.[0]?.finish_reason;
+    const finish = typeof raw === "string" && /^[A-Za-z_-]{1,40}$/.test(raw) ? raw : "unknown";
+    throw call.responseError(
+      `AI Gateway ${call.label} reply had no message content for ${call.model} (finish_reason: ${finish})` +
+        (finish === "length" ? `: the reply hit max_completion_tokens (${call.maxTokens}); raise the token ceiling for this model` : ""),
+    );
   }
   const inputTokens = typeof body.usage?.prompt_tokens === "number" ? body.usage.prompt_tokens : undefined;
   const outputTokens = typeof body.usage?.completion_tokens === "number" ? body.usage.completion_tokens : undefined;

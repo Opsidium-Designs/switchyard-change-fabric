@@ -10,8 +10,11 @@ import {
   AGENT_ACTION_TYPES,
   AGENT_TURN_JSON_SCHEMA,
   agentActionOrWait,
+  agentTurnMaxTokens,
   buildAgentTurnMessages,
   createAiGatewayAgentTurnInvoke,
+  DEFAULT_AGENT_TURN_MAX_TOKENS,
+  DEFAULT_REASONING_AGENT_TURN_MAX_TOKENS,
   parseAgentAction,
   slugifyNeed,
   type AgentTurnInput,
@@ -312,5 +315,62 @@ describe("createAiGatewayAgentTurnInvoke", () => {
     }
     // The turn's own core (goal, allowed actions) is always kept.
     expect(text).toMatch(/"goal":"do the thing"/);
+  });
+});
+
+describe("the turn digest stays within the context bound", () => {
+  it("sends a long protected list as its count plus the in-scope paths, with the full list in a block trimmed before the digest", () => {
+    const protectedPaths = [...Array.from({ length: 3000 }, (_, i) => `tests/deep/suite-${i}/case.test.ts`), "src/a/a.test.ts", "src/b/b.test.ts"];
+    const [, user] = buildAgentTurnMessages({
+      ...input,
+      digest: {
+        claims: [{ item: "i1", intent: { read: [], write: ["src/a/**"] } }],
+        openItems: [{ item: "i2", scopeHint: ["src/b/b.test.ts"] }],
+        protected: protectedPaths,
+        immutable: ["gate/a.test.ts"],
+        failure: { n: 3, output: "the failing gate line that must survive" },
+      },
+    });
+    const text = user!.content;
+    expect(text.length).toBeLessThanOrEqual(AGENT_TURN_MAX_CONTEXT_CHARS + 2000);
+    // The digest (with the failure) is kept; the long list is a count plus the in-scope subset.
+    expect(text).toContain("the failing gate line that must survive");
+    expect(text).toMatch(/"protected":\{"count":3002,"inScope":\["src\/a\/a\.test\.ts","src\/b\/b\.test\.ts"\]/);
+    // A short list stays inline.
+    expect(text).toContain('"immutable":["gate/a.test.ts"]');
+    // The full list is its own block, trimmed entry by entry (in-scope first).
+    expect(text).toMatch(/PROTECTED PATHS \(digest\.protected in full.*\(\d+ entries omitted to fit\)/);
+    expect(text).toMatch(/\["src\/a\/a\.test\.ts","src\/b\/b\.test\.ts","tests\/deep\/suite-0\/case\.test\.ts"/);
+  });
+
+  it("a short protected list is sent inline, unchanged", () => {
+    const [, user] = buildAgentTurnMessages({ ...input, digest: { claims: [], openItems: [], protected: ["a.test.ts"] } });
+    expect(user!.content).toContain('"protected":["a.test.ts"]');
+    expect(user!.content).not.toContain("PROTECTED PATHS");
+  });
+});
+
+describe("the turn's completion-token ceiling", () => {
+  it("defaults higher for reasoning models, honors a per-model override and an explicit ceiling, and names finish_reason on an empty reply", async () => {
+    expect(agentTurnMaxTokens("m1")).toBe(DEFAULT_AGENT_TURN_MAX_TOKENS);
+    for (const model of ["o3-mini", "openai/o4-mini", "gpt-5", "openai/gpt-5-mini", "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b", "@cf/qwen/qwq-32b"]) {
+      expect(agentTurnMaxTokens(model), model).toBe(DEFAULT_REASONING_AGENT_TURN_MAX_TOKENS);
+    }
+    expect(agentTurnMaxTokens("m1", { m1: 4096 })).toBe(4096);
+    expect(agentTurnMaxTokens("m1", { m1: 0 })).toBe(DEFAULT_AGENT_TURN_MAX_TOKENS);
+    const bodies: Record<string, unknown>[] = [];
+    const fetchFn = (async (_url: string, init: RequestInit) => {
+      bodies.push(JSON.parse(String(init.body)));
+      return new Response(JSON.stringify({ choices: [{ message: { content: "" }, finish_reason: "length" }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const reasoning = createAiGatewayAgentTurnInvoke({ gatewayUrl: "https://gw", gatewayToken: "t", model: "o3-mini", fetchFn });
+    const outcome = await reasoning(input);
+    expect(bodies[0]!.max_completion_tokens).toBe(DEFAULT_REASONING_AGENT_TURN_MAX_TOKENS);
+    expect(outcome.action.type).toBe("wait");
+    expect(outcome.invalid).toMatch(/had no message content for o3-mini \(finish_reason: length\): the reply hit max_completion_tokens \(16384\)/);
+    await createAiGatewayAgentTurnInvoke({ gatewayUrl: "https://gw", gatewayToken: "t", model: "m1", maxTokensByModel: { m1: 3000 }, fetchFn })(input);
+    expect(bodies[1]!.max_completion_tokens).toBe(3000);
+    await createAiGatewayAgentTurnInvoke({ gatewayUrl: "https://gw", gatewayToken: "t", model: "m1", maxTokens: 512, maxTokensByModel: { m1: 3000 }, fetchFn })(input);
+    expect(bodies[2]!.max_completion_tokens).toBe(512);
   });
 });

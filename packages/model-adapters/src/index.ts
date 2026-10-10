@@ -18,6 +18,9 @@ export type {
   ExecutorProvider,
 } from "./types.ts";
 
+export type { ExecutorCallUsage } from "./call-usage.ts";
+export { executorCallUsage, withCallUsage } from "./call-usage.ts";
+
 export type { NoopExecutorOptions } from "./noop.ts";
 export { NoopExecutor } from "./noop.ts";
 
@@ -142,7 +145,10 @@ export {
   agentActionOrWait,
   buildAgentTurnMessages,
   createAiGatewayAgentTurnInvoke,
+  agentTurnMaxTokens,
   DEFAULT_AGENT_TURN_MAX_TOKENS,
+  DEFAULT_REASONING_AGENT_TURN_MAX_TOKENS,
+  DIGEST_INLINE_PATHS,
   parseAgentAction,
   slugifyNeed,
   UNTRUSTED_CLOSE,

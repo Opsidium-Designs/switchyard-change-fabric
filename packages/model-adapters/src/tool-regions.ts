@@ -14,6 +14,7 @@
  * never because the reply was wrong.
  */
 
+import { withCallUsage } from "./call-usage.ts";
 import { callGatewayJsonSchema } from "./gateway-json-schema.ts";
 import { DEFAULT_WORKERS_AI_TIMEOUT_MS, type WorkersAiMessage } from "./workers-ai.ts";
 
@@ -55,8 +56,19 @@ export interface ToolRegionFill {
   readonly code: string;
 }
 
-/** Fill every region; returns the fills and the model that produced them. */
-export type ToolRegionFiller = (request: ToolRegionRequest) => Promise<{ readonly fills: readonly ToolRegionFill[]; readonly model: string }>;
+/**
+ * Fill every region; returns the fills, the model that produced them, and,
+ * when known, the model calls made (`attempts`, each model tried counts) and
+ * the successful call's token usage. A filler that throws after calling a
+ * model attaches the same (`executorCallUsage`).
+ */
+export type ToolRegionFiller = (request: ToolRegionRequest) => Promise<{
+  readonly fills: readonly ToolRegionFill[];
+  readonly model: string;
+  readonly attempts?: number;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+}>;
 
 /** Why a reply was not a usable set of fills (the reply's fault, not the transport's). */
 export class ToolRegionError extends Error {
@@ -237,34 +249,46 @@ export function createAiGatewayToolRegionFiller(options: AiGatewayToolRegionOpti
   const fetchFn = options.fetchFn ?? fetch;
   return async (request) => {
     let lastError: unknown = new Error("no model configured for tool authoring");
+    let attempts = 0;
     for (const model of options.models) {
-      let content: string;
+      let reply: Awaited<ReturnType<typeof callGatewayJsonSchema>>;
+      attempts += 1;
       try {
-        content = (
-          await callGatewayJsonSchema({
-            gatewayUrl: options.gatewayUrl,
-            gatewayToken: options.gatewayToken,
-            model,
-            messages: buildToolRegionMessages(request),
-            schemaName: TOOL_REGIONS_SCHEMA_NAME,
-            schema: TOOL_REGIONS_JSON_SCHEMA,
-            maxTokens: options.maxTokens ?? 8192,
-            timeoutMs: options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS,
-            fetchFn,
-            label: "tool fill",
-            responseError: (message) => new ToolRegionError(message),
-          })
-        ).content;
+        reply = await callGatewayJsonSchema({
+          gatewayUrl: options.gatewayUrl,
+          gatewayToken: options.gatewayToken,
+          model,
+          messages: buildToolRegionMessages(request),
+          schemaName: TOOL_REGIONS_SCHEMA_NAME,
+          schema: TOOL_REGIONS_JSON_SCHEMA,
+          maxTokens: options.maxTokens ?? 8192,
+          timeoutMs: options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS,
+          fetchFn,
+          label: "tool fill",
+          responseError: (message) => new ToolRegionError(message),
+        });
       } catch (error) {
         if (error instanceof ToolRegionError) {
-          throw error;
+          throw withCallUsage(error, { model, attempts });
         }
         // A transport failure (HTTP, timeout): try the next model down the ladder.
         lastError = error;
         continue;
       }
-      return { fills: parseToolRegionFills(content, request.regions), model };
+      const usage = {
+        model,
+        attempts,
+        ...(reply.usage?.inputTokens !== undefined ? { inputTokens: reply.usage.inputTokens } : {}),
+        ...(reply.usage?.outputTokens !== undefined ? { outputTokens: reply.usage.outputTokens } : {}),
+      };
+      let fills: ToolRegionFill[];
+      try {
+        fills = parseToolRegionFills(reply.content, request.regions);
+      } catch (error) {
+        throw withCallUsage(error, usage);
+      }
+      return { fills, ...usage };
     }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    throw attempts > 0 ? withCallUsage(lastError, { attempts }) : lastError instanceof Error ? lastError : new Error(String(lastError));
   };
 }

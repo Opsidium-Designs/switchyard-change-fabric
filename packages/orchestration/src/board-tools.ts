@@ -36,7 +36,14 @@ import {
   type BoardState,
   type ToolKind,
 } from "@switchyard-change/change-core";
-import { CODEMOD_REGION_EXAMPLES, type ExecutorProvider, type ToolRegionFiller, type ToolRegionSpec } from "@switchyard-change/model-adapters";
+import {
+  CODEMOD_REGION_EXAMPLES,
+  withCallUsage,
+  type ExecutorCallUsage,
+  type ExecutorProvider,
+  type ToolRegionFiller,
+  type ToolRegionSpec,
+} from "@switchyard-change/model-adapters";
 import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { authenticatedRemote } from "@switchyard-change/local-runner";
 import {
@@ -76,8 +83,13 @@ export interface ToolAuthorRequest {
   readonly goal?: string;
 }
 
-/** Writes a tool's files. Its result is scope-checked, committed, gated, and only then published. */
-export type ToolAuthor = (request: ToolAuthorRequest) => Promise<void>;
+/**
+ * Writes a tool's files. Its result is scope-checked, committed, gated, and
+ * only then published. A model-backed author returns the model calls it made
+ * (and attaches them to an error it throws), so a cost meter counts them
+ * (`meteredToolAuthor`); a template author returns nothing.
+ */
+export type ToolAuthor = (request: ToolAuthorRequest) => Promise<void | ExecutorCallUsage>;
 
 /** The tool contract every author is held to (and the live executor is told). */
 export function toolContract(capability: string, kind: ToolKind, inputs: readonly string[]): string {
@@ -219,7 +231,7 @@ export function regionToolAuthor(filler: ToolRegionFiller): ToolAuthor {
         excerpts.push({ path: rel, text: text.slice(0, AUTHOR_EXCERPT_CHARS) });
       }
     }
-    const { fills } = await filler({
+    const filled = await filler({
       capability: request.capability,
       kind: request.kind,
       contract: toolContract(request.capability, request.kind, request.inputs),
@@ -231,14 +243,25 @@ export function regionToolAuthor(filler: ToolRegionFiller): ToolAuthor {
       ...(request.gateFailure ? { gateFailure: request.gateFailure } : {}),
       ...(previous.length > 0 ? { previous } : {}),
     });
-    for (const [name, body] of modelFiles) {
-      const path = `${dir}/${name}`;
-      const mine = fills.filter((f) => f.file === path);
-      if (mine.length > 0) {
-        // Anchored on the runtime's own markers; refused when a region is unknown or broken.
-        await writeFile(join(request.worktreeDir, path), spliceRegions(body, mine), "utf8");
+    const usage: ExecutorCallUsage = {
+      model: filled.model,
+      attempts: filled.attempts ?? 1,
+      ...(filled.inputTokens !== undefined ? { inputTokens: filled.inputTokens } : {}),
+      ...(filled.outputTokens !== undefined ? { outputTokens: filled.outputTokens } : {}),
+    };
+    try {
+      for (const [name, body] of modelFiles) {
+        const path = `${dir}/${name}`;
+        const mine = filled.fills.filter((f) => f.file === path);
+        if (mine.length > 0) {
+          // Anchored on the runtime's own markers; refused when a region is unknown or broken.
+          await writeFile(join(request.worktreeDir, path), spliceRegions(body, mine), "utf8");
+        }
       }
+    } catch (error) {
+      throw withCallUsage(error, usage);
     }
+    return usage;
   };
 }
 

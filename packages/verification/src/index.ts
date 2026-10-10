@@ -62,6 +62,22 @@ export {
   planDependencyInstall,
   programOnPath,
 } from "./dependency-install.ts";
+export type { DependencySnapshot, DependencySource, RunnerResolutionContract } from "./runner-resolution.ts";
+export {
+  assertRunnerResolutionUnchanged,
+  DEPENDENCY_MAPS,
+  MAX_LOCKFILE_KEYS,
+  NPM_LOCKFILES,
+  OPAQUE_LOCKFILES,
+  readDependencySnapshot,
+  readDependencySnapshotFromDir,
+  RESOLUTION_SECTIONS,
+  runnerClosure,
+  runnerPackagesFor,
+  runnerPackagesFromJsonKeys,
+  runnerResolutionContract,
+  runnerResolutionViolations,
+} from "./runner-resolution.ts";
 
 export { matchesAny, matchesGlob, partitionByScope } from "./pathscope.ts";
 export type {

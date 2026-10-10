@@ -29,6 +29,7 @@ import type { AgentTurnTransport, ExecutorProvider, PlannerPlan } from "@switchy
 import {
   createAiGatewayToolRegionFiller,
   type ToolRegionFiller,
+  agentTurnMaxTokens,
   createAiGatewayAgentTurnInvoke,
   createAiGatewayJevInvoke,
   createAiGatewayPlannerInvoke,
@@ -64,6 +65,8 @@ export interface ExecutorEnv {
   readonly AI_GATEWAY_MODEL?: string;
   readonly AI_GATEWAY_PLANNER_MODEL?: string;
   readonly AI_GATEWAY_AGENT_MODEL?: string;
+  /** The board turn's completion-token ceiling (a positive integer; default by model family). */
+  readonly AI_GATEWAY_AGENT_MAX_TOKENS?: string;
   readonly AI_GATEWAY_ESCALATION_MODEL?: string;
   readonly AI_GATEWAY_ESCALATION_MODELS?: string;
   readonly AI_GATEWAY_MAX_MODEL_RETRIES?: string;
@@ -390,10 +393,12 @@ export function selectAgentTurn(env: ExecutorEnv = runtimeEnv()): SelectedAgentT
   }
   const model =
     (env.AI_GATEWAY_AGENT_MODEL ?? "").trim() || (env.AI_GATEWAY_MODEL ?? "").trim() || DEFAULT_AI_GATEWAY_MODEL;
-  const invoke = createAiGatewayAgentTurnInvoke({ gatewayUrl, gatewayToken, model });
+  const rawMax = (env.AI_GATEWAY_AGENT_MAX_TOKENS ?? "").trim();
+  const maxTokens = /^[1-9][0-9]{0,6}$/.test(rawMax) ? Number(rawMax) : agentTurnMaxTokens(model);
+  const invoke = createAiGatewayAgentTurnInvoke({ gatewayUrl, gatewayToken, model, maxTokens });
   return {
     live: true,
-    description: `ai-gateway agent turns (model ${model})`,
+    description: `ai-gateway agent turns (model ${model}, up to ${maxTokens} completion tokens)`,
     model,
     transport: (input) => invoke(input),
   };

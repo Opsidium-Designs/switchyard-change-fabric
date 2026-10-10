@@ -109,6 +109,12 @@ export interface ExecutionCost {
   readonly outputTokens?: number;
   /** The model identifier used, when applicable. */
   readonly model?: string;
+  /**
+   * The model calls this run made (each paid attempt, including transient
+   * retries), when the executor reports them; a meter counts 1 when absent.
+   * The token usage above is the successful attempt's.
+   */
+  readonly attempts?: number;
 }
 
 /**

@@ -80,6 +80,7 @@ import {
 
 import { maybeBuildTool, type ToolBuildResult } from "./tool-build.ts";
 import { withWorkerAuth } from "./worker-auth.ts";
+import { frameAttributionInput } from "./contract-triage.ts";
 import { deriveProtectedPaths } from "./protected-paths.ts";
 import { stableAppWorkerName } from "./app-deploy.ts";
 import type { Escalation } from "./local-control.ts";
@@ -1881,19 +1882,21 @@ async function runChangeLevelEscalationLadder(
         const threshold = input.jevThreshold ?? 0.75;
         const unitIds = gatedUnits.map((u) => u.unitId);
         const question = "Which module(s) does this failure implicate?";
-        const state = [
-          `Change: ${changeId}`,
-          `Gated units: ${unitIds.join(", ")}`,
-          "Failing gate evidence:",
-          lastEvidence.slice(0, 2000),
-        ].join("\n");
+        // The gate output and the units' objectives are untrusted data: framed,
+        // scrubbed, bounded, and defanged before they reach the decision model.
+        const framed = frameAttributionInput(
+          lastEvidence,
+          gatedUnits.map((u) => ({ id: u.unitId, objective: u.objective })),
+          { changeId, label: "Gated units" },
+        );
+        const state = framed.state;
         try {
           const answers = await input.jev(state, {
             attribution: {
               type: "choice",
               instructions: question,
               criteria: unitIds,
-              descriptions: Object.fromEntries(gatedUnits.map((u) => [u.unitId, u.objective.slice(0, 200)])),
+              descriptions: framed.descriptions,
             },
           });
           const answer = answers["attribution"];

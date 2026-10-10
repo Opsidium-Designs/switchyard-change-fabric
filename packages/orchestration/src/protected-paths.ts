@@ -28,11 +28,25 @@
  *     invokes (transitively, with their `pre`/`post` lifecycle scripts), and the
  *     keys that change what runs or how modules resolve (`type`,
  *     `packageManager`, `imports`, `exports`, and the jest, mocha, ava, babel,
- *     c8, nyc, vitest sections). Dependencies and lockfiles stay editable;
- *   - `tsconfig*.json` when the gate runs the type checker;
+ *     c8, nyc, vitest sections). Other dependencies stay editable, but the
+ *     gate's RUNNER packages (every program it runs through node_modules/.bin,
+ *     however reached: an npm script, npx, a node_modules path; `typescript`
+ *     when it runs tsc) are protected in the manifest's dependency maps and
+ *     `overrides`/`resolutions`/`pnpm` sections, and their resolution (with
+ *     their transitive dependencies) in an npm lockfile, entry by entry; a
+ *     pnpm or yarn lockfile (or an npm one whose closure is too large to list)
+ *     is protected whole (see runner-resolution in the
+ *     verification package, whose integration-time check the integrator can call);
+ *   - `tsconfig*.json` when the gate runs the type checker (`tsc`, `npx tsc`,
+ *     `./node_modules/.bin/tsc`);
  *   - the root config a test runner reads by default (vitest/vite, jest, mocha,
  *     ava, playwright configs) when a gate step runs that runner without an
- *     explicit config flag;
+ *     explicit config flag (`--config`, `-c`, `--config-file`, also as
+ *     `--flag=value`; `-c` is a syntax check only for node), and every repo file
+ *     a config the gate reads names by path (setupFiles, globalSetup, ...);
+ *   - every file under the acceptance gate's directories (a dedicated test
+ *     directory or one named like the gate holding a gate test or config, or a
+ *     directory the gate names);
  *   - harnesses the gate imports, transitively (see the import rule below).
  *   Root runner configs (pytest.ini, tox.ini, setup.cfg, pyproject.toml,
  *   conftest.py, noxfile.py, and the package-manager configs) are protected even
@@ -49,6 +63,7 @@ import { readdir, readFile, stat } from "node:fs/promises";
 import { dirname, join, posix, relative, resolve, sep } from "node:path";
 
 import { normalizeIntentEntry } from "@switchyard-change/change-core";
+import { readDependencySnapshotFromDir, runnerPackagesFor, runnerResolutionContract } from "@switchyard-change/verification";
 
 /**
  * Configs protected at the repo root even when absent (an agent may not add
@@ -151,6 +166,13 @@ export interface ProtectedPaths {
    * configs) stays contract-changeable with a human's approval.
    */
   readonly immutable: readonly string[];
+  /**
+   * The gate's runner packages (the programs it runs and their packages): their
+   * declarations and lockfile resolution are protected (`jsonKeys`), and the
+   * integrator checks the gated tree against the baseline for them
+   * (`assertRunnerResolutionUnchanged` in the verification package).
+   */
+  readonly runnerPackages: readonly string[];
 }
 
 /** A test-shaped repo path (any ecosystem's convention). */
@@ -272,6 +294,65 @@ function packageScript(argv: readonly string[]): string | undefined {
   return undefined;
 }
 
+/** Programs that run the next word as a program (`npx vitest`, `cross-env A=1 jest`). */
+const WRAPPERS = new Set(["npx", "bunx", "exec", "dlx", "env", "cross-env", "time", "nice", "nohup"]);
+/** Package managers whose next word may be a bin (`yarn vitest`, `pnpm exec jest`). */
+const PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn", "bun"]);
+/** A test-tree directory segment (a dedicated test directory). */
+const TEST_DIR_SEGMENT = /^(tests?|__tests__|specs?)$/;
+/** A directory named like the acceptance gate (`gate`, `gates`, `acceptance-gate`). */
+const GATE_DIR_SEGMENT = /gate/i;
+
+/**
+ * The programs one gate step runs: its first word (after environment
+ * assignments), the word a wrapper or package manager runs (`npx vitest`,
+ * `yarn jest`), and any bin or package reached through `node_modules`
+ * (`./node_modules/.bin/tsc`, `node node_modules/vitest/vitest.mjs`).
+ * Basenames; flags skipped.
+ */
+export function stepPrograms(words: readonly string[]): string[] {
+  const out: string[] = [];
+  let expect = true;
+  for (const word of words) {
+    const viaModules = /(?:^|\/)node_modules\/(?:\.bin\/([^/]+)|(@[^/]+\/[^/]+|[^/@.][^/]*))/.exec(word);
+    if (viaModules) {
+      out.push(viaModules[1] ?? viaModules[2]!);
+    }
+    if (!expect || /^[A-Za-z_][A-Za-z0-9_]*=/.test(word) || word.startsWith("-")) {
+      continue;
+    }
+    const base = posix.basename(word);
+    out.push(base);
+    expect = WRAPPERS.has(base) || PACKAGE_MANAGERS.has(base);
+  }
+  return out;
+}
+
+/** The stem a test file tests (`a.test.ts`, `test_a.py`, `a_test.go`, `ATest.java` are all `a`/`A`). */
+function testStem(file: string): string {
+  return posix
+    .basename(file)
+    .replace(/\.(test|spec)\.[A-Za-z0-9]+$/, "")
+    .replace(/^test_(.*)\.py$/, "$1")
+    .replace(/_(test|spec)\.[A-Za-z0-9]+$/, "")
+    .replace(/(Test|Tests)\.(java|kt|cs|scala)$/, "");
+}
+
+/** The string literals in a config's source that look like repo-relative file paths. */
+function configPathStrings(source: string): string[] {
+  const out: string[] = [];
+  const re = /["'`]([^"'`\n]{1,300})["'`]/g;
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(source)) !== null) {
+    const raw = match[1]!.replace(/^<rootDir>\//, "");
+    if (/[*?{}\s$]/.test(raw) || /^[a-z][a-z0-9+.-]*:/i.test(raw) || !/[/.]/.test(raw)) {
+      continue;
+    }
+    out.push(raw);
+  }
+  return out;
+}
+
 /** Collapse test-shaped files under dedicated test directories into `dir/**` until the list fits. */
 function collapse(paths: readonly string[], max: number): string[] {
   if (paths.length <= max) {
@@ -310,17 +391,35 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
   const scripts = manifest?.scripts ?? {};
 
   const gateFiles: string[] = [];
-  const consider = async (token: string, previous?: string): Promise<void> => {
-    if (previous === "--check" || previous === "-c") {
+  // Directories the gate names directly (fully part of the acceptance gate).
+  const namedDirs = new Set<string>();
+  // Runner configs the gate reads (an explicit config flag, or a root default).
+  const configFiles = new Set<string>();
+  // The programs the gate runs, and every other word (for the runner packages).
+  const programs = new Set<string>();
+  const otherWords = new Set<string>();
+  const consider = async (raw: string, previous: string | undefined, program: string | undefined): Promise<void> => {
+    // `node --check f` / `node -c f` only syntax-checks f (code under test);
+    // for any other program `-c` names a config.
+    if (previous === "--check" || (previous === "-c" && program === "node")) {
       return;
     }
+    // `--flag=value`: the value is what the gate reads.
+    const assigned = /^(--?[A-Za-z][\w-]*)=(.*)$/.exec(raw);
+    if (assigned && assigned[1] === "--check") {
+      return;
+    }
+    const token = assigned ? assigned[2]! : raw;
+    const flag = assigned ? assigned[1]! : previous;
     const normalized = normalizeIntentEntry(token)?.replace(/\/\*\*$/, "");
     if (normalized === undefined || normalized === "" || /[*?#]/.test(normalized)) {
       return;
     }
     const found = await kind(join(root, normalized));
     if (found === "dir") {
-      // A directory protects only the existing test-shaped files under it.
+      namedDirs.add(normalized);
+      // A directory protects the existing test-shaped files under it (and, as
+      // a directory the gate names, everything under it: see below).
       for (const file of files) {
         if (file.startsWith(`${normalized}/`) && isTestShaped(file)) {
           paths.add(file);
@@ -332,11 +431,15 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
     if (found === "file") {
       paths.add(normalized);
       gateFiles.push(normalized);
+      if (flag !== undefined && CONFIG_FLAG.test(flag)) {
+        configFiles.add(normalized);
+      }
     }
   };
   let runsTsc = false;
   const runsMakeOrJust = (program: string | undefined) => {
-    if (program !== undefined && /^(tsc|vue-tsc|tsc-files)$/.test(program)) {
+    // The type checker however it is reached (`tsc`, `npx tsc`, `./node_modules/.bin/tsc`).
+    if (program !== undefined && /^(tsc|vue-tsc|tsc-files)$/.test(posix.basename(program))) {
       runsTsc = true;
     }
     if (program === "make" && fileSet.has("Makefile")) {
@@ -360,9 +463,16 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
       if (!file.includes("/") && RUNNER_DEFAULT_CONFIGS[runner]!.test(file)) {
         paths.add(file);
         gateFiles.push(file);
+        configFiles.add(file);
       }
     }
   };
+  const notePrograms = (words: readonly string[]): void => {
+    stepPrograms(words).forEach((p) => programs.add(p));
+    words.forEach((w) => otherWords.add(posix.basename(w)));
+  };
+  /** The program a step runs (past wrappers and package managers), for flag meaning. */
+  const mainProgram = (words: readonly string[]): string | undefined => stepPrograms(words).find((p) => !WRAPPERS.has(p) && !PACKAGE_MANAGERS.has(p));
 
   const seen = new Set<string>();
   const walkScript = async (name: string, depth: number): Promise<void> => {
@@ -380,7 +490,9 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
       const stepScript = packageScript(words);
       if (stepScript === undefined || typeof scripts[stepScript] !== "string") {
         runnerDefaults(words);
+        notePrograms(words);
       }
+      const program = mainProgram(words);
       for (let i = 0; i < words.length; i += 1) {
         const word = words[i]!;
         const nested = packageScript(words.slice(i));
@@ -390,7 +502,7 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
           continue;
         }
         runsMakeOrJust(word);
-        await consider(word, words[i - 1]);
+        await consider(word, words[i - 1], program);
       }
     }
   };
@@ -406,7 +518,11 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
       } else {
         await walkScript(script, 0);
       }
-    } else if (program === undefined || !KNOWN_PROGRAMS.has(program)) {
+    } else if (
+      program === undefined ||
+      // A known runner by name, or reached through node_modules/.bin (never a repo script of that name).
+      !(KNOWN_PROGRAMS.has(program) || (/(^|\/)node_modules\/\.bin\/[^/]+$/.test(program) && KNOWN_PROGRAMS.has(posix.basename(program))))
+    ) {
       fallback = `the gate's program ${JSON.stringify(program ?? "")} cannot be analyzed: the manifest, Makefile, and justfile are protected whole`;
       for (const file of ["package.json", "Makefile", "justfile"]) {
         if (fileSet.has(file)) {
@@ -414,14 +530,48 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
           gateFiles.push(file);
         }
       }
+      notePrograms(gateCommand);
       for (let i = 1; i < gateCommand.length; i += 1) {
-        await consider(gateCommand[i]!, gateCommand[i - 1]);
+        runsMakeOrJust(gateCommand[i]);
+        await consider(gateCommand[i]!, gateCommand[i - 1], program);
       }
     } else {
-      runsMakeOrJust(program);
       runnerDefaults(gateCommand);
-      for (let i = 1; i < gateCommand.length; i += 1) {
-        await consider(gateCommand[i]!, gateCommand[i - 1]);
+      notePrograms(gateCommand);
+      const runs = mainProgram(gateCommand);
+      for (let i = 0; i < gateCommand.length; i += 1) {
+        // Every word: `npx tsc` and `./node_modules/.bin/tsc` run the type checker too.
+        runsMakeOrJust(gateCommand[i]);
+        if (i > 0) {
+          await consider(gateCommand[i]!, gateCommand[i - 1], runs);
+        }
+      }
+    }
+  }
+
+  // Paths a runner config the gate reads names (setupFiles, globalSetup, a
+  // reporter, a custom environment): the gate runs them, so they are part of
+  // it. Every string literal that resolves to a repo file, relative to the
+  // config's directory or the project root, is followed.
+  for (const config of [...configFiles].sort()) {
+    let source: string;
+    try {
+      source = await readFile(join(root, config), "utf8");
+    } catch {
+      continue;
+    }
+    for (const literal of configPathStrings(source)) {
+      for (const base of [posix.dirname(config), "."]) {
+        const joined = posix.normalize(posix.join(base, literal));
+        if (joined.startsWith("..") || joined.startsWith("/")) {
+          continue;
+        }
+        const hit = importCandidates(joined).map((c) => c.split(sep).join(posix.sep)).find((c) => fileSet.has(c));
+        if (hit !== undefined && hit !== config) {
+          paths.add(hit);
+          gateFiles.push(hit);
+          break;
+        }
       }
     }
   }
@@ -439,15 +589,33 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
   // Harnesses the gate imports, followed transitively (bounded depth). The
   // rule: starting from the files the gate runs and the existing test files,
   // an imported in-repo file is HARNESS (protected, and followed further) when
-  // it lies in the test tree: a directory that holds a gate-named or test
-  // file, or one below such a directory (the repo root only counts for files
-  // directly in it). An imported file anywhere else is APPLICATION code, the
-  // code under test: not protected and not followed. Imports that leave the
-  // project are reported.
-  const testTreeDirs = new Set([...gateFiles, ...files.filter(isTestShaped)].map((f) => posix.dirname(f)));
+  // it lies in a HARNESS ROOT or below one: a dedicated test directory
+  // (`test`, `tests`, `__tests__`, `spec`, `specs` anywhere in its path), a
+  // directory the gate names, or the directory of a file the gate runs (a
+  // gate test, script, or runner config) unless that directory is COLOCATED
+  // (it holds the module a gate test is named after: `a.ts` beside
+  // `a.test.ts`). The repo root only counts for files directly in it. A
+  // developer test outside a dedicated test directory is not a root: what a
+  // colocated test imports is APPLICATION code, the code under test, never
+  // protected or followed. Imports that leave the project are reported.
+  const colocated = (dir: string): boolean =>
+    !dir.split("/").some((s) => TEST_DIR_SEGMENT.test(s)) &&
+    gateFiles.some(
+      (g) =>
+        posix.dirname(g) === dir &&
+        isTestShaped(g) &&
+        files.some((f) => posix.dirname(f) === dir && !isTestShaped(f) && MODULE_FILE.test(f) && posix.basename(f).replace(/\.[^.]+$/, "") === testStem(g)),
+    );
+  const harnessRoots = new Set<string>([
+    ...namedDirs,
+    ...gateFiles.filter((f) => isTestShaped(f) || isRunnerConfig(f) || MODULE_FILE.test(f)).map((f) => posix.dirname(f)).filter((d) => !colocated(d)),
+  ]);
   const inTestTree = (rel: string): boolean => {
     const dir = posix.dirname(rel);
-    return [...testTreeDirs].some((t) => (t === "." ? dir === "." : dir === t || dir.startsWith(`${t}/`)));
+    if (dir.split("/").some((s) => TEST_DIR_SEGMENT.test(s))) {
+      return true;
+    }
+    return [...harnessRoots].some((t) => (t === "." ? dir === "." : dir === t || dir.startsWith(`${t}/`)));
   };
   const importsOf = new Map<string, string[]>();
   const queue = [...new Set([...gateFiles, ...files.filter(isTestShaped)])].filter((f) => MODULE_FILE.test(f)).map((f) => ({ file: f, depth: 0 }));
@@ -490,10 +658,34 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
     }
   }
 
+  // The gate's own toolchain: the packages it runs (and what they depend on,
+  // as the baseline lockfile resolves them) are protected in the manifest and
+  // the lockfile, so a worker cannot swap the runner through the dependency
+  // set (see runner-resolution in the verification package).
+  const snapshot = await readDependencySnapshotFromDir(root);
+  const runnerPackages = runnerPackagesFor(runsTsc ? [...programs, "tsc"] : programs, snapshot, otherWords);
+  const runner = runnerResolutionContract(snapshot, runnerPackages);
+  for (const file of runner.wholeFiles) {
+    paths.add(file);
+    gateFiles.push(file);
+  }
   const jsonKeys: { file: string; keys: string[][] }[] = [];
+  const lockLabels: string[] = [];
   if (manifest !== undefined && !paths.has("package.json")) {
-    const keys = [...[...scriptKeys].sort().map((k) => ["scripts", k]), ...MANIFEST_RUN_KEYS.map((k) => [k])];
+    const runnerKeys = runner.jsonKeys.find((j) => j.file === "package.json")?.keys ?? [];
+    const keys = [...[...scriptKeys].sort().map((k) => ["scripts", k]), ...MANIFEST_RUN_KEYS.map((k) => [k]), ...runnerKeys.map((k) => [...k])];
     jsonKeys.push({ file: "package.json", keys });
+  }
+  for (const entry of runner.jsonKeys) {
+    if (entry.file === "package.json" || paths.has(entry.file)) {
+      continue;
+    }
+    jsonKeys.push({ file: entry.file, keys: entry.keys.map((k) => [...k]) });
+    const closure = runner.closure[entry.file] ?? [];
+    const installed = runnerPackages.filter((n) => closure.includes(`node_modules/${n}`));
+    lockLabels.push(
+      `${entry.file} entries of the gate's runner packages and their dependencies (${installed.join(", ") || "none installed"}; ${closure.length} package entr${closure.length === 1 ? "y" : "ies"})`,
+    );
   }
   // The immutable acceptance gate: the files the gate names, the test files and
   // runner configs in the (non-root) directories of the test or config files it
@@ -502,10 +694,25 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
   // how the gate itself runs: immutable too.
   const immutable = new Set<string>([...gateFiles.filter((f) => paths.has(f)), ...RUNNER_CONFIG_FILES]);
   const gateDirs = new Set(
-    gateFiles.filter((f) => isTestShaped(f) || isRunnerConfig(f)).map((f) => posix.dirname(f)).filter((d) => d !== "."),
+    gateFiles.filter((f) => isTestShaped(f) || isRunnerConfig(f)).map((f) => posix.dirname(f)).filter((d) => d !== "." && !colocated(d)),
   );
+  // The ACCEPTANCE GATE directories (a dedicated test directory, or one named
+  // like the gate, that holds a gate test or config; or a directory the gate
+  // names): EVERY file under them is immutable (fixtures, expected outputs,
+  // setup files, helpers reached by path rather than by import). Other
+  // directories of gate tests or configs keep the narrower rule: their test
+  // files and runner configs.
+  const wholeDirs = [
+    ...[...namedDirs].filter((d) => d !== "." && d !== "" && !colocated(d)),
+    ...[...gateDirs].filter((d) => d.split("/").some((s) => TEST_DIR_SEGMENT.test(s) || GATE_DIR_SEGMENT.test(s))),
+  ];
   for (const file of files) {
-    if (gateDirs.has(posix.dirname(file)) && (isTestShaped(file) || isRunnerConfig(file))) {
+    const dir = posix.dirname(file);
+    if (gateDirs.has(dir) && (isTestShaped(file) || isRunnerConfig(file))) {
+      immutable.add(file);
+    }
+    if (wholeDirs.some((d) => dir === d || dir.startsWith(`${d}/`))) {
+      paths.add(file);
       immutable.add(file);
     }
   }
@@ -524,7 +731,13 @@ export async function deriveProtectedPaths(projectDir: string, gateCommand?: rea
     paths: collapse(all, MAX_POSTED_PROTECTED),
     restore: [...all, ...NESTED_CONFIG_GLOBS],
     jsonKeys,
-    keyLabels: jsonKeys.flatMap((j) => j.keys.map((k) => `${j.file} ${k.map((s, i) => (i === 0 ? s : `[${JSON.stringify(s)}]`)).join("")}`)),
+    keyLabels: [
+      ...jsonKeys
+        .filter((j) => j.file === "package.json")
+        .flatMap((j) => j.keys.map((k) => `${j.file} ${k.map((s, i) => (i === 0 ? s : `[${JSON.stringify(s)}]`)).join("")}`)),
+      ...lockLabels,
+    ],
+    runnerPackages,
     outside: [...outside].sort(),
     ...(fallback !== undefined ? { fallback } : {}),
   };
