@@ -221,6 +221,7 @@ export type {
   BoardDecisionRecordOutcome,
   BoardRevision,
   BoardRunBudgets,
+  BoardRunEffectiveBudgets,
   BoardRunEvent,
   BoardSeed,
   BoardStopReason,
@@ -249,12 +250,21 @@ export {
   ContinuousBoardIntegrator,
   describeWorkspace,
   formatBoardRunSummary,
+  formatBudgetsLine,
   formatToolRegistry,
   formatBoardTranscript,
   integrateBoardRevision,
   pendingPushKey,
   runBoard,
 } from "./run-board.ts";
+export type { ModelPrice, RunCapReached, RunCaps } from "./run-meter.ts";
+export { meteredExecutor, meteredTransport, RunMeter } from "./run-meter.ts";
+export type { ProofBundle, ProofBundleOptions, ProofCount } from "./proof-bundle.ts";
+export { buildProofBundle, formatProofSummary } from "./proof-bundle.ts";
+export type { RefreshableToken, TokenRefresherOptions } from "./token-refresh.ts";
+export { TokenRefresher } from "./token-refresh.ts";
+export type { PendingClashInput, PendingClashResult } from "./board-clash.ts";
+export { recordPendingClashes } from "./board-clash.ts";
 export type { ProtectedPaths } from "./protected-paths.ts";
 export { deriveProtectedPaths, isRunnerConfig, isTestShaped, RUNNER_CONFIG_FILES } from "./protected-paths.ts";
 export { promoteVerifiedIntegration, redeployIfPreviouslyDeployed } from "./run-live.ts";

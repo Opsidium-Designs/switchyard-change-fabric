@@ -13,7 +13,9 @@ import { describe, expect, it } from "vitest";
 import { assertBoardBacked, buildBoardGraph } from "@switchyard-change/orchestration/board-graph";
 
 import { findLocalPaths, findSecrets } from "../scripts/replay-export.ts";
-import { hullHeader, MissionControl, boardShortLabels, seedItemIds } from "../src/mission-control.tsx";
+import { buildProofBundle } from "@switchyard-change/orchestration/proof-bundle";
+
+import { hullHeader, MissionControl, ProofPanel, boardShortLabels, seedItemIds } from "../src/mission-control.tsx";
 import { RECORDED_BANNER, ReplayApp, VerdictPanel } from "../src/ReplayApp.tsx";
 import {
   finalVerdict,
@@ -171,5 +173,22 @@ describe("the recorded view", () => {
     const roomy = hullHeader({ title: "billing-tax", status: "claimed", width: 250, boost: 1 });
     expect(roomy.title).toBe("billing-tax");
     expect(roomy.status).toBe("claimed");
+  });
+});
+
+describe("the proof panel (from the log alone, in replay too)", () => {
+  it("each published run states honestly what it can prove: no recorded promotion means not proven", async () => {
+    for (const file of replayFiles) {
+      const run = await load(file.replace(/\.json$/, ""));
+      const bundle = buildProofBundle(run.messages);
+      // Recorded before promotions were written to the board: never claimed.
+      if (!run.messages.some((m) => m.type === "revision.promoted")) {
+        expect(bundle.status).toBe("not-proven");
+        expect(bundle.reasons.join(" ")).toMatch(/no promotion|failed its gate|no integrated revision/);
+      }
+      const html = renderToStaticMarkup(createElement(ProofPanel, { bundle, onSelectSeq: () => undefined }));
+      expect(html).toContain(bundle.status === "proven" ? "PROVEN" : "NOT PROVEN");
+      expect(html).not.toMatch(/undefined|NaN/);
+    }
   });
 });

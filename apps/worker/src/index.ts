@@ -1172,9 +1172,10 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
   //   POST /changes/:id/tools/gate           (bearer) the operator records a tool's own gate result
   //   POST /changes/:id/board/seam-stalled   (bearer) the operator records a seam item stalled on a quiet board
   //   POST /changes/:id/tools/used           (bearer) the operator records a run of a pinned tool version
+  //   POST /changes/:id/board/record         (bearer) {type, payload} the operator records an engine fact (a stalled claim, ...)
   // The engine's own messages are never accepted from any route.
   const boardRoute = url.pathname.match(
-    /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|board\/seam-stalled|integration\/revision|tools\/gate|tools\/used)$/,
+    /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|board\/seam-stalled|board\/record|integration\/revision|tools\/gate|tools\/used)$/,
   );
   if (boardRoute) {
     const changeId = decodeURIComponent(boardRoute[1] ?? "");
@@ -1257,6 +1258,8 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         outcome = await stub.recordBoardDecision(body.value);
       } else if (kind === "board/seam-stalled") {
         outcome = await stub.recordSeamStalled(body.value);
+      } else if (kind === "board/record") {
+        outcome = await stub.recordEngine(body.value);
       } else if (kind === "tools/gate") {
         outcome = await stub.recordToolGate(body.value);
       } else if (kind === "tools/used") {
@@ -1334,9 +1337,15 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
   }
 
-  const readTokenMatch = url.pathname.match(/^\/changes\/([^/]+)\/board\/read-token$/);
+  // A REFRESHED write token for a joined board agent's own repo (bearer), for
+  // runs longer than one token lifetime: the operator mints it before the
+  // agent's token expires, swaps it in, and revokes the old one (read-token
+  // revoke route) after the swap. With `help`, the granted helper's FORK.
+  //   POST /changes/:id/board/agent-token  {agent, ttlSeconds?, help?}  -> {workspaceName, tokenId, token, tokenExpiresAt}
+  const readTokenMatch = url.pathname.match(/^\/changes\/([^/]+)\/board\/(read-token|agent-token)$/);
   if (request.method === "POST" && readTokenMatch) {
     const changeId = decodeURIComponent(readTokenMatch[1] ?? "");
+    const scope = readTokenMatch[2] === "agent-token" ? "write" : "read";
     const stub = changeStateStub(env, changeId);
     if (!(await stub.isInitialized())) {
       return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
@@ -1365,14 +1374,15 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
       return json({ code: allowed.code, error: allowed.error }, 400);
     }
     const provisioner = selectProvisioner(env);
-    if (!provisioner.issueReadToken) {
-      return json({ code: "INVALID_STATE", error: "this Worker cannot issue read tokens" }, 501);
+    const issue = scope === "write" ? provisioner.issueWriteToken?.bind(provisioner) : provisioner.issueReadToken?.bind(provisioner);
+    if (!issue) {
+      return json({ code: "INVALID_STATE", error: `this Worker cannot issue ${scope} tokens` }, 501);
     }
     const workspaceName = typeof help === "string" ? boardHelpForkWorkspaceName(changeId, help) : boardAgentWorkspaceName(changeId, agent);
     try {
-      return json({ workspaceName, ...(await provisioner.issueReadToken(workspaceName, ttl)) }, 201);
+      return json({ workspaceName, ...(await issue(workspaceName, ttl)) }, 201);
     } catch (error) {
-      return json({ code: "INVALID_STATE", error: `could not issue a read token: ${errorMessage(error)}` }, 502);
+      return json({ code: "INVALID_STATE", error: `could not issue a ${scope} token: ${errorMessage(error)}` }, 502);
     }
   }
 

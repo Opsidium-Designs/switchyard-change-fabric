@@ -18,7 +18,7 @@ import { describe, expect, it } from "vitest";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 import type { BoardMessage } from "@switchyard-change/change-core";
 import type { AskJev } from "@switchyard-change/model-adapters";
-import type { CommandOutcome, CommandRunner } from "@switchyard-change/verification";
+import { PromotionRefusedError, type CommandOutcome, type CommandRunner } from "@switchyard-change/verification";
 
 import { BoardAgentClient, BoardOperatorClient } from "../src/board-client.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
@@ -424,6 +424,49 @@ describe("ContinuousBoardIntegrator: recorded base, transient retries, bounded s
     }
     expect(rev.payload.failing!.output).toMatch(/^regressed completed item\(s\): x/);
     expect(rev.payload.failing!.items).toEqual(["y"]); // the pushes that broke it own the fix
+  });
+});
+
+describe("trunk-moved and stale bases", () => {
+  it("each revision names the base it was built on: the first on revision-free head, the next on the last passing commit", async () => {
+    const env = await setup({ agents: ["a1", "a2"] });
+    await env.post("a1", { type: "item.claimed", payload: { item: "x", intent: { read: [], write: ["src/x/**"] } } });
+    await env.post("a2", { type: "item.claimed", payload: { item: "y", intent: { read: [], write: ["src/y/**"] } } });
+    const integrator = env.integrator({ appGateCommand: ["gate"], verifyCommandRunner: { run: async () => ({ code: 0, stdout: "ok", stderr: "" }) } });
+    await env.announce("a1", "x", await env.commit("a1", { "src/x/a.ts": "export const a = 1;\n" }), ["src/x/a.ts"]);
+    integrator.kick();
+    await integrator.idle();
+    await env.announce("a2", "y", await env.commit("a2", { "src/y/b.ts": "export const b = 1;\n" }), ["src/y/b.ts"]);
+    integrator.kick();
+    await integrator.idle();
+    const revs = (await env.log()).filter((m): m is Extract<BoardMessage, { type: "integrated.rev" }> => m.type === "integrated.rev");
+    expect(revs).toHaveLength(2);
+    // No baseline was posted with this goal: the first names none; the second is built on revision 1.
+    expect(revs[0]!.payload.base).toBeUndefined();
+    expect(revs[1]!.payload.base).toBe(revs[0]!.payload.commit);
+  });
+
+  it("a trunk another writer moved after a recorded pass is a distinct, typed outcome on the board (nothing pushed)", async () => {
+    const env = await setup({ agents: ["a1"] });
+    await env.post("a1", { type: "item.claimed", payload: { item: "x", intent: { read: [], write: ["src/x/**"] } } });
+    const advanced: string[] = [];
+    const integrator = env.integrator({
+      appGateCommand: ["gate"],
+      verifyCommandRunner: { run: async () => ({ code: 0, stdout: "ok", stderr: "" }) },
+      advanceBranch: async (_ref, _token, commit) => {
+        advanced.push(commit);
+        throw new PromotionRefusedError({ reason: "trunk-moved", ref: "refs/heads/main", commit, expected: "a".repeat(40), actual: "b".repeat(40) });
+      },
+    });
+    await env.announce("a1", "x", await env.commit("a1", { "src/x/a.ts": "export const a = 1;\n" }), ["src/x/a.ts"]);
+    integrator.kick();
+    await integrator.idle();
+    const revision = integrator.revisions[0]!;
+    expect(advanced).toEqual([revision.commit]);
+    expect(revision.trunkMoved).toEqual({ expected: "a".repeat(40), actual: "b".repeat(40) });
+    expect(revision.excludedAgents).toEqual([expect.objectContaining({ agent: "(integration)", reason: expect.stringMatching(/the trunk moved: the integration branch was not advanced/) })]);
+    const moved = (await env.log()).find((m) => m.type === "trunk.moved")!;
+    expect(moved.payload).toEqual({ rev: revision.n, commit: revision.commit, expected: "a".repeat(40), actual: "b".repeat(40) });
   });
 });
 

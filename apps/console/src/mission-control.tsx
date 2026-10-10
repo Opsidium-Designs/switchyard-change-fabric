@@ -23,6 +23,7 @@ import {
   type BoardTicker,
 } from "@switchyard-change/orchestration/board-graph";
 import type { EscalationSnapshot } from "@switchyard-change/orchestration/graph-model";
+import { buildProofBundle, type ProofBundle } from "@switchyard-change/orchestration/proof-bundle";
 
 import { IDENTITY_VIEW, shouldZoomOnWheel, zoomAt, type ViewTransform } from "./graph-interactions";
 import { keyMoments, MOMENT_GROUPS, type MomentKind } from "./replay-data";
@@ -251,6 +252,28 @@ export function payloadSummary(message: BoardMessage): string {
       return `hands ${message.payload.item} to ${message.payload.to}${message.payload.capsule.commit ? ` from ${message.payload.capsule.commit.slice(0, 7)}` : ""}`;
     case "seam.stalled":
       return `seam ${message.payload.item} stalled${message.payload.released ? ": released for another agent" : ""}`;
+    case "claim.lapsed":
+      return `${message.payload.agent}'s claim on ${message.payload.item} lapsed (${message.payload.reason}): open again`;
+    case "revision.promoted":
+      return `rev ${message.payload.rev} promoted to ${message.payload.branch} (${message.payload.commit.slice(0, 7)}, gated ${message.payload.gatedCommit.slice(0, 7)})`;
+    case "trunk.moved":
+      return `the integration branch moved after rev ${message.payload.rev}: not advanced`;
+    case "token.refreshed":
+      return `${message.payload.agent}'s ${message.payload.kind} token refreshed (never shown)`;
+    case "run.capped":
+      return `${message.payload.kind} cap reached${message.payload.item !== undefined ? ` for ${message.payload.item}` : ""}: ${message.payload.used} of ${message.payload.limit}`;
+    case "clash.predicted":
+      return message.payload.status === "conflict"
+        ? `${message.payload.a.item} and ${message.payload.b.item} would conflict on ${(message.payload.paths ?? []).join(", ")} (${message.payload.scope}; advisory)`
+        : `${message.payload.a.item} and ${message.payload.b.item}: clash ${message.payload.status} (${clip(message.payload.reason ?? "", 60)})`;
+    case "claim.overlap":
+      return `${message.payload.item} overlaps ${message.payload.withAgent}'s ${message.payload.with} on ${message.payload.files.join(", ")} (advisory)`;
+    case "item.replanned":
+      return `${message.payload.item} re-planned (${message.payload.action}${message.payload.with !== undefined ? ` with ${message.payload.with}` : ""}) into ${message.payload.children.map((c) => c.item).join(", ")}`;
+    case "item.escalated":
+      return `${message.payload.item} failed again after the re-plan of ${message.payload.replanOf}: a human decides`;
+    case "claim.extended":
+      return `${message.payload.item}: deadline extended (${clip(message.payload.reason, 80)})`;
     case "fix.exhausted":
       return `${message.payload.item}: fix budget spent (${message.payload.attempts} attempt(s), rev ${message.payload.n})`;
     case "review.requested":
@@ -423,7 +446,17 @@ function ItemCard({
         {d.fixExhausted ? <span className="mc-tag is-fix">fix budget spent</span> : null}
         {d.doneProposed && d.completed === undefined ? <span className="mc-tag">done proposed, unverified</span> : null}
         {d.status === "split" ? <span className="mc-tag">split</span> : null}
+        {(d.clashes ?? []).map((c) => (
+          <span key={c.seq} className={`mc-tag is-clash${c.scope === "shared" ? " is-shared" : ""}`} title={`clash prediction (advisory; the gate decides) (seq ${c.seq}, clash.predicted)`}>
+            {c.status === "conflict" ? `clash with ${c.with}${c.scope === "shared" ? " (shared seam)" : ""}` : `clash with ${c.with}: ${c.status}`}
+          </span>
+        ))}
       </span>
+      {d.wait !== undefined ? (
+        <span className={`mc-card-wait is-${d.wait.kind}`} title="why it is waiting, derived from the board">
+          {d.wait.line}
+        </span>
+      ) : null}
     </li>
   );
 }
@@ -1172,7 +1205,90 @@ function NodeLabel({ node, boost = 1 }: { node: BoardGraphNode; boost?: number }
 // Right pane: thread, node detail, tools
 // ---------------------------------------------------------------------------
 
-export type RightTab = "thread" | "node" | "tools";
+export type RightTab = "thread" | "node" | "tools" | "proof";
+
+/**
+ * The PROOF panel: what the board can prove about its final revision at seq K
+ * (the full log at the live head), built from the log alone, so a recorded
+ * run shows it the same way. Every line cites the board seq that backs it.
+ */
+export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSelectSeq: (seq: number) => void }) {
+  const seq = (n: number | undefined) =>
+    n === undefined ? null : (
+      <button type="button" className="mc-seq-link" onClick={() => onSelectSeq(n)}>
+        #{n}
+      </button>
+    );
+  return (
+    <div className="mc-proof" aria-label="Proof">
+      <p className={`mc-proof-status is-${bundle.status}`}>
+        {bundle.status === "proven" ? "PROVEN" : "NOT PROVEN"}
+        {bundle.revision ? ` for revision ${bundle.revision.n} (${bundle.revision.commit.slice(0, 12)})` : ""} {seq(bundle.revision?.seq)}
+      </p>
+      {bundle.reasons.length > 0 ? (
+        <ul className="mc-proof-reasons">
+          {bundle.reasons.map((r) => (
+            <li key={r}>{r}</li>
+          ))}
+        </ul>
+      ) : null}
+      <dl className="mc-proof-facts">
+        <dt>gate</dt>
+        <dd>
+          {bundle.gate.command?.join(" ") ?? "no command recorded"}: {bundle.gate.verdict}
+          {bundle.gate.gated ? "" : " (no gate ran)"}
+        </dd>
+        <dt>promoted</dt>
+        <dd>
+          {bundle.promotion ? (
+            <>
+              {bundle.promotion.branch} {bundle.promotion.commit.slice(0, 12)} from gated {bundle.promotion.gatedCommit.slice(0, 12)} (
+              {bundle.promotion.matchesGated ? "the gated tree" : "NOT the gated tree"}) {seq(bundle.promotion.seq)}
+            </>
+          ) : (
+            "not recorded"
+          )}
+        </dd>
+        <dt>tests</dt>
+        <dd>
+          baseline {bundle.inventory.baseline?.count ?? "unknown"}; final{" "}
+          {bundle.inventory.final
+            ? `executed ${bundle.inventory.final.executed}${bundle.inventory.final.acceptance ? `, acceptance ${bundle.inventory.final.acceptance.passed}/${bundle.inventory.final.acceptance.total}` : ""}${bundle.inventory.final.developer ? `, developer ${bundle.inventory.final.developer.passed}/${bundle.inventory.final.developer.total}` : ""}`
+            : "no count"}
+        </dd>
+        <dt>progress</dt>
+        <dd>
+          {bundle.progress.length > 0
+            ? bundle.progress.map((p, i) => (
+                <span key={p.seq}>
+                  {i > 0 ? " -> " : ""}rev {p.n} {p.line} {seq(p.seq)}
+                </span>
+              ))
+            : "none recorded"}
+        </dd>
+        <dt>merged</dt>
+        <dd>
+          {bundle.contributions.pushesMerged} push(es) from {bundle.contributions.agents.join(", ") || "nobody"};{" "}
+          {bundle.contributions.items.filter((i) => i.status === "done").length} of {bundle.contributions.items.length} item(s) done
+        </dd>
+        <dt>contracts</dt>
+        <dd>{bundle.contracts.length > 0 ? bundle.contracts.map((c) => `${c.contract} ${c.status}${c.decidedBy ? ` by ${c.decidedBy}` : ""}`).join("; ") : "none"}</dd>
+        <dt>tools</dt>
+        <dd>{bundle.tools.length > 0 ? bundle.tools.map((t) => `${t.capability} v${t.version} (${t.uses} use(s))`).join("; ") : "none"}</dd>
+        <dt>decisions</dt>
+        <dd>{bundle.decisions.length > 0 ? `${bundle.decisions.length} advisory (never part of the proof)` : "none"}</dd>
+        <dt>human</dt>
+        <dd>{bundle.human.length > 0 ? bundle.human.map((h) => `${h.ref}: ${h.decision}`).join("; ") : "none"}</dd>
+        <dt>stalls</dt>
+        <dd>
+          {bundle.lapses.length} lapse(s), {bundle.replans.length} re-plan(s), {bundle.escalations.length} escalation(s), {bundle.clashes.length} clash prediction(s)
+          {bundle.caps.length > 0 ? `, caps reached: ${bundle.caps.map((c) => c.kind).join(", ")}` : ""}
+        </dd>
+      </dl>
+      {bundle.incompleteItems.length > 0 ? <p className="muted">not completed: {bundle.incompleteItems.join(", ")}</p> : null}
+    </div>
+  );
+}
 
 export function Thread({
   messages,
@@ -1595,6 +1711,8 @@ export function MissionControl({
   }, [k, live, onSeqChange]);
 
   const layout = useMemo(() => boardLayout(log), [log]);
+  // The proof of the final revision at K, from the log alone (works the same in replay).
+  const proof = useMemo(() => buildProofBundle(boardPrefix(log, k)), [log, k]);
   const { model, error } = useMemo((): { model: BoardGraphModel | null; error: string | null } => {
     try {
       return { model: buildBoardGraph(log, k), error: null };
@@ -1737,7 +1855,7 @@ export function MissionControl({
       </div>
       <div className="mc-right" aria-label="Details">
         <div className="mc-tabs" role="tablist">
-          {(["thread", "node", "tools"] as const).map((t) => (
+          {(["thread", "node", "tools", "proof"] as const).map((t) => (
             <button key={t} type="button" role="tab" aria-selected={tab === t} className={tab === t ? "is-active" : ""} onClick={() => setTab(t)}>
               {t.toUpperCase()}
             </button>
@@ -1757,6 +1875,8 @@ export function MissionControl({
           ) : (
             <p className="muted mc-empty">Select an item, agent, revision, tool, or decision.</p>
           )
+        ) : tab === "proof" ? (
+          <ProofPanel bundle={proof} onSelectSeq={(seq) => select({ kind: "seq", seq })} />
         ) : (
           <ToolsRegistry model={model} />
         )}

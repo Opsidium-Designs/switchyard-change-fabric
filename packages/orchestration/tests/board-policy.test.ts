@@ -275,3 +275,92 @@ describe("the contract cue in the generic policy", () => {
     expect((await at([{ turn: 1, action: first.action, outcome: "posted" }])).action).toMatchObject({ type: "edit", itemId: "tax" });
   });
 });
+
+describe("claim deadlines in the generic policy (the lead)", () => {
+  const near = (progressing: boolean) => ({ item: "one", owner: "agent-1", deadlineSeq: 200, remaining: 12, lastProgressSeq: 180, extensions: 0, progressing });
+
+  it("extends a claim near its deadline whose holder is progressing, and lets a stalled one lapse", async () => {
+    const extend = input("lead", "lead", {});
+    const progressing = { ...extend, digest: { ...extend.digest, deadlines: [near(true)] } as BoardDigest };
+    expect((await policy(progressing)).action).toMatchObject({ type: "extend_claim", itemId: "one", rationale: expect.stringMatching(/agent-1 is making progress on one/) });
+    const stalled = { ...extend, digest: { ...extend.digest, deadlines: [near(false)] } as BoardDigest };
+    expect((await policy(stalled)).action.type).toBe("wait");
+  });
+
+  it("never retries an extension the board refused", async () => {
+    const base = input("lead", "lead", {});
+    const refused = {
+      ...base,
+      digest: { ...base.digest, deadlines: [near(true)] } as BoardDigest,
+      capsule: { ...base.capsule, decisions: [{ turn: 1, action: { type: "extend_claim" as const, itemId: "one", rationale: "r" }, outcome: "rejected" as const, code: "LIMIT" }] },
+    };
+    expect((await policy(refused)).action.type).toBe("wait");
+  });
+});
+
+describe("re-plans in the generic policy (the lead)", () => {
+  type Cue = NonNullable<Input["board"]["replan"]>[number];
+  const cue = (over: Partial<Cue> = {}): Cue => ({
+    item: "api",
+    reason: "fix-budget-exhausted",
+    rev: 3,
+    objective: "report status from the api",
+    scopeHint: ["src/api/**"],
+    exhaustedBy: ["agent-1"],
+    stallReleases: 0,
+    failingFiles: [],
+    failingTests: ["not ok 1 - api reports status"],
+    neighbours: [],
+    ...over,
+  });
+  const files = ["src/api/handler.ts", "src/api/routes.ts", "src/core/a.ts", "src/core/b.ts", "tests/core.test.ts"];
+  const lead = (c: Cue, repoFiles = files) => input("lead", "lead", { replan: [c] }, { repo: { files: repoFiles, excerpts: [] } });
+
+  it("re-scopes an item to the files its failure names outside its scope", async () => {
+    expect((await policy(lead(cue({ failingFiles: ["src/core/a.ts"] })))).action).toMatchObject({
+      type: "replan_item",
+      itemId: "api",
+      plan: "rescope",
+      children: [{ scopeHint: ["src/api/**", "src/core/a.ts"] }],
+    });
+  });
+
+  it("splits a multi-file item, one child per failing file first", async () => {
+    const action = (await policy(lead(cue({ failingFiles: ["src/api/routes.ts"] })))).action;
+    expect(action).toMatchObject({ type: "replan_item", plan: "split" });
+    const children = (action as unknown as { children: { scopeHint: string[] }[] }).children;
+    expect(children.map((c) => c.scopeHint)).toEqual([["src/api/routes.ts"], ["src/api/handler.ts"]]);
+  });
+
+  it("fresh eyes go first when the evidence calls for no other plan; then a single-file item merges with a neighbour in its directory, else it is re-scoped to the failing tests", async () => {
+    expect((await policy(lead(cue({ scopeHint: ["src/core/a.ts"] })))).action.type).toBe("wait");
+    // A file another outstanding item already covers is not added.
+    const covered = input("lead", "lead", { replan: [cue({ failingFiles: ["src/core/a.ts"] })], items: [{ item: "core", objective: "c", scopeHint: ["src/core/**"], status: "open" }] }, { repo: { files, excerpts: [] } });
+    expect((await policy(covered)).action.type).toBe("wait");
+    const single = cue({ scopeHint: ["src/core/a.ts"], exhaustedBy: ["agent-1", "agent-2"], neighbours: [{ item: "core-b", objective: "do b", scopeHint: ["src/core/b.ts"] }] });
+    expect((await policy(lead(single))).action).toMatchObject({ type: "replan_item", plan: "merge", withItemId: "core-b", children: [{ scopeHint: ["src/core/a.ts", "src/core/b.ts"] }] });
+    const alone = cue({ scopeHint: ["src/core/a.ts"], reason: "stalled", exhaustedBy: [], stallReleases: 2 });
+    expect((await policy(lead(alone))).action).toMatchObject({ type: "replan_item", plan: "rescope", children: [{ objective: expect.stringMatching(/not ok 1 - api reports status/) }] });
+  });
+
+  it("re-plans an item once (a decided item is left alone)", async () => {
+    const base = lead(cue());
+    const decided = {
+      ...base,
+      capsule: { ...base.capsule, decisions: [{ turn: 1, action: { type: "replan_item" as const, itemId: "api", plan: "rescope" as const, children: [], rationale: "r" }, outcome: "posted" as const }] },
+    };
+    expect((await policy(decided)).action.type).toBe("wait");
+  });
+});
+
+describe("overlap preference in the generic policy", () => {
+  it("a free worker claims an open item whose scope overlaps no other holder's before one that does", async () => {
+    const base = input("agent-2", "worker", {});
+    const openItems = [
+      { item: "two", objective: "t", acceptance: [], scopeHint: ["src/b/**", "src/shared/**"], overlapsClaimed: ["one"] },
+      { item: "three", objective: "th", acceptance: [], scopeHint: ["src/c/**"] },
+    ];
+    const free = { ...base, digest: { ...base.digest, openItems } as unknown as BoardDigest };
+    expect((await policy(free)).action).toMatchObject({ type: "claim", itemId: "three" });
+  });
+});

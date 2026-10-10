@@ -51,6 +51,8 @@ export interface JoinedWorkspace {
   readonly tokenId: string;
   readonly token: string;
   readonly tokenExpiresAt: string;
+  /** A fork only: the head it was expected to start from and the head it really has, when they differ. */
+  readonly baseMismatch?: { readonly expected: string; readonly realized: string };
 }
 
 /** The Change's tools repo and a token for it (returned once). */
@@ -199,6 +201,8 @@ export class BoardOperatorClient {
     readonly gated?: false;
     /** Advisory progress parsed from the gate output. */
     readonly progress?: BoardRevProgress;
+    /** The integrated head the revision was built on (the board refuses a stale one). */
+    readonly base?: string;
     /** Sub-lead merges the integrator could not verify in the gated tree. */
     readonly unverified?: readonly { readonly item: string; readonly reason: string }[];
   }): Promise<BoardPostOutcome> {
@@ -215,6 +219,12 @@ export class BoardOperatorClient {
   /** Record a seam item stalled on a quiet board (the engine appends seam.stalled). */
   async recordSeamStalled(item: string): Promise<BoardPostOutcome> {
     const { res, body } = await this.post("/board/seam-stalled", { item });
+    return res.status === 201 ? { ok: true, appended: (body.appended as BoardMessage[] | undefined) ?? [] } : rejection(res, body);
+  }
+
+  /** Record an engine fact the operator observed (the engine-record route validates it). */
+  async recordEngine(type: string, payload: Record<string, unknown>): Promise<BoardPostOutcome> {
+    const { res, body } = await this.post("/board/record", { type, payload });
     return res.status === 201 ? { ok: true, appended: (body.appended as BoardMessage[] | undefined) ?? [] } : rejection(res, body);
   }
 
@@ -241,6 +251,30 @@ export class BoardOperatorClient {
   }
 
   /** Revoke a read token the operator no longer needs. */
+  /**
+   * A REFRESHED, short-lived WRITE token for a joined agent's own repo (or,
+   * with `help`, its granted fork), issued to the operator before the agent's
+   * token expires. The old one is revoked with revokeReadToken (it revokes any
+   * token issued for that repo).
+   */
+  async agentToken(
+    agent: string,
+    ttlSeconds: number,
+    options: { readonly help?: string } = {},
+  ): Promise<({ readonly ok: true; readonly workspaceName: string; readonly tokenId: string; readonly token: string; readonly tokenExpiresAt: string }) | BoardRejection> {
+    const { res, body } = await this.post("/board/agent-token", { agent, ttlSeconds, ...(options.help !== undefined ? { help: options.help } : {}) });
+    if (res.status !== 201 || typeof body.token !== "string") {
+      return rejection(res, body);
+    }
+    return {
+      ok: true,
+      workspaceName: String(body.workspaceName ?? ""),
+      tokenId: String(body.tokenId ?? ""),
+      token: body.token,
+      tokenExpiresAt: String(body.tokenExpiresAt ?? ""),
+    };
+  }
+
   async revokeReadToken(agent: string, tokenId: string, help?: string): Promise<boolean> {
     const { res } = await this.post("/board/read-token/revoke", { agent, tokenId, ...(help !== undefined ? { help } : {}) });
     return res.status < 400;
@@ -359,5 +393,10 @@ export class BoardAgentClient {
   async state(): Promise<BoardState> {
     const page = await readBoardPage(this.fetchFn, this.base, this.changeId, 0, 1);
     return page.state;
+  }
+
+  /** The whole public board log (the lead reads a failing revision's evidence from it). */
+  async log(): Promise<BoardPage> {
+    return readBoardLog(this.fetchFn, this.base, this.changeId);
   }
 }

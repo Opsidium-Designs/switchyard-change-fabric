@@ -32,9 +32,9 @@ const variants = (AGENT_TURN_JSON_SCHEMA.properties.action.anyOf as unknown as r
 const variantOf = (type: string): Schema => variants.find((v) => v.type === type)!.schema;
 const payloadSchema = variantOf("message").properties!.payload!;
 
-const LEAD_ONLY: readonly AgentActionType[] = ["decide_contract", "decide_item"];
+const LEAD_ONLY: readonly AgentActionType[] = ["decide_contract", "decide_item", "extend_claim", "replan_item"];
 const WORKER: readonly AgentActionType[] = AGENT_ACTION_TYPES.filter((t) => !LEAD_ONLY.includes(t));
-const LEAD: readonly AgentActionType[] = ["decide_contract", "decide_item", "propose_item", "message", "wait"];
+const LEAD: readonly AgentActionType[] = ["decide_contract", "decide_item", "extend_claim", "replan_item", "propose_item", "message", "wait"];
 
 /** A schema-valid value for a field, by its name (ids, paths, capabilities, enums). */
 function sample(schema: Schema, name: string): unknown {
@@ -185,6 +185,9 @@ describe("every field the prompt tells the model to send is in the schema and ac
       ["wait", { reason: "nothing to do" }],
       ["decide_contract", { contractId: "agent-1-contract-1", decision: "accept", rationale: "additive optional field" }, LEAD],
       ["decide_item", { itemId: "agent-2-item-1", decision: "reject", rationale: "duplicates unit-a" }, LEAD],
+      ["extend_claim", { itemId: "unit-a", rationale: "its holder pushed within the lease" }, LEAD],
+      ["replan_item", { itemId: "unit-a", plan: "split", children: [{ objective: "x", acceptance: [], scopeHint: ["src/a/x.ts"] }, { objective: "y", acceptance: [], scopeHint: ["src/a/y.ts"] }], rationale: "fails in two files" }, LEAD],
+      ["replan_item", { itemId: "unit-a", plan: "merge", withItemId: "unit-b", children: [{ objective: "a and b", acceptance: [], scopeHint: ["src/a/**", "src/b/**"] }], rationale: "the failure spans both" }, LEAD],
     ];
     const covered = new Set(examples.map(([type]) => type));
     expect([...covered].sort()).toEqual([...AGENT_ACTION_TYPES].sort());

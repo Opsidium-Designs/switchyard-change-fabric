@@ -273,6 +273,36 @@ describe("Worker board routes", () => {
     expect(h.provisioner.revoked).toContainEqual({ workspaceName: `${ID}--board-w1`, tokenId: "read-1" });
   });
 
+  it("refreshes a joined agent's repo write token for the operator (bearer only), records the refresh without the token, and revokes the old one", async () => {
+    const h = createHarness({ apiToken: "op-secret" });
+    const auth = { authorization: "Bearer op-secret" };
+    expect((await h.request("POST", "/changes", specYaml(ID), auth)).status).toBe(201);
+    expect((await h.json("POST", `/changes/${ID}/board/human`, { type: "goal.posted", payload: { objective: "o" } }, auth)).status).toBe(201);
+    expect((await h.json("POST", `/changes/${ID}/board/join`, { agent: "w1", workspace: { ttlSeconds: 900 } }, auth)).status).toBe(201);
+    const path = `/changes/${ID}/board/agent-token`;
+    expect((await h.json("POST", path, { agent: "w1", ttlSeconds: 900 })).status).toBe(401);
+    const issued = await h.json<{ workspaceName: string; token: string; tokenId: string }>("POST", path, { agent: "w1", ttlSeconds: 900 }, auth);
+    expect(issued.status).toBe(201);
+    expect(issued.body).toMatchObject({ workspaceName: `${ID}--board-w1`, tokenId: "write-1", token: "write-secret-1" });
+    expect(h.provisioner.writeTokens).toEqual([{ workspaceName: `${ID}--board-w1`, ttlSeconds: 900 }]);
+    expect((await h.json<{ code: string }>("POST", path, { agent: "nobody" }, auth)).body.code).toBe("UNKNOWN_AGENT");
+    expect((await h.json<{ code: string }>("POST", path, { agent: "w1", ttlSeconds: 5000 }, auth)).body.code).toBe("BAD_PAYLOAD");
+    // The refresh is recorded through the engine-record route: never the token.
+    const record = `/changes/${ID}/board/record`;
+    expect((await h.json("POST", record, { type: "token.refreshed", payload: { agent: "w1", kind: "repo-write" } })).status).toBe(401);
+    const refreshed = await h.json<{ appended: BoardMessage[] }>("POST", record, { type: "token.refreshed", payload: { agent: "w1", kind: "repo-write" } }, auth);
+    expect(refreshed.status).toBe(201);
+    expect(refreshed.body.appended[0]).toMatchObject({ from: "engine", type: "token.refreshed", payload: { agent: "w1", kind: "repo-write" } });
+    expect(JSON.stringify(refreshed.body.appended)).not.toContain("write-secret");
+    const refused = await h.json<{ code: string }>("POST", record, { type: "token.refreshed", payload: { agent: "w1", kind: "repo-write", token: "write-secret-1" } }, auth);
+    expect([refused.status, refused.body.code]).toEqual([400, "BAD_PAYLOAD"]);
+    // The old token is revoked after the swap (the operator's revoke route).
+    expect((await h.json("POST", `/changes/${ID}/board/read-token/revoke`, { agent: "w1", tokenId: "old-token-id" }, auth)).status).toBe(200);
+    expect(h.provisioner.revoked).toContainEqual({ workspaceName: `${ID}--board-w1`, tokenId: "old-token-id" });
+    const verified = await h.json<{ ok: boolean }>("GET", `/changes/${ID}/board/verify`);
+    expect(verified.body.ok).toBe(true);
+  });
+
   it("forks the requester's repo for a helper only after the board allows it (bearer only), and reads the fork for the pull", async () => {
     const h = createHarness({ apiToken: "op-secret" });
     const auth = { authorization: "Bearer op-secret" };

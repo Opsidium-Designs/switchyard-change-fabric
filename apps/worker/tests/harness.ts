@@ -108,6 +108,11 @@ export class RecordingProvisioner implements WorkspaceProvisioner {
     this.readTokens.push({ workspaceName, ttlSeconds });
     return { tokenId: `read-${this.readTokens.length}`, token: `read-secret-${this.readTokens.length}`, tokenExpiresAt: "2099-01-01T00:00:00.000Z" };
   }
+  readonly writeTokens: { workspaceName: string; ttlSeconds: number }[] = [];
+  async issueWriteToken(workspaceName: string, ttlSeconds: number): Promise<{ tokenId: string; token: string; tokenExpiresAt: string }> {
+    this.writeTokens.push({ workspaceName, ttlSeconds });
+    return { tokenId: `write-${this.writeTokens.length}`, token: `write-secret-${this.writeTokens.length}`, tokenExpiresAt: "2099-01-01T00:00:00.000Z" };
+  }
 }
 
 export interface Harness {

@@ -473,13 +473,20 @@ describe("agents build tools for each other (offline, deterministic)", () => {
       seed,
       schedule: "concurrent",
       pollMs: 20,
-      budgets: { quiescenceMs: 3000, timeoutMs: 45_000 },
+      budgets: { quiescenceMs: 3000, timeoutMs: 100_000 },
       workRoot: join(root, "work"),
       toolAuthor: failing,
       resolveContract: reject,
     });
     expect(result.stopReason).toBe("quiescent");
-    expect(Date.now() - started).toBeLessThan(40_000);
+    expect(Date.now() - started).toBeLessThan(90_000);
+    // Claims nobody moved were recorded stalled on the quiet board (each item
+    // at most stallReleasesBeforeReplan times), and then the phase ended quiet.
+    const stalled = result.log.filter((m) => m.type === "claim.lapsed");
+    expect(stalled.length).toBeGreaterThan(0);
+    for (const item of new Set(stalled.map((m) => (m.payload as { item: string }).item))) {
+      expect(stalled.filter((m) => (m.payload as { item: string }).item === item).length).toBeLessThanOrEqual(2);
+    }
     expect(result.turns.some((t) => t.code === "TOOL_BUILD_FAILED")).toBe(true);
     const summary = formatBoardRunSummary(result);
     expect(result.stopDetail).toMatch(/every agent was idle \(none taking a turn\).*no board message arrived for 3 s/);
@@ -487,7 +494,7 @@ describe("agents build tools for each other (offline, deterministic)", () => {
     expect(summary).toMatch(/tools: 2 proposed, 0 built, 0 gated \(0 passed, 0 failed\), 0 version\(s\) published, 0 use\(s\)/);
     expect(summary).toMatch(/scanner scan-guard: proposed by lead; /);
     expect(summary).toMatch(/codemod codemod-guard: proposed by lead; /);
-  }, 90_000);
+  }, 150_000);
 
   it("tools are accelerators, never prerequisites: when no tool ever publishes, every item is still claimed and completed by hand", async () => {
     const projectDir = await project();

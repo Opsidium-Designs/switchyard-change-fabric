@@ -21,6 +21,7 @@ import {
   appendBoardMessage,
   appendDecisionRecorded,
   appendSeamStalled,
+  appendEngineRecord,
   appendDiscoveredUnits,
   BOARD_AGENT_ID_PATTERN,
   boardAgentWorkspaceName,
@@ -434,6 +435,8 @@ export interface Escalation {
   readonly boardContest?: string;
   /** The protected board contract this escalation decides (mirrors the Worker). */
   readonly boardContract?: string;
+  /** The re-planned board item that failed again (mirrors the Worker). */
+  readonly boardItem?: string;
   readonly question: string;
   readonly options: readonly string[];
   readonly status: EscalationStatus;
@@ -1655,7 +1658,7 @@ export class LocalChangeControl {
     const method = (init?.method ?? "GET").toUpperCase();
 
     const boardRoute = url.pathname.match(
-      /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|board\/seam-stalled|integration\/revision|tools\/gate|tools\/used)$/,
+      /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|board\/seam-stalled|board\/record|integration\/revision|tools\/gate|tools\/used)$/,
     );
     if (boardRoute && (method === "POST" || method === "GET")) {
       const response = await this.handleBoard(dec(boardRoute[1]), boardRoute[2] ?? "", method, url, init);
@@ -1704,9 +1707,10 @@ export class LocalChangeControl {
     if (method === "POST" && toolsRepo) {
       return this.handleToolsRepo(dec(toolsRepo[1]), toolsRepo[2] ?? "", parseBody(init));
     }
-    const readToken = url.pathname.match(/^\/changes\/([^/]+)\/board\/read-token$/);
+    const readToken = url.pathname.match(/^\/changes\/([^/]+)\/board\/(read-token|agent-token)$/);
     if (method === "POST" && readToken) {
-      return this.handleBoardReadToken(dec(readToken[1]), parseBody(init));
+      // agent-token: a refreshed WRITE token for the agent's repo (or its granted fork), as the Worker serves it.
+      return this.handleBoardReadToken(dec(readToken[1]), parseBody(init), readToken[2] === "agent-token" ? "write" : "read");
     }
     const helpFork = url.pathname.match(/^\/changes\/([^/]+)\/board\/help-fork$/);
     if (method === "POST" && helpFork) {
@@ -2170,6 +2174,10 @@ export class LocalChangeControl {
       // The board went quiet while a seam item held dependents: the engine records it stalled.
       const record = this.require(changeId);
       outcome = this.boardOutcome(() => this.appendToBoard(record, (state) => appendSeamStalled(state, body, this.boardAt())));
+    } else if (kind === "board/record") {
+      // A fact only the operator side observes (a stalled claim, ...): validated, then appended.
+      const record = this.require(changeId);
+      outcome = this.boardOutcome(() => this.appendToBoard(record, (state) => appendEngineRecord(state, body, this.boardAt())));
     } else if (kind === "tools/gate") {
       // The operator ran a tool's own gate: the engine records it (and publishes a pass).
       const record = this.require(changeId);
@@ -2241,8 +2249,12 @@ export class LocalChangeControl {
     );
   }
 
-  /** Mirrors the Worker's read-token route: a short-lived read token for a joined agent's repo. */
-  private async handleBoardReadToken(changeId: string, body: Record<string, unknown>): Promise<Response> {
+  /**
+   * Mirrors the Worker's read-token route (a short-lived read token for a
+   * joined agent's repo) and its agent-token route (a refreshed write token).
+   */
+  private async handleBoardReadToken(changeId: string, body: Record<string, unknown>, scope: "read" | "write" = "read"): Promise<Response> {
+    const issue = (ref: WorkspaceRef, ttl: number) => (scope === "write" ? this.workspaces.issueWriteToken(ref, ttl) : this.workspaces.issueReadToken(ref, ttl));
     const record = this.records.get(changeId);
     if (!record) {
       return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
@@ -2269,7 +2281,7 @@ export class LocalChangeControl {
       if (!fork) {
         return json({ code: "NOT_ALLOWED", error: `no fork was made for help request ${request.request}` }, 400);
       }
-      const token = await this.workspaces.issueReadToken(fork, ttl);
+      const token = await issue(fork, ttl);
       return json({ workspaceName: forkName, tokenId: token.id, token: token.token, tokenExpiresAt: token.expiresAt }, 201);
     }
     const joined = record.boardState.agents[agent];
@@ -2284,7 +2296,7 @@ export class LocalChangeControl {
     if (!ref) {
       return json({ code: "NOT_ALLOWED", error: `${agent} joined without a workspace and has no repo` }, 400);
     }
-    const token = await this.workspaces.issueReadToken(ref, ttl);
+    const token = await issue(ref, ttl);
     return json({ workspaceName, tokenId: token.id, token: token.token, tokenExpiresAt: token.expiresAt }, 201);
   }
 

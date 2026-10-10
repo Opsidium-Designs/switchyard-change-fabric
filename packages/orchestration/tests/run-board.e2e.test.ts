@@ -20,7 +20,7 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
-import { activeClaims, foldBoard, reduceBoard, seamHolds, type BoardDigest, type BoardMessage } from "@switchyard-change/change-core";
+import { activeClaims, foldBoard, pendingPushItems, reduceBoard, seamHolds, type BoardDigest, type BoardMessage } from "@switchyard-change/change-core";
 import type {
   AskJev,
   AgentTurnTransport,
@@ -149,7 +149,8 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
   it("forms around the goal, integrates per round of pushes, completes every item, and promotes the last revision", async () => {
     const projectDir = await project();
     const events: BoardRunEvent[] = [];
-    const result = await offline({ goal: GOAL, projectDir, seed, onEvent: (e) => events.push(e) });
+    // Claims in plan order (no overlap preference), so the nested scopes contest.
+    const result = await offline({ goal: GOAL, projectDir, seed, transport: createGenericBoardPolicy({ preferNonOverlapping: false }), onEvent: (e) => events.push(e) });
     const log = result.log;
 
     // The goal carries the protected set derived from the project.
@@ -164,6 +165,13 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     expect(of(log, "contract.rejected").every((m) => m.from === "human")).toBe(true);
     expect(of(log, "claim.granted").find((m) => m.payload.item === "tests")!.payload.intent.write).toEqual(["tests/tests.test.ts"]);
     expect(formatBoardRunSummary(result)).toContain(`repo: ${result.sourceRepoDir}`);
+    // The promotion is recorded on the board (backed), and the proof bundle proves the shipped tree is the gated one.
+    const promotedMsg = of(log, "revision.promoted")[0]!;
+    expect(promotedMsg.payload).toMatchObject({ rev: result.revision!.n, gatedCommit: result.revision!.commit, commit: result.promotion!.commit, branch: result.promotion!.branch });
+    // No gate is declared here: the promoted tree is the gated tree, but nothing was checked, so it is NOT proven (honestly).
+    expect(result.verdict).toBe("unverified");
+    expect(result.proof).toMatchObject({ status: "not-proven", revision: { n: result.revision!.n, gated: false }, promotion: { matchesGated: true } });
+    expect(result.proof!.reasons).toEqual([`no gate ran on the last revision (${result.revision!.n}): its pass checked nothing`]);
 
     // The lead proposes (never assigns); workers join under the dial.
     expect(of(log, "item.proposed").every((m) => m.from === "lead")).toBe(true);
@@ -173,6 +181,8 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     // Claims, one contest resolved by narrowing, and the claimant re-granted.
     expect(of(log, "claim.contested")[0]!.payload).toMatchObject({ claimant: "agent-3", owner: "agent-1", item: "wiring", overlap: ["src/**"] });
     expect(of(log, "claim.narrowed")[0]).toMatchObject({ from: "agent-3", payload: { write: ["src/index.ts"] } });
+    // Once granted, wiring's planned scope (src/**) still overlaps core's: recorded for both, advisory.
+    expect(of(log, "claim.overlap").find((m) => m.payload.item === "wiring" && m.payload.with === "core")).toMatchObject({ to: ["agent-3", "agent-1"] });
     expect(of(log, "claim.resolved")[0]).toMatchObject({ payload: { how: "narrowed" } });
 
     // A to-addressed question and its reply.
@@ -701,13 +711,40 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     expect(deleted).toEqual(["change-board-throw--board-agent-1"]);
   });
 
-  it("refuses an agent phase longer than the agents' write-token lifetime", async () => {
+  it("with token refresh off, refuses an agent phase longer than the agents' write-token lifetime", async () => {
     const projectDir = await project();
     const { control, base } = await direct("change-board-ttl");
     await expect(
-      runBoard({ ...base, projectDir, workspaceTtlSeconds: 60, budgets: { timeoutMs: 120_000 } }),
-    ).rejects.toThrow(/exceeds the agents' write-token lifetime/);
+      runBoard({ ...base, projectDir, workspaceTtlSeconds: 60, refreshTokens: false, budgets: { timeoutMs: 120_000 } }),
+    ).rejects.toThrow(/exceeds the agents' write-token lifetime \(60 s\) and token refresh is off/);
     expect(() => control.state("change-board-ttl")).toThrow();
+  });
+
+  it("with token refresh on (the default), a phase may outlast the token lifetime: each token is refreshed before it expires, swapped in, recorded (never the token), and the old one revoked", async () => {
+    const projectDir = await project();
+    const { control, base } = await direct("change-board-refresh");
+    // A fake clock running far ahead: every agent token is past its refresh margin at each tick.
+    let fake = Date.now();
+    const events: BoardRunEvent[] = [];
+    const result = await runBoard({
+      ...base,
+      projectDir,
+      changeId: "change-board-refresh",
+      workspaceTtlSeconds: 60,
+      budgets: { timeoutMs: 120_000 },
+      tokenClock: () => (fake += 10 * 60_000),
+      onEvent: (e) => events.push(e),
+    });
+    const refreshed = result.log.filter((m) => m.type === "token.refreshed");
+    expect(refreshed.length).toBeGreaterThan(0);
+    expect(refreshed.every((m) => m.from === "engine" && (m.payload as { kind: string }).kind === "repo-write")).toBe(true);
+    // The tokens themselves never reach the board.
+    const issued = control.revokedReadTokens;
+    expect(issued.length).toBeGreaterThan(0);
+    expect(events.some((e) => e.kind === "token-refreshed")).toBe(true);
+    expect(result.verdict).not.toBe("failed");
+    expect(result.incompleteItems).toEqual([]);
+    expect(reduceBoard(result.log)).toEqual(result.state);
   });
 
   it("never promotes when the verdict could not be recorded", async () => {
@@ -1161,7 +1198,14 @@ describe("budgets that scale with the plan (explicit values win)", () => {
       runTurnsScaled: true,
       maxActiveClaims: 1,
       activeClaimsScaled: true,
+      // The lease: max(150, 40 per agent of the dial's max); the deadline 8 leases.
+      claimLeaseMessages: 240,
+      leaseScaled: true,
+      claimDeadlineMessages: 1920,
+      deadlineScaled: true,
     });
+    expect(scaledBudgets({ items: 2, dial, scaleDial: true })).toMatchObject({ claimLeaseMessages: 150, claimDeadlineMessages: 1200 });
+    expect(scaledBudgets({ items: 2, explicitLease: 30, dial, scaleDial: true })).toMatchObject({ claimLeaseMessages: 30, leaseScaled: false, claimDeadlineMessages: 240 });
     // The run-wide turn budget weighs scope size: max(200, 25 per item + 10 per scope file), at most 800.
     expect(scaledBudgets({ items: 2, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 3, dialMax: 2, maxRunTurns: 200 });
     expect(scaledBudgets({ items: 7, scopeFiles: 12, dial, scaleDial: false })).toMatchObject({ maxRunTurns: 295 }); // sf7: 7 large items
@@ -1170,7 +1214,9 @@ describe("budgets that scale with the plan (explicit values win)", () => {
     // The claim cap: 1, or 2 when items are at least three times the dial's max.
     expect(scaledBudgets({ items: 9, dial, scaleDial: false })).toMatchObject({ maxActiveClaims: 2 });
     expect(scaledBudgets({ items: 8, dial, scaleDial: false })).toMatchObject({ maxActiveClaims: 1 });
-    expect(scaledBudgets({ items: 10, explicitFixAttempts: 2, explicitRunTurns: 1000, explicitActiveClaims: 3, dial, scaleDial: false })).toEqual({
+    expect(
+      scaledBudgets({ items: 10, explicitFixAttempts: 2, explicitRunTurns: 1000, explicitActiveClaims: 3, explicitLease: 90, explicitDeadline: 500, dial, scaleDial: false }),
+    ).toEqual({
       maxFixAttempts: 2,
       fixAttemptsScaled: false,
       dialMax: 3,
@@ -1179,6 +1225,10 @@ describe("budgets that scale with the plan (explicit values win)", () => {
       runTurnsScaled: false,
       maxActiveClaims: 3,
       activeClaimsScaled: false,
+      claimLeaseMessages: 90,
+      leaseScaled: false,
+      claimDeadlineMessages: 500,
+      deadlineScaled: false,
     });
   });
 
@@ -1190,11 +1240,11 @@ describe("budgets that scale with the plan (explicit values win)", () => {
       items: Array.from({ length: 10 }, (_, i) => ({ item: `i${i}`, objective: `do part ${i}`, acceptance: ["gate passes"], scopeHint: [`src/part${i}.ts`] })),
     });
     const result = await offline({ goal: GOAL, projectDir, seed: tenItems, scaleDial: true });
-    expect(of(result.log, "goal.posted")[0]!.payload.rules).toMatchObject({ maxFixAttempts: 5, maxActiveClaims: 1 });
+    expect(of(result.log, "goal.posted")[0]!.payload.rules).toMatchObject({ maxFixAttempts: 5, maxActiveClaims: 1, claimLeaseMessages: 240, claimDeadlineMessages: 1920 });
     expect(of(result.log, "agent.joined").filter((m) => m.from !== "lead").length).toBeLessThanOrEqual(6);
     expect(of(result.log, "agent.joined").filter((m) => m.from !== "lead").length).toBeGreaterThan(3);
     expect(formatBoardRunSummary(result)).toMatch(
-      /budgets: 5 fix attempt\(s\) per item \(scaled with 10 planned item\(s\)\), dial max 6 \(scaled with 10 planned item\(s\)\), 350 run turn\(s\) \(scaled with 10 planned item\(s\) and 10 scope file\(s\)\), claim cap 1 unfinished item\(s\) per agent \(scaled\)/,
+      /budgets: 5 fix attempt\(s\) per item \(scaled with 10 planned item\(s\)\), dial max 6 \(scaled with 10 planned item\(s\)\), 350 run turn\(s\) \(scaled with 10 planned item\(s\) and 10 scope file\(s\)\), claim cap 1 unfinished item\(s\) per agent \(scaled\), claim lease 240 board message\(s\) without progress \(scaled with dial max 6\), claim deadline 1920 message\(s\)/,
     );
   });
 });
@@ -1629,5 +1679,156 @@ describe("seam first (shared seams from the cohesion blueprint)", () => {
     expect(result.incompleteItems).toEqual([]);
     expect(result.verdict).not.toBe("failed");
     expect(reduceBoard(log)).toEqual(result.state);
+  });
+});
+
+describe("leases and stated wait reasons on a quiet board", () => {
+  it("a holder that sits on its claim is recorded stalled, the item is offered, and another agent finishes it", async () => {
+    const projectDir = await project();
+    const twoItems = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: [
+        { item: "api", objective: "report status from the api", acceptance: ["gate passes"], scopeHint: ["src/api/**"] },
+        { item: "tests", objective: "test the status report", acceptance: ["gate passes"], scopeHint: ["tests/**"] },
+      ],
+    });
+    const policy = createGenericBoardPolicy();
+    // agent-1 claims api and then never edits it: it only waits.
+    const sitter: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      const outcome = await policy(input);
+      const action = outcome.action as { type: string; itemId?: string };
+      return input.agent === "agent-1" && action.type === "edit" && action.itemId === "api" ? { action: { type: "wait", reason: "later" } } : outcome;
+    };
+    const events: BoardRunEvent[] = [];
+    const result = await offline({ goal: GOAL, projectDir, seed: twoItems, transport: sitter, dial: { minConcurrency: 2, maxConcurrency: 2 }, onEvent: (e) => events.push(e) });
+    const log = result.log;
+    expect(of(log, "goal.posted")[0]!.payload.rules).toMatchObject({ claimLeaseMessages: 150, claimDeadlineMessages: 1200 });
+    // The goal records the integration baseline; the first revision names it as its base.
+    const baseline = of(log, "goal.posted")[0]!.payload.baseline!;
+    expect(baseline).toMatch(/^[0-9a-f]{40}$/);
+    expect(of(log, "integrated.rev")[0]!.payload.base).toBe(baseline);
+    const first = of(log, "claim.granted").find((m) => m.payload.item === "api")!;
+    expect(first.payload.agent).toBe("agent-1");
+    // The quiet board advanced no message count: the operator recorded the claim stalled.
+    const lapsed = of(log, "claim.lapsed").find((m) => m.payload.item === "api")!;
+    expect(lapsed.payload).toMatchObject({ agent: "agent-1", reason: "stalled" });
+    expect(events).toContainEqual({ kind: "claim-stalled", item: "api", agent: "agent-1" });
+    // Another agent took it (the lapsed holder goes after it), and it completed.
+    const regrant = of(log, "claim.granted").find((m) => m.payload.item === "api" && m.seq > lapsed.seq)!;
+    expect(regrant.payload.agent).toBe("agent-2");
+    expect(result.state.items.api!.status).toBe("done");
+    expect(result.incompleteItems).toEqual([]);
+    expect(formatBoardTranscript(log)).toMatch(/claim\.lapsed\s+api \(held by agent-1\)/);
+    expect(reduceBoard(log)).toEqual(result.state);
+  });
+});
+
+describe("re-plan instead of giving up", () => {
+  /** A gate that fails, naming src/core/b.ts, until that file changed. */
+  class NeedsCoreBGate implements CommandRunner {
+    async run(_argv: readonly string[], cwd: string): Promise<CommandOutcome> {
+      const b = await readFile(join(cwd, "src/core/b.ts"), "utf8");
+      return b === "export const b = 2;\n"
+        ? { code: 1, stdout: "not ok 1 - core reports status\n# src/core/b.ts does not report status yet\n", stderr: "" }
+        : { code: 0, stdout: "ok 1 - core reports status\n", stderr: "" };
+    }
+  }
+
+  /** An executor that only ever edits the FIRST concrete file of an item (so a two-file item never fixes its second file). */
+  class FirstFileExecutor implements ExecutorProvider {
+    readonly name = "first-file";
+    private edits = 0;
+    async execute(context: ExecutorContext): Promise<ExecutionResult> {
+      this.edits += 1;
+      const first = [...context.paths].filter((p) => !/[*?]/.test(p)).sort()[0]!;
+      await mkdir(dirname(join(context.worktreeDir, first)), { recursive: true });
+      await writeFile(join(context.worktreeDir, first), `// ${context.workUnitId} reports status (edit ${this.edits})\n`);
+      return { status: "changed", changedPaths: [first], logs: [], cost: { usd: 0 }, commitMessage: `edit ${context.workUnitId}` };
+    }
+  }
+
+  it("an item that spends its fix budget gets ONE lead re-plan from the failure attribution (split by the failing file), and the children carry it to a pass", async () => {
+    const projectDir = await project();
+    const coreOnly = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: [{ item: "core", objective: "report status from core", acceptance: ["gate passes"], scopeHint: ["src/core/**"] }],
+    });
+    const result = await offline({
+      goal: GOAL,
+      projectDir,
+      seed: coreOnly,
+      executor: new FirstFileExecutor(),
+      appGateCommand: ["gate"],
+      verifyCommandRunner: new NeedsCoreBGate(),
+      budgets: { maxFixAttemptsPerItem: 1 },
+      dial: { minConcurrency: 2, maxConcurrency: 2 },
+    });
+    const log = result.log;
+    const exhausted = of(log, "fix.exhausted").find((m) => m.payload.item === "core")!;
+    const replanned = of(log, "item.replanned")[0]!;
+    expect(replanned.seq).toBeGreaterThan(exhausted.seq);
+    expect(replanned.from).toBe("lead");
+    expect(replanned.payload).toMatchObject({
+      item: "core",
+      reason: "fix-budget-exhausted",
+      action: "split",
+      rev: exhausted.payload.n,
+      children: [
+        { item: "core.r1", scopeHint: ["src/core/b.ts"] },
+        { item: "core.r2", scopeHint: ["src/core/a.ts"] },
+      ],
+    });
+    expect(of(log, "item.replanned")).toHaveLength(1);
+    // The children carried it: they passed, and the re-planned item completed with them.
+    expect(result.state.items["core.r1"]!.status).toBe("done");
+    expect(result.state.items.core!.status).toBe("done");
+    expect(of(log, "item.escalated")).toEqual([]);
+    expect(result.verdict).toBe("verified");
+    expect(result.incompleteItems).toEqual([]);
+    expect(formatBoardTranscript(log)).toMatch(/item\.replanned\s+core \(fix-budget-exhausted\) split into core\.r1 \[src\/core\/b\.ts\]/);
+    // Gated, promoted, and the promoted tree is the gated one: proven, with the re-plan on record.
+    expect(result.proof).toMatchObject({ status: "proven", promotion: { matchesGated: true }, replans: [expect.objectContaining({ item: "core", action: "split" })] });
+    expect(reduceBoard(log)).toEqual(result.state);
+  });
+});
+
+describe("cost and time caps (demo safety)", () => {
+  it("a model-call cap stops new turns, is recorded once, the in-flight work is integrated, and the verdict stays the gate's", async () => {
+    const projectDir = await project();
+    const events: BoardRunEvent[] = [];
+    const result = await offline({ goal: GOAL, projectDir, seed, caps: { maxCalls: 12 }, onEvent: (e) => events.push(e) });
+    expect(result.stopReason).toBe("capped");
+    expect(result.stopDetail).toMatch(/the model-calls cap was reached \(\d+ of 12\): no new turns/);
+    const capped = result.log.filter((m) => m.type === "run.capped");
+    expect(capped).toHaveLength(1);
+    expect(capped[0]!.payload).toMatchObject({ kind: "model-calls", limit: 12 });
+    expect(events.some((e) => e.kind === "capped")).toBe(true);
+    // Nothing announced was left ungated: the last integration ran after the cap.
+    expect(pendingPushItems(result.state)).toEqual([]);
+    expect(result.usage).toMatchObject({ capped: [expect.objectContaining({ kind: "model-calls" })] });
+    expect(formatBoardRunSummary(result)).toMatch(/caps: 12 model call\(s\)/);
+    expect(formatBoardRunSummary(result)).toMatch(/usage: \d+ model call\(s\)/);
+    expect(result.proof!.caps).toEqual([expect.objectContaining({ kind: "model-calls", limit: 12 })]);
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  });
+
+  it("a wall-clock cap (on an injected clock) ends the agent phase as capped", async () => {
+    const projectDir = await project();
+    let now = 0;
+    const result = await offline({ goal: GOAL, projectDir, seed, caps: { maxWallMs: 1000 }, capsClock: () => (now += 200) });
+    expect(result.stopReason).toBe("capped");
+    expect(result.log.find((m) => m.type === "run.capped")!.payload).toMatchObject({ kind: "wall-clock", limit: 1000 });
+  });
+
+  it("an item at its call cap gets no more turns (ITEM_CAP), recorded once for that item", async () => {
+    const projectDir = await project();
+    const result = await offline({ goal: GOAL, projectDir, seed, caps: { maxCallsPerItem: 1 } });
+    expect(result.turns.some((t) => t.code === "ITEM_CAP")).toBe(true);
+    const itemCaps = result.log.filter((m) => m.type === "run.capped" && (m.payload as { kind: string }).kind === "item-calls");
+    expect(itemCaps.length).toBeGreaterThan(0);
+    expect(new Set(itemCaps.map((m) => (m.payload as { item: string }).item)).size).toBe(itemCaps.length);
+    expect(reduceBoard(result.log)).toEqual(result.state);
   });
 });

@@ -83,6 +83,8 @@ Who sent a message is established by the route, never by the message body.
 | `POST /changes/:id/board` | agent token | `{type, payload, rationale?, inReplyTo?, to?}` appended as that agent; `201 {appended, escalations}`. |
 | `POST /changes/:id/board/human` | bearer | A human message. |
 | `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected or seam `contract` (kept on the contract as `triage` for whoever decides it). It changes only the decision counts and that advisory line, never arbitration or the verdict. |
+| `POST /changes/:id/board/record` | bearer | `{type, payload}`: an engine fact only the operator side observes, validated against the board before it is appended (`appendEngineRecord`): `claim.lapsed {item}` (a leased claim recorded `stalled` on a quiet board), `clash.predicted`, `trunk.moved`, `token.refreshed`, `revision.promoted`, `run.capped`. See "Stalls, re-plans, clashes, proofs, and caps". |
+| `POST /changes/:id/board/agent-token` | bearer | `{agent, ttlSeconds?, help?}` (60 to 3600): a REFRESHED, short-lived WRITE token for a joined agent's own repo (with `help`, the granted helper's fork), for runs longer than one token lifetime. `201 {workspaceName, tokenId, token, tokenExpiresAt}`, returned once; the old token is revoked through the read-token revoke route. Same checks as the read-token route. |
 | `POST /changes/:id/board/seam-stalled` | bearer | `{item}`: the board went quiet while this seam item held dependents; the engine appends `seam.stalled {item, released}` (the hold ends; with no push of its owner's the item is released). Refused unless the item holds a dependent. |
 | `POST /changes/:id/integration/revision` | bearer | An integration result `{commit, gate, merged, failing?}`; appends `integrated.rev` and what it triggers (completions and `rebase.needed` on a pass, `fix.requested` / `fix.exhausted` on a fail). |
 | `POST /changes/:id/tools/gate` | bearer | A tool's own gate result on the latest build of its item, `{capability, commit, passed, checks: [{check, passed, detail}], repo, usage, output?}`; the engine appends `tool.gated` (addressed to the builder) and, on a pass, `tool.published` (the next version) and the tool item's `item.completed {via: tool}`. See "Agent-built tools". |
@@ -107,7 +109,9 @@ write, leaves all of them untouched. Rejections carry a machine-readable code:
 `NO_GOAL`, `UNKNOWN_AGENT`, `UNKNOWN_REF`, `DUPLICATE`, `ITEM_NOT_OPEN`,
 `NOT_OWNER`, `CONTEST_OPEN`, `CONTEST_CLOSED`, `INTENT_OVERLAP`,
 `OUTSIDE_INTENT`, `OUTSIDE_SCOPE`, `PROTECTED`, `CONTRACT_REJECTED`, `NOT_WITHIN`, `INVALID_STATE`,
-`LIMIT`, `NOT_SUPPORTED` (a split under the cloud integrator). `AUTH` is 401,
+`LIMIT`, `NOT_SUPPORTED` (a split under the cloud integrator), `CLAIM_CAP`, `SEAM_FIRST`,
+`SEAM_OVERLAP` (a claim writing a shared seam another holder's scope covers),
+`STALE_BASE` (a revision not built on the board's integrated head). `AUTH` is 401,
 `LIMIT` is 409 (413 for an oversized body), the rest are 400.
 
 ## Envelope
@@ -141,7 +145,15 @@ contributors, failing?: {output, items}, gated?: false}` (`gated: false`: no gat
 `tool.built {capability, commit, paths}` (the tool item's owner), `tool.gated {capability, commit, passed, checks, repo, usage,
 output?}` (engine, recorded), `tool.published {tool, capability, version, repo, commit, verified: true, kind, usage,
 joinsGate?: false}` (engine, derived), `tool.used {capability, version, by, item?, commit?, changedFiles, findings?, exit?}`
-(engine, recorded), `decision.recorded {juncture:
+(engine, recorded), `claim.lapsed {item, agent, reason: no-progress | deadline | stalled, lastProgressSeq, deadlineSeq?, commit?}`
+(engine: derived under the lease rules, or recorded `stalled` on a quiet board), `claim.extended {item, reason}` (the lead or a human),
+`claim.overlap {item, agent, with, withAgent, files}` (engine, derived under the overlap rule, advisory),
+`item.replanned {item, reason: fix-budget-exhausted | stalled, action: split | rescope | merge, children, with?, rev?}` (the lead or a human),
+`item.escalated {item, reason: replan-failed, replanOf}` (engine, derived), `clash.predicted {a, b, status: conflict | unknown | unavailable,
+paths?, scope?, reason?}` (engine, recorded, advisory), `trunk.moved {rev, commit, expected?, actual?}` (engine, recorded),
+`token.refreshed {agent, kind: repo-write | help-fork, request?}` (engine, recorded; never a token),
+`revision.promoted {rev, gatedCommit, commit, branch}` (engine, recorded), `run.capped {kind: model-calls | spend | wall-clock |
+item-calls, limit, used, item?}` (engine, recorded), `decision.recorded {juncture:
 plan-review | attribution | fix-confidence | contract-triage, question, answer?, confidence?, accepted, error?, rev?,
 parsed?, contract?}` (engine, advisory), `decision.resolved {decisionSeq, rev, passed, answer, outcome:
 in-fixed-set | not-in-fixed-set, fixed, parsed, parseOutcome: in-fixed-set | not-in-fixed-set | none}` (engine, derived, advisory),
@@ -156,7 +168,11 @@ two symbols in one file contest.
 ## Arbitration rules
 
 `goal.posted` records the rules the board runs under (`maxContestTurns`,
-default 3; `contestIdleMessages`, default 25; `maxFixAttempts`, default 2) and
+default 3; `contestIdleMessages`, default 25; `maxFixAttempts`, default 2;
+the optional `maxActiveClaims`, `claimLeaseMessages`, `claimDeadlineMessages`,
+and `claimOverlap`, each absent on a board posted before it, which then
+behaves as before), the integration `baseline` commit and the `gateCommand`
+(both optional), and
 the CONTRACT (`protected`: the existing tests and gate configuration no agent
 may change alone; `protectedKeys`: gate-defining keys inside editable files,
 shown for visibility and restored by the integrator), so a log is
@@ -375,8 +391,10 @@ is distributed changes: items are proposed and claimed, never assigned.
   question, reply, contract, review; `to` addresses agents), `contest_reply`
   (cede, keep, narrow), `edit`, `propose_done`, `propose_tool`, `build_tool`,
   `use_tool`, `pull` (a sub-lead merges its children's pushes, or a requester
-  pulls a helper's delivered commit), `decide_contract` and `decide_item` (the
-  lead only), or `wait`. A `message` of kind `help` may carry `scope` (the
+  pulls a helper's delivered commit), `decide_contract`, `decide_item`,
+  `extend_claim` (a claim near its deadline) and `replan_item` (an item not
+  getting done: `plan` split, rescope, or merge with `withItemId`) (the lead
+  only), or `wait`. A `message` of kind `help` may carry `scope` (the
   files it grants to a helper who forks its repo). A lead turn
   sees the pending proposals (`board.pendingItems`) and the accepted items
   (`board.items`) to compare them against; a new undecided proposal wakes it. The reply is validated strictly;
@@ -1410,3 +1428,189 @@ Glob note: `**` matches whole path segments in both matchers (the path scope
 and intent overlap): `src/**/x` matches `src/x`, `src/a/x`, and `src/a/b/x`,
 never `srcx` or `src/ax`; a leading `**/x` matches `x` at any depth. An intent
 entry whose `**` shares a segment with other characters is refused.
+
+## Stalls, re-plans, clashes, proofs, and caps
+
+Long runs on a large app (ten or more items, a hundred or more acceptance
+tests) stall in recognizable ways: agents sit on claims, wait silently on each
+other, spend fix budgets and stop, and the plan's split does not match where
+the failures are. The board and the driver handle each one mechanically, from
+recorded state only.
+
+### Claim leases (`claimLeaseMessages`, `claimDeadlineMessages`)
+
+- A claim on an item carries a LEASE, measured in board messages (so the same
+  log always derives the same lapses). It is renewed ONLY by real progress on
+  that item: a push announced for it, a message of its holder's that names it
+  (`item.struggling`, `help.requested`, `help.closed`, `help.declined`, a
+  contract proposed for it, `done.proposed`, `review.requested`, a contest
+  turn on it, a handoff, which starts a fresh lease for the new holder), its
+  push being GATED by an integrated revision, its tool build or tool gate, a
+  decision on a contract for it, or a delivery by a granted helper. Messages
+  about other items never renew it.
+- With no progress for the lease, arbitration appends `claim.lapsed {reason:
+  no-progress, lastProgressSeq, commit?}` addressed to the holder: the item is
+  open again (`commit` is the holder's latest push, the next owner may start
+  from it; the runtime seeds it on the first edit, as for a reopened item).
+  The lapsed holder cannot claim it back for one lease period: another agent
+  gets it first. A lapse counts as a stall release (`stallReleases`).
+- A lease never lapses while it is SUSPENDED (`leaseSuspension`): the holder's
+  push waits for the gate (a lapse would drop a push integration is about to
+  gate), its tool build waits for its own gate, its push already passed (only
+  the done proposal is left), a contract for the item waits for a decision, a
+  helper holds a taken grant on it, or a contest on it is open (a contest
+  settles its own way). A held item waiting on a seam change does not lapse
+  for no progress either.
+- The firm DEADLINE (`claimDeadlineMessages` from the grant) is not renewed by
+  progress: the lead sees claims in their last quarter (`digest.deadlines`,
+  with whether the holder is progressing) and extends one (`claim.extended`
+  with a reason, at most twice, each a full period), or the claim lapses
+  (`reason: deadline`). The offline lead extends a progressing claim and lets
+  a stalled one lapse. Defaults keep normal work far from it.
+- A QUIET board advances no message count, so the driver acts there: a leased,
+  unsuspended claim with no stated wait reason whose holder sat the quiet
+  period out is recorded stalled (the engine-record route, `claim.lapsed
+  {reason: stalled}`), at most `stallReleasesBeforeReplan` (2) times per item.
+- Seam items are leased like any item (an absent owner never blocks the
+  seam's importers forever); tool items too (builds and tool gates renew them);
+  a split item is not (its children are). Defaults (`scaledBudgets`): a lease
+  of max(150, 40 per agent of the dial's max) board messages and a deadline of
+  8 leases; `--lease-messages` and `--deadline-messages` override them.
+
+### Every waiting item states why (`itemWaitReason`)
+
+A pure function of the board names why an item is not moving:
+`waiting-on-seam` (the seam item), `held-by-claim-cap` (every worker that may
+take it is at its cap), `lease-lapsed` (whose claim, why), `waiting-for-human`
+(a protected contract, or an escalated contest), `waiting-for-lead` (a seam
+contract, or a worker's proposal), `blocked-by` (a contest's owner item, a
+split's unfinished child, a sub-lead), `waiting-for-gate` (the pending push's
+commit: the revision has no number yet, so none is invented),
+`fix-budget-exhausted` (by whom), or `unclaimed`. A moving item has none.
+Each agent's digest carries it on its claims and the open items (`wait`, with
+one short line), and the console shows the line on every card. On a quiet
+board the driver acts on the stated reason, one step per quiet period: a seam
+hold that stopped moving is recorded stalled; an open seam item, or an
+`unclaimed` or `lease-lapsed` item, is offered to the free workers (bounded);
+a claim with no stated reason is recorded stalled (above). Waiting for a
+human, the lead, the gate, or another item is left alone.
+
+### Re-plan instead of giving up (`item.replanned`, `item.escalated`)
+
+When an item spends its fix budget (it is reopened with `exhaustedBy`) or is
+released for not moving twice, the lead gets one bounded re-plan turn on it
+(`digest.replan`, with the failing files and test lines of its latest failing
+revision `rev`), once per situation (a new exhaustion or stall gives one more).
+It may `split` it (two or more children), `rescope` it (one replacement with a
+new objective or files, for example the files the failure names), or `merge`
+it with an open neighbour `with` (one replacement covering both).
+`item.replanned` makes the item (and a merged neighbour) a split item carried by
+the replacement children (`replanOf`), which integrate directly and complete
+it. An item is re-planned at most once, and a replacement never is: when a
+replacement spends its budget or stalls twice, arbitration records
+`item.escalated` and the Change raises a human escalation (it closes when the
+item completes). The driver does not end the phase on spent fix budgets while
+the lead has not had its re-plan turn. The offline lead re-scopes an item to
+failing files no outstanding item covers, splits a multi-file item by its
+failing file, and otherwise lets fresh eyes go first (merging a single-file
+item with a neighbour in its directory, or re-scoping it to the failing tests,
+once fresh eyes spent the budget too). An agent that lost an item (reopened,
+lapsed, re-planned) keeps that work in its repo, so integration YIELDS the
+files it pushed for it (never applied from its repo).
+
+### Overlap check at claim time (`claimOverlap`)
+
+A claim granted on an item whose planner-declared scope overlaps the scope of
+an item another agent holds is recorded (`claim.overlap`, addressed to both,
+advisory): both digests list it (`claims[].overlaps`, with a hint to
+coordinate in a thread; the item claimed later rebases on the other's push),
+open items say which held items they overlap (`overlapsClaimed`), and the
+offline policy and the lead's prompt prefer items without any. A claim WRITING
+a shared seam another holder's item scope covers is refused (`SEAM_OVERLAP`),
+pointing at the question to that holder or the seam contract route.
+
+### Clash alerts from real code (`clash.predicted`)
+
+Before each revision, when two or more agents have pending pushes, the local
+continuous integrator runs `predictClashes` (git merge-tree, read-only) over
+the integration branch head (the current integrated commit, else the
+baseline) on each pair of pinned heads, fetched with operator read tokens as
+for integration, with the board's seams as the shared paths. A conflict is
+recorded only on paths at least one side's integration unit applies and both
+heads changed from the goal's baseline (by blob: a head that merely lacks what
+another revision integrated is stale, not a clash, and a file an agent's repo
+does not hold was never touched by it), scoped `shared` (a seam) or `local`; an
+undecided pair is `unknown` and a prediction that could not run is
+`unavailable`, both with the reason, never clean; a clean pair is not
+recorded; one record per pair of commits. Digest cues: a shared conflict goes
+through the seam contract; a local one is rebased by the item claimed later.
+It never blocks or orders integration. The console tags the card and threads
+the message. (The cloud integrator does not predict in this slice.)
+
+### Trunk-moved and stale checks
+
+- `goal.posted.baseline` records the integration branch's head before any
+  revision, and each `integrated.rev` names the `base` it was built on. A
+  revision whose base is not the board's integrated head (the latest passing
+  revision's commit, else the baseline) is refused (`STALE_BASE`): a stale
+  integration never becomes current; the integrator treats the refusal as
+  stale and rebuilds. A revision without a base (a board before the field,
+  or the cloud Workflow) is still recorded.
+- After a recorded pass, the branch advance leases the value it reads (never
+  the board's integrated commit, which the branch only reaches after it). A
+  `PromotionRefusedError` with reason `trunk-moved` is a distinct outcome:
+  `trunk.moved {rev, commit, expected, actual}` on the board and on the
+  revision (`trunkMoved`); nothing was pushed.
+- A help fork whose read-back head is not the head it was expected to start
+  from (`baseMismatch` in the fork response) is recorded on `help.offered`
+  (`baseMismatch {expected, realized}`), which then takes no grant
+  (`forkMismatches` on the request, shown to the requester).
+
+### Token refresh for runs over one token lifetime
+
+Agents push with repo-scoped write tokens that expire. Before one expires
+(expiry minus a margin, max(60 s, a fifth of the lifetime), on an injected
+clock), the driver mints a fresh token for the same agent and repo (the
+agent-token route; a helper's fork with `help`), swaps it into every later git
+call, records `token.refreshed {agent, kind}` (never the token), and revokes
+the old one on its next tick (a grace period for a git call in flight). So
+`--timeout-ms` may exceed `--token-ttl`; `--no-token-refresh` restores the
+refusal. Board agent tokens (`x-board-agent-token`) carry no expiry and are not
+rotated. The cloud integration repo's token is not refreshed in this slice:
+with `--integrator cloud` the phase may not outlast it.
+
+### Proof bundle per verified revision (`buildProofBundle`)
+
+A pure function of the board log builds the PROOF of the last revision (the
+only one ever promoted): the gated commit and the promoted one (the run now
+records `revision.promoted {rev, gatedCommit, commit, branch}` once it
+committed; the board refuses a gated commit that is not the latest passing
+revision's), the gate command and verdict, the test inventory (baseline
+count, the final revision's acceptance and developer counts, executed at least
+the baseline), per-suite progress across revisions, the items, agents, and
+pushes merged, contracts and their decisions, tools, the typed (Jev)
+decisions (advisory, with their outcomes, never part of the proof), human
+decisions, and the lapses, re-plans, escalations, clash predictions, trunk
+moves, token refreshes, and caps. It is PROVEN only when the last revision
+passed a gate that ran and the recorded promotion's gated commit is that
+revision's commit (and, when both are known, it executed at least the
+baseline's tests); otherwise NOT-PROVEN with each reason. The CLI prints a
+summary and writes the JSON to `--proof-out`, or `proof-bundle.json` in a kept
+work root (a live run's, or `--keep-work-root`); the console's PROOF tab
+renders it from the log alone, so a recorded run shows it too.
+
+### Cost and time caps (demo safety)
+
+The driver meters every model call (agent turns, executor edits, the
+planner) and estimates spend: tokens times the configured price per model
+(`--price <model>=<in>/<out>` USD per million tokens) when usage is reported,
+else the executor's own estimate; a call with neither is counted UNPRICED,
+never free. Caps: `--max-calls` (default 10 per run turn), `--max-spend-usd`
+(none unless set), `--max-wall-ms` (default twice the agent-phase timeout),
+and `--max-item-calls` (default 8 per item turn, across agents). Reaching a
+run cap records `run.capped {kind, limit, used}` once, stops new turns (the
+metered transport answers `wait` without calling the model), ends the agent
+phase as `capped`, lets the integrator finish what is in flight, and the
+verdict stays the gate's. An item at its cap gets no more turns (`ITEM_CAP`,
+recorded once per item). The budgets line prints the caps; the summary prints
+the usage.

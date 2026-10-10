@@ -118,6 +118,9 @@ export interface RunBoardOfflineOptions {
   /** Scale the dial's max with the plan size (no explicit --max). */
   readonly scaleDial?: boolean;
   readonly budgets?: BoardRunBudgets;
+  /** Cost and time caps (see RunBoardOptions.caps), and their clock. */
+  readonly caps?: RunBoardOptions["caps"];
+  readonly capsClock?: () => number;
   /** Defaults to the generic policy. */
   readonly transport?: AgentTurnTransport<BoardDigest, BoardMessage>;
   /** Defaults to the heuristic decomposition of the goal. */
@@ -191,6 +194,8 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       ...(options.executor ? { executor: options.executor } : {}),
       schedule: "lockstep",
       ...(options.budgets ? { budgets: options.budgets } : {}),
+      ...(options.caps ? { caps: options.caps } : {}),
+      ...(options.capsClock ? { capsClock: options.capsClock } : {}),
       workRoot: join(workRoot, "run"),
       ...(options.appGateCommand
         ? { appGateCommand: options.appGateCommand }

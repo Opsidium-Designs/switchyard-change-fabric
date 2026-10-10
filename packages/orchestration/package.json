@@ -11,6 +11,7 @@
     ".": "./src/index.ts",
     "./graph-model": "./src/graph-model.ts",
     "./board-graph": "./src/board-graph.ts",
+    "./proof-bundle": "./src/proof-bundle.ts",
     "./credentials": "./src/credentials.ts"
   },
   "scripts": {

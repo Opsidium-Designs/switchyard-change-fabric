@@ -1219,6 +1219,36 @@ body {
   font-size: 0.78rem;
 }
 
+.mc-tag.is-clash {
+  border-color: #d29922;
+  color: #e3b341;
+}
+
+.mc-tag.is-clash.is-shared {
+  border-color: #f0883e;
+  color: #ffa657;
+}
+
+/* One short line: why a card is waiting (derived from the board). */
+.mc-card-wait {
+  display: block;
+  margin-top: 0.2rem;
+  font-size: 0.72rem;
+  color: #d29922;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mc-card-wait.is-waiting-for-human {
+  color: #f0883e;
+}
+
+.mc-card-wait.is-unclaimed,
+.mc-card-wait.is-lease-lapsed {
+  color: #79c0ff;
+}
+
 .mc-card-tags {
   display: flex;
   flex-wrap: wrap;
@@ -1760,3 +1790,51 @@ body {
 .replay-guide summary { cursor: pointer; color: var(--accent); }
 .replay-guide ul { margin: 0.4rem 0 0; padding-left: 1.2rem; line-height: 1.5; }
 .replay-guide strong { color: var(--text); }
+
+/* The PROOF panel: what the board proves about its final revision. */
+.mc-proof {
+  padding: 0.5rem;
+  font-size: 0.78rem;
+}
+
+.mc-proof-status {
+  font-weight: 700;
+  margin: 0 0 0.4rem;
+}
+
+.mc-proof-status.is-proven {
+  color: #3fb950;
+}
+
+.mc-proof-status.is-not-proven {
+  color: #f85149;
+}
+
+.mc-proof-reasons {
+  margin: 0 0 0.5rem 1rem;
+  color: #f85149;
+}
+
+.mc-proof-facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.2rem 0.6rem;
+  margin: 0;
+}
+
+.mc-proof-facts dt {
+  color: var(--muted);
+}
+
+.mc-proof-facts dd {
+  margin: 0;
+}
+
+.mc .mc-seq-link {
+  padding: 0 0.2rem;
+  font-size: 0.7rem;
+  border: none;
+  background: none;
+  color: #79c0ff;
+  cursor: pointer;
+}

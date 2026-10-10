@@ -65,6 +65,10 @@ import {
   toolUnavailableReason,
   isSeamItem,
   seamHolds,
+  integratedHead,
+  itemWaitReason,
+  leasesOn,
+  leaseSuspension,
   deriveCohesionBlueprint,
   type BoardMessage,
   type BoardRules,
@@ -82,6 +86,7 @@ import { authenticatedRemote, type GitIdentity } from "@switchyard-change/local-
 import type { PromotionResult } from "@switchyard-change/git-promotion";
 import {
   advanceIntegrationBranch,
+  isPromotionRefused,
   ChangeVerification,
   ChildProcessCommandRunner,
   DEFAULT_COMMAND_TIMEOUT_MS,
@@ -103,6 +108,10 @@ import {
   type EvidenceSummary,
 } from "@switchyard-change/verification";
 
+import { recordPendingClashes, type PendingClashResult } from "./board-clash.ts";
+import { TokenRefresher } from "./token-refresh.ts";
+import { buildProofBundle, type ProofBundle } from "./proof-bundle.ts";
+import { meteredExecutor, meteredTransport, RunMeter, type RunCapReached, type RunCaps } from "./run-meter.ts";
 import { scanRepoSnapshot } from "./scan-repo.ts";
 import { BoardAgent, listRepoFiles, resolveIntentFiles, RunTurnBudget, type AgentStop, type AgentTurnRecord, type BoardSeedItem } from "./board-agent.ts";
 import {
@@ -189,6 +198,17 @@ export interface BoardRunBudgets {
    * max; an explicit value (1 to 8) wins.
    */
   readonly maxActiveClaims?: number;
+  /**
+   * The claim lease, in board messages (the board rule claimLeaseMessages): a
+   * claim with no progress on its item for this long lapses. Default: scaled,
+   * max(150, 40 per agent of the dial's max); an explicit value wins.
+   */
+  readonly claimLeaseMessages?: number;
+  /**
+   * The firm claim deadline, in board messages from the grant (the board rule
+   * claimDeadlineMessages; the lead may extend it). Default: 8 leases.
+   */
+  readonly claimDeadlineMessages?: number;
   /** Lockstep rounds before the run stops (default 200). */
   readonly maxRounds?: number;
   /** Wall-clock limit for the agent phase, in ms (default 30 minutes). */
@@ -214,7 +234,7 @@ export type BoardRunEvent =
   | { readonly kind: "change-created"; readonly changeId: string }
   | { readonly kind: "goal-posted"; readonly protected: readonly string[]; readonly immutable?: readonly string[]; readonly testInventory: string }
   /** The effective budgets for this run, after scaling with the plan size (explicit flags win). */
-  | { readonly kind: "budgets"; readonly items: number; readonly scopeFiles?: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean; readonly maxRunTurns: number; readonly runTurnsScaled: boolean; readonly maxActiveClaims: number; readonly activeClaimsScaled: boolean }
+  | ({ readonly kind: "budgets" } & BoardRunEffectiveBudgets)
   | { readonly kind: "contract-decision"; readonly contract: string; readonly decision: string; readonly path?: string }
   | { readonly kind: "contract-awaiting-human"; readonly contract: string; readonly escalationId: string; readonly path?: string; readonly recommendation?: string }
   /** The advisory triage of a protected contract, recorded before the human is asked. */
@@ -233,13 +253,52 @@ export type BoardRunEvent =
   | { readonly kind: "open-seams-nudged"; readonly items: readonly string[] }
   /** The board went quiet while a seam item held dependents: recorded stalled (released when its owner had pushed nothing). */
   | { readonly kind: "seam-stalled"; readonly item: string; readonly released: boolean; readonly dependents: readonly string[] }
+  /** The board went quiet while a leased claim with no stated wait reason made no progress: recorded stalled (it lapsed). */
+  | { readonly kind: "claim-stalled"; readonly item: string; readonly agent: string }
+  /** A quiet board with open items nobody holds (unclaimed, or a lapsed claim): free workers were offered them. */
+  | { readonly kind: "open-items-offered"; readonly items: readonly string[] }
+  /** The run reached a cost or time cap (recorded as run.capped). */
+  | { readonly kind: "capped"; readonly cap: RunCapReached }
+  /** The run promoted, but the board refused to record the promotion (the proof bundle says not proven). */
+  | { readonly kind: "promotion-unrecorded"; readonly reason: string }
+  /** An agent's repo (or fork) token was replaced before it expired (recorded as token.refreshed; never the token). */
+  | { readonly kind: "token-refreshed"; readonly agent: string; readonly tokenKind: "repo-write" | "help-fork"; readonly request?: string }
+  | { readonly kind: "token-refresh-failed"; readonly reason: string }
+  /** Clash predictions among pending pushes were recorded on the board (advisory). */
+  | { readonly kind: "clashes-predicted"; readonly pairs: number; readonly recorded: number; readonly conflicts: number }
   /** The operator forked a requester's repo for the helper of a help request. */
   | { readonly kind: "help-forked"; readonly request: string; readonly helper: string; readonly forkOf: string; readonly workspace: string }
   | FullLiveEvent;
 
+/** The effective budgets of a board run (scaled with the plan unless explicit). */
+export interface BoardRunEffectiveBudgets extends ScaledBudgets {
+  readonly items: number;
+  readonly scopeFiles?: number;
+  /** The run's cost and time caps (engine-enforced). */
+  readonly caps?: { readonly maxCalls?: number; readonly maxSpendUsd?: number; readonly maxWallMs?: number; readonly maxCallsPerItem?: number };
+}
+
+/** One line for a run's effective budgets (the CLI and the summary print the same). */
+export function formatBudgetsLine(b: BoardRunEffectiveBudgets): string {
+  const scaled = (yes: boolean, what = `scaled with ${b.items} planned item(s)`) => (yes ? what : "explicit");
+  return (
+    `budgets: ${b.maxFixAttempts} fix attempt(s) per item (${scaled(b.fixAttemptsScaled)}), dial max ${b.dialMax} (${scaled(b.dialScaled)}), ` +
+    `${b.maxRunTurns} run turn(s) (${scaled(b.runTurnsScaled, `scaled with ${b.items} planned item(s) and ${b.scopeFiles ?? 0} scope file(s)`)}), ` +
+    `claim cap ${b.maxActiveClaims} unfinished item(s) per agent (${scaled(b.activeClaimsScaled, "scaled")}), ` +
+    `claim lease ${b.claimLeaseMessages} board message(s) without progress (${scaled(b.leaseScaled, `scaled with dial max ${b.dialMax}`)}), ` +
+    `claim deadline ${b.claimDeadlineMessages} message(s) (${scaled(b.deadlineScaled, "8 leases")}; the lead may extend it)` +
+    (b.caps
+      ? `; caps: ${b.caps.maxCalls !== undefined ? `${b.caps.maxCalls} model call(s)` : "no call cap"}, ${b.caps.maxSpendUsd !== undefined ? `${b.caps.maxSpendUsd} USD estimated spend` : "no spend cap"}, ` +
+        `${b.caps.maxWallMs !== undefined ? `${Math.round(b.caps.maxWallMs / 1000)} s wall clock` : "no wall-clock cap"}, ${b.caps.maxCallsPerItem !== undefined ? `${b.caps.maxCallsPerItem} call(s) per item` : "no per-item cap"}`
+      : "")
+  );
+}
+
 /** Why the agent phase ended. */
 export type BoardStopReason =
   | "all-items-done"
+  /** A cost or time cap was reached (run.capped): no new turns. */
+  | "capped"
   | "fix-budget"
   | "run-budget"
   | "quiescent"
@@ -278,6 +337,8 @@ export interface BoardRevision {
   /** Items whose fix request the board sent (or whose fix budget it recorded as spent). */
   readonly fixRequested?: readonly string[];
   readonly fixExhausted?: readonly string[];
+  /** The integration branch could not be advanced to this passing revision: another writer moved it (recorded as trunk.moved). */
+  readonly trunkMoved?: { readonly expected: string | null; readonly actual?: string | null };
 }
 
 /** A contract decision the board escalated to the human. */
@@ -326,11 +387,28 @@ export interface RunBoardOptions {
   readonly budgets?: BoardRunBudgets;
   /**
    * The explicit, short write-token lifetime each worker's join asks for
-   * (default 1800 s). Agents' tokens are not refreshed, so the run refuses an
-   * agent-phase timeout longer than this; the integrator never uses them (it
-   * reads with fresh operator read tokens).
+   * (default 1800 s). Agents' tokens are REFRESHED before they expire (see
+   * `refreshTokens`), so the agent phase may outlast them; the integrator
+   * never uses them (it reads with fresh operator read tokens).
    */
   readonly workspaceTtlSeconds?: number;
+  /**
+   * Refresh agents' repo write tokens (and helpers' fork tokens) before they
+   * expire (default true). Off, the run refuses an agent-phase timeout longer
+   * than the token lifetime, as before.
+   */
+  readonly refreshTokens?: boolean;
+  /** The token refresher's clock (default Date.now): injected in tests. */
+  readonly tokenClock?: () => number;
+  /**
+   * Cost and time caps (demo safety): model calls, estimated spend (tokens x
+   * the configured price per model), the run's wall clock, and calls per item.
+   * Defaults are generous: 10 calls per run turn, twice the agent-phase
+   * timeout, 8 calls per item turn; no spend cap unless set.
+   */
+  readonly caps?: RunCaps;
+  /** The caps' clock (default Date.now): injected in tests. */
+  readonly capsClock?: () => number;
   /** The lifetime of the read tokens the integrator asks for per revision (default 600 s). */
   readonly readTokenTtlSeconds?: number;
   readonly rules?: Partial<BoardRules>;
@@ -465,13 +543,17 @@ export interface RunBoardResult {
   readonly scratchRoot?: string;
   readonly cleanedUp: readonly string[];
   /** The effective budgets (scaled with the plan unless explicit). */
-  readonly budgets?: { readonly items: number; readonly scopeFiles?: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean; readonly maxRunTurns: number; readonly runTurnsScaled: boolean; readonly maxActiveClaims: number; readonly activeClaimsScaled: boolean };
+  readonly budgets?: BoardRunEffectiveBudgets;
   /** The model each pushed app edit used (the strongest for complex items). */
   readonly editModels?: readonly { readonly agent: string; readonly item: string; readonly commit: string; readonly model: string; readonly why?: string }[];
   /** Every tool gate the run's bench ran and recorded, in order. */
   readonly toolGates?: readonly ToolGateRecord[];
   /** The tool author's label (when the run set one). */
   readonly toolAuthorLabel?: string;
+  /** What the run can prove about the revision it shipped (built from the board log). */
+  readonly proof?: ProofBundle;
+  /** Model calls and estimated spend the run's meter counted (unpriced calls are counted, never free). */
+  readonly usage?: { readonly calls: number; readonly spendUsd: number; readonly unpricedCalls: number; readonly capped: readonly RunCapReached[] };
 }
 
 /** The repo of one agent the integrator reads (no credential: it reads with fresh operator tokens). */
@@ -517,6 +599,8 @@ export interface IntegrateBoardOptions {
   readonly scrub?: (text: string) => string;
   /** Record an advisory typed decision's outcome (attribution) on the board. */
   readonly recordDecision?: RecordBoardDecision;
+  /** The branch advance after a recorded pass (default: advanceIntegrationBranch; injectable for tests). */
+  readonly advanceBranch?: typeof advanceIntegrationBranch;
 }
 
 /** The result of one integration attempt. */
@@ -1006,10 +1090,14 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   const progress = gated
     ? labelGateProgress(finalCheck.progress ?? readTestProgress(finalCheck.outputs.map((o) => o.text).join("\n")), state.immutable ?? [])
     : undefined;
+  // The base this revision was built on (the board's integrated head when the
+  // integration started): the board refuses it if the head moved since.
+  const base = integratedHead(state);
   const recorded = await options.operator.recordRevision({
     commit,
     gate,
     merged,
+    ...(base !== undefined ? { base } : {}),
     ...(progress ? { progress } : {}),
     ...(failing ? { failing } : {}),
     ...(gated ? {} : { gated: false as const }),
@@ -1017,24 +1105,44 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   });
   if (!recorded.ok) {
     await flushDecisions(undefined);
-    if (recorded.code === "UNKNOWN_REF") {
+    if (recorded.code === "UNKNOWN_REF" || recorded.code === "STALE_BASE") {
+      // Superseded pushes, or a head that moved while the gate ran: run again on the current board.
       return { requiresIntegrationGate, key, evidence, stale: true, failure: scrub(`the board refused the revision: ${recorded.error}`) };
     }
     return { requiresIntegrationGate, key, evidence, failure: scrub(`the board refused the revision (${recorded.code}): ${recorded.error}`) };
   }
+  const rev = recorded.appended.find((m) => m.type === "integrated.rev");
+  const n = rev && rev.type === "integrated.rev" ? rev.payload.n : state.lastRevN + 1;
+  let trunkMoved: BoardRevision["trunkMoved"];
   if (gate === "pass") {
-    // Only now, with the revision recorded, does the integration branch move.
+    // Only now, with the revision recorded, does the integration branch move
+    // (a compare-and-swap: the advance leases the value it reads, never the
+    // board's integrated commit, which the branch only reaches after this).
     try {
-      await advanceIntegrationBranch(options.integration.integrationRef, options.integration.integrationToken, commit, options.worktreeRoot);
+      await (options.advanceBranch ?? advanceIntegrationBranch)(options.integration.integrationRef, options.integration.integrationToken, commit, options.worktreeRoot);
     } catch (error) {
+      if (isPromotionRefused(error, "trunk-moved")) {
+        // A distinct, typed outcome: another writer moved the trunk. Nothing was pushed.
+        trunkMoved = { expected: error.expected, ...(error.actual !== undefined ? { actual: error.actual } : {}) };
+        await options.operator
+          .recordEngine("trunk.moved", {
+            rev: n,
+            commit,
+            ...(error.expected !== null ? { expected: error.expected } : {}),
+            ...(error.actual !== undefined && error.actual !== null ? { actual: error.actual } : {}),
+          })
+          .catch(() => undefined);
+      }
       excludedAgents.push({
         agent: "(integration)",
-        reason: scrub(`recorded, but the integration branch could not be advanced: ${error instanceof Error ? error.message : String(error)}`),
+        reason: scrub(
+          isPromotionRefused(error, "trunk-moved")
+            ? `recorded, but the trunk moved: the integration branch was not advanced (${error.message})`
+            : `recorded, but the integration branch could not be advanced: ${error instanceof Error ? error.message : String(error)}`,
+        ),
       });
     }
   }
-  const rev = recorded.appended.find((m) => m.type === "integrated.rev");
-  const n = rev && rev.type === "integrated.rev" ? rev.payload.n : state.lastRevN + 1;
   await flushDecisions(rev ? n : undefined);
   const revision: BoardRevision = {
     n,
@@ -1055,6 +1163,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     ...(implicated ? { implicated } : {}),
     ...(gate === "fail" ? { failure: scrub(revisionFailure(evidence.integration.finalCheck)) } : {}),
     ...(adjusted.relaxed !== undefined ? { inventoryNote: adjusted.relaxed } : {}),
+    ...(trunkMoved !== undefined ? { trunkMoved } : {}),
     ...(gate === "fail"
       ? {
           fixRequested: recorded.appended.flatMap((m) => (m.type === "fix.requested" ? [m.payload.item] : [])),
@@ -1100,8 +1209,16 @@ export class ContinuousBoardIntegrator {
       readonly retryBackoffMs?: number;
       /** Superseded re-runs before the superseded agents are held back (default 3). */
       readonly maxStaleRuns?: number;
+      /**
+       * Predict clashes among the pending pushes before each revision and record
+       * them on the board (advisory; default on). Never blocks integration.
+       */
+      readonly predictClashes?: boolean;
+      readonly onClashes?: (result: PendingClashResult) => void;
     },
   ) {}
+  /** Pairs of pending pushes this integrator already predicted. */
+  private readonly clashSeen = new Set<string>();
 
   /** True while a revision is being built. */
   get busy(): boolean {
@@ -1149,6 +1266,21 @@ export class ContinuousBoardIntegrator {
     }
     let result: IntegrateBoardResult;
     try {
+      if (this.options.predictClashes !== false) {
+        // Clash alerts from real code (advisory): never blocks the revision below.
+        const clashes = await recordPendingClashes({
+          operator: this.options.operator,
+          integrationRemote: authenticatedRemote(this.options.integration.integrationRef.gitUrl, this.options.integration.integrationToken),
+          integrationBranch: this.options.integration.integrationRef.defaultBranch,
+          readRemote: (agent) => this.options.readRemote(agent),
+          workRoot: this.options.worktreeRoot,
+          scrub: this.options.scrub ?? redactSecrets,
+          seen: this.clashSeen,
+        }).catch(() => undefined);
+        if (clashes !== undefined && clashes.recorded > 0) {
+          this.options.onClashes?.(clashes);
+        }
+      }
       result = await integrateBoardRevision({ ...this.options, ...(this.holdBack.size > 0 ? { holdBack: [...this.holdBack] } : {}) });
     } catch (error) {
       // A thrown attempt (the board or a repo unreachable) is transient.
@@ -1224,6 +1356,11 @@ function outstanding(state: BoardState): BoardItem[] {
 export function incompleteItemReasons(state: BoardState): string[] {
   return outstanding(state).map((i) => {
     const push = i.lastPush;
+    if (i.status === "split" && i.replanned !== undefined) {
+      const carriers = i.replanned.into !== undefined ? [i.replanned.into] : i.children;
+      const open = carriers.filter((c) => state.items[c]?.status !== "done");
+      return `item ${i.id}: re-planned (${i.replanned.action}, ${i.replanned.reason}) into ${carriers.join(", ")}; not completed: ${open.join(", ") || "none"}`;
+    }
     if (i.status === "split") {
       const open = i.children.filter((c) => state.items[c]?.status !== "done");
       return open.length > 0
@@ -1291,16 +1428,27 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     toolHoldMs: options.budgets?.toolHoldMs ?? 90 * 1000,
   };
   const ttl = options.workspaceTtlSeconds ?? 1800;
-  if (budgets.timeoutMs > ttl * 1000) {
-    // Agents push with their own short write tokens, which are not refreshed:
-    // an agent phase longer than their lifetime would fail pushes mid-run.
+  const refreshTokens = options.refreshTokens !== false;
+  if (!refreshTokens && budgets.timeoutMs > ttl * 1000) {
+    // Without refresh, agents push with their own short write tokens only: an
+    // agent phase longer than their lifetime would fail pushes mid-run.
     throw new Error(
       `the agent-phase timeout (${Math.round(budgets.timeoutMs / 1000)} s) exceeds the agents' write-token lifetime ` +
-        `(${ttl} s); raise --token-ttl or lower --timeout-ms`,
+        `(${ttl} s) and token refresh is off; raise --token-ttl, lower --timeout-ms, or turn refresh on`,
+    );
+  }
+  if (options.integrator === "cloud" && budgets.timeoutMs > Math.min(3600, ttl) * 1000) {
+    // The cloud integration repo's token (agents rebase from it) is not refreshed in this slice.
+    throw new Error(
+      `the agent-phase timeout (${Math.round(budgets.timeoutMs / 1000)} s) exceeds the cloud integration repo token's lifetime ` +
+        `(${Math.min(3600, ttl)} s), which is not refreshed; lower --timeout-ms or integrate locally`,
     );
   }
   const readTtl = options.readTokenTtlSeconds ?? 600;
-  const executor = options.executor ?? new ScopedNoopExecutor();
+  // Cost and time caps: every model call is metered (plan-scaled defaults are set once planned).
+  const meter = new RunMeter(options.caps ?? {}, options.capsClock ?? Date.now);
+  const executor = meteredExecutor(options.executor ?? new ScopedNoopExecutor(), meter);
+  const transport = meteredTransport(options.transport, meter);
   const workRoot = options.workRoot ?? (await mkdtemp(join(tmpdir(), "scf-board-")));
   await mkdir(workRoot, { recursive: true });
   const worktreeRoot = join(workRoot, "worktrees");
@@ -1352,6 +1500,12 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   const integration = cloudWorkspace
     ? { integrationRef: cloudWorkspace.integrationRef, integrationToken: cloudWorkspace.integrationToken }
     : await createIntegrationWorkspace(workRoot, options.projectDir, changeId, identity);
+  // The integration branch's head before any revision: the first revision
+  // must name it as the base it was built on (posted with the goal).
+  const baselineCommit = await runGit(["ls-remote", authenticatedRemote(integration.integrationRef.gitUrl, integration.integrationToken), `refs/heads/${integration.integrationRef.defaultBranch}`])
+    .then(({ stdout }) => stdout.trim().split(/\s+/)[0])
+    .then((sha) => (sha !== undefined && /^[0-9a-f]{40,64}$/.test(sha) ? sha : undefined))
+    .catch(() => undefined);
   // Run the gate once on the baseline and record which tests it executed, so a
   // later run that exits early (tests never run) cannot pass.
   const inventory =
@@ -1407,6 +1561,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   let planned: BoardSeed;
   try {
     planned = await options.seed(objective);
+    // The planner's decomposition is a model call too (usage unknown here: counted unpriced).
+    meter.count(planned.model !== undefined ? { model: planned.model } : {});
   } catch (error) {
     await failPlanningChange({
       workerUrl: base,
@@ -1428,17 +1584,44 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     ...(options.budgets?.maxActiveClaims !== undefined ? { explicitActiveClaims: options.budgets.maxActiveClaims } : {}),
     explicitFixAttempts: options.rules?.maxFixAttempts ?? options.budgets?.maxFixAttemptsPerItem,
     ...(options.budgets?.maxRunTurns !== undefined ? { explicitRunTurns: options.budgets.maxRunTurns } : {}),
+    ...((options.rules?.claimLeaseMessages ?? options.budgets?.claimLeaseMessages) !== undefined
+      ? { explicitLease: (options.rules?.claimLeaseMessages ?? options.budgets?.claimLeaseMessages)! }
+      : {}),
+    ...((options.rules?.claimDeadlineMessages ?? options.budgets?.claimDeadlineMessages) !== undefined
+      ? { explicitDeadline: (options.rules?.claimDeadlineMessages ?? options.budgets?.claimDeadlineMessages)! }
+      : {}),
     dial: options.dial,
     scaleDial: options.scaleDial === true,
   });
   budgets.maxRunTurns = effective.maxRunTurns;
+  meter.caps = {
+    ...(options.caps ?? {}),
+    maxCalls: options.caps?.maxCalls ?? CALLS_PER_RUN_TURN * effective.maxRunTurns,
+    maxWallMs: options.caps?.maxWallMs ?? 2 * budgets.timeoutMs,
+    maxCallsPerItem: options.caps?.maxCallsPerItem ?? CALLS_PER_ITEM_TURN * budgets.maxTurnsPerItem,
+  };
+  const capsLine = {
+    maxCalls: meter.caps.maxCalls!,
+    maxWallMs: meter.caps.maxWallMs!,
+    maxCallsPerItem: meter.caps.maxCallsPerItem!,
+    ...(meter.caps.maxSpendUsd !== undefined ? { maxSpendUsd: meter.caps.maxSpendUsd } : {}),
+  };
   const dial: ConcurrencyDial = { minConcurrency: options.dial.minConcurrency, maxConcurrency: effective.dialMax };
-  emit({ kind: "budgets", items: planned.items.length, scopeFiles, ...effective });
+  emit({ kind: "budgets", items: planned.items.length, scopeFiles, ...effective, caps: capsLine });
   const goal = await operator.postAsHuman({
     type: "goal.posted",
     payload: {
       objective,
-      rules: { ...(options.rules ?? {}), maxFixAttempts: effective.maxFixAttempts, maxActiveClaims: effective.maxActiveClaims },
+      rules: {
+        ...(options.rules ?? {}),
+        maxFixAttempts: effective.maxFixAttempts,
+        maxActiveClaims: effective.maxActiveClaims,
+        // Claims stay live only while their holders make progress (a lapse opens the item).
+        claimLeaseMessages: effective.claimLeaseMessages,
+        claimDeadlineMessages: effective.claimDeadlineMessages,
+        // Overlapping scopes are recorded for both holders (advisory); a shared seam goes through its contract.
+        claimOverlap: true,
+      },
       protected: guarded.paths,
       // The immutable acceptance gate: never contract-changeable.
       ...(guarded.immutable.length > 0 ? { immutable: guarded.immutable } : {}),
@@ -1446,6 +1629,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       ...(seams.length > 0 ? { seams } : {}),
       // Recorded with the goal: the board refuses splits under the cloud integrator.
       ...(cloud ? { integrator: "cloud" } : {}),
+      ...(baselineCommit !== undefined ? { baseline: baselineCommit } : {}),
+      // The gate every revision runs, for the record (and the proof bundle).
+      ...(options.appGateCommand && options.appGateCommand.length > 0 ? { gateCommand: options.appGateCommand.slice(0, 32).map((a) => a.slice(0, 200)) } : {}),
       ...(guarded.keyLabels.length > 0 ? { protectedKeys: guarded.keyLabels } : {}),
       ...(options.appGateCommand && options.appGateCommand.length > 0
         ? {
@@ -1484,6 +1670,21 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     return outcome?.ok === true ? "recorded" : outcome !== undefined && outcome.status >= 400 && outcome.status < 500 ? "refused" : "failed";
   };
 
+  // Agents' repo tokens (and helpers' fork tokens) are refreshed before they
+  // expire, so a run may outlast one token lifetime.
+  const refresher = refreshTokens
+    ? new TokenRefresher({
+        operator,
+        ttlSeconds: Math.min(3600, Math.max(60, ttl)),
+        ...(options.tokenClock ? { now: options.tokenClock } : {}),
+        secrets,
+        onRefresh: (e) => emit({ kind: "token-refreshed", agent: e.agent, tokenKind: e.kind, ...(e.request !== undefined ? { request: e.request } : {}) }),
+        onFailure: (reason) => emit({ kind: "token-refresh-failed", reason: scrub(reason) }),
+      })
+    : undefined;
+  const refreshAgentTokens = async (): Promise<void> => {
+    await refresher?.tick(workers.flatMap((w) => w.refreshableTokens())).catch(() => 0);
+  };
   // Read tokens the integrator was issued, revoked as soon as it is done with them.
   const issuedReadTokens: { agent: string; tokenId: string; help?: string }[] = [];
   const revokeReadTokens = async (): Promise<void> => {
@@ -1629,8 +1830,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       baseUrl: base,
       fetchFn: rawFetch,
       join: joinAgent,
-      transport: options.transport,
+      transport,
       executor,
+      meter,
+      onItemCap: (cap) => void recordCap(cap),
       projectDir: options.projectDir,
       workRoot,
       ...(options.identity ? { identity: options.identity } : {}),
@@ -1729,6 +1932,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     recordDecision,
     onRevision: (revision) => emit({ kind: "integrated", revision }),
     onFailure: (reason) => emit({ kind: "integration-not-recorded", reason }),
+    onClashes: (c) => emit({ kind: "clashes-predicted", pairs: c.pairs, recorded: c.recorded, conflicts: c.conflicts }),
   });
 
   // Contract changes on the original tests wait for a HUMAN: hand each pending
@@ -1877,6 +2081,80 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     return nudged;
   };
 
+  // A quiet board acts on each waiting item's STATED reason (itemWaitReason),
+  // never on a guess: a seam hold that stopped moving is recorded stalled; an
+  // open seam item, an unclaimed item, or one whose claim lapsed is offered to
+  // the free workers; a leased claim with NO stated reason whose holder sat
+  // the quiet period out is recorded stalled (it lapses: a quiet board
+  // advances no message count). Waiting for a human, the lead, the gate, or
+  // another item is left alone: someone else acts next.
+  // One step per quiet period, in this order, so each holder gets a chance to
+  // act on what the previous step changed before the next one judges it.
+  const actOnStalls = async (): Promise<boolean> => {
+    if (seamHolds((await operator.page(0, 1)).state).length > 0 && (await releaseStalledSeams())) {
+      return true;
+    }
+    if (await nudgeOpenSeamItems()) {
+      return true;
+    }
+    const state = (await operator.page(0, 1)).state;
+    const offered = Object.values(state.items)
+      .filter((i) => {
+        const why = itemWaitReason(state, i.id);
+        return why?.kind === "unclaimed" || why?.kind === "lease-lapsed";
+      })
+      .map((i) => i.id)
+      .sort();
+    if (offered.length > 0) {
+      let nudged = false;
+      for (const worker of workers) {
+        if (worker.offerOpenItems(offered)) {
+          nudged = true;
+        }
+      }
+      if (nudged) {
+        emit({ kind: "open-items-offered", items: offered });
+        return true;
+      }
+    }
+    let acted = false;
+    if (leasesOn(state)) {
+      for (const item of Object.values(state.items)) {
+        if (
+          item.status !== "claimed" ||
+          item.owner === undefined ||
+          item.lease === undefined ||
+          // Released for not moving twice already: the lead re-plans it instead.
+          (item.stallReleases ?? 0) >= BOARD_LIMITS.stallReleasesBeforeReplan ||
+          itemWaitReason(state, item.id) !== undefined ||
+          leaseSuspension(state, item) !== undefined
+        ) {
+          continue;
+        }
+        const recorded = await operator.recordEngine("claim.lapsed", { item: item.id });
+        if (recorded.ok) {
+          acted = true;
+          emit({ kind: "claim-stalled", item: item.id, agent: item.owner });
+        }
+      }
+    }
+    return acted;
+  };
+
+  // Each cap is recorded on the board once (run.capped), never the cause of a verdict.
+  const capsRecorded = new Set<string>();
+  const capsReached: RunCapReached[] = [];
+  const recordCap = async (cap: RunCapReached): Promise<void> => {
+    const key = `${cap.kind}:${cap.item ?? ""}`;
+    if (capsRecorded.has(key)) {
+      return;
+    }
+    capsRecorded.add(key);
+    capsReached.push(cap);
+    emit({ kind: "capped", cap });
+    await operator.recordEngine("run.capped", { kind: cap.kind, limit: cap.limit, used: cap.used, ...(cap.item !== undefined ? { item: cap.item } : {}) }).catch(() => undefined);
+  };
+
   const lead = makeAgent("lead", "lead");
   const controller = new AbortController();
   const loops: Promise<void>[] = [];
@@ -1887,6 +2165,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   let planningMarked = false;
 
   const cleanupRepos = async (): Promise<void> => {
+    await refresher?.flush();
     if (options.skipCleanup) {
       return;
     }
@@ -1987,12 +2266,18 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       if (
         owed.length > 0 &&
         owed.every((i) => i.status === "open" && (i.exhaustedBy?.length ?? 0) > 0 && running.every((w) => i.exhaustedBy!.includes(w))) &&
-        !integrator.wants(state)
+        !integrator.wants(state) &&
+        // The lead gets its one re-plan turn on each such item first.
+        lead.replanPending(state).length === 0
       ) {
         return "fix-budget";
       }
       if (runBudget.exhausted) {
         return "run-budget";
+      }
+      // A cost or time cap: no new turns; the integrator finishes what is in flight.
+      if (meter.reached() !== undefined) {
+        return "capped";
       }
       if (Date.now() - started > budgets.timeoutMs) {
         return "timeout";
@@ -2005,6 +2290,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
 
     if ((options.schedule ?? "lockstep") === "lockstep") {
       for (let round = 1; round <= budgets.maxRounds && stopReason === undefined; round += 1) {
+        await refreshAgentTokens();
         const state = (await operator.page(0, 1)).state;
         stopReason = check(state);
         if (stopReason) {
@@ -2027,7 +2313,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         }
         const integrated = integrator.revisions.length > before;
         const decided = await settleContracts();
-        if (!acted && joined === 0 && !integrated && !decided && !(await releaseStalledSeams()) && !(await nudgeOpenSeamItems())) {
+        if (!acted && joined === 0 && !integrated && !decided && !(await actOnStalls())) {
           stopReason = check((await operator.page(0, 1)).state) ?? "quiescent";
           stopDetail = "no agent had anything to do and no integration was pending";
         }
@@ -2041,6 +2327,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       let lastSeq = -1;
       let quietSince = Date.now();
       while (stopReason === undefined) {
+        await refreshAgentTokens();
         const state = (await operator.page(0, 1)).state;
         stopReason = check(state);
         if (stopReason) {
@@ -2082,12 +2369,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         if (state.lastSeq !== lastSeq || anyBusy) {
           lastSeq = state.lastSeq;
           quietSince = Date.now();
-        } else if (
-          Date.now() - quietSince >= budgets.quiescenceMs / 2 &&
-          ((seamHolds(state).length > 0 && (await releaseStalledSeams())) || (await nudgeOpenSeamItems()))
-        ) {
-          // A quiet board with seam holds, or with open seam items: the holds
-          // end, and the workers are nudged to take them, before quiescence could.
+        } else if (Date.now() - quietSince >= budgets.quiescenceMs / 2 && (await actOnStalls())) {
+          // A quiet board acts on the stated reasons (seam holds end, open
+          // items are offered, stalled claims lapse) before quiescence could.
           quietSince = Date.now();
         } else if (Date.now() - quietSince >= budgets.quiescenceMs) {
           stopReason = "quiescent";
@@ -2124,6 +2408,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       await toolBench.dispose();
     }
   }
+  const cap = meter.reached();
+  if (stopReason === "capped" && cap !== undefined) {
+    stopDetail ??= `the ${cap.kind} cap was reached (${cap.used} of ${cap.limit}): no new turns; the in-flight work was integrated`;
+    await recordCap(cap);
+  }
   emit({ kind: "agents-done", reason: stopReason!, ...(stopDetail ? { detail: stopDetail } : {}) });
 
   let promotion: PromotionResult | undefined;
@@ -2134,6 +2423,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   let incompleteItems: string[] = [];
   let incompleteReasons: string[] = [];
   let evidence: EvidenceSummary | undefined;
+  // A promotion the board refused to record (the proof bundle checks it the same way).
+  let promotionUnrecorded: { rev: number; gatedCommit: string; commit: string; branch: string } | undefined;
   try {
     // 4. The last integration: anything still pending is integrated once more,
     // so the final verdict is the gate of the revision that includes it.
@@ -2230,6 +2521,18 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       }).finally(() => promotionToken?.revoke());
       promotion = promoted.promotion;
       sourceRepoDir = promoted.sourceRepoDir;
+      if (promotion.committed && promotion.commit !== "") {
+        // Promotion is recorded on the board (backed): the board checks the
+        // promoted gated commit is the last revision's, so a replay can show it.
+        const gatedCommit = evidence.integration.commit ?? last.commit;
+        const recorded = await operator
+          .recordEngine("revision.promoted", { rev: last.n, gatedCommit, commit: promotion.commit, branch: promotion.branch })
+          .catch(() => undefined);
+        if (!recorded?.ok) {
+          promotionUnrecorded = { rev: last.n, gatedCommit, commit: promotion.commit, branch: promotion.branch };
+          emit({ kind: "promotion-unrecorded", reason: scrub(recorded && !recorded.ok ? `${recorded.code}: ${recorded.error}` : "the board was unreachable") });
+        }
+      }
       deployment = await redeployIfPreviouslyDeployed({
         evidence,
         promotion,
@@ -2265,6 +2568,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
 
   const final = await operator.log();
   const last = integrator.revisions.at(-1);
+  const proof = buildProofBundle(final.messages, {
+    changeId,
+    ...(options.appGateCommand ? { gateCommand: options.appGateCommand } : {}),
+    ...(promotionUnrecorded ? { promotion: promotionUnrecorded } : {}),
+  });
   return {
     changeId,
     stopReason: stopReason!,
@@ -2299,9 +2607,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     workRoot,
     cleanedUp,
     toolGates: [...toolBench.gates],
+    usage: { calls: meter.calls, spendUsd: Math.round(meter.spendUsd * 1e6) / 1e6, unpricedCalls: meter.unpricedCalls, capped: [...capsReached] },
     editModels: workers.flatMap((w) => w.editModels.map((e) => ({ agent: w.id, ...e }))),
-    budgets: { items: planned.items.length, scopeFiles, ...effective },
+    budgets: { items: planned.items.length, scopeFiles, ...effective, caps: capsLine },
     ...(options.toolAuthorLabel !== undefined ? { toolAuthorLabel: options.toolAuthorLabel } : {}),
+    proof,
   };
 }
 
@@ -2382,21 +2692,8 @@ export function exportedNames(source: string): string[] {
   return [...names].filter((n) => n.length <= 80).slice(0, 64);
 }
 
-/**
- * Budgets that scale with the plan (bounded): fix attempts per item are
- * 3 + floor(items / 5), at most 6; the dial's max, when scaled, is
- * min(items, 6) and at least the dial's min. An explicit value always wins.
- */
-export function scaledBudgets(input: {
-  readonly items: number;
-  /** Distinct repo files the planned items' scopes cover (large items get more turns). */
-  readonly scopeFiles?: number;
-  readonly explicitFixAttempts?: number;
-  readonly explicitRunTurns?: number;
-  readonly explicitActiveClaims?: number;
-  readonly dial: ConcurrencyDial;
-  readonly scaleDial: boolean;
-}): {
+/** The budgets `scaledBudgets` derives (each with whether it was scaled or explicit). */
+export interface ScaledBudgets {
   readonly maxFixAttempts: number;
   readonly fixAttemptsScaled: boolean;
   readonly dialMax: number;
@@ -2405,7 +2702,31 @@ export function scaledBudgets(input: {
   readonly runTurnsScaled: boolean;
   readonly maxActiveClaims: number;
   readonly activeClaimsScaled: boolean;
-} {
+  readonly claimLeaseMessages: number;
+  readonly leaseScaled: boolean;
+  readonly claimDeadlineMessages: number;
+  readonly deadlineScaled: boolean;
+}
+
+/**
+ * Budgets that scale with the plan (bounded): fix attempts per item are
+ * 3 + floor(items / 5), at most 6; the dial's max, when scaled, is
+ * min(items, 6) and at least the dial's min; the claim lease is
+ * max(150, 40 per agent of the dial's max) board messages and the claim
+ * deadline 8 leases. An explicit value always wins.
+ */
+export function scaledBudgets(input: {
+  readonly items: number;
+  /** Distinct repo files the planned items' scopes cover (large items get more turns). */
+  readonly scopeFiles?: number;
+  readonly explicitFixAttempts?: number;
+  readonly explicitRunTurns?: number;
+  readonly explicitActiveClaims?: number;
+  readonly explicitLease?: number;
+  readonly explicitDeadline?: number;
+  readonly dial: ConcurrencyDial;
+  readonly scaleDial: boolean;
+}): ScaledBudgets {
   const fix = input.explicitFixAttempts ?? Math.min(6, 3 + Math.floor(input.items / 5));
   const dialMax = input.scaleDial ? Math.max(input.dial.minConcurrency, Math.min(Math.max(1, input.items), 6)) : input.dial.maxConcurrency;
   const runTurns =
@@ -2413,6 +2734,9 @@ export function scaledBudgets(input: {
     Math.min(MAX_SCALED_RUN_TURNS, Math.max(200, RUN_TURNS_PER_ITEM * input.items + RUN_TURNS_PER_SCOPE_FILE * (input.scopeFiles ?? 0)));
   // One unfinished item per agent; two when the plan dwarfs the dial.
   const activeClaims = input.explicitActiveClaims ?? (input.items >= 3 * Math.max(1, dialMax) ? 2 : 1);
+  // Generous: more agents post more messages between one holder's turns.
+  const lease = input.explicitLease ?? Math.max(MIN_SCALED_LEASE_MESSAGES, LEASE_MESSAGES_PER_AGENT * Math.max(1, dialMax));
+  const deadline = input.explicitDeadline ?? DEADLINE_LEASES * lease;
   return {
     maxFixAttempts: fix,
     fixAttemptsScaled: input.explicitFixAttempts === undefined,
@@ -2422,8 +2746,24 @@ export function scaledBudgets(input: {
     runTurnsScaled: input.explicitRunTurns === undefined,
     maxActiveClaims: activeClaims,
     activeClaimsScaled: input.explicitActiveClaims === undefined,
+    claimLeaseMessages: lease,
+    leaseScaled: input.explicitLease === undefined,
+    claimDeadlineMessages: deadline,
+    deadlineScaled: input.explicitDeadline === undefined,
   };
 }
+
+/** Default model-call cap per run turn (turns plus the edits they run, generously). */
+export const CALLS_PER_RUN_TURN = 10;
+/** Default per-item call cap per allowed item turn. */
+export const CALLS_PER_ITEM_TURN = 8;
+
+/** The smallest plan-scaled claim lease, in board messages. */
+export const MIN_SCALED_LEASE_MESSAGES = 150;
+/** Board messages of claim lease per agent of the dial's max, when scaled. */
+export const LEASE_MESSAGES_PER_AGENT = 40;
+/** The scaled claim deadline, in leases. */
+export const DEADLINE_LEASES = 8;
 
 /** Run-wide turns per file in the planned scopes (added to the per-item turns). */
 export const RUN_TURNS_PER_SCOPE_FILE = 10;
@@ -2563,6 +2903,25 @@ function payloadSummary(m: BoardMessage): string {
       return `${String(p.contest)} ${String(p.how)}${p.winner ? ` (winner ${String(p.winner)})` : ""}`;
     case "claim.escalated":
       return `${String(p.contest)} after ${String(p.turns)} turn(s) (${String(p.reason)})`;
+    case "claim.lapsed":
+      return `${String(p.item)} (held by ${String(p.agent)}): ${p.reason === "deadline" ? `its deadline (seq ${String(p.deadlineSeq)}) passed` : p.reason === "stalled" ? `stalled on a quiet board (no progress since seq ${String(p.lastProgressSeq)})` : `no progress since seq ${String(p.lastProgressSeq)}`}; open again${p.commit !== undefined ? ` (the next owner may start from ${String(p.commit).slice(0, 10)})` : ""}`;
+    case "claim.extended":
+      return `${String(p.item)}: deadline extended (${String(p.reason).slice(0, 100)})`;
+    case "clash.predicted": {
+      const a = p.a as { agent: string; item: string; sha: string };
+      const b = p.b as { agent: string; item: string; sha: string };
+      return `${a.agent}'s ${a.item} (${a.sha.slice(0, 10)}) and ${b.agent}'s ${b.item} (${b.sha.slice(0, 10)}): ${p.status === "conflict" ? `would conflict on ${list(p.paths)} (${String(p.scope)})` : `${String(p.status)}: ${String(p.reason).slice(0, 120)}`} (advisory)`;
+    }
+    case "run.capped":
+      return `${String(p.kind)} cap reached${p.item !== undefined ? ` for ${String(p.item)}` : ""}: ${String(p.used)} of ${String(p.limit)} (no new turns)`;
+    case "revision.promoted":
+      return `rev ${String(p.rev)} promoted to ${String(p.branch)} commit ${String(p.commit).slice(0, 10)} (gated ${String(p.gatedCommit).slice(0, 10)})`;
+    case "token.refreshed":
+      return `${String(p.agent)}'s ${String(p.kind)} token refreshed${p.request !== undefined ? ` (help ${String(p.request)})` : ""}`;
+    case "trunk.moved":
+      return `after rev ${String(p.rev)} (${String(p.commit).slice(0, 10)}) the integration branch had moved${p.expected !== undefined ? ` from ${String(p.expected).slice(0, 10)}` : ""}${p.actual !== undefined ? ` to ${String(p.actual).slice(0, 10)}` : ""}: not advanced`;
+    case "claim.overlap":
+      return `${String(p.agent)}'s ${String(p.item)} overlaps ${String(p.withAgent)}'s ${String(p.with)} on ${list(p.files)} (advisory)`;
     case "help.requested":
       return `${String(p.request)} on ${String(p.item)} (need ${String(p.need)})${Array.isArray(p.scope) ? `, grants ${list(p.scope)} to the helper who forks` : ""}`;
     case "help.offered":
@@ -2579,6 +2938,12 @@ function payloadSummary(m: BoardMessage): string {
       return `offers help on ${String(p.item)}`;
     case "help.declined":
       return `${String(p.volunteer)}'s offer on ${String(p.item)}`;
+    case "item.replanned": {
+      const children = p.children as { item: string; scopeHint: string[] }[];
+      return `${String(p.item)} (${String(p.reason)}) ${String(p.action)}${p.with !== undefined ? ` with ${String(p.with)}` : ""} into ${children.map((c) => `${c.item} [${c.scopeHint.join(", ")}]`).join(", ")}${p.rev !== undefined ? ` (from revision ${String(p.rev)}'s failure)` : ""}`;
+    }
+    case "item.escalated":
+      return `${String(p.item)} (a re-plan of ${String(p.replanOf)}) failed again: a human decides`;
     case "item.split": {
       const children = p.children as { item: string; scopeHint: string[] }[];
       return `${String(p.item)} into ${children.map((c) => `${c.item} [${c.scopeHint.join(", ")}]`).join(", ")}; ${m.from} is its sub-lead`;
@@ -2844,7 +3209,13 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     `  agent phase ended: ${result.stopReason}${result.stopDetail ? ` (${result.stopDetail})` : ""}`,
     ...(result.budgets
       ? [
-          `  budgets: ${result.budgets.maxFixAttempts} fix attempt(s) per item (${result.budgets.fixAttemptsScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"}), dial max ${result.budgets.dialMax} (${result.budgets.dialScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"}), ${result.budgets.maxRunTurns} run turn(s) (${result.budgets.runTurnsScaled ? `scaled with ${result.budgets.items} planned item(s) and ${result.budgets.scopeFiles ?? 0} scope file(s)` : "explicit"}), claim cap ${result.budgets.maxActiveClaims} unfinished item(s) per agent (${result.budgets.activeClaimsScaled ? "scaled" : "explicit"})`,
+          `  ${formatBudgetsLine(result.budgets)}`,
+        ]
+      : []),
+    ...(result.usage
+      ? [
+          `  usage: ${result.usage.calls} model call(s), ${result.usage.spendUsd.toFixed(4)} USD estimated${result.usage.unpricedCalls > 0 ? ` (+${result.usage.unpricedCalls} unpriced call(s))` : ""}` +
+            (result.usage.capped.length > 0 ? `; caps reached: ${result.usage.capped.map((c) => `${c.kind}${c.item ? ` (${c.item})` : ""} ${c.used} of ${c.limit}`).join(", ")}` : ""),
         ]
       : []),
     ...(result.gateLabel !== undefined ? [`  gate: ${result.gateLabel}`] : []),
@@ -2891,6 +3262,9 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
       }
       if (rev.fixRequested && rev.fixRequested.length > 0) {
         lines.push(`    fix requested: ${rev.fixRequested.join(", ")}`);
+      }
+      if (rev.trunkMoved) {
+        lines.push(`    trunk moved: the integration branch was not advanced to this revision (another writer; expected ${rev.trunkMoved.expected?.slice(0, 12) ?? "(absent)"})`);
       }
       if (rev.fixExhausted && rev.fixExhausted.length > 0) {
         lines.push(`    fix budget spent (reopened for another agent): ${rev.fixExhausted.join(", ")}`);

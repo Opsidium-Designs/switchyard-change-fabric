@@ -18,12 +18,19 @@ make replay-preview   # build, then serve on http://127.0.0.1:4180 (REPLAY_PORT=
 ```
 
 - `?run=<id>` opens a run at its end (the final state), `?run=<id>&seq=<n>` at
-  seq n, `&tab=tools` (or `thread`, `node`) opens a right pane tab. The address
+  seq n, `&tab=tools` (or `thread`, `node`, `proof`) opens a right pane tab. The address
   bar follows the scrubber, so a link opens the moment being watched.
 - Play from the start, change speed (1x, 4x, 16x), scrub, or jump to a key
   moment: claims, contests, contract changes, help and handoffs, tool
-  publications, gate passes and failures, completions, spent fix budgets, and
-  stalled seams. Every key moment is a recorded message.
+  publications, gate passes and failures, promotions, completions, spent fix
+  budgets, stalled seams, lapsed claims, re-plans, and caps. Every key moment
+  is a recorded message.
+- The PROOF tab shows what the run can prove about its final revision at the
+  current seq (`buildProofBundle` over the log alone): proven only when the
+  last revision passed a gate that ran and the recorded promotion's gated
+  commit is that revision's commit; otherwise each reason. Item cards carry
+  one line saying why a waiting item is not moving (derived from the board),
+  and clash predictions are tagged on the cards.
 - Live-only controls are gone: no launcher, templates, deploy, or dial, and a
   pending escalation is shown read-only ("recorded run: decided during the live
   run, not here").
@@ -75,5 +82,8 @@ make delete-replay    # remove it again
 | `board-live-sf7` | failed | storefront: contracts, help, handoffs, a scanner and a codemod; a shared Invoice change broke typecheck for revisions 2 to 9; best acceptance 40/129 |
 | `board-live-sf8` | failed | storefront: 7 contract proposals, 4 escalated to a human; acceptance peaked at 35/129; two seam items stalled |
 
-Promotion to local Git happens after the verdict is recorded and is not part of
-the exported board, so the page reports the recorded verdict, not promotion.
+Runs recorded before promotions were written to the board (the three above)
+carry no `revision.promoted`, so the page reports the recorded verdict, never
+promotion, and their PROOF tab says not proven (no promotion recorded). A run
+recorded since shows "VERIFIED AND PROMOTED" only from its recorded
+`revision.promoted`.

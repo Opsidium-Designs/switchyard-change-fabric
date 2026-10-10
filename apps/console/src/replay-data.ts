@@ -178,12 +178,16 @@ export function finalVerdict(run: ReplayRun): FinalVerdict {
   if (verdict === "verified" && integration?.gated !== false) {
     const units = integration?.integratedUnits?.length;
     const rev = passing ?? last;
+    // Promotion only when the board recorded it (revision.promoted): never inferred.
+    const promoted = run.messages.filter((m) => m.type === "revision.promoted").at(-1);
+    const promotedText =
+      promoted && promoted.type === "revision.promoted" ? `; promoted to ${promoted.payload.branch} (${promoted.payload.commit.slice(0, 10)}, the gated tree of revision ${promoted.payload.rev})` : "";
     return {
       kind: "verified",
-      headline: "VERIFIED",
+      headline: promotedText !== "" ? "VERIFIED AND PROMOTED" : "VERIFIED",
       detail: `${rev ? `The gate passed on revision ${rev.n}${acceptanceText(rev) ? ` (${acceptanceText(rev)})` : ""}` : "The gate passed"}${
         units !== undefined ? `; ${units} item(s) integrated` : ""
-      }.`,
+      }${promotedText}.`,
       ...atField,
     };
   }
@@ -222,7 +226,7 @@ export const MOMENT_GROUPS: readonly { readonly kind: MomentKind; readonly title
   { kind: "help", title: "Help and handoffs" },
   { kind: "tool", title: "Tools" },
   { kind: "done", title: "Items completed" },
-  { kind: "trouble", title: "Fix budget spent, stalls" },
+  { kind: "trouble", title: "Fix budget spent, stalls, lapses, re-plans, caps" },
 ];
 
 function field(m: BoardMessage, key: string): string {
@@ -278,11 +282,26 @@ export function keyMoments(log: readonly BoardMessage[]): KeyMoment[] {
       case "item.completed":
         push("done", `${field(m, "item")} completed`);
         break;
+      case "revision.promoted":
+        push("gate-pass", `revision ${field(m, "rev")} promoted to ${field(m, "branch")}`);
+        break;
+      case "run.capped":
+        push("trouble", `${field(m, "kind")} cap reached`);
+        break;
       case "fix.exhausted":
         push("trouble", `${field(m, "item")}: fix budget spent`);
         break;
       case "seam.stalled":
         push("trouble", `seam ${field(m, "item")} stalled`);
+        break;
+      case "item.replanned":
+        push("trouble", `lead re-planned ${field(m, "item")} (${field(m, "action")})`);
+        break;
+      case "item.escalated":
+        push("trouble", `${field(m, "item")} failed again after a re-plan: a human decides`);
+        break;
+      case "claim.lapsed":
+        push("trouble", `${field(m, "agent")}'s claim on ${field(m, "item")} lapsed (${field(m, "reason")})`);
         break;
       default:
         break;

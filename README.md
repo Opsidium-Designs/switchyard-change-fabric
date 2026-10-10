@@ -147,7 +147,14 @@ recorded by the engine (see "Agent-built tools" in docs/BOARD.md). Owners can
 split an item and become its sub-lead (the children's pushes integrate into
 the sub-lead's repo first, and it announces one push upward), or grant part of
 an item to a helper that forks their repo and delivers a commit they pull (see
-"Splits, sub-leads, and fork-based help" in docs/BOARD.md). With
+"Splits, sub-leads, and fork-based help" in docs/BOARD.md). Long runs stay
+moving: claims are leased (they lapse without real progress), every waiting
+item states why, an item that spends its fix budget gets one lead re-plan
+before a human is asked, overlapping scopes and predicted clashes are flagged,
+stale revisions are refused, agents' repo tokens are refreshed, cost and time
+caps stop new turns, and each run ends with a proof bundle of what it can
+prove about the revision it shipped (see "Stalls, re-plans, clashes, proofs,
+and caps" in docs/BOARD.md). With
 `--integrator cloud` the integration runs on Cloudflare instead of in the
 driver: a Workflow gates each revision in a Cloudflare Container with phased
 egress (`make dev-containers` locally, Docker required). See

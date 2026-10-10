@@ -16,6 +16,13 @@ import {
   activeClaims,
   claimCapReached,
   appendSeamStalled,
+  appendEngineRecord,
+  ENGINE_RECORD_TYPES,
+  leaseLapse,
+  leaseSuspension,
+  itemWaitReason,
+  describeWaitReason,
+  replanEligible,
   seamContractFacts,
   releasedTargets,
   uncoveredFailureFiles,
@@ -77,6 +84,9 @@ class TestBoard {
     const { from, ...body } = draft;
     if (from === "engine") {
       const payload = (draft.payload ?? {}) as unknown;
+      if ((ENGINE_RECORD_TYPES as readonly string[]).includes(String(draft.type))) {
+        return appendEngineRecord(this.state, { type: draft.type, payload }, AT);
+      }
       return draft.type === "decision.recorded"
         ? appendDecisionRecorded(this.state, payload, AT)
         : draft.type === "tool.gated"
@@ -179,7 +189,20 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
   "claim.narrowed": { from: "a", payload: { contest: "c", write: ["src/a.ts"] } },
   "claim.resolved": { from: "human", payload: { contest: "c", how: "human-decided", winner: "a" } },
   "claim.escalated": { from: "engine", payload: { contest: "c", item: "i", owner: "b", claimant: "a", overlap: ["src/a.ts"], turns: 0, reason: "idle" } },
+  "claim.lapsed": { from: "engine", payload: { item: "i", agent: "a", reason: "no-progress", lastProgressSeq: 4, commit: "c1" } },
+  "claim.extended": { from: "lead", payload: { item: "i", reason: "it pushed within the lease" } },
+  "claim.overlap": { from: "engine", payload: { item: "i", agent: "a", with: "j", withAgent: "b", files: ["src/shared/**"] } },
   "item.split": { from: "a", payload: { item: "i", children: [{ item: "k", objective: "o" }] } },
+  "item.replanned": { from: "lead", payload: { item: "i", reason: "stalled", action: "rescope", children: [{ item: "k", objective: "o", scopeHint: ["src/k.ts"] }], rev: 2 } },
+  "item.escalated": { from: "engine", payload: { item: "k", reason: "replan-failed", replanOf: "i" } },
+  "trunk.moved": { from: "engine", payload: { rev: 2, commit: "abc", expected: "def", actual: "fed" } },
+  "token.refreshed": { from: "engine", payload: { agent: "a", kind: "help-fork", request: "r" } },
+  "revision.promoted": { from: "engine", payload: { rev: 3, gatedCommit: "abc", commit: "def", branch: "switchyard/change-1" } },
+  "run.capped": { from: "engine", payload: { kind: "spend", limit: 5, used: 5.25 } },
+  "clash.predicted": {
+    from: "engine",
+    payload: { a: { agent: "a", item: "i", sha: "c1" }, b: { agent: "b", item: "j", sha: "c2" }, status: "conflict", paths: ["src/a.ts"], scope: "local" },
+  },
   "item.discovered": { from: "a", payload: { item: "k", objective: "o", reason: "found a gap", parent: "i" } },
   "help.requested": { from: "a", payload: { request: "r", item: "i", need: "tool" } },
   "help.offered": { from: "b", payload: { request: "r", forkOf: "a", forkCommit: "abc123", fork: "chg--help-r" } },
@@ -238,7 +261,17 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "claim.narrowed": { contest: "c", write: "src/a.ts" },
   "claim.resolved": { contest: "c", how: "coin-flip" },
   "claim.escalated": { contest: "c", item: "i", owner: "b", claimant: "a", overlap: [], turns: 1, reason: "bored" },
+  "claim.lapsed": { item: "i", agent: "a", reason: "bored", lastProgressSeq: 1 },
+  "claim.extended": { item: "i" },
+  "claim.overlap": { item: "i", agent: "a", with: "j", withAgent: "b", files: "src" },
   "item.split": { item: "i", children: [] },
+  "item.replanned": { item: "i", reason: "bored", action: "split", children: [{ item: "k", objective: "o" }] },
+  "item.escalated": { item: "k", reason: "replan-failed" },
+  "clash.predicted": { a: { agent: "a", item: "i", sha: "c1" }, b: { agent: "b", item: "j", sha: "c2" }, status: "clean" },
+  "trunk.moved": { rev: 0, commit: "abc" },
+  "token.refreshed": { agent: "a", kind: "help-fork" },
+  "revision.promoted": { rev: 3, gatedCommit: "abc", commit: "def", branch: "../etc" },
+  "run.capped": { kind: "item-calls", limit: 5, used: 6 },
   "item.discovered": { item: "k", objective: "o" },
   "help.requested": { request: "r", item: "i" },
   "help.offered": {},
@@ -277,7 +310,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(46);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(56);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -2468,6 +2501,28 @@ describe("the active-claim cap (no hoarding)", () => {
   });
 });
 
+describe("integration plans for an agent that lost an item", () => {
+  it("files it pushed for an item it no longer holds (reopened, lapsed, re-planned) are yielded, never applied from its repo", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", rules: { maxFixAttempts: 1 } }));
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "one", objective: "o", acceptance: [], scopeHint: ["src/one/**"] }));
+    board.post(msg("lead", "item.proposed", { item: "two", objective: "t", acceptance: [], scopeHint: ["src/two/**"] }));
+    board.post(claim("a", "one", ["src/one/**"]));
+    board.post(push("a", "one", "c1", ["src/one/x.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1"], failing: { output: "x", items: ["one"] } }));
+    board.post(push("a", "one", "c2", ["src/one/x.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c2"], failing: { output: "x", items: ["one"] } }));
+    expect(board.state.items.one!.status).toBe("open");
+    // a moves on: its repo still carries src/one/x.ts, which is no longer its to apply.
+    board.post(claim("a", "two", ["src/two/**"]));
+    board.post(push("a", "two", "c3", ["src/two/y.ts"]));
+    const unit = planBoardIntegration(board.log, board.state).units.find((u) => u.agent === "a")!;
+    expect(unit).toMatchObject({ commit: "c3", scope: ["src/two/**"], yieldedScope: ["src/one/x.ts"] });
+  });
+});
+
 describe("integration plans after a sub-lead merge", () => {
   it("a child owner's later push on another item diffs from its child commit the sub-lead's passing push integrated", () => {
     const board = seeded();
@@ -2481,5 +2536,570 @@ describe("integration plans after a sub-lead merge", () => {
     board.post(push("b", "two", "pb", ["src/b/y.ts"]));
     const unit = planBoardIntegration(board.log, board.state).units.find((u) => u.agent === "b")!;
     expect(unit).toMatchObject({ commit: "pb", baselineRef: "px", scope: ["src/b/**"] });
+  });
+});
+
+describe("claim leases: a claim stays live only while its holder makes progress", () => {
+  /** Post `n` messages that touch none of `one`: b proposes items (proposals wait for the lead). */
+  function chatter(board: TestBoard, n: number, from = "b"): BoardMessage[] {
+    const out: BoardMessage[] = [];
+    for (let k = 0; k < n; k += 1) {
+      out.push(...board.post(msg(from, "item.proposed", { item: `${from}-idea-${board.state.lastSeq}`, objective: "an idea", acceptance: [], scopeHint: ["docs/**"] })));
+    }
+    return out;
+  }
+
+  it("lapses after the lease with no progress: typed, addressed to the holder, the item open again with its push to start from", () => {
+    const board = seeded({ claimLeaseMessages: 6 });
+    const granted = board.post(claim("a", "one", ["src/one.ts"])).find((m) => m.type === "claim.granted")!;
+    expect(board.state.items.one!.lease).toEqual({ progressSeq: granted.seq, extensions: 0 });
+    // A push, then a failing revision gates it (progress), then nothing from a.
+    board.post(push("a", "one", "c1", ["src/one.ts"]));
+    const failed = board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1"], failing: { output: "boom", items: ["one"] } }));
+    const gatedAt = failed[0]!.seq;
+    expect(board.state.items.one!.lease!.progressSeq).toBe(gatedAt);
+    // Idle chatter elsewhere does not renew it.
+    const appended = chatter(board, 6);
+    const lapsed = appended.find((m) => m.type === "claim.lapsed");
+    expect(lapsed).toMatchObject({
+      from: "engine",
+      to: ["a"],
+      payload: { item: "one", agent: "a", reason: "no-progress", lastProgressSeq: gatedAt, commit: "c1" },
+    });
+    expect(lapsed!.seq - gatedAt).toBeGreaterThanOrEqual(6);
+    const item = board.state.items.one!;
+    expect(item.status).toBe("open");
+    expect(item.owner).toBeUndefined();
+    expect(item.lease).toBeUndefined();
+    expect(item.lastLapse).toMatchObject({ agent: "a", reason: "no-progress", lastProgressSeq: gatedAt });
+    expect(item.reopenedFrom).toEqual({ agent: "a", commit: "c1" });
+    expect(item.stallReleases).toBe(1);
+    // Another agent takes it first: the lapsed holder is refused for one lease period.
+    board.reject(claim("a", "one", ["src/one.ts"]), /a's claim on one lapsed at seq \d+: another agent takes it first/, "NOT_ALLOWED");
+    board.post(claim("c", "one", ["src/one.ts"]));
+    expect(board.state.items.one).toMatchObject({ status: "claimed", owner: "c" });
+    expect(board.state.items.one!.lastLapse).toBeUndefined();
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("only the holder's real progress renews: its push, a message naming the item; another agent's messages never do", () => {
+    const board = seeded({ claimLeaseMessages: 4 });
+    board.post(claim("a", "one", ["src/one.ts"]));
+    chatter(board, 3);
+    // a reports the item struggling: progress, the lease runs from here.
+    const report = board.post(msg("a", "item.struggling", { item: "one", turnsSpent: 3, failedEdits: 1, reason: "failed-edits" }))[0]!;
+    expect(board.state.items.one!.lease!.progressSeq).toBe(report.seq);
+    chatter(board, 2);
+    expect(board.state.items.one!.status).toBe("claimed");
+    // a talks about another item: no renewal.
+    board.post(claim("a", "two", ["src/two.ts"]));
+    expect(board.state.items.one!.lease!.progressSeq).toBe(report.seq);
+    const appended = chatter(board, 1);
+    expect(appended.map((m) => m.type)).toContain("claim.lapsed");
+    expect(board.state.items.one!.status).toBe("open");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("never lapses while its push waits for the gate or a contract for it waits for a decision", () => {
+    const board = seeded({ claimLeaseMessages: 3 });
+    board.post(claim("a", "one", ["src/one.ts"]));
+    board.post(push("a", "one", "c1", ["src/one.ts"]));
+    expect(leaseSuspension(board.state, board.state.items.one!)).toBe("its push waits for the gate");
+    chatter(board, 6);
+    expect(board.state.items.one!.status).toBe("claimed");
+    expect(leaseLapse(board.state, "one", board.state.lastSeq + 100)).toBeUndefined();
+    // Gated (pass) and finished: still no lapse while only the done proposal is left.
+    board.post(rev("pass", ["c1"], "r1"));
+    expect(leaseSuspension(board.state, board.state.items.one!)).toBe("its push passed");
+    chatter(board, 6);
+    expect(board.state.items.one!.status).toBe("claimed");
+    // A pending contract for an item suspends it too.
+    board.post(claim("b", "two", ["src/two.ts"]));
+    board.post(msg("b", "contract.proposed", { contract: "k1", target: "src/api.ts", kind: "modify", item: "two" }));
+    chatter(board, 6, "c");
+    expect(board.state.items.two!.status).toBe("claimed");
+    board.post(msg("lead", "contract.rejected", { contract: "k1" }, { rationale: "no" }));
+    // The decision renews the lease; it then runs again.
+    expect(board.state.items.two!.lease!.progressSeq).toBe(board.state.lastSeq);
+    chatter(board, 3, "c");
+    expect(board.state.items.two!.status).toBe("open");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("the firm deadline is not renewed by progress: the lead extends it with a reason (bounded) or it lapses", () => {
+    const board = seeded({ claimDeadlineMessages: 20 });
+    const granted = board.post(claim("a", "one", ["src/one.ts"])).find((m) => m.type === "claim.granted")!;
+    expect(board.state.items.one!.lease).toEqual({ progressSeq: granted.seq, deadlineSeq: granted.seq + 20, extensions: 0 });
+    chatter(board, 14);
+    // Progress does not move the deadline.
+    board.post(msg("a", "item.struggling", { item: "one", turnsSpent: 1, failedEdits: 0, reason: "turn-budget" }));
+    chatter(board, 1);
+    expect(board.state.items.one!.lease!.deadlineSeq).toBe(granted.seq + 20);
+    // Near the deadline the lead sees it, with the holder progressing.
+    expect(boardDigest(board.state, board.log, "lead", 0).deadlines).toEqual([
+      expect.objectContaining({ item: "one", owner: "a", deadlineSeq: granted.seq + 20, extensions: 0, progressing: true }),
+    ]);
+    expect(boardDigest(board.state, board.log, "b", 0).deadlines).toBeUndefined();
+    board.reject(msg("b", "claim.extended", { item: "one", reason: "r" }), /cannot be sent by an agent/, "NOT_ALLOWED");
+    const ext = board.post(msg("lead", "claim.extended", { item: "one", reason: "it reports progress" }))[0]!;
+    expect(board.state.items.one!.lease).toMatchObject({ deadlineSeq: ext.seq + 20, extensions: 1 });
+    board.post(msg("lead", "claim.extended", { item: "one", reason: "still moving" }));
+    board.reject(msg("lead", "claim.extended", { item: "one", reason: "again" }), /already extended 2 times/, "LIMIT");
+    const appended = chatter(board, 20);
+    expect(appended.find((m) => m.type === "claim.lapsed")).toMatchObject({ payload: { item: "one", reason: "deadline" } });
+    expect(board.state.items.one!.status).toBe("open");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("on a quiet board the operator records a stalled claim (no message count advances): refused while suspended or just progressed", () => {
+    const board = seeded({ claimLeaseMessages: 100 });
+    board.post(claim("a", "one", ["src/one.ts"]));
+    chatter(board, 1);
+    board.reject(msg("engine", "claim.lapsed", { item: "one", agent: "a" }), /a stalled claim record is \{item\}/, "BAD_PAYLOAD");
+    const appended = board.post(msg("engine", "claim.lapsed", { item: "one" }));
+    expect(appended[0]).toMatchObject({ from: "engine", type: "claim.lapsed", to: ["a"], payload: { item: "one", agent: "a", reason: "stalled" } });
+    expect(board.state.items.one!.status).toBe("open");
+    // A pushed claim waiting for the gate is never recorded stalled.
+    board.post(claim("b", "two", ["src/two.ts"]));
+    board.post(push("b", "two", "c2", ["src/two.ts"]));
+    chatter(board, 1, "c");
+    board.reject(msg("engine", "claim.lapsed", { item: "two" }), /its push waits for the gate/, "INVALID_STATE");
+    // Without lease rules there is nothing to record.
+    const plain = seeded();
+    plain.post(claim("a", "one", ["src/one.ts"]));
+    chatter(plain, 1);
+    plain.reject(msg("engine", "claim.lapsed", { item: "one" }), /no leased claim/, "INVALID_STATE");
+    // Replay accepts the recorded (stalled) lapse, never a forged derived one.
+    expect(reduceBoard(board.log)).toEqual(board.state);
+    const forged = board.log.map((m) => (m.type === "claim.lapsed" ? ({ ...m, payload: { ...m.payload, reason: "no-progress" } } as BoardMessage) : m));
+    expect(() => reduceBoard(forged)).toThrow(/was not produced by arbitration/);
+  });
+
+  it("a claim on a seam item is leased too: an absent owner never blocks importers forever", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", rules: { claimLeaseMessages: 4 }, seams: [{ path: "src/contracts.ts", importers: ["src/a.ts"] }] }));
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "feat", objective: "f", acceptance: [], scopeHint: ["src/a.ts"] }));
+    board.post(claim("a", "feat", ["src/a.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r0", gate: "fail", merged: [] }));
+    board.post(msg("a", "contract.proposed", { contract: "k", target: "src/contracts.ts", kind: "modify", item: "feat", description: "add a field" }));
+    board.post(msg("lead", "contract.accepted", { contract: "k" }));
+    expect(board.state.items["seam-k"]).toMatchObject({ status: "claimed", owner: "a" });
+    expect(board.state.items["seam-k"]!.lease).toBeDefined();
+    chatter(board, 6);
+    expect(board.state.items["seam-k"]!.status).toBe("open");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("the digest states the lease; boards without the rule never lapse and carry no lease", () => {
+    const leased = seeded({ claimLeaseMessages: 10 });
+    const granted = leased.post(claim("a", "one", ["src/one.ts"])).find((m) => m.type === "claim.granted")!;
+    expect(boardDigest(leased.state, leased.log, "a", 0).claims[0]!.lease).toMatchObject({ lastProgressSeq: granted.seq, lapsesAt: granted.seq + 10 });
+    const plain = seeded();
+    plain.post(claim("a", "one", ["src/one.ts"]));
+    chatter(plain, 30);
+    expect(plain.state.items.one).toMatchObject({ status: "claimed", owner: "a" });
+    expect(plain.state.items.one!.lease).toBeUndefined();
+    expect(boardDigest(plain.state, plain.log, "a", 0).claims[0]!.lease).toBeUndefined();
+    expect(plain.log.some((m) => m.type === "claim.lapsed")).toBe(false);
+  });
+});
+
+describe("every waiting item states why (derived from recorded state only)", () => {
+  it("open items: unclaimed, the claim cap, a lapsed lease, a spent fix budget", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", rules: { maxActiveClaims: 1, claimLeaseMessages: 3, maxFixAttempts: 1 } }));
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    for (const item of ["one", "two", "three"]) {
+      board.post(msg("lead", "item.proposed", { item, objective: `do ${item}`, acceptance: [], scopeHint: [`src/${item}/**`] }));
+    }
+    expect(itemWaitReason(board.state, "three")).toEqual({ kind: "unclaimed" });
+    board.post(claim("a", "one", ["src/one/**"]));
+    board.post(claim("b", "two", ["src/two/**"]));
+    // Both workers are at their cap: nobody can take three.
+    expect(itemWaitReason(board.state, "three")).toEqual({ kind: "held-by-claim-cap", agents: 2 });
+    expect(boardDigest(board.state, board.log, "a", 0).openItems.find((i) => i.item === "three")!.wait).toEqual({
+      reason: { kind: "held-by-claim-cap", agents: 2 },
+      line: "open, but all 2 agent(s) are at their claim cap",
+    });
+    // a pushes; the revision fails and spends one's single fix attempt on the second failure.
+    board.post(push("a", "one", "c1", ["src/one/x.ts"]));
+    expect(itemWaitReason(board.state, "one")).toEqual({ kind: "waiting-for-gate", commit: "c1" });
+    expect(describeWaitReason(itemWaitReason(board.state, "one")!)).toBe("push c1 waits for the gate");
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1"], failing: { output: "x", items: ["one"] } }));
+    expect(itemWaitReason(board.state, "one")).toBeUndefined(); // its holder fixes it next: moving
+    board.post(push("a", "one", "c2", ["src/one/x.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c2"], failing: { output: "x", items: ["one"] } }));
+    expect(board.state.items.one!.status).toBe("open");
+    expect(itemWaitReason(board.state, "one")).toEqual({ kind: "fix-budget-exhausted", by: ["a"] });
+    // b's claim on two lapses (no progress for the lease): open, saying so.
+    board.post(msg("a", "item.proposed", { item: "a-x", objective: "x", acceptance: [], scopeHint: ["docs/**"] }));
+    board.post(msg("a", "item.proposed", { item: "a-y", objective: "y", acceptance: [], scopeHint: ["docs/y/**"] }));
+    expect(itemWaitReason(board.state, "a-x")).toEqual({ kind: "waiting-for-lead" });
+    expect(board.state.items.two!.status).toBe("open");
+    expect(itemWaitReason(board.state, "two")).toMatchObject({ kind: "lease-lapsed", agent: "b", reason: "no-progress" });
+    expect(boardDigest(board.state, board.log, "a", 0).openItems.find((i) => i.item === "two")!.wait!.line).toMatch(/^b's claim lapsed \(no progress since seq \d+\): open to take$/);
+  });
+
+  it("held items: a human or the lead decides first, a contest blocks, a split waits on its children, seam first", () => {
+    const board = new TestBoard();
+    board.post(
+      msg("human", "goal.posted", {
+        objective: "o",
+        protected: ["tests/a.test.ts"],
+        seams: [{ path: "src/contracts.ts", importers: ["src/feat/a.ts"] }],
+      }),
+    );
+    for (const agent of ["a", "b", "c"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "tests", objective: "t", acceptance: [], scopeHint: ["src/t.ts", "tests/a.test.ts"] }));
+    board.post(msg("lead", "item.proposed", { item: "split-me", objective: "s", acceptance: [], scopeHint: ["src/s/**"] }));
+    board.post(msg("lead", "item.proposed", { item: "feat", objective: "f", acceptance: [], scopeHint: ["src/feat/a.ts"] }));
+    board.post(claim("a", "tests", ["src/t.ts"]));
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/a.test.ts", kind: "modify", item: "tests" }));
+    expect(itemWaitReason(board.state, "tests")).toEqual({ kind: "waiting-for-human", contract: "k1" });
+    // A contest: c's claim waits on b's item.
+    board.post(claim("b", "split-me", ["src/s/**"]));
+    board.post(msg("b", "item.split", { item: "split-me", children: [{ item: "s1", objective: "s1", scopeHint: ["src/s/1.ts"] }] }));
+    expect(itemWaitReason(board.state, "split-me")).toEqual({ kind: "blocked-by", item: "s1" });
+    board.post(claim("c", "feat", ["src/feat/a.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r0", gate: "fail", merged: [] }));
+    board.post(msg("c", "contract.proposed", { contract: "k2", target: "src/contracts.ts", kind: "modify", item: "feat", description: "add a field" }));
+    expect(itemWaitReason(board.state, "feat")).toEqual({ kind: "waiting-for-lead", contract: "k2" });
+    board.post(msg("lead", "contract.accepted", { contract: "k2" }));
+    // The seam item (granted to c) holds feat until its push is gated.
+    expect(itemWaitReason(board.state, "feat")).toEqual({ kind: "waiting-on-seam", item: "seam-k2", seams: ["src/contracts.ts"] });
+    expect(boardDigest(board.state, board.log, "c", 0).claims.find((x) => x.item === "feat")!.wait!.line).toBe("waits on the seam change seam-k2 (src/contracts.ts)");
+    expect(itemWaitReason(board.state, "nope")).toBeUndefined();
+  });
+});
+
+describe("re-plan an item instead of giving up (one bounded re-plan, then a human)", () => {
+  /** A board where item `one` spent its single fix attempt (a held, then reopened by exhaustion). */
+  function exhausted(): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", rules: { maxFixAttempts: 1 } }));
+    for (const agent of ["a", "b", "c"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "one", objective: "do one", acceptance: [], scopeHint: ["src/one/**"] }));
+    board.post(msg("lead", "item.proposed", { item: "two", objective: "do two", acceptance: [], scopeHint: ["src/two/**"] }));
+    board.post(claim("a", "one", ["src/one/**"]));
+    board.post(push("a", "one", "c1", ["src/one/x.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1"], failing: { output: "src/one/x.ts failed", items: ["one"] } }));
+    board.post(push("a", "one", "c2", ["src/one/x.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c2"], failing: { output: "src/one/y.ts failed", items: ["one"] } }));
+    return board;
+  }
+
+  it("the lead sees the item to re-plan with its failure attribution, and splits it: the children carry it to completion", () => {
+    const board = exhausted();
+    expect(board.state.items.one).toMatchObject({ status: "open", exhaustedBy: ["a"], failedRev: 2 });
+    expect(replanEligible(board.state, "one")).toBe("fix-budget-exhausted");
+    expect(boardDigest(board.state, board.log, "lead", 0).replan).toEqual([
+      expect.objectContaining({ item: "one", reason: "fix-budget-exhausted", rev: 2, scopeHint: ["src/one/**"], exhaustedBy: ["a"], neighbours: [expect.objectContaining({ item: "two" })] }),
+    ]);
+    expect(boardDigest(board.state, board.log, "a", 0).replan).toBeUndefined();
+    board.reject(msg("a", "item.replanned", { item: "one", reason: "fix-budget-exhausted", action: "split", children: [] }), /children must be a non-empty array/, "BAD_PAYLOAD");
+    board.reject(
+      msg("a", "item.replanned", { item: "one", reason: "fix-budget-exhausted", action: "rescope", children: [{ item: "one-r", objective: "o", scopeHint: ["src/one/**"] }] }),
+      /cannot be sent by an agent/,
+      "NOT_ALLOWED",
+    );
+    board.reject(
+      msg("lead", "item.replanned", { item: "one", reason: "stalled", action: "rescope", children: [{ item: "one-r", objective: "o", scopeHint: ["src/one/**"] }] }),
+      /re-planned for fix-budget-exhausted, not stalled/,
+      "LOG_MISMATCH",
+    );
+    board.reject(
+      msg("lead", "item.replanned", { item: "one", reason: "fix-budget-exhausted", action: "split", children: [{ item: "one-r", objective: "o", scopeHint: ["src/one/**"] }] }),
+      /at least two children/,
+      "BAD_PAYLOAD",
+    );
+    board.reject(msg("lead", "item.replanned", { item: "two", reason: "stalled", action: "rescope", children: [{ item: "two-r", objective: "o", scopeHint: ["src/two/**"] }] }), /only an open item whose fix budget was spent/, "INVALID_STATE");
+    board.post(
+      msg(
+        "lead",
+        "item.replanned",
+        {
+          item: "one",
+          reason: "fix-budget-exhausted",
+          action: "split",
+          rev: 2,
+          children: [
+            { item: "one-x", objective: "fix x", acceptance: ["x passes"], scopeHint: ["src/one/x.ts"] },
+            { item: "one-y", objective: "fix y", acceptance: ["y passes"], scopeHint: ["src/one/y.ts"] },
+          ],
+        },
+        { rationale: "revision 2 fails in y, which the item never touched" },
+      ),
+    );
+    expect(board.state.items.one).toMatchObject({ status: "split", children: ["one-x", "one-y"], replanned: { action: "split", reason: "fix-budget-exhausted", by: "lead" } });
+    expect(board.state.items["one-x"]).toMatchObject({ status: "open", parent: "one", replanOf: "one" });
+    expect(itemWaitReason(board.state, "one")).toEqual({ kind: "blocked-by", item: "one-x" });
+    // Re-planned once: never again.
+    board.reject(msg("lead", "item.replanned", { item: "one", reason: "fix-budget-exhausted", action: "rescope", children: [{ item: "one-z", objective: "o", scopeHint: ["src/one/**"] }] }), /only an open item/, "INVALID_STATE");
+    // The children integrate directly (no sub-lead) and the re-planned item completes with them.
+    board.post(claim("b", "one-x", ["src/one/x.ts"]));
+    board.post(claim("c", "one-y", ["src/one/y.ts"]));
+    complete(board, "b", "one-x", "cx", "src/one/x.ts");
+    const last = complete(board, "c", "one-y", "cy", "src/one/y.ts");
+    expect(last.filter((m) => m.type === "item.completed").map((m) => (m.payload as { item: string }).item)).toEqual(["one-y", "one"]);
+    expect(board.state.items.one!.status).toBe("done");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a merge replaces the item and an open neighbour with one item; both complete with it", () => {
+    const board = exhausted();
+    board.post(
+      msg("lead", "item.replanned", {
+        item: "one",
+        reason: "fix-budget-exhausted",
+        action: "merge",
+        with: "two",
+        children: [{ item: "one-two", objective: "do one and two together", acceptance: [], scopeHint: ["src/one/**", "src/two/**"] }],
+      }),
+    );
+    expect(board.state.items.two).toMatchObject({ status: "split", children: ["one-two"], replanned: { action: "merge", into: "one-two" } });
+    expect(board.state.items["one-two"]).toMatchObject({ replaces: ["one", "two"], parent: "one" });
+    board.post(claim("b", "one-two", ["src/one/**", "src/two/**"]));
+    const done = complete(board, "b", "one-two", "m1", "src/two/z.ts");
+    expect(done.filter((m) => m.type === "item.completed").map((m) => (m.payload as { item: string }).item)).toEqual(["one-two", "one", "two"]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("released for not moving twice makes an item re-plannable too (reason stalled)", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", rules: { claimLeaseMessages: 100 } }));
+    for (const agent of ["a", "b", "c"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "one", objective: "do one", acceptance: [], scopeHint: ["src/one/**"] }));
+    for (const agent of ["a", "b"]) {
+      board.post(claim(agent, "one", ["src/one/**"]));
+      board.post(msg("c", "item.proposed", { item: `c-${agent}`, objective: "x", acceptance: [], scopeHint: ["docs/**"] }));
+      board.post(msg("engine", "claim.lapsed", { item: "one" }));
+    }
+    expect(board.state.items.one!.stallReleases).toBe(2);
+    expect(replanEligible(board.state, "one")).toBe("stalled");
+    board.post(msg("lead", "item.replanned", { item: "one", reason: "stalled", action: "rescope", children: [{ item: "one-r", objective: "do one, smaller", acceptance: [], scopeHint: ["src/one/a.ts"] }] }));
+    expect(board.state.items["one-r"]).toMatchObject({ status: "open", replanOf: "one" });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a re-plan that fails again escalates to a human (an escalation record), and is never re-planned again", () => {
+    const board = exhausted();
+    board.post(msg("lead", "item.replanned", { item: "one", reason: "fix-budget-exhausted", action: "rescope", children: [{ item: "one-r", objective: "redo one", acceptance: [], scopeHint: ["src/one/**"] }] }));
+    board.post(claim("b", "one-r", ["src/one/**"]));
+    board.post(push("b", "one-r", "d1", ["src/one/x.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r3", gate: "fail", merged: ["d1"], failing: { output: "still", items: ["one-r"] } }));
+    board.post(push("b", "one-r", "d2", ["src/one/x.ts"]));
+    const appended = board.post(msg("engine", "integrated.rev", { commit: "r4", gate: "fail", merged: ["d2"], failing: { output: "still", items: ["one-r"] } }));
+    expect(appended.map((m) => m.type)).toEqual(["integrated.rev", "fix.exhausted", "item.reopened", "item.escalated"]);
+    expect(appended.at(-1)!.payload).toEqual({ item: "one-r", reason: "replan-failed", replanOf: "one" });
+    expect(replanEligible(board.state, "one-r")).toBeUndefined();
+    board.reject(msg("lead", "item.replanned", { item: "one-r", reason: "fix-budget-exhausted", action: "rescope", children: [{ item: "one-rr", objective: "o", scopeHint: ["src/one/**"] }] }), /a second failure escalates to a human/, "NOT_ALLOWED");
+    const raised = applyBoardEscalations([], appended, 0);
+    expect(raised.raised).toEqual([expect.objectContaining({ kind: "decision", boardItem: "one-r", status: "pending", options: ["acknowledge"] })]);
+    // Another agent finishes it: the escalation closes as completed.
+    board.post(claim("c", "one-r", ["src/one/**"]));
+    const done = complete(board, "c", "one-r", "d3", "src/one/x.ts");
+    expect(applyBoardEscalations(raised.list, done, 1).list[0]).toMatchObject({ status: "resolved", decision: "completed" });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("overlap check at claim time (advisory; a shared seam goes through its contract)", () => {
+  function overlapping(rules: Record<string, unknown> = { claimOverlap: true }): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", rules, seams: [{ path: "src/shared/ctx.ts", importers: ["src/a/x.ts"] }] }));
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "one", objective: "o", acceptance: [], scopeHint: ["src/a/**", "src/shared/**"] }));
+    board.post(msg("lead", "item.proposed", { item: "two", objective: "t", acceptance: [], scopeHint: ["src/b/**", "src/shared/**"] }));
+    board.post(msg("lead", "item.proposed", { item: "three", objective: "th", acceptance: [], scopeHint: ["src/c/**"] }));
+    return board;
+  }
+
+  it("a claim whose item scope overlaps another holder's is granted and recorded for both, never refused", () => {
+    const board = overlapping();
+    board.post(claim("a", "one", ["src/a/**"]));
+    expect(boardDigest(board.state, board.log, "b", 0).openItems.find((i) => i.item === "two")!.overlapsClaimed).toEqual(["one"]);
+    expect(boardDigest(board.state, board.log, "b", 0).openItems.find((i) => i.item === "three")!.overlapsClaimed).toBeUndefined();
+    const appended = board.post(claim("b", "two", ["src/b/**"]));
+    expect(appended.map((m) => m.type)).toEqual(["item.claimed", "claim.granted", "claim.overlap"]);
+    expect(appended[2]).toMatchObject({ from: "engine", to: ["b", "a"], payload: { item: "two", agent: "b", with: "one", withAgent: "a", files: ["src/shared/**"] } });
+    // Both digests say so.
+    expect(boardDigest(board.state, board.log, "a", 0).claims[0]!.overlaps).toEqual([expect.objectContaining({ item: "two", agent: "b", files: ["src/shared/**"] })]);
+    expect(boardDigest(board.state, board.log, "b", 0).claims[0]!.overlaps![0]!.hint).toMatch(/a holds one, whose scope overlaps yours on src\/shared\/\*\*: coordinate/);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a claim writing a shared seam another holder's scope covers is refused, pointing at the seam route", () => {
+    const board = overlapping();
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.reject(claim("b", "two", ["src/b/**", "src/shared/ctx.ts"]), /both touch the shared seam src\/shared\/ctx\.ts: .*propose a seam contract/, "SEAM_OVERLAP");
+    // Without the rule (a board posted before it) nothing changes.
+    const plain = overlapping({});
+    plain.post(claim("a", "one", ["src/a/**"]));
+    expect(plain.types(claim("b", "two", ["src/b/**", "src/shared/ctx.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+    expect(boardDigest(plain.state, plain.log, "b", 0).claims[0]!.overlaps).toBeUndefined();
+  });
+});
+
+describe("clash alerts from real code (recorded predictions, advisory)", () => {
+  function pushed(): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", seams: [{ path: "src/shared/ctx.ts", importers: ["src/a/x.ts"] }] }));
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "one", objective: "o", acceptance: [], scopeHint: ["src/a/**", "src/shared/ctx.ts"] }));
+    board.post(msg("lead", "item.proposed", { item: "two", objective: "t", acceptance: [], scopeHint: ["src/b/**", "src/common.ts"] }));
+    board.post(claim("a", "one", ["src/a/**", "src/shared/ctx.ts"]));
+    board.post(claim("b", "two", ["src/b/**", "src/common.ts"]));
+    board.post(push("a", "one", "aaa1", ["src/a/x.ts"]));
+    board.post(push("b", "two", "bbb1", ["src/b/y.ts"]));
+    return board;
+  }
+  const record = (payload: Record<string, unknown>) => msg("engine", "clash.predicted", payload);
+  const heads = { a: { agent: "a", item: "one", sha: "aaa1" }, b: { agent: "b", item: "two", sha: "bbb1" } };
+
+  it("a conflict between two pending pushes is recorded once, addressed to both, with each digest's cue", () => {
+    const board = pushed();
+    const appended = board.post(record({ ...heads, status: "conflict", paths: ["src/common.ts"], scope: "local" }));
+    expect(appended).toHaveLength(1);
+    expect(appended[0]).toMatchObject({ from: "engine", type: "clash.predicted", to: ["a", "b"] });
+    board.reject(record({ a: heads.b, b: heads.a, status: "unknown", reason: "timeout" }), /already predicted/, "DUPLICATE");
+    // b claimed later: it rebases.
+    expect(boardDigest(board.state, board.log, "b", 0).claims[0]!.clashes).toEqual([
+      expect.objectContaining({ item: "one", agent: "a", status: "conflict", paths: ["src/common.ts"], scope: "local", hint: expect.stringMatching(/you claimed later, so rebase onto its push/) }),
+    ]);
+    expect(boardDigest(board.state, board.log, "a", 0).claims[0]!.clashes![0]!.hint).toMatch(/it claimed later and rebases onto yours/);
+    // A new push supersedes the prediction: the cue is gone.
+    board.post(push("b", "two", "bbb2", ["src/b/y.ts"]));
+    expect(boardDigest(board.state, board.log, "b", 0).claims[0]!.clashes).toBeUndefined();
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a shared-seam conflict points at the seam contract; the scope must match the board's seams", () => {
+    const board = pushed();
+    board.reject(record({ ...heads, status: "conflict", paths: ["src/shared/ctx.ts"], scope: "local" }), /scoped shared/, "LOG_MISMATCH");
+    board.post(record({ ...heads, status: "conflict", paths: ["src/shared/ctx.ts"], scope: "shared" }));
+    expect(boardDigest(board.state, board.log, "a", 0).claims[0]!.clashes![0]!.hint).toMatch(/shared seam src\/shared\/ctx\.ts: propose or consult the seam contract/);
+  });
+
+  it("an undecided or unavailable prediction is recorded as such, never as clean; only pending pushes", () => {
+    const board = pushed();
+    board.reject(record({ ...heads, status: "unknown" }), /says why/, "BAD_PAYLOAD");
+    board.reject(record({ ...heads, status: "clean" }), /status must be one of conflict, unknown, unavailable/, "BAD_PAYLOAD");
+    board.post(record({ ...heads, status: "unavailable", reason: "git older than 2.38: merge-tree --write-tree unavailable" }));
+    expect(boardDigest(board.state, board.log, "a", 0).claims[0]!.clashes![0]).toMatchObject({ status: "unavailable", hint: expect.stringMatching(/could not be decided/) });
+    board.post(rev("pass", ["aaa1"], "r1"));
+    board.post(push("b", "two", "bbb3", ["src/b/y.ts"]));
+    board.post(push("a", "one", "aaa2", ["src/a/x.ts"]));
+    board.reject(record({ a: { agent: "a", item: "one", sha: "aaa1" }, b: { agent: "b", item: "two", sha: "bbb3" }, status: "unknown", reason: "x" }), /not a's pending push/, "INVALID_STATE");
+  });
+});
+
+describe("trunk-moved and stale checks", () => {
+  function based(): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", baseline: "base0" }));
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    for (const item of ["one", "two"]) {
+      board.post(msg("lead", "item.proposed", { item, objective: item, acceptance: [], scopeHint: [`src/${item}/**`] }));
+    }
+    board.post(claim("a", "one", ["src/one/**"]));
+    board.post(claim("b", "two", ["src/two/**"]));
+    return board;
+  }
+
+  it("a revision names the base it was built on; one built on anything but the integrated head is refused (STALE_BASE)", () => {
+    const board = based();
+    expect(board.state.baseline).toBe("base0");
+    board.post(push("a", "one", "c1", ["src/one/x.ts"]));
+    board.reject(msg("engine", "integrated.rev", { commit: "r1", gate: "pass", merged: ["c1"], base: "elsewhere" }), /built on elsewhere, but the board's integrated head is base0 \(the baseline\)/, "STALE_BASE");
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "pass", merged: ["c1"], base: "base0" }));
+    expect(board.log.find((m) => m.type === "integrated.rev")!.payload).toMatchObject({ base: "base0" });
+    // The next one is built on revision 1's commit, never the baseline again.
+    board.post(push("b", "two", "c2", ["src/two/y.ts"]));
+    board.reject(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c2"], base: "base0" }), /integrated head is r1 \(revision 1\)/, "STALE_BASE");
+    board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c2"], base: "r1" }));
+    // A failing revision does not move the head.
+    board.post(push("b", "two", "c3", ["src/two/y.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r3", gate: "pass", merged: ["c3"], base: "r1" }));
+    // A revision without a base (a board before the rule, or the cloud Workflow) is still recorded.
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a trunk that moved after a passing revision is recorded once, only for the latest passing revision", () => {
+    const board = based();
+    board.post(push("a", "one", "c1", ["src/one/x.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "pass", merged: ["c1"], base: "base0" }));
+    board.reject(msg("engine", "trunk.moved", { rev: 2, commit: "r1" }), /is not the board's latest passing revision/, "INVALID_STATE");
+    board.post(msg("engine", "trunk.moved", { rev: 1, commit: "r1", expected: "base0", actual: "zzz" }));
+    expect(board.state.trunkMoved).toEqual([1]);
+    board.reject(msg("engine", "trunk.moved", { rev: 1, commit: "r1" }), /already recorded/, "DUPLICATE");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a help fork whose head is not the requester's push is recorded on the offer and takes no grant", () => {
+    const board = based();
+    board.post(push("a", "one", "c1", ["src/one/x.ts"]));
+    board.post(msg("a", "help.requested", { request: "h1", item: "one", need: "hands", scope: ["src/one/z.ts"] }));
+    board.reject(msg("b", "help.offered", { request: "h1", forkOf: "a", baseMismatch: { expected: "c1", realized: "c1" } }), /two different heads/, "BAD_PAYLOAD");
+    board.post(msg("b", "help.offered", { request: "h1", forkOf: "a", fork: "chg--help-h1", baseMismatch: { expected: "c1", realized: "base0" } }));
+    expect(board.state.help.h1!.grant).toBeUndefined();
+    expect(board.state.help.h1!.forkMismatches).toEqual([{ agent: "b", seq: board.state.lastSeq, expected: "c1", realized: "base0" }]);
+    expect(boardDigest(board.state, board.log, "a", 0).help!.mine[0]!.forkMismatches).toEqual([{ agent: "b", expected: "c1", realized: "base0" }]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("token refreshes are recorded, never the token", () => {
+  it("records a refresh for a joined agent's repo or its granted fork; refuses a token-shaped field or a stranger", () => {
+    const board = seeded();
+    board.post(msg("engine", "token.refreshed", { agent: "a", kind: "repo-write" }));
+    expect(board.state.tokenRefreshes).toBe(1);
+    board.reject(msg("engine", "token.refreshed", { agent: "a", kind: "repo-write", token: "secret" }), /never a token/, "BAD_PAYLOAD");
+    board.reject(msg("engine", "token.refreshed", { agent: "zed", kind: "repo-write" }), /not a joined agent/, "UNKNOWN_AGENT");
+    board.reject(msg("engine", "token.refreshed", { agent: "b", kind: "help-fork", request: "nope" }), /holds no granted help fork/, "NOT_ALLOWED");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("promotion is recorded on the board", () => {
+  it("only the latest passing revision is recorded promoted, with its own gated commit, once", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", gateCommand: ["npm", "run", "gate"] }));
+    expect(board.state.gateCommand).toEqual(["npm", "run", "gate"]);
+    board.post(msg("a", "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "one", objective: "o", acceptance: [], scopeHint: ["src/**"] }));
+    board.post(claim("a", "one", ["src/**"]));
+    board.post(push("a", "one", "c1", ["src/x.ts"]));
+    board.reject(msg("engine", "revision.promoted", { rev: 1, gatedCommit: "r1", commit: "p1", branch: "b" }), /not the board's latest revision, passing/, "INVALID_STATE");
+    board.post(rev("pass", ["c1"], "r1"));
+    board.reject(msg("engine", "revision.promoted", { rev: 1, gatedCommit: "other", commit: "p1", branch: "b" }), /is not revision 1's r1: gate-equals-deploy/, "LOG_MISMATCH");
+    board.post(msg("engine", "revision.promoted", { rev: 1, gatedCommit: "r1", commit: "p1", branch: "switchyard/change-1" }));
+    expect(board.state.promoted).toMatchObject({ rev: 1, gatedCommit: "r1", commit: "p1", branch: "switchyard/change-1" });
+    board.reject(msg("engine", "revision.promoted", { rev: 1, gatedCommit: "r1", commit: "p1", branch: "b" }), /already recorded promoted/, "DUPLICATE");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("run caps are recorded once each", () => {
+  it("records a run cap or an item's cap once; refuses a repeat and an unknown item", () => {
+    const board = seeded();
+    board.post(msg("engine", "run.capped", { kind: "model-calls", limit: 100, used: 100 }));
+    board.reject(msg("engine", "run.capped", { kind: "model-calls", limit: 100, used: 101 }), /already recorded/, "DUPLICATE");
+    board.post(msg("engine", "run.capped", { kind: "item-calls", limit: 10, used: 11, item: "one" }));
+    board.reject(msg("engine", "run.capped", { kind: "item-calls", limit: 10, used: 11, item: "nope" }), /unknown item/, "UNKNOWN_REF");
+    expect(board.state.capped).toEqual([
+      expect.objectContaining({ kind: "model-calls", limit: 100, used: 100 }),
+      expect.objectContaining({ kind: "item-calls", item: "one" }),
+    ]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
   });
 });

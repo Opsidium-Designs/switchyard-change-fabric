@@ -99,12 +99,19 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
   const announced = new Map<string, { commit: string; seq: number }[]>();
   const passingMerged = new Set<string>();
   const handedOff = new Map<string, Set<string>>();
+  // Each agent's own announced paths per item: an item it no longer holds
+  // (handed off, reopened, lapsed, re-planned) leaves work in its repo that is
+  // not its to apply any more.
+  const pushedPaths = new Map<string, Map<string, Set<string>>>();
   // A sub-lead's push carries its children's commits: when a passing revision
   // merges it, those child commits are merged too (for their authors' diff base).
   const mergesOf = new Map<string, readonly { item: string; commit: string }[]>();
   for (const m of messages) {
     if (m.type === "push.announced") {
       announced.set(m.from, [...(announced.get(m.from) ?? []), { commit: m.payload.commit, seq: m.seq }]);
+      const byItem = pushedPaths.get(m.from) ?? new Map<string, Set<string>>();
+      byItem.set(m.payload.item, new Set([...(byItem.get(m.payload.item) ?? []), ...m.payload.paths]));
+      pushedPaths.set(m.from, byItem);
       if (m.payload.merges !== undefined) {
         mergesOf.set(m.payload.commit, m.payload.merges);
       }
@@ -141,10 +148,18 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
           [...(i.intent?.write ?? []).map(intentPath), ...releasedTargets(state, i.id).filter((t) => !(state.immutable ?? []).includes(t))];
     const scope = [...new Set(mine.flatMap(writeOf))].sort();
     // Items this agent handed to someone else: their files are not its to apply.
-    const yieldedScope = [...(handedOff.get(agent) ?? [])]
-      .map((id) => state.items[id])
-      .flatMap((item) => (item ? [...(item.intent?.write ?? []).map(intentPath), ...(item.lastPush?.paths ?? [])] : []))
-      .filter((entry) => !scope.some((own) => entriesOverlap(entry, own)));
+    // Nor are the files it pushed for an item it no longer holds (its claim was
+    // reopened, lapsed, or re-planned): that work stays in its repo, unapplied.
+    const lost = [...(pushedPaths.get(agent) ?? [])].filter(([id]) => {
+      const item = state.items[id];
+      return item !== undefined && item.owner !== agent && item.subLead !== agent;
+    });
+    const yieldedScope = [
+      ...[...(handedOff.get(agent) ?? [])]
+        .map((id) => state.items[id])
+        .flatMap((item) => (item ? [...(item.intent?.write ?? []).map(intentPath), ...(item.lastPush?.paths ?? [])] : [])),
+      ...lost.flatMap(([, paths]) => [...paths]),
+    ].filter((entry) => !scope.some((own) => entriesOverlap(entry, own)));
     // Contract paths released for the items this unit integrates, including the
     // children a sub-lead's push merges (their accepted changes ship through it).
     const released = [

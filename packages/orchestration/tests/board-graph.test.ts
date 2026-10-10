@@ -389,3 +389,23 @@ describe("formation: split hulls nested with the sub-lead on the border, and for
     }
   });
 });
+
+describe("wait reasons on item cards (derived from the folded board)", () => {
+  it("every non-moving item card states one short reason; a moving or finished one states none", () => {
+    for (const node of full.nodes.filter((n) => n.kind === "item")) {
+      if (node.detail.kind !== "item") continue;
+      const d = node.detail;
+      if (d.status === "done") {
+        expect(d.wait).toBeUndefined();
+      }
+      if (d.status === "open") {
+        expect(d.wait?.line).toMatch(/open|lapsed|cap|seam|fix budget/);
+      }
+      if (d.wait !== undefined) {
+        expect(node.tooltip).toContain(`(${d.wait.line})`);
+      }
+    }
+    // At the head of the fixture some item is waiting on something stated.
+    expect(full.nodes.some((n) => n.detail.kind === "item" && n.detail.wait !== undefined)).toBe(true);
+  });
+});

@@ -40,6 +40,9 @@
 import {
   contractTriageRecommendation,
   describeProgress,
+  describeWaitReason,
+  itemWaitReason,
+  liveClashes,
   progressHeadline,
   foldBoard,
   toolItemId,
@@ -51,6 +54,7 @@ import {
   type BoardRules,
   type BoardState,
   type BoardTestInventory,
+  type BoardWaitReason,
 } from "@switchyard-change/change-core";
 
 // ---------------------------------------------------------------------------
@@ -137,6 +141,10 @@ export interface ItemNodeDetail {
   /** The agents drawn in this item's hull at K (owner first, then claimants). */
   readonly agents: readonly string[];
   readonly lastPush?: { readonly seq: number; readonly commit: string; readonly agent: string; readonly integratedIn?: number };
+  /** Why it is not moving, derived from the folded board (one short line per card), when it is not. */
+  readonly wait?: { readonly kind: BoardWaitReason["kind"]; readonly line: string };
+  /** Recorded clash predictions still about its pending push (advisory). */
+  readonly clashes?: readonly { readonly with: string; readonly status: string; readonly scope?: "shared" | "local"; readonly seq: number }[];
 }
 
 export interface RevNodeDetail {
@@ -375,6 +383,8 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     case "handoff":
     case "item.struggling":
     case "seam.stalled":
+    case "item.replanned":
+    case "item.escalated":
       return "item";
     case "item.claimed":
     case "claim.granted":
@@ -382,6 +392,9 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     case "claim.kept":
     case "claim.narrowed":
     case "claim.resolved":
+    case "claim.lapsed":
+    case "claim.extended":
+    case "claim.overlap":
       return "claim";
     case "claim.contested":
     case "claim.escalated":
@@ -389,6 +402,9 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     case "push.announced":
     case "integrated.rev":
     case "rebase.needed":
+    case "clash.predicted":
+    case "trunk.moved":
+    case "revision.promoted":
     case "fix.requested":
     case "fix.exhausted":
       return "rev";
@@ -472,10 +488,19 @@ export function messageItems(message: BoardMessage, state?: BoardState): string[
   if (typeof payload.ownerItem === "string" && payload.ownerItem !== payload.item) {
     out.push(payload.ownerItem);
   }
-  if (isType(message, "item.split")) {
+  if (isType(message, "item.split") || isType(message, "item.replanned")) {
     for (const child of message.payload.children) {
       out.push(child.item);
     }
+  }
+  if (isType(message, "item.replanned") && message.payload.with !== undefined) {
+    out.push(message.payload.with);
+  }
+  if (isType(message, "item.escalated")) {
+    out.push(message.payload.replanOf);
+  }
+  if (isType(message, "clash.predicted")) {
+    out.push(message.payload.a.item, message.payload.b.item);
   }
   if (isType(message, "integrated.rev") && message.payload.failing) {
     out.push(...message.payload.failing.items);
@@ -623,7 +648,8 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
       if (!itemOrigin.has(m.payload.item)) {
         itemOrigin.set(m.payload.item, m);
       }
-    } else if (isType(m, "item.split")) {
+    } else if (isType(m, "item.split") || isType(m, "item.replanned")) {
+      // A split's children, or a re-plan's replacements, are created by it.
       for (const child of m.payload.children) {
         if (!itemOrigin.has(child.item)) {
           itemOrigin.set(child.item, m);
@@ -664,6 +690,7 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
     const volunteers = Object.values(state.volunteers ?? {}).filter((v) => v.item === item.id);
     if (item.triage) seqs.add(item.triage.seq);
     const status = contestedItems.has(item.id) && item.status !== "done" ? "contested" : item.status;
+    const waitReason = itemWaitReason(state, item.id);
     const ownerText = item.owner !== undefined ? `, owner ${item.owner}` : "";
     const doneText =
       item.status === "done"
@@ -683,7 +710,7 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
       label: item.id,
       status,
       seqs: [...seqs].sort((a, b) => a - b),
-      tooltip: `item ${item.id}: ${item.objective} [${status}${ownerText}${doneText}] ${backingSuffix(origin)}`,
+      tooltip: `item ${item.id}: ${item.objective} [${status}${ownerText}${doneText}]${waitReason ? ` (${describeWaitReason(waitReason)})` : ""} ${backingSuffix(origin)}`,
       detail: {
         kind: "item",
         item: item.id,
@@ -721,6 +748,13 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
               },
             }
           : {}),
+        ...(waitReason ? { wait: { kind: waitReason.kind, line: describeWaitReason(waitReason) } } : {}),
+        ...((): { clashes?: { with: string; status: string; scope?: "shared" | "local"; seq: number }[] } => {
+          const live = liveClashes(state, item.id);
+          return live.length > 0
+            ? { clashes: live.map((c) => ({ with: c.a.item === item.id ? c.b.item : c.a.item, status: c.status, ...(c.scope !== undefined ? { scope: c.scope } : {}), seq: c.seq })) }
+            : {};
+        })(),
       },
     });
     // goal -> item, or parent -> child (dependency, backed by the creating message).
@@ -1350,7 +1384,7 @@ const NODE_BACKING_TYPES: Record<BoardGraphNodeKind, readonly BoardMessageType[]
   goal: ["goal.posted"],
   lead: ["agent.joined"],
   agent: ["agent.joined"],
-  item: ["item.proposed", "item.discovered", "item.split", "tool.proposed"],
+  item: ["item.proposed", "item.discovered", "item.split", "item.replanned", "tool.proposed"],
   rev: ["integrated.rev"],
   tool: ["tool.proposed", "tool.published"],
   jev: ["decision.recorded"],
@@ -1555,7 +1589,7 @@ export function boardLayout(log: readonly BoardMessage[]): BoardLayout {
   const parentOf = new Map<string, string>();
   for (const m of log) {
     if (isType(m, "item.proposed") || isType(m, "item.discovered")) addItem(m.payload.item);
-    else if (isType(m, "item.split")) {
+    else if (isType(m, "item.split") || isType(m, "item.replanned")) {
       m.payload.children.forEach((c) => {
         addItem(c.item);
         if (!parentOf.has(c.item)) {

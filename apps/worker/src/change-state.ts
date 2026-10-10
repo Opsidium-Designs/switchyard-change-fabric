@@ -4,6 +4,7 @@ import {
   appendBoardMessage,
   appendDecisionRecorded,
   appendSeamStalled,
+  appendEngineRecord,
   appendDiscoveredUnits,
   appendIntegratedRev,
   appendToolGated,
@@ -868,6 +869,8 @@ export interface Escalation {
    * accept or reject to the board.
    */
   readonly boardContract?: string;
+  /** A re-planned board item that failed again: the human is told (closed when the item completes). */
+  readonly boardItem?: string;
   /** The human-readable question the engine needs answered. */
   readonly question: string;
   /** The candidate answers the human may choose among (advisory, not enforced). */
@@ -1321,6 +1324,14 @@ export class ChangeState extends DurableObject<Env> {
    */
   async recordSeamStalled(input: unknown): Promise<BoardAppendResponse> {
     return this.boardOutcome(() => this.appendToBoard((state) => appendSeamStalled(state, input, new Date().toISOString())));
+  }
+
+  /**
+   * Record an engine fact only the operator side observes (the engine-record
+   * route, `{type, payload}`): validated against the board, then appended.
+   */
+  async recordEngine(input: unknown): Promise<BoardAppendResponse> {
+    return this.boardOutcome(() => this.appendToBoard((state) => appendEngineRecord(state, input, new Date().toISOString())));
   }
 
   /**

@@ -327,7 +327,7 @@ describe("the lead", () => {
     const token = w.ok ? w.token : "";
     await env.rawPost(token, { type: "contract.proposed", payload: { contract: "k1", target: "src/shared.ts", kind: "modify" } });
     expect(await lead.step()).toBe("acted");
-    expect(calls[0]!.allowed).toEqual(["decide_contract", "decide_item", "propose_item", "message", "wait"]);
+    expect(calls[0]!.allowed).toEqual(["decide_contract", "decide_item", "extend_claim", "replan_item", "propose_item", "message", "wait"]);
     expect(calls[0]!.board.pendingContracts).toEqual([{ contract: "k1", target: "src/shared.ts", kind: "modify", proposedBy: "w9" }]);
     expect((await env.log()).messages.find((m) => m.type === "contract.accepted")).toMatchObject({ from: "lead", payload: { contract: "k1" } });
   });
@@ -767,3 +767,42 @@ describe("day-2 review regressions", () => {
   });
 });
 
+
+describe("help forks that did not start where the requester is", () => {
+  it("a fork response with a base mismatch is recorded on help.offered (no grant taken), never silently used", async () => {
+    const env = await setup();
+    const requester = await env.operator.join("w2", { role: "worker", workspaceTtlSeconds: 600 });
+    expect(requester.ok).toBe(true);
+    const token = requester.ok ? requester.token : "";
+    const gitUrl = requester.ok && requester.workspace ? requester.workspace.gitUrl : "";
+    expect((await env.rawPost(token, { type: "item.claimed", payload: { item: "i2", intent: { write: ["src/b/**"] } } })).status).toBe(201);
+    expect((await env.rawPost(token, { type: "help.requested", payload: { request: "h1", item: "i2", need: "hands", scope: ["src/b/y.ts"] } })).status).toBe(201);
+    const transport = scripted([{ type: "message", kind: "reply", payload: { requestId: "h1" }, rationale: "taking it" }]);
+    const helper = env.agent("w1", {
+      transport,
+      // The operator's fork read back a head that is not the requester's state.
+      forkForHelp: async () => ({
+        ok: true,
+        forkOf: "w2",
+        workspaceId: "f1",
+        workspaceName: `${ID}--help-h1`,
+        gitUrl,
+        defaultBranch: "main",
+        backend: "local-filesystem",
+        fallback: false,
+        tokenId: "t1",
+        token: "fork-token-123456",
+        tokenExpiresAt: "2026-01-01T01:00:00.000Z",
+        baseMismatch: { expected: "aaaaaaa", realized: "bbbbbbb" },
+      }),
+    });
+    await helper.join();
+    expect(await helper.step()).toBe("acted");
+    const offer = (await env.log()).messages.find((m) => m.type === "help.offered")!;
+    expect(offer).toMatchObject({ from: "w1", payload: { request: "h1", forkOf: "w2", baseMismatch: { expected: "aaaaaaa", realized: "bbbbbbb" } } });
+    expect(offer.rationale).toMatch(/started at bbbbbbb, not at its push aaaaaaa/);
+    const state = (await env.log()).state;
+    expect(state.help.h1!.grant).toBeUndefined();
+    expect(state.help.h1!.forkMismatches).toEqual([expect.objectContaining({ agent: "w1", expected: "aaaaaaa", realized: "bbbbbbb" })]);
+  });
+});

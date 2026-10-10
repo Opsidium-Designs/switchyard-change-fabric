@@ -6,6 +6,16 @@
  * The policy reads only what a live model reads (the agent's digest, its own
  * past decisions, the public board facts, and the repo listing) and applies
  * generic rules, in priority order:
+ *   0. the lead extends a claim near its firm deadline whose holder is
+ *      progressing (digest.deadlines), and lets a stalled one lapse; it
+ *      RE-PLANS an item that is not getting done (board.replan) once: when the
+ *      failure names files outside its scope that no outstanding item covers
+ *      it re-scopes it to cover them; when its scope spans several files and
+ *      the failure names some, it splits it (one child per failing file, the
+ *      rest per directory or file); otherwise fresh eyes go first, and once
+ *      they spent the budget too (or the item stopped moving twice) a
+ *      single-file item merges with an open neighbour in its directory, else
+ *      it is re-scoped to the failing tests;
  *   1. the lead decides pending contracts (accept unless the target overlaps a
  *      write intent held by someone other than the proposer; a seam contract
  *      is also rejected when it duplicates another live seam change or the
@@ -23,7 +33,8 @@
  *      a fix whose type error needs a frozen shared seam proposes a seam
  *      contract instead (the lead accepts it unless someone holds the seam),
  *      and the proposer claims the seam item it became first;
- *   6. while free, claim the first open item it has not been refused, with the
+ *   6. while free, claim the first open item it has not been refused (seam
+ *      items first, then items whose scope overlaps no other holder's), with the
  *      item's scope hint as the write intent; a claim refused because it
  *      touches the contract (existing tests, gate config) proposes a contract
  *      change per protected entry, waits for the decision, and claims again;
@@ -507,12 +518,123 @@ function toolAction(input: Input, stage: "held" | "free"): AgentAction | undefin
   return undefined;
 }
 
-function decide(input: Input): AgentAction {
+/** The directory of a path ("." at the root). */
+function dirOf(path: string): string {
+  return path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : ".";
+}
+
+/**
+ * The lead's one re-plan of an item that is not getting done (board.replan),
+ * from its failure attribution, or undefined when nothing is due. Generic:
+ * files and test lines come from the gate's own output and the repo listing.
+ */
+function replanAction(input: Input): AgentAction | undefined {
+  const d = input.digest;
+  for (const cue of input.board.replan ?? []) {
+    if (input.capsule.decisions.some((h) => h.action.type === "replan_item" && h.action.itemId === cue.item)) {
+      continue;
+    }
+    const unprotected = (f: string) => !d.protected.some((p) => entryWithin(f, p) || f === p);
+    const inScope = (f: string) => cue.scopeHint.some((h) => entryWithin(f, intentPath(h)));
+    const objective = cue.objective.split(" (claim this item now")[0]!;
+    const evidence = cue.rev !== undefined ? `revision ${cue.rev}` : "its latest failing revision";
+    const acceptance = ["the change gate passes on an integrated revision that merges this item's push"];
+    // The failure names files no outstanding item covers: widen it to them.
+    const outside = cue.failingFiles.filter(
+      (f) => !inScope(f) && unprotected(f) && !coveredByOutstanding(f, input.board.items ?? [], input.board.pendingItems ?? []),
+    );
+    if (outside.length > 0) {
+      return {
+        type: "replan_item",
+        itemId: cue.item,
+        plan: "rescope",
+        children: [{ objective: `${objective} (re-scoped: ${evidence} fails in ${outside.join(", ")})`.slice(0, 500), acceptance, scopeHint: [...cue.scopeHint, ...outside].slice(0, 64) }],
+        rationale: `${cue.item} ${cue.reason === "stalled" ? "stopped moving twice" : "spent its fix budget"}; ${evidence} fails in ${outside.join(", ")}, outside its scope`,
+      };
+    }
+    // Several files, and the failure names some of them: one child per failing file, the rest by directory (or file).
+    const files = input.repo.files.filter((f) => inScope(f) && unprotected(f));
+    const failing = cue.failingFiles.filter((f) => files.includes(f));
+    if (files.length >= 2 && failing.length > 0) {
+      const rest = files.filter((f) => !failing.includes(f));
+      const children = [
+        ...failing.map((f) => ({ objective: `${objective}: make ${f} pass ${evidence}`.slice(0, 500), acceptance, scopeHint: [f] })),
+        ...(rest.length > 0 ? splitChildren(objective, rest) : []),
+      ].slice(0, 32);
+      if (children.length >= 2) {
+        return {
+          type: "replan_item",
+          itemId: cue.item,
+          plan: "split",
+          children,
+          rationale: `${cue.item} spans ${files.length} files and ${evidence} fails in ${failing.join(", ")}: smaller items other agents can take`,
+        };
+      }
+    }
+    // Nothing in the evidence calls for a different plan: fresh eyes go first,
+    // and only once they also spent the budget (or it stopped moving) does the
+    // lead re-plan it anyway.
+    if (cue.reason === "fix-budget-exhausted" && cue.exhaustedBy.length < 2) {
+      continue;
+    }
+    // A single file: merge with an open neighbour in the same directory, when there is one.
+    const dirs = new Set(files.map(dirOf));
+    const neighbour = cue.neighbours.find((n) => input.repo.files.some((f) => dirs.has(dirOf(f)) && n.scopeHint.some((h) => entryWithin(f, intentPath(h)))));
+    if (neighbour) {
+      return {
+        type: "replan_item",
+        itemId: cue.item,
+        plan: "merge",
+        withItemId: neighbour.item,
+        children: [{ objective: `${objective}; and ${neighbour.objective}`.slice(0, 500), acceptance, scopeHint: [...new Set([...cue.scopeHint, ...neighbour.scopeHint])].slice(0, 64) }],
+        rationale: `${cue.item} and ${neighbour.item} touch the same directory: one owner does both`,
+      };
+    }
+    return {
+      type: "replan_item",
+      itemId: cue.item,
+      plan: "rescope",
+      children: [
+        {
+          objective: `${objective} (re-planned: make ${cue.failingTests.length > 0 ? cue.failingTests.slice(0, 2).join("; ") : `${evidence}'s failures`} pass)`.slice(0, 500),
+          acceptance,
+          scopeHint: [...cue.scopeHint],
+        },
+      ],
+      rationale: `${cue.item} ${cue.reason === "stalled" ? "stopped moving twice" : "spent its fix budget twice"}: a fresh item focused on the failing tests`,
+    };
+  }
+  return undefined;
+}
+
+/** Options for the generic policy. */
+export interface GenericBoardPolicyOptions {
+  /** Prefer open items whose scope overlaps no other holder's (default true). */
+  readonly preferNonOverlapping?: boolean;
+}
+
+function decide(input: Input, options: GenericBoardPolicyOptions = {}): AgentAction {
   const d = input.digest;
   const me = input.agent;
   const decisions = input.capsule.decisions;
 
   if (input.role === "lead") {
+    // A claim near its firm deadline whose holder is progressing gets one more
+    // period (a refused extension is not retried); a stalled one is left to lapse.
+    for (const near of d.deadlines ?? []) {
+      const refused = decisions.some((h) => h.action.type === "extend_claim" && h.action.itemId === near.item && h.outcome !== "posted");
+      if (near.progressing && !refused) {
+        return {
+          type: "extend_claim",
+          itemId: near.item,
+          rationale: `${near.owner} is making progress on ${near.item} (last at board seq ${near.lastProgressSeq}); its deadline is ${near.remaining} message(s) away`,
+        };
+      }
+    }
+    const replan = replanAction(input);
+    if (replan) {
+      return replan;
+    }
     // Contracts on the original tests or the gate's configuration are a
     // human's to decide; the lead decides only the others.
     const contract = input.board.pendingContracts.find((c) => !c.protected);
@@ -891,10 +1013,17 @@ function decide(input: Input): AgentAction {
     // Seam-changing items first; items waiting for one are left until it lands.
     // At the claim cap only open seam items (exempt) may be claimed.
     const openSeamItems = new Set((d.openSeams ?? []).map((o) => o.item));
+    // An item whose claim of mine lapsed goes to another agent first.
+    const lapsedMine = (i: (typeof d.openItems)[number]) => i.wait?.reason.kind === "lease-lapsed" && i.wait.reason.agent === me;
     const claimable = d.openItems
-      .filter((i) => i.scopeHint.length > 0 && !otherTools.has(i.item) && !mine(i) && (i.waitsFor ?? []).length === 0)
+      .filter((i) => i.scopeHint.length > 0 && !otherTools.has(i.item) && !mine(i) && (i.waitsFor ?? []).length === 0 && !lapsedMine(i))
       .filter((i) => d.claimCap === undefined || openSeamItems.has(i.item))
-      .sort((a, b) => Number(b.seam === true) - Number(a.seam === true));
+      // Seam items first; then items whose scope overlaps no other holder's (fewer collisions).
+      .sort(
+        (a, b) =>
+          Number(b.seam === true) - Number(a.seam === true) ||
+          (options.preferNonOverlapping === false ? 0 : (a.overlapsClaimed?.length ?? 0) - (b.overlapsClaimed?.length ?? 0)),
+      );
     for (const open of claimable) {
       const claims = decisions.filter((h) => h.action.type === "claim" && h.action.itemId === open.item);
       const last = claims.at(-1);
@@ -975,6 +1104,6 @@ function decide(input: Input): AgentAction {
 }
 
 /** The deterministic generic policy as a turn transport. */
-export function createGenericBoardPolicy(): AgentTurnTransport<BoardDigest, BoardMessage> {
-  return async (input): Promise<AgentTurnOutcome> => ({ action: decide(input), model: "generic-policy" });
+export function createGenericBoardPolicy(options: GenericBoardPolicyOptions = {}): AgentTurnTransport<BoardDigest, BoardMessage> {
+  return async (input): Promise<AgentTurnOutcome> => ({ action: decide(input, options), model: "generic-policy" });
 }

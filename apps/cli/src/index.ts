@@ -16,8 +16,8 @@
  *   promote <change.yaml>  run a Change and promote the result into local Git
  */
 
-import { readFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -57,6 +57,9 @@ import {
   boardSeedFromChange,
   formatBoardRunSummary,
   formatBoardTranscript,
+  formatBudgetsLine,
+  formatProofSummary,
+  type ProofBundle,
   runBoard,
   runBoardOffline,
   runChange,
@@ -917,7 +920,7 @@ const commands: Command[] = [
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
       `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--id <changeId>] ` +
-      `[--item-turns N] [--max-turns N] [--claim-cap N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const goal = await resolveGoal(args);
@@ -944,9 +947,40 @@ const commands: Command[] = [
         ...(intFlag("--item-turns") !== undefined ? { maxTurnsPerItem: intFlag("--item-turns")! } : {}),
         ...(intFlag("--max-turns") !== undefined ? { maxRunTurns: intFlag("--max-turns")! } : {}),
         ...(intFlag("--claim-cap") !== undefined ? { maxActiveClaims: intFlag("--claim-cap")! } : {}),
+        ...(intFlag("--lease-messages") !== undefined ? { claimLeaseMessages: intFlag("--lease-messages")! } : {}),
+        ...(intFlag("--deadline-messages") !== undefined ? { claimDeadlineMessages: intFlag("--deadline-messages")! } : {}),
         ...(intFlag("--timeout-ms") !== undefined ? { timeoutMs: intFlag("--timeout-ms")! } : {}),
         ...(intFlag("--fix-attempts") !== undefined ? { maxFixAttemptsPerItem: intFlag("--fix-attempts")! } : {}),
         ...(intFlag("--quiet-ms") !== undefined ? { quiescenceMs: intFlag("--quiet-ms")! } : {}),
+      };
+      // Cost and time caps (demo safety): engine-enforced, recorded on the board when reached.
+      const numberFlag = (flag: string): number | undefined => {
+        const raw = optionValue(args, flag);
+        if (raw === undefined) {
+          return undefined;
+        }
+        const value = Number(raw);
+        if (!Number.isFinite(value) || value <= 0) {
+          throw new Error(`${flag} must be a positive number`);
+        }
+        return value;
+      };
+      // --price <model>=<input USD per million tokens>/<output USD per million tokens>, repeatable.
+      const prices: Record<string, { inputPerMTok: number; outputPerMTok: number }> = {};
+      args.forEach((arg, i) => {
+        if (arg !== "--price") return;
+        const m = /^([^=]+)=([0-9.]+)\/([0-9.]+)$/.exec(args[i + 1] ?? "");
+        if (!m) {
+          throw new Error("--price must be <model>=<input USD per Mtok>/<output USD per Mtok>");
+        }
+        prices[m[1]!] = { inputPerMTok: Number(m[2]), outputPerMTok: Number(m[3]) };
+      });
+      const caps = {
+        ...(intFlag("--max-calls") !== undefined ? { maxCalls: intFlag("--max-calls")! } : {}),
+        ...(numberFlag("--max-spend-usd") !== undefined ? { maxSpendUsd: numberFlag("--max-spend-usd")! } : {}),
+        ...(intFlag("--max-wall-ms") !== undefined ? { maxWallMs: intFlag("--max-wall-ms")! } : {}),
+        ...(intFlag("--max-item-calls") !== undefined ? { maxCallsPerItem: intFlag("--max-item-calls")! } : {}),
+        ...(Object.keys(prices).length > 0 ? { prices } : {}),
       };
       const gateTimeoutRaw = optionValue(args, "--gate-timeout-ms");
       const gateTimeoutMs = gateTimeoutRaw === undefined ? undefined : Number(gateTimeoutRaw);
@@ -1042,6 +1076,7 @@ const commands: Command[] = [
           // No explicit --max: the dial's max scales with the plan size.
           ...(optionValue(args, "--max") === undefined ? { scaleDial: true } : {}),
           budgets,
+          caps,
           // The fixture replaces the declared gate entirely (offline only).
           ...(fixtureGate ? {} : gateOptions),
           ...contractOptions,
@@ -1052,7 +1087,9 @@ const commands: Command[] = [
         console.log(redactSecrets(formatBoardTranscript(result.log)));
         console.log("");
         console.log(redactSecrets(formatBoardRunSummary(result)));
-        // The offline demo's scratch work root is removed unless asked to keep it.
+        // The offline demo's scratch work root is removed unless asked to keep it: the
+        // proof bundle is written there only when it is kept, else only with --proof-out.
+        await writeProofBundle(result, optionValue(args, "--proof-out"), hasFlag(args, KEEP_WORK_ROOT_FLAG));
         console.log(await finishWorkRoot({ workRoot: result.scratchRoot ?? result.workRoot, keepAll: hasFlag(args, KEEP_WORK_ROOT_FLAG) }));
         // Non-zero unless a gate ran and passed and every item completed.
         return boardRunExitCode(result);
@@ -1134,7 +1171,10 @@ const commands: Command[] = [
         },
         schedule: hasFlag(args, "--lockstep") ? "lockstep" : "concurrent",
         budgets,
+        caps,
         ...(ttlRaw !== undefined ? { workspaceTtlSeconds: Number(ttlRaw) } : {}),
+        // Agents' repo tokens are refreshed before they expire unless turned off.
+        ...(hasFlag(args, "--no-token-refresh") ? { refreshTokens: false } : {}),
         ...gateOptions,
         ...(hasFlag(args, "--watch") ? { skipCleanup: true } : {}),
         ...(deployAppDir ? { deployAppDir: resolve(deployAppDir) } : {}),
@@ -1149,9 +1189,7 @@ const commands: Command[] = [
               console.log(`Change ${event.changeId} created.`);
               break;
             case "budgets":
-              console.log(
-                `  budgets: ${event.maxFixAttempts} fix attempt(s) per item (${event.fixAttemptsScaled ? `scaled with ${event.items} planned item(s)` : "explicit"}), dial max ${event.dialMax} (${event.dialScaled ? `scaled with ${event.items} planned item(s)` : "explicit"}), ${event.maxRunTurns} run turn(s) (${event.runTurnsScaled ? `scaled with ${event.items} planned item(s) and ${event.scopeFiles ?? 0} scope file(s)` : "explicit"}), claim cap ${event.maxActiveClaims} unfinished item(s) per agent (${event.activeClaimsScaled ? "scaled" : "explicit"})`,
-              );
+              console.log(`  ${formatBudgetsLine(event)}`);
               break;
             case "goal-posted":
               console.log(`  goal posted; immutable acceptance gate (never changed): ${(event.immutable ?? []).join(", ") || "none"}`);
@@ -1202,6 +1240,15 @@ const commands: Command[] = [
             case "integration-not-recorded":
               console.log(`  integration recorded no revision: ${event.reason}`);
               break;
+            case "capped":
+              console.log(`  cap reached: ${event.cap.kind}${event.cap.item ? ` (${event.cap.item})` : ""} ${event.cap.used} of ${event.cap.limit}: no new turns`);
+              break;
+            case "token-refreshed":
+              console.log(`  refreshed ${event.agent}'s ${event.tokenKind} token before it expired${event.request ? ` (help ${event.request})` : ""}`);
+              break;
+            case "token-refresh-failed":
+              console.log(redactSecrets(`  token refresh failed: ${event.reason}`));
+              break;
             case "promotion-skipped":
               console.log(`  promotion skipped: ${event.reason}`);
               break;
@@ -1221,12 +1268,13 @@ const commands: Command[] = [
       console.log(redactSecrets(formatBoardTranscript(result.log)));
       console.log("");
       console.log(redactSecrets(formatBoardRunSummary(result)));
-      // A live run keeps its promoted repo and removes the rest of its work root.
+      const proofPath = await writeProofBundle(result, optionValue(args, "--proof-out"), true);
+      // A live run keeps its promoted repo (and its proof bundle) and removes the rest of its work root.
       console.log(
         await finishWorkRoot({
           workRoot: result.workRoot,
           keepAll: hasFlag(args, KEEP_WORK_ROOT_FLAG),
-          ...(result.sourceRepoDir ? { keep: [result.sourceRepoDir] } : {}),
+          keep: [...(result.sourceRepoDir ? [result.sourceRepoDir] : []), ...(proofPath ? [proofPath] : [])],
         }),
       );
       // Non-zero unless a gate ran and passed, every item completed, and it was promoted.
@@ -1671,6 +1719,32 @@ function loadCredentials(): void {
   if (values) {
     setRuntimeCredentials(values);
   }
+}
+
+/**
+ * Print a board run's proof bundle summary and write it as JSON: to `out`,
+ * else (`inWorkRoot`) `proof-bundle.json` in the run's work root, which the
+ * cleanup keeps. Returns the path written, if any.
+ */
+async function writeProofBundle(
+  result: { readonly proof?: ProofBundle; readonly workRoot: string },
+  out: string | undefined,
+  inWorkRoot: boolean,
+): Promise<string | undefined> {
+  if (!result.proof) {
+    return undefined;
+  }
+  console.log("");
+  console.log(redactSecrets(formatProofSummary(result.proof).join("\n")));
+  const path = out !== undefined ? resolve(out) : inWorkRoot ? join(result.workRoot, "proof-bundle.json") : undefined;
+  if (path === undefined) {
+    console.log(`  proof bundle: not written (the scratch work root is removed; pass --proof-out <file> or ${KEEP_WORK_ROOT_FLAG})`);
+    return undefined;
+  }
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `${JSON.stringify(result.proof, null, 2)}\n`);
+  console.log(`  proof bundle: ${path}`);
+  return path;
 }
 
 /** The wrangler invocation: the repo's installed binary, else npx. */

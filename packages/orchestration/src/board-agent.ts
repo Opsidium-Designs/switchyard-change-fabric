@@ -39,6 +39,7 @@ import {
   splitCue,
   uncoveredFailureFiles,
   failingRepoFiles,
+  replanEligible,
   hasWildcard,
   intentPath,
   isAcceptedItem,
@@ -68,6 +69,8 @@ import { authenticatedRemote, clone, push, type GitIdentity } from "@switchyard-
 import { gateFailureLine, matchesGlob, partitionByScope, toolSkeleton } from "@switchyard-change/verification";
 
 import { ToolUseError, type ToolAuthor, type ToolBench } from "./board-tools.ts";
+import type { RefreshableToken } from "./token-refresh.ts";
+import type { RunCapReached, RunMeter } from "./run-meter.ts";
 
 import { redactSecrets } from "./redact.ts";
 import {
@@ -192,11 +195,16 @@ export interface BoardAgentOptions {
   readonly toolAuthor?: ToolAuthor;
   /** How many of the agent's past turns its capsule carries (default 12). */
   readonly historyLimit?: number;
+  /** The run's cost meter: a turn on an item past its per-item cap is refused (ITEM_CAP). */
+  readonly meter?: RunMeter;
+  /** Called when a turn hit its item's cap (the driver records run.capped once). */
+  readonly onItemCap?: (cap: RunCapReached) => void;
 }
 
 /** The action types each role may return. */
-const LEAD_ACTIONS: readonly AgentActionType[] = ["decide_contract", "decide_item", "propose_item", "message", "wait"];
-const WORKER_ACTIONS: readonly AgentActionType[] = AGENT_ACTION_TYPES.filter((t) => t !== "decide_contract" && t !== "decide_item");
+const LEAD_ACTIONS: readonly AgentActionType[] = ["decide_contract", "decide_item", "extend_claim", "replan_item", "propose_item", "message", "wait"];
+const LEAD_ONLY_ACTIONS: ReadonlySet<AgentActionType> = new Set(["decide_contract", "decide_item", "extend_claim", "replan_item"]);
+const WORKER_ACTIONS: readonly AgentActionType[] = AGENT_ACTION_TYPES.filter((t) => !LEAD_ONLY_ACTIONS.has(t));
 
 /** Message types that matter to an agent only while it is free to take new work. */
 const NEW_WORK_TYPES: ReadonlySet<string> = new Set(["item.proposed", "item.accepted", "item.discovered", "item.split", "help.requested", "item.struggling"]);
@@ -245,6 +253,8 @@ export const MAX_FIX_CUES = 2;
  * nudge it before a quiet board could end the run. Bounded per set.
  */
 export const MAX_OPEN_SEAM_CUES = 2;
+/** How many times the driver may offer one set of open items (unclaimed, or a lapsed claim) to a worker on a quiet board. */
+export const MAX_OFFER_CUES = 2;
 /** Items the lead may propose for failing files no item covers, per run. */
 export const MAX_UNCOVERED_PROPOSALS = 4;
 /** An item whose write intent covers at least this many files starts on the strongest model. */
@@ -361,6 +371,11 @@ function toolGateEvidence(gate: { readonly checks: readonly { readonly check: st
   );
 }
 
+/** The situation a re-plan cue is about: the item, who spent its budget, and its stall releases. */
+function replanKey(cue: { readonly item: string; readonly exhaustedBy: readonly string[]; readonly stallReleases: number }): string {
+  return `${cue.item}:${cue.exhaustedBy.length}:${cue.stallReleases}`;
+}
+
 /** The item an action is about, for the per-item turn budget. */
 function actionItem(action: AgentAction, digest: BoardDigest): string | undefined {
   switch (action.type) {
@@ -448,8 +463,24 @@ export class BoardAgent {
   private readonly openSeamCues = new Map<string, number>();
   /** Set by the driver: take a turn on the next step to look at open seam items. */
   private openSeamNudge = false;
+  /** The driver's offers per set of open items nobody holds (bounded by MAX_OFFER_CUES). */
+  private readonly offerNudges = new Map<string, number>();
+  /** Set by the driver: open items nobody holds were offered; look at them on the next step. */
+  private offerNudge = false;
+  /** Whether the agent was free (could claim) at its latest observation. */
+  private freeSeen = false;
   /** Lead: the undecided worker proposals it last saw (a change wakes it). */
   private lastProposals = "";
+  /** Lead: the claims near their deadline it last saw (a change wakes it). */
+  private lastDeadlines = "";
+  /**
+   * Lead: re-plan cues it has had, per item and situation (`<item>:<agents
+   * that spent its budget>:<stall releases>`): one bounded re-plan turn each
+   * time the board finds the item not getting done again.
+   */
+  private readonly replanCued = new Set<string>();
+  /** Lead: the re-plan cues of the turn being taken (the action carries their reason and revision). */
+  private replanCues: NonNullable<BoardDigest["replan"]> = [];
   /** Items (and tool items) this agent proposed: their decision wakes it. */
   private readonly proposedItems = new Set<string>();
   /** Capabilities this agent built: a passing revision is its cue to re-run its scanner. */
@@ -458,6 +489,8 @@ export class BoardAgent {
   private readonly toolGateFailures = new Map<string, string>();
   /** Forks this agent made as a helper: help request -> its fork's worktree and remote. */
   private readonly forks = new Map<string, { readonly workspace: JoinedWorkspace; readonly remote: string; readonly dir: string; readonly requester: string }>();
+  /** Tokens replaced by a refresh (still scrubbed from any text that leaves the agent). */
+  private readonly retiredTokens: string[] = [];
 
   constructor(private readonly options: BoardAgentOptions) {
     this.id = options.id;
@@ -487,6 +520,44 @@ export class BoardAgent {
   /** The authenticated push/clone remote of the agent's repo ("" before joining). */
   get repoRemote(): string {
     return this.remote;
+  }
+
+  /**
+   * The repo tokens this agent writes with (its own repo, and each fork it took
+   * as a helper), each with a swap that puts a refreshed token into every later
+   * git call (see TokenRefresher).
+   */
+  refreshableTokens(): RefreshableToken[] {
+    const out: RefreshableToken[] = [];
+    if (this.workspace) {
+      const ws = this.workspace;
+      out.push({
+        agent: this.id,
+        kind: "repo-write",
+        tokenId: ws.tokenId,
+        expiresAt: ws.tokenExpiresAt,
+        swap: (fresh) => {
+          this.retiredTokens.push(ws.token);
+          this.workspace = { ...ws, token: fresh.token, tokenId: fresh.tokenId, tokenExpiresAt: fresh.tokenExpiresAt };
+          this.remote = authenticatedRemote(ws.gitUrl, fresh.token);
+        },
+      });
+    }
+    for (const [request, fork] of this.forks) {
+      out.push({
+        agent: this.id,
+        kind: "help-fork",
+        request,
+        tokenId: fork.workspace.tokenId,
+        expiresAt: fork.workspace.tokenExpiresAt,
+        swap: (fresh) => {
+          this.retiredTokens.push(fork.workspace.token);
+          const workspace = { ...fork.workspace, token: fresh.token, tokenId: fresh.tokenId, tokenExpiresAt: fresh.tokenExpiresAt };
+          this.forks.set(request, { ...fork, workspace, remote: authenticatedRemote(workspace.gitUrl, fresh.token) });
+        },
+      });
+    }
+    return out;
   }
 
   /** Stop the agent (the run is over). */
@@ -582,6 +653,15 @@ export class BoardAgent {
       if (m.type === "item.reopened" && m.payload.previousOwner !== this.id && m.payload.commit !== undefined) {
         this.inherited.set(m.payload.item, { from: m.payload.previousOwner, commit: m.payload.commit, seeded: false });
       }
+      // A lapsed claim: whoever claims it next starts from the holder's latest push.
+      if (m.type === "claim.lapsed" && m.payload.agent !== this.id && m.payload.commit !== undefined) {
+        this.inherited.set(m.payload.item, { from: m.payload.agent, commit: m.payload.commit, seeded: false });
+      }
+      if (m.type === "claim.lapsed" && m.payload.agent === this.id) {
+        this.evidence.push(
+          `my claim on ${m.payload.item} LAPSED (${m.payload.reason === "deadline" ? "its deadline passed" : `no progress on it since board seq ${m.payload.lastProgressSeq}`}): it is open for any agent now; claim it again only if I can move it now`,
+        );
+      }
     }
 
     if (this.role === "lead") {
@@ -605,7 +685,13 @@ export class BoardAgent {
         .join(",");
       const newProposals = proposals !== "" && proposals !== this.lastProposals;
       this.lastProposals = proposals;
-      if (!(this.followUp || addressed || newProposals || (undecided && fresh.some((m) => m.type === "contract.proposed")))) {
+      // Claims near their firm deadline: the lead extends a progressing one or lets it lapse.
+      const deadlines = (digest.deadlines ?? []).map((d) => `${d.item}@${d.deadlineSeq}`).join(",");
+      const newDeadlines = deadlines !== "" && deadlines !== this.lastDeadlines;
+      this.lastDeadlines = deadlines;
+      // Items to re-plan the lead has not had a turn on yet: one bounded turn each.
+      const newReplans = (digest.replan ?? []).some((r) => !this.replanCued.has(replanKey(r)));
+      if (!(this.followUp || addressed || newProposals || newDeadlines || newReplans || (undecided && fresh.some((m) => m.type === "contract.proposed")))) {
         return "idle";
       }
       await this.turn(digest, state);
@@ -625,6 +711,7 @@ export class BoardAgent {
     const cues = this.doneCues.get(passedKey) ?? 0;
     const nudged = passedKey !== "" && cues < MAX_DONE_CUES;
     const free = this.isFree(digest);
+    this.freeSeen = free;
     const freeKey = free && digest.openItems.length > 0 ? digest.openItems.map((i) => i.item).join(",") : undefined;
     const relevant = fresh.some((m) => {
       if (m.to?.includes(this.id)) {
@@ -698,7 +785,17 @@ export class BoardAgent {
       this.openSeamCues.set(openSeamKey, (this.openSeamCues.get(openSeamKey) ?? 0) + 1);
       this.evidence.push(`OPEN SEAM ITEM: ${openSeams.map((o) => o.hint).join(" ")}`.slice(0, 1000));
     }
-    if (!(this.followUp || relevant || nudged || newlyUnavailable || newCue || claimNudge || openSeamCue || (freeKey !== undefined && freeKey !== this.lastFreeKey))) {
+    // The driver offered open items nobody holds (a quiet board): a free worker
+    // looks at them, with each item's stated reason.
+    const offers = this.role === "worker" && this.offerNudge && free
+      ? digest.openItems.filter((i) => i.wait?.reason.kind === "unclaimed" || i.wait?.reason.kind === "lease-lapsed")
+      : [];
+    this.offerNudge = false;
+    const offerCue = offers.length > 0;
+    if (offerCue) {
+      this.evidence.push(`OPEN ITEMS nobody holds: ${offers.map((i) => `${i.item} (${i.wait!.line})`).join("; ")}. Claim one now if you can move it.`.slice(0, 1000));
+    }
+    if (!(this.followUp || relevant || nudged || newlyUnavailable || newCue || claimNudge || openSeamCue || offerCue || (freeKey !== undefined && freeKey !== this.lastFreeKey))) {
       return "idle";
     }
     // A cue counts as delivered only on a turn it caused by itself (not a
@@ -723,6 +820,20 @@ export class BoardAgent {
   }
 
   /**
+   * Lead: the items the board would let it re-plan that it has not had its
+   * one re-plan turn on yet (the driver keeps the run going until it has).
+   */
+  replanPending(state: BoardState): string[] {
+    if (this.role !== "lead" || this.stop) {
+      return [];
+    }
+    return Object.values(state.items)
+      .filter((i) => replanEligible(state, i.id) !== undefined && !this.replanCued.has(replanKey({ item: i.id, exhaustedBy: i.exhaustedBy ?? [], stallReleases: i.stallReleases ?? 0 })))
+      .map((i) => i.id)
+      .sort();
+  }
+
+  /**
    * The driver's nudge before a quiet board would end the run while seam items
    * are open: this agent's next step takes a turn to look at them (still
    * bounded by MAX_OPEN_SEAM_CUES per open set). Returns false when it has no
@@ -735,6 +846,23 @@ export class BoardAgent {
     }
     this.driverSeamNudges.set(key, (this.driverSeamNudges.get(key) ?? 0) + 1);
     this.openSeamNudge = true;
+    return true;
+  }
+
+  /**
+   * The driver's OFFER on a quiet board: open items nobody holds (unclaimed,
+   * or a claim that lapsed) are waiting; a free worker takes a turn on its
+   * next step to claim one (bounded by MAX_OFFER_CUES per set of items).
+   * Returns false when it has no offer left for the set.
+   */
+  offerOpenItems(items: readonly string[]): boolean {
+    const key = items.join(",");
+    // Only a worker that was free when it last looked can take one (an offer to a busy one changes nothing).
+    if (this.role !== "worker" || this.stop || !this.freeSeen || (this.offerNudges.get(key) ?? 0) >= MAX_OFFER_CUES) {
+      return false;
+    }
+    this.offerNudges.set(key, (this.offerNudges.get(key) ?? 0) + 1);
+    this.offerNudge = true;
     return true;
   }
 
@@ -1025,6 +1153,16 @@ export class BoardAgent {
     this.lastRejection = undefined;
 
     const item = actionItem(action, digest);
+    if (item !== undefined && this.options.meter) {
+      // The per-item call cap (across agents): no more turns on an item past it.
+      this.options.meter.noteItem(item);
+      const cap = this.options.meter.itemReached(item);
+      if (cap !== undefined) {
+        this.record({ turn: this.turns, action, outcome: "local", code: "ITEM_CAP", error: `item ${item} reached its call cap (${cap.used} of ${cap.limit})` });
+        this.options.onItemCap?.(cap);
+        return;
+      }
+    }
     if (item !== undefined) {
       const spent = (this.turnsByItem.get(item) ?? 0) + 1;
       this.turnsByItem.set(item, spent);
@@ -1118,6 +1256,7 @@ export class BoardAgent {
     });
     const files = await listRepoFiles(this.baseDir);
     const excerpts = await this.excerpts(digest, files);
+    const replan = this.role === "lead" ? await this.replanFacts(digest, files) : [];
     return {
       agent: this.id,
       role: this.role,
@@ -1141,6 +1280,7 @@ export class BoardAgent {
         pendingItems,
         items: acceptedItems,
         tools,
+        ...(replan.length > 0 ? { replan } : {}),
         ...((): { cues?: { splittable: { item: string; files: number; subChanges: number }[] } } => {
           // No split cue where splits are not supported (the cloud integrator).
           const splittable = (state.integrator === "cloud" ? [] : (digest.struggling ?? [])).flatMap((s) => {
@@ -1157,6 +1297,43 @@ export class BoardAgent {
       ...(this.lastRejection ? { lastRejection: this.lastRejection } : {}),
       allowed: this.role === "lead" ? LEAD_ACTIONS : WORKER_ACTIONS,
     };
+  }
+
+  /**
+   * The lead's re-plan cues for this turn (each item once: one bounded re-plan
+   * turn), with the failure attribution of the item's latest failing revision:
+   * the repo files its output names and its failing test lines.
+   */
+  private async replanFacts(digest: BoardDigest, files: readonly string[]): Promise<NonNullable<AgentTurnInput["board"]["replan"]>> {
+    const cues = (digest.replan ?? []).filter((r) => !this.replanCued.has(replanKey(r)));
+    this.replanCues = cues;
+    if (cues.length === 0) {
+      return [];
+    }
+    const log = cues.some((c) => c.rev !== undefined) ? await this.requireClient().log().catch(() => undefined) : undefined;
+    return cues.map((cue) => {
+      this.replanCued.add(replanKey(cue));
+      const rev = log?.messages.find((m) => m.type === "integrated.rev" && m.payload.n === cue.rev);
+      const output = rev && rev.type === "integrated.rev" ? (rev.payload.failing?.output ?? "") : "";
+      const failingTests = output
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => /^not ok\b|\bFAIL\b|\u2716|\u00d7|AssertionError|error TS\d+/.test(l))
+        .slice(0, 8)
+        .map((l) => bounded(this.scrub(l), 200));
+      return {
+        item: cue.item,
+        reason: cue.reason,
+        ...(cue.rev !== undefined ? { rev: cue.rev } : {}),
+        objective: cue.objective,
+        scopeHint: cue.scopeHint,
+        exhaustedBy: cue.exhaustedBy,
+        stallReleases: cue.stallReleases,
+        failingFiles: output !== "" ? failingRepoFiles(output, files).slice(0, 16) : [],
+        failingTests,
+        neighbours: cue.neighbours,
+      };
+    });
   }
 
   /** Bounded file contents inside the agent's intents (or the open items it may claim). */
@@ -1203,8 +1380,8 @@ export class BoardAgent {
     if (this.remote !== "" && this.workspace && this.remote !== this.workspace.gitUrl) {
       out = out.split(this.remote).join(this.workspace.gitUrl);
     }
-    if (token) {
-      out = out.split(token).join("[redacted]").split(encodeURIComponent(token)).join("[redacted]");
+    for (const secret of [...(token ? [token] : []), ...this.retiredTokens]) {
+      out = out.split(secret).join("[redacted]").split(encodeURIComponent(secret)).join("[redacted]");
     }
     return redactSecrets(out);
   }
@@ -1455,6 +1632,44 @@ export class BoardAgent {
           payload: { item: action.itemId },
           rationale: action.rationale,
         });
+        return;
+      case "replan_item": {
+        if (this.role !== "lead" || !state.agents[this.id]) {
+          local("NOT_ALLOWED", "only the lead re-plans an item");
+          return;
+        }
+        const reason = replanEligible(state, action.itemId);
+        if (reason === undefined) {
+          local("INVALID_STATE", `item ${action.itemId} is not an item to re-plan now (board.replan lists them)`);
+          return;
+        }
+        const cue = this.replanCues.find((c) => c.item === action.itemId) ?? digest.replan?.find((c) => c.item === action.itemId);
+        const prefix = action.itemId.slice(0, 120);
+        await posted({
+          type: "item.replanned",
+          payload: {
+            item: action.itemId,
+            reason,
+            action: action.plan,
+            children: action.children.map((child, index) => ({
+              item: `${prefix}.r${index + 1}`,
+              objective: child.objective,
+              acceptance: child.acceptance,
+              scopeHint: child.scopeHint,
+            })),
+            ...(action.withItemId !== undefined ? { with: action.withItemId } : {}),
+            ...(cue?.rev !== undefined ? { rev: cue.rev } : {}),
+          },
+          rationale: action.rationale,
+        });
+        return;
+      }
+      case "extend_claim":
+        if (this.role !== "lead" || !state.agents[this.id]) {
+          local("NOT_ALLOWED", "only the lead extends a claim's deadline");
+          return;
+        }
+        await posted({ type: "claim.extended", payload: { item: action.itemId, reason: bounded(action.rationale, 200) }, rationale: action.rationale });
         return;
       case "decide_contract":
         if (this.role !== "lead" || !state.agents[this.id]) {
@@ -1934,8 +2149,23 @@ export class BoardAgent {
       local("CLONE_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)).split(forked.token).join("[redacted]"), 300), note);
       return;
     }
-    this.forks.set(requestId, { workspace: forked, remote, dir, requester: wanted.by });
     const known = this.requests.get(requestId);
+    if (forked.baseMismatch !== undefined) {
+      // The fork does not start where the requester is: say so on the board (it takes no grant), never proceed silently.
+      await posted(
+        {
+          type: "help.offered",
+          payload: { request: requestId, forkOf: wanted.by, fork: forked.workspaceName, baseMismatch: { expected: forked.baseMismatch.expected, realized: forked.baseMismatch.realized } },
+          rationale: `the fork of ${wanted.by}'s repo started at ${forked.baseMismatch.realized}, not at its push ${forked.baseMismatch.expected}: I cannot take this grant from it`,
+          ...(known ? { inReplyTo: known.seq } : {}),
+          to: [wanted.by],
+        },
+        note,
+      );
+      this.evidence.push(`the fork for help request ${requestId} did not start at ${wanted.by}'s push (fork head ${forked.baseMismatch.realized}): recorded, grant not taken`);
+      return;
+    }
+    this.forks.set(requestId, { workspace: forked, remote, dir, requester: wanted.by });
     const ok = await posted(
       {
         type: "help.offered",
