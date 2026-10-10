@@ -166,6 +166,7 @@ export type {
   BoardWaitReason,
   BoardDigestWait,
   BoardClash,
+  BoardCandidatePush,
   BoardClashHead,
   EngineRecordType,
 } from "./board.ts";
@@ -298,8 +299,17 @@ export {
   toolsWorkspaceName,
 } from "./board-join.ts";
 
-export type { BoardIntegrationPlan, BoardIntegrationUnitPlan } from "./board-integration-plan.ts";
-export { awaitingSubLead, narrowToSplitChildren, pendingPushItems, pendingPushKey, planBoardIntegration } from "./board-integration-plan.ts";
+export type { BoardIntegrationPlan, BoardIntegrationUnitPlan, CandidateVerdict, SpeculativeLanding } from "./board-integration-plan.ts";
+export {
+  awaitingSubLead,
+  decideSpeculativeLanding,
+  narrowToSplitChildren,
+  pendingPushItems,
+  pendingPushKey,
+  planBoardIntegration,
+  speculationStateKey,
+  speculativeUnits,
+} from "./board-integration-plan.ts";
 export type { AttributableUnit } from "./failure-attribution.ts";
 export { attributeFailure, combineAttribution, failingRepoFiles } from "./failure-attribution.ts";
 export type { ImplicationSource } from "./failure-attribution.ts";

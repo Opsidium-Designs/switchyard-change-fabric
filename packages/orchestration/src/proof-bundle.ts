@@ -18,6 +18,11 @@
  * the typed (Jev) decisions (ADVISORY, with their mechanical outcomes, never
  * part of the proof), the human decisions, and the lapses, re-plans,
  * escalations, clash predictions, trunk moves, token refreshes, and caps.
+ *
+ * With speculative batch gating, the bundle also lists the candidates the
+ * round that landed the final revision considered (candidate.gated), and the
+ * landed one: its commit must be the revision's (and the promoted gated
+ * commit), or the bundle is not proven.
  */
 
 import { foldBoard, isChangeItem, progressHeadline, type BoardMessage, type BoardRevProgress } from "@switchyard-change/change-core";
@@ -67,6 +72,31 @@ export interface ProofBundle {
   readonly caps: readonly { readonly seq: number; readonly kind: string; readonly limit: number; readonly used: number; readonly item?: string }[];
   /** Change items not completed (a proven revision with these is a partial Change). */
   readonly incompleteItems: readonly string[];
+  /**
+   * The speculative round that landed the final revision (absent without
+   * speculation): every candidate it gated, in order, and the landed one,
+   * whose commit is the revision's gated commit (and the promoted one).
+   */
+  readonly speculation?: {
+    readonly round: number;
+    readonly candidates: readonly ProofCandidate[];
+    readonly landed?: ProofCandidate & { readonly matchesRevision: boolean; readonly matchesPromoted?: boolean };
+  };
+}
+
+/** One speculative candidate as the proof lists it (each backed by its candidate.gated seq). */
+export interface ProofCandidate {
+  readonly seq: number;
+  readonly index: number;
+  /** The items of each push in its stack, in order. */
+  readonly prefix: readonly (readonly string[])[];
+  readonly commit: string;
+  readonly verdict: "pass" | "fail";
+  readonly outcome: "landed" | "passed" | "blamed" | "retest";
+  readonly rev?: number;
+  readonly blamed?: readonly string[];
+  readonly acceptance?: ProofCount;
+  readonly developer?: ProofCount;
 }
 
 /** Options: what the log alone cannot carry (the run's own id, a promotion the board refused to record). */
@@ -130,6 +160,40 @@ export function buildProofBundle(log: readonly BoardMessage[], options: ProofBun
           : `the promoted gated commit ${promoted.gatedCommit.slice(0, 12)} (revision ${rev}) is not the last revision's commit ${last.payload.commit.slice(0, 12)} (revision ${last.payload.n}): the shipped tree is not the gated tree`,
       );
     }
+  }
+
+  // Speculation: the round whose landed candidate is the final revision.
+  const candidateRecords = of(log, "candidate.gated");
+  const landedRecord = last !== undefined ? candidateRecords.find((m) => m.payload.outcome === "landed" && m.payload.rev === last.payload.n) : undefined;
+  let speculation: ProofBundle["speculation"];
+  if (landedRecord !== undefined && last !== undefined) {
+    const toCandidate = (m: (typeof candidateRecords)[number]): ProofCandidate => {
+      const p = m.payload;
+      const developer = p.progress ? developerCount(p.progress) : undefined;
+      return {
+        seq: m.seq,
+        index: p.index,
+        prefix: p.prefix.map((x) => [...x.items]),
+        commit: p.commit,
+        verdict: p.verdict,
+        outcome: p.outcome,
+        ...(p.rev !== undefined ? { rev: p.rev } : {}),
+        ...(p.blamed !== undefined ? { blamed: [...p.blamed] } : {}),
+        ...(p.progress?.acceptance ? { acceptance: { passed: p.progress.acceptance.passed, total: p.progress.acceptance.total } } : {}),
+        ...(developer ? { developer } : {}),
+      };
+    };
+    const round = landedRecord.payload.round;
+    const matchesRevision = landedRecord.payload.commit === last.payload.commit;
+    const matchesPromoted = promotion !== undefined ? landedRecord.payload.commit === promotion.gatedCommit : undefined;
+    if (!matchesRevision) {
+      reasons.push(`the landed candidate's commit ${landedRecord.payload.commit.slice(0, 12)} is not revision ${last.payload.n}'s gated commit ${last.payload.commit.slice(0, 12)}`);
+    }
+    speculation = {
+      round,
+      candidates: candidateRecords.filter((m) => m.payload.round === round).map(toCandidate),
+      landed: { ...toCandidate(landedRecord), matchesRevision, ...(matchesPromoted !== undefined ? { matchesPromoted } : {}) },
+    };
   }
 
   // Test inventory: the baseline run's count, and what the final revision executed.
@@ -306,7 +370,21 @@ export function buildProofBundle(log: readonly BoardMessage[], options: ProofBun
     tokenRefreshes: of(log, "token.refreshed").length,
     caps: of(log, "run.capped").map((m) => ({ seq: m.seq, kind: m.payload.kind, limit: m.payload.limit, used: m.payload.used, ...(m.payload.item !== undefined ? { item: m.payload.item } : {}) })),
     incompleteItems: changeItems.filter((i) => i.status !== "done").map((i) => i.id),
+    ...(speculation ? { speculation } : {}),
   };
+}
+
+/** One line for the speculative round that landed the final revision. */
+export function formatProofSpeculation(speculation: NonNullable<ProofBundle["speculation"]>): string {
+  const what = (c: ProofCandidate): string =>
+    c.outcome === "landed"
+      ? `landed as rev ${c.rev}${speculation.landed?.matchesRevision ? " (its gated commit)" : " (NOT its gated commit)"}${
+          speculation.landed?.matchesPromoted === undefined ? "" : speculation.landed.matchesPromoted ? ", promoted" : ", NOT the promoted commit"
+        }`
+      : c.outcome === "blamed"
+        ? `blamed ${(c.blamed ?? []).join(", ")}${c.rev !== undefined ? ` in rev ${c.rev}` : ""}`
+        : c.outcome;
+  return `speculation: round ${speculation.round}, ${speculation.candidates.map((c) => `C${c.index} ${c.commit.slice(0, 10)} ${c.verdict} (${what(c)})`).join(", ")}`;
 }
 
 /** A short, readable summary of a proof bundle (the CLI prints it). */
@@ -321,6 +399,9 @@ export function formatProofSummary(bundle: ProofBundle): string[] {
   lines.push(`  gate: ${bundle.gate.command?.join(" ") ?? "(no command recorded)"} -> ${bundle.gate.verdict}${bundle.gate.gated ? "" : " (no gate ran)"}`);
   if (bundle.progress.length > 0) {
     lines.push(`  progress: ${bundle.progress.map((p) => `rev ${p.n} ${p.line}`).join(" -> ")}`);
+  }
+  if (bundle.speculation) {
+    lines.push(`  ${formatProofSpeculation(bundle.speculation)}`);
   }
   lines.push(
     `  merged: ${bundle.contributions.pushesMerged} push(es) from ${bundle.contributions.agents.join(", ") || "nobody"}; ${bundle.contributions.items.filter((i) => i.status === "done").length} of ${bundle.contributions.items.length} item(s) done`,

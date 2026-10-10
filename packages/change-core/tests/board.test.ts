@@ -57,6 +57,9 @@ import {
   pendingPushItems,
   splitCue,
   planBoardIntegration,
+  decideSpeculativeLanding,
+  speculationStateKey,
+  speculativeUnits,
   summarizeBoard,
   verifyBoard,
   type BoardAppendResult,
@@ -199,6 +202,10 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
   "token.refreshed": { from: "engine", payload: { agent: "a", kind: "help-fork", request: "r" } },
   "revision.promoted": { from: "engine", payload: { rev: 3, gatedCommit: "abc", commit: "def", branch: "switchyard/change-1" } },
   "run.capped": { from: "engine", payload: { kind: "spend", limit: 5, used: 5.25 } },
+  "candidate.gated": {
+    from: "engine",
+    payload: { round: 1, index: 1, of: 2, prefix: [{ agent: "a", items: ["i"], commit: "c1" }], commit: "abc", base: "b0", verdict: "fail", outcome: "blamed", rev: 2, blamed: ["i"] },
+  },
   "clash.predicted": {
     from: "engine",
     payload: { a: { agent: "a", item: "i", sha: "c1" }, b: { agent: "b", item: "j", sha: "c2" }, status: "conflict", paths: ["src/a.ts"], scope: "local" },
@@ -272,6 +279,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "token.refreshed": { agent: "a", kind: "help-fork" },
   "revision.promoted": { rev: 3, gatedCommit: "abc", commit: "def", branch: "../etc" },
   "run.capped": { kind: "item-calls", limit: 5, used: 6 },
+  "candidate.gated": { round: 1, index: 2, of: 2, prefix: [{ agent: "a", items: ["i"], commit: "c1" }], commit: "abc", verdict: "pass", outcome: "passed" },
   "item.discovered": { item: "k", objective: "o" },
   "help.requested": { request: "r", item: "i" },
   "help.offered": {},
@@ -310,7 +318,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(56);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(57);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -3054,6 +3062,103 @@ describe("trunk-moved and stale checks", () => {
     expect(board.state.help.h1!.forkMismatches).toEqual([{ agent: "b", seq: board.state.lastSeq, expected: "c1", realized: "base0" }]);
     expect(boardDigest(board.state, board.log, "a", 0).help!.mine[0]!.forkMismatches).toEqual([{ agent: "b", expected: "c1", realized: "base0" }]);
     expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("speculative batch gating on the board", () => {
+  function speculating(rules: Record<string, unknown> = { speculate: 3 }): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", baseline: "base0", rules }));
+    for (const agent of ["a", "b", "c"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    for (const item of ["one", "two", "three"]) {
+      board.post(msg("lead", "item.proposed", { item, objective: item, acceptance: [], scopeHint: [`src/${item}/**`] }));
+    }
+    board.post(claim("a", "one", ["src/one/**"]));
+    board.post(claim("b", "two", ["src/two/**"]));
+    board.post(claim("c", "three", ["src/three/**"]));
+    return board;
+  }
+  const candidate = (payload: Record<string, unknown>) =>
+    msg("engine", "candidate.gated", { round: 1, of: 3, base: "base0", ...payload });
+
+  it("records the speculate rule (1 to the bound) and refuses it with the cloud integrator", () => {
+    expect(speculating().state.rules.speculate).toBe(3);
+    expect(seeded().state.rules.speculate).toBeUndefined();
+    const over = new TestBoard();
+    over.reject(msg("human", "goal.posted", { objective: "o", rules: { speculate: BOARD_LIMITS.maxSpeculate + 1 } }), /speculate must be an integer from 1 to 8/, "BAD_PAYLOAD");
+    const cloud = new TestBoard();
+    cloud.reject(msg("human", "goal.posted", { objective: "o", integrator: "cloud", rules: { speculate: 2 } }), /integration Workflow gates one revision at a time/, "NOT_SUPPORTED");
+    cloud.post(msg("human", "goal.posted", { objective: "o", integrator: "cloud", rules: { speculate: 1 } }));
+    expect(cloud.state.integrator).toBe("cloud");
+  });
+
+  it("a blamed candidate backs a failing revision and charges only its items; the landed one IS the latest passing revision", () => {
+    const board = speculating();
+    board.post(push("a", "one", "c1", ["src/one/x.ts"]));
+    board.post(push("b", "two", "c2", ["src/two/y.ts"]));
+    board.post(push("c", "three", "c3", ["src/three/z.ts"]));
+    // C2 failed after C1 passed: recorded first, implicating two only.
+    const failed = board.post(msg("engine", "integrated.rev", { commit: "k2", gate: "fail", merged: ["c1", "c2"], base: "base0", failing: { output: "src/two/y.ts:1 failed", items: ["two"] } }));
+    expect(failed.filter((m) => m.type === "fix.requested").map((m) => m.payload)).toEqual([{ item: "two", n: 1, attempt: 1 }]);
+    // C1 lands, built on the same head (a failing revision does not move it).
+    board.post(msg("engine", "integrated.rev", { commit: "k1", gate: "pass", merged: ["c1"], base: "base0" }));
+    expect(board.state.items.one!.fixAttempts).toBeUndefined();
+    expect(board.state.items.three!.fixAttempts).toBeUndefined();
+    // The landed candidate must be the latest passing revision's commit.
+    board.reject(candidate({ index: 1, prefix: [{ agent: "a", items: ["one"], commit: "c1" }], commit: "other", verdict: "pass", outcome: "landed", rev: 2 }), /not the latest passing revision 2's commit/, "LOG_MISMATCH");
+    board.post(candidate({ index: 1, prefix: [{ agent: "a", items: ["one"], commit: "c1" }], commit: "k1", verdict: "pass", outcome: "landed", rev: 2 }));
+    // A blamed candidate names a recorded FAILING revision and the items it blames.
+    const two = [{ agent: "a", items: ["one"], commit: "c1" }, { agent: "b", items: ["two"], commit: "c2" }];
+    board.reject(candidate({ index: 2, prefix: two, commit: "k2", verdict: "fail", outcome: "blamed", rev: 2, blamed: ["two"] }), /not a recorded failing revision/, "LOG_MISMATCH");
+    board.reject(candidate({ index: 2, prefix: two, commit: "k2", verdict: "fail", outcome: "blamed", rev: 1 }), /exactly a blamed candidate names the items/, "BAD_PAYLOAD");
+    board.reject(candidate({ index: 2, prefix: two, commit: "k2", verdict: "pass", outcome: "blamed", rev: 1, blamed: ["two"] }), /a blamed candidate failed its gate/, "LOG_MISMATCH");
+    board.post(candidate({ index: 2, prefix: two, commit: "k2", verdict: "fail", outcome: "blamed", rev: 1, blamed: ["two"] }));
+    // A re-tested candidate blames nobody and backs no revision.
+    const three = [...two, { agent: "c", items: ["three"], commit: "c3" }];
+    board.reject(candidate({ index: 3, prefix: three, commit: "k3", verdict: "fail", outcome: "retest", rev: 1 }), /exactly a landed or a blamed candidate names the revision/, "BAD_PAYLOAD");
+    board.reject(candidate({ index: 3, prefix: two, commit: "k3", verdict: "fail", outcome: "retest" }), /index \(at most of\) is the length of its prefix/, "BAD_PAYLOAD");
+    board.post(candidate({ index: 3, prefix: three, commit: "k3", verdict: "fail", outcome: "retest" }));
+    // Rounds and indexes only move forward.
+    board.reject(candidate({ index: 3, prefix: three, commit: "k3", verdict: "fail", outcome: "retest" }), /is not after the last recorded one/, "DUPLICATE");
+    expect(board.state.lastCandidate).toMatchObject({ round: 1, index: 3 });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("refuses candidates on a board that does not speculate, or more than its rule allows", () => {
+    const board = speculating({ speculate: 2 });
+    board.post(push("a", "one", "c1", ["src/one/x.ts"]));
+    board.reject(candidate({ index: 1, prefix: [{ agent: "a", items: ["one"], commit: "c1" }], commit: "k1", verdict: "pass", outcome: "passed" }), /at most 2 candidate/, "LIMIT");
+    const off = seeded();
+    off.reject(candidate({ index: 1, of: 1, prefix: [{ agent: "a", items: ["one"], commit: "c1" }], commit: "k1", verdict: "pass", outcome: "passed" }), /does not gate speculatively/, "INVALID_STATE");
+  });
+
+  it("stacks pending pushes in push order and holds a push whose fix is owed", () => {
+    const board = speculating();
+    board.post(push("c", "three", "c3", ["src/three/z.ts"]));
+    board.post(push("a", "one", "c1", ["src/one/x.ts"]));
+    board.post(push("b", "two", "c2", ["src/two/y.ts"]));
+    const plan = planBoardIntegration(board.log, board.state);
+    expect(plan.units.map((u) => u.agent)).toEqual(["a", "b", "c"]);
+    expect(speculativeUnits(plan).map((u) => u.agent)).toEqual(["c", "a", "b"]);
+    expect(speculationStateKey(board.state)).toBe(["c1", "c2", "c3"].join(","));
+    board.post(msg("engine", "integrated.rev", { commit: "k", gate: "fail", merged: ["c3"], base: "base0", failing: { output: "x", items: ["three"] } }));
+    expect(speculativeUnits(planBoardIntegration(board.log, board.state)).map((u) => u.agent)).toEqual(["a", "b"]);
+    expect(speculationStateKey(board.state)).toBe(["c1", "c2"].join(","));
+    // The owner's next push answers the fix request: it is stacked again (in its new push order).
+    board.post(push("c", "three", "c4", ["src/three/z.ts"]));
+    expect(speculativeUnits(planBoardIntegration(board.log, board.state)).map((u) => u.agent)).toEqual(["a", "b", "c"]);
+  });
+
+  it("lands the longest passing prefix, blames the first failure after it, and re-tests the rest", () => {
+    const v = (...gates: ("pass" | "fail" | undefined)[]) => gates.map((gate, i) => ({ index: i + 1, ...(gate ? { gate } : {}) }));
+    expect(decideSpeculativeLanding(v("pass", "fail", "fail"))).toEqual({ landed: 1, blamed: 2, passed: [], retest: [3] });
+    expect(decideSpeculativeLanding(v("fail", "fail", "pass"))).toEqual({ blamed: 1, passed: [], retest: [2, 3] });
+    expect(decideSpeculativeLanding(v("pass", "pass", "pass"))).toEqual({ landed: 3, passed: [1, 2], retest: [] });
+    // A candidate that could not be gated ends the prefix and blames nobody.
+    expect(decideSpeculativeLanding(v("pass", undefined, "pass"))).toEqual({ landed: 1, passed: [], retest: [2, 3] });
+    expect(decideSpeculativeLanding(v(undefined, "fail"))).toEqual({ passed: [], retest: [1, 2] });
+    expect(decideSpeculativeLanding(v("pass"))).toEqual({ landed: 1, passed: [], retest: [] });
   });
 });
 

@@ -259,8 +259,8 @@ export {
 } from "./run-board.ts";
 export type { ModelPrice, RunCapReached, RunCaps } from "./run-meter.ts";
 export { meteredExecutor, meteredTransport, RunMeter } from "./run-meter.ts";
-export type { ProofBundle, ProofBundleOptions, ProofCount } from "./proof-bundle.ts";
-export { buildProofBundle, formatProofSummary } from "./proof-bundle.ts";
+export type { ProofBundle, ProofBundleOptions, ProofCandidate, ProofCount } from "./proof-bundle.ts";
+export { buildProofBundle, formatProofSpeculation, formatProofSummary } from "./proof-bundle.ts";
 export type { RefreshableToken, TokenRefresherOptions } from "./token-refresh.ts";
 export { TokenRefresher } from "./token-refresh.ts";
 export type { PendingClashInput, PendingClashResult } from "./board-clash.ts";
@@ -330,3 +330,5 @@ export {
   setRuntimeCredentials,
   withoutCredentials as withoutCredentialEnv,
 } from "./credentials.ts";
+export type { CandidateOutcome, SpeculativeRoundOptions, SpeculativeRoundResult } from "./speculative-integration.ts";
+export { DEFAULT_SPECULATE, formatCandidates, integrateSpeculativeRound, MAX_SPECULATE } from "./speculative-integration.ts";

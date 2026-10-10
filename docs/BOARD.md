@@ -109,7 +109,7 @@ write, leaves all of them untouched. Rejections carry a machine-readable code:
 `NO_GOAL`, `UNKNOWN_AGENT`, `UNKNOWN_REF`, `DUPLICATE`, `ITEM_NOT_OPEN`,
 `NOT_OWNER`, `CONTEST_OPEN`, `CONTEST_CLOSED`, `INTENT_OVERLAP`,
 `OUTSIDE_INTENT`, `OUTSIDE_SCOPE`, `PROTECTED`, `CONTRACT_REJECTED`, `NOT_WITHIN`, `INVALID_STATE`,
-`LIMIT`, `NOT_SUPPORTED` (a split under the cloud integrator), `CLAIM_CAP`, `SEAM_FIRST`,
+`LIMIT`, `NOT_SUPPORTED` (a split, or a goal with `speculate` above 1, under the cloud integrator), `CLAIM_CAP`, `SEAM_FIRST`,
 `SEAM_OVERLAP` (a claim writing a shared seam another holder's scope covers),
 `STALE_BASE` (a revision not built on the board's integrated head). `AUTH` is 401,
 `LIMIT` is 409 (413 for an oversized body), the rest are 400.
@@ -153,7 +153,9 @@ joinsGate?: false}` (engine, derived), `tool.used {capability, version, by, item
 paths?, scope?, reason?}` (engine, recorded, advisory), `trunk.moved {rev, commit, expected?, actual?}` (engine, recorded),
 `token.refreshed {agent, kind: repo-write | help-fork, request?}` (engine, recorded; never a token),
 `revision.promoted {rev, gatedCommit, commit, branch}` (engine, recorded), `run.capped {kind: model-calls | spend | wall-clock |
-item-calls, limit, used, item?}` (engine, recorded), `decision.recorded {juncture:
+item-calls, limit, used, item?}` (engine, recorded), `candidate.gated {round, index, of, prefix: [{agent, items, commit}], commit,
+base?, verdict: pass | fail, outcome: landed | passed | blamed | retest, rev?, blamed?, progress?}` (engine, recorded: one
+speculative candidate; see "Speculative batch gating"), `decision.recorded {juncture:
 plan-review | attribution | fix-confidence | contract-triage, question, answer?, confidence?, accepted, error?, rev?,
 parsed?, contract?}` (engine, advisory), `decision.resolved {decisionSeq, rev, passed, answer, outcome:
 in-fixed-set | not-in-fixed-set, fixed, parsed, parseOutcome: in-fixed-set | not-in-fixed-set | none}` (engine, derived, advisory),
@@ -170,8 +172,9 @@ two symbols in one file contest.
 `goal.posted` records the rules the board runs under (`maxContestTurns`,
 default 3; `contestIdleMessages`, default 25; `maxFixAttempts`, default 2;
 the optional `maxActiveClaims`, `claimLeaseMessages`, `claimDeadlineMessages`,
-and `claimOverlap`, each absent on a board posted before it, which then
-behaves as before), the integration `baseline` commit and the `gateCommand`
+`claimOverlap`, and `speculate` (speculative batch gating, 1 to 8; absent
+means 1), each absent on a board posted before it, which then behaves as
+before), the integration `baseline` commit and the `gateCommand`
 (both optional), and
 the CONTRACT (`protected`: the existing tests and gate configuration no agent
 may change alone; `protectedKeys`: gate-defining keys inside editable files,
@@ -741,7 +744,9 @@ is distributed changes: items are proposed and claimed, never assigned.
 - `ContinuousBoardIntegrator` serializes revisions (one at a time) and coalesces
   pushes that land while one runs into the next; the same pending set is never
   gated twice. In `lockstep` it integrates between rounds; in `concurrent` the
-  driver kicks it whenever it observes pending pushes.
+  driver kicks it whenever it observes pending pushes. With speculation on (the
+  `speculate` rule, K > 1) and a head that passed, a round gates prefix
+  candidates of the pending pushes instead (next section).
 - A failing revision's reason (`failure:`) and its evidence lead with the
   gate's own failing line (a `SyntaxError`, a failing test); an inventory
   shortfall is the stated cause only when the gate exited 0 (the early exit it
@@ -978,8 +983,13 @@ switchyard-change run-board --offline [--fixture-gate] [--decide-contracts accep
 switchyard-change run-board "<goal>" --project <dir> --worker <url> [--min N] [--max N] \
   [--id <changeId>] [--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] \
   [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] \
-  [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [--allow-heuristic-planner]
+  [--speculate K] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [--allow-heuristic-planner]
 ```
+
+`--speculate K` (1 to 8; default 3 with the local integrator) sets speculative
+batch gating (see "Speculative batch gating" below); `--speculate 1` integrates
+every pending push as one revision, exactly as before. The offline run accepts
+it too (`run-board --offline --speculate K`).
 
 `--integrator local` (the default) integrates in the driver process;
 `--integrator cloud` leaves integration to the Worker's integration Workflow,
@@ -989,6 +999,83 @@ INTEGRATOR=cloud` passes it through.
 A live board run needs `EXECUTOR=ai-gateway` with the gateway URL and token
 (the turn model is `AI_GATEWAY_AGENT_MODEL`, else `AI_GATEWAY_MODEL`); without a
 live turn model it refuses rather than substituting the offline policy.
+
+### Speculative batch gating (`speculate`, `candidate.gated`)
+
+One revision of every pending push means one bad push sinks the good ones
+merged with it, and attribution may send fix requests (and charge fix
+budgets) to owners whose pushes were fine. With the goal rule `speculate` K
+(`--speculate K`, 1 to `BOARD_LIMITS.maxSpeculate` = 8; default 3 with the
+local integrator; absent on the goal means 1) the local integrator gates a
+round of PREFIX CANDIDATES instead (`integrateSpeculativeRound`,
+`packages/orchestration/src/speculative-integration.ts`):
+
+- **When.** Only once the integrated head PASSED the gate (a recorded passing
+  revision). A candidate's failure says something about the push it added only
+  when what it was stacked on is known to pass; the goal's baseline may fail
+  the gate (the gaps the goal is about), so until a revision passed, every
+  pending push is integrated as one revision, exactly as with K = 1 (the
+  demos' first, failing revision is unchanged).
+- **The stack.** The units of `planBoardIntegration` (one per agent, pinned,
+  scoped, as above), minus any agent whose pending item carries an unanswered
+  fix request (a push a candidate already blamed waits for its owner's next
+  push instead of sinking the pushes behind it again), ordered by each unit's
+  earliest pending push seq, then agent id (`speculativeUnits`). At most K
+  units are stacked; the rest wait for the next round.
+- **Candidates.** C1 = head + p1, C2 = head + p1 + p2, ..., Ck. Each is built
+  and gated exactly like a revision: the same verifier and integrator, the
+  same immutable gate, contract restore, dependency install, test inventory,
+  and process-group kill per command, each in its own disposable work
+  directories, on the same recorded head, none moving the branch. They run with
+  bounded concurrency (`candidateConcurrency`, default K; the offline run uses
+  1, in order, so its log stays deterministic). A later candidate is not
+  started once a shorter one is known to have failed, nor once a run cap is
+  reached (`stopCandidates`: caps stop NEW candidates; C1 always runs).
+- **Landing.** The LONGEST prefix C1..Ck that all passed lands as ONE passing
+  revision whose recorded commit is exactly Ck's gated commit, built on the
+  head (`STALE_BASE` applies: a head that moved while the candidates gated is
+  a rebuild, never a wrong landing). Nothing lands when C1 fails.
+- **Blame.** When C(k+1) FAILED right after the landed prefix (or C1 failed:
+  head + p1 alone), its last push is the only difference from a tree known to
+  pass, so the failure is attributed to that push: C(k+1) is recorded as a
+  FAILING revision on the same head (its own gated commit, every push it
+  contains in `merged`) whose implicated items are that push's items only,
+  narrowed further by the existing parse of test titles and error locations
+  (`failingRevisionEvidence`; never stack frames). It is recorded BEFORE the
+  landed pass (a failing revision does not move the head), so both name the
+  head they were built on and the pass stays the latest revision. The board's
+  fix loop then asks, and charges the fix budget of, those items alone. With
+  nothing landed the advisory typed decision may narrow among that push's
+  items as for any failing revision; after a landed prefix it is not asked
+  (the pass that follows would resolve its pick at once).
+- **Re-tests.** Every candidate after the first non-pass is NOT blamed: its
+  push stays pending and is stacked again next round on the new head (the
+  blamed push is held, so it no longer sits ahead of it). Each round decides at
+  least its first candidate's push (it lands or is blamed), so a re-tested push
+  is decided within as many rounds as there are pushes ahead of it. The
+  integrator starts the next round itself after a recorded round.
+- **Records.** Every gated candidate is recorded after the revisions as
+  `candidate.gated {round, index, of, prefix, commit, base, verdict, outcome,
+  rev?, blamed?, progress?}` (engine, through the engine-record route):
+  `landed` (rev: the passing revision; the board refuses one whose commit is
+  not the latest passing revision's), `passed` (a longer prefix landed),
+  `blamed` (rev: the failing revision; blamed items), `retest`. Only revisions
+  are verdicts; candidates are records that back them, and the board refuses
+  them unless the goal's `speculate` rule is above 1. A candidate that was not
+  built, or not gated, is never recorded.
+- **Console and proof.** A revision's detail lists the candidates of the round
+  that recorded it (records, each with its seq: no new node or edge kind), the
+  thread shows each `candidate.gated`, and the proof bundle lists the round
+  that landed the final revision with its landed candidate, whose commit must
+  be the revision's gated commit and the promoted one (`formatProofSummary`
+  prints it on one line). Recorded replays without candidates fold unchanged.
+- **K = 1** records exactly the board log of the integrator before this
+  feature (a golden test pins the offline demo's log), and the goal posts no
+  `speculate` rule.
+- **Cloud.** The integration Workflow on Cloudflare gates one revision at a
+  time: with `--integrator cloud` the default is 1, and `--speculate` above 1
+  is refused at startup (the CLI and `runBoard`), as is a goal with
+  `integrator: cloud` and `speculate` above 1 (`NOT_SUPPORTED`), like splits.
 
 ## Agent-built tools
 
@@ -1278,7 +1365,9 @@ an announced push the integrator gates.
 
 With the cloud integrator the driver does not integrate. The Worker does, on
 Cloudflare primitives, through the same board path and with the same
-integrator code:
+integrator code. It gates one revision at a time: speculative batch gating is
+a local-integrator feature, and a cloud run with `--speculate` above 1 is
+refused at startup (see "Speculative batch gating"):
 
 - **Trigger.** An agent's `push.announced` (the board's authoritative signal:
   the commit is pinned there) asks the ChangeState for integration. When no
@@ -1594,7 +1683,10 @@ decisions, and the lapses, re-plans, escalations, clash predictions, trunk
 moves, token refreshes, and caps. It is PROVEN only when the last revision
 passed a gate that ran and the recorded promotion's gated commit is that
 revision's commit (and, when both are known, it executed at least the
-baseline's tests); otherwise NOT-PROVEN with each reason. The CLI prints a
+baseline's tests); otherwise NOT-PROVEN with each reason. With speculative
+batch gating it also lists the candidates of the round that landed the final
+revision and the landed one (whose commit must be the revision's and the
+promoted gated commit, else NOT-PROVEN). The CLI prints a
 summary and writes the JSON to `--proof-out`, or `proof-bundle.json` in a kept
 work root (a live run's, or `--keep-work-root`); the console's PROOF tab
 renders it from the log alone, so a recorded run shows it too.
@@ -1611,6 +1703,7 @@ and `--max-item-calls` (default 8 per item turn, across agents). Reaching a
 run cap records `run.capped {kind, limit, used}` once, stops new turns (the
 metered transport answers `wait` without calling the model), ends the agent
 phase as `capped`, lets the integrator finish what is in flight, and the
-verdict stays the gate's. An item at its cap gets no more turns (`ITEM_CAP`,
+verdict stays the gate's; a reached cap also stops new speculative candidates
+(each round then gates its first candidate only). An item at its cap gets no more turns (`ITEM_CAP`,
 recorded once per item). The budgets line prints the caps; the summary prints
 the usage.

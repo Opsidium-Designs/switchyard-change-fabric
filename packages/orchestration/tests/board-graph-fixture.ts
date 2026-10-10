@@ -11,6 +11,7 @@
 import {
   appendBoardMessage,
   appendDecisionRecorded,
+  appendEngineRecord,
   appendIntegratedRev,
   appendToolGated,
   appendToolUsed,
@@ -68,6 +69,11 @@ export class FixtureBoard {
   /** The operator records a use the runtime ran (agents never post one). */
   toolUse(input: Record<string, unknown>): readonly BoardMessage[] {
     return this.take(appendToolUsed(this.state, input, AT));
+  }
+
+  /** The operator records an engine fact (candidate.gated, revision.promoted, ...). */
+  record(type: string, payload: Record<string, unknown>): readonly BoardMessage[] {
+    return this.take(appendEngineRecord(this.state, { type, payload }, AT));
   }
 
   lastSeqOf(type: string): number {
@@ -262,5 +268,37 @@ export function formationLog(): BoardMessage[] {
   b.agent("ag-3", { type: "help.offered", payload: { request: "h1", forkOf: "ag-2", forkCommit: "c0000004", fork: "chg--help-h1" }, to: ["ag-2"] });
   b.agent("ag-3", { type: "help.delivered", payload: { request: "h1", commit: "c0000005", paths: ["src/p/b.ts"] }, to: ["ag-2"] });
   b.agent("ag-2", { type: "push.announced", payload: { item: "pair", commit: "c0000005", paths: ["src/p/b.ts"], pulled: ["h1"] } });
+  return b.log;
+}
+
+/**
+ * A speculative-gating log (rules.speculate 2): after a first passing
+ * revision, two pushes are stacked; C1 (one) passes and C2 (one then two)
+ * fails, so C2 is recorded first as a failing revision implicating two only,
+ * then C1 lands as the passing revision (its commit is C1's), both candidates
+ * are recorded, and the landed revision is promoted.
+ */
+export function speculativeLog(): BoardMessage[] {
+  const b = new FixtureBoard();
+  b.human({ type: "goal.posted", payload: { objective: "add two reports", baseline: "base000", rules: { speculate: 2 }, gateCommand: ["npm", "run", "gate"] } });
+  b.join("lead", "lead");
+  for (const item of ["warm", "one", "two"]) {
+    b.agent("lead", { type: "item.proposed", payload: { item, objective: `report ${item}`, scopeHint: [`src/${item}/**`] } });
+  }
+  for (const [agent, item] of [["ag-0", "warm"], ["ag-1", "one"], ["ag-2", "two"]] as const) {
+    b.join(agent);
+    b.agent(agent, { type: "item.claimed", payload: { item, intent: { read: [], write: [`src/${item}/**`] } } });
+  }
+  b.agent("ag-0", { type: "push.announced", payload: { item: "warm", commit: "aaa0000", paths: ["src/warm/w.js"] } });
+  b.rev({ commit: "rev1000", gate: "pass", merged: ["aaa0000"], base: "base000" });
+  b.agent("ag-1", { type: "push.announced", payload: { item: "one", commit: "bbb1111", paths: ["src/one/a.js"] } });
+  b.agent("ag-2", { type: "push.announced", payload: { item: "two", commit: "ccc2222", paths: ["src/two/b.js"] } });
+  b.rev({ commit: "cand222", gate: "fail", merged: ["bbb1111", "ccc2222"], base: "rev1000", failing: { output: "not ok 1 - src/two/b.js:3 total is wrong", items: ["two"] } });
+  b.rev({ commit: "cand111", gate: "pass", merged: ["bbb1111"], base: "rev1000" });
+  const one = { agent: "ag-1", items: ["one"], commit: "bbb1111" };
+  const two = { agent: "ag-2", items: ["two"], commit: "ccc2222" };
+  b.record("candidate.gated", { round: 1, index: 1, of: 2, prefix: [one], commit: "cand111", base: "rev1000", verdict: "pass", outcome: "landed", rev: 3 });
+  b.record("candidate.gated", { round: 1, index: 2, of: 2, prefix: [one, two], commit: "cand222", base: "rev1000", verdict: "fail", outcome: "blamed", rev: 2, blamed: ["two"] });
+  b.record("revision.promoted", { rev: 3, gatedCommit: "cand111", commit: "prom333", branch: "switchyard/change-1" });
   return b.log;
 }

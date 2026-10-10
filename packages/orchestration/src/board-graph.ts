@@ -166,6 +166,25 @@ export interface RevNodeDetail {
   readonly install?: string;
   /** ADVISORY: how many of the gate's checks passed, and the change since the previous revision that recorded it. */
   readonly progress?: GraphProgress;
+  /**
+   * The speculative round this revision came from (candidate.gated records,
+   * each backed by its seq): every candidate it gated and what became of it.
+   * Records, not nodes: only revisions are drawn.
+   */
+  readonly candidates?: readonly RevCandidate[];
+}
+
+/** One speculative candidate in a revision's detail. */
+export interface RevCandidate {
+  readonly seq: number;
+  readonly index: number;
+  /** The items of each push in the candidate's stack, in order (`a then b+c`). */
+  readonly prefix: string;
+  readonly commit: string;
+  readonly verdict: "pass" | "fail";
+  readonly outcome: "landed" | "passed" | "blamed" | "retest";
+  readonly rev?: number;
+  readonly blamed?: readonly string[];
 }
 
 /**
@@ -405,6 +424,7 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     case "clash.predicted":
     case "trunk.moved":
     case "revision.promoted":
+    case "candidate.gated":
     case "fix.requested":
     case "fix.exhausted":
       return "rev";
@@ -780,6 +800,33 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
   let latestRev: BoardMessageOf<"integrated.rev"> | undefined;
   let previousProgress: { passed: number; acceptance: boolean } | undefined;
   let latestProgress: GraphProgress | undefined;
+  // Each speculative round's candidates, attached to every revision the round recorded.
+  const candidateRounds = new Map<number, RevCandidate[]>();
+  for (const m of messages) {
+    if (isType(m, "candidate.gated")) {
+      const c = m.payload;
+      const list = candidateRounds.get(c.round) ?? [];
+      list.push({
+        seq: m.seq,
+        index: c.index,
+        prefix: c.prefix.map((x) => x.items.join("+")).join(" then "),
+        commit: c.commit,
+        verdict: c.verdict,
+        outcome: c.outcome,
+        ...(c.rev !== undefined ? { rev: c.rev } : {}),
+        ...(c.blamed !== undefined ? { blamed: c.blamed } : {}),
+      });
+      candidateRounds.set(c.round, list);
+    }
+  }
+  const candidatesByRev = new Map<number, RevCandidate[]>();
+  for (const list of candidateRounds.values()) {
+    for (const c of list) {
+      if (c.rev !== undefined) {
+        candidatesByRev.set(c.rev, list);
+      }
+    }
+  }
   for (const m of messages) {
     if (isType(m, "push.announced")) {
       pushByCommit.set(m.payload.commit, m);
@@ -837,6 +884,7 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
         ...(failureLine !== undefined ? { failureLine } : {}),
         ...(install !== undefined ? { install } : {}),
         ...(progress ? { progress } : {}),
+        ...(candidatesByRev.has(p.n) ? { candidates: candidatesByRev.get(p.n)! } : {}),
       },
     });
     if (previousRev) {

@@ -10,6 +10,7 @@ import { describe, expect, it } from "vitest";
 import { appendBoardMessage, appendDecisionRecorded, appendEngineRecord, appendIntegratedRev, emptyBoard, type BoardMessage, type BoardState } from "@switchyard-change/change-core";
 
 import { buildProofBundle, formatProofSummary } from "../src/proof-bundle.ts";
+import { speculativeLog } from "./board-graph-fixture.ts";
 
 const AT = "2026-01-01T00:00:00.000Z";
 
@@ -129,5 +130,27 @@ describe("the proof bundle (pure, from the log)", () => {
     const upToFailure = run.messages.slice(0, run.messages.findIndex((m) => m.type === "integrated.rev" && m.payload.gate === "fail") + 1);
     expect(buildProofBundle(upToFailure)).toMatchObject({ status: "not-proven", reasons: ["the last revision (1) failed its gate"] });
     expect(buildProofBundle([])).toMatchObject({ status: "not-proven", reasons: ["no integrated revision was recorded"] });
+  });
+});
+
+describe("the proof bundle of a speculative round", () => {
+  it("lists the candidates the landing round considered and ties the landed one to the gated and promoted commit", () => {
+    const log = speculativeLog();
+    const bundle = buildProofBundle(log);
+    expect(bundle.status).toBe("proven");
+    expect(bundle.speculation).toMatchObject({
+      round: 1,
+      landed: { index: 1, commit: "cand111", rev: 3, matchesRevision: true, matchesPromoted: true },
+    });
+    expect(bundle.speculation!.candidates.map((c) => [c.index, c.prefix, c.verdict, c.outcome, c.rev, c.blamed ?? null])).toEqual([
+      [1, [["one"]], "pass", "landed", 3, null],
+      [2, [["one"], ["two"]], "fail", "blamed", 2, ["two"]],
+    ]);
+    expect(formatProofSummary(bundle)).toContain(
+      "  speculation: round 1, C1 cand111 pass (landed as rev 3 (its gated commit), promoted), C2 cand222 fail (blamed two in rev 2)",
+    );
+    // Before the landing round, the last revision has no landed candidate: no speculation section.
+    const beforeCandidates = log.slice(0, log.findIndex((m) => m.type === "candidate.gated"));
+    expect(buildProofBundle(beforeCandidates).speculation).toBeUndefined();
   });
 });

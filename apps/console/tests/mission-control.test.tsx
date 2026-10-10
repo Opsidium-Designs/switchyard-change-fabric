@@ -19,7 +19,8 @@ import {
   type BoardPoint,
 } from "@switchyard-change/orchestration/board-graph";
 
-import { FixtureBoard, formationLog, missionControlLog, ungatedLog } from "../../../packages/orchestration/tests/board-graph-fixture.ts";
+import { FixtureBoard, formationLog, missionControlLog, speculativeLog, ungatedLog } from "../../../packages/orchestration/tests/board-graph-fixture.ts";
+import { buildProofBundle } from "@switchyard-change/orchestration/proof-bundle";
 import { launchArgs, launchOptionsFromBody, runBoardArgs } from "../launcher";
 import { isBoardRun } from "../src/App.tsx";
 import { mergeBoardLog, pullBoard, resolveEscalation } from "../src/board-data.ts";
@@ -34,6 +35,7 @@ import {
   textBoost,
   BoardNodeDetail,
   BoardPane,
+  ProofPanel,
   EscalationCard,
   escalationCards,
   MissionControl,
@@ -243,6 +245,29 @@ describe("honesty labels", () => {
     const detail = renderToStaticMarkup(createElement(BoardNodeDetail, { node: tool }));
     expect(detail).toContain("Tool gate evidence");
     expect(detail).toContain("finds: ok - found 4 place(s) in 4 file(s) on the baseline");
+  });
+
+  it("shows a revision's speculative candidates (records, not nodes) in its detail, the thread, and the proof", () => {
+    const spec = speculativeLog();
+    const model = buildBoardGraph(spec);
+    expect(model.nodes.some((n) => n.id.includes("cand"))).toBe(false);
+    const landed = model.nodes.find((n) => n.id === "rev:3")!;
+    const detail = renderToStaticMarkup(createElement(BoardNodeDetail, { node: landed }));
+    expect(detail).toContain("Speculative candidates");
+    expect(detail).toMatch(/C1 <code>cand111<\/code> one: PASS, landed \(rev 3\)/);
+    expect(detail).toMatch(/C2 <code>cand222<\/code> one then two: FAIL, blamed \(rev 2\); blamed two/);
+    const thread = renderToStaticMarkup(
+      createElement(Thread, { messages: spec.filter((m) => m.type === "candidate.gated"), title: "t", selectedSeq: null, onSelectSeq: () => {}, onSelectAgent: () => {} }),
+    );
+    expect(thread).toContain("round 1 C2/2 cand222 (one then two): gate fail, blamed (rev 2); blamed two");
+    const bundle = buildProofBundle(spec);
+    expect(bundle.status).toBe("proven");
+    expect(bundle.speculation?.landed).toMatchObject({ commit: "cand111", rev: 3, matchesRevision: true, matchesPromoted: true });
+    const proof = renderToStaticMarkup(createElement(ProofPanel, { bundle, onSelectSeq: () => undefined }));
+    expect(proof).toContain("<dt>speculation</dt>");
+    expect(proof).toMatch(/C1 pass \(landed, the gated commit\)/);
+    expect(proof).toMatch(/C2 fail \(blamed\)/);
+    expect(proof).not.toMatch(/undefined|NaN/);
   });
 
   it("describes a resolved attribution as where the pick landed, advisory", () => {

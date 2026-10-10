@@ -154,7 +154,11 @@ before a human is asked, overlapping scopes and predicted clashes are flagged,
 stale revisions are refused, agents' repo tokens are refreshed, cost and time
 caps stop new turns, and each run ends with a proof bundle of what it can
 prove about the revision it shipped (see "Stalls, re-plans, clashes, proofs,
-and caps" in docs/BOARD.md). With
+and caps" in docs/BOARD.md). Once a revision has passed, the local integrator
+gates speculative prefix candidates of the pending pushes (`--speculate K`,
+default 3), lands the longest passing prefix, and blames only the push whose
+candidate failed after a passing one (see "Speculative batch gating" in
+docs/BOARD.md). With
 `--integrator cloud` the integration runs on Cloudflare instead of in the
 driver: a Workflow gates each revision in a Cloudflare Container with phased
 egress (`make dev-containers` locally, Docker required). See

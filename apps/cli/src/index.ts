@@ -56,6 +56,9 @@ import {
   recordAppDeployment,
   boardSeedFromChange,
   formatBoardRunSummary,
+  formatCandidates,
+  DEFAULT_SPECULATE,
+  MAX_SPECULATE,
   formatBoardTranscript,
   formatBudgetsLine,
   formatProofSummary,
@@ -920,7 +923,7 @@ const commands: Command[] = [
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
       `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--id <changeId>] ` +
-      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const goal = await resolveGoal(args);
@@ -997,6 +1000,21 @@ const commands: Command[] = [
       }
       if (integratorFlag === "cloud" && hasFlag(args, "--offline")) {
         console.error("Error: --integrator cloud needs a live Worker; the offline board run integrates locally");
+        return 1;
+      }
+      // Speculative batch gating: up to K prefix candidates per round (default
+      // 3 with the local integrator; 1 integrates every pending push as one
+      // revision). The cloud integration Workflow gates one revision at a time.
+      const speculateRaw = optionValue(args, "--speculate");
+      const speculate = speculateRaw === undefined ? undefined : Number(speculateRaw);
+      if (speculate !== undefined && (!Number.isInteger(speculate) || speculate < 1 || speculate > MAX_SPECULATE)) {
+        console.error(`Error: --speculate must be an integer from 1 to ${MAX_SPECULATE}`);
+        return 1;
+      }
+      if (integratorFlag === "cloud" && speculate !== undefined && speculate > 1) {
+        console.error(
+          "Error: --speculate above 1 needs the local integrator: the cloud integration Workflow gates one revision at a time (pass --speculate 1 or --integrator local)",
+        );
         return 1;
       }
       const gateWiring = buildAppGateWiring({
@@ -1082,6 +1100,7 @@ const commands: Command[] = [
           ...contractOptions,
           ...(fixtureGate ? { fixtureGate: true } : {}),
           ...(declaredGate ? { replacesDeclaredGate: declaredGate } : {}),
+          ...(speculate !== undefined ? { speculate } : {}),
         });
         console.log("Board transcript:");
         console.log(redactSecrets(formatBoardTranscript(result.log)));
@@ -1135,11 +1154,14 @@ const commands: Command[] = [
       console.log(
         integratorFlag === "cloud"
           ? "  integrator: cloud (the Worker's integration Workflow gates each revision in a Cloudflare Container; promotion stays local)"
-          : "  integrator: local (this process integrates and gates each revision)",
+          : `  integrator: local (this process integrates and gates each revision; speculative batch gating: ${
+              (speculate ?? DEFAULT_SPECULATE) > 1 ? `up to ${speculate ?? DEFAULT_SPECULATE} prefix candidates per round` : "off"
+            })`,
       );
       console.log("");
       const result = await runBoard({
         ...(integratorFlag === "cloud" ? { integrator: "cloud" as const, ...(gateTimeoutMs !== undefined ? { cloudGateTimeoutMs: gateTimeoutMs } : {}) } : {}),
+        ...(speculate !== undefined ? { speculate } : {}),
         goal,
         projectDir,
         changeId,
@@ -1237,6 +1259,9 @@ const commands: Command[] = [
               }
               break;
             }
+            case "candidates-gated":
+              console.log(`  speculative candidates: ${formatCandidates(event.candidates)}`);
+              break;
             case "integration-not-recorded":
               console.log(`  integration recorded no revision: ${event.reason}`);
               break;

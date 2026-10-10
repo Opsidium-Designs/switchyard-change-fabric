@@ -216,3 +216,75 @@ export function narrowToSplitChildren(state: BoardState, implicated: readonly st
   }
   return out;
 }
+
+/**
+ * The units a SPECULATIVE round may stack (rules.speculate > 1), in stack
+ * order: every unit of the plan whose items carry no unanswered fix request
+ * (a push a candidate already blamed waits for its owner's next push instead
+ * of sinking the pushes behind it again), ordered by the earliest pending
+ * push seq of each unit (stable: push order, then agent id). Pure.
+ */
+export function speculativeUnits(plan: BoardIntegrationPlan): BoardIntegrationUnitPlan[] {
+  const first = (u: BoardIntegrationUnitPlan): number => Math.min(...u.items.map((i) => i.lastPush!.seq));
+  return plan.units
+    .filter((u) => u.items.every((i) => i.fixRequested === undefined))
+    .sort((a, b) => first(a) - first(b) || (a.agent < b.agent ? -1 : a.agent > b.agent ? 1 : 0));
+}
+
+/**
+ * A stable key for what a speculative round would stack, from state alone:
+ * the pending pushes of the agents whose pending items carry no unanswered
+ * fix request (the units `speculativeUnits` keeps). A round that only blamed
+ * a push changes it, so the pushes behind that push are gated next.
+ */
+export function speculationStateKey(state: BoardState): string {
+  const pending = pendingPushItems(state);
+  const held = new Set(pending.filter((i) => i.fixRequested !== undefined).map((i) => i.lastPush!.agent));
+  return pending
+    .filter((i) => !held.has(i.lastPush!.agent))
+    .map((i) => i.lastPush!.commit)
+    .sort()
+    .join(",");
+}
+
+/** One gated candidate's verdict, by its 1-based index (absent gate: it could not be gated). */
+export interface CandidateVerdict {
+  readonly index: number;
+  readonly gate?: "pass" | "fail";
+}
+
+/** What a speculative round lands and blames (see decideSpeculativeLanding). */
+export interface SpeculativeLanding {
+  /** The landed candidate's index: the longest passing prefix whose shorter prefixes all passed. */
+  readonly landed?: number;
+  /** The candidate whose last push is blamed: the first failure, right after the landed prefix (or the first candidate). */
+  readonly blamed?: number;
+  /** Passing candidates a longer landed prefix subsumes. */
+  readonly passed: readonly number[];
+  /** Candidates after the first non-pass: their own pushes are not blamed; re-tested next round. */
+  readonly retest: readonly number[];
+}
+
+/**
+ * Decide a speculative round from its candidates' verdicts, in index order:
+ * land the longest prefix C1..Ck that all passed (as ONE revision, Ck); blame
+ * C(k+1) when it FAILED (its last push is the only difference from Ck, or
+ * from the head when k = 0, where C1 is that push alone); everything after
+ * the first non-pass is re-tested, never blamed (something ahead of it was
+ * broken or not gated). Pure.
+ */
+export function decideSpeculativeLanding(verdicts: readonly CandidateVerdict[]): SpeculativeLanding {
+  const ordered = [...verdicts].sort((a, b) => a.index - b.index);
+  let k = 0;
+  while (k < ordered.length && ordered[k]!.gate === "pass" && ordered[k]!.index === k + 1) {
+    k += 1;
+  }
+  const next = ordered[k];
+  const blamed = next !== undefined && next.index === k + 1 && next.gate === "fail" ? next.index : undefined;
+  return {
+    ...(k > 0 ? { landed: k } : {}),
+    ...(blamed !== undefined ? { blamed } : {}),
+    passed: ordered.slice(0, Math.max(0, k - 1)).map((v) => v.index),
+    retest: ordered.slice(blamed !== undefined ? k + 1 : k).map((v) => v.index),
+  };
+}

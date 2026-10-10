@@ -254,6 +254,12 @@ export function payloadSummary(message: BoardMessage): string {
       return `seam ${message.payload.item} stalled${message.payload.released ? ": released for another agent" : ""}`;
     case "claim.lapsed":
       return `${message.payload.agent}'s claim on ${message.payload.item} lapsed (${message.payload.reason}): open again`;
+    case "candidate.gated":
+      return `round ${message.payload.round} C${message.payload.index}/${message.payload.of} ${message.payload.commit.slice(0, 7)} (${message.payload.prefix
+        .map((x) => x.items.join("+"))
+        .join(" then ")}): gate ${message.payload.verdict}, ${message.payload.outcome}${message.payload.rev !== undefined ? ` (rev ${message.payload.rev})` : ""}${
+        message.payload.blamed !== undefined ? `; blamed ${message.payload.blamed.join(", ")}` : ""
+      }`;
     case "revision.promoted":
       return `rev ${message.payload.rev} promoted to ${message.payload.branch} (${message.payload.commit.slice(0, 7)}, gated ${message.payload.gatedCommit.slice(0, 7)})`;
     case "trunk.moved":
@@ -1266,6 +1272,20 @@ export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSel
               ))
             : "none recorded"}
         </dd>
+        {bundle.speculation ? (
+          <>
+            <dt>speculation</dt>
+            <dd>
+              round {bundle.speculation.round}:{" "}
+              {bundle.speculation.candidates.map((c, i) => (
+                <span key={c.seq}>
+                  {i > 0 ? ", " : ""}C{c.index} {c.verdict} ({c.outcome}
+                  {c.outcome === "landed" ? (bundle.speculation?.landed?.matchesRevision ? ", the gated commit" : ", NOT the gated commit") : ""}) {seq(c.seq)}
+                </span>
+              ))}
+            </dd>
+          </>
+        ) : null}
         <dt>merged</dt>
         <dd>
           {bundle.contributions.pushesMerged} push(es) from {bundle.contributions.agents.join(", ") || "nobody"};{" "}
@@ -1438,6 +1458,20 @@ export function BoardNodeDetail({ node }: { node: BoardGraphNode }) {
         <>
           <h4>Failing gate output</h4>
           <pre className="detail-pre">{d.failing.output}</pre>
+        </>
+      ) : null}
+      {d.kind === "rev" && d.candidates && d.candidates.length > 0 ? (
+        <>
+          <h4>Speculative candidates</h4>
+          <ol className="mc-candidates" aria-label="Speculative candidates">
+            {d.candidates.map((c) => (
+              <li key={c.seq} className={`mc-candidate is-${c.verdict}${c.rev === d.n ? " is-this" : ""}`} title={`seq ${c.seq}, candidate.gated`}>
+                C{c.index} <code>{c.commit.slice(0, 10)}</code> {c.prefix}: {c.verdict.toUpperCase()}, {c.outcome}
+                {c.rev !== undefined ? ` (rev ${c.rev})` : ""}
+                {c.blamed !== undefined ? `; blamed ${c.blamed.join(", ")}` : ""}
+              </li>
+            ))}
+          </ol>
         </>
       ) : null}
       {d.kind === "rev" && !d.gated ? (

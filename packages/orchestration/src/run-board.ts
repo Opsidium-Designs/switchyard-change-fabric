@@ -47,6 +47,7 @@ import {
   pendingPushItems,
   pendingPushKey,
   planBoardIntegration,
+  speculationStateKey,
   narrowToSplitChildren,
   helpGrantLive,
   routedToSubLead,
@@ -109,6 +110,7 @@ import {
 } from "@switchyard-change/verification";
 
 import { recordPendingClashes, type PendingClashResult } from "./board-clash.ts";
+import { DEFAULT_SPECULATE, formatCandidates, integrateSpeculativeRound, MAX_SPECULATE, type CandidateOutcome, type SpeculativeRoundResult } from "./speculative-integration.ts";
 import { TokenRefresher } from "./token-refresh.ts";
 import { buildProofBundle, type ProofBundle } from "./proof-bundle.ts";
 import { meteredExecutor, meteredTransport, RunMeter, type RunCapReached, type RunCaps } from "./run-meter.ts";
@@ -245,6 +247,8 @@ export type BoardRunEvent =
   | { readonly kind: "agents-done"; readonly reason: BoardStopReason; readonly detail?: string }
   | { readonly kind: "agent-stopped"; readonly agent: string; readonly stop: AgentStop }
   | { readonly kind: "integrated"; readonly revision: BoardRevision }
+  /** A speculative round gated its prefix candidates (recorded as candidate.gated). */
+  | { readonly kind: "candidates-gated"; readonly candidates: readonly CandidateOutcome[] }
   | { readonly kind: "integration-not-recorded"; readonly reason: string }
   | { readonly kind: "nothing-to-integrate" }
   /** The operator ran a tool's own gate on a build and recorded it (published only on a pass). */
@@ -463,6 +467,18 @@ export interface RunBoardOptions {
    * gate container.
    */
   readonly integrator?: "local" | "cloud";
+  /**
+   * SPECULATIVE BATCH GATING: gate up to K prefix candidates of the pending
+   * pushes per round and land the longest passing prefix, blaming only the
+   * push whose candidate failed after a passing one (a goal rule; see
+   * speculative-integration.ts). Default 3 with the local integrator; 1
+   * integrates every pending push as one revision, as before. The cloud
+   * integrator gates one revision at a time: it defaults to 1 and refuses
+   * anything more.
+   */
+  readonly speculate?: number;
+  /** Speculative candidates built and gated at once (default: speculate; 1 keeps the order deterministic). */
+  readonly candidateConcurrency?: number;
   /** Cloud integrator: the gate's limit inside the container, in ms (default 10 minutes). */
   readonly cloudGateTimeoutMs?: number;
   /** Cloud integrator: how long to wait for the Workflow to settle at the end, in ms (default 30 minutes). */
@@ -552,6 +568,8 @@ export interface RunBoardResult {
   readonly toolAuthorLabel?: string;
   /** What the run can prove about the revision it shipped (built from the board log). */
   readonly proof?: ProofBundle;
+  /** The speculation the run used (K) and every speculative round's candidates, in order. */
+  readonly speculation?: { readonly speculate: number; readonly rounds: readonly (readonly CandidateOutcome[])[] };
   /** Model calls and estimated spend the run's meter counted (unpriced calls are counted, never free). */
   readonly usage?: { readonly calls: number; readonly spendUsd: number; readonly unpricedCalls: number; readonly capped: readonly RunCapReached[] };
 }
@@ -635,7 +653,7 @@ export { gateFailureLine };
  * its own failing line leads (the integrator's summary follows); otherwise the
  * integrator's summary (for example an inventory shortfall) is the reason.
  */
-function revisionFailure(check: { readonly summary: string; readonly outputs: readonly { readonly text: string }[] }): string {
+export function revisionFailure(check: { readonly summary: string; readonly outputs: readonly { readonly text: string }[] }): string {
   const key = /exited 0 but/.test(check.summary) ? undefined : gateFailureLine(check.outputs.map((o) => o.text).join("\n"));
   return firstLines(key !== undefined ? `${key}\n${check.summary}` : check.summary, 300);
 }
@@ -818,6 +836,108 @@ export async function verifySubLeadMerges(input: {
   return out;
 }
 
+/**
+ * Record the buffered attribution decisions: linked to revision `n` when it
+ * was recorded (the board then resolves each at the next passing revision),
+ * otherwise, or if the board REFUSES the link, recorded unlinked so the call
+ * stays visible. A transport failure is not a refusal (the linked copy may
+ * have been appended): the linked recording is retried, bounded, and an
+ * unlinked second copy is never posted, so no decision is counted twice.
+ */
+export async function flushAttributionDecisions(
+  operator: Pick<BoardOperatorClient, "log">,
+  recordDecision: RecordBoardDecision | undefined,
+  decisions: BoardDecisionRecord[],
+  n: number | undefined,
+): Promise<void> {
+  const record = recordDecision;
+  if (!record) {
+    decisions.length = 0;
+    return;
+  }
+  // Was a linked attribution of revision `rev` already appended (a lost response)?
+  const alreadyLinked = async (rev: number): Promise<boolean | undefined> => {
+    try {
+      const page = await operator.log();
+      return page.messages.some((m) => m.type === "decision.recorded" && m.payload.juncture === "attribution" && m.payload.rev === rev);
+    } catch {
+      return undefined;
+    }
+  };
+  for (const decision of decisions.splice(0)) {
+    const { parsed, ...unlinked } = decision;
+    if (n === undefined || decision.error !== undefined) {
+      // One attempt only: an unlinked copy cannot be matched on the board, so it is never retried.
+      await record(unlinked);
+      continue;
+    }
+    let outcome: BoardDecisionRecordOutcome | void = await record({ ...unlinked, rev: n, parsed: parsed ?? [] });
+    for (let attempt = 1; attempt < 3 && outcome === "failed"; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** attempt));
+      const found = await alreadyLinked(n);
+      if (found !== false) {
+        // Appended already, or the board is unreadable: never risk a second copy.
+        outcome = found === true ? "recorded" : "failed";
+        break;
+      }
+      outcome = await record({ ...unlinked, rev: n, parsed: parsed ?? [] });
+    }
+    if (outcome === "refused") {
+      // A definite refusal appended nothing: record it unlinked so it stays visible.
+      await record(unlinked);
+    }
+  }
+}
+
+/**
+ * A failing revision's evidence and implicated items: the gate's own failing
+ * line leads, then its output, then the integrator's summary (scrubbed and
+ * bounded); attribution (see attributeRevisionFailure) chooses among `items`,
+ * and an implicated split item is narrowed to the children who wrote the code.
+ */
+export async function failingRevisionEvidence(input: {
+  readonly state: BoardState;
+  readonly check: EvidenceSummary["integration"]["finalCheck"];
+  readonly scrub: (text: string) => string;
+  /** The items attribution chooses among (a failing revision's merged items). */
+  readonly items: readonly BoardItem[];
+  readonly changeId: string;
+  readonly jev?: AskJev;
+  readonly jevThreshold?: number;
+  readonly onDecision?: (decision: BoardDecisionRecord) => Promise<unknown>;
+}): Promise<{ failing: { output: string; items: string[] }; implicated: NonNullable<BoardRevision["implicated"]> }> {
+  const { state, check, scrub } = input;
+  // Lead with the gate's own failing line (a SyntaxError, a failing test),
+  // then its output, then the integrator's summary.
+  const key = gateFailureLine(check.outputs.map((o) => o.text).join("\n"));
+  const raw = scrub([...(key !== undefined ? [key] : []), ...check.outputs.map((o) => o.text), check.summary].join("\n"));
+  // A failure that names only files of already COMPLETED items is a
+  // regression this revision's pushes caused (the tree passed before them),
+  // so their owners are asked to fix it; the evidence says which completed
+  // items regressed.
+  const regressed = Object.values(state.items).filter(
+    (i) => i.status === "done" && i.lastPush !== undefined && i.lastPush.paths.some((p) => raw.includes(p)),
+  );
+  const attribution = await attributeRevisionFailure({
+    items: input.items.map((i) => ({ id: i.id, objective: i.objective, paths: (i.intent?.write ?? []).map(intentPath) })),
+    output: raw,
+    changeId: input.changeId,
+    ...(input.jev ? { jev: input.jev } : {}),
+    ...(input.jevThreshold !== undefined ? { jevThreshold: input.jevThreshold } : {}),
+    ...(input.onDecision ? { onDecision: input.onDecision } : {}),
+  });
+  // A split item's failure is its children's work: ask their owners.
+  const narrowed = narrowToSplitChildren(state, attribution.items, raw);
+  const note =
+    regressed.length > 0
+      ? `regressed completed item(s): ${regressed.map((i) => i.id).join(", ")} (their files fail after this revision's pushes)\n`
+      : "";
+  return {
+    failing: { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: [...narrowed] },
+    implicated: { ...attribution, items: narrowed },
+  };
+}
+
 /** Keep `chosen` in the items' order. */
 function inOrder(chosen: readonly string[], items: readonly { readonly id: string }[]): string[] {
   return items.map((i) => i.id).filter((id) => chosen.includes(id));
@@ -993,83 +1113,21 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   const gate: "pass" | "fail" = evidence.integration.verdict === "verified" ? "pass" : "fail";
   const install = evidence.integration.finalCheck.skipped ? undefined : installing?.takeLastInstall();
   const attributionDecisions: BoardDecisionRecord[] = [];
-  // Record the buffered attribution decisions: linked to revision `n` when it
-  // was recorded (the board then resolves each at the next passing revision),
-  // otherwise, or if the board REFUSES the link, recorded unlinked so the call
-  // stays visible. A transport failure is not a refusal (the linked copy may
-  // have been appended): the linked recording is retried, bounded, and an
-  // unlinked second copy is never posted, so no decision is counted twice.
-  const flushDecisions = async (n: number | undefined): Promise<void> => {
-    const record = options.recordDecision;
-    if (!record) {
-      attributionDecisions.length = 0;
-      return;
-    }
-    // Was a linked attribution of revision `rev` already appended (a lost response)?
-    const alreadyLinked = async (rev: number): Promise<boolean | undefined> => {
-      try {
-        const page = await options.operator.log();
-        return page.messages.some((m) => m.type === "decision.recorded" && m.payload.juncture === "attribution" && m.payload.rev === rev);
-      } catch {
-        return undefined;
-      }
-    };
-    for (const decision of attributionDecisions.splice(0)) {
-      const { parsed, ...unlinked } = decision;
-      if (n === undefined || decision.error !== undefined) {
-        // One attempt only: an unlinked copy cannot be matched on the board, so it is never retried.
-        await record(unlinked);
-        continue;
-      }
-      let outcome: BoardDecisionRecordOutcome | void = await record({ ...unlinked, rev: n, parsed: parsed ?? [] });
-      for (let attempt = 1; attempt < 3 && outcome === "failed"; attempt += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** attempt));
-        const found = await alreadyLinked(n);
-        if (found !== false) {
-          // Appended already, or the board is unreadable: never risk a second copy.
-          outcome = found === true ? "recorded" : "failed";
-          break;
-        }
-        outcome = await record({ ...unlinked, rev: n, parsed: parsed ?? [] });
-      }
-      if (outcome === "refused") {
-        // A definite refusal appended nothing: record it unlinked so it stays visible.
-        await record(unlinked);
-      }
-    }
-  };
+  const flushDecisions = (n: number | undefined): Promise<void> => flushAttributionDecisions(options.operator, options.recordDecision, attributionDecisions, n);
   let failing: { output: string; items: string[] } | undefined;
   let implicated: BoardRevision["implicated"];
   if (gate === "fail") {
-    const check = evidence.integration.finalCheck;
-    // Lead with the gate's own failing line (a SyntaxError, a failing test),
-    // then its output, then the integrator's summary.
-    const key = gateFailureLine(check.outputs.map((o) => o.text).join("\n"));
-    const raw = scrub([...(key !== undefined ? [key] : []), ...check.outputs.map((o) => o.text), check.summary].join("\n"));
-    // A failure that names only files of already COMPLETED items is a
-    // regression this revision's pushes caused (the tree passed before them),
-    // so their owners are asked to fix it; the evidence says which completed
-    // items regressed.
-    const regressed = Object.values(state.items).filter(
-      (i) => i.status === "done" && i.lastPush !== undefined && i.lastPush.paths.some((p) => raw.includes(p)),
-    );
-    const attribution = await attributeRevisionFailure({
-      items: mergedItems.map((i) => ({ id: i.id, objective: i.objective, paths: (i.intent?.write ?? []).map(intentPath) })),
-      output: raw,
+    ({ failing, implicated } = await failingRevisionEvidence({
+      state,
+      check: evidence.integration.finalCheck,
+      scrub,
+      items: mergedItems,
       changeId: options.change.id,
       ...(options.jev ? { jev: options.jev } : {}),
       ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
       // Buffered: an attribution is recorded once its revision is (linked to it).
       ...(options.recordDecision ? { onDecision: async (decision: BoardDecisionRecord) => void attributionDecisions.push(decision) } : {}),
-    });
-    // A split item's failure is its children's work: ask their owners.
-    const narrowed = narrowToSplitChildren(state, attribution.items, raw);
-    implicated = { ...attribution, items: narrowed };
-    const note =
-      regressed.length > 0
-        ? `regressed completed item(s): ${regressed.map((i) => i.id).join(", ")} (their files fail after this revision's pushes)\n`
-        : "";
-    failing = { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: [...narrowed] };
+    }));
   }
   // No final check ran (no gate configured): the revision passed without being checked.
   const gated = !(gate === "pass" && evidence.integration.finalCheck.skipped);
@@ -1215,8 +1273,43 @@ export class ContinuousBoardIntegrator {
        */
       readonly predictClashes?: boolean;
       readonly onClashes?: (result: PendingClashResult) => void;
+      /**
+       * SPECULATIVE BATCH GATING: gate up to this many prefix candidates of
+       * the pending pushes per round (see speculative-integration.ts). 1 (the
+       * default) integrates every pending push as one revision, as before.
+       */
+      readonly speculate?: number;
+      /** Speculative candidates built and gated at once (default: speculate). */
+      readonly candidateConcurrency?: number;
+      /** A reason once a run cap is reached: no new speculative candidate starts. */
+      readonly stopCandidates?: () => string | undefined;
+      /** Called with each speculative round's candidates. */
+      readonly onCandidates?: (candidates: readonly CandidateOutcome[]) => void;
     },
   ) {}
+  /** Every speculative round's candidates, in order (empty without speculation). */
+  readonly rounds: (readonly CandidateOutcome[])[] = [];
+
+  /** Is speculation on (K > 1)? */
+  private get speculating(): boolean {
+    return (this.options.speculate ?? 1) > 1;
+  }
+
+  /**
+   * Does the next attempt speculate? Only with K > 1 AND a head that PASSED
+   * the gate (a recorded passing revision): a candidate's failure blames its
+   * last push only when what it was stacked on is known to pass. While the
+   * head is the goal's baseline (which may fail the gate: the gaps the goal
+   * is about), every pending push is integrated as one revision, as before.
+   */
+  private speculatesOn(state: BoardState): boolean {
+    return this.speculating && state.integrated !== null;
+  }
+
+  /** The pending-push set an attempt would read: every pending push, or (speculating) those not waiting for a fix. */
+  private keyOf(state: BoardState): string {
+    return this.speculatesOn(state) ? speculationStateKey(state) : pendingPushKey(state);
+  }
   /** Pairs of pending pushes this integrator already predicted. */
   private readonly clashSeen = new Set<string>();
 
@@ -1227,7 +1320,7 @@ export class ContinuousBoardIntegrator {
 
   /** Is there a pending-push set this integrator has not tried yet? */
   wants(state: BoardState): boolean {
-    const key = pendingPushKey(state);
+    const key = this.keyOf(state);
     return key !== "" && !this.attempted.has(key);
   }
 
@@ -1260,11 +1353,11 @@ export class ContinuousBoardIntegrator {
 
   private async once(): Promise<void> {
     const state = (await this.options.operator.page(0, 1)).state;
-    const key = pendingPushKey(state);
+    const key = this.keyOf(state);
     if (key === "" || this.attempted.has(key)) {
       return;
     }
-    let result: IntegrateBoardResult;
+    let result: SpeculativeRoundResult;
     try {
       if (this.options.predictClashes !== false) {
         // Clash alerts from real code (advisory): never blocks the revision below.
@@ -1281,7 +1374,15 @@ export class ContinuousBoardIntegrator {
           this.options.onClashes?.(clashes);
         }
       }
-      result = await integrateBoardRevision({ ...this.options, ...(this.holdBack.size > 0 ? { holdBack: [...this.holdBack] } : {}) });
+      const attempt = { ...this.options, ...(this.holdBack.size > 0 ? { holdBack: [...this.holdBack] } : {}) };
+      result = this.speculatesOn(state)
+        ? await integrateSpeculativeRound({
+            ...attempt,
+            speculate: this.options.speculate!,
+            ...(this.options.candidateConcurrency !== undefined ? { candidateConcurrency: this.options.candidateConcurrency } : {}),
+            ...(this.options.stopCandidates ? { stopCandidates: this.options.stopCandidates } : {}),
+          })
+        : await integrateBoardRevision(attempt);
     } catch (error) {
       // A thrown attempt (the board or a repo unreachable) is transient.
       result = {
@@ -1315,14 +1416,25 @@ export class ContinuousBoardIntegrator {
         return;
       }
     }
+    if (result.candidates && result.candidates.length > 0) {
+      this.rounds.push(result.candidates);
+      this.options.onCandidates?.(result.candidates);
+    }
     if (result.revision) {
       // One revision per pending-push set: the same set is never gated twice
       // (the next revision needs a new push).
       this.attempted.add(tried);
-      this.revisions.push(result.revision);
+      for (const revision of result.revisions ?? [result.revision]) {
+        this.revisions.push(revision);
+        this.options.onRevision?.(revision);
+      }
       this.lastEvidence = result.evidence;
       this.lastRequiresGate = result.requiresIntegrationGate;
-      this.options.onRevision?.(result.revision);
+      if (this.speculating) {
+        // A round lands at most K pushes and leaves re-tests behind: gate
+        // what is still pending next (on the new head) without waiting for a kick.
+        this.requested = true;
+      }
       return;
     }
     if (result.stale) {
@@ -1444,6 +1556,18 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         `(${Math.min(3600, ttl)} s), which is not refreshed; lower --timeout-ms or integrate locally`,
     );
   }
+  // Speculative batch gating: a local-integrator feature (the cloud Workflow
+  // gates one revision at a time), refused before anything is provisioned.
+  if (options.speculate !== undefined && (!Number.isInteger(options.speculate) || options.speculate < 1 || options.speculate > MAX_SPECULATE)) {
+    throw new Error(`speculate must be an integer from 1 to ${MAX_SPECULATE}`);
+  }
+  if (options.integrator === "cloud" && (options.speculate ?? 1) > 1) {
+    throw new Error(
+      `speculative batch gating (speculate ${options.speculate}) needs the local integrator: the cloud integration Workflow gates one revision at a time; ` +
+        "drop --speculate (or pass --speculate 1) or integrate locally",
+    );
+  }
+  const speculate = options.speculate ?? (options.integrator === "cloud" ? 1 : DEFAULT_SPECULATE);
   const readTtl = options.readTokenTtlSeconds ?? 600;
   // Cost and time caps: every model call is metered (plan-scaled defaults are set once planned).
   const meter = new RunMeter(options.caps ?? {}, options.capsClock ?? Date.now);
@@ -1621,6 +1745,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         claimDeadlineMessages: effective.claimDeadlineMessages,
         // Overlapping scopes are recorded for both holders (advisory); a shared seam goes through its contract.
         claimOverlap: true,
+        // Speculative batch gating (recorded only when on: absent is 1).
+        ...(speculate > 1 ? { speculate } : {}),
       },
       protected: guarded.paths,
       // The immutable acceptance gate: never contract-changeable.
@@ -1933,6 +2059,18 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     onRevision: (revision) => emit({ kind: "integrated", revision }),
     onFailure: (reason) => emit({ kind: "integration-not-recorded", reason }),
     onClashes: (c) => emit({ kind: "clashes-predicted", pairs: c.pairs, recorded: c.recorded, conflicts: c.conflicts }),
+    ...(speculate > 1
+      ? {
+          speculate,
+          ...(options.candidateConcurrency !== undefined ? { candidateConcurrency: options.candidateConcurrency } : {}),
+          // Caps stop NEW speculative candidates (the first one still gates).
+          stopCandidates: () => {
+            const cap = meter.reached();
+            return cap !== undefined ? `the run reached its ${cap.kind} cap (${cap.used} of ${cap.limit})` : undefined;
+          },
+          onCandidates: (candidates: readonly CandidateOutcome[]) => emit({ kind: "candidates-gated", candidates }),
+        }
+      : {}),
   });
 
   // Contract changes on the original tests wait for a HUMAN: hand each pending
@@ -2451,7 +2589,19 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     const ungated = pendingPushItems(finalState);
     if (verdict === "verified" && ungated.length > 0) {
       verdict = "failed";
-      partial = `the last revision passed, but ${ungated.length} announced push(es) were never gated (items ${ungated.map((i) => i.id).join(", ")}): a partial result is not verified`;
+      // A speculative candidate may have gated and blamed a pending push (its
+      // fix is still owed): say so rather than "never gated".
+      const blamedPending = ungated.filter((i) => i.fixRequested !== undefined);
+      const neverGated = ungated.filter((i) => i.fixRequested === undefined);
+      partial =
+        blamedPending.length === 0
+          ? `the last revision passed, but ${ungated.length} announced push(es) were never gated (items ${ungated.map((i) => i.id).join(", ")}): a partial result is not verified`
+          : `the last revision passed, but ${ungated.length} announced push(es) were not integrated (` +
+            [
+              `failed their gate and await a fix: ${blamedPending.map((i) => i.id).join(", ")}`,
+              ...(neverGated.length > 0 ? [`never gated: ${neverGated.map((i) => i.id).join(", ")}`] : []),
+            ].join("; ") +
+            "): a partial result is not verified";
       emit({ kind: "promotion-skipped", reason: partial });
     }
     const integratedItems = verdict === "verified" ? Object.values(finalState.items).filter((i) => i.lastPush?.integratedIn !== undefined).map((i) => i.id) : [];
@@ -2608,6 +2758,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     cleanedUp,
     toolGates: [...toolBench.gates],
     usage: { calls: meter.calls, spendUsd: Math.round(meter.spendUsd * 1e6) / 1e6, unpricedCalls: meter.unpricedCalls, capped: [...capsReached] },
+    ...(speculate > 1 ? { speculation: { speculate, rounds: integrator instanceof ContinuousBoardIntegrator ? [...integrator.rounds] : [] } } : {}),
     editModels: workers.flatMap((w) => w.editModels.map((e) => ({ agent: w.id, ...e }))),
     budgets: { items: planned.items.length, scopeFiles, ...effective, caps: capsLine },
     ...(options.toolAuthorLabel !== undefined ? { toolAuthorLabel: options.toolAuthorLabel } : {}),
@@ -2912,6 +3063,14 @@ function payloadSummary(m: BoardMessage): string {
       const b = p.b as { agent: string; item: string; sha: string };
       return `${a.agent}'s ${a.item} (${a.sha.slice(0, 10)}) and ${b.agent}'s ${b.item} (${b.sha.slice(0, 10)}): ${p.status === "conflict" ? `would conflict on ${list(p.paths)} (${String(p.scope)})` : `${String(p.status)}: ${String(p.reason).slice(0, 120)}`} (advisory)`;
     }
+    case "candidate.gated": {
+      const c = m.payload;
+      return (
+        `round ${c.round} candidate ${c.index}/${c.of} (${c.prefix.map((x) => x.items.join("+")).join(" then ")}) ${c.commit.slice(0, 10)}: gate ${c.verdict}, ${c.outcome}` +
+        (c.rev !== undefined ? ` (rev ${c.rev})` : "") +
+        (c.blamed !== undefined ? `; blamed ${c.blamed.join(", ")}` : "")
+      );
+    }
     case "run.capped":
       return `${String(p.kind)} cap reached${p.item !== undefined ? ` for ${String(p.item)}` : ""}: ${String(p.used)} of ${String(p.limit)} (no new turns)`;
     case "revision.promoted":
@@ -3212,6 +3371,11 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
           `  ${formatBudgetsLine(result.budgets)}`,
         ]
       : []),
+    ...(result.speculation
+      ? [
+          `  speculation: up to ${result.speculation.speculate} prefix candidate(s) per round, the longest passing prefix lands, only the push whose candidate failed after a passing one is blamed (${result.speculation.rounds.length} round(s))`,
+        ]
+      : []),
     ...(result.usage
       ? [
           `  usage: ${result.usage.calls} model call(s), ${result.usage.spendUsd.toFixed(4)} USD estimated${result.usage.unpricedCalls > 0 ? ` (+${result.usage.unpricedCalls} unpriced call(s))` : ""}` +
@@ -3271,6 +3435,11 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
       }
       for (const ex of rev.excludedAgents) {
         lines.push(`    excluded ${ex.agent}: ${ex.reason}`);
+      }
+      // The speculative round this revision closed (its last recorded revision).
+      const round = (result.speculation?.rounds ?? []).find((r) => Math.max(...r.map((c) => c.rev ?? 0)) === rev.n);
+      if (round) {
+        lines.push(`    speculative candidates: ${formatCandidates(round)}`);
       }
     }
   } else {

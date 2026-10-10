@@ -105,6 +105,16 @@ export interface BoardRules {
    * refused (SEAM_OVERLAP): the seam contract route settles a shared seam.
    */
   readonly claimOverlap?: boolean;
+  /**
+   * SPECULATIVE BATCH GATING (absent: 1, no speculation). With K > 1 the
+   * local integrator orders the pending pushes and gates up to K prefix
+   * candidates of them on the integrated head (base + p1, base + p1 + p2,
+   * ...), lands the longest passing prefix as one revision, and blames only
+   * the push whose candidate failed after a passing one (candidate.gated).
+   * The cloud integrator gates one revision at a time: a goal that integrates
+   * on Cloudflare refuses K > 1. At most BOARD_LIMITS.maxSpeculate.
+   */
+  readonly speculate?: number;
 }
 
 export const DEFAULT_BOARD_RULES: BoardRules = { maxContestTurns: 3, contestIdleMessages: 25, maxFixAttempts: 2 };
@@ -152,6 +162,8 @@ export const BOARD_LIMITS = {
   seamWaitMessages: 60,
   /** Times the lead may extend one claim's deadline (claim.extended). */
   maxClaimExtensions: 2,
+  /** Prefix candidates one speculative integration round may gate (the speculate rule's bound). */
+  maxSpeculate: 8,
   /**
    * Stall releases (lapsed claims, released seam stalls) after which an item
    * is not released again by a quiet board: it is the lead's to re-plan.
@@ -313,6 +325,13 @@ export interface BoardClashHead {
   readonly agent: string;
   readonly item: string;
   readonly sha: string;
+}
+
+/** One push of a speculative candidate's stack: an agent's pinned commit and the items it carries. */
+export interface BoardCandidatePush {
+  readonly agent: string;
+  readonly items: readonly string[];
+  readonly commit: string;
 }
 
 /** The payload of each message type. */
@@ -530,6 +549,37 @@ export interface BoardPayloads {
    * the gate's.
    */
   "run.capped": { readonly kind: "model-calls" | "spend" | "wall-clock" | "item-calls"; readonly limit: number; readonly used: number; readonly item?: string };
+  /**
+   * Engine (recorded by the operator): one candidate of a SPECULATIVE
+   * integration round (rules.speculate > 1). Candidate `index` of `of` is the
+   * integrated head (`base`) plus the first `index` pushes of the round's
+   * stack (`prefix`, in stack order, each an agent's pinned push and the
+   * items it carries), built as its own tree (`commit`) and gated by the same
+   * gate. `outcome`:
+   *   - landed: the longest passing prefix whose shorter prefixes all passed;
+   *     `rev` is the passing revision recorded with exactly this commit;
+   *   - passed: it passed, but a longer prefix landed;
+   *   - blamed: it failed right after a passing prefix (or as the first
+   *     candidate, base + its push alone): its last push is attributed
+   *     (`blamed` items) and `rev` is the failing revision recorded with
+   *     exactly this commit (its fix loop charges only those items);
+   *   - retest: something ahead of it failed, so its own push is not blamed;
+   *     it is gated again next round on the head.
+   * Only revisions are verdicts; candidates are records that back them.
+   */
+  "candidate.gated": {
+    readonly round: number;
+    readonly index: number;
+    readonly of: number;
+    readonly prefix: readonly BoardCandidatePush[];
+    readonly commit: string;
+    readonly base?: string;
+    readonly verdict: "pass" | "fail";
+    readonly outcome: "landed" | "passed" | "blamed" | "retest";
+    readonly rev?: number;
+    readonly blamed?: readonly string[];
+    readonly progress?: BoardRevProgress;
+  };
   /** Engine (derived): an item the lead already re-planned failed again (fix budget spent, or stalled twice): a human decides. */
   "item.escalated": { readonly item: string; readonly reason: "replan-failed"; readonly replanOf: string };
   "item.discovered": {
@@ -841,6 +891,7 @@ export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "token.refreshed",
   "revision.promoted",
   "run.capped",
+  "candidate.gated",
   "item.discovered",
   "help.requested",
   "help.offered",
@@ -1288,6 +1339,8 @@ export interface BoardState {
   promoted?: { readonly rev: number; readonly gatedCommit: string; readonly commit: string; readonly branch: string; readonly seq: number };
   /** The gate command, as posted with the goal. */
   gateCommand?: string[];
+  /** The latest speculative candidate recorded (candidate.gated): rounds and indexes only move forward. */
+  lastCandidate?: { readonly round: number; readonly index: number; readonly seq: number };
   /** The caps the run reached (run.capped). */
   capped?: { readonly kind: string; readonly limit: number; readonly used: number; readonly item?: string; readonly seq: number }[];
 }
@@ -1656,6 +1709,7 @@ function rules(raw: Raw): BoardRules {
     ...(value.claimLeaseMessages !== undefined ? { claimLeaseMessages: positiveInt(value, "claimLeaseMessages", 10000) } : {}),
     ...(value.claimDeadlineMessages !== undefined ? { claimDeadlineMessages: positiveInt(value, "claimDeadlineMessages", 100000) } : {}),
     ...(value.claimOverlap !== undefined ? { claimOverlap: bool(value, "claimOverlap") } : {}),
+    ...(value.speculate !== undefined ? { speculate: positiveInt(value, "speculate", BOARD_LIMITS.maxSpeculate) } : {}),
   };
 }
 
@@ -1771,9 +1825,16 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
       const guarded = pathList(raw, "protected", { optional: true, max: L.maxProtected });
       const keys = textList(raw, "protectedKeys", L.maxProtected, L.maxEntryLength);
       const inventory = raw.testInventory === undefined ? undefined : testInventory(raw.testInventory);
+      const goalRules = rules(raw);
+      if (raw.integrator === "cloud" && (goalRules.speculate ?? 1) > 1) {
+        fail(
+          "NOT_SUPPORTED",
+          "this run integrates on Cloudflare, whose integration Workflow gates one revision at a time: speculative batch gating (rules.speculate > 1) is not supported; integrate locally or drop it",
+        );
+      }
       return {
         objective: text(raw, "objective", L.maxRationale),
-        rules: rules(raw),
+        rules: goalRules,
         ...(guarded.length > 0 ? { protected: guarded } : {}),
         ...(keys.length > 0 ? { protectedKeys: keys } : {}),
         ...(inventory !== undefined ? { testInventory: inventory } : {}),
@@ -1897,6 +1958,42 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
     }
     case "item.escalated":
       return { item: id(raw, "item"), reason: oneOf(raw, "reason", ["replan-failed"] as const), replanOf: id(raw, "replanOf") };
+    case "candidate.gated": {
+      if (!Array.isArray(raw.prefix) || raw.prefix.length === 0 || raw.prefix.length > L.maxSpeculate) {
+        fail("BAD_PAYLOAD", `prefix must be an array of 1 to ${L.maxSpeculate} pushes {agent, items, commit}`);
+      }
+      const prefix = raw.prefix.map((entry): BoardCandidatePush => {
+        if (!isRecord(entry) || Object.keys(entry).some((k) => !["agent", "items", "commit"].includes(k))) {
+          fail("BAD_PAYLOAD", "each prefix push is {agent, items, commit}");
+        }
+        const items = idList(entry, "items", { max: L.maxIntentEntries });
+        if (items.length === 0) {
+          fail("BAD_PAYLOAD", "a prefix push carries at least one item");
+        }
+        return { agent: id(entry, "agent"), items, commit: id(entry, "commit") };
+      });
+      const index = positiveInt(raw, "index", L.maxSpeculate);
+      const of = positiveInt(raw, "of", L.maxSpeculate);
+      if (index > of || prefix.length !== index) {
+        fail("BAD_PAYLOAD", "candidate index (at most of) is the length of its prefix");
+      }
+      const base = optionalId(raw, "base");
+      const rev = raw.rev === undefined ? undefined : positiveInt(raw, "rev");
+      const blamed = idList(raw, "blamed", { optional: true, max: L.maxIntentEntries });
+      return {
+        round: positiveInt(raw, "round"),
+        index,
+        of,
+        prefix,
+        commit: id(raw, "commit"),
+        ...(base !== undefined ? { base } : {}),
+        verdict: oneOf(raw, "verdict", ["pass", "fail"] as const),
+        outcome: oneOf(raw, "outcome", ["landed", "passed", "blamed", "retest"] as const),
+        ...(rev !== undefined ? { rev } : {}),
+        ...(blamed.length > 0 ? { blamed } : {}),
+        ...(raw.progress !== undefined ? { progress: revProgress(raw.progress) } : {}),
+      };
+    }
     case "trunk.moved": {
       const expected = optionalId(raw, "expected");
       const actual = optionalId(raw, "actual");
@@ -2353,6 +2450,7 @@ const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "token.refreshed": ["engine"],
   "revision.promoted": ["engine"],
   "run.capped": ["engine"],
+  "candidate.gated": ["engine"],
   "item.discovered": ["agent"],
   "help.requested": ["agent"],
   "help.offered": ["agent"],
@@ -3433,6 +3531,44 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         if (child.scopeHint.length === 0) {
           fail("BAD_PAYLOAD", `child ${child.item} declares no scope hint, so it could never be claimed`);
         }
+      }
+      return;
+    }
+    case "candidate.gated": {
+      const p = draft.payload;
+      if ((state.rules.speculate ?? 1) < 2) {
+        fail("INVALID_STATE", "this board does not gate speculatively (rules.speculate is 1): no candidate is recorded");
+      }
+      if (p.of > (state.rules.speculate ?? 1)) {
+        fail("LIMIT", `a round gates at most ${state.rules.speculate} candidate(s) (rules.speculate)`);
+      }
+      const last = state.lastCandidate;
+      if (last !== undefined && (p.round < last.round || (p.round === last.round && p.index <= last.index))) {
+        fail("DUPLICATE", `candidate ${p.index} of round ${p.round} is not after the last recorded one (${last.index} of round ${last.round})`);
+      }
+      for (const push of p.prefix) {
+        for (const item of push.items) {
+          requireItem(state, item);
+        }
+      }
+      for (const item of p.blamed ?? []) {
+        requireItem(state, item);
+      }
+      if (p.outcome !== "retest" && (p.outcome === "blamed") !== (p.verdict === "fail")) {
+        fail("LOG_MISMATCH", `a ${p.outcome} candidate ${p.outcome === "blamed" ? "failed" : "passed"} its gate`);
+      }
+      if ((p.outcome === "landed" || p.outcome === "blamed") !== (p.rev !== undefined)) {
+        fail("BAD_PAYLOAD", "exactly a landed or a blamed candidate names the revision it backs (rev)");
+      }
+      if ((p.outcome === "blamed") !== (p.blamed !== undefined)) {
+        fail("BAD_PAYLOAD", "exactly a blamed candidate names the items it blames");
+      }
+      if (p.outcome === "landed" && (state.integrated?.n !== p.rev || state.integrated?.commit !== p.commit)) {
+        // Gate equals deploy: the landed candidate IS the latest passing revision.
+        fail("LOG_MISMATCH", `the landed candidate ${p.commit.slice(0, 12)} is not the latest passing revision ${p.rev}'s commit`);
+      }
+      if (p.outcome === "blamed" && (p.rev! > state.lastRevN || state.passingRevs.includes(p.rev!))) {
+        fail("LOG_MISMATCH", `revision ${p.rev} is not a recorded failing revision`);
       }
       return;
     }
@@ -4524,6 +4660,9 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       break;
     case "run.capped":
       (state.capped ??= []).push({ ...message.payload, seq: message.seq });
+      break;
+    case "candidate.gated":
+      state.lastCandidate = { round: message.payload.round, index: message.payload.index, seq: message.seq };
       break;
     case "clash.predicted": {
       const p = message.payload;
@@ -5622,6 +5761,7 @@ const RECORDED_ENGINE_TYPES: ReadonlySet<BoardMessageType> = new Set([
   "token.refreshed",
   "revision.promoted",
   "run.capped",
+  "candidate.gated",
 ]);
 
 /**
@@ -5891,7 +6031,7 @@ export function appendSeamStalled(state: BoardState, input: unknown, at: string)
 }
 
 /** The engine messages the operator records through the engine-record route (`appendEngineRecord`). */
-export const ENGINE_RECORD_TYPES = ["claim.lapsed", "clash.predicted", "trunk.moved", "token.refreshed", "revision.promoted", "run.capped"] as const;
+export const ENGINE_RECORD_TYPES = ["claim.lapsed", "clash.predicted", "trunk.moved", "token.refreshed", "revision.promoted", "run.capped", "candidate.gated"] as const;
 export type EngineRecordType = (typeof ENGINE_RECORD_TYPES)[number];
 
 /**
@@ -5910,6 +6050,9 @@ export type EngineRecordType = (typeof ENGINE_RECORD_TYPES)[number];
  *   - revision.promoted {rev, gatedCommit, commit, branch}: the run promoted
  *     the latest passing revision (its gated commit must be the revision's).
  *   - run.capped {kind, limit, used, item?}: the run reached a cost or time cap.
+ *   - candidate.gated {round, index, of, prefix, commit, base?, verdict,
+ *     outcome, rev?, blamed?, progress?}: one candidate of a speculative
+ *     integration round; a landed one must be the latest passing revision.
  * Refused (nothing appended) when the record does not match the board.
  */
 export function appendEngineRecord(state: BoardState, input: unknown, at: string): BoardAppendResult {
@@ -5945,6 +6088,12 @@ export function appendEngineRecord(state: BoardState, input: unknown, at: string
         },
         at,
       );
+    }
+    case "candidate.gated": {
+      if (Object.keys(raw).some((k) => !["round", "index", "of", "prefix", "commit", "base", "verdict", "outcome", "rev", "blamed", "progress"].includes(k))) {
+        fail("BAD_PAYLOAD", "a candidate.gated record is {round, index, of, prefix, commit, base?, verdict, outcome, rev?, blamed?, progress?}");
+      }
+      return appendChecked(state, { from: BOARD_ENGINE, type: "candidate.gated", payload: parsePayload("candidate.gated", raw) as BoardPayloads["candidate.gated"] }, at);
     }
     case "run.capped": {
       if (Object.keys(raw).some((k) => !["kind", "limit", "used", "item"].includes(k))) {

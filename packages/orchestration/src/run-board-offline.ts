@@ -158,6 +158,12 @@ export interface RunBoardOfflineOptions {
   readonly toolAuthor?: ToolAuthor;
   /** The limit on one tool run (and its tests), in ms (see RunBoardOptions.toolTimeoutMs). */
   readonly toolTimeoutMs?: number;
+  /**
+   * Speculative batch gating (see RunBoardOptions.speculate; default 3). The
+   * offline run gates its candidates one after another, in order, so the log
+   * stays byte-identical run to run.
+   */
+  readonly speculate?: number;
   /** Pin Git author and committer dates for the run so commit ids repeat (default true). */
   readonly fixedGitDates?: boolean;
   readonly onEvent?: (event: BoardRunEvent) => void;
@@ -193,6 +199,9 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
         (async (goal) => boardSeedFromChange((await decomposeGoal({ goal, projectDir: options.projectDir })).change)),
       ...(options.executor ? { executor: options.executor } : {}),
       schedule: "lockstep",
+      ...(options.speculate !== undefined ? { speculate: options.speculate } : {}),
+      // Candidates in order, one at a time: a deterministic log.
+      candidateConcurrency: 1,
       ...(options.budgets ? { budgets: options.budgets } : {}),
       ...(options.caps ? { caps: options.caps } : {}),
       ...(options.capsClock ? { capsClock: options.capsClock } : {}),
