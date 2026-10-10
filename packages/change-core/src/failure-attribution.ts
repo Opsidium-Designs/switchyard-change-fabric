@@ -242,31 +242,83 @@ export function combineAttribution(input: {
 }
 
 /**
- * The repo files a failing gate output points at: error LOCATIONS and
- * path-shaped tokens resolved to real repo files (an absolute path in the
- * gate's checkout resolves by its repo-relative suffix), plus failing test
- * titles mapped to the modules named like them (`users: ...` -> a source file
- * `users.*`, or its singular/plural). Test files are excluded (they are the
- * contract, or new tests). Pure, sorted, deduplicated.
+ * The repo files a failing gate output points at, most telling evidence first:
+ *   1. failing test TITLES mapped to the modules named like them (`users: ...`
+ *      or `users must ...` -> a source file `users.*`, or its singular/plural)
+ *      and error LOCATIONS outside stack frames (a type error's
+ *      `path(line,col)`, a syntax error's `path:line`);
+ *   2. only when there are none: stack frames, and of each stack only the
+ *      outermost repo frame that is not a test (the CALLER nearest the test).
+ *      A file seen only as a deeper callee in a frame (a shared helper the
+ *      failing code called, such as a contract's check) is never the place a
+ *      failure is "in";
+ *   3. only when there are no locations at all: path-shaped tokens.
+ * An absolute path in the gate's checkout resolves by its repo-relative
+ * suffix. Test files are excluded (they are the contract, or new tests).
+ * Pure, sorted, deduplicated.
  */
 export function failingRepoFiles(evidence: string, repoFiles: readonly string[]): string[] {
   const sources = repoFiles.filter((f) => !isTestFile(f));
-  const out = new Set<string>();
-  for (const raw of extractFailingFiles(evidence)) {
-    const clean = raw.replace(/^\.\//, "");
-    const hit = repoFiles.find((f) => clean === f || clean.endsWith(`/${f}`));
-    if (hit && !isTestFile(hit)) {
-      out.add(hit);
-    }
-  }
+  const resolve = (raw: string): string | undefined => {
+    const clean = raw.replace(/^file:\/\//, "").replace(/^\.\//, "");
+    return repoFiles.find((f) => clean === f || clean.endsWith(`/${f}`));
+  };
+  const titled = new Set<string>();
   for (const name of extractFailingNames(evidence)) {
     const n = name.toLowerCase();
     const variants = new Set([n, `${n}s`, n.endsWith("s") ? n.slice(0, -1) : n]);
     for (const file of sources) {
       const base = (file.split("/").pop() ?? "").replace(/\.[A-Za-z0-9]+$/, "").toLowerCase();
       if (variants.has(base)) {
-        out.add(file);
+        titled.add(file);
       }
+    }
+  }
+  const lines = evidence.split(/\r?\n/).filter((line) => !/^\s*[>$] /.test(line));
+  const location = /((?:[A-Za-z]:)?[A-Za-z0-9_./-]*\/?[A-Za-z0-9_.-]+\.[A-Za-z0-9]+)(?::\d+|\(\d+,\d+\))/g;
+  const locationsIn = (line: string): string[] =>
+    [...line.matchAll(location)].map((m) => m[1]!).filter((raw) => !raw.startsWith("node:") && raw.includes("/"));
+  const nonFrame = new Set<string>();
+  const callers = new Set<string>();
+  let stack: string[] = [];
+  const closeStack = () => {
+    const caller = stack.filter((f) => !isTestFile(f)).at(-1);
+    if (caller !== undefined) {
+      callers.add(caller);
+    }
+    stack = [];
+  };
+  for (const line of lines) {
+    if (/^\s*at\s/.test(line)) {
+      for (const raw of locationsIn(line)) {
+        const hit = resolve(raw);
+        if (hit !== undefined) {
+          stack.push(hit);
+        }
+      }
+      continue;
+    }
+    closeStack();
+    for (const raw of locationsIn(line)) {
+      const hit = resolve(raw);
+      if (hit !== undefined && !isTestFile(hit)) {
+        nonFrame.add(hit);
+      }
+    }
+  }
+  closeStack();
+  const first = new Set([...titled, ...nonFrame]);
+  if (first.size > 0) {
+    return [...first].sort();
+  }
+  if (callers.size > 0) {
+    return [...callers].sort();
+  }
+  const out = new Set<string>();
+  for (const raw of extractFailingFiles(evidence)) {
+    const hit = resolve(raw);
+    if (hit && !isTestFile(hit)) {
+      out.add(hit);
     }
   }
   return [...out].sort();

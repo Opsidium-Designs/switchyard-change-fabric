@@ -7,7 +7,9 @@
  * past decisions, the public board facts, and the repo listing) and applies
  * generic rules, in priority order:
  *   1. the lead decides pending contracts (accept unless the target overlaps a
- *      write intent held by someone other than the proposer), then workers'
+ *      write intent held by someone other than the proposer; a seam contract
+ *      is also rejected when it duplicates another live seam change or the
+ *      failing output does not name its seam), then workers'
  *      proposed items (accept unless the proposal duplicates an existing
  *      item's scope or objective, see `duplicateOf`), else waits;
  *   2. answer an open contest: as the claimant, narrow the overlapping part of
@@ -518,13 +520,23 @@ function decide(input: Input): AgentAction {
       const clash = input.board.liveClaims.some(
         (c) => c.owner !== contract.proposedBy && c.write.some((w) => entriesOverlap(w, contract.target)),
       );
+      // A seam contract: only the declaration the failing revision needs, once.
+      const seamReason =
+        contract.seam === undefined
+          ? undefined
+          : contract.duplicateOf !== undefined
+            ? `it duplicates the seam change ${contract.duplicateOf}: one seam change per failing cause`
+            : contract.namedInFailure === false
+              ? `the failing output does not name ${contract.seam}: a seam change is only for the shared declaration the error needs`
+              : undefined;
+      const reject = clash || seamReason !== undefined;
       return {
         type: "decide_contract",
         contractId: contract.contract,
-        decision: clash ? "reject" : "accept",
+        decision: reject ? "reject" : "accept",
         rationale: clash
           ? `${contract.target} is inside another agent's claimed write intent`
-          : `${contract.target} is not held by anyone but the proposer`,
+          : seamReason ?? `${contract.target} is not held by anyone but the proposer`,
       };
     }
     const proposal = input.board.pendingItems?.[0];

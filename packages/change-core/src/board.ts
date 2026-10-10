@@ -110,8 +110,16 @@ export const BOARD_LIMITS = {
   maxStruggleReports: 3,
   /** Sub-lead pushes that may merge one child's push. */
   maxChildMerges: 3,
-  /** Board messages a dependent item waits for a seam-changing item before it proceeds anyway. */
+  /**
+   * Board messages a dependent item waits for a seam-changing item's PROGRESS
+   * (its grant or its latest push) before it proceeds anyway: a seam item that
+   * stops moving stops holding anyone.
+   */
   seamWaitMessages: 60,
+  /** Seam contracts one agent may have waiting for the lead at once. */
+  maxPendingSeamContractsPerAgent: 1,
+  /** Seam contracts a Change may have waiting for the lead at once. */
+  maxPendingSeamContracts: 3,
   maxVolunteers: 2,
   maxObjective: 500,
   maxAcceptance: 20,
@@ -444,6 +452,12 @@ export interface BoardPayloads {
   "contract.escalated": { readonly contract: string; readonly item: string; readonly target: string; readonly kind: "add" | "modify" | "remove" };
   "contract.accepted": { readonly contract: string };
   "contract.rejected": { readonly contract: string };
+  /**
+   * Engine (recorded by the operator): a seam item that held dependents made
+   * no progress while the board went quiet. It holds no one from now on; with
+   * no push of its owner's it is released (open) for an idle agent to take.
+   */
+  "seam.stalled": { readonly item: string; readonly released: boolean };
   "push.announced": {
     readonly item: string;
     readonly commit: string;
@@ -663,6 +677,7 @@ export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "contract.escalated",
   "contract.accepted",
   "contract.rejected",
+  "seam.stalled",
   "push.announced",
   "integrated.rev",
   "rebase.needed",
@@ -855,6 +870,8 @@ export interface BoardItem {
   readonly fromTool?: { readonly capability: string; readonly version: string };
   /** The accepted seam contract this item carries out (engine-proposed). */
   readonly fromContract?: string;
+  /** A seam item recorded stalled (seam.stalled) since its current grant: it holds no dependent. */
+  seamStalledSeq?: number;
   /** The seq at which a human last rejected a contract change for this item. */
   contractRejectedSeq?: number;
   /** The current owner's latest struggling report (cleared when the claim changes hands or completes). */
@@ -950,6 +967,10 @@ export interface BoardContract {
   readonly seam?: string;
   /** The exact change needed (a seam contract's objective). */
   readonly description?: string;
+  /** The failing revision a seam contract was proposed for (one seam change per failing cause). */
+  readonly failingRev?: number;
+  /** The ADVISORY triage recommendation recorded for it (decision.recorded, contract-triage). */
+  triage?: string;
   readonly proposedBy: string;
   readonly proposedSeq?: number;
   status: "proposed" | "accepted" | "rejected";
@@ -1680,6 +1701,11 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
     case "contract.accepted":
     case "contract.rejected":
       return { contract: id(raw, "contract") };
+    case "seam.stalled":
+      if (typeof raw.released !== "boolean") {
+        fail("BAD_PAYLOAD", "released must be a boolean");
+      }
+      return { item: id(raw, "item"), released: raw.released };
     case "item.accepted":
     case "item.rejected":
       return { item: id(raw, "item") };
@@ -1977,6 +2003,7 @@ const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "contract.escalated": ["engine"],
   "contract.accepted": ["lead", "human"],
   "contract.rejected": ["lead", "human"],
+  "seam.stalled": ["engine"],
   "push.announced": ["agent"],
   "integrated.rev": ["engine"],
   "rebase.needed": ["engine"],
@@ -2093,7 +2120,8 @@ export function mergedChildrenWrite(state: BoardState, merges: readonly { readon
  */
 export function releasedTargets(state: BoardState, item?: string): string[] {
   return Object.values(state.contracts)
-    .filter((c) => c.status === "accepted" && c.item !== undefined && (item === undefined || c.item === item))
+    // A seam contract releases nothing to the item that asked: its SEAM ITEM carries the change.
+    .filter((c) => c.status === "accepted" && c.item !== undefined && c.seam === undefined && (item === undefined || c.item === item))
     .map((c) => c.target);
 }
 
@@ -2205,12 +2233,14 @@ function itemCovers(item: BoardItem, path: string): boolean {
 }
 
 /**
- * SEAM FIRST: the seam-changing items `itemId` must wait for. A seam item is a
- * CLAIMED item whose scope covers a shared seam (posted with the goal) and
- * whose latest push is not integrated yet; `itemId` depends on it when its own
+ * SEAM FIRST: the seam-changing items `itemId` must wait for: seam items
+ * that hold dependents (`seamItemHolding`: an accepted seam contract's item,
+ * claimed, making progress) whose scope covers a shared seam; `itemId` depends on it when its own
  * scope covers a file importing that seam (and it does not change that seam
- * itself). The wait is bounded: after `seamWaitMessages` board messages from
- * the seam item's proposal, dependents proceed anyway. Pure.
+ * itself). The wait is bounded by PROGRESS: after `seamWaitMessages` board
+ * messages since the seam item's grant or latest push, or once it is recorded
+ * stalled (seam.stalled, when the board goes quiet), dependents proceed
+ * anyway. Pure.
  */
 export function seamWaits(state: BoardState, itemId: string): { readonly item: string; readonly seams: readonly string[] }[] {
   const item = state.items[itemId];
@@ -2219,12 +2249,7 @@ export function seamWaits(state: BoardState, itemId: string): { readonly item: s
   }
   const out: { item: string; seams: string[] }[] = [];
   for (const other of Object.values(state.items)) {
-    // Only a seam change someone is working on blocks (a claimed item; a split
-    // item's children stand for it): an unclaimed one never stalls dependents.
-    if (other.id === itemId || other.tool !== undefined || (other.status !== "claimed" && other.status !== "contested")) {
-      continue;
-    }
-    if (other.lastPush?.integratedIn !== undefined || state.lastSeq - other.proposedSeq > BOARD_LIMITS.seamWaitMessages) {
+    if (other.id === itemId || !seamItemHolding(state, other)) {
       continue;
     }
     const seams = (state.seams ?? [])
@@ -2235,6 +2260,83 @@ export function seamWaits(state: BoardState, itemId: string): { readonly item: s
     }
   }
   return out.sort((a, b) => (a.item < b.item ? -1 : a.item > b.item ? 1 : 0));
+}
+
+/**
+ * THE predicate for "this seam item may hold dependents" (the hold, the
+ * digest's waitsFor, seamHolds, and the stall check all use it): an item
+ * carrying an ACCEPTED SEAM CONTRACT (`fromContract`; an item whose scope
+ * merely covers a seam path never holds anyone), claimed by someone, whose
+ * push is not integrated yet, not recorded stalled since its grant, and still
+ * making PROGRESS (its grant or latest push within `seamWaitMessages`).
+ */
+export function seamItemHolding(state: BoardState, other: BoardItem): boolean {
+  if (other.fromContract === undefined || other.tool !== undefined || (other.status !== "claimed" && other.status !== "contested")) {
+    return false;
+  }
+  const activity = Math.max(other.grantedSeq ?? other.proposedSeq, other.lastPush?.seq ?? 0);
+  return other.lastPush?.integratedIn === undefined && other.seamStalledSeq === undefined && state.lastSeq - activity <= BOARD_LIMITS.seamWaitMessages;
+}
+
+/** A stalled seam item is released (open again) when its owner has pushed nothing for it. */
+function seamReleasable(item: BoardItem): boolean {
+  return item.lastPush === undefined || item.lastPush.agent !== item.owner;
+}
+
+/**
+ * The seam items holding dependents right now (each with the items waiting
+ * on it): what the driver records stalled when the board goes quiet, so
+ * SEAM_FIRST holds never end a run quiescent. Pure.
+ */
+export function seamHolds(state: BoardState): { readonly item: string; readonly dependents: readonly string[] }[] {
+  const holds = new Map<string, Set<string>>();
+  for (const item of Object.values(state.items)) {
+    if (item.status === "done" || item.status === "rejected") {
+      continue;
+    }
+    for (const wait of seamWaits(state, item.id)) {
+      holds.set(wait.item, (holds.get(wait.item) ?? new Set()).add(item.id));
+    }
+  }
+  return [...holds].map(([item, dependents]) => ({ item, dependents: [...dependents].sort() })).sort((a, b) => (a.item < b.item ? -1 : 1));
+}
+
+/**
+ * Mechanical facts the lead weighs on a seam contract (advisory inputs, never
+ * a decision): whether the latest failing output names the seam (its path, a
+ * path ending in it such as `../contracts/auth.ts`, or a quoted name it
+ * exports), and the earlier live seam change it duplicates (an identical
+ * description, or the same quoted NEW identifier, one no seam exports yet;
+ * pending, or accepted and unfinished). Pure.
+ */
+export function seamContractFacts(state: BoardState, contractId: string): { readonly namedInFailure: boolean; readonly duplicateOf?: string } {
+  const contract = state.contracts[contractId];
+  if (contract?.seam === undefined) {
+    return { namedInFailure: false };
+  }
+  const output = state.lastFailure?.output ?? "";
+  const segments = contract.seam.split("/");
+  const pathNamed = segments.some((_, k) => {
+    const suffix = segments.slice(k).join("/");
+    return k === 0 ? output.includes(suffix) : output.includes(`/${suffix}`);
+  });
+  const symbols = (state.seams ?? []).find((seam) => seam.path === contract.seam)?.symbols ?? [];
+  const quoted = (text: string) => new Set([...text.matchAll(/['"`]([A-Za-z_$][\w$]*)['"`]/g)].map((m) => m[1]!));
+  const named = quoted(output);
+  const namedInFailure = pathNamed || symbols.some((sym) => named.has(sym));
+  const normal = (text: string | undefined) => (text ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  // A NEW name both would add (not one a seam already exports, like the type they extend).
+  const existing = new Set((state.seams ?? []).flatMap((seam) => seam.symbols ?? []));
+  const mine = new Set([...quoted(contract.description ?? "")].filter((id) => !existing.has(id)));
+  const duplicate = Object.values(state.contracts).find(
+    (other) =>
+      other.contract !== contract.contract &&
+      other.seam !== undefined &&
+      (other.status === "proposed" || (other.status === "accepted" && state.items[seamItemId(other.contract)]?.status !== "done")) &&
+      (other.proposedSeq ?? 0) < (contract.proposedSeq ?? 0) &&
+      (normal(other.description) === normal(contract.description) || [...quoted(other.description ?? "")].some((id) => mine.has(id))),
+  );
+  return { namedInFailure, ...(duplicate ? { duplicateOf: duplicate.contract } : {}) };
 }
 
 /** The shared seam a contract target names (`path` or `path#symbol`), if any. */
@@ -2821,6 +2923,30 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         if (pending) {
           fail("DUPLICATE", `contract ${pending.contract} on the seam ${seam} is already waiting for the lead's decision`);
         }
+        const waiting = Object.values(state.contracts).filter((c) => c.seam !== undefined && c.status === "proposed");
+        if (waiting.filter((c) => c.proposedBy === draft.from).length >= BOARD_LIMITS.maxPendingSeamContractsPerAgent) {
+          fail("LIMIT", `${draft.from} already has a seam contract waiting for the lead; wait for its decision before proposing another`);
+        }
+        if (waiting.length >= BOARD_LIMITS.maxPendingSeamContracts) {
+          fail("LIMIT", `${waiting.length} seam contracts are already waiting for the lead's decision`);
+        }
+        // One seam change per failing cause: an accepted seam change this agent
+        // asked for the same failing revision, still unfinished, comes first.
+        const sameCause = Object.values(state.contracts).find(
+          (c) =>
+            c.seam !== undefined &&
+            c.status === "accepted" &&
+            c.proposedBy === draft.from &&
+            c.failingRev !== undefined &&
+            c.failingRev === state.lastFailure?.n &&
+            state.items[seamItemId(c.contract)]?.status !== "done",
+        );
+        if (sameCause) {
+          fail(
+            "DUPLICATE",
+            `${draft.from}'s seam change ${seamItemId(sameCause.contract)} (contract ${sameCause.contract}) for failing revision ${sameCause.failingRev} is not finished: one seam change per failing cause; it lands first`,
+          );
+        }
         if (seamItemId(draft.payload.contract).length > 128) {
           fail("BAD_PAYLOAD", "a seam contract's id must leave room for its seam item's id (at most 123 characters)");
         }
@@ -2867,6 +2993,17 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       if (contract.guarded && draft.from !== BOARD_HUMAN) {
         fail("NOT_ALLOWED", `contract ${contract.contract} changes the original tests or the gate's configuration: only a human decides it`);
+      }
+      return;
+    }
+    case "seam.stalled": {
+      const item = requireItem(state, draft.payload.item);
+      // The same predicate as the hold: only an item that holds dependents now can stall.
+      if (!seamHolds(state).some((h) => h.item === item.id)) {
+        fail("INVALID_STATE", `item ${item.id} holds no dependent: nothing is stalled on it`);
+      }
+      if (draft.payload.released !== seamReleasable(item)) {
+        fail("LOG_MISMATCH", `seam.stalled on ${item.id} must record released=${seamReleasable(item)}`);
       }
       return;
     }
@@ -3208,8 +3345,8 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       const p = draft.payload;
       if (p.contract !== undefined) {
         const contract = state.contracts[p.contract] ?? fail("UNKNOWN_REF", `unknown contract ${p.contract}`);
-        if (!contract.guarded) {
-          fail("INVALID_STATE", `contract ${p.contract} is not a protected contract a human decides`);
+        if (!contract.guarded && contract.seam === undefined) {
+          fail("INVALID_STATE", `contract ${p.contract} is neither a protected contract a human decides nor a seam contract the lead decides`);
         }
       }
       if (p.rev !== undefined) {
@@ -3361,6 +3498,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       item.owner = message.payload.agent;
       item.intent = message.payload.intent;
       item.grantedSeq = message.seq;
+      delete item.seamStalledSeq;
       delete item.struggling;
       delete item.claimant;
       break;
@@ -3547,6 +3685,9 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
               return seam !== undefined ? { seam } : {};
             })()),
         ...(message.payload.description !== undefined ? { description: message.payload.description } : {}),
+        ...(seamTarget(state, message.payload.target) !== undefined && !state.protected.some((p) => entriesOverlap(message.payload.target, p)) && state.lastFailure !== null
+          ? { failingRev: state.lastFailure.n }
+          : {}),
         proposedBy: from,
         proposedSeq: message.seq,
         status: "proposed",
@@ -3795,7 +3936,19 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       }
       break;
     }
+    case "seam.stalled": {
+      const item = state.items[message.payload.item]!;
+      if (message.payload.released) {
+        releaseClaim(item);
+      }
+      item.seamStalledSeq = message.seq;
+      break;
+    }
     case "decision.recorded":
+      // A contract's advisory triage, shown to whoever decides it.
+      if (message.payload.juncture === "contract-triage" && message.payload.contract !== undefined && state.contracts[message.payload.contract]) {
+        state.contracts[message.payload.contract]!.triage = contractTriageRecommendation(message.payload);
+      }
       state.decisions.calls += 1;
       if (message.payload.accepted) {
         state.decisions.accepted += 1;
@@ -4127,6 +4280,16 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
             fromContract: contract.contract,
           },
         });
+        // The PROPOSER holds the context: it is granted the seam item at once
+        // (when it is still on the board and no other live claim overlaps).
+        const proposer = contract.proposedBy;
+        const intent = { read: [], write: [contract.seam] };
+        const clash = liveClaims(work, proposer, undefined, seamItemId(contract.contract)).some(
+          (holder) => overlappingEntries(intent.write, holder.intent!.write).length > 0,
+        );
+        if (activeAgent(work, proposer) && work.agents[proposer]?.role !== LEAD_ROLE && !clash) {
+          emit({ from: BOARD_ENGINE, type: "claim.granted", payload: { item: seamItemId(contract.contract), agent: proposer, intent } });
+        }
       }
       break;
     }
@@ -4385,7 +4548,7 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
  * through its own route (an integration, an advisory decision, a tool's gate,
  * a tool use). Every other engine message is derived by arbitration.
  */
-const RECORDED_ENGINE_TYPES: ReadonlySet<BoardMessageType> = new Set(["integrated.rev", "decision.recorded", "tool.gated", "tool.used"]);
+const RECORDED_ENGINE_TYPES: ReadonlySet<BoardMessageType> = new Set(["integrated.rev", "decision.recorded", "tool.gated", "tool.used", "seam.stalled"]);
 
 /**
  * Replay a log into state. Replay is a full re-verification, not a blind fold:
@@ -4627,6 +4790,26 @@ export function appendToolUsed(state: BoardState, input: unknown, at: string): B
   const builder = state.tools.published.find((t) => t.capability === payload.capability && t.version === payload.version)?.publishedBy;
   const to = builder !== undefined && builder !== payload.by && activeAgent(state, builder) ? { to: [builder] } : {};
   return appendChecked(state, { from: BOARD_ENGINE, type: "tool.used", payload, ...to }, at);
+}
+
+/**
+ * Record a seam item STALLED (operator-recorded engine message): it held
+ * dependents and the board went quiet. It holds no one from now on; with no
+ * push of its owner's it is released for an idle agent (the engine derives
+ * `released`). Refused unless it is a claimed seam item holding someone.
+ */
+export function appendSeamStalled(state: BoardState, input: unknown, at: string): BoardAppendResult {
+  if (state.goal === null) {
+    fail("NO_GOAL", "the board has no goal yet");
+  }
+  if (!isRecord(input) || Object.keys(input).some((k) => k !== "item")) {
+    fail("BAD_PAYLOAD", "a seam.stalled record is {item}");
+  }
+  const item = requireItem(state, id(input, "item"));
+  if (!seamHolds(state).some((h) => h.item === item.id)) {
+    fail("INVALID_STATE", `item ${item.id} holds no dependent: nothing is stalled on it`);
+  }
+  return appendChecked(state, { from: BOARD_ENGINE, type: "seam.stalled", payload: { item: item.id, released: seamReleasable(item) } }, at);
 }
 
 /**
@@ -5434,12 +5617,16 @@ export function splitCue(files: number, objective: string): { readonly splittabl
 /**
  * Files a failing revision points at that NO item covers (no accepted item's
  * scope or write intent, in any status, and no undecided proposal): work the
- * plan missed. Protected paths and tool directories are never proposed. Pure.
+ * plan missed. Protected paths, tool directories, and shared seams (they change
+ * only through a seam contract) are never proposed. Pure.
  */
 export function uncoveredFailureFiles(state: BoardState, failingFiles: readonly string[]): string[] {
   const covers = (entries: readonly string[], file: string) => entries.some((e) => entryWithin(file, intentPath(e)));
+  const seams = new Set((state.seams ?? []).map((seam) => seam.path));
   return failingFiles
     .filter((file) => !file.startsWith(`${TOOLS_DIR}/`))
+    // A shared seam changes only through a seam contract, never as uncovered work.
+    .filter((file) => !seams.has(file))
     .filter((file) => !state.protected.some((p) => p === file || entryWithin(file, p)))
     .filter(
       (file) =>

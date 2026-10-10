@@ -90,7 +90,7 @@ interface Env {
   rawPost(token: string, draft: unknown): Promise<{ status: number; body: Record<string, unknown> }>;
 }
 
-async function setup(): Promise<Env> {
+async function setup(options: { readonly seams?: readonly { path: string; importers: string[] }[] } = {}): Promise<Env> {
   const root = await mkdtemp(join(tmpdir(), "scf-board-agent-"));
   const projectDir = join(root, "project");
   for (const [rel, body] of Object.entries({
@@ -117,7 +117,7 @@ async function setup(): Promise<Env> {
     const outcome = await operator.postAsHuman(draft);
     expect(outcome.ok).toBe(true);
   };
-  await human({ type: "goal.posted", payload: { objective: "runtime" } });
+  await human({ type: "goal.posted", payload: { objective: "runtime", ...(options.seams ? { seams: options.seams } : {}) } });
   await human({ type: "item.proposed", payload: { item: "i1", objective: "do a", scopeHint: ["src/a/**"] } });
   await human({ type: "item.proposed", payload: { item: "i2", objective: "do b", scopeHint: ["src/b/**"] } });
   return {
@@ -330,6 +330,35 @@ describe("the lead", () => {
     expect(calls[0]!.allowed).toEqual(["decide_contract", "decide_item", "propose_item", "message", "wait"]);
     expect(calls[0]!.board.pendingContracts).toEqual([{ contract: "k1", target: "src/shared.ts", kind: "modify", proposedBy: "w9" }]);
     expect((await env.log()).messages.find((m) => m.type === "contract.accepted")).toMatchObject({ from: "lead", payload: { contract: "k1" } });
+  });
+
+  it("decide_contract takes the contract id or the seam item id derived from it; an already decided one is refused locally with what carries it", async () => {
+    const env = await setup({ seams: [{ path: "src/shared.ts", importers: ["src/a/x.ts", "src/b/y.ts"] }] });
+    const transport = scripted([
+      { type: "decide_contract", contractId: "seam-k1", decision: "accept", rationale: "the item id of a pending contract" },
+      { type: "decide_contract", contractId: "seam-k1", decision: "accept", rationale: "again" },
+      { type: "decide_contract", contractId: "nope", decision: "reject", rationale: "unknown" },
+    ]);
+    const lead = env.agent("lead", { role: "lead", transport, seed: async () => [] });
+    await lead.join();
+    await lead.step(); // seeds nothing
+    const w = await env.operator.join("w9", {});
+    const token = w.ok ? w.token : "";
+    await env.rawPost(token, { type: "item.claimed", payload: { item: "i1", intent: { read: [], write: ["src/a/**"] } } });
+    const proposed = await env.rawPost(token, {
+      type: "contract.proposed",
+      payload: { contract: "k1", target: "src/shared.ts", kind: "modify", item: "i1", description: "add a shared field" },
+    });
+    expect(proposed.status).toBe(201);
+    for (let i = 0; i < 4; i += 1) await lead.step();
+    const log = await env.log();
+    // The seam item id of the pending contract decided the contract itself; the engine granted the seam item to the proposer.
+    expect(log.messages.find((m) => m.type === "contract.accepted")).toMatchObject({ from: "lead", payload: { contract: "k1" } });
+    expect(log.state.items["seam-k1"]).toMatchObject({ status: "claimed", owner: "w9" });
+    const refusals = env.turns.filter((t) => t.agent === "lead" && t.outcome === "local" && t.action.type === "decide_contract");
+    expect(refusals.map((t) => t.code)).toEqual(["INVALID_STATE", "UNKNOWN_REF"]);
+    expect(refusals[0]!.error).toMatch(/already accepted \(its seam item seam-k1 carries it out\): nothing to decide/);
+    expect(refusals[1]!.error).toMatch(/no contract nope; pending contracts: none \(use pendingContracts\[\]\.contract exactly\)/);
   });
 
   it("propagates a planner failure (no silent substitute)", async () => {

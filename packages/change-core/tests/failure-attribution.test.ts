@@ -64,3 +64,34 @@ describe("type-checker locations", () => {
     ]);
   });
 });
+
+describe("failingRepoFiles: the place a failure is IN, not a helper it called", () => {
+  const repo = ["src/resources/users.js", "src/resources/orders.js", "src/contracts/auth.js", "src/app.js", "test/users.test.js"];
+  // The service-api shape: the assertion names the resource; a stack frame (and a
+  // require stack) names the shared contract the handler called.
+  const reg2 = [
+    "✖ users: unauthenticated request is rejected (401/403) (12ms)",
+    "  AssertionError [ERR_ASSERTION]: users must reject an unauthenticated request via requireAuth, got 201",
+    "      at requireAuth (/tmp/scf-int/src/contracts/auth.js:14:9)",
+    "      at handleUsers (/tmp/scf-int/src/resources/users.js:22:3)",
+    "      at TestContext.<anonymous> (/tmp/scf-int/test/users.test.js:30:5)",
+  ].join("\n");
+
+  it("prefers the failing test title over stack frames: never the shared contract a frame names", () => {
+    expect(failingRepoFiles(reg2, repo)).toEqual(["src/resources/users.js"]);
+  });
+
+  it("from frames alone, takes each stack's outermost non-test repo frame (the caller), never a deeper callee", () => {
+    const framesOnly = [
+      "Error: boom",
+      "    at requireAuth (/tmp/x/src/contracts/auth.js:14:9)",
+      "    at handleOrders (/tmp/x/src/resources/orders.js:9:1)",
+      "    at Object.<anonymous> (/tmp/x/test/users.test.js:3:1)",
+    ].join("\n");
+    expect(failingRepoFiles(framesOnly, repo)).toEqual(["src/resources/orders.js"]);
+  });
+
+  it("keeps error locations outside frames (type and syntax errors)", () => {
+    expect(failingRepoFiles("src/app.js:3\n  return x +;\n           ^\nSyntaxError: Unexpected token ';'", repo)).toEqual(["src/app.js"]);
+  });
+});

@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 import {
   appendBoardMessage,
   appendDecisionRecorded,
+  appendSeamStalled,
   appendDiscoveredUnits,
   appendIntegratedRev,
   appendToolGated,
@@ -1311,6 +1312,15 @@ export class ChangeState extends DurableObject<Env> {
     return this.boardOutcome(() =>
       this.appendToBoard((state) => appendDecisionRecorded(state, input, new Date().toISOString())),
     );
+  }
+
+  /**
+   * Record a seam item STALLED (the operator's route, when the board went
+   * quiet while it held dependents): the engine appends seam.stalled, which
+   * ends its hold and, with no push of its owner's, releases it.
+   */
+  async recordSeamStalled(input: unknown): Promise<BoardAppendResponse> {
+    return this.boardOutcome(() => this.appendToBoard((state) => appendSeamStalled(state, input, new Date().toISOString())));
   }
 
   /**

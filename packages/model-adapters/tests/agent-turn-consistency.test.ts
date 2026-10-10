@@ -196,6 +196,21 @@ describe("every field the prompt tells the model to send is in the schema and ac
     expect(seam).toMatchObject({ payload: { target: "src/store.ts", description: "add an optional `user: User` field to the Ctx type" } });
   });
 
+  it("decide_contract: the field the lead rules name is the schema's, and a contract id or a seam item id both pass the transport parser (the runtime maps the item to its contract)", () => {
+    expect(system).toContain("decide_contract.contractId is pendingContracts[].contract EXACTLY");
+    expect(Object.keys(variantOf("decide_contract").properties!)).toEqual(["type", "contractId", "decision", "rationale"]);
+    for (const contractId of ["agent-4-contract-1", "seam-agent-4-contract-1"]) {
+      expect(parsed(strict("decide_contract", { contractId, decision: "reject", rationale: "duplicates an existing seam change" }), LEAD)).toEqual({
+        type: "decide_contract",
+        contractId,
+        decision: "reject",
+        rationale: "duplicates an existing seam change",
+      });
+    }
+    // A worker may not decide contracts.
+    expect(agentActionOrWait(strict("decide_contract", { contractId: "k1", decision: "accept" }), WORKER).invalid).toMatch(/not allowed/);
+  });
+
   it("a long description is shortened, never a reason to drop the turn", () => {
     const action = parsed(strict("message", { kind: "contract", rationale: "r", payload: { target: "src/store.ts", change: "modify", itemId: "u", description: "x".repeat(2000) } }));
     expect(action.type === "message" ? action.payload.description?.length : 0).toBe(400);

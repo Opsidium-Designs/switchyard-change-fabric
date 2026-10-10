@@ -1169,10 +1169,11 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
   //   GET  /changes/:id/board?for=<agent>    that agent's digest (agent board token)
   //   GET  /changes/:id/board/verify         re-verify the stored log against the state
   //   POST /changes/:id/tools/gate           (bearer) the operator records a tool's own gate result
+  //   POST /changes/:id/board/seam-stalled   (bearer) the operator records a seam item stalled on a quiet board
   //   POST /changes/:id/tools/used           (bearer) the operator records a run of a pinned tool version
   // The engine's own messages are never accepted from any route.
   const boardRoute = url.pathname.match(
-    /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|integration\/revision|tools\/gate|tools\/used)$/,
+    /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|board\/seam-stalled|integration\/revision|tools\/gate|tools\/used)$/,
   );
   if (boardRoute) {
     const changeId = decodeURIComponent(boardRoute[1] ?? "");
@@ -1253,6 +1254,8 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
         outcome = await stub.recordBoardIntegration(body.value);
       } else if (kind === "board/decision") {
         outcome = await stub.recordBoardDecision(body.value);
+      } else if (kind === "board/seam-stalled") {
+        outcome = await stub.recordSeamStalled(body.value);
       } else if (kind === "tools/gate") {
         outcome = await stub.recordToolGate(body.value);
       } else if (kind === "tools/used") {

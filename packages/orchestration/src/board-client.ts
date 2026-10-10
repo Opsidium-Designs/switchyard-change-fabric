@@ -212,6 +212,12 @@ export class BoardOperatorClient {
     return res.status === 201 ? { ok: true, appended: (body.appended as BoardMessage[] | undefined) ?? [] } : rejection(res, body);
   }
 
+  /** Record a seam item stalled on a quiet board (the engine appends seam.stalled). */
+  async recordSeamStalled(item: string): Promise<BoardPostOutcome> {
+    const { res, body } = await this.post("/board/seam-stalled", { item });
+    return res.status === 201 ? { ok: true, appended: (body.appended as BoardMessage[] | undefined) ?? [] } : rejection(res, body);
+  }
+
   /**
    * A fresh, short-lived READ token for a joined agent's repo, issued by the
    * Worker to the operator (the integrator reads agents' repos with these at

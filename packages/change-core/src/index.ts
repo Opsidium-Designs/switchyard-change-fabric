@@ -171,6 +171,7 @@ export {
   appendIntegratedRev,
   appendToolGated,
   appendToolUsed,
+  appendSeamStalled,
   applyBoardEscalations,
   applyBoardMessage,
   arbitrate,
@@ -223,6 +224,9 @@ export {
   isSeamItem,
   seamContractCue,
   seamItemId,
+  seamHolds,
+  seamItemHolding,
+  seamContractFacts,
   verifyBoard,
   withContractTriage,
 } from "./board.ts";

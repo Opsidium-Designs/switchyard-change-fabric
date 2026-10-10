@@ -374,6 +374,7 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     case "done.proposed":
     case "handoff":
     case "item.struggling":
+    case "seam.stalled":
       return "item";
     case "item.claimed":
     case "claim.granted":

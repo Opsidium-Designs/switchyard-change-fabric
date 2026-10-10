@@ -14,6 +14,8 @@ import {
   CONTRACT_TRIAGE_QUESTIONS,
   readTargetExcerpt,
   scrubForDecision,
+  SEAM_TRIAGE_QUESTION,
+  SEAM_TRIAGE_QUESTIONS,
   triageContract,
 } from "../src/contract-triage.ts";
 
@@ -70,6 +72,25 @@ describe("contract triage", () => {
     const failed = await triageContract({ ask: failing, input });
     expect(failed).toMatchObject({ accepted: false });
     expect(failed.error).not.toContain("secret-token-value");
+  });
+
+  it("asks the SEAM question for a seam contract, with the other seam changes as data (the lead still decides)", async () => {
+    let questions: Record<string, unknown> = {};
+    let state = "";
+    const ask: AskJev = async (s, q) => {
+      state = s;
+      questions = q as Record<string, unknown>;
+      return { triage: { type: "choice", choice: "reject", confidence: 0.9 } };
+    };
+    const decision = await triageContract({
+      ask,
+      input: { ...input, seam: true, proposedChange: "add 'validateInput' to http.ts", otherSeamChanges: "agent-2-contract-1 (accepted) on src/contracts/auth.ts: add 'validateInput'" },
+    });
+    expect(decision).toMatchObject({ juncture: "contract-triage", question: SEAM_TRIAGE_QUESTION, answer: "reject", accepted: true });
+    expect(questions).toEqual(SEAM_TRIAGE_QUESTIONS);
+    expect(state).toMatch(/shared seam/);
+    expect(state).toMatch(/other seam changes pending or accepted[\s\S]*agent-2-contract-1/);
+    expect(state).toContain("The lead makes the final decision");
   });
 
   it("reads a bounded excerpt of a regular file inside the project only", async () => {

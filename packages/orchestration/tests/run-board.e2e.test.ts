@@ -20,7 +20,7 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
-import { reduceBoard, type BoardDigest, type BoardMessage } from "@switchyard-change/change-core";
+import { reduceBoard, seamHolds, type BoardDigest, type BoardMessage } from "@switchyard-change/change-core";
 import type {
   AskJev,
   AgentTurnTransport,
@@ -1116,10 +1116,26 @@ describe("budgets that scale with the plan (explicit values win)", () => {
   it("scales fix attempts and the dial's max with the planned items, bounded", async () => {
     const { scaledBudgets } = await import("../src/run-board.ts");
     const dial = { minConcurrency: 1, maxConcurrency: 3 };
-    expect(scaledBudgets({ items: 10, dial, scaleDial: true })).toEqual({ maxFixAttempts: 5, fixAttemptsScaled: true, dialMax: 6, dialScaled: true });
-    expect(scaledBudgets({ items: 2, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 3, dialMax: 2 });
-    expect(scaledBudgets({ items: 40, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 6, dialMax: 6 });
-    expect(scaledBudgets({ items: 10, explicitFixAttempts: 2, dial, scaleDial: false })).toEqual({ maxFixAttempts: 2, fixAttemptsScaled: false, dialMax: 3, dialScaled: false });
+    expect(scaledBudgets({ items: 10, dial, scaleDial: true })).toEqual({
+      maxFixAttempts: 5,
+      fixAttemptsScaled: true,
+      dialMax: 6,
+      dialScaled: true,
+      maxRunTurns: 250,
+      runTurnsScaled: true,
+    });
+    // The run-wide turn budget: max(200, 25 per item), at most 800; an explicit value wins.
+    expect(scaledBudgets({ items: 2, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 3, dialMax: 2, maxRunTurns: 200 });
+    expect(scaledBudgets({ items: 15, dial, scaleDial: true })).toMatchObject({ maxRunTurns: 375 });
+    expect(scaledBudgets({ items: 40, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 6, dialMax: 6, maxRunTurns: 800 });
+    expect(scaledBudgets({ items: 10, explicitFixAttempts: 2, explicitRunTurns: 1000, dial, scaleDial: false })).toEqual({
+      maxFixAttempts: 2,
+      fixAttemptsScaled: false,
+      dialMax: 3,
+      dialScaled: false,
+      maxRunTurns: 1000,
+      runTurnsScaled: false,
+    });
   });
 
   it("a run posts the scaled fix budget with its goal, recruits under the scaled dial, and prints the effective values", async () => {
@@ -1133,7 +1149,9 @@ describe("budgets that scale with the plan (explicit values win)", () => {
     expect(of(result.log, "goal.posted")[0]!.payload.rules.maxFixAttempts).toBe(5);
     expect(of(result.log, "agent.joined").filter((m) => m.from !== "lead").length).toBeLessThanOrEqual(6);
     expect(of(result.log, "agent.joined").filter((m) => m.from !== "lead").length).toBeGreaterThan(3);
-    expect(formatBoardRunSummary(result)).toMatch(/budgets: 5 fix attempt\(s\) per item \(scaled with 10 planned item\(s\)\), dial max 6 \(scaled with 10 planned item\(s\)\)/);
+    expect(formatBoardRunSummary(result)).toMatch(
+      /budgets: 5 fix attempt\(s\) per item \(scaled with 10 planned item\(s\)\), dial max 6 \(scaled with 10 planned item\(s\)\), 250 run turn\(s\) \(scaled with 10 planned item\(s\)\)/,
+    );
   });
 });
 
@@ -1169,7 +1187,96 @@ class CtxTypecheckGate implements CommandRunner {
   }
 }
 
+/** Writes a guard into every in-scope resource file it edits (never the shared contract). */
+class GuardExecutor implements ExecutorProvider {
+  readonly name = "guard";
+  async execute(context: ExecutorContext): Promise<ExecutionResult> {
+    const written: string[] = [];
+    for (const path of context.paths.filter((p) => !/[*?]/.test(p))) {
+      const name = path.split("/").pop()!.replace(/\.js$/, "");
+      await mkdir(dirname(join(context.worktreeDir, path)), { recursive: true });
+      await writeFile(
+        join(context.worktreeDir, path),
+        `import { requireAuth } from "../contracts/auth.js";\nexport const ${name} = (req) => requireAuth(req) ?? { status: 200 }; // guarded\n`,
+      );
+      written.push(path);
+    }
+    return { status: "changed", changedPaths: written, logs: [], cost: { usd: 0 }, commitMessage: `guard ${context.workUnitId}` };
+  }
+}
+
+/**
+ * The service-api regression (reg2): until every resource is guarded the gate
+ * fails with node's spec output whose assertion names the RESOURCE while a
+ * stack frame (the callee) names the shared contract src/contracts/auth.js.
+ */
+class ResourceGuardGate implements CommandRunner {
+  async run(_argv: readonly string[], cwd: string): Promise<CommandOutcome> {
+    const unguarded: string[] = [];
+    for (const name of ["users", "orders", "products"]) {
+      if (!(await readFile(join(cwd, `src/resources/${name}.js`), "utf8")).includes("// guarded")) unguarded.push(name);
+    }
+    if (unguarded.length === 0) {
+      return { code: 0, stdout: "✔ users: guarded\n✔ orders: guarded\n✔ products: guarded\nℹ pass 3\nℹ fail 0\n", stderr: "" };
+    }
+    const name = unguarded[0]!;
+    return {
+      code: 1,
+      stdout: [
+        `✖ ${name}: unauthenticated request is rejected (401/403) (3ms)`,
+        `  AssertionError [ERR_ASSERTION]: ${name} must reject an unauthenticated request via requireAuth, got 201`,
+        `      at requireAuth (${cwd}/src/contracts/auth.js:4:9)`,
+        `      at handle (${cwd}/src/resources/${name}.js:2:30)`,
+        `      at TestContext.<anonymous> (${cwd}/test/api.test.js:9:5)`,
+        `ℹ pass ${3 - unguarded.length}`,
+        `ℹ fail ${unguarded.length}`,
+      ].join("\n"),
+      stderr: "",
+    };
+  }
+}
+
 describe("seam first (shared seams from the cohesion blueprint)", () => {
+  it("reg2: a failure whose stack frame names a shared contract never becomes a seam-scoped uncovered item, and the run completes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scf-reg2-"));
+    const files: Record<string, string> = {
+      "package.json": '{"name":"p","type":"module","scripts":{}}\n',
+      "src/contracts/auth.js": "export const requireAuth = (req) => (req && req.token ? null : { status: 401 });\n",
+      "test/api.test.js": "// the acceptance tests\n",
+    };
+    for (const name of ["users", "orders", "products"]) {
+      files[`src/resources/${name}.js`] = `import { requireAuth } from "../contracts/auth.js";\nexport const ${name} = () => ({ status: 201 });\n`;
+    }
+    for (const [rel, body] of Object.entries(files)) {
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      await writeFile(join(dir, rel), body);
+    }
+    // The planner covers the resources only: the shared contract belongs to no item.
+    const resources = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: ["users", "orders", "products"].map((n) => ({ item: `unit-${n}`, objective: `require auth in ${n}`, acceptance: ["gate passes"], scopeHint: [`src/resources/${n}.js`] })),
+    });
+    const result = await offline({
+      goal: GOAL,
+      projectDir: dir,
+      seed: resources,
+      executor: new GuardExecutor(),
+      appGateCommand: ["gate"],
+      verifyCommandRunner: new ResourceGuardGate(),
+    });
+    const log = result.log;
+    expect(of(log, "goal.posted")[0]!.payload.seams?.map((seam) => seam.path)).toContain("src/contracts/auth.js");
+    // No item (uncovered or otherwise) is scoped to the shared contract, and nobody pushed it.
+    expect(of(log, "item.proposed").filter((m) => m.payload.scopeHint.some((h) => h.includes("contracts/auth.js")))).toEqual([]);
+    expect(of(log, "push.announced").filter((m) => m.payload.paths.includes("src/contracts/auth.js"))).toEqual([]);
+    // Nothing was held SEAM_FIRST.
+    expect(result.turns.filter((t) => t.code === "SEAM_FIRST")).toEqual([]);
+    expect(result.incompleteItems).toEqual([]);
+    expect(result.verdict).toBe("verified");
+    expect(reduceBoard(log)).toEqual(result.state);
+  });
+
   it("derives the storefront's seams and their importers", async () => {
     const { sharedSeams } = await import("../src/run-board.ts");
     const { fileURLToPath } = await import("node:url");
@@ -1211,6 +1318,173 @@ describe("seam first (shared seams from the cohesion blueprint)", () => {
     expect(result.verdict).not.toBe("failed");
     expect(result.incompleteItems).toEqual([]);
     expect(reduceBoard(log)).toEqual(result.state);
+  });
+
+  it("SEAM_FIRST holds plus a seam item nobody works on never end a run quiescent: it is recorded stalled, released, and taken by another agent", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scf-seam-stall-"));
+    const files: Record<string, string> = {
+      "package.json": '{"name":"p","type":"module","scripts":{}}\n',
+      "src/shared/ctx.ts": "export interface Ctx {\n  store: string;\n}\n",
+    };
+    for (const name of ["a", "b", "c"]) {
+      files[`src/res/${name}.ts`] = `import type { Ctx } from "../shared/ctx.ts";\nexport const ${name} = (ctx: Ctx) => ctx.store;\n`;
+    }
+    for (const [rel, body] of Object.entries(files)) {
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      await writeFile(join(dir, rel), body);
+    }
+    const ctxSeed = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: ["a", "b", "c"].map((n) => ({ item: `res-${n}`, objective: `greet the user in ${n}`, acceptance: ["gate passes"], scopeHint: [`src/res/${n}.ts`] })),
+    });
+    // The proposer of a seam contract is granted its seam item, but never
+    // works on it (it only waits): its dependents are held, the board goes quiet.
+    const policy = createGenericBoardPolicy();
+    const absentOwner: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      const outcome = await policy(input);
+      const action = outcome.action as { type: string; itemId?: string };
+      return action.itemId?.startsWith(`seam-${input.agent}-`) ? { action: { type: "wait", reason: "not now" } } : outcome;
+    };
+    const events: BoardRunEvent[] = [];
+    const result = await offline({
+      goal: GOAL,
+      projectDir: dir,
+      seed: ctxSeed,
+      executor: new CtxUserExecutor(),
+      appGateCommand: ["gate"],
+      verifyCommandRunner: new CtxTypecheckGate(),
+      transport: absentOwner,
+      // A spare agent: someone idle can take a released seam item.
+      dial: { minConcurrency: 1, maxConcurrency: 4 },
+      onEvent: (e) => events.push(e),
+    });
+    const log = result.log;
+    const accepted = of(log, "contract.accepted")[0]!;
+    const seamItem = `seam-${accepted.payload.contract}`;
+    // Granted to the proposer at once, by the engine.
+    const grant = of(log, "claim.granted").find((m) => m.payload.item === seamItem)!;
+    expect(grant.from).toBe("engine");
+    expect(log.find((m) => m.type === "contract.proposed" && m.payload.contract === accepted.payload.contract)!.from).toBe(grant.payload.agent);
+    // Quiet with a hold: recorded stalled and released (no push of the owner's), never quiescent with it.
+    const stalled = of(log, "seam.stalled").find((m) => m.payload.item === seamItem)!;
+    expect(stalled.payload.released).toBe(true);
+    expect(events.find((e) => e.kind === "seam-stalled")).toMatchObject({ item: seamItem, released: true });
+    // Another agent took it, its change landed in a passing revision, and the run completed.
+    const regrant = of(log, "claim.granted").find((m) => m.payload.item === seamItem && m.seq > stalled.seq)!;
+    expect(regrant.payload.agent).not.toBe(grant.payload.agent);
+    const seamPush = of(log, "push.announced").find((m) => m.payload.item === seamItem)!;
+    expect(seamPush.from).toBe(regrant.payload.agent);
+    expect(result.state.items[seamItem]!.status).toBe("done");
+    expect(result.incompleteItems).toEqual([]);
+    expect(result.verdict).not.toBe("failed");
+    expect(formatBoardTranscript(log)).toMatch(/seam\.stalled\s+seam-.* released for another agent/);
+    expect(reduceBoard(log)).toEqual(result.state);
+  });
+
+  it("concurrent schedule: a quiet board with a SEAM_FIRST hold records the seam item stalled before quiescence could end the run", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scf-seam-stall-live-"));
+    const files: Record<string, string> = {
+      "package.json": '{"name":"p","type":"module","scripts":{}}\n',
+      "src/shared/ctx.ts": "export interface Ctx {\n  store: string;\n}\n",
+    };
+    for (const name of ["a", "b", "c"]) {
+      files[`src/res/${name}.ts`] = `import type { Ctx } from "../shared/ctx.ts";\nexport const ${name} = (ctx: Ctx) => ctx.store;\n`;
+    }
+    for (const [rel, body] of Object.entries(files)) {
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      await writeFile(join(dir, rel), body);
+    }
+    const ctxSeed = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: ["a", "b", "c"].map((n) => ({ item: `res-${n}`, objective: `greet the user in ${n}`, acceptance: ["gate passes"], scopeHint: [`src/res/${n}.ts`] })),
+    });
+    const policy = createGenericBoardPolicy();
+    const absentOwner: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      const outcome = await policy(input);
+      const action = outcome.action as { type: string; itemId?: string };
+      return action.itemId?.startsWith(`seam-${input.agent}-`) ? { action: { type: "wait", reason: "not now" } } : outcome;
+    };
+    const { base } = await direct("change-seam-stall-live");
+    const result = await runBoard({
+      ...base,
+      projectDir: dir,
+      seed: ctxSeed,
+      transport: absentOwner,
+      executor: new CtxUserExecutor(),
+      appGateCommand: ["gate"],
+      verifyCommandRunner: new CtxTypecheckGate(),
+      dial: { minConcurrency: 1, maxConcurrency: 4 },
+      schedule: "concurrent",
+      pollMs: 20,
+      // Longer than an idle agent's longest poll backoff (4 s), so an agent sees the released item.
+      budgets: { quiescenceMs: 10_000, timeoutMs: 100_000 },
+    });
+    const stalled = of(result.log, "seam.stalled");
+    expect(stalled.length).toBeGreaterThanOrEqual(1);
+    expect(stalled[0]!.payload.released).toBe(true);
+    // Whatever the schedule did next (timing decides who is free to take the
+    // released item; the lockstep test above pins completion), the run never
+    // ended with a SEAM_FIRST hold in effect.
+    expect(seamHolds(result.state)).toEqual([]);
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  }, 120_000);
+
+  it("a seam contract gets an ADVISORY triage before the lead decides: recorded on the board, kept on the contract, shown in the lead's turn", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scf-seam-triage-"));
+    const files: Record<string, string> = {
+      "package.json": '{"name":"p","type":"module","scripts":{}}\n',
+      "src/shared/ctx.ts": "export interface Ctx {\n  store: string;\n}\n",
+    };
+    for (const name of ["a", "b", "c"]) {
+      files[`src/res/${name}.ts`] = `import type { Ctx } from "../shared/ctx.ts";\nexport const ${name} = (ctx: Ctx) => ctx.store;\n`;
+    }
+    for (const [rel, body] of Object.entries(files)) {
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      await writeFile(join(dir, rel), body);
+    }
+    const ctxSeed = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: ["a", "b", "c"].map((n) => ({ item: `res-${n}`, objective: `greet the user in ${n}`, acceptance: ["gate passes"], scopeHint: [`src/res/${n}.ts`] })),
+    });
+    const asked: string[] = [];
+    const jev: AskJev = async (state, questions) => {
+      if ("triage" in questions) {
+        asked.push(String((questions.triage as { instructions: string }).instructions));
+        expect(state).toContain("shared seam");
+        return { triage: { type: "choice", choice: "accept", confidence: 0.92 } };
+      }
+      throw new Error("not asked in this test");
+    };
+    const policy = createGenericBoardPolicy();
+    const leadSaw: { contract: string; triage?: string; namedInFailure?: boolean }[] = [];
+    const recording: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      if (input.role === "lead") leadSaw.push(...input.board.pendingContracts.filter((c) => c.seam !== undefined));
+      return policy(input);
+    };
+    const result = await offline({
+      goal: GOAL,
+      projectDir: dir,
+      seed: ctxSeed,
+      executor: new CtxUserExecutor(),
+      appGateCommand: ["gate"],
+      verifyCommandRunner: new CtxTypecheckGate(),
+      transport: recording,
+      jev,
+    });
+    const proposal = of(result.log, "contract.proposed").find((m) => m.payload.target === "src/shared/ctx.ts")!;
+    const triage = of(result.log, "decision.recorded").find((m) => m.payload.juncture === "contract-triage" && m.payload.contract === proposal.payload.contract)!;
+    expect(triage.payload).toMatchObject({ answer: "accept", confidence: 0.92, accepted: true });
+    expect(triage.payload.question).toMatch(/shared seam/);
+    expect(asked[0]).toMatch(/shared seam/);
+    expect(result.state.contracts[proposal.payload.contract]!.triage).toBe("accept (confidence 0.92)");
+    // Recorded before the lead decided, and shown to it with the mechanical facts.
+    const decided = of(result.log, "contract.accepted").find((m) => m.payload.contract === proposal.payload.contract)!;
+    expect(triage.seq).toBeLessThan(decided.seq);
+    expect(leadSaw.find((c) => c.contract === proposal.payload.contract)).toMatchObject({ triage: "accept (confidence 0.92)", namedInFailure: true });
+    expect(reduceBoard(result.log)).toEqual(result.state);
   });
 
   it("a type error on a frozen shared seam becomes a seam contract the LEAD decides, then a seam item that lands first", async () => {

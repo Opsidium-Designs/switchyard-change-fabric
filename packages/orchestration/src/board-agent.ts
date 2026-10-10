@@ -45,6 +45,8 @@ import {
   LEAD_ROLE,
   toolBranch,
   toolItemId,
+  seamContractFacts,
+  seamItemId,
   toolUnavailableReason,
   toolScope,
   type BoardDigest,
@@ -766,8 +768,27 @@ export class BoardAgent {
     }
     this.uncoveredSeen.add(message.payload.n);
     const output = message.payload.failing!.output;
-    const files = uncoveredFailureFiles(state, failingRepoFiles(output, await listRepoFiles(this.baseDir))).slice(0, 16);
+    const pointed = failingRepoFiles(output, await listRepoFiles(this.baseDir));
+    const files = uncoveredFailureFiles(state, pointed).slice(0, 16);
     if (files.length === 0) {
+      // Only shared seams were left: they change through a seam contract (the
+      // implicated owner's cue), never as uncovered work. Recorded, not proposed.
+      const seams = pointed.filter((f) => (state.seams ?? []).some((seam) => seam.path === f));
+      const uncoveredSeams = seams.filter((f) => uncoveredFailureFiles({ ...state, seams: [] }, [f]).length > 0);
+      if (uncoveredSeams.length > 0) {
+        this.record({
+          turn: this.turns,
+          action: {
+            type: "wait",
+            reason: bounded(
+              `revision ${message.payload.n} points only at the shared seam(s) ${uncoveredSeams.join(", ")} outside every item: no uncovered item proposed (a seam changes only through a seam contract)`,
+              500,
+            ),
+          },
+          outcome: "local",
+          code: "SEAM_ONLY",
+        });
+      }
       return false;
     }
     this.uncoveredProposals += 1;
@@ -986,9 +1007,15 @@ export class BoardAgent {
         proposedBy: c.proposedBy,
         ...(c.item !== undefined ? { item: c.item } : {}),
         ...(c.guarded ? { protected: true } : {}),
-        ...(c.seam !== undefined ? { seam: c.seam } : {}),
+        ...(c.seam !== undefined ? { seam: c.seam, ...seamContractFacts(state, c.contract) } : {}),
         ...(c.description !== undefined ? { description: c.description } : {}),
+        ...(c.triage !== undefined ? { triage: c.triage } : {}),
       }));
+    // Seam contracts already decided (with their seam item): nothing to decide again.
+    const decidedContracts = Object.values(state.contracts)
+      .filter((c) => c.seam !== undefined && c.status !== "proposed")
+      .slice(-20)
+      .map((c) => ({ contract: c.contract, status: c.status, seamItem: seamItemId(c.contract) }));
     // The lead decides workers' proposals against the items already on the
     // Change; every agent sees them, so a tool's findings are compared with
     // what outstanding items already cover.
@@ -1061,6 +1088,7 @@ export class BoardAgent {
       board: {
         liveClaims,
         pendingContracts,
+        ...(this.role === "lead" && decidedContracts.length > 0 ? { decidedContracts } : {}),
         pendingItems,
         items: acceptedItems,
         tools,
@@ -1384,11 +1412,31 @@ export class BoardAgent {
           local("NOT_ALLOWED", "only the lead decides contracts");
           return;
         }
-        await posted({
-          type: action.decision === "accept" ? "contract.accepted" : "contract.rejected",
-          payload: { contract: action.contractId },
-          ...rationale(action.rationale),
-        });
+        {
+          // The contract id, or the seam item id derived from it (`seam-<contract>`).
+          const contractId = state.contracts[action.contractId]
+            ? action.contractId
+            : (state.items[action.contractId]?.fromContract ??
+              (action.contractId.startsWith("seam-") && state.contracts[action.contractId.slice(5)] ? action.contractId.slice(5) : undefined));
+          const contract = contractId !== undefined ? state.contracts[contractId] : undefined;
+          if (contract === undefined) {
+            const pending = Object.values(state.contracts).filter((c) => c.status === "proposed").map((c) => c.contract);
+            local("UNKNOWN_REF", `no contract ${action.contractId}; pending contracts: ${pending.join(", ") || "none"} (use pendingContracts[].contract exactly)`);
+            return;
+          }
+          if (contract.status !== "proposed") {
+            local(
+              "INVALID_STATE",
+              `contract ${contract.contract} is already ${contract.status}${contract.seam !== undefined && contract.status === "accepted" ? ` (its seam item ${seamItemId(contract.contract)} carries it out)` : ""}: nothing to decide`,
+            );
+            return;
+          }
+          await posted({
+            type: action.decision === "accept" ? "contract.accepted" : "contract.rejected",
+            payload: { contract: contract.contract },
+            ...rationale(action.rationale),
+          });
+        }
         return;
     }
   }

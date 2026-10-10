@@ -20,6 +20,7 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   appendBoardMessage,
   appendDecisionRecorded,
+  appendSeamStalled,
   appendDiscoveredUnits,
   BOARD_AGENT_ID_PATTERN,
   boardAgentWorkspaceName,
@@ -1653,7 +1654,7 @@ export class LocalChangeControl {
     const method = (init?.method ?? "GET").toUpperCase();
 
     const boardRoute = url.pathname.match(
-      /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|integration\/revision|tools\/gate|tools\/used)$/,
+      /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|board\/seam-stalled|integration\/revision|tools\/gate|tools\/used)$/,
     );
     if (boardRoute && (method === "POST" || method === "GET")) {
       const response = await this.handleBoard(dec(boardRoute[1]), boardRoute[2] ?? "", method, url, init);
@@ -2164,6 +2165,10 @@ export class LocalChangeControl {
     } else if (kind === "board/decision") {
       const record = this.require(changeId);
       outcome = this.boardOutcome(() => this.appendToBoard(record, (state) => appendDecisionRecorded(state, body, this.boardAt())));
+    } else if (kind === "board/seam-stalled") {
+      // The board went quiet while a seam item held dependents: the engine records it stalled.
+      const record = this.require(changeId);
+      outcome = this.boardOutcome(() => this.appendToBoard(record, (state) => appendSeamStalled(state, body, this.boardAt())));
     } else if (kind === "tools/gate") {
       // The operator ran a tool's own gate: the engine records it (and publishes a pass).
       const record = this.require(changeId);

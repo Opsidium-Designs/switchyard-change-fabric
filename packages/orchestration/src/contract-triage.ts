@@ -51,6 +51,25 @@ export const CONTRACT_TRIAGE_QUESTIONS: JevQuestions = {
   },
 };
 
+/** The seam-contract triage question (a change to a shared seam the LEAD decides). */
+export const SEAM_TRIAGE_QUESTION =
+  "Is this change to a shared seam (a type or contract many modules import) what the failing revision needs, without duplicating another seam change or adding unrelated behavior? Recommend accept or reject.";
+
+/** The seam-contract variant of the choice question (same key and options). */
+export const SEAM_TRIAGE_QUESTIONS: JevQuestions = {
+  [CONTRACT_TRIAGE_KEY]: {
+    type: "choice",
+    instructions: SEAM_TRIAGE_QUESTION,
+    criteria: ["accept", "reject"],
+    descriptions: {
+      accept:
+        "The failing output needs exactly this shared declaration (a missing field, member, or export the error names), it is compatible for the seam's other importers, and no other pending or accepted seam change already provides it.",
+      reject:
+        "The failing output does not name this seam or what it would add; or it duplicates another seam change; or it adds new behavior (logic, validation, helpers) rather than the shared type or contract the error needs; or it would break other importers.",
+    },
+  },
+};
+
 /** Size bounds for what the triage sends (characters). */
 export const CONTRACT_TRIAGE_LIMITS = {
   field: 600,
@@ -81,6 +100,10 @@ export interface ContractTriageInput {
   readonly targetExcerpt?: string;
   /** The proposed change itself, when one exists before the decision. */
   readonly proposedChange?: string;
+  /** A SEAM contract (the lead decides it): asks the seam question instead. */
+  readonly seam?: boolean;
+  /** Other seam changes pending or accepted (to judge duplicates), one line each. */
+  readonly otherSeamChanges?: string;
 }
 
 /** The advisory decision a triage produced, ready to record on the board. */
@@ -133,8 +156,15 @@ export function buildContractTriageState(input: ContractTriageInput, scrub?: (te
   const L = CONTRACT_TRIAGE_LIMITS;
   const clean = (text: string, max: number) => defang(bound(scrubForDecision(text, scrub), max));
   const lines = [
-    "A coding agent asks to change part of the project's existing tests or gate configuration (the contract that decides whether the change ships).",
-    "Decide whether that change is needed to achieve the goal, or whether it would weaken the check. A human makes the final decision.",
+    ...(input.seam
+      ? [
+          "A coding agent asks to change a shared seam (a type or contract many modules import) that no work item owns, because a failing revision needs it.",
+          "Decide whether the change is what the failing output needs, without duplicating another seam change or adding unrelated behavior. The lead makes the final decision.",
+        ]
+      : [
+          "A coding agent asks to change part of the project's existing tests or gate configuration (the contract that decides whether the change ships).",
+          "Decide whether that change is needed to achieve the goal, or whether it would weaken the check. A human makes the final decision.",
+        ]),
     `Change: ${clean(input.changeId, 200)}`,
     `Contract: ${clean(input.contract, 200)} (${clean(input.kind, 20)} ${clean(input.target, 300)})`,
     ...(input.item !== undefined ? [`Item: ${clean(input.item, 200)}`] : []),
@@ -147,6 +177,7 @@ export function buildContractTriageState(input: ContractTriageInput, scrub?: (te
     ["the latest failing gate output for the item", input.failingEvidence, L.evidence],
     [`an excerpt of ${clean(input.target, 300)} as it is now`, input.targetExcerpt, L.excerpt],
     ["the proposed change", input.proposedChange, L.excerpt],
+    ...(input.seam ? ([["other seam changes pending or accepted", input.otherSeamChanges, L.field]] as [string, string | undefined, number][]) : []),
   ];
   for (const [title, body, max] of blocks) {
     lines.push(
@@ -169,9 +200,10 @@ export async function triageContract(options: {
   readonly threshold?: number;
   readonly scrub?: (text: string) => string;
 }): Promise<ContractTriageDecision> {
-  const base = { juncture: "contract-triage" as const, contract: options.input.contract, question: CONTRACT_TRIAGE_QUESTION };
+  const seam = options.input.seam === true;
+  const base = { juncture: "contract-triage" as const, contract: options.input.contract, question: seam ? SEAM_TRIAGE_QUESTION : CONTRACT_TRIAGE_QUESTION };
   try {
-    const answers = await options.ask(buildContractTriageState(options.input, options.scrub), CONTRACT_TRIAGE_QUESTIONS);
+    const answers = await options.ask(buildContractTriageState(options.input, options.scrub), seam ? SEAM_TRIAGE_QUESTIONS : CONTRACT_TRIAGE_QUESTIONS);
     const answer = answers[CONTRACT_TRIAGE_KEY];
     if (answer === undefined) {
       return { ...base, accepted: false, error: "the decision reply carried no triage answer" };

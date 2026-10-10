@@ -1149,7 +1149,7 @@ const commands: Command[] = [
               break;
             case "budgets":
               console.log(
-                `  budgets: ${event.maxFixAttempts} fix attempt(s) per item (${event.fixAttemptsScaled ? `scaled with ${event.items} planned item(s)` : "explicit"}), dial max ${event.dialMax} (${event.dialScaled ? `scaled with ${event.items} planned item(s)` : "explicit"})`,
+                `  budgets: ${event.maxFixAttempts} fix attempt(s) per item (${event.fixAttemptsScaled ? `scaled with ${event.items} planned item(s)` : "explicit"}), dial max ${event.dialMax} (${event.dialScaled ? `scaled with ${event.items} planned item(s)` : "explicit"}), ${event.maxRunTurns} run turn(s) (${event.runTurnsScaled ? `scaled with ${event.items} planned item(s)` : "explicit"})`,
               );
               break;
             case "goal-posted":

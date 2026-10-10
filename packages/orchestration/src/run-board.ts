@@ -64,6 +64,7 @@ import {
   isChangeItem,
   toolUnavailableReason,
   isSeamItem,
+  seamHolds,
   deriveCohesionBlueprint,
   type BoardMessage,
   type BoardRules,
@@ -176,7 +177,10 @@ export interface BoardSeed {
 export interface BoardRunBudgets {
   /** Turns one agent may spend on one item (default 8). */
   readonly maxTurnsPerItem?: number;
-  /** Turns across every agent in the run (default 200). */
+  /**
+   * Turns across every agent in the run. Default: scaled with the plan,
+   * min(800, max(200, 25 per planned item)); an explicit value wins.
+   */
   readonly maxRunTurns?: number;
   /** Lockstep rounds before the run stops (default 200). */
   readonly maxRounds?: number;
@@ -203,7 +207,7 @@ export type BoardRunEvent =
   | { readonly kind: "change-created"; readonly changeId: string }
   | { readonly kind: "goal-posted"; readonly protected: readonly string[]; readonly immutable?: readonly string[]; readonly testInventory: string }
   /** The effective budgets for this run, after scaling with the plan size (explicit flags win). */
-  | { readonly kind: "budgets"; readonly items: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean }
+  | { readonly kind: "budgets"; readonly items: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean; readonly maxRunTurns: number; readonly runTurnsScaled: boolean }
   | { readonly kind: "contract-decision"; readonly contract: string; readonly decision: string; readonly path?: string }
   | { readonly kind: "contract-awaiting-human"; readonly contract: string; readonly escalationId: string; readonly path?: string; readonly recommendation?: string }
   /** The advisory triage of a protected contract, recorded before the human is asked. */
@@ -218,6 +222,8 @@ export type BoardRunEvent =
   | { readonly kind: "nothing-to-integrate" }
   /** The operator ran a tool's own gate on a build and recorded it (published only on a pass). */
   | { readonly kind: "tool-gated"; readonly gate: ToolGateRecord }
+  /** The board went quiet while a seam item held dependents: recorded stalled (released when its owner had pushed nothing). */
+  | { readonly kind: "seam-stalled"; readonly item: string; readonly released: boolean; readonly dependents: readonly string[] }
   /** The operator forked a requester's repo for the helper of a help request. */
   | { readonly kind: "help-forked"; readonly request: string; readonly helper: string; readonly forkOf: string; readonly workspace: string }
   | FullLiveEvent;
@@ -450,7 +456,7 @@ export interface RunBoardResult {
   readonly scratchRoot?: string;
   readonly cleanedUp: readonly string[];
   /** The effective budgets (scaled with the plan unless explicit). */
-  readonly budgets?: { readonly items: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean };
+  readonly budgets?: { readonly items: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean; readonly maxRunTurns: number; readonly runTurnsScaled: boolean };
   /** The model each pushed app edit used (the strongest for complex items). */
   readonly editModels?: readonly { readonly agent: string; readonly item: string; readonly commit: string; readonly model: string; readonly why?: string }[];
   /** Every tool gate the run's bench ran and recorded, in order. */
@@ -1268,7 +1274,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   const changeId = options.changeId;
   const budgets = {
     maxTurnsPerItem: options.budgets?.maxTurnsPerItem ?? 8,
-    maxRunTurns: options.budgets?.maxRunTurns ?? 200,
+    maxRunTurns: options.budgets?.maxRunTurns ?? 200, // replaced by the plan-scaled value once planned
     maxRounds: options.budgets?.maxRounds ?? 200,
     timeoutMs: options.budgets?.timeoutMs ?? 30 * 60 * 1000,
     maxFixAttemptsPerItem: options.budgets?.maxFixAttemptsPerItem ?? 3,
@@ -1408,9 +1414,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   const effective = scaledBudgets({
     items: planned.items.length,
     explicitFixAttempts: options.rules?.maxFixAttempts ?? options.budgets?.maxFixAttemptsPerItem,
+    ...(options.budgets?.maxRunTurns !== undefined ? { explicitRunTurns: options.budgets.maxRunTurns } : {}),
     dial: options.dial,
     scaleDial: options.scaleDial === true,
   });
+  budgets.maxRunTurns = effective.maxRunTurns;
   const dial: ConcurrencyDial = { minConcurrency: options.dial.minConcurrency, maxConcurrency: effective.dialMax };
   emit({ kind: "budgets", items: planned.items.length, ...effective });
   const goal = await operator.postAsHuman({
@@ -1744,7 +1752,19 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         proposer: contract.proposedBy,
         ...(proposal?.rationale !== undefined ? { rationale: proposal.rationale } : {}),
         ...(failure && contract.item !== undefined && failure.items.includes(contract.item) ? { failingEvidence: failure.output } : {}),
-        ...(await readTargetExcerpt(options.projectDir, contract.target).then((excerpt) => (excerpt !== undefined ? { targetExcerpt: excerpt } : {}))),
+        ...(await readTargetExcerpt(options.projectDir, contract.target.split("#")[0]!).then((excerpt) => (excerpt !== undefined ? { targetExcerpt: excerpt } : {}))),
+        ...(contract.seam !== undefined
+          ? {
+              seam: true,
+              ...(contract.description !== undefined ? { proposedChange: contract.description } : {}),
+              ...(failure ? { failingEvidence: failure.output } : {}),
+              otherSeamChanges:
+                Object.values(page.state.contracts)
+                  .filter((c) => c.seam !== undefined && c.contract !== contractId && c.status !== "rejected")
+                  .map((c) => `${c.contract} (${c.status}) on ${c.seam}: ${c.description ?? ""}`)
+                  .join("\n") || "none",
+            }
+          : {}),
       },
     });
     await recordDecision(decision);
@@ -1752,7 +1772,24 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     emit({ kind: "contract-triage", contract: contractId, recommendation });
     return recommendation;
   };
+  // Seam contracts the LEAD decides get the same ADVISORY triage first (when a
+  // decision model is configured): recorded on the board, shown in the lead's
+  // turn (pendingContracts[].triage). It never decides.
+  const seamTriaged = new Set<string>();
+  const triageSeamContracts = async (): Promise<void> => {
+    if (!options.jev) {
+      return;
+    }
+    const state = (await operator.page(0, 1)).state;
+    for (const c of Object.values(state.contracts)) {
+      if (c.seam !== undefined && c.status === "proposed" && c.triage === undefined && !seamTriaged.has(c.contract)) {
+        seamTriaged.add(c.contract);
+        await triageContractFor(c.contract);
+      }
+    }
+  };
   const settleContracts = async (): Promise<boolean> => {
+    await triageSeamContracts();
     let decided = false;
     const res = await authed(`${base}/changes/${encodeURIComponent(changeId)}/escalations`).catch(() => undefined);
     const body = res && res.status < 400 ? ((await res.json()) as { escalations?: { id: string; status: string; boardContract?: string; path?: string; question: string }[] }) : {};
@@ -1786,6 +1823,23 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       }
     }
     return decided;
+  };
+
+  // SEAM_FIRST holds never end a run quiescent: when the board goes quiet
+  // while a seam item holds dependents, the operator records it stalled (the
+  // engine ends the hold, and releases the item when its owner pushed nothing).
+  const releaseStalledSeams = async (): Promise<boolean> => {
+    const holds = seamHolds((await operator.page(0, 1)).state);
+    let released = false;
+    for (const hold of holds) {
+      const recorded = await operator.recordSeamStalled(hold.item);
+      if (recorded.ok) {
+        released = true;
+        const m = recorded.appended.find((a) => a.type === "seam.stalled");
+        emit({ kind: "seam-stalled", item: hold.item, released: m?.type === "seam.stalled" ? m.payload.released : false, dependents: hold.dependents });
+      }
+    }
+    return released;
   };
 
   const lead = makeAgent("lead", "lead");
@@ -1938,7 +1992,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         }
         const integrated = integrator.revisions.length > before;
         const decided = await settleContracts();
-        if (!acted && joined === 0 && !integrated && !decided) {
+        if (!acted && joined === 0 && !integrated && !decided && !(await releaseStalledSeams())) {
           stopReason = check((await operator.page(0, 1)).state) ?? "quiescent";
           stopDetail = "no agent had anything to do and no integration was pending";
         }
@@ -1992,6 +2046,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         const anyBusy = [lead, ...workers].some((a) => a.busy) || integrator.busy || integrator.wants(state);
         if (state.lastSeq !== lastSeq || anyBusy) {
           lastSeq = state.lastSeq;
+          quietSince = Date.now();
+        } else if (Date.now() - quietSince >= budgets.quiescenceMs / 2 && seamHolds(state).length > 0 && (await releaseStalledSeams())) {
+          // A quiet board with seam holds: the holds end before quiescence could.
           quietSince = Date.now();
         } else if (Date.now() - quietSince >= budgets.quiescenceMs) {
           stopReason = "quiescent";
@@ -2294,13 +2351,34 @@ export function exportedNames(source: string): string[] {
 export function scaledBudgets(input: {
   readonly items: number;
   readonly explicitFixAttempts?: number;
+  readonly explicitRunTurns?: number;
   readonly dial: ConcurrencyDial;
   readonly scaleDial: boolean;
-}): { readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean } {
+}): {
+  readonly maxFixAttempts: number;
+  readonly fixAttemptsScaled: boolean;
+  readonly dialMax: number;
+  readonly dialScaled: boolean;
+  readonly maxRunTurns: number;
+  readonly runTurnsScaled: boolean;
+} {
   const fix = input.explicitFixAttempts ?? Math.min(6, 3 + Math.floor(input.items / 5));
   const dialMax = input.scaleDial ? Math.max(input.dial.minConcurrency, Math.min(Math.max(1, input.items), 6)) : input.dial.maxConcurrency;
-  return { maxFixAttempts: fix, fixAttemptsScaled: input.explicitFixAttempts === undefined, dialMax, dialScaled: input.scaleDial };
+  const runTurns = input.explicitRunTurns ?? Math.min(MAX_SCALED_RUN_TURNS, Math.max(200, RUN_TURNS_PER_ITEM * input.items));
+  return {
+    maxFixAttempts: fix,
+    fixAttemptsScaled: input.explicitFixAttempts === undefined,
+    dialMax,
+    dialScaled: input.scaleDial,
+    maxRunTurns: runTurns,
+    runTurnsScaled: input.explicitRunTurns === undefined,
+  };
 }
+
+/** Run-wide turns per planned item when the turn budget scales with the plan. */
+export const RUN_TURNS_PER_ITEM = 25;
+/** The most turns a plan-scaled run budget grants (an explicit --max-turns may go higher). */
+export const MAX_SCALED_RUN_TURNS = 800;
 
 /**
  * The lockstep order of the workers in a round: agents building a tool that is
@@ -2485,6 +2563,8 @@ function payloadSummary(m: BoardMessage): string {
       return `${String(p.contract)}: ${String(p.kind)} ${String(p.target)}${p.item ? ` for item ${String(p.item)}` : ""}${p.description ? `: ${String(p.description).slice(0, 160)}` : ""}`;
     case "contract.escalated":
       return `${String(p.contract)}: ${String(p.kind)} ${String(p.target)} for item ${String(p.item)} waits for a human decision`;
+    case "seam.stalled":
+      return `${String(p.item)} held dependents and made no progress while the board was quiet: its hold ends${p.released ? "; released for another agent (no push of its owner's)" : ""}`;
     case "contract.accepted":
     case "contract.rejected":
       return String(p.contract);
@@ -2711,7 +2791,7 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     `  agent phase ended: ${result.stopReason}${result.stopDetail ? ` (${result.stopDetail})` : ""}`,
     ...(result.budgets
       ? [
-          `  budgets: ${result.budgets.maxFixAttempts} fix attempt(s) per item (${result.budgets.fixAttemptsScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"}), dial max ${result.budgets.dialMax} (${result.budgets.dialScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"})`,
+          `  budgets: ${result.budgets.maxFixAttempts} fix attempt(s) per item (${result.budgets.fixAttemptsScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"}), dial max ${result.budgets.dialMax} (${result.budgets.dialScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"}), ${result.budgets.maxRunTurns} run turn(s) (${result.budgets.runTurnsScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"})`,
         ]
       : []),
     ...(result.gateLabel !== undefined ? [`  gate: ${result.gateLabel}`] : []),

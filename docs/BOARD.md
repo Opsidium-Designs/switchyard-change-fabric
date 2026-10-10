@@ -82,7 +82,8 @@ Who sent a message is established by the route, never by the message body.
 | `POST /changes/:id/board/help-fork` | bearer | `{request, agent, ttlSeconds?}` (default 900, 60 to 3600): fork the REQUESTER's repo for `agent`, the helper of a help request that grants a scope (`<change>--help-<request>`, the Artifacts repo fork; offline, the local backend copies the repo). The board checks first (`checkHelpFork`: the request grants a scope, is live and not yet granted, the agent is another joined non-lead agent, the requester has a repo), so a fork the board would refuse is never made. `201 {workspaceName, gitUrl, defaultBranch, backend, fallback, tokenId, token, tokenExpiresAt, forkOf}`: the fork's one-time creation token is revoked and only a short write token is returned, once. The helper then posts `help.offered {forkOf, forkCommit, fork}` itself. Forks are archived at cleanup with the agents' repos (`DELETE /workspaces/:name`, which the offline control serves too). |
 | `POST /changes/:id/board` | agent token | `{type, payload, rationale?, inReplyTo?, to?}` appended as that agent; `201 {appended, escalations}`. |
 | `POST /changes/:id/board/human` | bearer | A human message. |
-| `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected `contract`. It changes only the decision counts, never arbitration or the verdict. |
+| `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected or seam `contract` (kept on the contract as `triage` for whoever decides it). It changes only the decision counts and that advisory line, never arbitration or the verdict. |
+| `POST /changes/:id/board/seam-stalled` | bearer | `{item}`: the board went quiet while this seam item held dependents; the engine appends `seam.stalled {item, released}` (the hold ends; with no push of its owner's the item is released). Refused unless the item holds a dependent. |
 | `POST /changes/:id/integration/revision` | bearer | An integration result `{commit, gate, merged, failing?}`; appends `integrated.rev` and what it triggers (completions and `rebase.needed` on a pass, `fix.requested` / `fix.exhausted` on a fail). |
 | `POST /changes/:id/tools/gate` | bearer | A tool's own gate result on the latest build of its item, `{capability, commit, passed, checks: [{check, passed, detail}], repo, usage, output?}`; the engine appends `tool.gated` (addressed to the builder) and, on a pass, `tool.published` (the next version) and the tool item's `item.completed {via: tool}`. See "Agent-built tools". |
 | `POST /changes/:id/tools/used` | bearer | A run of a pinned, published tool version the operator's runtime executed in a consumer's repo, `{capability, version, by, item?, commit?, changedFiles, findings?, exit?}`; the engine appends `tool.used` (addressed to the tool's builder). |
@@ -130,7 +131,7 @@ bounded fields that define an item.
 `help.volunteered {item}` (addressed to the owner), `help.declined {item, volunteer}`,
 `contract.proposed {contract, target, kind, item?}`, `contract.escalated {contract, item,
 target, kind}` (engine: a protected contract waits for a human), `contract.accepted`,
-`contract.rejected`, `push.announced
+`contract.rejected`, `seam.stalled {item, released}` (engine, recorded by the operator: a seam item held dependents while the board went quiet), `push.announced
 {item, commit, paths, merges?: [{item, commit}], pulled?: [request]}`, `integrated.rev {n, commit, gate, merged, paths,
 contributors, failing?: {output, items}, gated?: false}` (`gated: false`: no gate ran, so its pass checked nothing; `unverified: [{item, reason}]`: merged children of a sub-lead push the integrator could not verify, not integrated by it), `rebase.needed`, `review.requested`,
 `review.result`, `handoff`, `done.proposed`, `item.completed`, `item.reopened {item, previousOwner, commit?, n?}` (n absent for a tool item)
@@ -444,18 +445,22 @@ is distributed changes: items are proposed and claimed, never assigned.
   `edit models: ...`.
 - Budgets scale with the plan (bounded; explicit flags win): the lead plans
   BEFORE the goal is posted, so the goal's fix budget is 3 + floor(items / 5)
-  (at most 6) and, without an explicit `--max`, the dial's max is
-  min(items, 6) (at least the dial's min). The effective values are printed
-  (`budgets: ...`).
+  (at most 6), without an explicit `--max` the dial's max is min(items, 6)
+  (at least the dial's min), and without an explicit `--max-turns` the
+  run-wide turn budget is min(800, max(200, 25 per planned item)). The
+  effective values are printed (`budgets: ...`).
 - Seam first: the goal records the shared seams of a modular project (the
   cohesion blueprint's frozen contracts) with their importers
-  (`goal.posted.seams`). An item whose scope covers a seam goes first: a claim
-  on an item covering one of its importers is refused (`SEAM_FIRST`) until
-  the seam item's push is integrated, bounded by 60 board messages
-  (`seamWaits`); open items show `seam` and `waitsFor`, a held dependent does
+  (`goal.posted.seams`). An item whose scope covers a seam is offered first
+  (`seam` on open items; in lockstep its holder moves first), but only the
+  seam item of an ACCEPTED SEAM CONTRACT (`fromContract`) HOLDS dependents: a
+  claim on an item covering one of its importers is refused (`SEAM_FIRST`)
+  until its push is integrated, while it makes progress (its grant or latest
+  push within 60 board messages). One predicate, `seamItemHolding`, decides
+  this for the hold, the digest's `waitsFor`, `seamHolds`, and the stall check
+  (`seamWaits`); a held dependent does
   not edit yet and then rebases onto the seam change (a passing revision that
-  changes a seam sends `rebase.needed` to the holders of its importers), and
-  in lockstep the holder of a seam change moves first. Each seam also records
+  changes a seam sends `rebase.needed` to the holders of its importers). Each seam also records
   the names it exports (`symbols`).
 - Seam contracts (decided by the LEAD): a seam no live item's scope covers is
   frozen. When a failing revision's type error (a tsc `path(line,col): error
@@ -466,18 +471,45 @@ is distributed changes: items are proposed and claimed, never assigned.
   {target: the seam, kind, item, description: the exact change}` instead of
   using undeclared fields or casts. Only the owner of the implicated item
   proposes it, one pending per seam; a seam another item owns is refused
-  (ask its owner). It is not escalated: the lead decides it (`seam` and
-  `description` on `pendingContracts`). Accepted, the engine proposes the
-  seam item `seam-<contract>` (open, `fromContract`, scoped to the seam),
-  which goes first like any seam item; its importers wait for it and rebase
-  onto it. A rejected seam contract is cued again only after a newer failing
-  revision implicates the item.
+  (ask its owner). Bounded: one seam contract waiting per agent, three per
+  Change, and one seam change per failing cause (a second one from the same
+  agent for the same failing revision is refused while the first is
+  unfinished). It is not escalated: the lead decides it. The lead's turn
+  shows each with its exact id (`pendingContracts[].contract`; already
+  decided ones in `decidedContracts`), the needed change (`description`),
+  mechanical facts (`namedInFailure`: the failing output names the seam or a
+  name it exports; `duplicateOf`: an earlier live seam change with the same
+  description or the same NEW name), and, when a decision model is
+  configured, an ADVISORY triage (`triage`, recorded as a `contract-triage`
+  decision before the lead's turn; it never decides). The lead rejects
+  duplicates, seams the error does not name, and new behavior; the offline
+  policy does the same. `decide_contract` accepts the contract id or the
+  seam item id derived from it, and refuses an already decided one locally.
+  Accepted, the engine proposes the seam item `seam-<contract>`
+  (`fromContract`, scoped to the seam) and GRANTS it to the proposer at once
+  (it holds the context); it goes first like any seam item, and its
+  importers wait for it and rebase onto it. The item that asked gets no
+  release of the seam path: the seam item alone carries the change. The
+  hold lasts only while the seam item makes progress (its grant or latest
+  push within the seam-wait bound); when the board goes quiet while a seam
+  item holds dependents, the driver records `seam.stalled` before quiescence
+  could end the run (lockstep: an idle round; concurrent: half the
+  quiescence window): the hold ends, and a seam item its owner pushed nothing
+  for is released (open, `seam` first) for an idle agent. A rejected seam
+  contract is cued again only after a newer failing revision implicates the
+  item.
 - Failures the plan missed become work: when a failing revision's evidence
-  points at repo files (error locations, or failing test titles naming a
-  module) that no item covers in any status, the lead proposes ONE item for
-  them per revision (at most 4 per run), scoped to those files, with the
-  revision's failing line in its rationale (`failingRepoFiles`,
-  `uncoveredFailureFiles`). Struggling reports carry the gate's failing line
+  points at repo files that no item covers in any status, the lead proposes
+  ONE item for them per revision (at most 4 per run), scoped to those files,
+  with the revision's failing line in its rationale (`failingRepoFiles`,
+  `uncoveredFailureFiles`). The evidence is read most telling first: failing
+  test titles naming a module and error locations outside stack frames;
+  only without those, stack frames, and of each stack only the outermost
+  non-test repo frame (the caller): a file seen only as a deeper callee (a
+  shared helper the failing code called) is never where a failure is. Shared
+  seams are never proposed as uncovered work (they change only through a
+  seam contract); when only seams are left, nothing is proposed and the lead
+  records why (`SEAM_ONLY`). Struggling reports carry the gate's failing line
   (`gateFailureLine`), never a command echo.
 - The lead joins with role `lead`. Its first turn is the existing planner (the
   LLM planner live; a live run without one fails unless

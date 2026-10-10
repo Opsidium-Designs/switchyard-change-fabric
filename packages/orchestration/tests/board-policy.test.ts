@@ -78,6 +78,28 @@ function input(agent: string, role: "lead" | "worker", board: Partial<Input["boa
 
 const policy = createGenericBoardPolicy();
 
+describe("the offline lead's seam contract decisions", () => {
+  const policy = createGenericBoardPolicy();
+  const seam = (contract: string, facts: { namedInFailure: boolean; duplicateOf?: string }) => ({
+    contract,
+    target: "src/contracts/http.ts",
+    kind: "modify",
+    proposedBy: "agent-2",
+    item: "inv",
+    seam: "src/contracts/http.ts",
+    description: "add 'validateInput'",
+    ...facts,
+  });
+  it("accepts the seam change the failing output names; rejects a duplicate and a seam the error does not name", async () => {
+    const accept = await policy(input("lead", "lead", { pendingContracts: [seam("k1", { namedInFailure: true })] }));
+    expect(accept.action).toMatchObject({ type: "decide_contract", contractId: "k1", decision: "accept" });
+    const dup = await policy(input("lead", "lead", { pendingContracts: [seam("k2", { namedInFailure: true, duplicateOf: "k1" })] }));
+    expect(dup.action).toMatchObject({ type: "decide_contract", contractId: "k2", decision: "reject", rationale: expect.stringMatching(/duplicates the seam change k1/) });
+    const unnamed = await policy(input("lead", "lead", { pendingContracts: [seam("k3", { namedInFailure: false })] }));
+    expect(unnamed.action).toMatchObject({ decision: "reject", rationale: expect.stringMatching(/does not name src\/contracts\/http\.ts/) });
+  });
+});
+
 describe("tools in the generic policy (goal-agnostic)", () => {
   const items = [
     { item: "fix-a", objective: "fix a", scopeHint: ["src/a.js"], status: "done" },

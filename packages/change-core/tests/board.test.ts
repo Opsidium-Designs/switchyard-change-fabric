@@ -10,6 +10,13 @@ import {
   progressHeadline,
   seamContractCue,
   seamItemId,
+  seamHolds,
+  seamItemHolding,
+  seamWaits,
+  appendSeamStalled,
+  seamContractFacts,
+  releasedTargets,
+  uncoveredFailureFiles,
   appendToolGated,
   appendToolUsed,
   applyBoardEscalations,
@@ -74,7 +81,9 @@ class TestBoard {
           ? appendToolGated(this.state, payload, AT)
           : draft.type === "tool.used"
             ? appendToolUsed(this.state, payload, AT)
-            : appendIntegratedRev(this.state, payload, AT);
+            : draft.type === "seam.stalled"
+              ? appendSeamStalled(this.state, payload, AT)
+              : appendIntegratedRev(this.state, payload, AT);
     }
     const origin: BoardOrigin =
       from === "human"
@@ -181,6 +190,7 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
   "contract.escalated": { from: "engine", payload: { contract: "k", item: "i", target: "tests/a.test.ts", kind: "modify" } },
   "contract.accepted": { from: "lead", payload: { contract: "k" } },
   "contract.rejected": { from: "human", payload: { contract: "k" } },
+  "seam.stalled": { from: "engine", payload: { item: "i", released: true } },
   "push.announced": { from: "a", payload: { item: "i", commit: "abc123", paths: ["src/a.ts"] } },
   "integrated.rev": { from: "engine", payload: { n: 1, commit: "abc", gate: "pass", merged: ["c1"], paths: ["src/a.ts"], contributors: ["a"] } },
   "rebase.needed": { from: "engine", payload: { agent: "a", n: 1, paths: ["src/a.ts"] } },
@@ -239,6 +249,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "contract.escalated": { contract: "k", item: "i", target: "../x", kind: "modify" },
   "contract.accepted": {},
   "contract.rejected": { contract: "" },
+  "seam.stalled": { item: "i", released: "yes" },
   "push.announced": { item: "i", commit: "abc", paths: ["src/**"] },
   "integrated.rev": { n: 1, commit: "abc", gate: "maybe", merged: [], paths: [], contributors: [] },
   "rebase.needed": { agent: "a", n: -1, paths: [] },
@@ -264,7 +275,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(45);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(46);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -2093,33 +2104,25 @@ describe("seam first", () => {
     return board;
   }
 
-  it("an importer's item waits for the seam change's integrated revision; unrelated items do not", () => {
+  it("an item whose scope merely covers a seam is taken first but holds no one: only an accepted seam contract's item holds dependents", () => {
     const board = seamBoard();
-    // Nobody is changing the seam yet: nothing waits (an unclaimed seam item never stalls dependents).
     expect(boardDigest(board.state, board.log, "b", 0).openItems.map((i) => [i.item, i.seam ?? false, i.waitsFor ?? []])).toEqual([
       ["money", true, []],
       ["cart", false, []],
       ["catalog", false, []],
     ]);
+    // Claimed and pushed, a PLANNED seam item still holds nobody (SEAM_FIRST comes only from fromContract items).
     board.post(claim("a", "money", ["src/contracts/money.ts"]));
+    board.post(push("a", "money", "m1", ["src/contracts/money.ts"]));
+    expect(seamHolds(board.state)).toEqual([]);
     expect(boardDigest(board.state, board.log, "b", 0).openItems.map((i) => [i.item, i.waitsFor ?? []])).toEqual([
-      ["cart", ["money"]],
+      ["cart", []],
       ["catalog", []],
     ]);
-    board.reject(claim("b", "cart", ["src/orders/cart.ts"]), /waits for that change's integrated revision/, "SEAM_FIRST");
-    expect(board.types(claim("b", "catalog", ["src/catalog/products.ts"]))).toEqual(["item.claimed", "claim.granted"]);
-    board.post(push("a", "money", "m1", ["src/contracts/money.ts"]));
-    board.reject(claim("b", "cart", ["src/orders/cart.ts"]), /SEAM|seam/, "SEAM_FIRST");
-    board.post(rev("pass", ["m1"], "r1"));
     expect(board.types(claim("b", "cart", ["src/orders/cart.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+    // And nothing can be recorded stalled on it: the same predicate says it holds no one.
+    expect(() => appendSeamStalled(board.state, { item: "money" }, AT)).toThrow(/holds no dependent/);
     expect(reduceBoard(board.log)).toEqual(board.state);
-  });
-
-  it("the wait is bounded: after the seam wait the importer proceeds anyway", () => {
-    const board = seamBoard();
-    board.post(claim("a", "money", ["src/contracts/money.ts"]));
-    for (let i = 0; i <= BOARD_LIMITS.seamWaitMessages; i += 1) board.post(msg("human", "item.proposed", { item: `pad-${i}`, objective: "pad", scopeHint: ["pad/**"] }));
-    expect(board.types(claim("b", "cart", ["src/orders/cart.ts"]))).toEqual(["item.claimed", "claim.granted"]);
   });
 });
 
@@ -2178,22 +2181,170 @@ describe("seam contracts: a change to a frozen shared seam, decided by the lead"
     board.reject(msg("b", "contract.accepted", { contract: "k1" }), /cannot be sent by an agent/, "NOT_ALLOWED");
 
     // The lead accepts: the engine proposes the seam item (open, seam-first).
-    expect(board.types(msg("lead", "contract.accepted", { contract: "k1" }))).toEqual(["contract.accepted", "item.proposed"]);
+    // The lead accepts: the engine proposes the seam item and grants it to the PROPOSER (it holds the context).
+    expect(board.types(msg("lead", "contract.accepted", { contract: "k1" }))).toEqual(["contract.accepted", "item.proposed", "claim.granted"]);
     const seamItem = board.state.items[seamItemId("k1")]!;
-    expect(seamItem).toMatchObject({ status: "open", scopeHint: ["src/store.ts"], fromContract: "k1", proposedBy: "engine" });
+    expect(seamItem).toMatchObject({ status: "claimed", owner: "a", scopeHint: ["src/store.ts"], fromContract: "k1", proposedBy: "engine" });
     expect(seamItem.objective).toContain(change);
-    const open = boardDigest(board.state, board.log, "b", 0).openItems;
-    expect(open.find((i) => i.item === seamItemId("k1"))).toMatchObject({ seam: true });
+    expect(boardDigest(board.state, board.log, "a", 0).claims.find((c) => c.item === seamItemId("k1"))).toBeDefined();
 
     // Claimed, it goes first: importers wait for its integrated revision, then rebase.
-    board.post(claim("b", seamItemId("k1"), ["src/store.ts"]));
     expect(boardDigest(board.state, board.log, "a", 0).claims.find((c) => c.item === "cart")!.waitsFor).toEqual([seamItemId("k1")]);
-    board.reject(claim("a", "invoices", ["src/billing/invoices.ts"]), /waits for that change's integrated revision/, "SEAM_FIRST");
-    board.post(push("b", seamItemId("k1"), "s1", ["src/store.ts"]));
+    board.reject(claim("b", "invoices", ["src/billing/invoices.ts"]), /waits for that change's integrated revision/, "SEAM_FIRST");
+    expect(seamHolds(board.state)).toEqual([{ item: seamItemId("k1"), dependents: ["cart", "invoices"] }]);
+    board.post(push("a", seamItemId("k1"), "s1", ["src/store.ts"]));
     const integrated = board.post(rev("pass", ["s1"], "r2"));
-    expect(integrated.some((m) => m.type === "rebase.needed")).toBe(true);
+    expect(integrated.some((m) => m.type === "rebase.needed" && m.payload.agent === "b")).toBe(false); // b holds nothing importing it
+    expect(seamHolds(board.state)).toEqual([]);
     expect(boardDigest(board.state, board.log, "a", 0).claims.find((c) => c.item === "cart")!.waitsFor).toBeUndefined();
     expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("caps seam contracts: one waiting per agent, a bounded number per Change, and one seam change per failing cause", () => {
+    const board = storefront();
+    board.post(claim("b", "invoices", ["src/billing/invoices.ts"]));
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user to Ctx" }));
+    // A second waiting seam contract from the same agent is refused until the first is decided.
+    board.reject(
+      msg("a", "contract.proposed", { contract: "k2", target: "src/contracts/http.ts", kind: "modify", item: "cart", description: "add validateInput" }),
+      /already has a seam contract waiting/,
+      "LIMIT",
+    );
+    board.post(msg("lead", "contract.accepted", { contract: "k1" }));
+    expect(board.state.contracts.k1).toMatchObject({ failingRev: 1 });
+    // Accepted and unfinished for the same failing revision: no second seam change for that cause.
+    board.reject(
+      msg("a", "contract.proposed", { contract: "k3", target: "src/contracts/money.ts", kind: "modify", item: "cart", description: "add validateInput" }),
+      /one seam change per failing cause/,
+      "DUPLICATE",
+    );
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("facts for the lead (the sf5 shape): the seam the error names, duplicates of a NEW name across seams, and no release to the requester", () => {
+    const board = new TestBoard();
+    board.post(
+      msg("human", "goal.posted", {
+        objective: "o",
+        seams: [
+          { path: "src/contracts/auth.ts", importers: ["src/billing/invoices.ts"], symbols: ["requireAuth"] },
+          { path: "src/contracts/http.ts", importers: ["src/billing/invoices.ts"], symbols: ["json"] },
+          { path: "src/contracts/money.ts", importers: ["src/billing/invoices.ts"], symbols: ["Money"] },
+        ],
+      }),
+    );
+    for (const agent of ["a", "b", "c"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    for (const [item, file] of [["inv", "invoices"], ["pay", "payments"]] as const) {
+      board.post(msg("lead", "item.proposed", { item, objective: item, acceptance: ["ok"], scopeHint: [`src/billing/${file}.ts`] }));
+    }
+    board.post(claim("a", "inv", ["src/billing/invoices.ts"]));
+    board.post(push("a", "inv", "c1", ["src/billing/invoices.ts"]));
+    board.post(
+      msg("engine", "integrated.rev", {
+        commit: "r1",
+        gate: "fail",
+        merged: ["c1"],
+        failing: { output: `src/billing/invoices.ts(14,23): error TS2305: Module '"../contracts/auth.ts"' has no exported member 'validateInput'.`, items: ["inv"] },
+      }),
+    );
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/contracts/auth.ts", kind: "modify", item: "inv", description: "add 'validateInput' to auth" }));
+    expect(seamContractFacts(board.state, "k1")).toEqual({ namedInFailure: true });
+    board.post(msg("lead", "contract.accepted", { contract: "k1" }));
+    // The requester's own unit never carries the seam: its seam item does.
+    expect(releasedTargets(board.state, "inv")).toEqual([]);
+    // A shared seam is never uncovered work (it changes only through a seam contract).
+    expect(uncoveredFailureFiles(board.state, ["src/contracts/http.ts", "src/billing/refunds.ts"])).toEqual(["src/billing/refunds.ts"]);
+    // Another agent asks the same NEW name on a seam the error does not name: both facts say no.
+    board.post(claim("b", "pay", ["src/billing/payments.ts"]));
+    board.post(msg("b", "contract.proposed", { contract: "k2", target: "src/contracts/http.ts", kind: "modify", item: "pay", description: "add 'validateInput' to http" }));
+    expect(seamContractFacts(board.state, "k2")).toEqual({ namedInFailure: false, duplicateOf: "k1" });
+    expect(seamContractFacts(board.state, "nope")).toEqual({ namedInFailure: false });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a seam contract's advisory triage is kept on the contract for the lead (it never decides)", () => {
+    const board = storefront();
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user to Ctx" }));
+    board.post(msg("engine", "decision.recorded", { juncture: "contract-triage", contract: "k1", question: "q", answer: "accept", confidence: 0.9, accepted: true }));
+    expect(board.state.contracts.k1).toMatchObject({ status: "proposed", triage: "accept (confidence 0.90)" });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a seam item holds dependents only while it makes progress; recorded stalled, it holds no one and, with no push, is released for others", () => {
+    const board = storefront();
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user to Ctx" }));
+    board.post(msg("lead", "contract.accepted", { contract: "k1" }));
+    expect(seamHolds(board.state).map((h) => h.item)).toEqual([seamItemId("k1")]);
+    // Nothing is stalled on an item holding no one.
+    expect(() => appendSeamStalled(board.state, { item: "invoices" }, AT)).toThrow(/holds no dependent/);
+    // The board went quiet: the operator records it stalled. No push of a's: released (open).
+    expect(board.types(msg("engine", "seam.stalled", { item: seamItemId("k1") }))).toEqual(["seam.stalled"]);
+    const seam = board.state.items[seamItemId("k1")]!;
+    expect(seam).toMatchObject({ status: "open" });
+    expect(seam.owner).toBeUndefined();
+    expect(seamHolds(board.state)).toEqual([]);
+    expect(boardDigest(board.state, board.log, "b", 0).openItems.find((i) => i.item === seamItemId("k1"))).toMatchObject({ seam: true });
+    // Taken again, it holds again (a fresh grant is progress) ...
+    board.post(claim("b", seamItemId("k1"), ["src/store.ts"]));
+    expect(seamHolds(board.state).map((h) => h.item)).toEqual([seamItemId("k1")]);
+    // ... and with a push of its owner's, a stall keeps the claim but ends the hold.
+    board.post(push("b", seamItemId("k1"), "s1", ["src/store.ts"]));
+    expect(board.post(msg("engine", "seam.stalled", { item: seamItemId("k1") }))[0]!.payload).toEqual({ item: seamItemId("k1"), released: false });
+    expect(board.state.items[seamItemId("k1")]).toMatchObject({ status: "claimed", owner: "b" });
+    expect(seamHolds(board.state)).toEqual([]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("ONE predicate: the hold (waitsFor, SEAM_FIRST), seamHolds, and the stall check agree at every step", () => {
+    const agree = (board: TestBoard) => {
+      const state = board.state;
+      const waitedOn = new Set(Object.keys(state.items).flatMap((id) => seamWaits(state, id).map((w) => w.item)));
+      const held = new Set(seamHolds(state).map((h) => h.item));
+      expect([...held].sort()).toEqual([...waitedOn].sort());
+      for (const item of Object.values(state.items)) {
+        let stallable = true;
+        try {
+          appendSeamStalled(state, { item: item.id }, AT);
+        } catch {
+          stallable = false;
+        }
+        expect({ item: item.id, stallable }).toEqual({ item: item.id, stallable: held.has(item.id) });
+        if (held.has(item.id)) expect(seamItemHolding(state, item)).toBe(true);
+      }
+      return [...held];
+    };
+    // Progress path: proposed, accepted (granted), pushed, integrated.
+    const one = storefront();
+    expect(agree(one)).toEqual([]);
+    one.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user to Ctx" }));
+    expect(agree(one)).toEqual([]);
+    one.post(msg("lead", "contract.accepted", { contract: "k1" }));
+    expect(agree(one)).toEqual([seamItemId("k1")]);
+    one.post(push("a", seamItemId("k1"), "s1", ["src/store.ts"]));
+    expect(agree(one)).toEqual([seamItemId("k1")]);
+    one.post(rev("pass", ["s1"], "r2"));
+    expect(agree(one)).toEqual([]);
+    // Stall path: recorded stalled (released), taken again, then lapsing without progress.
+    const two = storefront();
+    two.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user to Ctx" }));
+    two.post(msg("lead", "contract.accepted", { contract: "k1" }));
+    two.post(msg("engine", "seam.stalled", { item: seamItemId("k1") }));
+    expect(agree(two)).toEqual([]);
+    two.post(claim("b", seamItemId("k1"), ["src/store.ts"]));
+    expect(agree(two)).toEqual([seamItemId("k1")]);
+    for (let i = 0; i <= BOARD_LIMITS.seamWaitMessages; i += 1) two.post(msg("human", "item.proposed", { item: `pad-${i}`, objective: "pad", scopeHint: ["pad/**"] }));
+    expect(agree(two)).toEqual([]);
+    expect(reduceBoard(two.log)).toEqual(two.state);
+  });
+
+  it("without progress the hold lapses after the bounded number of board messages since the grant", () => {
+    const board = storefront();
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user to Ctx" }));
+    board.post(msg("lead", "contract.accepted", { contract: "k1" }));
+    for (let i = 0; i <= BOARD_LIMITS.seamWaitMessages; i += 1) board.post(msg("human", "item.proposed", { item: `pad-${i}`, objective: "pad", scopeHint: ["pad/**"] }));
+    expect(seamHolds(board.state)).toEqual([]);
+    expect(board.types(claim("b", "invoices", ["src/billing/invoices.ts"]))).toEqual(["item.claimed", "claim.granted"]);
   });
 
   it("only the engine proposes an item from a seam contract, and only for an accepted one; a seam an item owns is changed by that item", () => {
