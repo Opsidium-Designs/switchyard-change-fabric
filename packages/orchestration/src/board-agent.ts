@@ -237,6 +237,14 @@ export const MAX_HELD_WAIT_CUES = 2;
  * board's other cues take over.
  */
 export const MAX_FIX_CUES = 2;
+
+/**
+ * How many times an agent is woken for one set of OPEN seam items (nobody
+ * holds them) when it is free or holds items that import their seams, by the
+ * runtime when the set appears; and, separately, how many times the driver may
+ * nudge it before a quiet board could end the run. Bounded per set.
+ */
+export const MAX_OPEN_SEAM_CUES = 2;
 /** Items the lead may propose for failing files no item covers, per run. */
 export const MAX_UNCOVERED_PROPOSALS = 4;
 /** An item whose write intent covers at least this many files starts on the strongest model. */
@@ -433,6 +441,13 @@ export class BoardAgent {
   private readonly heldWaitCues = new Map<string, number>();
   /** Re-cues after a wait while a fix request is open, per `item@revision` (bounded by MAX_FIX_CUES). */
   private readonly fixCues = new Map<string, number>();
+  private lastOpenSeamKey = "";
+  /** The driver's nudges per set of open seam items (bounded by MAX_OPEN_SEAM_CUES). */
+  private readonly driverSeamNudges = new Map<string, number>();
+  /** Wakes for one set of open seam items (bounded by MAX_OPEN_SEAM_CUES). */
+  private readonly openSeamCues = new Map<string, number>();
+  /** Set by the driver: take a turn on the next step to look at open seam items. */
+  private openSeamNudge = false;
   /** Lead: the undecided worker proposals it last saw (a change wakes it). */
   private lastProposals = "";
   /** Items (and tool items) this agent proposed: their decision wakes it. */
@@ -666,7 +681,24 @@ export class BoardAgent {
         `I hold no item and ${digest.openItems.length} open item(s) can be claimed: claim one now. Tools are accelerators, never prerequisites: when a tool is published use_tool it, otherwise edit by hand; never wait for a tool.`,
       );
     }
-    if (!(this.followUp || relevant || nudged || newlyUnavailable || newCue || claimNudge || (freeKey !== undefined && freeKey !== this.lastFreeKey))) {
+    // OPEN seam items (nobody holds them): wake an agent that is free or holds
+    // items importing their seams, once per set (bounded), and tell it plainly
+    // that it may claim one itself. The driver may nudge it once more before a
+    // quiet board ends the run.
+    // Free, blocked on it, or holding no change item in progress (only tool items, or all proposed done).
+    const seamState = this.role === "worker" && (digest.openSeams ?? []).length > 0 ? await client.state() : undefined;
+    const noChangeWork = digest.claims.every((c) => seamState?.items[c.item]?.tool !== undefined || (c.doneProposed && c.fix === undefined));
+    const openSeams = this.role === "worker" ? (digest.openSeams ?? []).filter((o) => free || noChangeWork || o.blocks.length > 0) : [];
+    const openSeamKey = openSeams.map((o) => o.item).join(",");
+    const openSeamCue =
+      openSeamKey !== "" && (this.openSeamNudge || (openSeamKey !== this.lastOpenSeamKey && (this.openSeamCues.get(openSeamKey) ?? 0) < MAX_OPEN_SEAM_CUES));
+    this.lastOpenSeamKey = openSeamKey;
+    this.openSeamNudge = false;
+    if (openSeamCue) {
+      this.openSeamCues.set(openSeamKey, (this.openSeamCues.get(openSeamKey) ?? 0) + 1);
+      this.evidence.push(`OPEN SEAM ITEM: ${openSeams.map((o) => o.hint).join(" ")}`.slice(0, 1000));
+    }
+    if (!(this.followUp || relevant || nudged || newlyUnavailable || newCue || claimNudge || openSeamCue || (freeKey !== undefined && freeKey !== this.lastFreeKey))) {
       return "idle";
     }
     // A cue counts as delivered only on a turn it caused by itself (not a
@@ -688,6 +720,22 @@ export class BoardAgent {
     }
     await this.turn(digest, await client.state());
     return "acted";
+  }
+
+  /**
+   * The driver's nudge before a quiet board would end the run while seam items
+   * are open: this agent's next step takes a turn to look at them (still
+   * bounded by MAX_OPEN_SEAM_CUES per open set). Returns false when it has no
+   * cue left for the current set.
+   */
+  nudgeOpenSeams(openItems: readonly string[]): boolean {
+    const key = openItems.join(",");
+    if (this.role !== "worker" || this.stop || (this.driverSeamNudges.get(key) ?? 0) >= MAX_OPEN_SEAM_CUES) {
+      return false;
+    }
+    this.driverSeamNudges.set(key, (this.driverSeamNudges.get(key) ?? 0) + 1);
+    this.openSeamNudge = true;
+    return true;
   }
 
   /**
@@ -732,6 +780,7 @@ export class BoardAgent {
    */
   private isFree(digest: BoardDigest): boolean {
     return (
+      digest.claimCap === undefined &&
       digest.pending.length === 0 &&
       digest.claims.every((c) => c.doneProposed && c.fix === undefined) &&
       !(digest.help?.granted ?? []).some((g) => g.live && g.delivered === undefined)

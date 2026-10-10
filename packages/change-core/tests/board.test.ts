@@ -13,6 +13,8 @@ import {
   seamHolds,
   seamItemHolding,
   seamWaits,
+  activeClaims,
+  claimCapReached,
   appendSeamStalled,
   seamContractFacts,
   releasedTargets,
@@ -2338,6 +2340,48 @@ describe("seam contracts: a change to a frozen shared seam, decided by the lead"
     expect(reduceBoard(two.log)).toEqual(two.state);
   });
 
+  it("seam items are exempt from the claim cap; an OPEN one is listed for agents whose items need it; a GATED seam push holds no one", () => {
+    const board = new TestBoard();
+    board.post(
+      msg("human", "goal.posted", {
+        objective: "o",
+        rules: { maxActiveClaims: 1 },
+        seams: [{ path: "src/store.ts", importers: ["src/orders/cart.ts", "src/billing/invoices.ts"], symbols: ["Ctx"] }],
+      }),
+    );
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "cart", objective: "cart", acceptance: ["ok"], scopeHint: ["src/orders/cart.ts"] }));
+    board.post(msg("lead", "item.proposed", { item: "invoices", objective: "inv", acceptance: ["ok"], scopeHint: ["src/billing/invoices.ts"] }));
+    board.post(claim("a", "cart", ["src/orders/cart.ts"]));
+    board.post(claim("b", "invoices", ["src/billing/invoices.ts"]));
+    board.post(push("a", "cart", "c1", ["src/orders/cart.ts"]));
+    board.post(
+      msg("engine", "integrated.rev", {
+        commit: "r1",
+        gate: "fail",
+        merged: ["c1"],
+        failing: { output: "src/orders/cart.ts(4,1): error TS2339: Property 'user' does not exist on type 'Ctx'.", items: ["cart"] },
+      }),
+    );
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user to Ctx" }));
+    // The proposer is at its cap (cart), yet the engine grants it the seam item: exempt.
+    expect(board.types(msg("lead", "contract.accepted", { contract: "k1" }))).toEqual(["contract.accepted", "item.proposed", "claim.granted"]);
+    // Released (stalled), it is OPEN: b's held invoices needs it, and b may claim it at its cap.
+    board.post(msg("engine", "seam.stalled", { item: seamItemId("k1") }));
+    expect(boardDigest(board.state, board.log, "b", 0).openSeams).toEqual([
+      expect.objectContaining({ item: seamItemId("k1"), seam: "src/store.ts", blocks: ["invoices"], hint: expect.stringMatching(/Claim it yourself/) }),
+    ]);
+    expect(board.types(claim("b", seamItemId("k1"), ["src/store.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+    expect(seamHolds(board.state).map((h) => h.item)).toEqual([seamItemId("k1")]);
+    // Its push merged into a revision (even a failing one): dependents merge with it from now on, so it holds no one.
+    board.post(push("b", seamItemId("k1"), "s1", ["src/store.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c1", "s1"], failing: { output: "AssertionError: expected 1072 to be 1073", items: ["cart"] } }));
+    expect(board.state.items[seamItemId("k1")]!.lastPush).toMatchObject({ gatedIn: 2 });
+    expect(seamHolds(board.state)).toEqual([]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
   it("without progress the hold lapses after the bounded number of board messages since the grant", () => {
     const board = storefront();
     board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user to Ctx" }));
@@ -2380,6 +2424,47 @@ describe("seam contracts: a change to a frozen shared seam, decided by the lead"
     );
     expect(seamContractCue(board.state, "cart")?.seams).toEqual(["src/store.ts"]);
     expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("the active-claim cap (no hoarding)", () => {
+  function capped(cap = 1): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", rules: { maxActiveClaims: cap } }));
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    for (const item of ["one", "two", "three"]) {
+      board.post(msg("lead", "item.proposed", { item, objective: `do ${item}`, acceptance: ["ok"], scopeHint: [`src/${item}/**`] }));
+    }
+    return board;
+  }
+
+  it("an agent holding an unfinished item cannot claim another until its push passed; the digest says why", () => {
+    const board = capped();
+    expect(board.state.rules.maxActiveClaims).toBe(1);
+    board.post(claim("a", "one", ["src/one/**"]));
+    board.reject(claim("a", "two", ["src/two/**"]), /holds 1 unfinished item\(s\) \(one; cap 1\)/, "CLAIM_CAP");
+    expect(boardDigest(board.state, board.log, "a", 0).claimCap).toMatchObject({ cap: 1, holding: ["one"] });
+    expect(boardDigest(board.state, board.log, "b", 0).claimCap).toBeUndefined();
+    // Another agent takes the open work.
+    expect(board.types(claim("b", "two", ["src/two/**"]))).toEqual(["item.claimed", "claim.granted"]);
+    // A push alone does not finish it; a failing revision does not either.
+    board.post(push("a", "one", "c1", ["src/one/x.ts"]));
+    board.reject(claim("a", "three", ["src/three/**"]), /cap 1/, "CLAIM_CAP");
+    // Passing: the item is finished (done once proposed), so a has room again.
+    board.post(rev("pass", ["c1"], "r1"));
+    expect(activeClaims(board.state, "a")).toEqual([]);
+    expect(board.types(claim("a", "three", ["src/three/**"]))).toEqual(["item.claimed", "claim.granted"]);
+    // A handoff to an agent at its cap is refused.
+    board.reject(msg("a", "handoff", { item: "three", to: "b", capsule: { repo: "r" } }), /at its active-claim cap/, "CLAIM_CAP");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("without the rule (a board posted before it) claims are unlimited, as before", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/one/**"]));
+    expect(board.types(claim("a", "two", ["src/two/**"]))).toEqual(["item.claimed", "claim.granted"]);
+    expect(claimCapReached(board.state, "a")).toBeUndefined();
   });
 });
 

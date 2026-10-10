@@ -20,7 +20,7 @@ import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
-import { reduceBoard, seamHolds, type BoardDigest, type BoardMessage } from "@switchyard-change/change-core";
+import { activeClaims, foldBoard, reduceBoard, seamHolds, type BoardDigest, type BoardMessage } from "@switchyard-change/change-core";
 import type {
   AskJev,
   AgentTurnTransport,
@@ -1112,6 +1112,42 @@ describe("a stronger executor for complex items", () => {
   });
 });
 
+describe("no claim hoarding (the active-claim cap)", () => {
+  it("a greedy agent never holds more unfinished items than the cap; other agents get the open items; the run completes", async () => {
+    const projectDir = await project();
+    const sixItems = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: Array.from({ length: 6 }, (_, i) => ({ item: `i${i}`, objective: `do part ${i}`, acceptance: ["gate passes"], scopeHint: [`src/part${i}.ts`] })),
+    });
+    // agent-1 tries to claim every open item before doing anything else.
+    const policy = createGenericBoardPolicy();
+    const greedy: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      if (input.agent === "agent-1") {
+        const tried = new Set(input.capsule.decisions.filter((h) => h.action.type === "claim").map((h) => (h.action as { itemId: string }).itemId));
+        const open = input.digest.openItems.find((i) => !tried.has(i.item));
+        if (open) {
+          return { action: { type: "claim", itemId: open.item, intent: { read: [], write: [...open.scopeHint] }, rationale: "taking everything" } };
+        }
+      }
+      return policy(input);
+    };
+    const result = await offline({ goal: GOAL, projectDir, seed: sixItems, transport: greedy, fixtureGate: true });
+    const log = result.log;
+    expect(of(log, "goal.posted")[0]!.payload.rules.maxActiveClaims).toBe(1);
+    // At every grant, the grantee holds at most the cap of unfinished change items.
+    for (const grant of of(log, "claim.granted")) {
+      const state = foldBoard(log, grant.seq);
+      expect({ seq: grant.seq, held: activeClaims(state, grant.payload.agent).length <= 1 }).toEqual({ seq: grant.seq, held: true });
+    }
+    expect(result.turns.some((t) => t.agent === "agent-1" && t.code === "CLAIM_CAP")).toBe(true);
+    const owners = new Set(of(log, "claim.granted").filter((m) => /^i\d$/.test(m.payload.item)).map((m) => m.payload.agent));
+    expect(owners.size).toBeGreaterThan(1);
+    expect(result.incompleteItems).toEqual([]);
+    expect(reduceBoard(log)).toEqual(result.state);
+  });
+});
+
 describe("budgets that scale with the plan (explicit values win)", () => {
   it("scales fix attempts and the dial's max with the planned items, bounded", async () => {
     const { scaledBudgets } = await import("../src/run-board.ts");
@@ -1123,18 +1159,26 @@ describe("budgets that scale with the plan (explicit values win)", () => {
       dialScaled: true,
       maxRunTurns: 250,
       runTurnsScaled: true,
+      maxActiveClaims: 1,
+      activeClaimsScaled: true,
     });
-    // The run-wide turn budget: max(200, 25 per item), at most 800; an explicit value wins.
+    // The run-wide turn budget weighs scope size: max(200, 25 per item + 10 per scope file), at most 800.
     expect(scaledBudgets({ items: 2, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 3, dialMax: 2, maxRunTurns: 200 });
+    expect(scaledBudgets({ items: 7, scopeFiles: 12, dial, scaleDial: false })).toMatchObject({ maxRunTurns: 295 }); // sf7: 7 large items
     expect(scaledBudgets({ items: 15, dial, scaleDial: true })).toMatchObject({ maxRunTurns: 375 });
-    expect(scaledBudgets({ items: 40, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 6, dialMax: 6, maxRunTurns: 800 });
-    expect(scaledBudgets({ items: 10, explicitFixAttempts: 2, explicitRunTurns: 1000, dial, scaleDial: false })).toEqual({
+    expect(scaledBudgets({ items: 40, scopeFiles: 60, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 6, dialMax: 6, maxRunTurns: 800 });
+    // The claim cap: 1, or 2 when items are at least three times the dial's max.
+    expect(scaledBudgets({ items: 9, dial, scaleDial: false })).toMatchObject({ maxActiveClaims: 2 });
+    expect(scaledBudgets({ items: 8, dial, scaleDial: false })).toMatchObject({ maxActiveClaims: 1 });
+    expect(scaledBudgets({ items: 10, explicitFixAttempts: 2, explicitRunTurns: 1000, explicitActiveClaims: 3, dial, scaleDial: false })).toEqual({
       maxFixAttempts: 2,
       fixAttemptsScaled: false,
       dialMax: 3,
       dialScaled: false,
       maxRunTurns: 1000,
       runTurnsScaled: false,
+      maxActiveClaims: 3,
+      activeClaimsScaled: false,
     });
   });
 
@@ -1146,11 +1190,11 @@ describe("budgets that scale with the plan (explicit values win)", () => {
       items: Array.from({ length: 10 }, (_, i) => ({ item: `i${i}`, objective: `do part ${i}`, acceptance: ["gate passes"], scopeHint: [`src/part${i}.ts`] })),
     });
     const result = await offline({ goal: GOAL, projectDir, seed: tenItems, scaleDial: true });
-    expect(of(result.log, "goal.posted")[0]!.payload.rules.maxFixAttempts).toBe(5);
+    expect(of(result.log, "goal.posted")[0]!.payload.rules).toMatchObject({ maxFixAttempts: 5, maxActiveClaims: 1 });
     expect(of(result.log, "agent.joined").filter((m) => m.from !== "lead").length).toBeLessThanOrEqual(6);
     expect(of(result.log, "agent.joined").filter((m) => m.from !== "lead").length).toBeGreaterThan(3);
     expect(formatBoardRunSummary(result)).toMatch(
-      /budgets: 5 fix attempt\(s\) per item \(scaled with 10 planned item\(s\)\), dial max 6 \(scaled with 10 planned item\(s\)\), 250 run turn\(s\) \(scaled with 10 planned item\(s\)\)/,
+      /budgets: 5 fix attempt\(s\) per item \(scaled with 10 planned item\(s\)\), dial max 6 \(scaled with 10 planned item\(s\)\), 350 run turn\(s\) \(scaled with 10 planned item\(s\) and 10 scope file\(s\)\), claim cap 1 unfinished item\(s\) per agent \(scaled\)/,
     );
   });
 });
@@ -1379,6 +1423,51 @@ describe("seam first (shared seams from the cohesion blueprint)", () => {
     expect(result.incompleteItems).toEqual([]);
     expect(result.verdict).not.toBe("failed");
     expect(formatBoardTranscript(log)).toMatch(/seam\.stalled\s+seam-.* released for another agent/);
+    expect(reduceBoard(log)).toEqual(result.state);
+  });
+
+  it("an OPEN seam item with no free agent: a busy agent claims it itself (seam items are exempt from the claim cap and offered to agents with room), and the run completes", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "scf-seam-open-"));
+    const files: Record<string, string> = {
+      "package.json": '{"name":"p","type":"module","scripts":{}}\n',
+      "src/shared/ctx.ts": "export interface Ctx {\n  store: string;\n}\n",
+    };
+    for (const name of ["a", "b", "c"]) {
+      files[`src/res/${name}.ts`] = `import type { Ctx } from "../shared/ctx.ts";\nexport const ${name} = (ctx: Ctx) => ctx.store;\n`;
+    }
+    for (const [rel, body] of Object.entries(files)) {
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      await writeFile(join(dir, rel), body);
+    }
+    const ctxSeed = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: ["a", "b", "c"].map((n) => ({ item: `res-${n}`, objective: `greet the user in ${n}`, acceptance: ["gate passes"], scopeHint: [`src/res/${n}.ts`] })),
+    });
+    const policy = createGenericBoardPolicy();
+    const absentOwner: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      const outcome = await policy(input);
+      const action = outcome.action as { type: string; itemId?: string };
+      return action.itemId?.startsWith(`seam-${input.agent}-`) ? { action: { type: "wait", reason: "not now" } } : outcome;
+    };
+    const result = await offline({
+      goal: GOAL,
+      projectDir: dir,
+      seed: ctxSeed,
+      executor: new CtxUserExecutor(),
+      appGateCommand: ["gate"],
+      verifyCommandRunner: new CtxTypecheckGate(),
+      transport: absentOwner,
+    });
+    const log = result.log;
+    const stalled = of(log, "seam.stalled")[0]!;
+    expect(stalled.payload.released).toBe(true);
+    const regrant = of(log, "claim.granted").find((m) => m.payload.item === stalled.payload.item && m.seq > stalled.seq)!;
+    // Nobody was free: the claimant was holding another item when it took the open seam item.
+    const before = foldBoard(log, regrant.seq - 1);
+    expect(Object.values(before.items).some((i) => i.status === "claimed" && i.owner === regrant.payload.agent)).toBe(true);
+    expect(result.state.items[stalled.payload.item]!.status).toBe("done");
+    expect(result.incompleteItems).toEqual([]);
     expect(reduceBoard(log)).toEqual(result.state);
   });
 

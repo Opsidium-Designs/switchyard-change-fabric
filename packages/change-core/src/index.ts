@@ -226,6 +226,8 @@ export {
   seamItemId,
   seamHolds,
   seamItemHolding,
+  activeClaims,
+  claimCapReached,
   seamContractFacts,
   verifyBoard,
   withContractTriage,

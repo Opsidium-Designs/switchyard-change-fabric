@@ -917,7 +917,7 @@ const commands: Command[] = [
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
       `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--id <changeId>] ` +
-      `[--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+      `[--item-turns N] [--max-turns N] [--claim-cap N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const goal = await resolveGoal(args);
@@ -943,6 +943,7 @@ const commands: Command[] = [
       const budgets = {
         ...(intFlag("--item-turns") !== undefined ? { maxTurnsPerItem: intFlag("--item-turns")! } : {}),
         ...(intFlag("--max-turns") !== undefined ? { maxRunTurns: intFlag("--max-turns")! } : {}),
+        ...(intFlag("--claim-cap") !== undefined ? { maxActiveClaims: intFlag("--claim-cap")! } : {}),
         ...(intFlag("--timeout-ms") !== undefined ? { timeoutMs: intFlag("--timeout-ms")! } : {}),
         ...(intFlag("--fix-attempts") !== undefined ? { maxFixAttemptsPerItem: intFlag("--fix-attempts")! } : {}),
         ...(intFlag("--quiet-ms") !== undefined ? { quiescenceMs: intFlag("--quiet-ms")! } : {}),
@@ -1149,7 +1150,7 @@ const commands: Command[] = [
               break;
             case "budgets":
               console.log(
-                `  budgets: ${event.maxFixAttempts} fix attempt(s) per item (${event.fixAttemptsScaled ? `scaled with ${event.items} planned item(s)` : "explicit"}), dial max ${event.dialMax} (${event.dialScaled ? `scaled with ${event.items} planned item(s)` : "explicit"}), ${event.maxRunTurns} run turn(s) (${event.runTurnsScaled ? `scaled with ${event.items} planned item(s)` : "explicit"})`,
+                `  budgets: ${event.maxFixAttempts} fix attempt(s) per item (${event.fixAttemptsScaled ? `scaled with ${event.items} planned item(s)` : "explicit"}), dial max ${event.dialMax} (${event.dialScaled ? `scaled with ${event.items} planned item(s)` : "explicit"}), ${event.maxRunTurns} run turn(s) (${event.runTurnsScaled ? `scaled with ${event.items} planned item(s) and ${event.scopeFiles ?? 0} scope file(s)` : "explicit"}), claim cap ${event.maxActiveClaims} unfinished item(s) per agent (${event.activeClaimsScaled ? "scaled" : "explicit"})`,
               );
               break;
             case "goal-posted":

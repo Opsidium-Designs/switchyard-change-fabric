@@ -355,9 +355,14 @@ describe("M5: the full end-to-end run with the human escalation beat", () => {
     // POST to the Worker's resolve route does. The run must block until then.
     let resolvedExternally = false;
     const browser = setInterval(() => {
-      const pending = control
-        .escalations("change-m5")
-        .find((e) => e.status === "pending");
+      // Until the run has created the Change there is nothing to look at (a
+      // loaded machine may tick before that): not an error.
+      let pending: { id: string; status: string } | undefined;
+      try {
+        pending = control.escalations("change-m5").find((e) => e.status === "pending");
+      } catch {
+        return;
+      }
       if (pending) {
         control.resolveEscalation("change-m5", pending.id, "tests");
         resolvedExternally = true;

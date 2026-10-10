@@ -716,6 +716,23 @@ function decide(input: Input): AgentAction {
       }
     }
   }
+  // An OPEN seam item (nobody holds it) that my held items need: claim it myself
+  // (seam items are exempt from the claim cap); nothing waits on anyone else.
+  // Or when no change item of mine is in progress (I hold only tool items, or my
+  // items are all proposed done): an open seam item goes to whoever has room.
+  const myToolItems = new Set((input.board.tools ?? []).map((t) => t.item));
+  const noChangeWork = d.claims.every((c) => myToolItems.has(c.item) || (c.doneProposed && c.fix === undefined));
+  for (const open of d.openSeams ?? []) {
+    const refused = decisions.some((h) => h.action.type === "claim" && h.action.itemId === open.item && h.outcome !== "posted" && h.code !== "CLAIM_CAP");
+    if ((open.blocks.length > 0 || noChangeWork) && !refused) {
+      return {
+        type: "claim",
+        itemId: open.item,
+        intent: { read: [], write: [open.seam] },
+        rationale: `${open.item} is open and nobody holds it; my ${open.blocks.join(", ")} need(s) it, so I make the seam change myself`,
+      };
+    }
+  }
   // The seam item my accepted seam contract became: take it first (I know the change it needs).
   const askedSeams = new Set(
     decisions.flatMap((h) => (h.action.type === "message" && h.action.kind === "contract" && h.outcome === "posted" ? [h.action.payload.target ?? ""] : [])),
@@ -872,13 +889,17 @@ function decide(input: Input): AgentAction {
     const waitedSinceSplit = splitAt < 0 ? 0 : decisions.slice(splitAt + 1).filter((h) => h.action.type === "wait").length;
     const mine = (i: { readonly parent?: string }) => i.parent !== undefined && led.has(i.parent) && waitedSinceSplit < 2;
     // Seam-changing items first; items waiting for one are left until it lands.
+    // At the claim cap only open seam items (exempt) may be claimed.
+    const openSeamItems = new Set((d.openSeams ?? []).map((o) => o.item));
     const claimable = d.openItems
       .filter((i) => i.scopeHint.length > 0 && !otherTools.has(i.item) && !mine(i) && (i.waitsFor ?? []).length === 0)
+      .filter((i) => d.claimCap === undefined || openSeamItems.has(i.item))
       .sort((a, b) => Number(b.seam === true) - Number(a.seam === true));
     for (const open of claimable) {
       const claims = decisions.filter((h) => h.action.type === "claim" && h.action.itemId === open.item);
       const last = claims.at(-1);
-      if (last === undefined || last.outcome === "posted") {
+      // A claim refused at the cap is tried again once the agent has room.
+      if (last === undefined || last.outcome === "posted" || last.code === "CLAIM_CAP") {
         return {
           type: "claim",
           itemId: open.item,

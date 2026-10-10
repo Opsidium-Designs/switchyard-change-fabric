@@ -104,7 +104,7 @@ import {
 } from "@switchyard-change/verification";
 
 import { scanRepoSnapshot } from "./scan-repo.ts";
-import { BoardAgent, RunTurnBudget, type AgentStop, type AgentTurnRecord, type BoardSeedItem } from "./board-agent.ts";
+import { BoardAgent, listRepoFiles, resolveIntentFiles, RunTurnBudget, type AgentStop, type AgentTurnRecord, type BoardSeedItem } from "./board-agent.ts";
 import {
   CloudBoardIntegrator,
   configureCloudIntegration,
@@ -179,9 +179,16 @@ export interface BoardRunBudgets {
   readonly maxTurnsPerItem?: number;
   /**
    * Turns across every agent in the run. Default: scaled with the plan,
-   * min(800, max(200, 25 per planned item)); an explicit value wins.
+   * min(800, max(200, 25 per planned item + 10 per file in the planned
+   * scopes)); an explicit value wins.
    */
   readonly maxRunTurns?: number;
+  /**
+   * Unfinished items one agent may hold at once (the board's claim cap).
+   * Default: 1, or 2 when planned items are at least three times the dial's
+   * max; an explicit value (1 to 8) wins.
+   */
+  readonly maxActiveClaims?: number;
   /** Lockstep rounds before the run stops (default 200). */
   readonly maxRounds?: number;
   /** Wall-clock limit for the agent phase, in ms (default 30 minutes). */
@@ -207,7 +214,7 @@ export type BoardRunEvent =
   | { readonly kind: "change-created"; readonly changeId: string }
   | { readonly kind: "goal-posted"; readonly protected: readonly string[]; readonly immutable?: readonly string[]; readonly testInventory: string }
   /** The effective budgets for this run, after scaling with the plan size (explicit flags win). */
-  | { readonly kind: "budgets"; readonly items: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean; readonly maxRunTurns: number; readonly runTurnsScaled: boolean }
+  | { readonly kind: "budgets"; readonly items: number; readonly scopeFiles?: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean; readonly maxRunTurns: number; readonly runTurnsScaled: boolean; readonly maxActiveClaims: number; readonly activeClaimsScaled: boolean }
   | { readonly kind: "contract-decision"; readonly contract: string; readonly decision: string; readonly path?: string }
   | { readonly kind: "contract-awaiting-human"; readonly contract: string; readonly escalationId: string; readonly path?: string; readonly recommendation?: string }
   /** The advisory triage of a protected contract, recorded before the human is asked. */
@@ -222,6 +229,8 @@ export type BoardRunEvent =
   | { readonly kind: "nothing-to-integrate" }
   /** The operator ran a tool's own gate on a build and recorded it (published only on a pass). */
   | { readonly kind: "tool-gated"; readonly gate: ToolGateRecord }
+  /** A quiet board with open seam items (nobody holds them): the workers were nudged to look before quiescence. */
+  | { readonly kind: "open-seams-nudged"; readonly items: readonly string[] }
   /** The board went quiet while a seam item held dependents: recorded stalled (released when its owner had pushed nothing). */
   | { readonly kind: "seam-stalled"; readonly item: string; readonly released: boolean; readonly dependents: readonly string[] }
   /** The operator forked a requester's repo for the helper of a help request. */
@@ -456,7 +465,7 @@ export interface RunBoardResult {
   readonly scratchRoot?: string;
   readonly cleanedUp: readonly string[];
   /** The effective budgets (scaled with the plan unless explicit). */
-  readonly budgets?: { readonly items: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean; readonly maxRunTurns: number; readonly runTurnsScaled: boolean };
+  readonly budgets?: { readonly items: number; readonly scopeFiles?: number; readonly maxFixAttempts: number; readonly fixAttemptsScaled: boolean; readonly dialMax: number; readonly dialScaled: boolean; readonly maxRunTurns: number; readonly runTurnsScaled: boolean; readonly maxActiveClaims: number; readonly activeClaimsScaled: boolean };
   /** The model each pushed app edit used (the strongest for complex items). */
   readonly editModels?: readonly { readonly agent: string; readonly item: string; readonly commit: string; readonly model: string; readonly why?: string }[];
   /** Every tool gate the run's bench ran and recorded, in order. */
@@ -1411,8 +1420,12 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     throw error;
   }
   const seams = await sharedSeams(options.projectDir);
+  const repoFiles = await listRepoFiles(options.projectDir).catch(() => [] as string[]);
+  const scopeFiles = new Set(planned.items.flatMap((i) => resolveIntentFiles(i.scopeHint, repoFiles))).size;
   const effective = scaledBudgets({
     items: planned.items.length,
+    scopeFiles,
+    ...(options.budgets?.maxActiveClaims !== undefined ? { explicitActiveClaims: options.budgets.maxActiveClaims } : {}),
     explicitFixAttempts: options.rules?.maxFixAttempts ?? options.budgets?.maxFixAttemptsPerItem,
     ...(options.budgets?.maxRunTurns !== undefined ? { explicitRunTurns: options.budgets.maxRunTurns } : {}),
     dial: options.dial,
@@ -1420,12 +1433,12 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   });
   budgets.maxRunTurns = effective.maxRunTurns;
   const dial: ConcurrencyDial = { minConcurrency: options.dial.minConcurrency, maxConcurrency: effective.dialMax };
-  emit({ kind: "budgets", items: planned.items.length, ...effective });
+  emit({ kind: "budgets", items: planned.items.length, scopeFiles, ...effective });
   const goal = await operator.postAsHuman({
     type: "goal.posted",
     payload: {
       objective,
-      rules: { ...(options.rules ?? {}), maxFixAttempts: effective.maxFixAttempts },
+      rules: { ...(options.rules ?? {}), maxFixAttempts: effective.maxFixAttempts, maxActiveClaims: effective.maxActiveClaims },
       protected: guarded.paths,
       // The immutable acceptance gate: never contract-changeable.
       ...(guarded.immutable.length > 0 ? { immutable: guarded.immutable } : {}),
@@ -1841,6 +1854,28 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     }
     return released;
   };
+  // Never end quiet while a seam item is OPEN (nobody holds it) and agents
+  // could take it: nudge the workers to look (bounded per open set).
+  const nudgeOpenSeamItems = async (): Promise<boolean> => {
+    const state = (await operator.page(0, 1)).state;
+    const open = Object.values(state.items)
+      .filter((i) => i.status === "open" && i.fromContract !== undefined)
+      .map((i) => i.id)
+      .sort();
+    if (open.length === 0) {
+      return false;
+    }
+    let nudged = false;
+    for (const worker of workers) {
+      if (worker.nudgeOpenSeams(open)) {
+        nudged = true;
+      }
+    }
+    if (nudged) {
+      emit({ kind: "open-seams-nudged", items: open });
+    }
+    return nudged;
+  };
 
   const lead = makeAgent("lead", "lead");
   const controller = new AbortController();
@@ -1992,7 +2027,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         }
         const integrated = integrator.revisions.length > before;
         const decided = await settleContracts();
-        if (!acted && joined === 0 && !integrated && !decided && !(await releaseStalledSeams())) {
+        if (!acted && joined === 0 && !integrated && !decided && !(await releaseStalledSeams()) && !(await nudgeOpenSeamItems())) {
           stopReason = check((await operator.page(0, 1)).state) ?? "quiescent";
           stopDetail = "no agent had anything to do and no integration was pending";
         }
@@ -2047,8 +2082,12 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         if (state.lastSeq !== lastSeq || anyBusy) {
           lastSeq = state.lastSeq;
           quietSince = Date.now();
-        } else if (Date.now() - quietSince >= budgets.quiescenceMs / 2 && seamHolds(state).length > 0 && (await releaseStalledSeams())) {
-          // A quiet board with seam holds: the holds end before quiescence could.
+        } else if (
+          Date.now() - quietSince >= budgets.quiescenceMs / 2 &&
+          ((seamHolds(state).length > 0 && (await releaseStalledSeams())) || (await nudgeOpenSeamItems()))
+        ) {
+          // A quiet board with seam holds, or with open seam items: the holds
+          // end, and the workers are nudged to take them, before quiescence could.
           quietSince = Date.now();
         } else if (Date.now() - quietSince >= budgets.quiescenceMs) {
           stopReason = "quiescent";
@@ -2261,7 +2300,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     cleanedUp,
     toolGates: [...toolBench.gates],
     editModels: workers.flatMap((w) => w.editModels.map((e) => ({ agent: w.id, ...e }))),
-    budgets: { items: planned.items.length, ...effective },
+    budgets: { items: planned.items.length, scopeFiles, ...effective },
     ...(options.toolAuthorLabel !== undefined ? { toolAuthorLabel: options.toolAuthorLabel } : {}),
   };
 }
@@ -2350,8 +2389,11 @@ export function exportedNames(source: string): string[] {
  */
 export function scaledBudgets(input: {
   readonly items: number;
+  /** Distinct repo files the planned items' scopes cover (large items get more turns). */
+  readonly scopeFiles?: number;
   readonly explicitFixAttempts?: number;
   readonly explicitRunTurns?: number;
+  readonly explicitActiveClaims?: number;
   readonly dial: ConcurrencyDial;
   readonly scaleDial: boolean;
 }): {
@@ -2361,10 +2403,16 @@ export function scaledBudgets(input: {
   readonly dialScaled: boolean;
   readonly maxRunTurns: number;
   readonly runTurnsScaled: boolean;
+  readonly maxActiveClaims: number;
+  readonly activeClaimsScaled: boolean;
 } {
   const fix = input.explicitFixAttempts ?? Math.min(6, 3 + Math.floor(input.items / 5));
   const dialMax = input.scaleDial ? Math.max(input.dial.minConcurrency, Math.min(Math.max(1, input.items), 6)) : input.dial.maxConcurrency;
-  const runTurns = input.explicitRunTurns ?? Math.min(MAX_SCALED_RUN_TURNS, Math.max(200, RUN_TURNS_PER_ITEM * input.items));
+  const runTurns =
+    input.explicitRunTurns ??
+    Math.min(MAX_SCALED_RUN_TURNS, Math.max(200, RUN_TURNS_PER_ITEM * input.items + RUN_TURNS_PER_SCOPE_FILE * (input.scopeFiles ?? 0)));
+  // One unfinished item per agent; two when the plan dwarfs the dial.
+  const activeClaims = input.explicitActiveClaims ?? (input.items >= 3 * Math.max(1, dialMax) ? 2 : 1);
   return {
     maxFixAttempts: fix,
     fixAttemptsScaled: input.explicitFixAttempts === undefined,
@@ -2372,8 +2420,13 @@ export function scaledBudgets(input: {
     dialScaled: input.scaleDial,
     maxRunTurns: runTurns,
     runTurnsScaled: input.explicitRunTurns === undefined,
+    maxActiveClaims: activeClaims,
+    activeClaimsScaled: input.explicitActiveClaims === undefined,
   };
 }
+
+/** Run-wide turns per file in the planned scopes (added to the per-item turns). */
+export const RUN_TURNS_PER_SCOPE_FILE = 10;
 
 /** Run-wide turns per planned item when the turn budget scales with the plan. */
 export const RUN_TURNS_PER_ITEM = 25;
@@ -2791,7 +2844,7 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     `  agent phase ended: ${result.stopReason}${result.stopDetail ? ` (${result.stopDetail})` : ""}`,
     ...(result.budgets
       ? [
-          `  budgets: ${result.budgets.maxFixAttempts} fix attempt(s) per item (${result.budgets.fixAttemptsScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"}), dial max ${result.budgets.dialMax} (${result.budgets.dialScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"}), ${result.budgets.maxRunTurns} run turn(s) (${result.budgets.runTurnsScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"})`,
+          `  budgets: ${result.budgets.maxFixAttempts} fix attempt(s) per item (${result.budgets.fixAttemptsScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"}), dial max ${result.budgets.dialMax} (${result.budgets.dialScaled ? `scaled with ${result.budgets.items} planned item(s)` : "explicit"}), ${result.budgets.maxRunTurns} run turn(s) (${result.budgets.runTurnsScaled ? `scaled with ${result.budgets.items} planned item(s) and ${result.budgets.scopeFiles ?? 0} scope file(s)` : "explicit"}), claim cap ${result.budgets.maxActiveClaims} unfinished item(s) per agent (${result.budgets.activeClaimsScaled ? "scaled" : "explicit"})`,
         ]
       : []),
     ...(result.gateLabel !== undefined ? [`  gate: ${result.gateLabel}`] : []),

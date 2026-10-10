@@ -71,6 +71,13 @@ export interface BoardRules {
    * engine records the item's fix budget as exhausted instead.
    */
   readonly maxFixAttempts: number;
+  /**
+   * Unfinished items one agent may hold at once (absent: unlimited). An item
+   * is unfinished until its owner's latest push passed an integrated revision.
+   * Seam items (accepted seam contracts) and tool items are exempt: the cap
+   * stops hoarding, never the fix or tool a held item needs.
+   */
+  readonly maxActiveClaims?: number;
 }
 
 export const DEFAULT_BOARD_RULES: BoardRules = { maxContestTurns: 3, contestIdleMessages: 25, maxFixAttempts: 2 };
@@ -761,6 +768,7 @@ export type BoardErrorCode =
   | "NOT_SUPPORTED"
   | "IMMUTABLE"
   | "SEAM_FIRST"
+  | "CLAIM_CAP"
   | "LOG_MISMATCH";
 
 /** A rejected message or an inconsistent log, with a machine-readable code. */
@@ -811,6 +819,8 @@ export interface BoardItemPush {
   readonly agent: string;
   readonly paths: readonly string[];
   integratedIn?: number;
+  /** The revision that first GATED this push (merged into it, pass or fail). */
+  gatedIn?: number;
   /** A sub-lead's push: the children's pushes it merged. */
   readonly merges?: readonly { readonly item: string; readonly commit: string }[];
   /** Children of `merges` a revision could not verify in the gated tree (not integrated by it). */
@@ -1417,6 +1427,7 @@ function rules(raw: Raw): BoardRules {
         : positiveInt(value, "contestIdleMessages", 10000),
     maxFixAttempts:
       value.maxFixAttempts === undefined ? DEFAULT_BOARD_RULES.maxFixAttempts : positiveInt(value, "maxFixAttempts", 20),
+    ...(value.maxActiveClaims !== undefined ? { maxActiveClaims: positiveInt(value, "maxActiveClaims", 8) } : {}),
   };
 }
 
@@ -2244,7 +2255,9 @@ function itemCovers(item: BoardItem, path: string): boolean {
  */
 export function seamWaits(state: BoardState, itemId: string): { readonly item: string; readonly seams: readonly string[] }[] {
   const item = state.items[itemId];
-  if (!item || item.tool !== undefined || (state.seams ?? []).length === 0) {
+  // A seam item never waits on another seam item (a seam that imports a seam
+  // would otherwise chain holds).
+  if (!item || item.tool !== undefined || item.fromContract !== undefined || (state.seams ?? []).length === 0) {
     return [];
   }
   const out: { item: string; seams: string[] }[] = [];
@@ -2267,7 +2280,7 @@ export function seamWaits(state: BoardState, itemId: string): { readonly item: s
  * digest's waitsFor, seamHolds, and the stall check all use it): an item
  * carrying an ACCEPTED SEAM CONTRACT (`fromContract`; an item whose scope
  * merely covers a seam path never holds anyone), claimed by someone, whose
- * push is not integrated yet, not recorded stalled since its grant, and still
+ * latest push has not been gated by a revision yet, not recorded stalled since its grant, and still
  * making PROGRESS (its grant or latest push within `seamWaitMessages`).
  */
 export function seamItemHolding(state: BoardState, other: BoardItem): boolean {
@@ -2275,7 +2288,45 @@ export function seamItemHolding(state: BoardState, other: BoardItem): boolean {
     return false;
   }
   const activity = Math.max(other.grantedSeq ?? other.proposedSeq, other.lastPush?.seq ?? 0);
-  return other.lastPush?.integratedIn === undefined && other.seamStalledSeq === undefined && state.lastSeq - activity <= BOARD_LIMITS.seamWaitMessages;
+  // Once its push was GATED (merged into a revision, pass or fail), dependents
+  // merge with it in every later revision: holding them longer only stalls
+  // them on failures that are not the seam's.
+  return other.lastPush?.gatedIn === undefined && other.seamStalledSeq === undefined && state.lastSeq - activity <= BOARD_LIMITS.seamWaitMessages;
+}
+
+/**
+ * The items counting toward `agent`'s active-claim cap: the change items it
+ * holds (or is contesting for) that are UNFINISHED, i.e. its latest push has
+ * not passed an integrated revision. Seam items, tool items, and split items
+ * (a sub-lead's) are exempt. Pure.
+ */
+export function activeClaims(state: BoardState, agent: string): string[] {
+  return Object.values(state.items)
+    .filter((i) => {
+      if (i.fromContract !== undefined || i.tool !== undefined) {
+        return false;
+      }
+      if (i.status === "contested" && i.claimant?.agent === agent) {
+        return true;
+      }
+      if ((i.status !== "claimed" && i.status !== "contested") || i.owner !== agent) {
+        return false;
+      }
+      const passed = i.lastPush !== undefined && i.lastPush.agent === agent && i.lastPush.integratedIn !== undefined && i.fixRequested === undefined;
+      return !passed;
+    })
+    .map((i) => i.id)
+    .sort();
+}
+
+/** The claim cap `agent` is at (it may not claim another change item), or undefined. Pure. */
+export function claimCapReached(state: BoardState, agent: string): { readonly cap: number; readonly holding: readonly string[] } | undefined {
+  const cap = state.rules.maxActiveClaims;
+  if (cap === undefined) {
+    return undefined;
+  }
+  const holding = activeClaims(state, agent);
+  return holding.length >= cap ? { cap, holding } : undefined;
 }
 
 /** A stalled seam item is released (open again) when its owner has pushed nothing for it. */
@@ -2568,6 +2619,17 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       if (item.exhaustedBy?.includes(draft.from)) {
         fail("NOT_ALLOWED", `${draft.from} already spent item ${item.id}'s fix budget; it was reopened for another agent`);
+      }
+      // No hoarding: an agent at its active-claim cap finishes (or hands off)
+      // first. Seam and tool items are exempt (a held item may need them).
+      if (item.fromContract === undefined && item.tool === undefined) {
+        const capped = claimCapReached(state, draft.from);
+        if (capped) {
+          fail(
+            "CLAIM_CAP",
+            `${draft.from} holds ${capped.holding.length} unfinished item(s) (${capped.holding.join(", ")}; cap ${capped.cap}): finish one (push it and let it pass an integrated revision) or hand it off before claiming ${item.id}`,
+          );
+        }
       }
       // A change to a shared seam goes first: an item covering the seam's
       // importers waits (bounded) until the seam item's push is integrated.
@@ -3158,6 +3220,9 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
           "INTENT_OVERLAP",
           `handing ${item.id} to ${draft.payload.to} would overlap ${clash.owner}'s claim on ${clash.id}`,
         );
+      }
+      if (item.fromContract === undefined && item.tool === undefined && claimCapReached(state, draft.payload.to)) {
+        fail("CLAIM_CAP", `${draft.payload.to} is at its active-claim cap: hand ${item.id} to an agent with room, or ask for help`);
       }
       return;
     }
@@ -3760,6 +3825,12 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         }
       }
       attribution.lastRev = { n: message.payload.n, merged: mergedByItem };
+      for (const [id, commit] of Object.entries(mergedByItem)) {
+        const push = state.items[id]?.lastPush;
+        if (push && push.commit === commit && push.gatedIn === undefined) {
+          push.gatedIn = message.payload.n;
+        }
+      }
       state.lastRevN = message.payload.n;
       if (message.payload.gate === "fail" && message.payload.failing !== undefined) {
         state.lastFailure = { n: message.payload.n, ...message.payload.failing };
@@ -4922,6 +4993,14 @@ export interface BoardDigest {
     readonly waitsFor?: readonly string[];
   }[];
   readonly integrated: { readonly n: number; readonly commit: string } | null;
+  /** This agent is at its active-claim cap: it finishes or hands off before claiming another item. */
+  readonly claimCap?: { readonly cap: number; readonly holding: readonly string[]; readonly hint: string };
+  /**
+   * Seam items (accepted seam contracts) that are OPEN: nobody holds them. Any
+   * agent may claim one (exempt from the claim cap); `blocks` lists this
+   * agent's items whose files import that seam.
+   */
+  readonly openSeams?: readonly { readonly item: string; readonly seam: string; readonly blocks: readonly string[]; readonly hint: string }[];
   /** The latest revision this agent was told to rebase onto, if any. */
   readonly rebaseTo: number | null;
   /** The latest failing revision's evidence, when it asks this agent for a fix. */
@@ -5179,6 +5258,38 @@ export function boardDigest(
         })(),
       })),
     integrated: state.integrated ? { n: state.integrated.n, commit: state.integrated.commit } : null,
+    ...((): Pick<BoardDigest, "claimCap"> => {
+      const capped = claimCapReached(state, agent);
+      return capped
+        ? {
+            claimCap: {
+              cap: capped.cap,
+              holding: [...capped.holding],
+              hint: `you hold ${capped.holding.length} unfinished item(s) (${capped.holding.join(", ")}; cap ${capped.cap}): finish one (edit, push, let it pass) or hand it off before claiming another; idle agents take the open items`,
+            },
+          }
+        : {};
+    })(),
+    ...((): Pick<BoardDigest, "openSeams"> => {
+      const open = Object.values(state.items).filter((i) => i.status === "open" && i.fromContract !== undefined);
+      if (open.length === 0) {
+        return {};
+      }
+      const mine = Object.values(state.items).filter((i) => (i.status === "claimed" || i.status === "contested") && i.owner === agent);
+      return {
+        openSeams: open.map((i) => {
+          const seam = i.scopeHint[0] ?? "";
+          const importers = (state.seams ?? []).find((x) => x.path === seam)?.importers ?? [];
+          const blocks = mine.filter((m) => importers.some((imp) => itemCovers(m, imp))).map((m) => m.id);
+          return {
+            item: i.id,
+            seam,
+            blocks,
+            hint: `${i.id} (a change to the shared seam ${seam}) is OPEN: nobody holds it, so nothing is waiting on anyone else. Claim it yourself (seam items are exempt from the claim cap)${blocks.length > 0 ? `; your ${blocks.join(", ")} need(s) it` : ""}`,
+          };
+        }),
+      };
+    })(),
     rebaseTo: record?.rebaseTo ?? null,
     failure: askedToFix ? failure : null,
     protected: state.protected,

@@ -446,17 +446,32 @@ is distributed changes: items are proposed and claimed, never assigned.
 - Budgets scale with the plan (bounded; explicit flags win): the lead plans
   BEFORE the goal is posted, so the goal's fix budget is 3 + floor(items / 5)
   (at most 6), without an explicit `--max` the dial's max is min(items, 6)
-  (at least the dial's min), and without an explicit `--max-turns` the
-  run-wide turn budget is min(800, max(200, 25 per planned item)). The
+  (at least the dial's min), without an explicit `--max-turns` the
+  run-wide turn budget is min(800, max(200, 25 per planned item + 10 per file
+  in the planned scopes)), and without an explicit `--claim-cap` the claim cap
+  is 1 (2 when planned items are at least three times the dial's max). The
   effective values are printed (`budgets: ...`).
+- No claim hoarding (`goal.posted.rules.maxActiveClaims`): an agent may hold
+  at most that many UNFINISHED change items (its latest push has not passed
+  an integrated revision); a further claim, or a handoff to an agent at its
+  cap, is refused (`CLAIM_CAP`) and the digest says so (`claimCap`: finish
+  one or hand it off). Seam items and tool items are exempt. A board posted
+  without the rule keeps unlimited claims.
 - Seam first: the goal records the shared seams of a modular project (the
   cohesion blueprint's frozen contracts) with their importers
   (`goal.posted.seams`). An item whose scope covers a seam is offered first
   (`seam` on open items; in lockstep its holder moves first), but only the
   seam item of an ACCEPTED SEAM CONTRACT (`fromContract`) HOLDS dependents: a
   claim on an item covering one of its importers is refused (`SEAM_FIRST`)
-  until its push is integrated, while it makes progress (its grant or latest
-  push within 60 board messages). One predicate, `seamItemHolding`, decides
+  until its push is GATED (merged into a revision, pass or fail: dependents
+  merge with it from then on), while it makes progress (its grant or latest
+  push within 60 board messages). A seam item never waits on another seam
+  item. An OPEN seam item (nobody holds it) is listed in every worker's
+  digest (`openSeams`, with `blocks`: the agent's items importing that seam)
+  with a plain hint that it may claim it itself; a free agent, one whose
+  items need it, or one with no change item in progress is woken once per
+  open set, and before a quiet board could end the run the driver nudges the
+  workers again (bounded, `MAX_OPEN_SEAM_CUES`). One predicate, `seamItemHolding`, decides
   this for the hold, the digest's `waitsFor`, `seamHolds`, and the stall check
   (`seamWaits`); a held dependent does
   not edit yet and then rebases onto the seam change (a passing revision that

@@ -361,6 +361,33 @@ describe("the lead", () => {
     expect(refusals[1]!.error).toMatch(/no contract nope; pending contracts: none \(use pendingContracts\[\]\.contract exactly\)/);
   });
 
+  it("an OPEN seam item wakes a free worker once per set, says it may claim it, and the driver may nudge it once more (bounded)", async () => {
+    const env = await setup({ seams: [{ path: "src/shared.ts", importers: ["src/a/x.ts", "src/b/y.ts"] }] });
+    const lead = await env.operator.join("lead", { role: "lead" });
+    const w9 = await env.operator.join("w9", {});
+    const leadToken = lead.ok ? lead.token : "";
+    const token = w9.ok ? w9.token : "";
+    await env.rawPost(token, { type: "item.claimed", payload: { item: "i1", intent: { read: [], write: ["src/a/**"] } } });
+    await env.rawPost(token, { type: "contract.proposed", payload: { contract: "k1", target: "src/shared.ts", kind: "modify", item: "i1", description: "add a shared field" } });
+    await env.rawPost(leadToken, { type: "contract.accepted", payload: { contract: "k1" } });
+    expect((await env.operator.recordSeamStalled("seam-k1")).ok).toBe(true);
+    const transport = scripted(Array.from({ length: 6 }, () => ({ type: "wait" as const, reason: "looking" })));
+    const w1 = env.agent("w1", { transport });
+    await w1.join();
+    const results: string[] = [];
+    for (let i = 0; i < 3; i += 1) results.push(await w1.step());
+    const cues = () => transport.inputs.at(-1)!.capsule.evidence.filter((e) => /^OPEN SEAM ITEM: seam-k1 .*is OPEN: nobody holds it/.test(e)).length;
+    expect(cues()).toBe(1);
+    expect((transport.inputs[0]!.digest as BoardDigest).openSeams).toEqual([expect.objectContaining({ item: "seam-k1", seam: "src/shared.ts" })]);
+    // The driver's nudge gives one more turn, at most MAX_OPEN_SEAM_CUES times per set.
+    expect(w1.nudgeOpenSeams(["seam-k1"])).toBe(true);
+    expect(await w1.step()).toBe("acted");
+    expect(cues()).toBe(2);
+    expect(w1.nudgeOpenSeams(["seam-k1"])).toBe(true);
+    expect(w1.nudgeOpenSeams(["seam-k1"])).toBe(false);
+    expect(results[0]).toBe("acted");
+  });
+
   it("propagates a planner failure (no silent substitute)", async () => {
     const env = await setup();
     const lead = env.agent("lead", {
