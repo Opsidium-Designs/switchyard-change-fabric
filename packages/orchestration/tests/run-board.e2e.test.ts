@@ -663,9 +663,14 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
       budgets: { maxTurnsPerItem: 1 },
     });
     const help = of(result.log, "help.requested");
-    expect(help).toHaveLength(1);
-    expect(help[0]).toMatchObject({ from: "agent-1", payload: { item: "core", need: "turn-budget" } });
-    expect(result.agents.find((a) => a.id === "agent-1")!.stop).toMatchObject({ reason: "item-budget" });
+    // Each spent item is released once (no other agent can take it: help) and
+    // the worker takes the next open item; the third item it exhausts stops it.
+    expect(help.map((h) => h.payload.item)).toEqual(["core", "api", "wiring"]);
+    expect(help.every((h) => h.from === "agent-1" && h.payload.need === "turn-budget")).toBe(true);
+    expect(result.agents.find((a) => a.id === "agent-1")!.stop).toMatchObject({
+      reason: "item-budget",
+      detail: expect.stringMatching(/spent more than 1 turns on item wiring; exhausted 3 item\(s\) \(core, api, wiring\), at most 3/),
+    });
     expect(result.stopReason).toBe("all-agents-stopped");
     expect(types(result.log)).not.toContain("push.announced");
     expect(result.revision).toBeUndefined();
@@ -1295,6 +1300,9 @@ describe("budgets that scale with the plan (explicit values win)", () => {
     expect(scaledBudgets({ items: 10, dial, scaleDial: true })).toEqual({
       maxFixAttempts: 5,
       fixAttemptsScaled: true,
+      // The per-item turns: max(8, 4 + 2 per fix attempt), so five fix requests are not starved.
+      maxTurnsPerItem: 14,
+      itemTurnsScaled: true,
       dialMax: 6,
       dialScaled: true,
       maxRunTurns: 250,
@@ -1310,7 +1318,9 @@ describe("budgets that scale with the plan (explicit values win)", () => {
     expect(scaledBudgets({ items: 2, dial, scaleDial: true })).toMatchObject({ claimLeaseMessages: 150, claimDeadlineMessages: 1200 });
     expect(scaledBudgets({ items: 2, explicitLease: 30, dial, scaleDial: true })).toMatchObject({ claimLeaseMessages: 30, leaseScaled: false, claimDeadlineMessages: 240 });
     // The run-wide turn budget weighs scope size: max(200, 25 per item + 10 per scope file), at most 800.
-    expect(scaledBudgets({ items: 2, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 3, dialMax: 2, maxRunTurns: 200 });
+    expect(scaledBudgets({ items: 2, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 3, maxTurnsPerItem: 10, dialMax: 2, maxRunTurns: 200 });
+    expect(scaledBudgets({ items: 40, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 6, maxTurnsPerItem: 16 });
+    expect(scaledBudgets({ items: 10, explicitItemTurns: 3, dial, scaleDial: true })).toMatchObject({ maxTurnsPerItem: 3, itemTurnsScaled: false });
     expect(scaledBudgets({ items: 7, scopeFiles: 12, dial, scaleDial: false })).toMatchObject({ maxRunTurns: 295 }); // sf7: 7 large items
     expect(scaledBudgets({ items: 15, dial, scaleDial: true })).toMatchObject({ maxRunTurns: 375 });
     expect(scaledBudgets({ items: 40, scopeFiles: 60, dial, scaleDial: true })).toMatchObject({ maxFixAttempts: 6, dialMax: 6, maxRunTurns: 800 });
@@ -1322,6 +1332,8 @@ describe("budgets that scale with the plan (explicit values win)", () => {
     ).toEqual({
       maxFixAttempts: 2,
       fixAttemptsScaled: false,
+      maxTurnsPerItem: 8,
+      itemTurnsScaled: true,
       dialMax: 3,
       dialScaled: false,
       maxRunTurns: 1000,
@@ -1367,7 +1379,7 @@ describe("budgets that scale with the plan (explicit values win)", () => {
     expect(of(result.log, "agent.joined").filter((m) => m.from !== "lead").length).toBeLessThanOrEqual(6);
     expect(of(result.log, "agent.joined").filter((m) => m.from !== "lead").length).toBeGreaterThan(3);
     expect(formatBoardRunSummary(result)).toMatch(
-      /budgets: 5 fix attempt\(s\) per item \(scaled with 10 planned item\(s\)\), dial max 6 \(scaled with 10 planned item\(s\)\), 350 run turn\(s\) \(scaled with 10 planned item\(s\) and 10 scope file\(s\)\), claim cap 1 unfinished item\(s\) per agent \(scaled\), claim lease 240 board message\(s\) without progress \(scaled with dial max 6\), claim deadline 1920 message\(s\)/,
+      /budgets: 5 fix attempt\(s\) per item \(scaled with 10 planned item\(s\)\), 14 turn\(s\) per item per agent \(scaled with the fix attempts\), dial max 6 \(scaled with 10 planned item\(s\)\), 350 run turn\(s\) \(scaled with 10 planned item\(s\) and 10 scope file\(s\)\), claim cap 1 unfinished item\(s\) per agent \(scaled\), claim lease 240 board message\(s\) without progress \(scaled with dial max 6\), claim deadline 1920 message\(s\)/,
     );
   });
 });

@@ -1,9 +1,11 @@
 /**
  * Failure attribution by parsing a failing gate's output: which units (board
  * items, WorkUnits) does it implicate? The files and resource names the output
- * reports are mapped to the units' declared paths and ids. Best-effort
- * narrowing, never a correctness claim: when nothing maps, every unit is
- * implicated (`attributed: false`). A caller may also pass the OUTSTANDING
+ * reports are mapped to the units' declared paths and ids; when none does, the
+ * failing TESTS (their files and describe names) are mapped to the code they
+ * exercise, most specific match first. Best-effort narrowing, never a
+ * correctness claim: when nothing maps, every unit is implicated
+ * (`attributed: false`). A caller may also pass the OUTSTANDING
  * units (work not in the gated tree): a failure that maps only to them
  * implicates no gated unit. Shared by the local drivers and the integration
  * Workflow on Cloudflare. Pure: no I/O.
@@ -31,9 +33,6 @@ export function attributeFailure<U extends AttributableUnit>(
 ): { readonly units: readonly U[]; readonly attributed: boolean; readonly outstanding: readonly U[] } {
   const failingFiles = extractFailingFiles(evidence);
   const failingNames = extractFailingNames(evidence);
-  if (failingFiles.length === 0 && failingNames.length === 0) {
-    return { units: gatedUnits, attributed: false, outstanding: [] }; // nothing to attribute to: re-fan all
-  }
   const maps = (unit: U) =>
     unit.paths.some((declared) => failingFiles.some((file) => pathCovers(declared, file))) || failingNames.some((name) => unitCoversName(unit, name));
   const implicated = gatedUnits.filter(maps);
@@ -48,10 +47,219 @@ export function attributeFailure<U extends AttributableUnit>(
     // tree yet): no gated unit is implicated.
     return { units: [], attributed: true, outstanding };
   }
-  // Honest fallback: if neither the named files nor the named resources map to
-  // any unit, re-fan all rather than silently skip (the change failed either
-  // way). Attribution is best-effort narrowing, not a correctness claim.
+  // Nothing named a declared file or resource directly: the failing TESTS
+  // (their files and describe names) still name the code they exercise
+  // (`tests/billing/tax.test.ts` -> `src/billing/tax.ts`, `orders > ...` ->
+  // `src/orders/**`). Mapped over gated and outstanding units together so the
+  // most specific match wins across both.
+  const tested = testSubjectMatches([...gatedUnits, ...outstandingUnits], (unit) => unit.paths, evidence);
+  if (tested.size > 0) {
+    return { units: gatedUnits.filter((u) => tested.has(u)), attributed: true, outstanding: outstandingUnits.filter((u) => tested.has(u)) };
+  }
+  // Honest fallback: if neither the named files, the named resources, nor the
+  // failing tests map to any unit, re-fan all rather than silently skip (the
+  // change failed either way). Attribution is best-effort narrowing, not a
+  // correctness claim.
   return { units: gatedUnits, attributed: false, outstanding: [] };
+}
+
+/** Directory names that hold tests: a test path's subject starts after the last one. */
+const TEST_DIRS = new Set(["test", "tests", "__tests__", "spec", "specs"]);
+
+/** Segments and words too generic to name the code a test exercises. */
+const GENERIC_SEGMENTS = new Set([
+  "src",
+  "lib",
+  "app",
+  "apps",
+  "packages",
+  "pkg",
+  "source",
+  "index",
+  "main",
+  "dist",
+  "build",
+  "test",
+  "tests",
+  "spec",
+  "specs",
+  "__tests__",
+  "and",
+  "the",
+  "for",
+  "with",
+]);
+
+/** A test-NAMED file (`x.test.ts`, `x.spec.js`, `test_x.py`, `x_test.go`): the failing test itself. */
+function isTestNamed(path: string): boolean {
+  return /\.(test|spec)\.[A-Za-z0-9]+$/.test(path) || /(^|\/)test_[^/]+\.py$|_test\.(go|py)$/.test(path);
+}
+
+/** Whether a path lies in an installed dependency (never a unit's code). */
+function inDependency(path: string): boolean {
+  return /(^|[\/])node_modules[\/]/.test(path);
+}
+
+/**
+ * The failing TESTS a gate output reports: test-named files (from vitest's
+ * `FAIL <file> > ...` and failed-file `❯ <file> (...)` lines, jest's
+ * `FAIL <file>`, and any error location in a test file, as node:test's stack
+ * frames give) and describe names (vitest's `× <describe> > <test>` and
+ * `FAIL <file> > <describe> > <test>`, jest's `● <describe> › <test>`).
+ * Passing lines (`✓`, `✔`, `PASS`) are never read. Linear time.
+ */
+function extractFailingTests(evidence: string): { readonly files: readonly string[]; readonly describes: readonly string[] } {
+  const files = new Set<string>();
+  const describes = new Set<string>();
+  const lines = evidence.split(/\r?\n/).filter((line) => !/^\s*[>$] /.test(line));
+  const addFile = (raw: string) => {
+    const clean = raw.replace(/^file:\/\//, "").replace(/(:\d+)+$/, "");
+    if (isTestNamed(clean) && !inDependency(clean)) {
+      files.add(clean);
+    }
+  };
+  for (const raw of errorLocations(lines.join("\n"))) {
+    addFile(raw);
+  }
+  const addDescribe = (title: string, separator: string) => {
+    const at = title.indexOf(separator);
+    if (at > 0) {
+      describes.add(title.slice(0, at).trim());
+    }
+  };
+  for (const line of lines) {
+    const marker = /^\s*(FAIL|\u276f|[\u00d7\u2716\u2717]|\u25cf)\s+/.exec(line);
+    if (!marker) {
+      continue;
+    }
+    const rest = line.slice(marker[0].length);
+    const space = rest.search(/\s/);
+    const token = space < 0 ? rest : rest.slice(0, space);
+    if (isTestNamed(token.replace(/(:\d+)+$/, ""))) {
+      addFile(token);
+      // `FAIL <file> > <describe> > <test>`: the describe follows the file.
+      if (rest.slice(token.length).startsWith(" > ")) {
+        addDescribe(rest.slice(token.length + 3), " > ");
+      }
+      continue;
+    }
+    if (marker[1] === "\u25cf") {
+      addDescribe(rest, " \u203a ");
+    } else if (marker[1] !== "FAIL" && marker[1] !== "\u276f") {
+      addDescribe(rest, " > ");
+    }
+  }
+  return { files: [...files], describes: [...describes] };
+}
+
+/** A name and its simple singular/plural forms (`order` <-> `orders`). */
+function nameVariants(name: string): ReadonlySet<string> {
+  return new Set([name, `${name}s`, name.endsWith("s") ? name.slice(0, -1) : name]);
+}
+
+/**
+ * The SUBJECT of a test file: its path after the last test directory, with the
+ * test suffix dropped, lowercased (`tests/billing/tax.test.ts` ->
+ * `billing/tax`, `src/orders/cart.test.ts` -> `src/orders/cart`).
+ */
+function testSubject(file: string): string[] {
+  const segments = file.split(/[\\/]/).filter((seg) => seg !== "");
+  let start = 0;
+  segments.forEach((seg, i) => {
+    if (TEST_DIRS.has(seg.toLowerCase()) && i < segments.length - 1) {
+      start = i + 1;
+    }
+  });
+  const subject = segments.slice(start).map((seg) => seg.toLowerCase());
+  const last = subject.pop() ?? "";
+  const stem = last
+    .replace(/\.(test|spec)\.[a-z0-9]+$/, "")
+    .replace(/^test_/, "")
+    .replace(/_test\.[a-z0-9]+$/, "")
+    .replace(/\.[a-z0-9]+$/, "");
+  return stem === "" ? subject : [...subject, stem];
+}
+
+/**
+ * A declared path's shape: its directory segments and its full segments with
+ * the file extension dropped (a glob is cut at its first wildcard segment, so
+ * `src/orders/**` is the directory `src/orders`).
+ */
+function declaredShape(declared: string): { readonly dirs: readonly string[]; readonly full: readonly string[] } {
+  const segments = declared.replace(/^\.\//, "").split("/").filter((seg) => seg !== "");
+  const wild = segments.findIndex((seg) => seg.includes("*"));
+  const kept = (wild < 0 ? segments : segments.slice(0, wild)).map((seg) => seg.toLowerCase());
+  if (wild < 0 && kept.length > 0 && hasExtension(kept.at(-1)!)) {
+    return { dirs: kept.slice(0, -1), full: [...kept.slice(0, -1), kept.at(-1)!.replace(/\.[a-z0-9]+$/, "")] };
+  }
+  return { dirs: kept, full: kept };
+}
+
+/**
+ * How specifically a declared path matches a test subject (0: not at all):
+ *   3: the subject's directory AND name (`billing/tax` -> `src/billing/tax.ts`);
+ *   2: its name (`tax` -> `.../tax.ts`, `orders` -> `src/orders/**`);
+ *   1: its domain, a directory named like the subject's directory or name
+ *      (`orders` -> `src/orders/cart.ts`, `billing/tax` -> `src/billing/*`).
+ */
+function subjectTier(declared: string, subject: readonly string[]): number {
+  const { dirs, full } = declaredShape(declared);
+  const name = subject.at(-1);
+  if (name === undefined || full.length === 0) {
+    return 0;
+  }
+  if (subject.length >= 2 && full.length >= 2 && full.at(-1) === name && full.at(-2) === subject.at(-2)) {
+    return 3;
+  }
+  if (nameVariants(name).has(full.at(-1)!)) {
+    return 2;
+  }
+  const domain = subject.slice(-2).filter((seg) => !GENERIC_SEGMENTS.has(seg));
+  return dirs.some((dir) => !GENERIC_SEGMENTS.has(dir) && domain.some((seg) => nameVariants(seg).has(dir))) ? 1 : 0;
+}
+
+/**
+ * The candidates the failing tests in `evidence` exercise, each test subject
+ * resolved to its MOST SPECIFIC matches only (see subjectTier). Test files
+ * are the stronger evidence: describe names are used only when no failing
+ * test file maps. A describe name is tried word by word from its last word
+ * (the head noun: `checkout tax` is about tax) and the first word that maps
+ * wins. Pure, deterministic.
+ */
+function testSubjectMatches<T>(candidates: readonly T[], pathsOf: (candidate: T) => readonly string[], evidence: string): ReadonlySet<T> {
+  const { files, describes } = extractFailingTests(evidence);
+  const best = (subject: readonly string[]): T[] => {
+    let top = 0;
+    let out: T[] = [];
+    for (const candidate of candidates) {
+      const tier = Math.max(0, ...pathsOf(candidate).map((declared) => subjectTier(declared, subject)));
+      if (tier > top) {
+        top = tier;
+        out = [candidate];
+      } else if (tier > 0 && tier === top) {
+        out.push(candidate);
+      }
+    }
+    return out;
+  };
+  const matched = new Set<T>(files.flatMap((file) => best(testSubject(file))));
+  if (matched.size > 0) {
+    return matched;
+  }
+  for (const title of describes) {
+    const words = title
+      .toLowerCase()
+      .split(/[^a-z0-9_]+/)
+      .filter((word) => word.length >= 3 && !GENERIC_SEGMENTS.has(word));
+    for (const word of words.reverse()) {
+      const hits = best([word]);
+      if (hits.length > 0) {
+        hits.forEach((hit) => matched.add(hit));
+        break;
+      }
+    }
+  }
+  return matched;
 }
 
 /**
@@ -149,8 +357,11 @@ function extractFailingFiles(evidence: string): readonly string[] {
   // name the file that failed; prefer them when there are any.
   const located = new Set<string>();
   // `<path>:<line>` (stack frames, most runners) and tsc's `<path>(<line>,<col>)`.
+  // A location inside an installed dependency is never a unit's code.
   for (const raw of errorLocations(text)) {
-    located.add(raw);
+    if (!inDependency(raw)) {
+      located.add(raw);
+    }
   }
   if (located.size > 0) {
     return [...located];
@@ -159,7 +370,9 @@ function extractFailingFiles(evidence: string): readonly string[] {
   // Otherwise: path-shaped tokens, one or more segments separated by `/`,
   // ending in a file with an extension.
   for (const raw of pathTokens(text)) {
-    found.add(raw);
+    if (!inDependency(raw)) {
+      found.add(raw);
+    }
   }
   return [...found];
 }
@@ -378,7 +591,11 @@ export function combineAttribution(input: {
  *      A file seen only as a deeper callee in a frame (a shared helper the
  *      failing code called, such as a contract's check) is never the place a
  *      failure is "in";
- *   3. only when there are no locations at all: path-shaped tokens.
+ *   3. only when there are no locations at all: path-shaped tokens;
+ *   4. only when none of those resolve: the source files the failing tests
+ *      exercise (`tests/billing/tax.test.ts` -> `src/billing/tax.ts`, a
+ *      describe `orders > ...` -> `src/orders/*`), most specific match first.
+ * A location inside `node_modules` is never a repo file.
  * An absolute path in the gate's checkout resolves by its repo-relative
  * suffix. Test files are excluded (they are the contract, or new tests).
  * Pure, sorted, deduplicated.
@@ -387,6 +604,9 @@ export function failingRepoFiles(evidence: string, repoFiles: readonly string[])
   const sources = repoFiles.filter((f) => !isTestFile(f));
   const resolve = (raw: string): string | undefined => {
     const clean = raw.replace(/^file:\/\//, "").replace(/^\.\//, "");
+    if (inDependency(clean)) {
+      return undefined;
+    }
     return repoFiles.find((f) => clean === f || clean.endsWith(`/${f}`));
   };
   const titled = new Set<string>();
@@ -445,7 +665,12 @@ export function failingRepoFiles(evidence: string, repoFiles: readonly string[])
       out.add(hit);
     }
   }
-  return [...out].sort();
+  if (out.size > 0) {
+    return [...out].sort();
+  }
+  // Last: the source files the failing tests exercise (their files and
+  // describe names, most specific match first).
+  return [...testSubjectMatches(sources, (file) => [file], evidence)].sort();
 }
 
 /** A test-shaped path (never a module a failure is "in"). */

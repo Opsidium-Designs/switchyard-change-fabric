@@ -8,15 +8,16 @@
  * failure attribution narrows by parse, then by a confident typed decision.
  */
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { describe, expect, it } from "vitest";
 
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
-import type { BoardMessage } from "@switchyard-change/change-core";
+import { boardDigest, type BoardMessage } from "@switchyard-change/change-core";
 import type { AskJev } from "@switchyard-change/model-adapters";
 import { PromotionRefusedError, type CommandOutcome, type CommandRunner } from "@switchyard-change/verification";
 
@@ -37,7 +38,7 @@ interface Agent {
   readonly dir: string;
 }
 
-async function setup(options: { readonly agents?: readonly string[] } = {}) {
+async function setup(options: { readonly agents?: readonly string[]; readonly protected?: readonly string[] } = {}) {
   const root = await mkdtemp(join(tmpdir(), "scf-integrator-"));
   const projectDir = join(root, "project");
   for (const [rel, body] of Object.entries({
@@ -54,7 +55,7 @@ async function setup(options: { readonly agents?: readonly string[] } = {}) {
   const operator = new BoardOperatorClient(fetchFn, BASE, ID);
   expect((await fetchFn(`${BASE}/changes/planning`, { method: "POST", body: JSON.stringify({ id: ID, objective: "o" }) })).status).toBe(201);
   const human = async (draft: unknown) => expect((await operator.postAsHuman(draft)).ok).toBe(true);
-  await human({ type: "goal.posted", payload: { objective: "o", protected: ["package.json"] } });
+  await human({ type: "goal.posted", payload: { objective: "o", protected: ["package.json", ...(options.protected ?? [])] } });
   for (const item of ["x", "y", "z"]) {
     await human({ type: "item.proposed", payload: { item, objective: `do ${item}`, scopeHint: [`src/${item}/**`] } });
   }
@@ -305,6 +306,48 @@ describe("ContinuousBoardIntegrator", () => {
     const fix = (await env.log()).filter((m) => m.type === "fix.requested");
     expect(fix.map((m) => m.to)).toEqual([["a2"]]);
   });
+
+  it("a failing developer test implicates only the item its file exercises; its owner alone is asked to fix and cued to the protected test", async () => {
+    const env = await setup({ protected: ["tests/x.test.ts", "tests/y.test.ts"] });
+    for (const [agent, item, file] of [
+      ["a1", "x", "src/x/a.ts"],
+      ["a2", "y", "src/y/b.ts"],
+      ["a3", "z", "src/z/c.ts"],
+    ] as const) {
+      await env.post(agent, { type: "item.claimed", payload: { item, intent: { read: [], write: [`src/${item}/**`] } } });
+      await env.announce(agent, item, await env.commit(agent, { [file]: "export const v = 1;\n" }), [file]);
+    }
+    // vitest's shape, as the storefront developer suite printed it: no source
+    // file named, only the failing test file and its describe.
+    const vitest = [
+      " RUN  v2.1.8 /tmp/scf-integration-x",
+      " \u2713 tests/x.test.ts (1 test) 2ms",
+      " \u276f tests/y.test.ts (1 test | 1 failed) 3ms",
+      "   \u00d7 y > rounds b 2ms",
+      "     \u2192 expected 0 to be 1 // Object.is equality",
+      " FAIL  tests/y.test.ts > y > rounds b",
+      "AssertionError: expected 0 to be 1 // Object.is equality",
+      " \u276f tests/y.test.ts:4:20",
+    ].join("\n");
+    const integrator = env.integrator({
+      appGateCommand: ["gate"],
+      verifyCommandRunner: { run: async () => ({ code: 1, stdout: vitest, stderr: "" }) },
+    });
+    integrator.kick();
+    await integrator.idle();
+    const log = await env.log();
+    const rev = log.find((m) => m.type === "integrated.rev")!;
+    if (rev.type !== "integrated.rev") {
+      throw new Error("no revision");
+    }
+    expect(rev.payload.failing!.items).toEqual(["y"]);
+    expect(log.filter((m) => m.type === "fix.requested").map((m) => m.to)).toEqual([["a2"]]);
+    const { state } = await env.operator.page(0, 1);
+    // The cue names the failing protected test (it lists every protected path
+    // the output names, so the passing tests/x.test.ts too).
+    expect(boardDigest(state, log, "a2", 0).claims.find((c) => c.item === "y")!.contractCue?.paths).toContain("tests/y.test.ts");
+    expect(boardDigest(state, log, "a1", 0).claims.find((c) => c.item === "x")!.contractCue).toBeUndefined();
+  });
 });
 
 describe("ContinuousBoardIntegrator: recorded base, transient retries, bounded staleness", () => {
@@ -507,6 +550,23 @@ describe("attributeRevisionFailure", () => {
   it("narrows by the failing output's files, else falls back to every item", async () => {
     expect(await attributeRevisionFailure({ items, output: "FAIL src/b/x.ts", changeId: "c" })).toEqual({ items: ["b"], source: "parse" });
     expect(await attributeRevisionFailure({ items, output: "boom", changeId: "c" })).toEqual({ items: ["a", "b"], source: "all" });
+  });
+
+  it("the storefront run board-live-sf10's revision 6: only the orders and tax owners' items, never all ten", async () => {
+    const fixture = JSON.parse(
+      await readFile(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "change-core", "tests", "fixtures", "storefront-sf10-rev6.json"), "utf8"),
+    ) as { output: string; merged: { id: string; paths: string[] }[]; outstanding: { id: string; paths: string[] }[] };
+    const asItem = (i: { id: string; paths: string[] }) => ({ id: i.id, objective: `do ${i.id}`, paths: i.paths });
+    // The recorded run's typed decision was low-confidence (0.63): the parse alone decides.
+    expect(
+      await attributeRevisionFailure({
+        items: fixture.merged.map(asItem),
+        outstanding: fixture.outstanding.map(asItem),
+        output: fixture.output,
+        changeId: "c",
+        jev: jev("unit-orders-cart", 0.63),
+      }),
+    ).toEqual({ items: ["unit-orders-cart", "unit-billing-tax"], source: "parse", outstanding: ["unit-orders-checkout", "unit-orders-history"] });
   });
 
   it("a confident typed decision narrows an unattributable failure; a low-confidence one changes nothing", async () => {

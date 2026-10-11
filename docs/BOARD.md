@@ -488,9 +488,17 @@ is distributed changes: items are proposed and claimed, never assigned.
   write intent with the verification path scope, commits, pushes to its own
   repo, and announces the push. A refused announcement rolls the repo back.
   Budgets: turns per item, and turns per run; a spent budget is recorded on the
-  board (a handoff to another worker when the board accepts it, else a help
-  request with need `turn-budget` or `run-budget`, or `agent.left` when the
-  agent holds nothing) and stops the agent.
+  board (a handoff to another running worker when the board accepts it, else a
+  help request with need `turn-budget` or `run-budget`, or `agent.left` when
+  the agent holds nothing). A worker's spent per-item budget (or an item whose
+  call cap its own call reached) releases THAT item only, and the worker stays
+  in the pool as a free worker for other open items: it never acts on, or
+  re-claims, an item it exhausted (refused locally, `ITEM_BUDGET`; the item is
+  hidden from its turn input), skips its turn without a model call while it
+  holds only such items with nothing else to do, and stops when it exhausts
+  its third distinct item (`MAX_EXHAUSTED_ITEMS`). A spent run budget stops
+  the agent. An item still held after a help request frees the worker's claim
+  slot only when its claim lapses or another agent takes it.
 - Cues in the runtime: before a turn the runtime posts the owner's
   `item.struggling` report when a threshold is crossed (once per reason and
   revision); the turn input carries the digest's `struggling`, `idleAgents`,
@@ -563,7 +571,12 @@ is distributed changes: items are proposed and claimed, never assigned.
   states the limit.
 - Budgets scale with the plan (bounded; explicit flags win): the lead plans
   BEFORE the goal is posted, so the goal's fix budget is 3 + floor(items / 5)
-  (at most 6), without an explicit `--max` the dial's max is min(items, 6)
+  (at most 6), without an explicit `--item-turns` the turns one agent may
+  spend on one item are max(8, 4 + 2 per fix attempt) (a first pass, then an
+  edit and a push per fix request, so an item with 5 fix attempts gets 14; a
+  run pinned to arbitration revision 1 keeps the fixed 8, so its recorded
+  logs replay unchanged),
+  without an explicit `--max` the dial's max is min(items, 6)
   (at least the dial's min), without an explicit `--max-turns` the
   run-wide turn budget is min(800, max(200, 25 per planned item + 10 per file
   in the planned scopes)), and without an explicit `--claim-cap` the claim cap
@@ -912,7 +925,16 @@ is distributed changes: items are proposed and claimed, never assigned.
   such as npm's `> node --check a.js && ...` are ignored, and error locations
   `<path>:<line>` and the type checker's `<path>(<line>,<col>): error TS...`,
   which may be absolute paths in the gate's checkout, are preferred when
-  present; a type error is also the revision's stated failing line); then a CONFIDENT
+  present; a type error is also the revision's stated failing line; a location
+  inside `node_modules` is never an item's code). When nothing named maps, the
+  failing TESTS do: a failing test file (vitest's `FAIL`/`❯` lines, jest's
+  `FAIL`, a test file's error location) maps to the items whose paths it
+  exercises, most specific first (`tests/billing/tax.test.ts` ->
+  `src/billing/tax.ts`; else a file named `tax`; else the `billing` domain,
+  so `tests/orders.test.ts` -> `src/orders/*`), and only when no test file
+  maps, a failing describe name (`× checkout tax > ...`, tried from its last
+  word: `tax`). Passing lines are never read; output naming no item's code
+  is still "all". Then a CONFIDENT
   typed-decision choice when configured (advisory narrowing only); else every
   item the revision merged. The parse is linear in the output (path tokens
   are found by single-class scans, tokens longer than 1024 characters are
@@ -2000,7 +2022,8 @@ verdict stays the gate's; a reached cap also stops new speculative candidates
 their cap, with nothing else to act on, skips its turn without calling the
 model, and the agent whose own call took an item to its cap releases it
 through the item-budget path (a handoff to a running worker, else a help
-request; the agent then stops, as for a spent per-item turn budget). Another
+request; the agent then stays in the pool for other items, as for a spent
+per-item turn budget). Another
 holder of a capped item only skips it. A capped item is eligible for the
 lead's re-plan (reason `item-cap`, open or still held): its replacement
 children are new items with their own call counts. A replacement that reaches

@@ -28,7 +28,7 @@ import type {
 } from "@switchyard-change/model-adapters";
 import { ModelBudgetError } from "@switchyard-change/model-adapters";
 
-import { BoardAgent, MAX_MERGE_CUES, RunTurnBudget, type AgentTurnRecord, type BoardAgentOptions } from "../src/board-agent.ts";
+import { BoardAgent, MAX_EXHAUSTED_ITEMS, MAX_MERGE_CUES, RunTurnBudget, type AgentTurnRecord, type BoardAgentOptions } from "../src/board-agent.ts";
 import { RunMeter, type RunCapReached } from "../src/run-meter.ts";
 import { BoardOperatorClient, type BoardPage } from "../src/board-client.ts";
 import { createGenericBoardPolicy } from "../src/board-policy.ts";
@@ -329,21 +329,108 @@ describe("BoardAgent scheduling", () => {
 });
 
 describe("BoardAgent budgets", () => {
-  it("records a spent per-item budget on the board and stops", async () => {
+  it("a spent per-item budget releases THAT item on the board; the worker stays in the pool and takes another open item, never the released one", async () => {
     const env = await setup();
     const transport = scripted([
       { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
       { type: "edit", itemId: "i1", instruction: "go" },
+      { type: "claim", itemId: "i2", intent: { read: [], write: ["src/b/**"] } },
+      { type: "edit", itemId: "i1", instruction: "once more" },
     ]);
     const w1 = env.agent("w1", { transport, maxTurnsPerItem: 1 });
     await w1.join();
     await w1.step(); // claim (1 turn on i1)
-    await w1.step(); // edit would be a 2nd turn on i1: over budget
-    expect(w1.stopped).toMatchObject({ reason: "item-budget" });
-    expect(await w1.step()).toBe("stopped");
+    await w1.step(); // edit would be a 2nd turn on i1: over budget, i1 is released
+    expect(w1.stopped).toBeUndefined();
     const help = (await env.log()).messages.find((m) => m.type === "help.requested");
     expect(help).toMatchObject({ from: "w1", payload: { item: "i1", need: "turn-budget" } });
-    expect(help!.rationale).toMatch(/spent more than 1 turns on item i1/);
+    expect(help!.rationale).toMatch(/^releasing it: spent more than 1 turns on item i1/);
+    // Its next turn: the released item is not offered or shown as its claim; it claims i2.
+    expect(await w1.step()).toBe("acted");
+    const seen = transport.inputs.at(-1)!.digest;
+    expect(seen.claims.map((c) => c.item)).toEqual([]);
+    expect(seen.openItems.map((i) => i.item)).toEqual(["i2"]);
+    expect(transport.inputs.at(-1)!.capsule.evidence.join("\n")).toMatch(/released item i1 .*never act on it again/);
+    expect((await env.log()).state.items.i2).toMatchObject({ status: "claimed", owner: "w1" });
+    // Acting on the released item again is refused locally: nothing about i1 is posted.
+    const before = (await env.log()).messages.length;
+    await w1.step();
+    expect(env.turns.at(-1)).toMatchObject({ action: { type: "edit", itemId: "i1" }, outcome: "local", code: "ITEM_BUDGET" });
+    expect((await env.log()).messages.slice(before).filter((m) => (m.payload as { item?: string }).item === "i1")).toEqual([]);
+    expect(w1.stopped).toBeUndefined();
+  });
+
+  it("never re-claims an item it exhausted: the claim is refused locally and never posted", async () => {
+    const env = await setup();
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "go" },
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+    ]);
+    const w1 = env.agent("w1", { transport, maxTurnsPerItem: 1 });
+    const w2 = env.agent("w2", { transport: scripted([]) });
+    await w1.join();
+    await w2.join();
+    await w1.step();
+    await w1.step(); // over budget: i1 handed to w2
+    expect((await env.log()).state.items.i1!.owner).toBe("w2");
+    // The claim is refused locally, before it reaches the board.
+    await w1.step();
+    expect(env.turns.filter((t) => t.agent === "w1").at(-1)).toMatchObject({ action: { type: "claim", itemId: "i1" }, outcome: "local", code: "ITEM_BUDGET" });
+    expect((await env.log()).messages.filter((m) => m.type === "item.claimed" && m.from === "w1")).toHaveLength(1);
+  });
+
+  it(`stops after exhausting ${MAX_EXHAUSTED_ITEMS} distinct items, releasing only what it has not released yet`, async () => {
+    const env = await setup();
+    await env.human({ type: "item.proposed", payload: { item: "i3", objective: "do c", scopeHint: ["src/c/**"] } });
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "go" },
+      { type: "claim", itemId: "i2", intent: { read: [], write: ["src/b/**"] } },
+      { type: "edit", itemId: "i2", instruction: "go" },
+      { type: "claim", itemId: "i3", intent: { read: [], write: ["src/c/**"] } },
+      { type: "edit", itemId: "i3", instruction: "go" },
+    ]);
+    const w1 = env.agent("w1", { transport, maxTurnsPerItem: 1 });
+    await w1.join();
+    for (let i = 0; i < 6 && !w1.stopped; i += 1) {
+      await w1.step();
+    }
+    expect(MAX_EXHAUSTED_ITEMS).toBe(3);
+    expect(w1.stopped).toMatchObject({ reason: "item-budget", detail: expect.stringMatching(/exhausted 3 item\(s\) \(i1, i2, i3\), at most 3/) });
+    expect(await w1.step()).toBe("stopped");
+    const help = (await env.log()).messages.filter((m) => m.type === "help.requested");
+    expect(help.map((m) => (m.payload as { item: string }).item)).toEqual(["i1", "i2", "i3"]);
+    expect(help.at(-1)!.rationale).toMatch(/^stopping: /);
+  });
+
+  it("holding only items it exhausted, with nothing else to do: no model call", async () => {
+    const env = await setup();
+    let calls = 0;
+    const script = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "go" },
+    ]);
+    const w1 = env.agent("w1", {
+      transport: async (input) => {
+        calls += 1;
+        return script(input);
+      },
+      maxTurnsPerItem: 1,
+      runningAgents: () => ["w1"], // w2 is not running: nobody can take i1
+    });
+    const w2 = await env.operator.join("w2", { role: "worker" });
+    expect(w2.ok).toBe(true);
+    expect((await env.rawPost(w2.ok ? w2.token : "", { type: "item.claimed", payload: { item: "i2", intent: { write: ["src/b/**"] } } })).status).toBe(201);
+    await w1.join();
+    await w1.step();
+    await w1.step(); // over budget: no running agent can take it, so help is asked; w1 still holds i1
+    expect((await env.log()).state.items.i1!.owner).toBe("w1");
+    const before = calls;
+    await w1.step();
+    expect(calls).toBe(before);
+    expect(env.turns.at(-1)).toMatchObject({ outcome: "local", code: "ITEM_BUDGET" });
+    expect(w1.stopped).toBeUndefined();
   });
 
   it("hands the item to another worker when one can take it", async () => {
@@ -398,7 +485,8 @@ describe("BoardAgent budgets", () => {
     expect(w1Calls).toBe(1);
     expect(env.turns.some((t) => t.code === "ITEM_CAP" && t.action.type === "wait")).toBe(true);
     expect(caps).toEqual(expect.arrayContaining([{ kind: "item-calls", limit: 1, used: 1, item: "i1" }]));
-    expect(w1.stopped).toMatchObject({ reason: "item-budget" });
+    // Released, and w1 stays in the pool (it exhausted one item).
+    expect(w1.stopped).toBeUndefined();
     const handoff = (await env.log()).messages.find((m) => m.type === "handoff");
     expect(handoff).toMatchObject({ from: "w1", payload: { item: "i1", to: "w2" } });
     expect(handoff!.rationale).toMatch(/item i1 reached its call cap \(1 of 1\)/);
@@ -406,7 +494,12 @@ describe("BoardAgent budgets", () => {
     const before = w2Calls;
     await w2.step();
     expect(w2Calls).toBe(before);
-    expect(w2.stopped).toMatchObject({ reason: "item-budget", detail: expect.stringMatching(/item i2 reached its call cap/) });
+    expect(w2.stopped).toBeUndefined();
+    expect((await env.log()).messages.filter((m) => m.type === "handoff").at(-1)).toMatchObject({
+      from: "w2",
+      payload: { item: "i2", to: "w1" },
+      rationale: expect.stringMatching(/item i2 reached its call cap/),
+    });
     expect(meter.itemCalls("i1")).toBe(1);
   });
 

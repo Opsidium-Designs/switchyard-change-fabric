@@ -191,7 +191,11 @@ export interface BoardSeed {
 
 /** Budgets and limits for a board run. */
 export interface BoardRunBudgets {
-  /** Turns one agent may spend on one item (default 8). */
+  /**
+   * Turns one agent may spend on one item. Default: scaled with the fix
+   * budget, max(8, 4 + 2 per fix attempt), so every fix request an item may
+   * get leaves turns to answer it; an explicit value wins.
+   */
   readonly maxTurnsPerItem?: number;
   /**
    * Turns across every agent in the run. Default: scaled with the plan,
@@ -312,7 +316,8 @@ export function awaitingSubLeadDetail(state: BoardState): string {
 export function formatBudgetsLine(b: BoardRunEffectiveBudgets): string {
   const scaled = (yes: boolean, what = `scaled with ${b.items} planned item(s)`) => (yes ? what : "explicit");
   return (
-    `budgets: ${b.maxFixAttempts} fix attempt(s) per item (${scaled(b.fixAttemptsScaled)}), dial max ${b.dialMax} (${scaled(b.dialScaled)}), ` +
+    `budgets: ${b.maxFixAttempts} fix attempt(s) per item (${scaled(b.fixAttemptsScaled)}), ` +
+    `${b.maxTurnsPerItem} turn(s) per item per agent (${scaled(b.itemTurnsScaled, "scaled with the fix attempts")}), dial max ${b.dialMax} (${scaled(b.dialScaled)}), ` +
     `${b.maxRunTurns} run turn(s) (${scaled(b.runTurnsScaled, `scaled with ${b.items} planned item(s) and ${b.scopeFiles ?? 0} scope file(s)`)}), ` +
     `claim cap ${b.maxActiveClaims} unfinished item(s) per agent (${scaled(b.activeClaimsScaled, "scaled")}), ` +
     `claim lease ${b.claimLeaseMessages} board message(s) without progress (${scaled(b.leaseScaled, `scaled with dial max ${b.dialMax}`)}), ` +
@@ -1723,7 +1728,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   const base = options.workerUrl.replace(/\/$/, "");
   const changeId = options.changeId;
   const budgets = {
-    maxTurnsPerItem: options.budgets?.maxTurnsPerItem ?? 8,
+    maxTurnsPerItem: options.budgets?.maxTurnsPerItem ?? MIN_ITEM_TURNS, // replaced by the fix-scaled value once planned
     maxRunTurns: options.budgets?.maxRunTurns ?? 200, // replaced by the plan-scaled value once planned
     maxRounds: options.budgets?.maxRounds ?? 200,
     timeoutMs: options.budgets?.timeoutMs ?? 30 * 60 * 1000,
@@ -1913,6 +1918,12 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       ? { explicitActiveClaims: (options.rules?.maxActiveClaims ?? options.budgets?.maxActiveClaims)! }
       : {}),
     explicitFixAttempts: options.rules?.maxFixAttempts ?? options.budgets?.maxFixAttemptsPerItem,
+    // A run pinned to arbitration revision 1 keeps that revision's fixed per-item turns, so its recorded logs replay unchanged.
+    ...(options.budgets?.maxTurnsPerItem !== undefined
+      ? { explicitItemTurns: options.budgets.maxTurnsPerItem }
+      : options.rules?.arbitration === 1
+        ? { explicitItemTurns: MIN_ITEM_TURNS }
+        : {}),
     ...(options.budgets?.maxRunTurns !== undefined ? { explicitRunTurns: options.budgets.maxRunTurns } : {}),
     ...((options.rules?.claimLeaseMessages ?? options.budgets?.claimLeaseMessages) !== undefined
       ? { explicitLease: (options.rules?.claimLeaseMessages ?? options.budgets?.claimLeaseMessages)! }
@@ -1924,6 +1935,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     scaleDial: options.scaleDial === true,
   });
   budgets.maxRunTurns = effective.maxRunTurns;
+  budgets.maxTurnsPerItem = effective.maxTurnsPerItem;
   meter.caps = {
     ...(options.caps ?? {}),
     maxCalls: options.caps?.maxCalls ?? CALLS_PER_RUN_TURN * effective.maxRunTurns,
@@ -3139,6 +3151,9 @@ export function exportedNames(source: string): string[] {
 export interface ScaledBudgets {
   readonly maxFixAttempts: number;
   readonly fixAttemptsScaled: boolean;
+  /** Turns one agent may spend on one item. */
+  readonly maxTurnsPerItem: number;
+  readonly itemTurnsScaled: boolean;
   readonly dialMax: number;
   readonly dialScaled: boolean;
   readonly maxRunTurns: number;
@@ -3155,7 +3170,9 @@ export interface ScaledBudgets {
 
 /**
  * Budgets that scale with the plan (bounded): fix attempts per item are
- * 3 + floor(items / 5), at most 6; the dial's max, when scaled, is
+ * 3 + floor(items / 5), at most 6; the turns one agent may spend on one item
+ * are max(8, 4 + 2 per fix attempt) (a first pass, then an edit and a push
+ * per fix request); the dial's max, when scaled, is
  * min(items, 6) and at least the dial's min; the claim lease is
  * max(150, 40 per agent of the dial's max) board messages and the claim
  * deadline 8 leases. An explicit value always wins.
@@ -3165,6 +3182,7 @@ export function scaledBudgets(input: {
   /** Distinct repo files the planned items' scopes cover (large items get more turns). */
   readonly scopeFiles?: number;
   readonly explicitFixAttempts?: number;
+  readonly explicitItemTurns?: number;
   readonly explicitRunTurns?: number;
   readonly explicitActiveClaims?: number;
   readonly explicitLease?: number;
@@ -3173,6 +3191,7 @@ export function scaledBudgets(input: {
   readonly scaleDial: boolean;
 }): ScaledBudgets {
   const fix = input.explicitFixAttempts ?? Math.min(6, 3 + Math.floor(input.items / 5));
+  const itemTurns = input.explicitItemTurns ?? Math.max(MIN_ITEM_TURNS, ITEM_TURNS_BASE + ITEM_TURNS_PER_FIX * fix);
   const dialMax = input.scaleDial ? Math.max(input.dial.minConcurrency, Math.min(Math.max(1, input.items), 6)) : input.dial.maxConcurrency;
   const runTurns =
     input.explicitRunTurns ??
@@ -3195,6 +3214,8 @@ export function scaledBudgets(input: {
   return {
     maxFixAttempts: fix,
     fixAttemptsScaled: input.explicitFixAttempts === undefined,
+    maxTurnsPerItem: itemTurns,
+    itemTurnsScaled: input.explicitItemTurns === undefined,
     dialMax,
     dialScaled: input.scaleDial,
     maxRunTurns: runTurns,
@@ -3226,6 +3247,12 @@ export const RUN_TURNS_PER_SCOPE_FILE = 10;
 
 /** Run-wide turns per planned item when the turn budget scales with the plan. */
 export const RUN_TURNS_PER_ITEM = 25;
+/** The least per-item turn budget (one agent, one item). */
+export const MIN_ITEM_TURNS = 8;
+/** Per-item turns before any fix request (claim, edit, push, done). */
+export const ITEM_TURNS_BASE = 4;
+/** Per-item turns per fix attempt the item may get (an edit and a push). */
+export const ITEM_TURNS_PER_FIX = 2;
 /** The most turns a plan-scaled run budget grants (an explicit --max-turns may go higher). */
 export const MAX_SCALED_RUN_TURNS = 800;
 

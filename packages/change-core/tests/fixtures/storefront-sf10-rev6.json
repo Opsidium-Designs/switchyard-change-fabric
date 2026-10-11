@@ -1,0 +1,147 @@
+{
+  "run": "board-live-sf10",
+  "revision": 6,
+  "output": "AssertionError: expected 401 to be 201 // Object.is equality\n> switchyard-change-fabric-storefront@0.0.0 gate\n> npm run typecheck && vitest run && vitest run --config gate/vitest.config.ts\n\n\n> switchyard-change-fabric-storefront@0.0.0 typecheck\n> tsc --noEmit -p tsconfig.json\n\n\n RUN  v2.1.8 /tmp/scf-integration-x\n\n ✓ tests/catalog.test.ts (5 tests) 15ms\n ❯ tests/orders.test.ts (2 tests | 2 failed) 20ms\n   × orders > checks a cart out into an order with an invoice 16ms\n     → expected 401 to be 201 // Object.is equality\n   × orders > removes a product from the cart 2ms\n     → Cannot read properties of undefined (reading 'map')\n ❯ tests/billing/tax.test.ts (2 tests | 2 failed) 23ms\n   × checkout tax > taxes a $10.00 order shipped to CA at 72 cents 18ms\n     → expected +0 to be 1000 // Object.is equality\n   × checkout tax > charges no sales tax in OR 3ms\n     → expected +0 to be 9000 // Object.is equality\n\n Test Files  2 failed | 1 passed (3)\n      Tests  4 failed | 5 passed (9)\n   Start at  02:25:26\n   Duration  632ms (transform 216ms, setup 0ms, collect 558ms, tests 58ms, environment 1ms, prepare 331ms)\n⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯\n\n FAIL  tests/orders.test.ts > orders > checks a cart out into an order with an invoice\nAssertionError: expected 401 to be 201 // Object.is equality\n\n- Expected\n+ Received\n\n- 201\n+ 401\n\n ❯ tests/orders.test.ts:8:90\n      6|   it(\"checks a cart out into an order with an invoice\", async () => {\n      7|     const app = freshApp();\n      8|     expect((await send(app, \"POST\", \"/cart/items\", { productId: \"p3\", …\n       |                                                                                          ^\n      9|     const order = await send(app, \"POST\", \"/checkout\", { region: \"OR\" …\n     10|     expect(order.status).toBe(201);\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/4]⎯\n\n FAIL  tests/orders.test.ts > orders > removes a product from the cart\nTypeError: Cannot read properties of undefined (reading 'map')\n ❯ tests/orders.test.ts:27:28\n     25|     await send(app, \"POST\", \"/cart/items\", { productId: \"p3\", qty: 1 }…\n     26|     const cart = await send(app, \"DELETE\", \"/cart/items/p2\");\n     27|     expect(cart.body.lines.map((l: { productId: string }) => l.product…\n       |                            ^\n     28|   });\n     29| });\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/4]⎯\n\n FAIL  tests/billing/tax.test.ts > checkout tax > taxes a $10.00 order shipped to CA at 72 cents\nAssertionError: expected +0 to be 1000 // Object.is equality\n\n- Expected\n+ Received\n\n- 1000\n+ 0\n\n ❯ tests/billing/tax.test.ts:11:38\n      9|     await send(app, \"POST\", \"/cart/items\", { productId: \"p5\", qty: 2 }…\n     10|     const order = await send(app, \"POST\", \"/checkout\", { region: \"CA\" …\n     11|     expect(order.body.subtotalCents).toBe(1000);\n       |                                      ^\n     12|     expect(order.body.taxCents).toBe(72);\n     13|     expect(order.body.totalCents).toBe(1072);\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/4]⎯\n\n FAIL  tests/billing/tax.test.ts > checkout tax > charges no sales tax in OR\nAssertionError: expected +0 to be 9000 // Object.is equality\n\n- Expected\n+ Received\n\n- 9000\n+ 0\n\n ❯ tests/billing/tax.test.ts:21:35\n     19|     const order = await send(app, \"POST\", \"/checkout\", { region: \"OR\" …\n     20|     expect(order.body.taxCents).toBe(0);\n     21|     expect(order.body.totalCents).toBe(9000);\n       |                                   ^\n     22|   });\n     23| });\n\n⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/4]⎯\nintegration app-gate failed over the promoted tree (exit 1)",
+  "merged": [
+    {
+      "id": "unit-catalog-products",
+      "owner": "agent-1",
+      "paths": [
+        "src/catalog/products.ts"
+      ]
+    },
+    {
+      "id": "unit-catalog-search",
+      "owner": "agent-1",
+      "paths": [
+        "src/catalog/search.ts"
+      ]
+    },
+    {
+      "id": "unit-orders-cart",
+      "owner": "agent-1",
+      "paths": [
+        "src/orders/cart.ts"
+      ]
+    },
+    {
+      "id": "seam-agent-2-contract-1",
+      "owner": "agent-2",
+      "paths": [
+        "src/store.ts"
+      ]
+    },
+    {
+      "id": "unit-billing-payments",
+      "owner": "agent-2",
+      "paths": [
+        "src/billing/payments.ts"
+      ]
+    },
+    {
+      "id": "unit-billing-tax",
+      "owner": "agent-3",
+      "paths": [
+        "src/billing/tax.ts"
+      ]
+    },
+    {
+      "id": "unit-billing-refunds",
+      "owner": "agent-4",
+      "paths": [
+        "src/billing/refunds.ts"
+      ]
+    },
+    {
+      "id": "seam-agent-5-contract-2",
+      "owner": "agent-5",
+      "paths": [
+        "src/contracts/money.ts"
+      ]
+    },
+    {
+      "id": "unit-billing-invoices",
+      "owner": "agent-5",
+      "paths": [
+        "src/billing/invoices.ts"
+      ]
+    },
+    {
+      "id": "unit-catalog-categories",
+      "owner": "agent-6",
+      "paths": [
+        "src/catalog/categories.ts"
+      ]
+    }
+  ],
+  "outstanding": [
+    {
+      "id": "unit-orders-checkout",
+      "paths": [
+        "src/orders/checkout.ts"
+      ]
+    },
+    {
+      "id": "unit-orders-history",
+      "paths": [
+        "src/orders/history.ts"
+      ]
+    }
+  ],
+  "protected": [
+    ".npmrc",
+    ".pnpmfile.cjs",
+    ".yarnrc",
+    ".yarnrc.yml",
+    "bunfig.toml",
+    "conftest.py",
+    "gate/billing.test.ts",
+    "gate/harness.ts",
+    "gate/money.test.ts",
+    "gate/safety.test.ts",
+    "gate/vitest.config.ts",
+    "noxfile.py",
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.cfg",
+    "tests/billing/tax.test.ts",
+    "tests/catalog.test.ts",
+    "tests/helpers.ts",
+    "tests/orders.test.ts",
+    "tox.ini",
+    "tsconfig.json",
+    "vitest.config.ts"
+  ],
+  "immutable": [
+    ".npmrc",
+    ".pnpmfile.cjs",
+    ".yarnrc",
+    ".yarnrc.yml",
+    "bunfig.toml",
+    "conftest.py",
+    "gate/billing.test.ts",
+    "gate/harness.ts",
+    "gate/money.test.ts",
+    "gate/safety.test.ts",
+    "gate/vitest.config.ts",
+    "noxfile.py",
+    "pyproject.toml",
+    "pytest.ini",
+    "setup.cfg",
+    "tox.ini",
+    "tsconfig.json",
+    "vitest.config.ts"
+  ],
+  "recordedFixRequested": [
+    "unit-catalog-products",
+    "unit-catalog-search",
+    "unit-orders-cart",
+    "seam-agent-2-contract-1",
+    "unit-billing-payments",
+    "unit-billing-tax",
+    "unit-billing-refunds",
+    "seam-agent-5-contract-2",
+    "unit-billing-invoices",
+    "unit-catalog-categories"
+  ]
+}

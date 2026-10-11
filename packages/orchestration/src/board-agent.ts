@@ -260,6 +260,12 @@ export const MAX_OPEN_SEAM_CUES = 2;
 /** How many times the driver may offer one set of open items (unclaimed, or a lapsed claim) to a worker on a quiet board. */
 export const MAX_OFFER_CUES = 2;
 /**
+ * How many distinct items a worker may spend its per-item turn budget on: it
+ * releases each of the first ones and stays in the pool for other open items,
+ * and stops when it exhausts this many (so it cannot cycle forever).
+ */
+export const MAX_EXHAUSTED_ITEMS = 3;
+/**
  * How many times a sub-lead is told that children's pushes wait for its merge
  * (`pull`), per set of such pushes: when the set appears, then by the driver
  * on a quiet board. Bounded: then a quiet board may end the run, naming them.
@@ -455,6 +461,8 @@ export class BoardAgent {
   private readonly turnsByItem = new Map<string, number>();
   /** Items whose per-item call cap THIS agent's own call reached (it releases them, once). */
   private readonly capReachedHere = new Set<string>();
+  /** Items this worker spent its per-item budget on: released, never acted on again. */
+  private readonly exhaustedItems = new Set<string>();
   private stop: AgentStop | undefined;
   private seeded = false;
   private rebasedTo = 0;
@@ -1195,8 +1203,8 @@ export class BoardAgent {
       await this.exhaust(digest, "run-budget", `the run's turn budget (${budget.maxTurns}) is spent`);
       return;
     }
-    if (await this.skipCappedTurn(digest)) {
-      // No model call on capped items: no follow-up is owed either.
+    if ((await this.skipCappedTurn(digest)) || this.skipExhaustedTurn(digest)) {
+      // No model call on capped (or exhausted) items: no follow-up is owed either.
       this.followUp = false;
       return;
     }
@@ -1309,6 +1317,44 @@ export class BoardAgent {
     return true;
   }
 
+  /**
+   * A worker whose every held item is one it exhausted (still held only
+   * because no running agent could take it, so it asked for help; the claim
+   * lapses, or a helper takes it), with nothing else to act on, skips the turn
+   * without a model call (a local ITEM_BUDGET wait; no turn budget used).
+   */
+  private skipExhaustedTurn(digest: BoardDigest): boolean {
+    if (this.role !== "worker" || this.exhaustedItems.size === 0) {
+      return false;
+    }
+    const held = digest.claims.filter((c) => !c.doneProposed || c.fix !== undefined).map((c) => c.item);
+    if (held.length === 0 || !held.every((item) => this.exhaustedItems.has(item))) {
+      return false;
+    }
+    const otherCue =
+      (digest.openItems.some((i) => !this.exhaustedItems.has(i.item)) && digest.claimCap === undefined) ||
+      this.pending.some((m) => m.to?.includes(this.id)) ||
+      (digest.volunteers ?? []).length > 0;
+    if (otherCue) {
+      return false;
+    }
+    const reason = `every item I hold is one I spent my turn budget on (${held.join(", ")}): no model call`;
+    this.record({ turn: this.turns, action: { type: "wait", reason }, outcome: "local", code: "ITEM_BUDGET", error: reason });
+    return true;
+  }
+
+  /** The digest the model sees: never an item this worker exhausted (it may not act on it again). */
+  private withoutExhausted(digest: BoardDigest): BoardDigest {
+    if (this.exhaustedItems.size === 0) {
+      return digest;
+    }
+    return {
+      ...digest,
+      claims: digest.claims.filter((c) => !this.exhaustedItems.has(c.item)),
+      openItems: digest.openItems.filter((i) => !this.exhaustedItems.has(i.item)),
+    };
+  }
+
   private async takeTurn(initialDigest: BoardDigest, initialState: BoardState): Promise<void> {
     let digest = initialDigest;
     let state = initialState;
@@ -1318,7 +1364,7 @@ export class BoardAgent {
       digest = { ...(await client.digest(this.lastSeen)).digest, messages: digest.messages };
       state = await client.state();
     }
-    const input = await this.turnInput(digest, state);
+    const input = await this.turnInput(this.withoutExhausted(digest), state);
     const outcome = await this.options.transport(input);
     const action = outcome.action;
     this.pending = [];
@@ -1326,6 +1372,13 @@ export class BoardAgent {
     this.lastRejection = undefined;
 
     const item = actionItem(action, digest);
+    if (item !== undefined && this.exhaustedItems.has(item)) {
+      // An item this worker already spent its turn budget on and released: never re-claimed or acted on again.
+      const error = `you spent your turn budget on item ${item} and released it: it is another agent's now; take a different open item or wait`;
+      this.record({ turn: this.turns, action, outcome: "local", code: "ITEM_BUDGET", error });
+      this.lastRejection = { code: "ITEM_BUDGET", error, action: action.type };
+      return;
+    }
     if (item !== undefined && this.options.meter) {
       // The per-item call cap (across agents): no more turns on an item past it.
       this.options.meter.noteItem(item);
@@ -3125,14 +3178,35 @@ export class BoardAgent {
   }
 
   /**
-   * A budget ran out: record it on the board and stop. Each item the agent
-   * still holds is handed to another active worker when the board accepts the
-   * handoff, otherwise it asks for help on it; an agent holding nothing leaves.
+   * A budget ran out. A worker's per-item budget on one item releases THAT
+   * item (handed to another running worker when the board accepts the
+   * handoff, otherwise it asks for help on it) and the worker stays in the
+   * pool for other open items: it never acts on that item again, and the
+   * MAX_EXHAUSTED_ITEMS-th item it exhausts stops it. Any other budget (the
+   * run's, or that last item) records it on the board and stops: each item
+   * the agent still holds is released the same way; an agent holding nothing
+   * leaves.
    */
   private async exhaust(digest: BoardDigest, reason: AgentStop["reason"], detail: string, item?: string): Promise<void> {
     const client = this.requireClient();
+    if (reason === "item-budget" && item !== undefined && this.role === "worker") {
+      this.exhaustedItems.add(item);
+      if (this.exhaustedItems.size < MAX_EXHAUSTED_ITEMS) {
+        const held = digest.claims.some((c) => c.item === item) ? [item] : [];
+        if (held.length > 0) {
+          await this.release(digest, reason, detail, held);
+        } else {
+          this.record({ turn: this.turns, action: { type: "wait", reason: detail }, outcome: "local", code: "ITEM_BUDGET", error: detail });
+        }
+        this.evidence.push(`released item ${item} (${detail}): I never act on it again; I take other open items`);
+        this.followUp = true;
+        return;
+      }
+      detail = `${detail}; exhausted ${this.exhaustedItems.size} item(s) (${[...this.exhaustedItems].join(", ")}), at most ${MAX_EXHAUSTED_ITEMS}`;
+    }
     this.stop = { reason, detail };
-    const held = digest.claims.filter((c) => !c.doneProposed).map((c) => c.item);
+    // An item released earlier (handed off, or help already asked) is not released again.
+    const held = digest.claims.filter((c) => !c.doneProposed && (c.item === item || !this.exhaustedItems.has(c.item))).map((c) => c.item);
     if (item !== undefined && !held.includes(item) && digest.claims.some((c) => c.item === item)) {
       held.unshift(item);
     }
@@ -3146,6 +3220,15 @@ export class BoardAgent {
       });
       return;
     }
+    await this.release(digest, reason, detail, held);
+  }
+
+  /**
+   * Release held items: each is handed to another running worker when the
+   * board accepts the handoff, otherwise the agent asks for help on it.
+   */
+  private async release(digest: BoardDigest, reason: AgentStop["reason"], detail: string, held: readonly string[]): Promise<void> {
+    const client = this.requireClient();
     const state = await client.state();
     // A handoff only ever goes to an agent that is still running: one that has
     // stopped (or left) could never act on the item.
@@ -3186,7 +3269,7 @@ export class BoardAgent {
         const outcome = await client.post({
           type: "help.requested",
           payload: { request: this.nextId("budget"), item: held1, need: reason === "run-budget" ? "run-budget" : "turn-budget" },
-          rationale: `stopping: ${detail}; this item needs another agent`,
+          rationale: `${this.stop ? "stopping" : "releasing it"}: ${detail}; this item needs another agent`,
         });
         this.record({
           turn: this.turns,
