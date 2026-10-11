@@ -59,6 +59,7 @@ import {
   type BoardIntegrationUnitPlan,
   type BoardItem,
   type BoardRevProgress,
+  type BoardState,
   type Change,
 } from "@switchyard-change/change-core";
 import {
@@ -74,6 +75,7 @@ import {
   type CompletedWorkUnit,
   type DependencyInstallOutcome,
   type EvidenceSummary,
+  type TestInventory,
 } from "@switchyard-change/verification";
 
 import { redactSecrets } from "./redact.ts";
@@ -148,13 +150,13 @@ class CandidateCommandRunner implements CommandRunner {
 }
 
 /** One stacked unit: the plan's unit and its fresh read remote. */
-interface StackEntry {
+export interface StackEntry {
   readonly unit: BoardIntegrationUnitPlan;
   readonly remote: string;
 }
 
 /** A candidate as built and gated. */
-interface BuiltCandidate {
+export interface BuiltCandidate {
   readonly index: number;
   readonly entries: readonly StackEntry[];
   readonly evidence?: EvidenceSummary;
@@ -249,88 +251,8 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
   const inventoryNow = adjusted.inventory;
   const head = integratedHead(state);
 
-  const gateCandidate = async (index: number, entries: readonly StackEntry[]): Promise<BuiltCandidate> => {
-    const change: Change = {
-      id: options.change.id,
-      objective: options.change.objective,
-      baseline: "HEAD",
-      budgetUsd: 0,
-      assurance: "standard",
-      work: entries.map((e) => ({
-        id: e.unit.agent,
-        objective: `the announced pushes of ${e.unit.agent} (items ${e.unit.items.map((i) => i.id).join(", ")})`,
-        dependsOn: [],
-        paths: [...e.unit.scope],
-      })),
-    };
-    const completed: CompletedWorkUnit[] = entries.map((e) => ({
-      unitId: e.unit.agent,
-      gitUrl: e.remote,
-      baselineRef: e.unit.baselineRef,
-      commit: e.unit.commit,
-      includes: [...e.unit.includes],
-      ...(e.unit.yieldedScope ? { yieldedScope: [...e.unit.yieldedScope] } : {}),
-      ...(e.unit.releasedPaths ? { releasedPaths: [...e.unit.releasedPaths] } : {}),
-    }));
-    const runner = options.verifyCommandRunner ? new CandidateCommandRunner(options.verifyCommandRunner) : undefined;
-    const verification = new ChangeVerification(options.integration.workspaces, runner ? { commandRunner: runner } : {});
-    let evidence: EvidenceSummary;
-    try {
-      evidence = await verification.verifyAndIntegrate({
-        change,
-        completed,
-        integrationRef: options.integration.integrationRef,
-        integrationToken: options.integration.integrationToken,
-        ...(requiresIntegrationGate
-          ? {
-              ...(options.appGateCommand && options.appGateCommand.length > 0 ? { integrationGateCommand: options.appGateCommand } : {}),
-              requiresIntegrationGate,
-            }
-          : {}),
-        ...(options.contract
-          ? { protectedPaths: options.contract.restore, protectedJsonKeys: options.contract.jsonKeys, onProtectedChange: "fail" as const }
-          : {}),
-        ...(inventoryNow ? { testInventory: inventoryNow } : {}),
-        // Every candidate builds on the same RECORDED head; none moves the branch.
-        ...(state.integrated ? { integrationBaseCommit: state.integrated.commit } : {}),
-        deferIntegrationPush: true,
-        workRoot: options.worktreeRoot,
-        identity: options.identity,
-      });
-    } catch (error) {
-      const refused = scrub(`the integrator refused: ${error instanceof Error ? error.message : String(error)}`);
-      return { index, entries, mergedAgents: [], excludedAgents: [], skipped: refused, refused };
-    }
-    const excluded = evidence.units
-      .filter((u) => u.verdict !== "verified")
-      .map((u) => ({
-        agent: u.unitId,
-        reason: scrub(`failed verification (${u.checks.filter((c) => !c.passed && !c.skipped).map((c) => `${c.kind}: ${c.summary}`).join("; ") || "verdict failed"})`),
-      }));
-    const mergedAgents = evidence.units.filter((u) => u.verdict === "verified").map((u) => u.unitId);
-    const commit = evidence.integration.commit;
-    if (mergedAgents.length === 0 || commit === undefined) {
-      return {
-        index,
-        entries,
-        evidence,
-        mergedAgents,
-        excludedAgents: excluded,
-        skipped:
-          mergedAgents.length === 0
-            ? `every push of the candidate was excluded: ${excluded.map((e) => `${e.agent}: ${e.reason}`).join("; ")}`
-            : "the integrator reported no commit for the gated tree",
-      };
-    }
-    const gate: "pass" | "fail" = evidence.integration.verdict === "verified" ? "pass" : "fail";
-    const finalCheck = evidence.integration.finalCheck;
-    const gated = !(gate === "pass" && finalCheck.skipped);
-    const progress = gated
-      ? labelGateProgress(finalCheck.progress ?? readTestProgress(finalCheck.outputs.map((o) => o.text).join("\n")), state.immutable ?? [])
-      : undefined;
-    const install = finalCheck.skipped ? undefined : runner?.lastInstall;
-    return { index, entries, evidence, commit, gate, gated, ...(install ? { install } : {}), ...(progress ? { progress } : {}), mergedAgents, excludedAgents: excluded };
-  };
+  const ctx: CandidateContext = { options, state, scrub, requiresIntegrationGate, ...(inventoryNow ? { inventory: inventoryNow } : {}) };
+  const gateCandidate = (index: number, entries: readonly StackEntry[]): Promise<BuiltCandidate> => gateCandidateTree(ctx, index, entries);
 
   // Build and gate the candidates: C1 always; a later one only while no cap
   // is reached and no shorter prefix is already known to have failed.
@@ -385,7 +307,7 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
   if (blamed && !blamed.mergedAgents.includes(blamedEntry!.unit.agent)) {
     blamed = undefined;
   }
-  const itemsOf = (c: BuiltCandidate): BoardItem[] => c.entries.filter((e) => c.mergedAgents.includes(e.unit.agent)).flatMap((e) => [...e.unit.items]);
+  const itemsOf = candidateItems;
 
   if (!landed && !blamed) {
     // Nothing gated can be recorded: C1 could not be built or gated. When a
@@ -417,105 +339,24 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
 
   const revisions: BoardRevision[] = [];
   const outcomes = new Map<number, { rev?: number; blamed?: readonly string[] }>();
-  const record = async (
+  const record = (
     c: BuiltCandidate,
     failingEvidence?: { failing: { output: string; items: string[]; outstanding?: string[] }; implicated: NonNullable<BoardRevision["implicated"]> },
     decisions: BoardDecisionRecord[] = [],
-  ): Promise<{ revision?: BoardRevision; failure?: string; stale?: boolean }> => {
-    const items = itemsOf(c);
-    const merged = items.map((i) => i.lastPush!.commit);
-    const unverified = await verifySubLeadMerges({
-      units: c.entries.filter((e) => c.mergedAgents.includes(e.unit.agent)).map((e) => e.unit),
-      state,
-      readRemote: options.readRemote,
-      workRoot: options.worktreeRoot,
-      scrub,
-    });
-    const recorded = await options.operator.recordRevision({
-      commit: c.commit!,
-      gate: c.gate!,
-      merged,
-      ...(head !== undefined ? { base: head } : {}),
-      ...(c.progress ? { progress: c.progress } : {}),
-      ...(failingEvidence ? { failing: failingEvidence.failing } : {}),
-      ...(c.gated ? {} : { gated: false as const }),
-      ...(unverified.length > 0 ? { unverified } : {}),
-    });
-    if (!recorded.ok) {
-      await flushAttributionDecisions(options.operator, options.recordDecision, decisions, undefined);
-      return recorded.code === "UNKNOWN_REF" || recorded.code === "STALE_BASE"
-        ? { stale: true, failure: scrub(`the board refused the revision: ${recorded.error}`) }
-        : { failure: scrub(`the board refused the revision (${recorded.code}): ${recorded.error}`) };
-    }
-    const rev = recorded.appended.find((m) => m.type === "integrated.rev");
-    const n = rev && rev.type === "integrated.rev" ? rev.payload.n : state.lastRevN + revisions.length + 1;
-    const revExcluded = [
-      ...excludedAgents,
-      ...c.excludedAgents,
-      ...stack
-        .slice(c.index)
-        .map((e) => ({
+  ): Promise<{ revision?: BoardRevision; failure?: string; stale?: boolean }> =>
+    recordBuiltCandidate({ ...ctx, ...(head !== undefined ? { head } : {}), pending, ...(adjusted.relaxed !== undefined ? { inventoryNote: adjusted.relaxed } : {}) }, c, {
+      revExcluded: [
+        ...excludedAgents,
+        ...c.excludedAgents,
+        ...stack.slice(c.index).map((e) => ({
           agent: e.unit.agent,
           reason: `speculative: not in candidate ${c.index}; its push stays pending for the next round`,
         })),
-    ];
-    let trunkMoved: BoardRevision["trunkMoved"];
-    if (c.gate === "pass") {
-      // Only now, with the revision recorded, does the integration branch move
-      // to exactly the landed candidate's gated commit (a compare-and-swap).
-      try {
-        await (options.advanceBranch ?? advanceIntegrationBranch)(options.integration.integrationRef, options.integration.integrationToken, c.commit!, options.worktreeRoot);
-      } catch (error) {
-        if (isPromotionRefused(error, "trunk-moved")) {
-          trunkMoved = { expected: error.expected, ...(error.actual !== undefined ? { actual: error.actual } : {}) };
-          await options.operator
-            .recordEngine("trunk.moved", {
-              rev: n,
-              commit: c.commit!,
-              ...(error.expected !== null ? { expected: error.expected } : {}),
-              ...(error.actual !== undefined && error.actual !== null ? { actual: error.actual } : {}),
-            })
-            .catch(() => undefined);
-        }
-        revExcluded.push({
-          agent: "(integration)",
-          reason: scrub(
-            isPromotionRefused(error, "trunk-moved")
-              ? `recorded, but the trunk moved: the integration branch was not advanced (${error.message})`
-              : `recorded, but the integration branch could not be advanced: ${error instanceof Error ? error.message : String(error)}`,
-          ),
-        });
-      }
-    }
-    await flushAttributionDecisions(options.operator, options.recordDecision, decisions, rev ? n : undefined);
-    const revision: BoardRevision = {
-      n,
-      gate: c.gate!,
-      gated: c.gated !== false,
-      ...(c.install ? { install: c.install } : {}),
-      commit: c.commit!,
-      merged,
-      integratedItems: items.flatMap((i) => [
-        i.id,
-        ...(i.status === "split" ? (i.lastPush?.merges ?? []).filter((m) => state.items[m.item]?.lastPush?.commit === m.commit).map((m) => m.item) : []),
-      ]),
-      excludedItems: pending.filter((i) => !items.includes(i)).map((i) => i.id),
-      excludedAgents: revExcluded,
-      completedItems: recorded.appended.flatMap((m) => (m.type === "item.completed" ? [m.payload.item] : [])),
-      ...(c.progress ? { progress: c.progress } : {}),
-      ...(failingEvidence ? { implicated: failingEvidence.implicated } : {}),
-      ...(c.gate === "fail" ? { failure: scrub(revisionFailure(c.evidence!.integration.finalCheck)) } : {}),
-      ...(adjusted.relaxed !== undefined ? { inventoryNote: adjusted.relaxed } : {}),
-      ...(trunkMoved !== undefined ? { trunkMoved } : {}),
-      ...(c.gate === "fail"
-        ? {
-            fixRequested: recorded.appended.flatMap((m) => (m.type === "fix.requested" ? [m.payload.item] : [])),
-            fixExhausted: recorded.appended.flatMap((m) => (m.type === "fix.exhausted" ? [m.payload.item] : [])),
-          }
-        : {}),
-    };
-    return { revision };
-  };
+      ],
+      ...(failingEvidence ? { failingEvidence } : {}),
+      decisions,
+      nFallback: state.lastRevN + revisions.length + 1,
+    });
 
   // 1. The blamed candidate, as a failing revision on the head: attributed to
   //    its last push's items only. With nothing landed (C1 is that push alone)
@@ -604,6 +445,221 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
   }
   const lastEvidence = landed?.evidence ?? blamed!.evidence!;
   return { revision: revisions.at(-1)!, revisions, evidence: lastEvidence, requiresIntegrationGate, key, candidates, ...(excludedPushes > 0 ? { excludedPushes } : {}) };
+}
+
+/** What every candidate of one integration round is built and gated against (the same board read, gate, and inventory). */
+export interface CandidateContext {
+  readonly options: IntegrateBoardOptions;
+  readonly state: BoardState;
+  readonly scrub: (text: string) => string;
+  readonly requiresIntegrationGate: boolean;
+  /** The baseline test inventory adjusted for accepted contracts. */
+  readonly inventory?: TestInventory;
+}
+
+/**
+ * Build and gate ONE candidate tree: the units of `entries` composed on the
+ * board's recorded head (never moving the branch), with the same verifier,
+ * integrator, immutable gate, contract restore, dependency install, and test
+ * inventory as a revision, in its own disposable work directories. Returns
+ * what was gated (its commit, gate, progress) or why nothing was.
+ */
+export async function gateCandidateTree(ctx: CandidateContext, index: number, entries: readonly StackEntry[]): Promise<BuiltCandidate> {
+  const { options, state, scrub, requiresIntegrationGate } = ctx;
+  const inventoryNow = ctx.inventory;
+  const change: Change = {
+    id: options.change.id,
+    objective: options.change.objective,
+    baseline: "HEAD",
+    budgetUsd: 0,
+    assurance: "standard",
+    work: entries.map((e) => ({
+      id: e.unit.agent,
+      objective: `the announced pushes of ${e.unit.agent} (items ${e.unit.items.map((i) => i.id).join(", ")})`,
+      dependsOn: [],
+      paths: [...e.unit.scope],
+    })),
+  };
+  const completed: CompletedWorkUnit[] = entries.map((e) => ({
+    unitId: e.unit.agent,
+    gitUrl: e.remote,
+    baselineRef: e.unit.baselineRef,
+    commit: e.unit.commit,
+    includes: [...e.unit.includes],
+    ...(e.unit.yieldedScope ? { yieldedScope: [...e.unit.yieldedScope] } : {}),
+    ...(e.unit.releasedPaths ? { releasedPaths: [...e.unit.releasedPaths] } : {}),
+  }));
+  const runner = options.verifyCommandRunner ? new CandidateCommandRunner(options.verifyCommandRunner) : undefined;
+  const verification = new ChangeVerification(options.integration.workspaces, runner ? { commandRunner: runner } : {});
+  let evidence: EvidenceSummary;
+  try {
+    evidence = await verification.verifyAndIntegrate({
+      change,
+      completed,
+      integrationRef: options.integration.integrationRef,
+      integrationToken: options.integration.integrationToken,
+      ...(requiresIntegrationGate
+        ? {
+            ...(options.appGateCommand && options.appGateCommand.length > 0 ? { integrationGateCommand: options.appGateCommand } : {}),
+            requiresIntegrationGate,
+          }
+        : {}),
+      ...(options.contract
+        ? { protectedPaths: options.contract.restore, protectedJsonKeys: options.contract.jsonKeys, onProtectedChange: "fail" as const }
+        : {}),
+      ...(inventoryNow ? { testInventory: inventoryNow } : {}),
+      // Every candidate builds on the same RECORDED head; none moves the branch.
+      ...(state.integrated ? { integrationBaseCommit: state.integrated.commit } : {}),
+      deferIntegrationPush: true,
+      workRoot: options.worktreeRoot,
+      identity: options.identity,
+    });
+  } catch (error) {
+    const refused = scrub(`the integrator refused: ${error instanceof Error ? error.message : String(error)}`);
+    return { index, entries, mergedAgents: [], excludedAgents: [], skipped: refused, refused };
+  }
+  const excluded = evidence.units
+    .filter((u) => u.verdict !== "verified")
+    .map((u) => ({
+      agent: u.unitId,
+      reason: scrub(`failed verification (${u.checks.filter((c) => !c.passed && !c.skipped).map((c) => `${c.kind}: ${c.summary}`).join("; ") || "verdict failed"})`),
+    }));
+  const mergedAgents = evidence.units.filter((u) => u.verdict === "verified").map((u) => u.unitId);
+  const commit = evidence.integration.commit;
+  if (mergedAgents.length === 0 || commit === undefined) {
+    return {
+      index,
+      entries,
+      evidence,
+      mergedAgents,
+      excludedAgents: excluded,
+      skipped:
+        mergedAgents.length === 0
+          ? `every push of the candidate was excluded: ${excluded.map((e) => `${e.agent}: ${e.reason}`).join("; ")}`
+          : "the integrator reported no commit for the gated tree",
+    };
+  }
+  const gate: "pass" | "fail" = evidence.integration.verdict === "verified" ? "pass" : "fail";
+  const finalCheck = evidence.integration.finalCheck;
+  const gated = !(gate === "pass" && finalCheck.skipped);
+  const progress = gated
+    ? labelGateProgress(finalCheck.progress ?? readTestProgress(finalCheck.outputs.map((o) => o.text).join("\n")), state.immutable ?? [])
+    : undefined;
+  const install = finalCheck.skipped ? undefined : runner?.lastInstall;
+  return { index, entries, evidence, commit, gate, gated, ...(install ? { install } : {}), ...(progress ? { progress } : {}), mergedAgents, excludedAgents: excluded };
+}
+
+/**
+ * Record a gated candidate as an integrated revision built on the recorded
+ * head: exactly its gated commit, the pushes of the units the verifier
+ * merged (each still its item's latest), its progress, and (failing) the
+ * evidence; a pass advances the integration branch only after it is
+ * recorded. Returns the revision, or why the board refused it (`stale`:
+ * superseded pushes or a moved head).
+ */
+export async function recordBuiltCandidate(
+  ctx: CandidateContext & { readonly head?: string; readonly pending: readonly BoardItem[]; readonly inventoryNote?: string },
+  c: BuiltCandidate,
+  input: {
+    readonly revExcluded: readonly { agent: string; reason: string }[];
+    readonly failingEvidence?: { failing: { output: string; items: string[]; outstanding?: string[] }; implicated: NonNullable<BoardRevision["implicated"]> };
+    readonly decisions?: BoardDecisionRecord[];
+    /** The revision number to report when the board's reply does not carry it. */
+    readonly nFallback: number;
+  },
+): Promise<{ revision?: BoardRevision; failure?: string; stale?: boolean }> {
+  const { options, state, scrub, head, pending } = ctx;
+  const failingEvidence = input.failingEvidence;
+  const decisions = input.decisions ?? [];
+  const items = candidateItems(c);
+  const merged = items.map((i) => i.lastPush!.commit);
+  const unverified = await verifySubLeadMerges({
+    units: c.entries.filter((e) => c.mergedAgents.includes(e.unit.agent)).map((e) => e.unit),
+    state,
+    readRemote: options.readRemote,
+    workRoot: options.worktreeRoot,
+    scrub,
+  });
+  const recorded = await options.operator.recordRevision({
+    commit: c.commit!,
+    gate: c.gate!,
+    merged,
+    ...(head !== undefined ? { base: head } : {}),
+    ...(c.progress ? { progress: c.progress } : {}),
+    ...(failingEvidence ? { failing: failingEvidence.failing } : {}),
+    ...(c.gated ? {} : { gated: false as const }),
+    ...(unverified.length > 0 ? { unverified } : {}),
+  });
+  if (!recorded.ok) {
+    await flushAttributionDecisions(options.operator, options.recordDecision, decisions, undefined);
+    return recorded.code === "UNKNOWN_REF" || recorded.code === "STALE_BASE"
+      ? { stale: true, failure: scrub(`the board refused the revision: ${recorded.error}`) }
+      : { failure: scrub(`the board refused the revision (${recorded.code}): ${recorded.error}`) };
+  }
+  const rev = recorded.appended.find((m) => m.type === "integrated.rev");
+  const n = rev && rev.type === "integrated.rev" ? rev.payload.n : input.nFallback;
+  const revExcluded = [...input.revExcluded];
+  let trunkMoved: BoardRevision["trunkMoved"];
+  if (c.gate === "pass") {
+    // Only now, with the revision recorded, does the integration branch move
+    // to exactly the landed candidate's gated commit (a compare-and-swap).
+    try {
+      await (options.advanceBranch ?? advanceIntegrationBranch)(options.integration.integrationRef, options.integration.integrationToken, c.commit!, options.worktreeRoot);
+    } catch (error) {
+      if (isPromotionRefused(error, "trunk-moved")) {
+        trunkMoved = { expected: error.expected, ...(error.actual !== undefined ? { actual: error.actual } : {}) };
+        await options.operator
+          .recordEngine("trunk.moved", {
+            rev: n,
+            commit: c.commit!,
+            ...(error.expected !== null ? { expected: error.expected } : {}),
+            ...(error.actual !== undefined && error.actual !== null ? { actual: error.actual } : {}),
+          })
+          .catch(() => undefined);
+      }
+      revExcluded.push({
+        agent: "(integration)",
+        reason: scrub(
+          isPromotionRefused(error, "trunk-moved")
+            ? `recorded, but the trunk moved: the integration branch was not advanced (${error.message})`
+            : `recorded, but the integration branch could not be advanced: ${error instanceof Error ? error.message : String(error)}`,
+        ),
+      });
+    }
+  }
+  await flushAttributionDecisions(options.operator, options.recordDecision, decisions, rev ? n : undefined);
+  const revision: BoardRevision = {
+    n,
+    gate: c.gate!,
+    gated: c.gated !== false,
+    ...(c.install ? { install: c.install } : {}),
+    commit: c.commit!,
+    merged,
+    integratedItems: items.flatMap((i) => [
+      i.id,
+      ...(i.status === "split" ? (i.lastPush?.merges ?? []).filter((m) => state.items[m.item]?.lastPush?.commit === m.commit).map((m) => m.item) : []),
+    ]),
+    excludedItems: pending.filter((i) => !items.includes(i)).map((i) => i.id),
+    excludedAgents: revExcluded,
+    completedItems: recorded.appended.flatMap((m) => (m.type === "item.completed" ? [m.payload.item] : [])),
+    ...(c.progress ? { progress: c.progress } : {}),
+    ...(failingEvidence ? { implicated: failingEvidence.implicated } : {}),
+    ...(c.gate === "fail" ? { failure: scrub(revisionFailure(c.evidence!.integration.finalCheck)) } : {}),
+    ...(ctx.inventoryNote !== undefined ? { inventoryNote: ctx.inventoryNote } : {}),
+    ...(trunkMoved !== undefined ? { trunkMoved } : {}),
+    ...(c.gate === "fail"
+      ? {
+          fixRequested: recorded.appended.flatMap((m) => (m.type === "fix.requested" ? [m.payload.item] : [])),
+          fixExhausted: recorded.appended.flatMap((m) => (m.type === "fix.exhausted" ? [m.payload.item] : [])),
+        }
+      : {}),
+  };
+  return { revision };
+}
+
+/** The items whose pushes a gated candidate's tree carries (the units the verifier merged). */
+export function candidateItems(c: BuiltCandidate): BoardItem[] {
+  return c.entries.filter((e) => c.mergedAgents.includes(e.unit.agent)).flatMap((e) => [...e.unit.items]);
 }
 
 /** A built candidate as the round reports it. */

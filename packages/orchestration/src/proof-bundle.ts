@@ -23,9 +23,15 @@
  * round that landed the final revision considered (candidate.gated), and the
  * landed one: its commit must be the revision's (and the promoted gated
  * commit), or the bundle is not proven.
+ *
+ * Under arbitration revision 5 it lists the PRE-PASS RATCHET's history (each
+ * failing revision that became the best so far before the first pass) and
+ * the pushes recorded as regressing it: a record of what was stacked and who
+ * was asked to fix, never part of the proof (the ratchet never moves the head,
+ * promotes, or changes a verdict).
  */
 
-import { foldBoard, isChangeItem, progressHeadline, type BoardMessage, type BoardRevProgress } from "@switchyard-change/change-core";
+import { describeProgressScore, foldBoard, isChangeItem, progressHeadline, ratchetHistory, type BoardMessage, type BoardRevProgress } from "@switchyard-change/change-core";
 
 /** A count of passing out of total checks. */
 export interface ProofCount {
@@ -81,6 +87,15 @@ export interface ProofBundle {
     readonly round: number;
     readonly candidates: readonly ProofCandidate[];
     readonly landed?: ProofCandidate & { readonly matchesRevision: boolean; readonly matchesPromoted?: boolean };
+  };
+  /**
+   * The pre-pass ratchet (arbitration revision 5; absent before it or when it
+   * never had a scored revision): its history and the regressions recorded
+   * against it. A record, never part of the proof and never a verdict.
+   */
+  readonly ratchet?: {
+    readonly history: readonly { readonly n: number; readonly seq: number; readonly commit: string; readonly line: string }[];
+    readonly regressions: readonly { readonly seq: number; readonly item: string; readonly agent: string; readonly commit: string; readonly rev: number; readonly ratchet: number; readonly from: string; readonly to: string; readonly candidate: string }[];
   };
 }
 
@@ -309,6 +324,20 @@ export function buildProofBundle(log: readonly BoardMessage[], options: ProofBun
     }
   });
 
+  // The pre-pass ratchet (a record, never part of the proof).
+  const history = ratchetHistory(log).map((step) => ({ n: step.n, seq: step.seq, commit: step.commit, line: step.line }));
+  const regressions = of(log, "push.regressed").map((m) => ({
+    seq: m.seq,
+    item: m.payload.item,
+    agent: m.payload.agent,
+    commit: m.payload.commit,
+    rev: m.payload.rev,
+    ratchet: m.payload.ratchet,
+    from: describeProgressScore(m.payload.from),
+    to: describeProgressScore(m.payload.to),
+    candidate: m.payload.candidate,
+  }));
+
   return {
     version: 1,
     ...(options.changeId !== undefined ? { changeId: options.changeId } : {}),
@@ -371,6 +400,7 @@ export function buildProofBundle(log: readonly BoardMessage[], options: ProofBun
     caps: of(log, "run.capped").map((m) => ({ seq: m.seq, kind: m.payload.kind, limit: m.payload.limit, used: m.payload.used, ...(m.payload.item !== undefined ? { item: m.payload.item } : {}) })),
     incompleteItems: changeItems.filter((i) => i.status !== "done").map((i) => i.id),
     ...(speculation ? { speculation } : {}),
+    ...(history.length > 0 || regressions.length > 0 ? { ratchet: { history, regressions } } : {}),
   };
 }
 
@@ -402,6 +432,14 @@ export function formatProofSummary(bundle: ProofBundle): string[] {
   }
   if (bundle.speculation) {
     lines.push(`  ${formatProofSpeculation(bundle.speculation)}`);
+  }
+  if (bundle.ratchet) {
+    lines.push(
+      `  pre-pass ratchet (best so far before the first pass; a record, not a verdict): ${bundle.ratchet.history.map((h) => `rev ${h.n} ${h.line}`).join(" -> ") || "none"}` +
+        (bundle.ratchet.regressions.length > 0
+          ? `; regressions: ${bundle.ratchet.regressions.map((r) => `${r.item} (${r.agent}, ${r.commit.slice(0, 10)}) ${r.to} vs rev ${r.ratchet} ${r.from}, fix asked by rev ${r.rev}`).join("; ")}`
+          : ""),
+    );
   }
   lines.push(
     `  merged: ${bundle.contributions.pushesMerged} push(es) from ${bundle.contributions.agents.join(", ") || "nobody"}; ${bundle.contributions.items.filter((i) => i.status === "done").length} of ${bundle.contributions.items.length} item(s) done`,

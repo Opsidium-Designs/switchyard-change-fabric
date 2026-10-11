@@ -230,6 +230,47 @@ describe("replay", () => {
   });
 });
 
+describe("pre-pass ratchet (arbitration revision 5)", () => {
+  /** A failing revision with acceptance 3/9 (the ratchet), then one whose stack regressed: a push.regressed record. */
+  function ratchetLog(): BoardMessage[] {
+    const b = new FixtureBoard();
+    b.human({ type: "goal.posted", payload: { objective: "o", rules: { arbitration: 5, maxFixAttempts: 3 } } });
+    b.join("ag-1");
+    b.human({ type: "item.proposed", payload: { item: "x", objective: "do x", acceptance: [], scopeHint: ["src/x.ts"] } });
+    b.agent("ag-1", { type: "item.claimed", payload: { item: "x", intent: { read: [], write: ["src/x.ts"] } } });
+    b.agent("ag-1", { type: "push.announced", payload: { item: "x", commit: "c1", paths: ["src/x.ts"] } });
+    const progress = { passed: 3, failed: 6, total: 9, acceptance: { passed: 3, failed: 6, total: 9 } };
+    b.rev({ commit: "r1", gate: "fail", merged: ["c1"], progress, failing: { output: "x", items: [] } });
+    b.agent("ag-1", { type: "push.announced", payload: { item: "x", commit: "c2", paths: ["src/x.ts"] } });
+    b.rev({ commit: "r2", gate: "fail", merged: ["c2"], progress: { passed: 0, failed: 0, total: 0, acceptanceNotRun: "typecheck failed (22 errors)" }, failing: { output: "x", items: ["x"] } });
+    b.record("push.regressed", {
+      item: "x",
+      agent: "ag-1",
+      commit: "c2",
+      rev: 2,
+      ratchet: 1,
+      from: { runs: true, acceptance: 3, acceptanceTotal: 9, developer: 0, typeErrors: 0 },
+      to: { runs: false, acceptance: 0, developer: 0, typeErrors: 22 },
+      candidate: "cand",
+      evidence: ["src/x.ts(1,1): error TS2339: Property 'auth' does not exist on type 'Ctx'."],
+    });
+    return b.log;
+  }
+
+  it("the board pane shows the best revision so far as a count, never a verdict, and the thread summarizes the regression", () => {
+    const rlog = ratchetLog();
+    const model = buildBoardGraph(rlog);
+    const pane = renderToStaticMarkup(createElement(BoardPane, { model, cards: [], selection: null, busy: false, onSelect: () => {}, onResolve: () => {}, log: rlog }));
+    expect(pane).toContain("best so far: rev 1, acceptance 3/9 (not a verdict; the head is unchanged)");
+    expect(pane).not.toMatch(/best so far[^<]*(PASS|verified)/);
+    // Without arbitration revision 5 (the fixture logs) there is no such line.
+    const plain = renderToStaticMarkup(createElement(BoardPane, { model: buildBoardGraph(log), cards: [], selection: null, busy: false, onSelect: () => {}, onResolve: () => {}, log }));
+    expect(plain).not.toContain("best so far");
+    const markup = render({ log: rlog });
+    expect(markup).toContain("x c2 regressed the best revision so far (rev 1): not stacked until ag-1 pushes again");
+  });
+});
+
 describe("honesty labels", () => {
   it('reads "no gate: nothing checked" for an ungated revision, never a pass', () => {
     const markup = render({ log: ungatedLog() });

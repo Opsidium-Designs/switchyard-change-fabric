@@ -157,7 +157,9 @@ item-calls, limit, used, item?}` (engine, recorded), `candidate.gated {round, in
 base?, verdict: pass | fail, outcome: landed | passed | blamed | retest, rev?, blamed?, progress?}` (engine, recorded: one
 speculative candidate; see "Speculative batch gating"), `push.excluded {item, agent, commit, reason}` (engine,
 recorded, addressed to the holder: the integrator left its pending push out because it failed verification; see
-"Excluded pushes"), `decision.recorded {juncture:
+"Excluded pushes"), `push.regressed {item, agent, commit, rev, ratchet, from, to, candidate, evidence, seams?}` (engine,
+recorded, arbitration revision 5, before the first pass, addressed to the holder: the push alone regressed the pre-pass
+ratchet; see "The pre-pass progress ratchet"), `decision.recorded {juncture:
 plan-review | attribution | fix-confidence | contract-triage, question, answer?, confidence?, accepted, error?, rev?,
 parsed?, contract?}` (engine, advisory), `decision.resolved {decisionSeq, rev, passed, answer, outcome:
 in-fixed-set | not-in-fixed-set, fixed, parsed, parseOutcome: in-fixed-set | not-in-fixed-set | none}` (engine, derived, advisory),
@@ -175,7 +177,7 @@ two symbols in one file contest.
 default 3; `contestIdleMessages`, default 25; `maxFixAttempts`, default 2;
 the optional `maxActiveClaims`, `claimLeaseMessages`, `claimDeadlineMessages`,
 `claimOverlap`, `speculate` (speculative batch gating, 1 to 8; absent
-means 1), and `arbitration` (the arbitration revision, 1 to 3; absent means
+means 1), and `arbitration` (the arbitration revision, 1 to 5; absent means
 1), each absent on a board posted before it, which then behaves as
 before), the integration `baseline` commit and the `gateCommand`
 (both optional), and
@@ -187,9 +189,9 @@ self-describing.
 ARBITRATION REVISION (`rules.arbitration`). A recorded log replays under the
 rules it was recorded with, so arbitration changes that alter what a log
 derives sit behind this rule. Absent (revision 1) is how every earlier board
-was arbitrated; a new `run-board` posts revision 4 (pinning
-`rules: {arbitration: 1}`, `{arbitration: 2}`, or `{arbitration: 3}`
-reproduces that revision).
+was arbitrated; a new `run-board` posts revision 5 (pinning
+`rules: {arbitration: 1}` through `{arbitration: 4}` reproduces that
+revision).
 Revision 2:
 - a DIFFERENT agent granted (or handed) an item starts with a fresh fix
   budget (`fixAttempts`, `fixExhausted`, a tool's build failures), whatever
@@ -235,6 +237,14 @@ claim could otherwise never get it back. A `no-progress` or `deadline` lapse
 keeps its cooldown, and so does a stalled one another agent could take.
 Revision 3 runs were published live, so this is a new revision: it only
 accepts claims revision 3 refused, and a revision 3 log replays as recorded.
+Revision 5 (everything in revision 4, plus the PRE-PASS PROGRESS RATCHET; see
+"The pre-pass progress ratchet" below). Before the first passing revision the
+local integrator stacks new pushes on the best-scoring failing revision so
+far and isolates a push that alone makes it worse; such a push is recorded
+`push.regressed` and is not stacked again until its holder pushes again.
+Revision 4 runs were published live (the storefront runs), so this is a new
+revision; a revision 4 log replays as recorded (it can carry no
+`push.regressed`: the board refuses one below revision 5).
 The three published replays and the K = 1 golden demo log carry no
 `arbitration` and reduce (and fold at every seq) exactly as before
 (`recorded-replay-compat.test.ts` pins their state hashes); the coverage-run
@@ -1295,6 +1305,111 @@ round of PREFIX CANDIDATES instead (`integrateSpeculativeRound`,
   is refused at startup (the CLI and `runBoard`), as is a goal with
   `integrator: cloud` and `speculate` above 1 (`NOT_SUPPORTED`), like splits.
 
+### The pre-pass progress ratchet (arbitration revision 5, `push.regressed`)
+
+The problem it addresses. With a whole-goal gate (the storefront's `tsc &&
+vitest run && vitest run --config gate/vitest.config.ts`, 129 acceptance
+tests over ten items) no revision passes until essentially every item is
+right, so before the first pass there is no passing head to protect, and
+speculation (above) does not run. Every pre-pass revision merged every item's
+latest push on the baseline, so one agent's bad push (an invented `ctx.user`
+or `authenticate`, a duplicated declaration) took the whole tree backwards:
+live run sf11's typecheck errors went 1, 4, 2, 1, 26, 24, and sf10 peaked at
+acceptance 51/129 on revision 10, then fell back to typecheck failures. Good
+work was diluted by bad pushes and the fix loop chased moving targets.
+
+What it is. A PROGRESS SCORE is read from each revision's existing advisory
+progress record (`progressScore`): whether the acceptance suite ran, its
+passes, the developer suites' passes, and, when the typecheck stopped the
+gate (`acceptanceNotRun: typecheck failed (N errors)`), the error count. The
+order is total (`compareProgressScore`): a tree that runs the acceptance
+suite beats one that does not; then more acceptance passes; then more
+developer passes; then fewer type errors. The RATCHET (`prePassRatchet`, a
+pure function of the log) is the failing revision with the best score before
+the first pass, ties to the earliest; `ratchetHistory` lists each revision
+that became the best so far.
+
+What the local integrator does with it (`integrateRatchetRound`,
+`packages/orchestration/src/ratchet-integration.ts`), only under revision 5
+and only before the first pass (without a scored failing revision it
+integrates exactly as before):
+
+1. The whole stack (every pending push, as before) is built and gated. A tree
+   that scores at least as well as the ratchet, or passes, is recorded exactly
+   as before, with the usual attribution: it may become the next ratchet, or
+   the first passing revision.
+2. A stack that scores WORSE is isolated. For each NEW push (an agent's unit
+   that carries a push the ratchet did not merge), in push order, up to K (the
+   `speculate` rule) and only while no run cap is reached (`stopCandidates`),
+   the tree of the ratchet's merged set plus that push alone is built and gated
+   with the same candidate machinery as speculation (`gateCandidateTree`: the
+   same verifier, integrator, immutable gate, contract restore, install, and
+   inventory, its own work directories, on the recorded head). The ratchet's
+   set is rebuilt from the log (`ratchetUnits`: each agent pinned to its latest
+   commit the ratchet merged); when it cannot be rebuilt exactly, the rebuilt
+   tree is gated first and its score is the reference. A push whose tree scores
+   worse than the reference REGRESSES the ratchet; one that ties or improves is
+   kept; one beyond K or after a cap is stacked as usual, never blamed.
+3. With regressing pushes, the whole stack is recorded as a failing revision
+   (it is the gated tree; base = the head) whose implicated items are the
+   regressing pushes' items only (attribution source `ratchet` in the summary),
+   so the board's fix loop asks, and charges the fix budget of, those holders
+   alone; its failing output leads with what the isolation showed. Each
+   regression is recorded `push.regressed {item, agent, commit, rev, ratchet,
+   from, to, candidate, evidence, seams?}` through the engine-record route,
+   addressed to the holder: `from` is the reference score, `to` the isolation
+   tree's, `candidate` its gated commit, `evidence` the failure lines the push
+   alone added (bounded, credential-scrubbed), `seams` the shared seams it
+   edits (blueprint seams, `src/contracts/**`, `src/store.ts`). The board
+   refuses it below revision 5, after a pass, for a push that is not the
+   item's latest gated one, or when `to` is not worse than `from`.
+4. The stack without the regressing pushes is built, gated, and recorded as
+   the next revision (attributed as any revision is: under revision 3 a failure
+   that maps only to the excluded item is `outstanding` and blames no one). It
+   may become the next ratchet, or pass.
+
+A regressing push leaves every integration plan (`integrablePushItems`) until
+its holder pushes again; meanwhile the claim's lease runs (it renews at the
+record), the item's wait reason is `push-regressed`, and the holder's digest
+carries `claims[].regressed {commit, rev, from, to, evidence, seams?,
+instruction}`; the fix request's instruction quotes the regression ("your
+push adds 22 type errors: src/billing/payments.ts(25,12): error TS2339:
+Property 'auth' does not exist on type 'Ctx'..."), and the agent's edit
+objective carries the evidence. A push that edits a FROZEN shared seam (no
+item owns it), or whose new type errors point at one its item imports (read
+as the failing-revision cue reads them), also gets the existing seam contract
+cue (`seamCue`), so the agent proposes a seam contract instead of editing; the
+lead's seam-contract facts (`seamContractFacts`: does the failure name the
+seam?) read that evidence too, since the board's latest failure is then the
+stack without the push. A push that edits a shared file its own item owns is
+told to keep it backward compatible.
+
+What it is NOT, candidly. The ratchet never moves the integrated head (the
+head stays the baseline until a revision passes, and every revision is built
+on it: `STALE_BASE` applies), never promotes anything, and never changes a
+verdict: only a passing revision is verified, and only it is promoted
+(gate-equals-deploy is unchanged). Isolation trees are evidence, never
+verdicts; the ones that regress are named by their gated commit in
+`push.regressed`, the others appear only in the run summary. The ratchet only
+decides what the integrator stacks next and whom it asks to fix. It costs up
+to K + 2 gate runs in a round that regresses (the stack, K isolation trees,
+the stack without the regressing pushes). The board integrates only an item's
+LATEST push, so when a holder's new push for the same item regresses, that
+item's earlier, better push cannot be stacked in its place: the item is
+missing from the next revision until its holder pushes again (isolation still
+compares against the ratchet's tree, which carries the earlier push). The
+integration Workflow on Cloudflare does not run the ratchet in this slice.
+After the first passing revision the ratchet is over and speculative gating
+takes over unchanged.
+
+Where it shows. The run summary prints the ratchet's history, a `best so far:
+rev N, acceptance x/129` line, and each isolation round; the console's board
+pane shows the same `best so far` line (a count, never styled as a verdict)
+and the thread summarizes each `push.regressed`; the proof bundle lists the
+ratchet's history and the regressions as a record (`ratchet`), never part of
+the proof. Recorded replays and the revision 1 golden log are unchanged
+(`recorded-replay-compat.test.ts`, `speculation-demo.e2e.test.ts`).
+
 ## Agent-built tools
 
 Agents decide which tools to build, build them, and run them for each other;
@@ -1851,7 +1966,9 @@ gate on that merge; the split item itself then states no wait: its sub-lead
 acts next), `waiting-for-gate` (the pending push's
 commit: the revision has no number yet, so none is invented),
 `push-excluded` (the holder's latest push was left out of integration, with
-the reason: the holder pushes again), `waiting-on-others` (arbitration
+the reason: the holder pushes again), `push-regressed` (arbitration revision
+5: the holder's latest push alone regressed the pre-pass ratchet in revision
+`rev`: the holder pushes a fix), `waiting-on-others` (arbitration
 revision 3: the holder's push was gated in revision `rev` and owes no fix: it
 waits for the other items), `fix-budget-exhausted` (by whom), or
 `unclaimed`. A moving item has none.

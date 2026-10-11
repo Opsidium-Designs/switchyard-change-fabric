@@ -202,6 +202,21 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
   "item.escalated": { from: "engine", payload: { item: "k", reason: "replan-failed", replanOf: "i" } },
   "trunk.moved": { from: "engine", payload: { rev: 2, commit: "abc", expected: "def", actual: "fed" } },
   "push.excluded": { from: "engine", payload: { item: "i", agent: "a", commit: "c1", reason: "failed verification (scope: src/q.ts is outside the write intent)" } },
+  "push.regressed": {
+    from: "engine",
+    payload: {
+      item: "i",
+      agent: "a",
+      commit: "c1",
+      rev: 3,
+      ratchet: 2,
+      from: { runs: true, acceptance: 51, acceptanceTotal: 129, developer: 9, typeErrors: 0 },
+      to: { runs: false, acceptance: 0, developer: 0, typeErrors: 22 },
+      candidate: "cand1",
+      evidence: ["src/billing/payments.ts(25,12): error TS2339: Property 'auth' does not exist on type 'Ctx'."],
+      seams: ["src/contracts/auth.ts"],
+    },
+  },
   "token.refreshed": { from: "engine", payload: { agent: "a", kind: "help-fork", request: "r" } },
   "revision.promoted": { from: "engine", payload: { rev: 3, gatedCommit: "abc", commit: "def", branch: "switchyard/change-1" } },
   "run.capped": { from: "engine", payload: { kind: "spend", limit: 5, used: 5.25 } },
@@ -280,6 +295,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "clash.predicted": { a: { agent: "a", item: "i", sha: "c1" }, b: { agent: "b", item: "j", sha: "c2" }, status: "clean" },
   "trunk.moved": { rev: 0, commit: "abc" },
   "push.excluded": { item: "i", agent: "a", commit: "c1" },
+  "push.regressed": { item: "i", agent: "a", commit: "c1", rev: 3, ratchet: 2, from: { runs: true }, to: {}, candidate: "x", evidence: [] },
   "token.refreshed": { agent: "a", kind: "help-fork" },
   "revision.promoted": { rev: 3, gatedCommit: "abc", commit: "def", branch: "../etc" },
   "run.capped": { kind: "item-calls", limit: 5, used: 6 },
@@ -322,7 +338,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(58);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(59);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -3388,7 +3404,7 @@ describe("arbitration revision 2 (rules.arbitration)", () => {
     }
   }
 
-  it("only revisions 1 to 4 are accepted; revision 1 is the default and is not recorded", () => {
+  it("only revisions 1 to 5 are accepted; revision 1 is the default and is not recorded", () => {
     const one = seeded({ arbitration: 1 });
     expect(one.state.rules.arbitration).toBeUndefined();
     expect(one.log[0]!.type === "goal.posted" && one.log[0]!.payload.rules.arbitration).toBeUndefined();
@@ -3397,8 +3413,9 @@ describe("arbitration revision 2 (rules.arbitration)", () => {
     const three = seeded({ arbitration: 3 });
     expect(three.state.rules.arbitration).toBe(3);
     expect(seeded({ arbitration: 4 }).state.rules.arbitration).toBe(4);
+    expect(seeded({ arbitration: 5 }).state.rules.arbitration).toBe(5);
     const board = new TestBoard();
-    board.reject(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 5 } }), /arbitration/, "BAD_PAYLOAD");
+    board.reject(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 6 } }), /arbitration/, "BAD_PAYLOAD");
   });
 
   for (const arbitration of [1, 2]) {
@@ -3585,4 +3602,124 @@ describe("arbitration revision 3: an item waiting on others (conjunctive gates)"
       expect(reduceBoard(board.log)).toEqual(board.state);
     });
   }
+});
+
+describe("push.regressed (arbitration revision 5: the pre-pass progress ratchet)", () => {
+  const RATCHET = { runs: true, acceptance: 5, acceptanceTotal: 9, developer: 0, typeErrors: 0 };
+  const WORSE = { runs: false, acceptance: 0, developer: 0, typeErrors: 22 };
+  const regressed = (extra: Record<string, unknown> = {}) =>
+    msg("engine", "push.regressed", {
+      item: "two",
+      agent: "b",
+      commit: "c-two-2",
+      rev: 2,
+      ratchet: 1,
+      from: RATCHET,
+      to: WORSE,
+      candidate: "cand-two",
+      evidence: ["src/two.ts(3,7): error TS2339: Property 'auth' does not exist on type 'Ctx'."],
+      ...extra,
+    });
+  /** a, b, c each pushed once (rev 1, the ratchet), then b pushed again and rev 2 gated it, failing. */
+  function regressedBoard(rules: Record<string, number> = { arbitration: 5, maxFixAttempts: 3 }): TestBoard {
+    const board = seeded(rules);
+    for (const [agent, item] of [["a", "one"], ["b", "two"], ["c", "three"]] as const) {
+      board.post(claim(agent, item, [`src/${item}.ts`]));
+      board.post(push(agent, item, `c-${item}`, [`src/${item}.ts`]));
+    }
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c-one", "c-two", "c-three"], failing: { output: "x", items: [] } }));
+    board.post(push("b", "two", "c-two-2", ["src/two.ts"]));
+    // The regressing revision asks only the regressing item for the fix.
+    expect(board.types(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c-one", "c-two-2", "c-three"], failing: { output: "x", items: ["two"] } }))).toEqual([
+      "integrated.rev",
+      "fix.requested",
+    ]);
+    return board;
+  }
+
+  it("addressed to the holder: the push leaves the stack, the lease runs, the wait reason and the digest quote the regression; a new push clears it", () => {
+    const board = regressedBoard({ arbitration: 5, maxFixAttempts: 3, claimLeaseMessages: 50 });
+    expect(integrablePushItems(board.state).map((i) => i.id).sort()).toEqual(["one", "three", "two"]);
+    const [record] = board.post(regressed({ seams: ["src/contracts/auth.ts"] }));
+    expect(record).toMatchObject({ from: "engine", type: "push.regressed", to: ["b"] });
+    const push2 = board.state.items.two!.lastPush!;
+    expect(push2.regressed).toMatchObject({ seq: record!.seq, rev: 2, ratchet: 1, from: RATCHET, to: WORSE });
+    expect(board.state.items.two!.lease!.progressSeq).toBe(record!.seq);
+    expect(integrablePushItems(board.state).map((i) => i.id).sort()).toEqual(["one", "three"]);
+    expect(planBoardIntegration(board.log, board.state).units.map((u) => u.agent)).toEqual(["a", "c"]);
+    expect(itemWaitReason(board.state, "two")).toEqual({ kind: "push-regressed", commit: "c-two-2", rev: 2 });
+    expect(describeWaitReason(itemWaitReason(board.state, "two")!)).toMatch(/regressed the best revision so far \(revision 2\)/);
+    expect(waitingOnOthers(board.state, board.state.items.two!)).toBe(false);
+    expect(activeClaims(board.state, "b")).toEqual(["two"]);
+    const claimTwo = boardDigest(board.state, board.log, "b", 0).claims.find((c) => c.item === "two")!;
+    expect(claimTwo.regressed).toMatchObject({ commit: "c-two-2", rev: 2, from: "acceptance 5/9", to: "22 type errors", seams: ["src/contracts/auth.ts"] });
+    expect(claimTwo.regressed!.instruction).toMatch(/REGRESSED the best revision so far \(revision 1: acceptance 5\/9\)/);
+    expect(claimTwo.regressed!.instruction).toMatch(/Property 'auth' does not exist/);
+    // The seam is in a held item's scope (owned): keep it compatible; no seam contract cue.
+    expect(claimTwo.regressed!.instruction).toMatch(/shared file src\/contracts\/auth\.ts that other items import: keep it backward compatible/);
+    expect(claimTwo.seamCue).toBeUndefined();
+    expect(claimTwo.fix!.instruction).toMatch(/your push adds 22 type errors: src\/two\.ts\(3,7\): error TS2339/);
+    // Recorded once per push, only for a gated latest push, only when it scores worse.
+    board.reject(regressed(), /already recorded regressed/, "DUPLICATE");
+    board.reject(regressed({ commit: "c-two" }), /latest, gated, unintegrated push/, "INVALID_STATE");
+    board.reject(regressed({ item: "one", agent: "a", commit: "c-one", to: { ...RATCHET } }), /not worse than/, "BAD_PAYLOAD");
+    board.reject(regressed({ item: "one", agent: "a", commit: "c-one", rev: 9 }), /not a recorded revision/, "UNKNOWN_REF");
+    board.reject(regressed({ item: "one", agent: "a", commit: "c-one", ratchet: 2 }), /must precede/, "BAD_PAYLOAD");
+    board.reject(regressed({ extra: 1 }), /a push\.regressed record is/, "BAD_PAYLOAD");
+    // The holder's next push clears it and is stacked again.
+    board.post(push("b", "two", "c-two-3", ["src/two.ts"]));
+    expect(board.state.items.two!.lastPush!.regressed).toBeUndefined();
+    expect(itemWaitReason(board.state, "two")).toEqual({ kind: "waiting-for-gate", commit: "c-two-3" });
+    expect(integrablePushItems(board.state).map((i) => i.id).sort()).toEqual(["one", "three", "two"]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+    expect(foldBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a regression that edits a FROZEN shared seam cues a seam contract (the existing seamCue)", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 5, maxFixAttempts: 3 }, seams: [{ path: "src/contracts/auth.ts", importers: ["src/two.ts"] }] }));
+    board.post(msg("b", "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "two", objective: "do two", acceptance: [], scopeHint: ["src/two.ts"] }));
+    board.post(claim("b", "two", ["src/two.ts"]));
+    board.post(push("b", "two", "c-two", ["src/two.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c-two"], failing: { output: "x", items: [] } }));
+    board.post(push("b", "two", "c-two-2", ["src/two.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c-two-2"], failing: { output: "x", items: ["two"] } }));
+    board.post(regressed({ seams: ["src/contracts/auth.ts"] }));
+    const claimTwo = boardDigest(board.state, board.log, "b", 0).claims.find((c) => c.item === "two")!;
+    expect(claimTwo.seamCue).toMatchObject({ seams: ["src/contracts/auth.ts"], errors: [expect.stringMatching(/TS2339/)] });
+    expect(claimTwo.seamCue!.hint).toMatch(/send message kind contract \{target: src\/contracts\/auth\.ts, change: modify, itemId: two/);
+    expect(claimTwo.regressed!.instruction).toMatch(/shared seam src\/contracts\/auth\.ts, which no item owns/);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a regression whose new type errors point at a frozen seam the item imports cues the seam contract, and the lead's facts read that evidence", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 5, maxFixAttempts: 3 }, seams: [{ path: "src/shared/ctx.ts", importers: ["src/two.ts"], symbols: ["Ctx"] }] }));
+    board.post(msg("b", "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "two", objective: "do two", acceptance: [], scopeHint: ["src/two.ts"] }));
+    board.post(claim("b", "two", ["src/two.ts"]));
+    board.post(push("b", "two", "c-two", ["src/two.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c-two"], failing: { output: "not ok 1 - two greets", items: [] } }));
+    board.post(push("b", "two", "c-two-2", ["src/two.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c-two-2"], failing: { output: "x", items: ["two"] } }));
+    board.post(regressed({ evidence: ["src/two.ts(2,41): error TS2339: Property 'user' does not exist on type 'Ctx'."] }));
+    // A later failing revision whose output names no seam is the board's latest failure.
+    board.post(msg("engine", "integrated.rev", { commit: "r3", gate: "fail", merged: [], failing: { output: "not ok 1 - two greets", items: [] } }));
+    const claimTwo = boardDigest(board.state, board.log, "b", 0).claims.find((c) => c.item === "two")!;
+    expect(claimTwo.seamCue).toMatchObject({ seams: ["src/shared/ctx.ts"], errors: ["src/two.ts(2,41): error TS2339: Property 'user' does not exist on type 'Ctx'."] });
+    board.post(msg("b", "contract.proposed", { contract: "k1", target: "src/shared/ctx.ts", kind: "modify", item: "two", description: "add user?: string to Ctx" }));
+    expect(seamContractFacts(board.state, "k1").namedInFailure).toBe(true);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("only under arbitration revision 5, and only before the first passing revision", () => {
+    const v4 = regressedBoard({ arbitration: 4, maxFixAttempts: 3 });
+    v4.reject(regressed(), /only under arbitration revision 5/, "NOT_ALLOWED");
+    const board = regressedBoard();
+    board.post(msg("engine", "integrated.rev", { commit: "r3", gate: "pass", merged: ["c-one", "c-two-2", "c-three"] }));
+    board.reject(regressed(), /the pre-pass ratchet is over/, "INVALID_STATE");
+  });
 });

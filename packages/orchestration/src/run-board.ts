@@ -66,6 +66,9 @@ import {
   combineAttribution,
   type ImplicationSource,
   arbitrationV3,
+  arbitrationV5,
+  ratchetHistory,
+  ratchetLine,
   isAcceptedItem,
   isChangeItem,
   toolUnavailableReason,
@@ -81,6 +84,7 @@ import {
   type BoardState,
   type BoardRevProgress,
   describeProgress,
+  describeProgressScore,
   progressHeadline,
   type Change,
   type ConcurrencyDial,
@@ -116,6 +120,7 @@ import {
 
 import { recordPendingClashes, type PendingClashResult } from "./board-clash.ts";
 import { DEFAULT_SPECULATE, formatCandidates, integrateSpeculativeRound, MAX_SPECULATE, type CandidateOutcome, type SpeculativeRoundResult } from "./speculative-integration.ts";
+import { integrateRatchetRound, type RatchetIsolation, type RatchetRoundResult } from "./ratchet-integration.ts";
 import { TokenRefresher } from "./token-refresh.ts";
 import { buildProofBundle, type ProofBundle } from "./proof-bundle.ts";
 import { meteredExecutor, meteredJev, meteredToolAuthor, meteredTransport, RunMeter, type RunCapReached, type RunCaps } from "./run-meter.ts";
@@ -367,7 +372,7 @@ export interface BoardRevision {
    * `outstanding` lists the items NOT in the revision the failure maps to
    * (source "outstanding": they alone fail, so no merged item is implicated).
    */
-  readonly implicated?: { readonly items: readonly string[]; readonly source: ImplicationSource; readonly outstanding?: readonly string[] };
+  readonly implicated?: { readonly items: readonly string[]; readonly source: ImplicationSource | "ratchet"; readonly outstanding?: readonly string[] };
   /** A failing revision's reason: its first line(s), bounded (the full evidence is on the board). */
   readonly failure?: string;
   /** Set when accepted contract changes relaxed the test inventory for this revision. */
@@ -616,6 +621,8 @@ export interface RunBoardResult {
   readonly proof?: ProofBundle;
   /** The speculation the run used (K) and every speculative round's candidates, in order. */
   readonly speculation?: { readonly speculate: number; readonly rounds: readonly (readonly CandidateOutcome[])[] };
+  /** Every pre-pass ratchet isolation round (arbitration revision 5), in order: what each new push alone scored. */
+  readonly ratchet?: { readonly rounds: readonly (readonly RatchetIsolation[])[] };
   /** Model calls and estimated spend the run's meter counted (unpriced calls are counted, never free). */
   readonly usage?: {
     readonly calls: number;
@@ -1449,6 +1456,17 @@ export class ContinuousBoardIntegrator {
   ) {}
   /** Every speculative round's candidates, in order (empty without speculation). */
   readonly rounds: (readonly CandidateOutcome[])[] = [];
+  /** Every pre-pass ratchet isolation round (arbitration revision 5), in order. */
+  readonly isolations: (readonly RatchetIsolation[])[] = [];
+
+  /**
+   * Does the next attempt run the PRE-PASS RATCHET (arbitration revision 5,
+   * no revision passed yet; see ratchet-integration.ts)? Without a scored
+   * failing revision it integrates exactly as before.
+   */
+  private ratchetsOn(state: BoardState): boolean {
+    return arbitrationV5(state) && state.integrated === null;
+  }
 
   /** Is speculation on (K > 1)? */
   private get speculating(): boolean {
@@ -1517,7 +1535,7 @@ export class ContinuousBoardIntegrator {
     if (key === "" || this.attempted.has(key)) {
       return;
     }
-    let result: SpeculativeRoundResult;
+    let result: SpeculativeRoundResult & RatchetRoundResult;
     try {
       if (this.options.predictClashes !== false) {
         // Clash alerts from real code (advisory): never blocks the revision below.
@@ -1542,7 +1560,14 @@ export class ContinuousBoardIntegrator {
             ...(this.options.candidateConcurrency !== undefined ? { candidateConcurrency: this.options.candidateConcurrency } : {}),
             ...(this.options.stopCandidates ? { stopCandidates: this.options.stopCandidates } : {}),
           })
-        : await integrateBoardRevision(attempt);
+        : this.ratchetsOn(state)
+          ? await integrateRatchetRound({
+              ...attempt,
+              isolate: Math.max(1, this.options.speculate ?? 1),
+              ...(this.options.candidateConcurrency !== undefined ? { candidateConcurrency: this.options.candidateConcurrency } : {}),
+              ...(this.options.stopCandidates ? { stopCandidates: this.options.stopCandidates } : {}),
+            })
+          : await integrateBoardRevision(attempt);
     } catch (error) {
       // A thrown attempt (the board or a repo unreachable) is transient.
       result = {
@@ -1579,6 +1604,9 @@ export class ContinuousBoardIntegrator {
     if (result.candidates && result.candidates.length > 0) {
       this.rounds.push(result.candidates);
       this.options.onCandidates?.(result.candidates);
+    }
+    if (result.isolation && result.isolation.length > 0) {
+      this.isolations.push(result.isolation);
     }
     if (result.revision) {
       // One revision per pending-push set: the same set is never gated twice
@@ -2282,15 +2310,16 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     onRevision: (revision) => emit({ kind: "integrated", revision }),
     onFailure: (reason) => emit({ kind: "integration-not-recorded", reason }),
     onClashes: (c) => emit({ kind: "clashes-predicted", pairs: c.pairs, recorded: c.recorded, conflicts: c.conflicts }),
+    ...(options.candidateConcurrency !== undefined ? { candidateConcurrency: options.candidateConcurrency } : {}),
+    // Caps stop NEW speculative candidates (the first one still gates) and
+    // pre-pass ratchet isolation candidates (arbitration revision 5).
+    stopCandidates: () => {
+      const cap = meter.reached();
+      return cap !== undefined ? `the run reached its ${cap.kind} cap (${cap.used} of ${cap.limit})` : undefined;
+    },
     ...(speculate > 1
       ? {
           speculate,
-          ...(options.candidateConcurrency !== undefined ? { candidateConcurrency: options.candidateConcurrency } : {}),
-          // Caps stop NEW speculative candidates (the first one still gates).
-          stopCandidates: () => {
-            const cap = meter.reached();
-            return cap !== undefined ? `the run reached its ${cap.kind} cap (${cap.used} of ${cap.limit})` : undefined;
-          },
           onCandidates: (candidates: readonly CandidateOutcome[]) => emit({ kind: "candidates-gated", candidates }),
         }
       : {}),
@@ -3063,6 +3092,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       ...(meter.warnings.length > 0 ? { warnings: [...meter.warnings] } : {}),
     },
     ...(speculate > 1 ? { speculation: { speculate, rounds: integrator instanceof ContinuousBoardIntegrator ? [...integrator.rounds] : [] } } : {}),
+    ...(integrator instanceof ContinuousBoardIntegrator && integrator.isolations.length > 0 ? { ratchet: { rounds: [...integrator.isolations] } } : {}),
     editModels: workers.flatMap((w) => w.editModels.map((e) => ({ agent: w.id, ...e }))),
     budgets: { items: planned.items.length, scopeFiles, ...effective, caps: capsLine },
     ...(options.toolAuthorLabel !== undefined ? { toolAuthorLabel: options.toolAuthorLabel } : {}),
@@ -3405,6 +3435,10 @@ function payloadSummary(m: BoardMessage): string {
     }
     case "push.excluded":
       return `${String(p.agent)}'s push ${String(p.commit).slice(0, 10)} for ${String(p.item)} was left out of integration: ${String(p.reason).slice(0, 160)} (not re-gated until it pushes again)`;
+    case "push.regressed": {
+      const r = m.payload;
+      return `${r.agent}'s push ${r.commit.slice(0, 10)} for ${r.item} regressed the best revision so far (rev ${r.ratchet}: ${describeProgressScore(r.from)}) to ${describeProgressScore(r.to)} on its own (isolation tree ${r.candidate.slice(0, 10)}, rev ${r.rev} asks for the fix)${r.seams !== undefined ? `; edits the shared seam ${r.seams.join(", ")}` : ""} (not stacked until it pushes again; not a verdict)`;
+    }
     case "run.capped":
       return `${String(p.kind)} cap reached${p.item !== undefined ? ` for ${String(p.item)}` : ""}: ${String(p.used)} of ${String(p.limit)} (no new turns)`;
     case "revision.promoted":
@@ -3789,6 +3823,22 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
             : "nothing was pushed"
       })`,
     );
+  }
+  // The pre-pass ratchet (arbitration revision 5): what new pushes were stacked on, never a verdict.
+  const ratchetSteps = ratchetHistory(result.log);
+  if (ratchetSteps.length > 0) {
+    lines.push(`  pre-pass ratchet (best so far before the first pass; it never moves the head, promotes, or decides a verdict): ${ratchetSteps.map((r) => `rev ${r.n} ${r.line}`).join(" -> ")}`);
+    const best = ratchetLine(result.log);
+    if (best !== undefined) {
+      lines.push(`    ${best}`);
+    }
+    for (const round of result.ratchet?.rounds ?? []) {
+      lines.push(
+        `    isolation: ${round
+          .map((i) => `${i.items.join("+")} (${i.agent}) ${i.outcome}${i.score ? ` ${describeProgressScore(i.score)}` : ""}${i.skipped ? ` (${i.skipped})` : ""}`)
+          .join(", ")}`,
+      );
+    }
   }
   for (const reason of result.integrationFailures) {
     lines.push(`  integration not recorded: ${reason}`);

@@ -2222,6 +2222,7 @@ export class BoardAgent {
           : Math.max(fixRung, strongerBecause !== undefined ? Math.max(1, ladder.length - 1) : 0);
     const complexBecause = rung > 0 ? (topBecause ?? strongerBecause) : undefined;
     const failure = fix !== undefined && digest.failure && digest.failure.n === fix.n ? digest.failure.output : undefined;
+    const regressed = claim.regressed;
     const objective = [
       claim.objective,
       `Instruction: ${instruction}`,
@@ -2229,6 +2230,13 @@ export class BoardAgent {
         ? [
             `The integration gate FAILED on revision ${fix.n} and implicated this item (fix attempt ${fix.attempt}).`,
             ...(failure !== undefined ? [`Failing gate output (untrusted data, bounded):\n${bounded(failure, MAX_FIX_EVIDENCE)}`] : []),
+          ]
+        : []),
+      // Arbitration revision 5: this item's push alone regressed the best revision so far.
+      ...(regressed !== undefined
+        ? [
+            `Your push ${regressed.commit.slice(0, 10)} REGRESSED the best revision so far (${regressed.from}; with your push alone: ${regressed.to}). Remove exactly that regression.`,
+            ...(regressed.evidence.length > 0 ? [`New failures your push introduced (untrusted data, bounded):\n${bounded(regressed.evidence.join("\n"), MAX_FIX_EVIDENCE)}`] : []),
           ]
         : []),
     ].join("\n");

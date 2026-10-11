@@ -69,11 +69,12 @@ export function pendingPushItems(state: BoardState): BoardItem[] {
 
 /**
  * The pending pushes an integration may gate: every pending push except one
- * the integrator recorded excluded (push.excluded), which waits for its
- * holder's next push instead of being re-gated as it is. Pure.
+ * the integrator recorded excluded (push.excluded), or (arbitration revision
+ * 5) recorded as regressing the pre-pass ratchet (push.regressed), which
+ * waits for its holder's next push instead of being stacked as it is. Pure.
  */
 export function integrablePushItems(state: BoardState): BoardItem[] {
-  return pendingPushItems(state).filter((i) => i.lastPush!.excluded === undefined);
+  return pendingPushItems(state).filter((i) => i.lastPush!.excluded === undefined && i.lastPush!.regressed === undefined);
 }
 
 /** Children's pushes still waiting for their sub-lead to merge them (not pending integration). */

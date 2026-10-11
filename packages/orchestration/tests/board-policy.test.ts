@@ -276,6 +276,22 @@ describe("the contract cue in the generic policy", () => {
   });
 });
 
+describe("a regressing push in the generic policy (arbitration revision 5)", () => {
+  it("the fix edit names the regression its push introduced; a plain fix keeps the plain instruction", async () => {
+    const base = input("w1", "worker", {});
+    const fix = { n: 2, attempt: 1, instruction: "i" };
+    const regressed = { commit: "abcdef0123456789", rev: 2, from: "acceptance 3/9", to: "22 type errors", evidence: ["src/y.ts(1,1): error TS2339: x"], instruction: "i" };
+    const at = (claim: Record<string, unknown>) =>
+      policy({ ...base, digest: { ...(base.digest as unknown as Record<string, unknown>), claims: [{ item: "y", objective: "do y", intent: { read: [], write: ["src/y.ts"] }, doneProposed: false, lastPush: { commit: "abcdef0123456789", agent: "w1" }, ...claim }] } as unknown as BoardDigest });
+    expect((await at({ fix, regressed })).action).toMatchObject({
+      type: "edit",
+      itemId: "y",
+      instruction: "Fix the regression my push abcdef0123 introduced on revision 2 (attempt 1; 22 type errors against the best acceptance 3/9): do y",
+    });
+    expect((await at({ fix })).action).toMatchObject({ type: "edit", itemId: "y", instruction: "Fix what failed the integration gate on revision 2 (attempt 1): do y" });
+  });
+});
+
 describe("claim deadlines in the generic policy (the lead)", () => {
   const near = (progressing: boolean) => ({ item: "one", owner: "agent-1", deadlineSeq: 200, remaining: 12, lastProgressSeq: 180, extensions: 0, progressing });
 

@@ -11,6 +11,7 @@ import {
   buildBoardGraph,
   HULL_MAX_AGENTS,
   HULL_TITLE_H,
+  ratchetLine,
   revVerdictLabel,
   type BoardGraphEdge,
   type BoardGraphModel,
@@ -284,6 +285,8 @@ export function payloadSummary(message: BoardMessage): string {
         .join(" then ")}): gate ${message.payload.verdict}, ${message.payload.outcome}${message.payload.rev !== undefined ? ` (rev ${message.payload.rev})` : ""}${
         message.payload.blamed !== undefined ? `; blamed ${message.payload.blamed.join(", ")}` : ""
       }`;
+    case "push.regressed":
+      return `${message.payload.item} ${message.payload.commit.slice(0, 7)} regressed the best revision so far (rev ${message.payload.ratchet}): not stacked until ${message.payload.agent} pushes again`;
     case "revision.promoted":
       return `rev ${message.payload.rev} promoted to ${message.payload.branch} (${message.payload.commit.slice(0, 7)}, gated ${message.payload.gatedCommit.slice(0, 7)})`;
     case "trunk.moved":
@@ -719,9 +722,16 @@ export function BoardPane({
     ["CLAIMED", model.columns.claimed],
     ["DONE", model.columns.done],
   ];
+  // The pre-pass ratchet (arbitration revision 5): a count, never a verdict.
+  const best = log ? ratchetLine(boardPrefix(log, model.k)) : undefined;
   return (
     <div className="mc-board" aria-label="Board">
       <h2>BOARD</h2>
+      {best !== undefined ? (
+        <p className="muted mc-ratchet" title="the best-scoring failing revision before the first pass: what new pushes are stacked on; it never moves the head or promotes">
+          {best}
+        </p>
+      ) : null}
       {columns.map(([title, ids]) => (
         <section key={title} className={`mc-column col-${title.toLowerCase()}`}>
           <h3>

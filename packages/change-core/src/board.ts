@@ -145,12 +145,21 @@ export interface BoardRules {
    * claiming it again when no other active worker could take it (every other
    * active worker not barred from the item is at its claim cap, or there is
    * none): the cooldown exists so another agent gets it first, and nobody can.
+   * Revision 5 (what a new run posts) adds the PRE-PASS PROGRESS RATCHET:
+   * before the first passing revision, the best-scoring failing revision (see
+   * prePassRatchet) is the set the local integrator stacks new pushes on. A
+   * stack that scores worse than it is isolated (the ratchet's set plus each
+   * new push alone); a push that alone regresses it is recorded
+   * `push.regressed` (addressed to its holder, who is asked for the fix by the
+   * failing revision that gated it) and is not stacked again until its holder
+   * pushes again. The ratchet never moves the integrated head, never
+   * promotes, and never changes a verdict: only a passing revision does.
    */
   readonly arbitration?: number;
 }
 
 /** The arbitration revision a new board run posts (see BoardRules.arbitration). */
-export const CURRENT_ARBITRATION = 4;
+export const CURRENT_ARBITRATION = 5;
 
 export const DEFAULT_BOARD_RULES: BoardRules = { maxContestTurns: 3, contestIdleMessages: 25, maxFixAttempts: 2 };
 
@@ -197,6 +206,9 @@ export const BOARD_LIMITS = {
   seamWaitMessages: 60,
   /** Times the lead may extend one claim's deadline (claim.extended). */
   maxClaimExtensions: 2,
+  /** Quoted failure lines one push.regressed may carry, and the characters of each. */
+  maxRegressionEvidence: 8,
+  maxRegressionEvidenceLine: 300,
   /** Prefix candidates one speculative integration round may gate (the speculate rule's bound). */
   maxSpeculate: 8,
   /**
@@ -284,6 +296,74 @@ export function describeProgress(p: BoardRevProgress): string {
     return `acceptance suite did not run: ${p.acceptanceNotRun}${dev ? ` (${dev})` : ""}`;
   }
   return `${p.passed}/${p.total} checks passing`;
+}
+
+/**
+ * A revision's PROGRESS SCORE, read from its advisory progress record (under
+ * arbitration revision 5 it orders the failing revisions before the first
+ * pass; see compareProgressScore). Never a verdict: only the gate decides.
+ */
+export interface BoardProgressScore {
+  /** The acceptance suite ran (or, with no acceptance gate known, the gate's checks ran). */
+  readonly runs: boolean;
+  /** Acceptance tests passing (with no acceptance gate known: the gate's checks passing). */
+  readonly acceptance: number;
+  /** The acceptance suite's total, when it ran (for display). */
+  readonly acceptanceTotal?: number;
+  /** Developer-suite tests passing. */
+  readonly developer: number;
+  /** Type errors when the acceptance suite did not run because the typecheck failed (else 0). */
+  readonly typeErrors: number;
+}
+
+/**
+ * The progress score of a revision's progress record, or undefined when it
+ * carries nothing comparable (no record, or a record with no count and no
+ * stated reason). Pure.
+ */
+export function progressScore(p: BoardRevProgress | undefined): BoardProgressScore | undefined {
+  if (p === undefined) {
+    return undefined;
+  }
+  const developerSuites = (p.suites ?? []).filter((s) => s.suite === "developer");
+  const developer = developerSuites.reduce((n, s) => n + s.passed, 0);
+  if (p.acceptance !== undefined) {
+    return { runs: true, acceptance: p.acceptance.passed, acceptanceTotal: p.acceptance.total, developer, typeErrors: 0 };
+  }
+  if (p.acceptanceNotRun !== undefined) {
+    const errors = /typecheck failed \((\d+) errors?\)/.exec(p.acceptanceNotRun);
+    return { runs: false, acceptance: 0, developer, typeErrors: errors ? Number(errors[1]) : 0 };
+  }
+  if (p.total === 0) {
+    return undefined;
+  }
+  // No acceptance gate is known: the gate's own checks (minus labeled developer suites) stand in.
+  const checks = p.passed - developer;
+  return { runs: true, acceptance: checks, acceptanceTotal: p.total - developerSuites.reduce((n, s) => n + s.total, 0), developer, typeErrors: 0 };
+}
+
+/**
+ * The TOTAL ORDER of progress scores: a tree that runs the acceptance suite
+ * beats one that does not; then more acceptance passes; then more developer
+ * passes; then fewer type errors. Negative when `a` is worse than `b`, zero
+ * when they tie, positive when `a` is better. Pure.
+ */
+export function compareProgressScore(a: BoardProgressScore, b: BoardProgressScore): number {
+  if (a.runs !== b.runs) {
+    return a.runs ? 1 : -1;
+  }
+  return a.acceptance - b.acceptance || a.developer - b.developer || b.typeErrors - a.typeErrors;
+}
+
+/** One line for a progress score (`acceptance 51/129`, `22 type errors`). Never styled as a verdict. */
+export function describeProgressScore(s: BoardProgressScore): string {
+  if (s.runs) {
+    return `acceptance ${s.acceptance}${s.acceptanceTotal !== undefined ? `/${s.acceptanceTotal}` : ""}${s.developer > 0 ? `, developer ${s.developer} passing` : ""}`;
+  }
+  if (s.typeErrors > 0) {
+    return `${s.typeErrors} type error${s.typeErrors === 1 ? "" : "s"}`;
+  }
+  return `acceptance did not run${s.developer > 0 ? ` (developer ${s.developer} passing)` : ""}`;
 }
 
 /** A child item declared by an `item.split`. */
@@ -578,6 +658,31 @@ export interface BoardPayloads {
    * reason is `push-excluded`.
    */
   "push.excluded": { readonly item: string; readonly agent: string; readonly commit: string; readonly reason: string };
+  /**
+   * Engine (recorded by the operator, arbitration revision 5, before the first
+   * passing revision), addressed to the holder: `agent`'s push `commit` for
+   * `item` REGRESSED the pre-pass ratchet. Failing revision `rev` gated it with
+   * the rest of the stack and scored worse than the ratchet (failing revision
+   * `ratchet`, score `from`); the isolation tree of the ratchet's set plus
+   * this push alone (`candidate`, a real gated tree) scored `to`, worse than
+   * `from`. `evidence` quotes the new failure lines (bounded); `seams` lists
+   * the shared seams the push edits. The push is not stacked again until the
+   * holder pushes again; meanwhile the claim's lease runs and the item's wait
+   * reason is `push-regressed`. Never a verdict: it decides only what is
+   * stacked and who is asked to fix.
+   */
+  "push.regressed": {
+    readonly item: string;
+    readonly agent: string;
+    readonly commit: string;
+    readonly rev: number;
+    readonly ratchet: number;
+    readonly from: BoardProgressScore;
+    readonly to: BoardProgressScore;
+    readonly candidate: string;
+    readonly evidence: readonly string[];
+    readonly seams?: readonly string[];
+  };
   /**
    * Engine (recorded by the operator): before `agent`'s repo token expired,
    * the operator minted a fresh scoped token for the same repo (`repo-write`:
@@ -945,6 +1050,7 @@ export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "run.capped",
   "candidate.gated",
   "push.excluded",
+  "push.regressed",
   "item.discovered",
   "help.requested",
   "help.offered",
@@ -1105,6 +1211,8 @@ export interface BoardItemPush {
   unverifiedIn?: number;
   /** The integrator left this push out (push.excluded): not re-gated until the holder pushes again. */
   excluded?: { readonly seq: number; readonly reason: string };
+  /** Arbitration revision 5: this push regressed the pre-pass ratchet (push.regressed): not stacked until the holder pushes again. */
+  regressed?: { readonly seq: number } & Omit<BoardPayloads["push.regressed"], "item" | "agent" | "commit" | "candidate">;
   /** Its board clock under arbitration revision 2. */
   readonly tick?: number;
 }
@@ -1669,6 +1777,26 @@ function unverifiedMerges(value: unknown): { item: string; reason: string }[] {
   });
 }
 
+/** A progress score {runs, acceptance, acceptanceTotal?, developer, typeErrors}. */
+function progressScoreField(raw: Raw, field: string): BoardProgressScore {
+  const value = raw[field];
+  if (!isRecord(value) || Object.keys(value).some((k) => !["runs", "acceptance", "acceptanceTotal", "developer", "typeErrors"].includes(k))) {
+    fail("BAD_PAYLOAD", `${field} must be a progress score {runs, acceptance, acceptanceTotal?, developer, typeErrors}`);
+  }
+  const acceptance = nonNegativeInt(value, "acceptance");
+  const total = value.acceptanceTotal === undefined ? undefined : nonNegativeInt(value, "acceptanceTotal");
+  if (total !== undefined && total < acceptance) {
+    fail("BAD_PAYLOAD", `${field}.acceptanceTotal must be at least its acceptance count`);
+  }
+  return {
+    runs: bool(value, "runs"),
+    acceptance,
+    ...(total !== undefined ? { acceptanceTotal: total } : {}),
+    developer: nonNegativeInt(value, "developer"),
+    typeErrors: nonNegativeInt(value, "typeErrors"),
+  };
+}
+
 /** A revision's advisory progress: non-negative counts, passed + failed = total, at most 16 suites. */
 function revProgress(value: unknown): BoardRevProgress {
   if (!isRecord(value)) {
@@ -2066,6 +2194,21 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
     }
     case "push.excluded":
       return { item: id(raw, "item"), agent: id(raw, "agent"), commit: id(raw, "commit"), reason: text(raw, "reason", L.maxRationale) };
+    case "push.regressed": {
+      const seams = pathList(raw, "seams", { optional: true, concrete: true, max: L.maxShortList });
+      return {
+        item: id(raw, "item"),
+        agent: id(raw, "agent"),
+        commit: id(raw, "commit"),
+        rev: positiveInt(raw, "rev"),
+        ratchet: positiveInt(raw, "ratchet"),
+        from: progressScoreField(raw, "from"),
+        to: progressScoreField(raw, "to"),
+        candidate: id(raw, "candidate"),
+        evidence: textList(raw, "evidence", L.maxRegressionEvidence, L.maxRegressionEvidenceLine),
+        ...(seams.length > 0 ? { seams } : {}),
+      };
+    }
     case "trunk.moved": {
       const expected = optionalId(raw, "expected");
       const actual = optionalId(raw, "actual");
@@ -2520,6 +2663,7 @@ const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "clash.predicted": ["engine"],
   "trunk.moved": ["engine"],
   "push.excluded": ["engine"],
+  "push.regressed": ["engine"],
   "token.refreshed": ["engine"],
   "revision.promoted": ["engine"],
   "run.capped": ["engine"],
@@ -2832,7 +2976,7 @@ export function waitingOnOthers(state: BoardState, item: BoardItem): boolean {
     return false;
   }
   const push = item.lastPush;
-  if (push === undefined || push.agent !== item.owner || push.gatedIn === undefined || push.excluded !== undefined) {
+  if (push === undefined || push.agent !== item.owner || push.gatedIn === undefined || push.excluded !== undefined || push.regressed !== undefined) {
     return false;
   }
   if (item.fixRequested !== undefined || item.fixExhausted === true) {
@@ -2918,6 +3062,11 @@ export function arbitrationV3(state: BoardState): boolean {
 /** True under arbitration revision 4 or later (a stalled lapse nobody else can take; see BoardRules.arbitration). Pure. */
 export function arbitrationV4(state: BoardState): boolean {
   return (state.rules.arbitration ?? 1) >= 4;
+}
+
+/** True under arbitration revision 5 or later (the pre-pass progress ratchet; see BoardRules.arbitration). Pure. */
+export function arbitrationV5(state: Pick<BoardState, "rules">): boolean {
+  return (state.rules.arbitration ?? 1) >= 5;
 }
 
 /**
@@ -3117,6 +3266,8 @@ export type BoardWaitReason =
   | { readonly kind: "waiting-for-gate"; readonly commit: string }
   /** Its holder's latest push was left out of integration (push.excluded): the holder pushes again. */
   | { readonly kind: "push-excluded"; readonly commit: string; readonly reason: string }
+  /** Revision 5: its holder's latest push regressed the pre-pass ratchet in revision `rev` (push.regressed): the holder pushes a fix. */
+  | { readonly kind: "push-regressed"; readonly commit: string; readonly rev: number }
   /** Revision 3: its holder's push was gated in revision `rev` and no fix is owed: it waits for the other items (see waitingOnOthers). */
   | { readonly kind: "waiting-on-others"; readonly commit: string; readonly rev: number }
   /** Its fix budget was spent (by these agents): fresh eyes or a re-plan. */
@@ -3188,6 +3339,9 @@ export function itemWaitReason(state: BoardState, itemId: string): BoardWaitReas
   if (push !== undefined && push.agent === item.owner && push.gatedIn === undefined && push.excluded !== undefined) {
     return { kind: "push-excluded", commit: push.commit, reason: push.excluded.reason };
   }
+  if (push !== undefined && push.agent === item.owner && push.integratedIn === undefined && push.regressed !== undefined && !item.fixExhausted) {
+    return { kind: "push-regressed", commit: push.commit, rev: push.regressed.rev };
+  }
   if (push !== undefined && push.agent === item.owner && push.gatedIn === undefined) {
     if (routedToSubLead(state, item)) {
       const parent = state.items[item.parent!]!;
@@ -3227,6 +3381,8 @@ export function describeWaitReason(reason: BoardWaitReason): string {
       return `push ${reason.commit.slice(0, 10)} waits for the gate`;
     case "push-excluded":
       return `push ${reason.commit.slice(0, 10)} was left out of integration (${reason.reason.slice(0, 160)}): its holder pushes again`;
+    case "push-regressed":
+      return `push ${reason.commit.slice(0, 10)} regressed the best revision so far (revision ${reason.rev}): it is not stacked until its holder pushes a fix`;
     case "waiting-on-others":
       return `push ${reason.commit.slice(0, 10)} was gated in revision ${reason.rev} and owes no fix: it waits on the other items`;
     case "fix-budget-exhausted":
@@ -3302,7 +3458,8 @@ export function seamHolds(state: BoardState): { readonly item: string; readonly 
 
 /**
  * Mechanical facts the lead weighs on a seam contract (advisory inputs, never
- * a decision): whether the latest failing output names the seam (its path, a
+ * a decision): whether the latest failing output (or, under arbitration
+ * revision 5, the regression evidence of the item's latest push) names the seam (its path, a
  * path ending in it such as `../contracts/auth.ts`, or a quoted name it
  * exports), and the earlier live seam change it duplicates (an identical
  * description, or the same quoted NEW identifier, one no seam exports yet;
@@ -3313,7 +3470,10 @@ export function seamContractFacts(state: BoardState, contractId: string): { read
   if (contract?.seam === undefined) {
     return { namedInFailure: false };
   }
-  const output = state.lastFailure?.output ?? "";
+  // Arbitration revision 5: the item's latest push regressed the pre-pass
+  // ratchet: the new failures its push alone added are failing output too.
+  const regression = contract.item !== undefined ? state.items[contract.item]?.lastPush?.regressed : undefined;
+  const output = [state.lastFailure?.output ?? "", ...(regression?.evidence ?? [])].join("\n");
   const segments = contract.seam.split("/");
   const pathNamed = segments.some((_, k) => {
     const suffix = segments.slice(k).join("/");
@@ -3370,9 +3530,28 @@ export function seamContractCue(state: BoardState, itemId: string): { readonly s
   if (failure === null || item === undefined || !failure.items.includes(itemId) || (state.seams ?? []).length === 0) {
     return undefined;
   }
+  const { seams, errors } = frozenSeamMismatches(state, item, failure.output.split(/\r?\n/));
+  const asked = (seam: string) =>
+    Object.values(state.contracts).some(
+      (c) =>
+        c.seam === seam &&
+        c.item === itemId &&
+        (c.status !== "rejected" || (c.decidedSeq ?? 0) >= (item.implicatedSeq ?? 0)),
+    );
+  const open = [...seams].filter((seam) => !asked(seam)).sort();
+  return open.length > 0 ? { seams: open, errors } : undefined;
+}
+
+/**
+ * The FROZEN shared seams the type/contract mismatches among `lines` point at
+ * (`path(line,col): error TS2339: ...` located in a seam, or in a file of the
+ * item that imports one, named by a type the seam exports), and the first
+ * few of those error lines. Pure.
+ */
+function frozenSeamMismatches(state: BoardState, item: BoardItem, lines: readonly string[]): { readonly seams: Set<string>; readonly errors: string[] } {
   const seams = new Set<string>();
   const errors: string[] = [];
-  for (const line of failure.output.split(/\r?\n/)) {
+  for (const line of lines) {
     const m = /^\s*(?:\.\/)?([^\s()]+)\(\d+,\d+\): error (TS\d+): /.exec(line);
     if (!m || !TYPE_MISMATCH_CODES.has(m[2]!)) {
       continue;
@@ -3394,15 +3573,7 @@ export function seamContractCue(state: BoardState, itemId: string): { readonly s
       errors.push(line.trim().slice(0, 300));
     }
   }
-  const asked = (seam: string) =>
-    Object.values(state.contracts).some(
-      (c) =>
-        c.seam === seam &&
-        c.item === itemId &&
-        (c.status !== "rejected" || (c.decidedSeq ?? 0) >= (item.implicatedSeq ?? 0)),
-    );
-  const open = [...seams].filter((seam) => !asked(seam)).sort();
-  return open.length > 0 ? { seams: open, errors } : undefined;
+  return { seams, errors };
 }
 
 /** True when an item changes a shared seam (it goes first). */
@@ -3885,6 +4056,33 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       if (push.excluded !== undefined) {
         fail("DUPLICATE", `${p.agent}'s push ${p.commit.slice(0, 12)} for ${item.id} is already recorded excluded`);
+      }
+      return;
+    }
+    case "push.regressed": {
+      const p = draft.payload;
+      if (!arbitrationV5(state)) {
+        fail("NOT_ALLOWED", "a push regression is recorded only under arbitration revision 5 (the pre-pass progress ratchet)");
+      }
+      if (state.integrated !== null) {
+        fail("INVALID_STATE", `a revision already passed (revision ${state.integrated.n}): the pre-pass ratchet is over`);
+      }
+      const item = requireItem(state, p.item);
+      const push = item.lastPush;
+      if (push === undefined || push.commit !== p.commit || push.agent !== p.agent || push.integratedIn !== undefined || push.gatedIn === undefined) {
+        fail("INVALID_STATE", `${p.commit.slice(0, 12)} is not ${p.agent}'s latest, gated, unintegrated push for ${item.id}`);
+      }
+      if (p.rev < push.gatedIn || p.rev > state.lastRevN) {
+        fail("UNKNOWN_REF", `revision ${p.rev} is not a recorded revision since ${item.id}'s push was first gated (revision ${push.gatedIn})`);
+      }
+      if (p.ratchet >= p.rev) {
+        fail("BAD_PAYLOAD", `the ratchet (revision ${p.ratchet}) must precede the regressing revision ${p.rev}`);
+      }
+      if (compareProgressScore(p.to, p.from) >= 0) {
+        fail("BAD_PAYLOAD", `a regression scores worse than the ratchet (${describeProgressScore(p.to)} is not worse than ${describeProgressScore(p.from)})`);
+      }
+      if (push.regressed !== undefined) {
+        fail("DUPLICATE", `${p.agent}'s push ${p.commit.slice(0, 12)} for ${item.id} is already recorded regressed`);
       }
       return;
     }
@@ -4963,6 +5161,22 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       const push = state.items[message.payload.item]!.lastPush!;
       push.excluded = { seq: message.seq, reason: message.payload.reason };
       // The holder must act now: its lease runs again from here.
+      renewLease(state, message.payload.item, message.seq);
+      break;
+    }
+    case "push.regressed": {
+      const push = state.items[message.payload.item]!.lastPush!;
+      const p = message.payload;
+      push.regressed = {
+        seq: message.seq,
+        rev: p.rev,
+        ratchet: p.ratchet,
+        from: { ...p.from },
+        to: { ...p.to },
+        evidence: [...p.evidence],
+        ...(p.seams !== undefined ? { seams: [...p.seams] } : {}),
+      };
+      // The holder must act now (a fix): its lease runs again from here.
       renewLease(state, message.payload.item, message.seq);
       break;
     }
@@ -6105,6 +6319,7 @@ const RECORDED_ENGINE_TYPES: ReadonlySet<BoardMessageType> = new Set([
   "run.capped",
   "candidate.gated",
   "push.excluded",
+  "push.regressed",
 ]);
 
 /**
@@ -6401,7 +6616,17 @@ export function promotionRefusal(
 }
 
 /** The engine messages the operator records through the engine-record route (`appendEngineRecord`). */
-export const ENGINE_RECORD_TYPES = ["claim.lapsed", "clash.predicted", "trunk.moved", "token.refreshed", "revision.promoted", "run.capped", "candidate.gated", "push.excluded"] as const;
+export const ENGINE_RECORD_TYPES = [
+  "claim.lapsed",
+  "clash.predicted",
+  "trunk.moved",
+  "token.refreshed",
+  "revision.promoted",
+  "run.capped",
+  "candidate.gated",
+  "push.excluded",
+  "push.regressed",
+] as const;
 export type EngineRecordType = (typeof ENGINE_RECORD_TYPES)[number];
 
 /**
@@ -6427,6 +6652,11 @@ export type EngineRecordType = (typeof ENGINE_RECORD_TYPES)[number];
  *     holder's pending push out of the integrated tree (it failed
  *     verification); addressed to the holder, it is not re-gated until the
  *     holder pushes again.
+ *   - push.regressed {item, agent, commit, rev, ratchet, from, to, candidate,
+ *     evidence, seams?}: under arbitration revision 5, before the first pass,
+ *     the holder's push regressed the pre-pass ratchet (its isolation tree
+ *     scored worse); addressed to the holder, it is not stacked again until
+ *     the holder pushes again.
  * Refused (nothing appended) when the record does not match the board.
  */
 export function appendEngineRecord(state: BoardState, input: unknown, at: string): BoardAppendResult {
@@ -6495,6 +6725,17 @@ export function appendEngineRecord(state: BoardState, input: unknown, at: string
       return appendChecked(
         state,
         { from: BOARD_ENGINE, type: "push.excluded", payload, ...(activeAgent(state, payload.agent) ? { to: [payload.agent] } : {}) },
+        at,
+      );
+    }
+    case "push.regressed": {
+      if (Object.keys(raw).some((k) => !["item", "agent", "commit", "rev", "ratchet", "from", "to", "candidate", "evidence", "seams"].includes(k))) {
+        fail("BAD_PAYLOAD", "a push.regressed record is {item, agent, commit, rev, ratchet, from, to, candidate, evidence, seams?}");
+      }
+      const payload = parsePayload("push.regressed", raw) as BoardPayloads["push.regressed"];
+      return appendChecked(
+        state,
+        { from: BOARD_ENGINE, type: "push.regressed", payload, ...(activeAgent(state, payload.agent) ? { to: [payload.agent] } : {}) },
         at,
       );
     }
@@ -6567,6 +6808,52 @@ export function summarizeBoard(state: BoardState): BoardSummary {
   };
 }
 
+/**
+ * The seams a regressing push edits, split into FROZEN blueprint seams (no
+ * item owns them: a seam contract is the route) and the other shared files
+ * (an owned seam, a contracts file, the store). Pure.
+ */
+function regressionSeams(state: BoardState, seams: readonly string[]): { readonly frozen: string[]; readonly shared: string[] } {
+  const frozen = seams.filter((seam) => seamTarget(state, seam) !== undefined && seamOwner(state, seam) === undefined);
+  return { frozen, shared: seams.filter((seam) => !frozen.includes(seam)) };
+}
+
+/**
+ * Arbitration revision 5: the seam contract cue of a held item whose latest
+ * push regressed the pre-pass ratchet by editing a FROZEN shared seam (the
+ * board accepts a seam contract for it), unless that seam was already asked
+ * about for the item. Pure.
+ */
+function regressionSeamCue(
+  state: BoardState,
+  item: BoardItem,
+  regression: NonNullable<BoardItemPush["regressed"]> | undefined,
+): { readonly seams: readonly string[]; readonly errors: readonly string[] } | undefined {
+  if (regression === undefined) {
+    return undefined;
+  }
+  // The frozen seams the push edits, and those its new type errors point at (as the failing-revision cue reads them).
+  const named = frozenSeamMismatches(state, item, regression.evidence);
+  const asked = (seam: string) => Object.values(state.contracts).some((c) => c.seam === seam && c.item === item.id && c.status !== "rejected");
+  const open = [...new Set([...regressionSeams(state, regression.seams ?? []).frozen, ...named.seams])].filter((seam) => !asked(seam)).sort();
+  return open.length > 0 ? { seams: open, errors: named.errors.length > 0 ? named.errors : regression.evidence.slice(0, 4) } : undefined;
+}
+
+/**
+ * The regression a push.regressed records, quoted for its holder:
+ * `your push adds 22 type errors: src/billing/payments.ts(25,12): ...`. Pure.
+ */
+export function regressionQuote(r: Pick<BoardPayloads["push.regressed"], "from" | "to" | "evidence">): string {
+  const added = r.to.typeErrors - r.from.typeErrors;
+  const what =
+    !r.to.runs && r.to.typeErrors > 0 && added > 0
+      ? `your push adds ${added} type error${added === 1 ? "" : "s"}`
+      : !r.to.runs && r.from.runs
+        ? `with your push the acceptance suite no longer runs (${describeProgressScore(r.to)})`
+        : `your push takes the best revision from ${describeProgressScore(r.from)} to ${describeProgressScore(r.to)}`;
+  return r.evidence.length > 0 ? `${what}: ${r.evidence.slice(0, 3).join(" | ")}` : what;
+}
+
 /** A compact, per-agent view of the board: what one agent needs for its next turn. */
 export interface BoardDigest {
   readonly agent: string;
@@ -6595,6 +6882,21 @@ export interface BoardDigest {
     readonly fix?: { readonly n: number; readonly attempt: number; readonly instruction: string };
     /** The integrator left this claim's latest push out (push.excluded): fix and push again. */
     readonly excluded?: { readonly commit: string; readonly reason: string; readonly instruction: string };
+    /**
+     * Arbitration revision 5: this claim's latest push REGRESSED the pre-pass
+     * ratchet (push.regressed): `evidence` quotes the new failure lines;
+     * with `seams` the push edited a shared seam (propose a seam contract
+     * instead). Not stacked again until you push again.
+     */
+    readonly regressed?: {
+      readonly commit: string;
+      readonly rev: number;
+      readonly from: string;
+      readonly to: string;
+      readonly evidence: readonly string[];
+      readonly seams?: readonly string[];
+      readonly instruction: string;
+    };
     /** Seam-changing items this held item waits for before editing (bounded), then it rebases. */
     readonly waitsFor?: readonly string[];
     /** The failing check is in a protected path (the contract): propose a contract change if it pins old behavior. */
@@ -6875,6 +7177,14 @@ export function boardDigest(
     return m.type === "review.result" && myReviews.has(m.payload.review);
   };
   const held = Object.values(state.items).filter((i) => i.status === "claimed" && i.owner === agent && i.intent);
+  // Arbitration revision 5: the recorded regression of each held item's latest push.
+  const regressions = new Map<string, NonNullable<BoardItemPush["regressed"]> & { readonly commit: string }>();
+  for (const i of held) {
+    const r = i.lastPush?.regressed;
+    if (r !== undefined && i.lastPush!.agent === agent && i.lastPush!.integratedIn === undefined) {
+      regressions.set(i.id, { ...r, commit: i.lastPush!.commit });
+    }
+  }
   const failure = state.lastFailure;
   const askedToFix = failure !== null && held.some((i) => i.fixRequested === failure.n);
   return {
@@ -6909,14 +7219,43 @@ export function boardDigest(
             },
           }
         : {}),
+      ...((): Pick<BoardDigest["claims"][number], "regressed"> => {
+        const r = regressions.get(i.id);
+        if (r === undefined) {
+          return {};
+        }
+        const { frozen, shared } = regressionSeams(state, r.seams ?? []);
+        const seamHint =
+          frozen.length > 0
+            ? ` It edits the shared seam ${frozen.join(", ")}, which no item owns: do not change a seam other items import; send message kind contract {target: ${frozen[0]}, change: modify, itemId: ${i.id}, description: the exact change you need} (the lead decides).`
+            : shared.length > 0
+              ? ` It edits the shared file ${shared.join(", ")} that other items import: keep it backward compatible (add what you need; never rename or remove what others use), or propose the change as a seam contract instead of editing it.`
+              : "";
+        return {
+          regressed: {
+            commit: r.commit,
+            rev: r.rev,
+            from: describeProgressScore(r.from),
+            to: describeProgressScore(r.to),
+            evidence: [...r.evidence],
+            ...(r.seams !== undefined ? { seams: [...r.seams] } : {}),
+            instruction:
+              `your push ${r.commit.slice(0, 10)} REGRESSED the best revision so far (revision ${r.ratchet}: ${describeProgressScore(r.from)}): ` +
+              `with your push alone it scores ${describeProgressScore(r.to)}${r.evidence.length > 0 ? `; new failures: ${r.evidence.slice(0, 3).join(" | ")}` : ""}. ` +
+              `Fix exactly that (stay inside the write intent; use only APIs that exist) and push again; it is not stacked until you do.${seamHint}`,
+          },
+        };
+      })(),
       ...(i.fixRequested !== undefined
         ? {
             fix: {
               n: i.fixRequested,
               attempt: i.fixAttempts ?? 1,
-              instruction:
-                `revision ${i.fixRequested} FAILED the gate and implicates this item (fix attempt ${i.fixAttempts ?? 1} of ${state.rules.maxFixAttempts}): ` +
-                "edit it now to make the gate pass (digest.failure has the output). Your done proposal does not complete it, and you are not waiting for integration",
+              instruction: regressions.has(i.id)
+                ? `revision ${i.fixRequested} FAILED the gate and your push alone regressed it (fix attempt ${i.fixAttempts ?? 1} of ${state.rules.maxFixAttempts}): ${regressionQuote(regressions.get(i.id)!)}. ` +
+                  "Edit it now to remove the regression (claims.regressed has the evidence). Your done proposal does not complete it, and you are not waiting for integration"
+                : `revision ${i.fixRequested} FAILED the gate and implicates this item (fix attempt ${i.fixAttempts ?? 1} of ${state.rules.maxFixAttempts}): ` +
+                  "edit it now to make the gate pass (digest.failure has the output). Your done proposal does not complete it, and you are not waiting for integration",
             },
           }
         : {}),
@@ -6936,7 +7275,7 @@ export function boardDigest(
           : {};
       })(),
       ...((): { seamCue?: { seams: string[]; errors: string[]; hint: string } } => {
-        const cue = i.fixRequested !== undefined ? seamContractCue(state, i.id) : undefined;
+        const cue = i.fixRequested !== undefined ? (seamContractCue(state, i.id) ?? regressionSeamCue(state, i, regressions.get(i.id))) : undefined;
         return cue
           ? {
               seamCue: {

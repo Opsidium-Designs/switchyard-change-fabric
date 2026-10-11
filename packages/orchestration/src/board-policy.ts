@@ -885,7 +885,10 @@ function decide(input: Input, options: GenericBoardPolicyOptions = {}): AgentAct
         return {
           type: "edit",
           itemId: claim.item,
-          instruction: `Fix what failed the integration gate on revision ${claim.fix.n} (attempt ${claim.fix.attempt}): ${claim.objective}`,
+          instruction:
+            claim.regressed !== undefined
+              ? `Fix the regression my push ${claim.regressed.commit.slice(0, 10)} introduced on revision ${claim.fix.n} (attempt ${claim.fix.attempt}; ${claim.regressed.to} against the best ${claim.regressed.from}): ${claim.objective}`
+              : `Fix what failed the integration gate on revision ${claim.fix.n} (attempt ${claim.fix.attempt}): ${claim.objective}`,
         };
       }
     }

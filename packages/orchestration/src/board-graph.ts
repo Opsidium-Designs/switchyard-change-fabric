@@ -65,6 +65,8 @@ export type { BoardMessage, BoardState } from "@switchyard-change/change-core";
 // Re-exported so the console can validate a recorded log with the board's own
 // reducer through its declared dependency on this package.
 export { reduceBoard } from "@switchyard-change/change-core";
+// The pre-pass ratchet's one line for the board pane (arbitration revision 5; never a verdict).
+export { ratchetLine } from "@switchyard-change/change-core";
 
 export type BoardGraphNodeKind = "goal" | "lead" | "agent" | "item" | "rev" | "tool" | "jev" | "human";
 
@@ -429,6 +431,7 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     case "revision.promoted":
     case "candidate.gated":
     case "push.excluded":
+    case "push.regressed":
     case "fix.requested":
     case "fix.exhausted":
       return "rev";

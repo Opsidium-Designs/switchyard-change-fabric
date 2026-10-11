@@ -130,6 +130,7 @@ export type {
   BoardDigestHelp,
   BoardDigestStruggle,
   BoardRevProgress,
+  BoardProgressScore,
   BoardSeam,
   BoardVolunteer,
   BoardDraft,
@@ -243,6 +244,11 @@ export {
   arbitrationV2,
   arbitrationV3,
   arbitrationV4,
+  arbitrationV5,
+  progressScore,
+  compareProgressScore,
+  describeProgressScore,
+  regressionQuote,
   stalledLapseUntakeable,
   waitingOnOthers,
   boardClock,
@@ -322,6 +328,8 @@ export {
   speculationStateKey,
   speculativeUnits,
 } from "./board-integration-plan.ts";
+export type { PrePassRatchet, RatchetStep } from "./progress-ratchet.ts";
+export { prePassRatchet, ratchetHistory, ratchetLine, ratchetUnits } from "./progress-ratchet.ts";
 export type { AttributableUnit } from "./failure-attribution.ts";
 export { attributeFailure, combineAttribution, failingRepoFiles } from "./failure-attribution.ts";
 export type { ImplicationSource } from "./failure-attribution.ts";
