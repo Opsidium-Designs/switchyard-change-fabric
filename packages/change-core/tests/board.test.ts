@@ -15,6 +15,7 @@ import {
   seamWaits,
   activeClaims,
   claimCapReached,
+  waitingOnOthers,
   appendSeamStalled,
   appendEngineRecord,
   ENGINE_RECORD_TYPES,
@@ -3320,14 +3321,16 @@ describe("arbitration revision 2 (rules.arbitration)", () => {
     }
   }
 
-  it("only revision 1 or 2 is accepted; revision 1 is the default and is not recorded", () => {
+  it("only revisions 1 to 3 are accepted; revision 1 is the default and is not recorded", () => {
     const one = seeded({ arbitration: 1 });
     expect(one.state.rules.arbitration).toBeUndefined();
     expect(one.log[0]!.type === "goal.posted" && one.log[0]!.payload.rules.arbitration).toBeUndefined();
     const two = seeded({ arbitration: 2 });
     expect(two.state.rules.arbitration).toBe(2);
+    const three = seeded({ arbitration: 3 });
+    expect(three.state.rules.arbitration).toBe(3);
     const board = new TestBoard();
-    board.reject(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 3 } }), /arbitration/, "BAD_PAYLOAD");
+    board.reject(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 4 } }), /arbitration/, "BAD_PAYLOAD");
   });
 
   for (const arbitration of [1, 2]) {
@@ -3393,6 +3396,125 @@ describe("arbitration revision 2 (rules.arbitration)", () => {
       }
       expect(reduceBoard(board.log)).toEqual(board.state);
       expect(foldBoard(board.log)).toEqual(board.state);
+    });
+  }
+});
+
+describe("arbitration revision 3: an item waiting on others (conjunctive gates)", () => {
+  /** Six items, agents a/b/c and a lead, a claim cap of one; a/b/c each claim and push one..three. */
+  function sixPushed(rules: Record<string, number>): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", rules: { maxActiveClaims: 1, ...rules } }));
+    for (const agent of ["a", "b", "c"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    for (const item of ["one", "two", "three", "four", "five", "six"]) {
+      board.post(msg("lead", "item.proposed", { item, objective: `fix ${item}`, acceptance: ["ok"], scopeHint: [`src/${item}.ts`] }));
+    }
+    for (const [agent, item] of [["a", "one"], ["b", "two"], ["c", "three"]] as const) {
+      board.post(claim(agent, item, [`src/${item}.ts`]));
+      board.post(push(agent, item, `c-${item}`, [`src/${item}.ts`]));
+    }
+    return board;
+  }
+  /** A failing revision merging all three pushes whose failures are the unmerged items' only. */
+  const outstandingFail = (items: string[] = [], outstanding: string[] = ["four", "five", "six"]) =>
+    msg("engine", "integrated.rev", {
+      commit: "r1",
+      gate: "fail",
+      merged: ["c-one", "c-two", "c-three"],
+      failing: { output: "\u2716 four: fails\n\u2716 five: fails\n\u2716 six: fails", items, outstanding },
+    });
+
+  it("a gated push owing no fix frees the cap: U4 is not held by the cap and a fourth claim is granted", () => {
+    const board = sixPushed({ arbitration: 3 });
+    // Before the gate, every holder owes work (its push waits for the gate): capped, and the open items wait on the cap.
+    expect(claimCapReached(board.state, "a")).toMatchObject({ cap: 1, holding: ["one"] });
+    expect(itemWaitReason(board.state, "four")).toEqual({ kind: "held-by-claim-cap", agents: 3 });
+    board.reject(claim("a", "four", ["src/four.ts"]), /cap 1/, "CLAIM_CAP");
+    // The board accepts a failing revision that implicates no merged item.
+    const appended = board.post(outstandingFail());
+    expect(appended.map((m) => m.type)).toEqual(["integrated.rev"]);
+    expect(board.state.lastFailure).toMatchObject({ n: 1, items: [], outstanding: ["four", "five", "six"] });
+    for (const agent of ["a", "b", "c"]) {
+      expect(claimCapReached(board.state, agent)).toBeUndefined();
+      expect(activeClaims(board.state, agent)).toEqual([]);
+      expect(boardDigest(board.state, board.log, agent, 0).claimCap).toBeUndefined();
+    }
+    expect(waitingOnOthers(board.state, board.state.items.one!)).toBe(true);
+    expect(itemWaitReason(board.state, "one")).toEqual({ kind: "waiting-on-others", commit: "c-one", rev: 1 });
+    expect(describeWaitReason(itemWaitReason(board.state, "one")!)).toMatch(/gated in revision 1 and owes no fix: it waits on the other items/);
+    expect(itemWaitReason(board.state, "four")).toEqual({ kind: "unclaimed" });
+    expect(board.types(claim("a", "four", ["src/four.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+    // Hoarding protection: a now owes work on four (no push yet), so it is capped again.
+    board.reject(claim("a", "five", ["src/five.ts"]), /holds 1 unfinished item\(s\) \(four; cap 1\)/, "CLAIM_CAP");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+    expect(foldBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a fix request (or an excluded push) still counts against the cap", () => {
+    const board = sixPushed({ arbitration: 3, maxFixAttempts: 3 });
+    // The failure names one's own test: one is implicated and its owner asked for a fix.
+    expect(board.types(outstandingFail(["one"], ["four"]))).toEqual(["integrated.rev", "fix.requested"]);
+    expect(board.state.items.one!.fixRequested).toBe(1);
+    expect(waitingOnOthers(board.state, board.state.items.one!)).toBe(false);
+    expect(claimCapReached(board.state, "a")).toMatchObject({ cap: 1, holding: ["one"] });
+    board.reject(claim("a", "four", ["src/four.ts"]), /cap 1/, "CLAIM_CAP");
+    // b and c were not implicated: they have room.
+    expect(claimCapReached(board.state, "b")).toBeUndefined();
+    expect(board.types(claim("b", "four", ["src/four.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+    // An excluded push owes a new push: counts.
+    board.post(push("c", "three", "c-three-2", ["src/three.ts"]));
+    board.post(msg("engine", "push.excluded", { item: "three", agent: "c", commit: "c-three-2", reason: "failed verification" }));
+    expect(claimCapReached(board.state, "c")).toMatchObject({ holding: ["three"] });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("revision 2 keeps the old cap: an item counts until its push PASSED", () => {
+    const board = sixPushed({ arbitration: 2 });
+    board.post(outstandingFail());
+    expect(waitingOnOthers(board.state, board.state.items.one!)).toBe(false);
+    expect(claimCapReached(board.state, "a")).toMatchObject({ cap: 1, holding: ["one"] });
+    expect(itemWaitReason(board.state, "four")).toEqual({ kind: "held-by-claim-cap", agents: 3 });
+    expect(itemWaitReason(board.state, "one")).toBeUndefined();
+    board.reject(claim("a", "four", ["src/four.ts"]), /let it pass an integrated revision/, "CLAIM_CAP");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("the failing evidence's outstanding items must be known items not in the revision", () => {
+    const board = sixPushed({ arbitration: 3 });
+    board.reject(outstandingFail([], ["ghost"]), /outstanding item\(s\) ghost are unknown or in this revision/, "UNKNOWN_REF");
+    board.reject(outstandingFail([], ["one"]), /outstanding item\(s\) one are unknown or in this revision/, "UNKNOWN_REF");
+  });
+
+  function chatter(board: TestBoard, n: number): void {
+    for (let k = 0; k < n; k += 1) {
+      board.post(msg("lead", "item.proposed", { item: `pad-${board.state.lastSeq}`, objective: "pad", acceptance: [], scopeHint: ["docs/**"] }));
+    }
+  }
+
+  for (const arbitration of [2, 3]) {
+    it(`a gated, unimplicated claim ${arbitration === 3 ? "never lapses for no progress (only at its deadline)" : "lapses for no progress (revision 2)"}`, () => {
+      const board = sixPushed({ arbitration, claimLeaseMessages: 4, claimDeadlineMessages: 40 });
+      board.post(outstandingFail());
+      chatter(board, 10);
+      if (arbitration === 2) {
+        expect(board.log.filter((m) => m.type === "claim.lapsed").map((m) => m.type === "claim.lapsed" && m.payload.reason)).toContain("no-progress");
+        expect(board.state.items.one!.status).toBe("open");
+      } else {
+        expect(board.log.filter((m) => m.type === "claim.lapsed")).toEqual([]);
+        expect(board.state.items.one!.status).toBe("claimed");
+        expect(leaseLapse(board.state, "one")).toBeUndefined();
+        const lease = boardDigest(board.state, board.log, "a", 0).claims.find((c) => c.item === "one")!.lease!;
+        expect(lease.lapsesAt).toBeUndefined();
+        expect(lease.hint).toMatch(/does not lapse for no progress, only at its deadline/);
+        // A quiet board does not record it stalled: its holder is not the one stalling it.
+        board.reject(msg("engine", "claim.lapsed", { item: "one" }), /waits on the other items/, "INVALID_STATE");
+        // The firm deadline still applies.
+        chatter(board, 40);
+        const lapses = board.log.filter((m) => m.type === "claim.lapsed" && m.payload.item === "one");
+        expect(lapses.map((m) => m.type === "claim.lapsed" && m.payload.reason)).toEqual(["deadline"]);
+      }
+      expect(reduceBoard(board.log)).toEqual(board.state);
     });
   }
 });

@@ -419,7 +419,7 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
   const outcomes = new Map<number, { rev?: number; blamed?: readonly string[] }>();
   const record = async (
     c: BuiltCandidate,
-    failingEvidence?: { failing: { output: string; items: string[] }; implicated: NonNullable<BoardRevision["implicated"]> },
+    failingEvidence?: { failing: { output: string; items: string[]; outstanding?: string[] }; implicated: NonNullable<BoardRevision["implicated"]> },
     decisions: BoardDecisionRecord[] = [],
   ): Promise<{ revision?: BoardRevision; failure?: string; stale?: boolean }> => {
     const items = itemsOf(c);
@@ -529,6 +529,8 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
       check: blamed.evidence!.integration.finalCheck,
       scrub,
       items: [...blamedEntry!.unit.items],
+      // The candidate also carries the landed prefix: those pushes are in its tree, never outstanding.
+      inTree: itemsOf(blamed),
       changeId: options.change.id,
       ...(options.jev && !landed ? { jev: options.jev } : {}),
       ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),

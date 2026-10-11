@@ -2338,8 +2338,9 @@ export function selectImplicatedUnits(
 export function attributeImplicatedUnits(
   gatedUnits: readonly GatedUnitInput[],
   evidence: string,
-): { readonly units: readonly GatedUnitInput[]; readonly attributed: boolean } {
-  return attributeFailure(gatedUnits, evidence);
+  outstandingUnits: readonly GatedUnitInput[] = [],
+): { readonly units: readonly GatedUnitInput[]; readonly attributed: boolean; readonly outstanding: readonly GatedUnitInput[] } {
+  return attributeFailure(gatedUnits, evidence, outstandingUnits);
 }
 
 /**

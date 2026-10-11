@@ -247,7 +247,8 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     const failedFile = gate.runs.find((r) => r.file !== undefined)!.file!;
     expect(first!.payload.failing!.output).toContain(failedFile);
     const owner = Object.values(result.state.items).find((i) => (i.intent?.write ?? i.scopeHint).some((w) => failedFile.startsWith(w.replace("/**", ""))));
-    expect(result.revisions[0]!.implicated).toEqual({ items: first!.payload.failing!.items, source: "parse" });
+    // (Revision 3 also lists the unmerged items whose scope covers the failing file: advisory.)
+    expect(result.revisions[0]!.implicated).toMatchObject({ items: first!.payload.failing!.items, source: "parse" });
     expect(first!.payload.failing!.items).toHaveLength(1);
     // The engine addresses the fix request to that item's owner only.
     const fix = of(log, "fix.requested");

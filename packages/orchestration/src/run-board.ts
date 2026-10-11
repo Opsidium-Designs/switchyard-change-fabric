@@ -63,6 +63,8 @@ import {
   type BoardDigest,
   type BoardItem,
   combineAttribution,
+  type ImplicationSource,
+  arbitrationV3,
   isAcceptedItem,
   isChangeItem,
   toolUnavailableReason,
@@ -333,8 +335,12 @@ export interface BoardRevision {
   readonly excludedAgents: readonly { readonly agent: string; readonly reason: string }[];
   /** Items the board completed from this revision. */
   readonly completedItems: readonly string[];
-  /** A failing revision's implicated items and how attribution chose them. */
-  readonly implicated?: { readonly items: readonly string[]; readonly source: "parse" | "jev" | "all" };
+  /**
+   * A failing revision's implicated items and how attribution chose them;
+   * `outstanding` lists the items NOT in the revision the failure maps to
+   * (source "outstanding": they alone fail, so no merged item is implicated).
+   */
+  readonly implicated?: { readonly items: readonly string[]; readonly source: ImplicationSource; readonly outstanding?: readonly string[] };
   /** A failing revision's reason: its first line(s), bounded (the full evidence is on the board). */
   readonly failure?: string;
   /** Set when accepted contract changes relaxed the test inventory for this revision. */
@@ -751,29 +757,43 @@ function head(text: string, max: number): string {
  * attribution (parse the failing output for the files and names it reports and
  * map them to the items' write intents), then a CONFIDENT typed-decision choice
  * when one is configured (advisory narrowing, never a verdict), else every item
- * the revision merged.
+ * the revision merged. With `outstanding` (items whose work is not in the
+ * gated tree), the same parse maps the failures to them too: a failure that
+ * maps only to outstanding items implicates no merged item (`outstanding`)
+ * and the typed decision is not consulted; a mixed one implicates only the
+ * merged items whose own failures it names (the typed decision is still
+ * asked and recorded, advisory, but never adds blame to a merged item the
+ * parse cleared).
  */
 export async function attributeRevisionFailure(input: {
   readonly items: readonly { readonly id: string; readonly objective: string; readonly paths: readonly string[] }[];
+  /** Items NOT in the revision (their work is not in the gated tree), for the parse only. */
+  readonly outstanding?: readonly { readonly id: string; readonly objective: string; readonly paths: readonly string[] }[];
   readonly output: string;
   readonly changeId: string;
   readonly jev?: AskJev;
   readonly jevThreshold?: number;
   /** Record the typed decision's outcome (accepted, low-confidence, or an error): never silent. */
   readonly onDecision?: (decision: BoardDecisionRecord) => Promise<unknown>;
-}): Promise<{ readonly items: readonly string[]; readonly source: "parse" | "jev" | "all"; readonly pick?: string }> {
-  const units: GatedUnitInput[] = input.items.map((i) => ({
+}): Promise<{ readonly items: readonly string[]; readonly source: ImplicationSource; readonly pick?: string; readonly outstanding?: readonly string[] }> {
+  const unitOf = (i: { readonly id: string; readonly objective: string; readonly paths: readonly string[] }): GatedUnitInput => ({
     unitId: i.id,
     objective: i.objective,
     paths: i.paths,
     authRemote: "",
     gateCommand: [],
     requiredExports: [],
-  }));
-  const parsed = attributeImplicatedUnits(units, input.output);
+  });
+  const units: GatedUnitInput[] = input.items.map(unitOf);
+  const outstandingItems = input.outstanding ?? [];
+  const parsed = attributeImplicatedUnits(units, input.output, outstandingItems.map(unitOf));
   const parsedItems = parsed.attributed ? inOrder(parsed.units.map((u) => u.unitId), input.items) : [];
+  const outstanding = inOrder(parsed.outstanding.map((u) => u.unitId), outstandingItems);
   let pick: string | undefined;
-  if (input.jev && units.length > 1) {
+  // Every failure an outstanding item's: the parse cleared every merged item,
+  // so there is nothing for the typed decision to choose among.
+  const clearedAll = parsed.attributed && parsedItems.length === 0 && outstanding.length > 0;
+  if (input.jev && units.length > 1 && !clearedAll) {
     const ids = units.map((u) => u.unitId);
     const question = "Which item does this failure implicate?";
     // The gate output and the objectives are untrusted (agent-written code and
@@ -821,8 +841,9 @@ export async function attributeRevisionFailure(input: {
     parsed: parsedItems,
     attributed: parsed.attributed,
     picks: pick !== undefined ? [pick] : [],
+    ...(outstanding.length > 0 ? { outstanding } : {}),
   });
-  return { items: combined.items, source: combined.source, ...(pick !== undefined ? { pick } : {}) };
+  return { items: combined.items, source: combined.source, ...(pick !== undefined ? { pick } : {}), ...(outstanding.length > 0 ? { outstanding } : {}) };
 }
 
 /** One path's tree entry (mode and blob) in a commit, for the paths a glob set covers. */
@@ -957,11 +978,17 @@ export async function failingRevisionEvidence(input: {
   readonly scrub: (text: string) => string;
   /** The items attribution chooses among (a failing revision's merged items). */
   readonly items: readonly BoardItem[];
+  /**
+   * Every item whose push is in the gated tree (default `items`): a
+   * speculative candidate also carries the landed prefix's pushes, which are
+   * never outstanding.
+   */
+  readonly inTree?: readonly BoardItem[];
   readonly changeId: string;
   readonly jev?: AskJev;
   readonly jevThreshold?: number;
   readonly onDecision?: (decision: BoardDecisionRecord) => Promise<unknown>;
-}): Promise<{ failing: { output: string; items: string[] }; implicated: NonNullable<BoardRevision["implicated"]> }> {
+}): Promise<{ failing: { output: string; items: string[]; outstanding?: string[] }; implicated: NonNullable<BoardRevision["implicated"]> }> {
   const { state, check, scrub } = input;
   // Lead with the gate's own failing line (a SyntaxError, a failing test),
   // then its output, then the integrator's summary.
@@ -974,8 +1001,15 @@ export async function failingRevisionEvidence(input: {
   const regressed = Object.values(state.items).filter(
     (i) => i.status === "done" && i.lastPush !== undefined && i.lastPush.paths.some((p) => raw.includes(p)),
   );
+  // Arbitration revision 3: the items whose work is NOT in this tree yet
+  // (not merged, not integrated by an earlier pass, not done). A failure that
+  // maps only to them is theirs, not the merged items'.
+  const outstanding = arbitrationV3(state) ? outstandingItems(state, input.inTree ?? input.items) : [];
   const attribution = await attributeRevisionFailure({
     items: input.items.map((i) => ({ id: i.id, objective: i.objective, paths: (i.intent?.write ?? []).map(intentPath) })),
+    ...(outstanding.length > 0
+      ? { outstanding: outstanding.map((i) => ({ id: i.id, objective: i.objective, paths: (i.intent?.write ?? i.scopeHint).map(intentPath) })) }
+      : {}),
     output: raw,
     changeId: input.changeId,
     ...(input.jev ? { jev: input.jev } : {}),
@@ -985,13 +1019,39 @@ export async function failingRevisionEvidence(input: {
   // A split item's failure is its children's work: ask their owners.
   const narrowed = narrowToSplitChildren(state, attribution.items, raw);
   const note =
-    regressed.length > 0
-      ? `regressed completed item(s): ${regressed.map((i) => i.id).join(", ")} (their files fail after this revision's pushes)\n`
-      : "";
+    (regressed.length > 0 ? `regressed completed item(s): ${regressed.map((i) => i.id).join(", ")} (their files fail after this revision's pushes)\n` : "") +
+    (attribution.source === "outstanding"
+      ? `the failures map only to item(s) not in this revision: ${(attribution.outstanding ?? []).join(", ")} (no merged item is implicated)\n`
+      : "");
   return {
-    failing: { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: [...narrowed] },
+    failing: {
+      output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput),
+      items: [...narrowed],
+      ...(attribution.outstanding !== undefined ? { outstanding: [...attribution.outstanding] } : {}),
+    },
     implicated: { ...attribution, items: narrowed },
   };
+}
+
+/**
+ * The OUTSTANDING items for a failing revision whose gated tree carries the
+ * pushes of `inTree`: accepted change items (no tools) whose work is not in
+ * that tree: not merged into it (a merged sub-lead push carries its
+ * children), not integrated by an earlier passing revision, and not done. A
+ * failure in a done or integrated item's tests is a regression this
+ * revision's pushes caused, never "outstanding". Sorted by id. Pure.
+ */
+export function outstandingItems(state: BoardState, inTree: readonly BoardItem[]): BoardItem[] {
+  const merged = new Set<string>();
+  for (const item of inTree) {
+    merged.add(item.id);
+    for (const m of item.lastPush?.merges ?? []) {
+      merged.add(m.item);
+    }
+  }
+  return Object.values(state.items)
+    .filter((i) => isChangeItem(i) && i.status !== "done" && !merged.has(i.id) && i.lastPush?.integratedIn === undefined)
+    .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 /** Keep `chosen` in the items' order. */
@@ -1179,7 +1239,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   const install = evidence.integration.finalCheck.skipped ? undefined : installing?.takeLastInstall();
   const attributionDecisions: BoardDecisionRecord[] = [];
   const flushDecisions = (n: number | undefined): Promise<void> => flushAttributionDecisions(options.operator, options.recordDecision, attributionDecisions, n);
-  let failing: { output: string; items: string[] } | undefined;
+  let failing: { output: string; items: string[]; outstanding?: string[] } | undefined;
   let implicated: BoardRevision["implicated"];
   if (gate === "fail") {
     ({ failing, implicated } = await failingRevisionEvidence({

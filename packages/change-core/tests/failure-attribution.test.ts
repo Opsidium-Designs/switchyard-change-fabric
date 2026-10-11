@@ -37,6 +37,67 @@ describe("combineAttribution", () => {
   });
 });
 
+describe("outstanding items: failures of work not in the revision blame no merged item", () => {
+  // The service-api shape: one whole-goal acceptance suite, one resource per item.
+  const resource = (id: string, name: string) => ({ unitId: id, paths: [`src/resources/${name}.js`] });
+  const mergedUnits = [resource("U1-users-resource", "users"), resource("U2-orders-resource", "orders"), resource("U3-products-resource", "products")];
+  const outstandingUnits = [resource("U4-search-resource", "search"), resource("U5-notifications-resource", "notifications"), resource("U6-auth-resource", "auth")];
+  const suite = (failing: readonly string[]) =>
+    [
+      "> switchyard-change-fabric-service-api@0.0.0 gate",
+      "> node --check src/resources/users.js && node --check src/resources/search.js",
+      ...["users", "orders", "products", "auth", "search", "notifications"].flatMap((r) =>
+        [`unauthenticated request is rejected (401/403)`, `authenticated but invalid input is rejected with 400`].map(
+          (t) => `${failing.includes(r) ? "\u2716" : "\u2714"} ${r}: ${t} (1.0ms)`,
+        ),
+      ),
+      ...failing.map((r) => `  AssertionError [ERR_ASSERTION]: ${r} must reject an unauthenticated request via requireAuth, got 201`),
+    ].join("\n");
+
+  it("merged U1-U3 with only auth/search/notifications failing: no merged unit is implicated; the outstanding ones are listed", () => {
+    const parse = attributeFailure(mergedUnits, suite(["auth", "search", "notifications"]), outstandingUnits);
+    expect(parse).toEqual({ units: [], attributed: true, outstanding: outstandingUnits });
+    expect(
+      combineAttribution({
+        merged: mergedUnits.map((u) => u.unitId),
+        parsed: parse.units.map((u) => u.unitId),
+        attributed: parse.attributed,
+        picks: ["U1-users-resource"],
+        outstanding: parse.outstanding.map((u) => u.unitId),
+      }),
+    ).toEqual({ items: [], source: "outstanding" });
+  });
+
+  it("output that maps to no board item at all still falls back to every merged unit (all)", () => {
+    const parse = attributeFailure(mergedUnits, "AssertionError: something broke somewhere\n", outstandingUnits);
+    expect(parse).toEqual({ units: mergedUnits, attributed: false, outstanding: [] });
+    expect(combineAttribution({ merged: mergedUnits.map((u) => u.unitId), parsed: [], attributed: false, picks: [] })).toEqual({
+      items: mergedUnits.map((u) => u.unitId),
+      source: "all",
+    });
+  });
+
+  it("mixed: only the merged unit whose own tests fail is implicated; the typed decision cannot add a merged unit the parse cleared", () => {
+    const parse = attributeFailure(mergedUnits, suite(["orders", "search", "auth"]), outstandingUnits);
+    expect(parse.units.map((u) => u.unitId)).toEqual(["U2-orders-resource"]);
+    expect(parse.outstanding.map((u) => u.unitId)).toEqual(["U4-search-resource", "U6-auth-resource"]);
+    expect(
+      combineAttribution({
+        merged: mergedUnits.map((u) => u.unitId),
+        parsed: ["U2-orders-resource"],
+        attributed: true,
+        picks: ["U1-users-resource"],
+        outstanding: ["U4-search-resource", "U6-auth-resource"],
+      }),
+    ).toEqual({ items: ["U2-orders-resource"], source: "parse" });
+  });
+
+  it("without outstanding units the parse is unchanged (the revision 1 and 2 behavior)", () => {
+    const parse = attributeFailure(mergedUnits, suite(["auth", "search", "notifications"]));
+    expect(parse).toEqual({ units: mergedUnits, attributed: false, outstanding: [] });
+  });
+});
+
 describe("type-checker locations", () => {
   const tscOutput = [
     "> storefront@0.0.0 gate",

@@ -33,6 +33,7 @@ import {
   type BoardMessage,
   type BoardRevProgress,
   type BoardState,
+  type ImplicationSource,
 } from "@switchyard-change/change-core";
 import {
   INTEGRATE_JOB_VERSION,
@@ -346,8 +347,11 @@ export interface CloudRevisionRecord {
   readonly advanceError?: string;
 }
 
-/** How a failing revision's implicated items were chosen. */
-export type AttributionSource = "parse" | "jev" | "all";
+/**
+ * How a failing revision's implicated items were chosen (the shared label;
+ * the Workflow passes no outstanding units, so it never records "outstanding").
+ */
+export type AttributionSource = ImplicationSource;
 
 /** The driver's advisory choice for a failing revision (validated against what it merged). */
 export interface DriverAttribution {

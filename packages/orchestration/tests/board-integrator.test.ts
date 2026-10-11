@@ -526,6 +526,33 @@ describe("attributeRevisionFailure", () => {
     });
   });
 
+  it("with outstanding items: a failure that maps only to them implicates nobody (the typed decision is not consulted); a mixed one only the merged item it names", async () => {
+    const outstanding = [{ id: "z", objective: "do z", paths: ["src/z/**"] }];
+    let asked = 0;
+    const counting: AskJev = async () => {
+      asked += 1;
+      return { attribution: { type: "choice", choice: "a", confidence: 0.99 } };
+    };
+    expect(await attributeRevisionFailure({ items, outstanding, output: "FAIL src/z/x.ts", changeId: "c", jev: counting })).toEqual({
+      items: [],
+      source: "outstanding",
+      outstanding: ["z"],
+    });
+    expect(asked).toBe(0);
+    // Mixed: only the merged item whose own failure the output names; the
+    // typed decision is asked (advisory) but its confident pick of a cleared item adds nothing.
+    expect(await attributeRevisionFailure({ items, outstanding, output: "FAIL src/z/x.ts\nFAIL src/b/y.ts", changeId: "c", jev: counting })).toEqual({
+      items: ["b"],
+      source: "parse",
+      pick: "a",
+      outstanding: ["z"],
+    });
+    expect(asked).toBe(1);
+    // Output naming no item at all: the existing fallback (and the typed decision) as before.
+    expect(await attributeRevisionFailure({ items, outstanding, output: "boom", changeId: "c", jev: counting })).toEqual({ items: ["a"], source: "jev", pick: "a" });
+    expect(asked).toBe(2);
+  });
+
   it("frames the decision input as untrusted data: the gate output and objectives are scrubbed, bounded, and delimited", async () => {
     let seenState = "";
     let seenDescriptions: Readonly<Record<string, string>> = {};

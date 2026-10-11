@@ -240,6 +240,8 @@ export {
   claimCapReached,
   leasesOn,
   arbitrationV2,
+  arbitrationV3,
+  waitingOnOthers,
   boardClock,
   CURRENT_ARBITRATION,
   itemWaitReason,

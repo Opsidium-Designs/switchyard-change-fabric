@@ -73,9 +73,11 @@ export interface BoardRules {
   readonly maxFixAttempts: number;
   /**
    * Unfinished items one agent may hold at once (absent: unlimited). An item
-   * is unfinished until its owner's latest push passed an integrated revision.
-   * Seam items (accepted seam contracts) and tool items are exempt: the cap
-   * stops hoarding, never the fix or tool a held item needs.
+   * is unfinished until its owner's latest push passed an integrated revision;
+   * under arbitration revision 3, until that push was GATED (pass or fail)
+   * with no fix owed (see waitingOnOthers). Seam items (accepted seam
+   * contracts) and tool items are exempt: the cap stops hoarding, never the
+   * fix or tool a held item needs.
    */
   readonly maxActiveClaims?: number;
   /**
@@ -118,7 +120,7 @@ export interface BoardRules {
   /**
    * The engine's ARBITRATION revision (absent: 1, how every board before it
    * was arbitrated, so a recorded log replays exactly as it was recorded).
-   * Revision 2 (what a new run posts):
+   * Revision 2:
    *   - a different agent granted (or handed) an item starts with a fresh fix
    *     budget, whatever released the previous holder;
    *   - a claim's deadline is not charged for the time its push waited for
@@ -127,12 +129,23 @@ export interface BoardRules {
    *   - the lease, deadline, lapse cooldown, contest idle, seam wait, and help
    *     wait clocks count PARTICIPANT messages only (never engine records such
    *     as clash predictions, candidates, or token refreshes).
+   * Revision 3 (what a new run posts) adds WAITING ON OTHERS: an item whose
+   * holder's latest push was gated in a revision (pass or fail) and is not
+   * owed a fix (no fix request, not excluded, not implicated by that
+   * revision) waits on the other items, not on its holder:
+   *   - it no longer counts against the holder's claim cap (maxActiveClaims),
+   *     so the holder may take another item;
+   *   - its claim does not lapse for NO PROGRESS while it waits (the firm
+   *     deadline still applies).
+   * The local integrator, under it, implicates no merged item when a failing
+   * gate's output maps only to items not in the revision (see
+   * failure-attribution's "outstanding" source).
    */
   readonly arbitration?: number;
 }
 
 /** The arbitration revision a new board run posts (see BoardRules.arbitration). */
-export const CURRENT_ARBITRATION = 2;
+export const CURRENT_ARBITRATION = 3;
 
 export const DEFAULT_BOARD_RULES: BoardRules = { maxContestTurns: 3, contestIdleMessages: 25, maxFixAttempts: 2 };
 
@@ -366,6 +379,13 @@ export interface BoardFailingEvidence {
   readonly output: string;
   /** The items the integrator's attribution implicated (all of the revision's items when it could not narrow). */
   readonly items: readonly string[];
+  /**
+   * Items NOT in this revision the failure maps to (their own tests fail and
+   * their work is not in the gated tree). With `items` empty, the failure is
+   * the outstanding items' alone: no merged item is implicated or asked to
+   * fix. Advisory record only; it drives no arbitration.
+   */
+  readonly outstanding?: readonly string[];
 }
 
 export interface BoardPayloads {
@@ -1763,7 +1783,7 @@ function failingEvidence(value: unknown): BoardFailingEvidence {
     fail("BAD_PAYLOAD", "failing must be an object {output, items}");
   }
   for (const key of Object.keys(value)) {
-    if (key !== "output" && key !== "items") {
+    if (key !== "output" && key !== "items" && key !== "outstanding") {
       fail("BAD_PAYLOAD", `failing has an unknown field ${JSON.stringify(key)}`);
     }
   }
@@ -1771,7 +1791,8 @@ function failingEvidence(value: unknown): BoardFailingEvidence {
   if (typeof output !== "string" || output.length > BOARD_LIMITS.maxFailingOutput) {
     fail("BAD_PAYLOAD", `failing.output must be a string of at most ${BOARD_LIMITS.maxFailingOutput} characters`);
   }
-  return { output, items: idList(value, "items", { max: BOARD_LIMITS.maxIntentEntries }) };
+  const outstanding = value.outstanding === undefined ? undefined : idList(value, "outstanding", { max: BOARD_LIMITS.maxIntentEntries });
+  return { output, items: idList(value, "items", { max: BOARD_LIMITS.maxIntentEntries }), ...(outstanding !== undefined ? { outstanding } : {}) };
 }
 
 /** Validate a goal's test inventory: a status, and bounded format, count, and names. */
@@ -2793,10 +2814,38 @@ export function seamItemHolding(state: BoardState, other: BoardItem): boolean {
 }
 
 /**
+ * Under arbitration revision 3: true when a held item WAITS ON OTHERS, not on
+ * its holder: the holder's latest push was GATED in a revision (pass or fail),
+ * it was not left out (push.excluded), and no fix is owed on it (no fix
+ * request, no spent fix budget, not implicated by a failing revision since
+ * that push). With a whole-goal gate that passes only when every item's fix
+ * is in, such an item can do nothing until the others land. Always false
+ * before revision 3. Pure.
+ */
+export function waitingOnOthers(state: BoardState, item: BoardItem): boolean {
+  if (!arbitrationV3(state) || (item.status !== "claimed" && item.status !== "contested") || item.owner === undefined) {
+    return false;
+  }
+  const push = item.lastPush;
+  if (push === undefined || push.agent !== item.owner || push.gatedIn === undefined || push.excluded !== undefined) {
+    return false;
+  }
+  if (item.fixRequested !== undefined || item.fixExhausted === true) {
+    return false;
+  }
+  // Implicated by a failing revision after this push: its fix request follows.
+  return push.integratedIn !== undefined || item.implicatedSeq === undefined || item.implicatedSeq < push.seq;
+}
+
+/**
  * The items counting toward `agent`'s active-claim cap: the change items it
  * holds (or is contesting for) that are UNFINISHED, i.e. its latest push has
- * not passed an integrated revision. Seam items, tool items, and split items
- * (a sub-lead's) are exempt. Pure.
+ * not passed an integrated revision (under arbitration revision 3: the holder
+ * still owes work on it: no push yet, a push not yet gated, an excluded push,
+ * or a fix owed; an item waiting on others does not count). The hoarding
+ * protection holds either way: an agent claims again only once its current
+ * item's push has been through a gate. Seam items, tool items, and split
+ * items (a sub-lead's) are exempt. Pure.
  */
 export function activeClaims(state: BoardState, agent: string): string[] {
   return Object.values(state.items)
@@ -2811,7 +2860,7 @@ export function activeClaims(state: BoardState, agent: string): string[] {
         return false;
       }
       const passed = i.lastPush !== undefined && i.lastPush.agent === agent && i.lastPush.integratedIn !== undefined && i.fixRequested === undefined;
-      return !passed;
+      return !passed && !waitingOnOthers(state, i);
     })
     .map((i) => i.id)
     .sort();
@@ -2854,6 +2903,11 @@ export function leasesOn(state: BoardState): boolean {
 /** True under arbitration revision 2 or later (rules.arbitration, recorded in goal.posted). Pure. */
 export function arbitrationV2(state: BoardState): boolean {
   return (state.rules.arbitration ?? 1) >= 2;
+}
+
+/** True under arbitration revision 3 or later (waiting on others; see BoardRules.arbitration). Pure. */
+export function arbitrationV3(state: BoardState): boolean {
+  return (state.rules.arbitration ?? 1) >= 3;
 }
 
 /**
@@ -2917,8 +2971,9 @@ export interface BoardLeaseLapse {
 /**
  * The lapse a held claim is due for at board seq `now`, or undefined: its firm
  * deadline is reached, or (lease rule) no progress for `claimLeaseMessages`
- * messages and it is not waiting on a seam change. Never while suspended (see
- * leaseSuspension). Measured in board messages, so the same log always
+ * messages and it is not waiting on a seam change (nor, under arbitration
+ * revision 3, waiting on others: see waitingOnOthers). Never while suspended
+ * (see leaseSuspension). Measured in board messages, so the same log always
  * derives the same lapses. Pure.
  */
 export function leaseLapse(state: BoardState, itemId: string, now: number = state.lastSeq): BoardLeaseLapse | undefined {
@@ -2938,7 +2993,14 @@ export function leaseLapse(state: BoardState, itemId: string, now: number = stat
     return { reason: "deadline", lastProgressSeq: lease.progressSeq, deadlineSeq: lease.deadlineSeq };
   }
   const limit = state.rules.claimLeaseMessages;
-  if (limit !== undefined && clock - anchorClock(state, lease.progressSeq, lease.progressTick) >= limit && seamWaits(state, item.id).length === 0) {
+  // Revision 3: an item waiting on others has nothing for its holder to do
+  // (its push was gated and no fix is owed): no-progress never lapses it.
+  if (
+    limit !== undefined &&
+    clock - anchorClock(state, lease.progressSeq, lease.progressTick) >= limit &&
+    seamWaits(state, item.id).length === 0 &&
+    !waitingOnOthers(state, item)
+  ) {
     return { reason: "no-progress", lastProgressSeq: lease.progressSeq };
   }
   return undefined;
@@ -3027,6 +3089,8 @@ export type BoardWaitReason =
   | { readonly kind: "waiting-for-gate"; readonly commit: string }
   /** Its holder's latest push was left out of integration (push.excluded): the holder pushes again. */
   | { readonly kind: "push-excluded"; readonly commit: string; readonly reason: string }
+  /** Revision 3: its holder's push was gated in revision `rev` and no fix is owed: it waits for the other items (see waitingOnOthers). */
+  | { readonly kind: "waiting-on-others"; readonly commit: string; readonly rev: number }
   /** Its fix budget was spent (by these agents): fresh eyes or a re-plan. */
   | { readonly kind: "fix-budget-exhausted"; readonly by: readonly string[] }
   /** Open and nothing holds it: any agent may claim it. */
@@ -3097,6 +3161,9 @@ export function itemWaitReason(state: BoardState, itemId: string): BoardWaitReas
   if (item.fixExhausted) {
     return { kind: "fix-budget-exhausted", by: item.owner !== undefined ? [item.owner] : [] };
   }
+  if (push !== undefined && push.integratedIn === undefined && waitingOnOthers(state, item)) {
+    return { kind: "waiting-on-others", commit: push.commit, rev: push.gatedIn! };
+  }
   return undefined;
 }
 
@@ -3119,6 +3186,8 @@ export function describeWaitReason(reason: BoardWaitReason): string {
       return `push ${reason.commit.slice(0, 10)} waits for the gate`;
     case "push-excluded":
       return `push ${reason.commit.slice(0, 10)} was left out of integration (${reason.reason.slice(0, 160)}): its holder pushes again`;
+    case "waiting-on-others":
+      return `push ${reason.commit.slice(0, 10)} was gated in revision ${reason.rev} and owes no fix: it waits on the other items`;
     case "fix-budget-exhausted":
       return `fix budget spent${reason.by.length > 0 ? ` by ${reason.by.join(", ")}` : ""}: fresh eyes or a re-plan`;
     case "unclaimed":
@@ -3476,7 +3545,7 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         if (capped) {
           fail(
             "CLAIM_CAP",
-            `${draft.from} holds ${capped.holding.length} unfinished item(s) (${capped.holding.join(", ")}; cap ${capped.cap}): finish one (push it and let it pass an integrated revision) or hand it off before claiming ${item.id}`,
+            `${draft.from} holds ${capped.holding.length} unfinished item(s) (${capped.holding.join(", ")}; cap ${capped.cap}): finish one (${arbitrationV3(state) ? "push it and let the gate take it with no fix asked" : "push it and let it pass an integrated revision"}) or hand it off before claiming ${item.id}`,
           );
         }
       }
@@ -3816,6 +3885,9 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         }
         if (seamWaits(state, item.id).length > 0) {
           fail("INVALID_STATE", `item ${item.id} waits on a seam change: its holder is not the one stalling it`);
+        }
+        if (waitingOnOthers(state, item)) {
+          fail("INVALID_STATE", `item ${item.id} waits on the other items (its push was gated, no fix owed): its holder is not the one stalling it`);
         }
       }
       return;
@@ -5919,6 +5991,10 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
     if (strangers.length > 0) {
       fail("UNKNOWN_REF", `implicated item(s) ${strangers.join(", ")} had no push in this revision`);
     }
+    const misnamed = (input.failing.outstanding ?? []).filter((item) => state.items[item] === undefined || mergedItems.includes(item));
+    if (misnamed.length > 0) {
+      fail("UNKNOWN_REF", `outstanding item(s) ${misnamed.join(", ")} are unknown or in this revision`);
+    }
   }
   return {
     n: state.lastRevN + 1,
@@ -5927,7 +6003,15 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
     merged: [...input.merged],
     paths,
     contributors,
-    ...(input.failing !== undefined ? { failing: { output: input.failing.output, items: [...input.failing.items] } } : {}),
+    ...(input.failing !== undefined
+      ? {
+          failing: {
+            output: input.failing.output,
+            items: [...input.failing.items],
+            ...(input.failing.outstanding !== undefined ? { outstanding: [...input.failing.outstanding] } : {}),
+          },
+        }
+      : {}),
     ...(input.gated === false ? { gated: false as const } : {}),
     ...(input.unverified !== undefined ? { unverified: input.unverified.map((u) => ({ ...u })) } : {}),
     ...(input.progress !== undefined ? { progress: JSON.parse(JSON.stringify(input.progress)) as BoardRevProgress } : {}),
@@ -6813,7 +6897,9 @@ export function boardDigest(
         if (lease === undefined) {
           return {};
         }
-        const limit = state.rules.claimLeaseMessages;
+        // Revision 3: an item waiting on others never lapses for no progress.
+        const waiting = waitingOnOthers(state, i);
+        const limit = waiting ? undefined : state.rules.claimLeaseMessages;
         const suspended = leaseSuspension(state, i);
         // Revision 2 counts participant messages only: the earliest board seq it could lapse at.
         const lapsesAt =
@@ -6831,9 +6917,11 @@ export function boardDigest(
             hint:
               suspended !== undefined
                 ? `your claim cannot lapse now (${suspended})`
-                : arbitrationV2(state)
-                  ? `your claim lapses${lapsesAt !== undefined ? ` after ${lapsesAt - state.lastSeq} more participant message(s) unless you make progress on ${i.id} first (edit and push, or a message naming it)` : ""}${lease.deadlineTick !== undefined ? `${lapsesAt !== undefined ? ", and" : ""} at its deadline (${Math.max(0, lease.deadlineTick - boardClock(state))} more participant message(s)) unless the lead extends it` : ""}; then the item is open for another agent`
-                  : `your claim lapses${lapsesAt !== undefined ? ` at board seq ${lapsesAt} unless you make progress on ${i.id} first (edit and push, or a message naming it)` : ""}${lease.deadlineSeq !== undefined ? `${lapsesAt !== undefined ? ", and" : ""} at its deadline seq ${lease.deadlineSeq} unless the lead extends it` : ""}; then the item is open for another agent`,
+                : waiting
+                  ? `${i.id} waits on the other items (its push was gated and no fix is owed): it does not lapse for no progress${lease.deadlineTick !== undefined ? `, only at its deadline (${Math.max(0, lease.deadlineTick - boardClock(state))} more participant message(s)) unless the lead extends it` : ""}`
+                  : arbitrationV2(state)
+                    ? `your claim lapses${lapsesAt !== undefined ? ` after ${lapsesAt - state.lastSeq} more participant message(s) unless you make progress on ${i.id} first (edit and push, or a message naming it)` : ""}${lease.deadlineTick !== undefined ? `${lapsesAt !== undefined ? ", and" : ""} at its deadline (${Math.max(0, lease.deadlineTick - boardClock(state))} more participant message(s)) unless the lead extends it` : ""}; then the item is open for another agent`
+                    : `your claim lapses${lapsesAt !== undefined ? ` at board seq ${lapsesAt} unless you make progress on ${i.id} first (edit and push, or a message naming it)` : ""}${lease.deadlineSeq !== undefined ? `${lapsesAt !== undefined ? ", and" : ""} at its deadline seq ${lease.deadlineSeq} unless the lead extends it` : ""}; then the item is open for another agent`,
           },
         };
       })(),
@@ -6906,7 +6994,9 @@ export function boardDigest(
             claimCap: {
               cap: capped.cap,
               holding: [...capped.holding],
-              hint: `you hold ${capped.holding.length} unfinished item(s) (${capped.holding.join(", ")}; cap ${capped.cap}): finish one (edit, push, let it pass) or hand it off before claiming another; idle agents take the open items`,
+              hint: arbitrationV3(state)
+                ? `you hold ${capped.holding.length} unfinished item(s) (${capped.holding.join(", ")}; cap ${capped.cap}): push one and let the gate take it (once its push is gated with no fix asked, it no longer counts), or hand it off, before claiming another; idle agents take the open items`
+                : `you hold ${capped.holding.length} unfinished item(s) (${capped.holding.join(", ")}; cap ${capped.cap}): finish one (edit, push, let it pass) or hand it off before claiming another; idle agents take the open items`,
             },
           }
         : {};

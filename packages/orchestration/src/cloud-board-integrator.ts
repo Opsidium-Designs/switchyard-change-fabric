@@ -17,7 +17,7 @@
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
-import { pendingPushKey, type BoardState } from "@switchyard-change/change-core";
+import { pendingPushKey, type BoardState, type ImplicationSource } from "@switchyard-change/change-core";
 import type { WorkspaceRef } from "@switchyard-change/artifact-workspace";
 import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { authenticatedRemote, type GitIdentity } from "@switchyard-change/local-runner";
@@ -288,7 +288,7 @@ export class CloudBoardIntegrator implements BoardIntegratorLike {
        */
       readonly attribute?: (request: CloudAttributionRequest) => Promise<{
         readonly items: readonly string[];
-        readonly source: "parse" | "jev" | "all";
+        readonly source: ImplicationSource;
         /** The confident typed-decision pick, when there was one. */
         readonly pick?: string;
         readonly decisions: readonly BoardDecisionRecord[];

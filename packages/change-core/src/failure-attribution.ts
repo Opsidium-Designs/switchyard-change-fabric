@@ -3,8 +3,10 @@
  * items, WorkUnits) does it implicate? The files and resource names the output
  * reports are mapped to the units' declared paths and ids. Best-effort
  * narrowing, never a correctness claim: when nothing maps, every unit is
- * implicated (`attributed: false`). Shared by the local drivers and the
- * integration Workflow on Cloudflare. Pure: no I/O.
+ * implicated (`attributed: false`). A caller may also pass the OUTSTANDING
+ * units (work not in the gated tree): a failure that maps only to them
+ * implicates no gated unit. Shared by the local drivers and the integration
+ * Workflow on Cloudflare. Pure: no I/O.
  */
 
 /** What attribution needs of a unit. */
@@ -25,23 +27,31 @@ export interface AttributableUnit {
 export function attributeFailure<U extends AttributableUnit>(
   gatedUnits: readonly U[],
   evidence: string,
-): { readonly units: readonly U[]; readonly attributed: boolean } {
+  outstandingUnits: readonly U[] = [],
+): { readonly units: readonly U[]; readonly attributed: boolean; readonly outstanding: readonly U[] } {
   const failingFiles = extractFailingFiles(evidence);
   const failingNames = extractFailingNames(evidence);
   if (failingFiles.length === 0 && failingNames.length === 0) {
-    return { units: gatedUnits, attributed: false }; // nothing to attribute to: re-fan all
+    return { units: gatedUnits, attributed: false, outstanding: [] }; // nothing to attribute to: re-fan all
   }
-  const implicated = gatedUnits.filter(
-    (unit) =>
-      unit.paths.some((declared) => failingFiles.some((file) => pathCovers(declared, file))) ||
-      failingNames.some((name) => unitCoversName(unit, name)),
-  );
+  const maps = (unit: U) =>
+    unit.paths.some((declared) => failingFiles.some((file) => pathCovers(declared, file))) || failingNames.some((name) => unitCoversName(unit, name));
+  const implicated = gatedUnits.filter(maps);
+  // The same parse over the units whose work is NOT in the gated tree.
+  const outstanding = outstandingUnits.filter(maps);
+  if (implicated.length > 0) {
+    // Mixed: only the gated units whose own failures the output names.
+    return { units: implicated, attributed: true, outstanding };
+  }
+  if (outstanding.length > 0) {
+    // Every named failure is an outstanding unit's (its fix is not in this
+    // tree yet): no gated unit is implicated.
+    return { units: [], attributed: true, outstanding };
+  }
   // Honest fallback: if neither the named files nor the named resources map to
   // any unit, re-fan all rather than silently skip (the change failed either
   // way). Attribution is best-effort narrowing, not a correctness claim.
-  return implicated.length > 0
-    ? { units: implicated, attributed: true }
-    : { units: gatedUnits, attributed: false };
+  return { units: gatedUnits, attributed: false, outstanding: [] };
 }
 
 /**
@@ -302,8 +312,12 @@ function pathCoversRelative(declared: string, file: string): boolean {
   return f === d || f.startsWith(`${d}/`);
 }
 
-/** How a failing revision's implicated items were chosen. */
-export type ImplicationSource = "parse" | "jev" | "all";
+/**
+ * How a failing revision's implicated items were chosen: `outstanding` means
+ * the failure mapped only to items NOT in the revision, so no merged item is
+ * implicated.
+ */
+export type ImplicationSource = "parse" | "jev" | "all" | "outstanding";
 
 /**
  * Combine the parse with an advisory typed-decision pick into the implicated
@@ -315,7 +329,11 @@ export type ImplicationSource = "parse" | "jev" | "all";
  *     (`jev`), never the pick unioned with every item;
  *   - an attributed parse and a pick it already contains: the parse (`parse`:
  *     the pick changed nothing);
- *   - an attributed parse and a pick outside it: the parse plus the pick (`jev`).
+ *   - an attributed parse and a pick outside it: the parse plus the pick (`jev`);
+ *   - when the parse ALSO mapped failures to outstanding items (not in the
+ *     revision): it explained the failure, so no pick adds blame to a merged
+ *     item it cleared: the parse's merged items (`parse`), or none
+ *     (`outstanding`) when every failure was an outstanding item's.
  * Picks naming items outside `merged` are ignored. The result keeps `merged`'s order.
  */
 export function combineAttribution(input: {
@@ -325,9 +343,15 @@ export function combineAttribution(input: {
   readonly attributed: boolean;
   /** The confident typed-decision pick(s); empty for none. */
   readonly picks: readonly string[];
+  /** Items not in the revision the parse mapped failures to (absent or empty: none). */
+  readonly outstanding?: readonly string[];
 }): { readonly items: readonly string[]; readonly source: ImplicationSource } {
   const picks = input.picks.filter((p) => input.merged.includes(p));
   const ordered = (set: ReadonlySet<string>) => input.merged.filter((id) => set.has(id));
+  if (input.attributed && (input.outstanding ?? []).length > 0) {
+    const parsed = ordered(new Set(input.parsed));
+    return parsed.length > 0 ? { items: parsed, source: "parse" } : { items: [], source: "outstanding" };
+  }
   if (picks.length === 0) {
     return input.attributed
       ? { items: ordered(new Set(input.parsed)), source: "parse" }

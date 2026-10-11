@@ -175,7 +175,7 @@ two symbols in one file contest.
 default 3; `contestIdleMessages`, default 25; `maxFixAttempts`, default 2;
 the optional `maxActiveClaims`, `claimLeaseMessages`, `claimDeadlineMessages`,
 `claimOverlap`, `speculate` (speculative batch gating, 1 to 8; absent
-means 1), and `arbitration` (the arbitration revision, 1 or 2; absent means
+means 1), and `arbitration` (the arbitration revision, 1 to 3; absent means
 1), each absent on a board posted before it, which then behaves as
 before), the integration `baseline` commit and the `gateCommand`
 (both optional), and
@@ -187,8 +187,9 @@ self-describing.
 ARBITRATION REVISION (`rules.arbitration`). A recorded log replays under the
 rules it was recorded with, so arbitration changes that alter what a log
 derives sit behind this rule. Absent (revision 1) is how every earlier board
-was arbitrated; a new `run-board` posts revision 2 (pinning
-`rules: {arbitration: 1}` reproduces revision 1). Revision 2:
+was arbitrated; a new `run-board` posts revision 3 (pinning
+`rules: {arbitration: 1}` or `{arbitration: 2}` reproduces that revision).
+Revision 2:
 - a DIFFERENT agent granted (or handed) an item starts with a fresh fix
   budget (`fixAttempts`, `fixExhausted`, a tool's build failures), whatever
   released the previous holder (a lapse, a released seam stall, a ceded
@@ -206,9 +207,30 @@ was arbitrated; a new `run-board` posts revision 2 (pinning
 - the local integrator records the undecided pairs of one clash-prediction
   pass as ONE `clash.predicted` (the first pair; the count in the reason),
   never one record per pair.
+Revision 3 (everything in revision 2, plus WAITING ON OTHERS, for gates that
+pass only when every item's fix is in one revision, such as one whole-goal
+acceptance suite). An item WAITS ON OTHERS (`waitingOnOthers`) when its
+holder's latest push was GATED in a revision (pass or fail), the push was not
+excluded, and no fix is owed on it (no fix request, no spent fix budget, not
+implicated by a failing revision since the push). Then:
+- it does not count against the holder's claim cap, so the holder takes
+  another item while it waits (before revision 3 it counted until a PASSING
+  revision integrated it: with a cap of 1, three agents could hold only three
+  of six items and a conjunctive gate could never pass);
+- its claim does not lapse for no progress (the deadline still applies), and
+  a quiet board does not record it stalled; its wait reason is
+  `waiting-on-others`;
+- the local integrator implicates no merged item when a failing gate's output
+  maps only to items NOT in the revision (attribution source `outstanding`,
+  below).
 The three published replays and the K = 1 golden demo log carry no
 `arbitration` and reduce (and fold at every seq) exactly as before
-(`recorded-replay-compat.test.ts` pins their state hashes).
+(`recorded-replay-compat.test.ts` pins their state hashes); the coverage-run
+fixture pins revision 2 and records exactly as before. Revision 3 is a new
+revision rather than a change to revision 2 because a log recorded under
+revision 2 re-derives its lapses on replay: exempting a waiting item from the
+lease would make such a log (a live run since revision 2 was published) fail
+to replay.
 
 Proposals come first. An item the lead or a human proposes is `open` at once.
 An item a WORKER proposes (`item.proposed` or `item.discovered`) is `proposed`:
@@ -506,11 +528,19 @@ is distributed changes: items are proposed and claimed, never assigned.
   plan is empty (it can never end all-items-done) or the scaled turn budget is
   capped at 800 below what the plan asks (pass `--max-turns`).
 - No claim hoarding (`goal.posted.rules.maxActiveClaims`): an agent may hold
-  at most that many UNFINISHED change items (its latest push has not passed
-  an integrated revision); a further claim, or a handoff to an agent at its
-  cap, is refused (`CLAIM_CAP`) and the digest says so (`claimCap`: finish
-  one or hand it off). Seam items and tool items are exempt. A board posted
-  without the rule keeps unlimited claims.
+  at most that many UNFINISHED change items; a further claim, or a handoff to
+  an agent at its cap, is refused (`CLAIM_CAP`) and the digest says so
+  (`claimCap`: finish one or hand it off). Seam items and tool items are
+  exempt. A board posted without the rule keeps unlimited claims. Under
+  arbitration revision 3 an item is unfinished while its holder OWES WORK on
+  it: no push yet, a push not yet gated, an excluded push, or a fix owed; once
+  its latest push was gated (pass or fail) with no fix asked it waits on the
+  others and stops counting. The hoarding protection is unchanged: an agent
+  claims again only once its current item's push has been through a gate.
+  Before revision 3 an item counted until its push PASSED an integrated
+  revision, which deadlocked live run board-live-l1 (six items, three agents,
+  cap 1, one whole-goal acceptance suite): items four to six stayed
+  `held-by-claim-cap` forever and acceptance topped out at 14/20.
 - Seam first: the goal records the shared seams of a modular project (the
   cohesion blueprint's frozen contracts) with their importers
   (`goal.posted.seams`). An item whose scope covers a seam is offered first
@@ -849,6 +879,26 @@ is distributed changes: items are proposed and claimed, never assigned.
   outside an attributed parse is added to it (`jev`). The driver sends the
   Workflow only its pick, never its own combination, so the pick is never
   unioned with every item. The board then asks each implicated owner for a fix.
+- OUTSTANDING items (arbitration revision 3, the local integrator, K = 1 and
+  the speculative blame path): the same parse also runs over every board item
+  whose work is NOT in the gated tree (accepted change items not merged into
+  it, not integrated by an earlier pass, not done; their write intent, else
+  their scope hint). A failure that maps ONLY to such items implicates no
+  merged item: the revision is recorded with `failing.items: []` and
+  `failing.outstanding` listing them, no fix is requested and no fix budget is
+  charged, the summary says `implicated (outstanding): none`, and the typed
+  decision is not consulted. A MIXED failure implicates only the merged items
+  whose own failures it names; the typed decision is still asked (advisory,
+  recorded) but its pick never adds a merged item the parse cleared. `all`
+  remains only for output that maps to no board item at all. A failure in a
+  done or already integrated item's tests is a regression, never
+  outstanding. Before revision 3, run board-live-l1 blamed its three merged,
+  correct items for the failures of the unmerged ones (59 fix requests,
+  exhausted budgets, reopened items, and correct pushes dropped). Known
+  limit: the integration Workflow on Cloudflare does not pass outstanding
+  items yet (its parse is unchanged). The mapping is a parse, not proof: a
+  merged push that broke an outstanding item's test (on a baseline that
+  already failed it) is not caught by attribution; the gate still decides.
   A failure that names files of already COMPLETED items is a regression this
   revision's pushes caused (the tree passed before them): the evidence says
   which completed items regressed, and the fix is asked of the owners of the
@@ -1661,7 +1711,12 @@ recorded state only.
   the done proposal is left), a contract for the item waits for a decision, a
   helper holds a taken grant on it, or a contest on it is open (a contest
   settles its own way). A held item waiting on a seam change does not lapse
-  for no progress either.
+  for no progress either, nor (arbitration revision 3) one WAITING ON OTHERS
+  (its push was gated, no fix owed): its holder is working another item and
+  has nothing to do on it until the others land. Its deadline still applies
+  (its digest lease says so and gives no `lapsesAt`), and a quiet board never
+  records it stalled. Before revision 3 such a claim lapsed after one lease of
+  the holder working elsewhere, dropping a correct push.
 - The firm DEADLINE (`claimDeadlineMessages` from the grant) is not renewed by
   progress: the lead sees claims in their last quarter (`digest.deadlines`,
   with whether the holder is progressing) and extends one (`claim.extended`
@@ -1708,7 +1763,9 @@ contract, or a worker's proposal), `blocked-by` (a contest's owner item, a
 split's unfinished child, a sub-lead), `waiting-for-gate` (the pending push's
 commit: the revision has no number yet, so none is invented),
 `push-excluded` (the holder's latest push was left out of integration, with
-the reason: the holder pushes again), `fix-budget-exhausted` (by whom), or
+the reason: the holder pushes again), `waiting-on-others` (arbitration
+revision 3: the holder's push was gated in revision `rev` and owes no fix: it
+waits for the other items), `fix-budget-exhausted` (by whom), or
 `unclaimed`. A moving item has none.
 Each agent's digest carries it on its claims and the open items (`wait`, with
 one short line), and the console shows the line on every card. On a quiet
