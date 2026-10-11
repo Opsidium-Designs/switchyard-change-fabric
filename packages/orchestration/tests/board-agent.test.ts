@@ -91,7 +91,9 @@ interface Env {
   rawPost(token: string, draft: unknown): Promise<{ status: number; body: Record<string, unknown> }>;
 }
 
-async function setup(options: { readonly seams?: readonly { path: string; importers: string[] }[] } = {}): Promise<Env> {
+async function setup(
+  options: { readonly seams?: readonly { path: string; importers: string[] }[]; readonly rules?: Record<string, unknown> } = {},
+): Promise<Env> {
   const root = await mkdtemp(join(tmpdir(), "scf-board-agent-"));
   const projectDir = join(root, "project");
   for (const [rel, body] of Object.entries({
@@ -118,7 +120,10 @@ async function setup(options: { readonly seams?: readonly { path: string; import
     const outcome = await operator.postAsHuman(draft);
     expect(outcome.ok).toBe(true);
   };
-  await human({ type: "goal.posted", payload: { objective: "runtime", ...(options.seams ? { seams: options.seams } : {}) } });
+  await human({
+    type: "goal.posted",
+    payload: { objective: "runtime", ...(options.seams ? { seams: options.seams } : {}), ...(options.rules ? { rules: options.rules } : {}) },
+  });
   await human({ type: "item.proposed", payload: { item: "i1", objective: "do a", scopeHint: ["src/a/**"] } });
   await human({ type: "item.proposed", payload: { item: "i2", objective: "do b", scopeHint: ["src/b/**"] } });
   return {
@@ -841,6 +846,61 @@ describe("day-2 review regressions", () => {
   });
 });
 
+
+describe("waiting on others (arbitration revision 3)", () => {
+  /** w1 claims i1 and pushes for it under a claim cap of 1; the engine gates the push in a FAILING revision. */
+  async function gatedFailing(implicated: readonly string[], then: readonly AgentAction[]) {
+    const env = await setup({ rules: { maxActiveClaims: 1, arbitration: 3 } });
+    const executor = new RecordingExecutor(() => ({ "src/a/x.ts": "export const x = 'w1';\n" }));
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "go" },
+      { type: "wait", reason: "my push waits for the gate" },
+      ...then,
+    ]);
+    const w1 = env.agent("w1", { transport, executor, fetchRevision: async () => undefined });
+    await w1.join();
+    const before: string[] = [];
+    for (let i = 0; i < 4; i += 1) before.push(await w1.step());
+    expect(before).toEqual(["acted", "acted", "acted", "idle"]); // holds i1 with its push waiting for the gate
+    const push = (await env.log()).messages.find((m) => m.type === "push.announced" && m.from === "w1")!;
+    const rev = await env.operator.recordRevision({
+      commit: "badc0de",
+      gate: "fail",
+      merged: [(push.payload as { commit: string }).commit],
+      failing: { output: "not ok 1 - src/b/y.ts is wrong", items: [...implicated], ...(implicated.length === 0 ? { outstanding: ["i2"] } : {}) },
+    });
+    expect(rev.ok).toBe(true);
+    return { env, w1, transport };
+  }
+
+  it("a holder whose gated push is not implicated by a failing revision is free: it is nudged to claim and its claim is granted", async () => {
+    const { env, w1, transport } = await gatedFailing([], [{ type: "claim", itemId: "i2", intent: { read: [], write: ["src/b/**"] } }]);
+    expect(env.turns.at(-1)).toMatchObject({ action: { type: "wait" } }); // its last turn was a wait
+    expect(await w1.step()).toBe("acted");
+    const input = transport.inputs.at(-1)!;
+    const digest = input.digest as BoardDigest;
+    expect(digest.claimCap).toBeUndefined();
+    expect(digest.claims.find((c) => c.item === "i1")!.wait?.reason.kind).toBe("waiting-on-others");
+    expect(input.capsule.evidence.at(-1)).toMatch(/waiting on others.*claim one now/);
+    expect(env.turns.at(-1)).toMatchObject({ action: { type: "claim", itemId: "i2" }, outcome: "posted" });
+    const state = (await env.log()).state;
+    expect(state.items.i2).toMatchObject({ status: "claimed", owner: "w1" });
+  });
+
+  it("a holder implicated by the failing revision owes a fix: it is not free, gets no claim nudge, and a claim is refused at the cap", async () => {
+    const { env, w1, transport } = await gatedFailing(["i1"], [{ type: "claim", itemId: "i2", intent: { read: [], write: ["src/b/**"] } }]);
+    expect(await w1.step()).toBe("acted"); // the fix request wakes it
+    const input = transport.inputs.at(-1)!;
+    const digest = input.digest as BoardDigest;
+    expect(digest.claimCap).toBeDefined();
+    expect(digest.claims.find((c) => c.item === "i1")!.fix).toBeDefined();
+    expect(digest.claims.find((c) => c.item === "i1")!.wait?.reason.kind).not.toBe("waiting-on-others");
+    expect(input.capsule.evidence.some((e) => /claim one now/.test(e))).toBe(false);
+    expect(env.turns.at(-1)).toMatchObject({ action: { type: "claim", itemId: "i2" }, outcome: "rejected", code: "CLAIM_CAP" });
+    expect((await env.log()).state.items.i2!.status).toBe("open");
+  });
+});
 
 describe("help forks that did not start where the requester is", () => {
   it("a fork response with a base mismatch is recorded on help.offered (no grant taken), never silently used", async () => {

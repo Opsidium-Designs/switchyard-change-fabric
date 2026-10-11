@@ -771,7 +771,7 @@ export class BoardAgent {
       const count = (this.claimNudges.get(nudgeKey) ?? 0) + 1;
       this.claimNudges.set(nudgeKey, count);
       this.evidence.push(
-        `I hold no item and ${digest.openItems.length} open item(s) can be claimed: claim one now. Tools are accelerators, never prerequisites: when a tool is published use_tool it, otherwise edit by hand; never wait for a tool.`,
+        `I owe no work on what I hold (nothing, done, or waiting on others) and ${digest.openItems.length} open item(s) can be claimed: claim one now. Tools are accelerators, never prerequisites: when a tool is published use_tool it, otherwise edit by hand; never wait for a tool.`,
       );
     }
     // OPEN seam items (nobody holds them): wake an agent that is free or holds
@@ -909,14 +909,16 @@ export class BoardAgent {
   }
 
   /**
-   * Free: every claim it holds has a done proposal and no fix request, no
-   * claim is pending, and it holds no help grant it has not delivered yet.
+   * Free: every claim it holds has a done proposal and no fix request, or is
+   * waiting on others (its push was gated and not implicated, so it owes no
+   * work until another revision), no claim is pending, it is under its claim
+   * cap, and it holds no help grant it has not delivered yet.
    */
   private isFree(digest: BoardDigest): boolean {
     return (
       digest.claimCap === undefined &&
       digest.pending.length === 0 &&
-      digest.claims.every((c) => c.doneProposed && c.fix === undefined) &&
+      digest.claims.every((c) => (c.doneProposed && c.fix === undefined) || c.wait?.reason.kind === "waiting-on-others") &&
       !(digest.help?.granted ?? []).some((g) => g.live && g.delivered === undefined)
     );
   }
