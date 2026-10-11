@@ -175,6 +175,8 @@ export interface RunBoardOfflineOptions {
   readonly signal?: AbortSignal;
   /** After an interrupt: the wait for the agents and the in-flight integration, in ms. */
   readonly interruptGraceMs?: number;
+  /** The shared rate-limit backoff's window and bounds (see RunBoardOptions.rateLimit). */
+  readonly rateLimit?: RunBoardOptions["rateLimit"];
 }
 
 /** Run a board offline and deterministically. */
@@ -249,6 +251,7 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       ...(options.onEvent ? { onEvent: options.onEvent } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
       ...(options.interruptGraceMs !== undefined ? { interruptGraceMs: options.interruptGraceMs } : {}),
+      ...(options.rateLimit ? { rateLimit: options.rateLimit } : {}),
     });
     // The whole scratch directory: the offline control's repos and the run's work root.
     return { ...result, scratchRoot: workRoot };

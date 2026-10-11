@@ -20,6 +20,7 @@
 
 import { callGatewayJsonSchema } from "./gateway-json-schema.ts";
 import { isReasoningModel } from "./model-budget.ts";
+import { isRateLimitError } from "./rate-limit.ts";
 import { DEFAULT_WORKERS_AI_TIMEOUT_MS, type WorkersAiMessage } from "./workers-ai.ts";
 
 // ---------------------------------------------------------------------------
@@ -865,11 +866,26 @@ export interface AgentTurnInput<D = unknown, M = unknown> {
   readonly allowed: readonly AgentActionType[];
 }
 
+/** A turn call the gateway refused with a rate limit (no model decided anything). */
+export interface AgentTurnRateLimit {
+  /** The HTTP status (429, or 503 with Retry-After). */
+  readonly status: number;
+  readonly model: string;
+  /** The Retry-After delay the gateway asked for, in ms. */
+  readonly retryAfterMs?: number;
+}
+
 /** What a turn produced. */
 export interface AgentTurnOutcome {
   readonly action: AgentAction;
   /** Set when the model output (or the call) failed and the action is a recorded wait. */
   readonly invalid?: string;
+  /**
+   * Set when the call was rate limited (HTTP 429, or 503 with Retry-After):
+   * the action is a recorded wait that NO model decided, so the runtime backs
+   * off and does not spend a turn budget on it.
+   */
+  readonly rateLimited?: AgentTurnRateLimit;
   readonly model?: string;
   readonly inputTokens?: number;
   readonly outputTokens?: number;
@@ -1264,7 +1280,9 @@ export interface AiGatewayAgentTurnOptions {
  * through the gateway; the reply is validated with `parseAgentAction` against
  * the turn's allowed actions. A failed call or an invalid reply is returned as a
  * `wait` carrying the reason (never thrown), so the runtime records it and the
- * agent's budgets bound any repeat.
+ * agent's budgets bound any repeat. A rate-limited call (HTTP 429, or 503 with
+ * Retry-After) is such a wait flagged `rateLimited`, so the runtime backs off
+ * and spends no turn budget on it.
  */
 export function createAiGatewayAgentTurnInvoke(options: AiGatewayAgentTurnOptions): AgentTurnTransport {
   const fetchFn = options.fetchFn ?? fetch;
@@ -1291,6 +1309,16 @@ export function createAiGatewayAgentTurnInvoke(options: AiGatewayAgentTurnOption
         0,
         AGENT_ACTION_LIMITS.maxReason,
       );
+      if (isRateLimitError(error)) {
+        // The provider's rate or quota limit: a wait nobody decided, flagged so
+        // the runtime backs off instead of counting it as the agent's turn.
+        return {
+          action: { type: "wait", reason },
+          invalid: reason,
+          model: options.model,
+          rateLimited: { status: error.status, model: error.model, ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}) },
+        };
+      }
       return { action: { type: "wait", reason }, invalid: reason, model: options.model };
     }
     const parsed = agentActionOrWait(reply.content, input.allowed);

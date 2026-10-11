@@ -238,6 +238,12 @@ export interface PlanDiagnostic {
   readonly kind: "transport-error" | "validation-rejected";
   /** The thrown error message or the validatePlan rejection reason (no secrets). */
   readonly reason: string;
+  /**
+   * True when the transport error was a rate limit (an error named
+   * "RateLimitError": the gateway answered HTTP 429, or 503 with Retry-After),
+   * so a run can say its fall-back was the provider's limit, not the plan.
+   */
+  readonly rateLimited?: boolean;
 }
 
 /** The result of a plan pass: a decomposition plus the recorded plan. */
@@ -327,6 +333,7 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
         model,
         kind: "transport-error",
         reason: error instanceof Error ? error.message : String(error),
+        ...(error instanceof Error && error.name === "RateLimitError" ? { rateLimited: true } : {}),
       });
       continue;
     }

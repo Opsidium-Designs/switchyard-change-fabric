@@ -113,6 +113,9 @@ describe("CLI flag validation", () => {
     const nan = await runCli(offline("--max-calls", "NaN"));
     expect(nan.code).toBe(1);
     expect(nan.stderr).toContain('--max-calls must be a positive integer (got "NaN")');
+    const window = await runCli(offline("--rate-limit-window-ms", "0"));
+    expect(window.code).toBe(1);
+    expect(window.stderr).toContain('--rate-limit-window-ms must be a positive integer (got "0")');
     const spend = await runCli(offline("--max-spend-usd", "Infinity"));
     expect(spend.code).toBe(1);
     expect(spend.stderr).toContain("--max-spend-usd must be a positive number");

@@ -52,6 +52,8 @@ import {
   formatRunSummary,
   buildAppGateWiring,
   plannerFallbackBanner,
+  modelPlanRefusal,
+  REQUIRE_MODEL_PLAN_FLAG,
   ALLOW_HEURISTIC_PLANNER_FLAG,
   projectHasGateScript,
   readAppDeployment,
@@ -90,7 +92,7 @@ import {
   runToolSmoke,
   formatToolSmokeBuild,
 } from "@switchyard-change/orchestration";
-import { DEFAULT_JEV_MODEL, DiscoveringExecutor } from "@switchyard-change/model-adapters";
+import { DEFAULT_JEV_MODEL, describeRetryAfter, DiscoveringExecutor } from "@switchyard-change/model-adapters";
 
 const CLI_NAME = "switchyard-change";
 const VERSION = "0.0.0";
@@ -925,7 +927,7 @@ const commands: Command[] = [
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
       `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--id <changeId>] ` +
-      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [--rate-limit-window-ms N] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const goal = await resolveGoal(args);
@@ -980,6 +982,10 @@ const commands: Command[] = [
         ...(intFlag("--max-item-calls") !== undefined ? { maxCallsPerItem: intFlag("--max-item-calls")! } : {}),
         ...(Object.keys(prices).length > 0 ? { prices } : {}),
       };
+      // The shared rate-limit backoff: stop the run "rate-limited" after this
+      // long of consecutive HTTP 429s with no call getting through (default 10 min).
+      const rateLimitWindowMs = intFlag("--rate-limit-window-ms");
+      const rateLimit = rateLimitWindowMs !== undefined ? { rateLimit: { windowMs: rateLimitWindowMs } } : {};
       const gateTimeoutRaw = optionValue(args, "--gate-timeout-ms");
       const gateTimeoutMs = gateTimeoutRaw === undefined ? undefined : /^[0-9]+$/.test(gateTimeoutRaw) ? Number(gateTimeoutRaw) : Number.NaN;
       if (gateTimeoutMs !== undefined && (!Number.isInteger(gateTimeoutMs) || gateTimeoutMs < 1000)) {
@@ -1134,6 +1140,11 @@ const commands: Command[] = [
         console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
         return 1;
       }
+      const requireModelPlan = hasFlag(args, REQUIRE_MODEL_PLAN_FLAG);
+      if (requireModelPlan && hasFlag(args, ALLOW_HEURISTIC_PLANNER_FLAG)) {
+        console.error(`Error: ${REQUIRE_MODEL_PLAN_FLAG} refuses a heuristic plan, ${ALLOW_HEURISTIC_PLANNER_FLAG} allows one: pass one of them`);
+        return 1;
+      }
       if (!enforceLivePlanner(args)) {
         return 1;
       }
@@ -1170,6 +1181,19 @@ const commands: Command[] = [
             `Error: --max-spend-usd needs a --price for every model this run calls; unpriced: ${unpriced.join(", ")} ` +
               "(an unpriced call's spend is unknown, so the cap could not bound it)",
           );
+          return 1;
+        }
+      }
+      // --require-model-plan: plan BEFORE anything is created, and refuse to
+      // start (no Change, no repos) when no model produced a plan.
+      let preplanned: Awaited<ReturnType<typeof decomposeGoal>> | undefined;
+      if (requireModelPlan) {
+        console.log(`Planning before anything is created (${REQUIRE_MODEL_PLAN_FLAG})...`);
+        preplanned = await decomposeGoal({ goal, projectDir, ...(planner ? { planner } : {}) });
+        const refusal = modelPlanRefusal({ source: preplanned.change.plan?.source ?? (planner ? undefined : "heuristic-fallback"), diagnostics: preplanned.diagnostics ?? [] });
+        if (refusal !== undefined) {
+          console.error(redactSecrets(plannerFallbackBanner(preplanned.diagnostics ?? [])));
+          console.error(redactSecrets(`Error: ${refusal}`));
           return 1;
         }
       }
@@ -1214,15 +1238,17 @@ const commands: Command[] = [
           return jev.live && jev.ask ? { jev: jev.ask, jevThreshold: jev.threshold, jevModel: DEFAULT_JEV_MODEL } : {};
         })(),
         seed: async (text) => {
-          const decomposition = await decomposeGoal({ goal: text, projectDir, ...(planner ? { planner } : {}) });
+          const decomposition = preplanned ?? (await decomposeGoal({ goal: text, projectDir, ...(planner ? { planner } : {}) }));
+          preplanned = undefined;
           if (decomposition.change.plan?.source === "heuristic-fallback") {
-            console.error(plannerFallbackBanner());
+            console.error(redactSecrets(plannerFallbackBanner(decomposition.diagnostics ?? [])));
           }
           return boardSeedFromChange(decomposition.change);
         },
         schedule: hasFlag(args, "--lockstep") ? "lockstep" : "concurrent",
         budgets,
         caps,
+        ...rateLimit,
         ...(ttl !== undefined ? { workspaceTtlSeconds: ttl } : {}),
         // Agents' repo tokens are refreshed before they expire unless turned off.
         ...(hasFlag(args, "--no-token-refresh") ? { refreshTokens: false } : {}),
@@ -1296,6 +1322,12 @@ const commands: Command[] = [
               break;
             case "capped":
               console.log(`  cap reached: ${event.cap.kind}${event.cap.item ? ` (${event.cap.item})` : ""} ${event.cap.used} of ${event.cap.limit}: no new turns`);
+              break;
+            case "rate-limited":
+              console.log(
+                `  rate limited: the AI Gateway answered HTTP ${event.status} for ${event.model} (${describeRetryAfter(event.retryAfterMs)}); ` +
+                  `every agent pauses ${Math.ceil(event.backoffMs / 1000)} s (${event.consecutive} in a row, ${Math.round(event.limitedForMs / 1000)} s without a call getting through; no turn budget spent)`,
+              );
               break;
             case "token-refreshed":
               console.log(`  refreshed ${event.agent}'s ${event.tokenKind} token before it expired${event.request ? ` (help ${event.request})` : ""}`);
@@ -1792,7 +1824,7 @@ async function resolveChange(
   // which rides the spec to the Worker's planner node); say it loudly here too so
   // the operator cannot miss that no model planned this run.
   if (options.live && decomposition.change.plan?.source === "heuristic-fallback") {
-    console.error(plannerFallbackBanner());
+    console.error(plannerFallbackBanner(decomposition.diagnostics ?? []));
   }
   return decomposition.change;
 }

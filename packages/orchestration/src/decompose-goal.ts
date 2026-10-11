@@ -94,6 +94,11 @@ export interface DecomposeGoalResult extends DecomposeResult {
    * backs it with this record.
    */
   readonly plan?: RecordedPlan;
+  /**
+   * Why each planner ladder model failed, in attempt order (present when the
+   * inference planner ran; empty when the first plan was accepted).
+   */
+  readonly diagnostics?: readonly PlanDiagnostic[];
 }
 
 /**

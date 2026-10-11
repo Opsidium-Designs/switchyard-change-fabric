@@ -277,6 +277,22 @@ describe("createAiGatewayAgentTurnInvoke", () => {
     expect(JSON.stringify(outcome)).not.toContain("gw-secret");
   });
 
+  it("flags a rate-limited call (HTTP 429, or 503 with Retry-After) so the runtime backs off, carrying Retry-After", async () => {
+    const limited = (status: number, headers: Record<string, string> = {}) =>
+      (async () => new Response("slow down gw-secret", { status, headers })) as unknown as typeof fetch;
+    const outcome = await createAiGatewayAgentTurnInvoke({ gatewayUrl: "https://gw", gatewayToken: "gw-secret", model: "gpt-4o", fetchFn: limited(429, { "retry-after": "20" }) })(input);
+    expect(outcome.action.type).toBe("wait");
+    expect(outcome.rateLimited).toEqual({ status: 429, model: "gpt-4o", retryAfterMs: 20_000 });
+    expect(outcome.invalid).toMatch(/rate limited for gpt-4o \(HTTP 429, retry-after 20 s\)/);
+    expect(JSON.stringify(outcome)).not.toContain("gw-secret");
+    const unavailable = await createAiGatewayAgentTurnInvoke({ gatewayUrl: "https://gw", gatewayToken: "t", model: "m1", fetchFn: limited(503, { "retry-after": "3" }) })(input);
+    expect(unavailable.rateLimited).toEqual({ status: 503, model: "m1", retryAfterMs: 3000 });
+    // A plain 503 (no Retry-After) stays an ordinary failed call, not a rate limit.
+    const plain = await createAiGatewayAgentTurnInvoke({ gatewayUrl: "https://gw", gatewayToken: "t", model: "m1", fetchFn: limited(503) })(input);
+    expect(plain.rateLimited).toBeUndefined();
+    expect(plain.invalid).toMatch(/HTTP 503/);
+  });
+
   it("records an off-schema or disallowed reply as a wait", async () => {
     const reply = (content: string) =>
       (async () => new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 })) as unknown as typeof fetch;

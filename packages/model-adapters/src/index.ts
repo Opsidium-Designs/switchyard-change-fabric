@@ -63,6 +63,7 @@ export {
   extractReplyText,
   isModelBudgetError,
   isTransientWorkersAiError,
+  MAX_EXECUTOR_RETRY_AFTER_MS,
   ModelBudgetError,
   UnusableModelOutputError,
   WorkersAiExecutor,
@@ -146,6 +147,7 @@ export type {
   AgentTurnHistoryEntry,
   AgentTurnInput,
   AgentTurnOutcome,
+  AgentTurnRateLimit,
   AgentTurnTransport,
   AiGatewayAgentTurnOptions,
 } from "./agent-turn.ts";
@@ -182,3 +184,11 @@ export {
   TOOL_REGIONS_JSON_SCHEMA,
   ToolRegionError,
 } from "./tool-regions.ts";
+
+export {
+  describeRetryAfter,
+  isRateLimitError,
+  parseRetryAfter,
+  RateLimitError,
+  rateLimitErrorFor,
+} from "./rate-limit.ts";

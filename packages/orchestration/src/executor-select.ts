@@ -483,14 +483,60 @@ export function decideLivePlanner(input: {
  * which rides the spec to the Worker so the planner node shows it.
  */
 export function plannerFallbackBanner(
-  diagnostics: readonly { readonly model: string; readonly reason: string }[] = [],
+  diagnostics: readonly PlannerFailure[] = [],
 ): string {
   return loudBanner([
     "PLANNER FELL BACK TO THE HEURISTIC DECOMPOSITION",
+    ...(allPlannerCallsRateLimited(diagnostics)
+      ? [
+          `All planner calls were rate limited (HTTP 429) on ${[...new Set(diagnostics.map((d) => d.model))].join(", ")}:`,
+          "the provider's rate or quota limit, so no model planned this run.",
+        ]
+      : []),
     "Every model in the planner ladder failed to produce a usable plan, so this live",
     'run uses the deterministic heuristic plan (recorded as plan.source "heuristic-fallback").',
     ...diagnostics.map((d) => `  ${d.model}: ${d.reason}`),
   ]);
+}
+
+/** One planner ladder model's failure (a change-core PlanDiagnostic, or its subset). */
+export interface PlannerFailure {
+  readonly model: string;
+  readonly reason: string;
+  /** True when the call was rate limited (HTTP 429, or 503 with Retry-After). */
+  readonly rateLimited?: boolean;
+}
+
+/** True when the planner ladder failed ONLY because every call was rate limited. */
+export function allPlannerCallsRateLimited(diagnostics: readonly PlannerFailure[]): boolean {
+  return diagnostics.length > 0 && diagnostics.every((d) => d.rateLimited === true);
+}
+
+/** The run-board flag that refuses to start when the planner fails (no heuristic fallback). */
+export const REQUIRE_MODEL_PLAN_FLAG = "--require-model-plan";
+
+/**
+ * Under --require-model-plan, the error a live run refuses to start with when
+ * the planner produced no plan (it fell back to the heuristic); undefined when
+ * a model planned the run. Names every ladder model's failure, and says so when
+ * every planner call was rate limited.
+ */
+export function modelPlanRefusal(input: {
+  readonly source: string | undefined;
+  readonly diagnostics?: readonly PlannerFailure[];
+}): string | undefined {
+  if (input.source !== "heuristic-fallback") {
+    return undefined;
+  }
+  const diagnostics = input.diagnostics ?? [];
+  const why = allPlannerCallsRateLimited(diagnostics)
+    ? "all planner calls were rate limited (HTTP 429): the provider's rate or quota limit"
+    : "every model in the planner ladder failed to produce a usable plan";
+  return (
+    `${REQUIRE_MODEL_PLAN_FLAG}: the planner produced no plan (${why}), and a heuristic plan was refused` +
+    (diagnostics.length > 0 ? ` (${diagnostics.map((d) => `${d.model}: ${d.reason}`).join("; ")})` : "") +
+    ". Nothing was created; retry later or drop the flag to accept the heuristic decomposition."
+  );
 }
 
 /** Frame lines in a rule so a warning cannot be missed in the run output. */

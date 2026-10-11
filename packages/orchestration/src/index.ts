@@ -163,12 +163,15 @@ export type { CheckStatus, DoctorCheck, DoctorEnv, DoctorReport } from "./doctor
 export { formatDoctorReport, runDoctor } from "./doctor.ts";
 
 export type { ExecutorEnv, SelectedAgentTurn, SelectedExecutor, SelectedPlanner, PlanTransport } from "./executor-select.ts";
-export type { LivePlannerDecision } from "./executor-select.ts";
+export type { LivePlannerDecision, PlannerFailure } from "./executor-select.ts";
 export {
   ALLOW_HEURISTIC_PLANNER_FLAG,
+  allPlannerCallsRateLimited,
   DEFAULT_WORKERS_AI_ESCALATION_MODEL,
   decideLivePlanner,
+  modelPlanRefusal,
   plannerFallbackBanner,
+  REQUIRE_MODEL_PLAN_FLAG,
   selectExecutor,
   selectAgentTurn,
   selectPlanner,
@@ -264,6 +267,15 @@ export {
 } from "./run-board.ts";
 export type { ModelPrice, RunCapReached, RunCaps } from "./run-meter.ts";
 export { meteredExecutor, meteredJev, meteredToolAuthor, meteredTransport, parsePrice, parsePrices, RunMeter, validateSpendCap } from "./run-meter.ts";
+export type { RateLimitBackoffEvent, RateLimitBackoffOptions, RateLimitNote } from "./rate-limit-backoff.ts";
+export {
+  DEFAULT_RATE_LIMIT_BASE_MS,
+  DEFAULT_RATE_LIMIT_MAX_MS,
+  DEFAULT_RATE_LIMIT_WINDOW_MS,
+  RateLimitBackoff,
+  rateLimitedExecutor,
+  rateLimitedTransport,
+} from "./rate-limit-backoff.ts";
 export type { ProofBundle, ProofBundleOptions, ProofCandidate, ProofCount } from "./proof-bundle.ts";
 export { buildProofBundle, formatProofSpeculation, formatProofSummary } from "./proof-bundle.ts";
 export type { RefreshableToken, TokenRefresherOptions } from "./token-refresh.ts";

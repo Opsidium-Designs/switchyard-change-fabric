@@ -127,6 +127,7 @@ import { integrateRatchetRound, type RatchetIsolation, type RatchetRoundResult }
 import { TokenRefresher } from "./token-refresh.ts";
 import { buildProofBundle, type ProofBundle } from "./proof-bundle.ts";
 import { meteredExecutor, meteredJev, meteredToolAuthor, meteredTransport, RunMeter, type RunCapReached, type RunCaps } from "./run-meter.ts";
+import { RateLimitBackoff, rateLimitedExecutor, rateLimitedTransport, type RateLimitBackoffEvent, type RateLimitBackoffOptions } from "./rate-limit-backoff.ts";
 import { scanRepoSnapshot } from "./scan-repo.ts";
 import { BoardAgent, listRepoFiles, resolveIntentFiles, RunTurnBudget, type AgentStop, type AgentTurnRecord, type BoardSeedItem } from "./board-agent.ts";
 import {
@@ -286,6 +287,8 @@ export type BoardRunEvent =
   | { readonly kind: "lead-contracts-nudged"; readonly contracts: readonly string[]; readonly items: readonly string[] }
   /** The run reached a cost or time cap (recorded as run.capped). */
   | { readonly kind: "capped"; readonly cap: RunCapReached }
+  /** The AI Gateway rate limited a call: every agent pauses for backoffMs (shared backoff). */
+  | ({ readonly kind: "rate-limited" } & RateLimitBackoffEvent)
   /** The run promoted, but the board refused to record the promotion (the proof bundle says not proven). */
   | { readonly kind: "promotion-unrecorded"; readonly reason: string }
   /** An agent's repo (or fork) token was replaced before it expired (recorded as token.refreshed; never the token). */
@@ -454,6 +457,8 @@ export type BoardStopReason =
   | "all-items-done"
   /** A cost or time cap was reached (run.capped): no new turns. */
   | "capped"
+  /** The AI Gateway rate limited every call for the bounded window: no model decided anything in it. */
+  | "rate-limited"
   | "fix-budget"
   | "run-budget"
   | "quiescent"
@@ -665,6 +670,13 @@ export interface RunBoardOptions {
   readonly signal?: AbortSignal;
   /** After an interrupt: how long to wait for the agents and the in-flight integration, in ms (default 60 s). */
   readonly interruptGraceMs?: number;
+  /**
+   * The shared rate-limit backoff (see rate-limit-backoff.ts): the window of
+   * consecutive rate limits after which the run stops "rate-limited" (default
+   * 10 min), the backoff bounds (5 s to 120 s), and an injectable clock and
+   * jitter source. The run's own event sink is added.
+   */
+  readonly rateLimit?: Omit<RateLimitBackoffOptions, "onBackoff">;
   readonly onEvent?: (event: BoardRunEvent) => void;
 }
 
@@ -755,6 +767,8 @@ export interface RunBoardResult {
     readonly calls: number;
     readonly spendUsd: number;
     readonly unpricedCalls: number;
+    /** Call attempts the gateway refused with a rate limit (HTTP 429): not billed, not capped, reported separately. */
+    readonly rateLimitedCalls?: number;
     readonly capped: readonly RunCapReached[];
     /** What the meter warned about (an unpriced model under an active spend cap), once each. */
     readonly warnings?: readonly string[];
@@ -1959,8 +1973,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   const readTtl = options.readTokenTtlSeconds ?? 600;
   // Cost and time caps: every model call is metered (plan-scaled defaults are set once planned).
   const meter = new RunMeter(options.caps ?? {}, options.capsClock ?? Date.now);
-  const executor = meteredExecutor(options.executor ?? new ScopedNoopExecutor(), meter);
-  const transport = meteredTransport(options.transport, meter);
+  // One rate-limit backoff for the whole process: a 429 pauses every agent,
+  // spends no turn budget, and past the window ends the run "rate-limited".
+  const rateLimit = new RateLimitBackoff({ ...options.rateLimit, onBackoff: (event) => emit({ kind: "rate-limited", ...event }) });
+  const executor = meteredExecutor(rateLimitedExecutor(options.executor ?? new ScopedNoopExecutor(), rateLimit), meter);
+  const transport = meteredTransport(rateLimitedTransport(options.transport, rateLimit), meter);
   // Typed decisions are model calls too: every ask (the integrator's
   // attribution, speculative candidates' included, the contract triage, the
   // fix-confidence check) is counted, and refused past a run cap (advisory:
@@ -2373,6 +2390,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       transport,
       executor,
       meter,
+      rateLimit,
       onItemCap: (cap) => void recordCap(cap),
       projectDir: options.projectDir,
       workRoot,
@@ -2936,6 +2954,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       if (meter.reached() !== undefined) {
         return "capped";
       }
+      // Every call rate limited for the whole window: nothing a model decided
+      // can move the run, so it ends honestly (cleanup and the verdict as usual).
+      if (rateLimit.exceeded) {
+        return "rate-limited";
+      }
       if (Date.now() - started > budgets.timeoutMs) {
         return "timeout";
       }
@@ -2952,6 +2975,12 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         stopReason = check(state);
         if (stopReason) {
           break;
+        }
+        if (rateLimit.backingOff) {
+          // Every agent pauses for the shared backoff; the round is not spent.
+          await rateLimit.wait(controller.signal);
+          round -= 1;
+          continue;
         }
         const joined = await recruit(state);
         let acted = false;
@@ -2974,7 +3003,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         }
         const integrated = integrator.revisions.length > before;
         const decided = await settleContracts();
-        if (!acted && joined === 0 && !integrated && !decided && !(await actOnStalls())) {
+        // A rate-limit streak is not a quiet board: the next round waits it out.
+        if (!acted && joined === 0 && !integrated && !decided && !rateLimit.limited && !(await actOnStalls())) {
           const quietState = (await operator.page(0, 1)).state;
           stopReason = check(quietState) ?? "quiescent";
           stopDetail = `no agent had anything to do and no integration was pending${awaitingSubLeadDetail(quietState)}${undecidedDetail(quietState)}`;
@@ -3033,7 +3063,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         // agent about to take a turn it was given (a follow-up, a nudge).
         const acted = turns.slice(turnsSeen).some((t) => t.action.type !== "wait");
         turnsSeen = turns.length;
-        const anyBusy = [lead, ...workers].some((a) => a.busy || a.turnPending) || integrator.busy || integrator.wants(state) || acted;
+        // A rate-limit streak (a backoff, or calls still refused) is never quiescence.
+        const anyBusy =
+          [lead, ...workers].some((a) => a.busy || a.turnPending) || integrator.busy || integrator.wants(state) || acted || rateLimit.limited;
         if (state.lastSeq !== lastSeq || anyBusy) {
           lastSeq = state.lastSeq;
           quietSince = Date.now();
@@ -3099,6 +3131,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   if (stopReason === "capped" && cap !== undefined) {
     stopDetail ??= `the ${cap.kind} cap was reached (${cap.used} of ${cap.limit}): no new turns; the in-flight work was integrated`;
     await recordCap(cap);
+  }
+  if (stopReason === "rate-limited") {
+    stopDetail ??= rateLimit.stopDetail();
   }
   if (stopReason === "interrupted") {
     stopDetail ??=
@@ -3334,6 +3369,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       calls: meter.calls,
       spendUsd: Math.round(meter.spendUsd * 1e6) / 1e6,
       unpricedCalls: meter.unpricedCalls,
+      ...(meter.rateLimitedCalls > 0 ? { rateLimitedCalls: meter.rateLimitedCalls } : {}),
       capped: [...capsReached],
       ...(meter.warnings.length > 0 ? { warnings: [...meter.warnings] } : {}),
     },
@@ -3993,6 +4029,7 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     ...(result.usage
       ? [
           `  usage: ${result.usage.calls} model call(s), ${result.usage.spendUsd.toFixed(4)} USD estimated${result.usage.unpricedCalls > 0 ? ` (+${result.usage.unpricedCalls} unpriced call(s))` : ""}` +
+            ((result.usage.rateLimitedCalls ?? 0) > 0 ? `; ${result.usage.rateLimitedCalls} rate-limited call attempt(s) (HTTP 429: not billed, no turn budget spent)` : "") +
             (result.usage.capped.length > 0 ? `; caps reached: ${result.usage.capped.map((c) => `${c.kind}${c.item ? ` (${c.item})` : ""} ${c.used} of ${c.limit}`).join(", ")}` : ""),
           ...(result.usage.warnings ?? []).map((w) => `  meter warning: ${w}`),
         ]

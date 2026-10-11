@@ -17,6 +17,11 @@
  * Caps: total model calls, estimated spend in USD, the run's wall-clock time,
  * and calls per item (across agents).
  *
+ * A call the gateway refused with a rate limit (HTTP 429, or 503 with
+ * Retry-After) is a call ATTEMPT, reported separately (`rateLimitedCalls`):
+ * no model ran and nothing is billed, so it is neither priced, nor unpriced,
+ * nor counted against the call cap or an item's cap.
+ *
  * Reaching a run cap stops new turns (the metered transport answers `wait`
  * without calling the model; the metered tool author and decision caller
  * refuse); the driver records `run.capped` once per cap, lets the integrator
@@ -26,6 +31,7 @@
 
 import {
   executorCallUsage,
+  isRateLimitError,
   type AgentTurnTransport,
   type AskJev,
   type ExecutionResult,
@@ -124,6 +130,8 @@ export class RunMeter {
   spendUsd = 0;
   /** Calls with no usage and no price (their spend is unknown, never zero). */
   unpricedCalls = 0;
+  /** Call attempts the gateway refused with a rate limit (no model ran; not billed, not capped). */
+  rateLimitedCalls = 0;
   /** Warnings recorded while counting (an unpriced model under an active spend cap), once each. */
   readonly warnings: string[] = [];
   /** Called once per new warning (the driver may record it on the board). */
@@ -169,6 +177,11 @@ export class RunMeter {
     if (call.item !== undefined) {
       this.perItem.set(call.item, (this.perItem.get(call.item) ?? 0) + 1);
     }
+  }
+
+  /** Count rate-limited call attempts (reported separately; see the module comment). */
+  countRateLimited(attempts = 1): void {
+    this.rateLimitedCalls += Math.max(1, Number.isFinite(attempts) ? Math.floor(attempts) : 1);
   }
 
   /** Count the model calls one step made (its attempts; the usage belongs to the successful one). */
@@ -236,7 +249,8 @@ export class RunMeter {
       `caps: ${c.maxCalls !== undefined ? `${c.maxCalls} model call(s)` : "no call cap"} (used ${this.calls}), ` +
       `${c.maxSpendUsd !== undefined ? `${c.maxSpendUsd} USD` : "no spend cap"} (${spend}), ` +
       `${c.maxWallMs !== undefined ? `${Math.round(c.maxWallMs / 1000)} s wall clock` : "no wall-clock cap"}, ` +
-      `${c.maxCallsPerItem !== undefined ? `${c.maxCallsPerItem} call(s) per item` : "no per-item cap"}`
+      `${c.maxCallsPerItem !== undefined ? `${c.maxCallsPerItem} call(s) per item` : "no per-item cap"}` +
+      (this.rateLimitedCalls > 0 ? `; ${this.rateLimitedCalls} rate-limited call attempt(s) (HTTP 429, not billed, not capped)` : "")
     );
   }
 }
@@ -255,9 +269,18 @@ export function meteredTransport<D, M>(transport: AgentTurnTransport<D, M>, mete
     try {
       outcome = await transport(input);
     } catch (error) {
+      if (isRateLimitError(error)) {
+        meter.countRateLimited(executorCallUsage(error)?.attempts ?? 1);
+        throw error;
+      }
       // A transport that throws may still have made (paid) calls: at least one counts.
       meter.countUsage(executorCallUsage(error) ?? { attempts: 1 });
       throw error;
+    }
+    if (outcome.rateLimited !== undefined) {
+      // Refused by the gateway: an attempt, reported separately, never billed.
+      meter.countRateLimited();
+      return outcome;
     }
     meter.count({
       ...(outcome.model !== undefined ? { model: outcome.model } : {}),
@@ -284,6 +307,11 @@ export function meteredExecutor(executor: ExecutorProvider, meter: RunMeter): Ex
         result = await executor.execute(context);
       } catch (error) {
         const usage = executorCallUsage(error);
+        if (isRateLimitError(error)) {
+          // Every attempt of an edit that ends rate limited is reported as such (not billed).
+          meter.countRateLimited(usage?.attempts ?? 1);
+          throw error;
+        }
         meter.countUsage(
           usage !== undefined
             ? { ...usage, ...(usage.model === undefined && context.model !== undefined ? { model: context.model } : {}) }
@@ -352,9 +380,16 @@ export function meteredJev(ask: AskJev, meter: RunMeter, model?: string): AskJev
       throw new Error(`the run reached its ${capped.kind} cap (${capped.used} of ${capped.limit}): no decision call`);
     }
     try {
-      return await ask(state, questions);
-    } finally {
+      const answers = await ask(state, questions);
       meter.count(model !== undefined ? { model } : {});
+      return answers;
+    } catch (error) {
+      if (isRateLimitError(error)) {
+        meter.countRateLimited();
+      } else {
+        meter.count(model !== undefined ? { model } : {});
+      }
+      throw error;
     }
   };
 }

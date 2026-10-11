@@ -746,7 +746,10 @@ is distributed changes: items are proposed and claimed, never assigned.
   (`gateFailureLine`), never a command echo.
 - The lead joins with role `lead`. Its first turn is the existing planner (the
   LLM planner live; a live run without one fails unless
-  `--allow-heuristic-planner`, with the loud banner on a fallback); each planned
+  `--allow-heuristic-planner`, with the loud banner on a fallback, which says
+  so when every planner call was rate limited (HTTP 429); with
+  `--require-model-plan` the CLI plans before anything is created and refuses
+  to start when no model produced a plan); each planned
   unit becomes an `item.proposed` (objective, acceptance, the unit's paths as
   the scope hint). Later lead turns decide `contract.proposed` messages.
 - `packages/orchestration/src/run-board.ts`: the driver. It creates the Change
@@ -755,8 +758,9 @@ is distributed changes: items are proposed and claimed, never assigned.
   joins while open items outnumber the workers in flight, up to max), and
   integrates CONTINUOUSLY while the agents work (below). The agent phase ends
   when every item is completed, or every outstanding item's fix budget is spent
-  (`fix-budget`), or the run budget, the round limit, quiescence, or the timeout
-  ends it. The whole phase runs under try/finally: a throw (a refused join, an
+  (`fix-budget`), or the run budget, a cost or time cap (`capped`), persistent
+  rate limiting (`rate-limited`, see "Rate limits"), the round limit,
+  quiescence, or the timeout ends it. The whole phase runs under try/finally: a throw (a refused join, an
   unreachable board) aborts every agent loop, marks the Change failed, and
   archives every repo the run created before the error propagates. An operator
   interrupt (`options.signal`; the CLI aborts it on the FIRST SIGINT or SIGTERM)
@@ -1296,7 +1300,8 @@ switchyard-change run-board --offline [--fixture-gate] [--decide-contracts accep
 switchyard-change run-board "<goal>" --project <dir> --worker <url> [--min N] [--max N] \
   [--id <changeId>] [--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] \
   [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] \
-  [--speculate K] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [--allow-heuristic-planner]
+  [--speculate K] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] \
+  [--rate-limit-window-ms N] [--require-model-plan] [--allow-heuristic-planner]
 ```
 
 Flags are `--flag value` (two arguments): an inline `--flag=value` and a known
@@ -2297,3 +2302,54 @@ children are new items with their own call counts. A replacement that reaches
 its own cap is not escalated to a human by that alone (escalation still
 follows a spent fix budget or two stalls). The budgets line prints the caps;
 the summary prints the usage and every meter warning.
+
+### Rate limits (HTTP 429, `rate-limited`)
+
+An HTTP 429 from the AI Gateway (or a 503 that carries `Retry-After`) is the
+provider's rate or quota limit, not agent behavior: no model looked at the
+request. Every gateway transport classifies it as a distinct, transient
+`RateLimitError` (`packages/model-adapters/src/rate-limit.ts`) carrying the
+status, the model, and the `Retry-After` delay when the gateway sent one: the
+executor's edit call, the planner call, the agent turn call (which returns a
+`wait` flagged `rateLimited` instead of throwing), and the typed-decision
+call. A plain 503 stays an ordinary transient 5xx. The executor's bounded
+retry treats it as transient on the SAME model (never a model switch),
+honours a `Retry-After` up to `MAX_EXECUTOR_RETRY_AFTER_MS` (30 s), and throws
+a longer one at once so the run's shared backoff waits it out.
+
+In a board run (`packages/orchestration/src/rate-limit-backoff.ts`):
+
+- A rate-limited turn is recorded as a local `RATE_LIMITED` wait outside the
+  agent's capsule. It spends no run turn and no per-item turn, is not
+  attributed to an item, and the turn stays owed with the same cues. An edit
+  whose executor call ends rate limited is recorded `RATE_LIMITED` (never a
+  failed edit: it feeds no struggling report or split) and its turn is
+  refunded the same way.
+- The meter counts it as a call attempt, reported separately
+  (`rateLimitedCalls`, on the budgets line and in the summary's usage): not
+  billed, not unpriced, and not against `--max-calls` or an item's cap.
+- One backoff is shared by every agent of the process: while it lasts no
+  agent takes a turn (each is held, the lockstep schedule waits it out without
+  spending a round). It honours `Retry-After` when sent, else waits 5 s,
+  doubling per consecutive rate limit up to 120 s, with jitter (x0.75 to
+  x1.25, kept within those bounds). Calls already in flight when it starts
+  extend it to their `Retry-After` but do not escalate it again. Any call the
+  gateway answers other than with a rate limit ends the streak. Each backoff
+  is an event (`rate-limited`, printed by the CLI with the pause).
+- Quiescence never fires while a rate-limit streak is open (a backoff, or
+  calls still refused).
+- When every call has been rate limited for the window (default 10 minutes,
+  `--rate-limit-window-ms N`) with no call getting through, the agent phase
+  ends with stop reason `rate-limited` and the detail "the AI Gateway returned
+  HTTP 429 for every call for N min (last: <model>, retry-after ...; K
+  rate-limited call(s)): the provider's rate or quota limit; nothing was
+  decided by a model in that window". The normal ending runs: the in-flight
+  integration finishes, every repo is cleaned up, and the verdict is only what
+  was gated.
+
+The planner: when every planner ladder model fails with a rate limit, the
+fall-back banner says "All planner calls were rate limited (HTTP 429)" (each
+`PlanDiagnostic` carries `rateLimited`). `--require-model-plan` (live
+`run-board`) runs the planner BEFORE the Change is created and refuses to start
+(exit 1, nothing created) when the plan fell back to the heuristic, naming
+every ladder model's failure; it conflicts with `--allow-heuristic-planner`.

@@ -27,6 +27,7 @@ import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
 import { withCallUsage } from "./call-usage.ts";
+import { isRateLimitError } from "./rate-limit.ts";
 import type {
   ExecutionResult,
   ExecutorContext,
@@ -243,6 +244,12 @@ const DEFAULT_MAX_FILE_BYTES = 8 * 1024;
 const DEFAULT_MAX_REFERENCE_BYTES = 12 * 1024;
 const DEFAULT_MAX_RETRIES = 2;
 const DEFAULT_RETRY_BACKOFF_MS = 500;
+/**
+ * The longest Retry-After the executor's own bounded retry waits out. A rate
+ * limit asking for longer is thrown at once, so the caller (the board's shared
+ * backoff) pauses every agent instead of one edit sleeping on it.
+ */
+export const MAX_EXECUTOR_RETRY_AFTER_MS = 30_000;
 
 /** The model calls one execute() made so far (see WorkersAiExecutor.execute). */
 interface CallTrack {
@@ -307,7 +314,8 @@ export class WorkersAiTimeoutError extends Error {
 }
 
 /**
- * The default transient-error classifier: a provider internal error, a 5xx, an
+ * The default transient-error classifier: a provider internal error, a 5xx, a
+ * rate limit (RateLimitError: HTTP 429, or 503 with Retry-After), an
  * aborted/timed-out call, or a network-level fetch failure is transient and
  * worth a bounded retry. A UnusableModelOutputError (a bad model reply) is NOT
  * transient: retrying it would not help and would hide an honest failure.
@@ -316,7 +324,7 @@ export function isTransientWorkersAiError(error: unknown): boolean {
   if (error instanceof UnusableModelOutputError) {
     return false;
   }
-  if (error instanceof WorkersAiTimeoutError) {
+  if (error instanceof WorkersAiTimeoutError || isRateLimitError(error)) {
     return true;
   }
   const message = (error instanceof Error ? error.message : String(error ?? "")).toLowerCase();
@@ -477,8 +485,16 @@ export class WorkersAiExecutor implements ExecutorProvider {
         if (tryNo >= maxRetries || !isTransient(error)) {
           throw error;
         }
-        if (backoffMs > 0) {
-          await sleep(backoffMs * (tryNo + 1));
+        // A rate limit's Retry-After is honoured (still the SAME model); one
+        // asking for longer than the executor waits out is thrown at once so
+        // the caller backs off for every agent.
+        const retryAfterMs = isRateLimitError(error) ? error.retryAfterMs : undefined;
+        if (retryAfterMs !== undefined && retryAfterMs > MAX_EXECUTOR_RETRY_AFTER_MS) {
+          throw error;
+        }
+        const waitMs = Math.max(backoffMs > 0 ? backoffMs * (tryNo + 1) : 0, retryAfterMs ?? 0);
+        if (waitMs > 0) {
+          await sleep(waitMs);
         }
       }
     }

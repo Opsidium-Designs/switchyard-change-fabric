@@ -33,6 +33,7 @@
  */
 
 import { executorModelBudget, type ModelBudgetCeilings } from "./model-budget.ts";
+import { rateLimitErrorFor } from "./rate-limit.ts";
 import {
   DEFAULT_WORKERS_AI_TIMEOUT_MS,
   extractReplyText,
@@ -157,7 +158,9 @@ export function createAiGatewayRestInvoke(options: AiGatewayRestOptions): Worker
     if (res.status >= 400) {
       // Drain the body (do not include it in the error) and fail without leaking.
       await res.text().catch(() => "");
-      throw new Error(`AI Gateway call failed for ${request.model} (HTTP ${res.status})`);
+      // A rate limit (HTTP 429, or 503 with Retry-After) is its own transient
+      // failure: nothing was decided, and the caller backs off.
+      throw rateLimitErrorFor(res, request.model) ?? new Error(`AI Gateway call failed for ${request.model} (HTTP ${res.status})`);
     }
     const text = await res.text();
     let body: {

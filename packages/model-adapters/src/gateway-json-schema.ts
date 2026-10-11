@@ -13,6 +13,7 @@
  */
 
 import type { ReasoningEffort } from "./model-budget.ts";
+import { rateLimitErrorFor } from "./rate-limit.ts";
 import { WorkersAiTimeoutError, type WorkersAiMessage } from "./workers-ai.ts";
 
 /** One schema-constrained call. */
@@ -48,8 +49,9 @@ export interface GatewayJsonSchemaReply {
 
 /**
  * Run one NON-STREAMING schema-constrained call and return the reply content.
- * Throws a timeout error when the call is aborted, a plain error (without the
- * response body) on an HTTP failure, and `responseError` when the reply is not
+ * Throws a timeout error when the call is aborted, a RateLimitError on HTTP 429
+ * (or 503 with Retry-After), a plain error (without the response body) on any
+ * other HTTP failure, and `responseError` when the reply is not
  * JSON or carries no message content.
  */
 export async function callGatewayJsonSchema(call: GatewayJsonSchemaCall): Promise<GatewayJsonSchemaReply> {
@@ -95,7 +97,8 @@ export async function callGatewayJsonSchema(call: GatewayJsonSchemaCall): Promis
   if (res.status >= 400) {
     // Drain the body (do not include it in the error) and fail without leaking.
     await res.text().catch(() => "");
-    throw new Error(`AI Gateway ${call.label} call failed for ${call.model} (HTTP ${res.status})`);
+    // A rate limit (HTTP 429, or 503 with Retry-After) is a RateLimitError.
+    throw rateLimitErrorFor(res, call.model, call.label) ?? new Error(`AI Gateway ${call.label} call failed for ${call.model} (HTTP ${res.status})`);
   }
   const text = await res.text();
   let body: {

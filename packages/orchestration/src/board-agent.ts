@@ -63,7 +63,7 @@ import type {
   AgentTurnTransport,
   ExecutorProvider,
 } from "@switchyard-change/model-adapters";
-import { AGENT_ACTION_TYPES, isModelBudgetError } from "@switchyard-change/model-adapters";
+import { AGENT_ACTION_TYPES, isModelBudgetError, isRateLimitError } from "@switchyard-change/model-adapters";
 import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { authenticatedRemote, clone, push, type GitIdentity } from "@switchyard-change/local-runner";
 import { gateFailureLine, matchesGlob, partitionByScope, toolSkeleton } from "@switchyard-change/verification";
@@ -72,6 +72,7 @@ import { boardReferenceFiles, type ReferenceFile } from "./board-references.ts";
 import { ToolUseError, type ToolAuthor, type ToolBench } from "./board-tools.ts";
 import type { RefreshableToken } from "./token-refresh.ts";
 import type { RunCapReached, RunMeter } from "./run-meter.ts";
+import type { RateLimitBackoff } from "./rate-limit-backoff.ts";
 
 import { redactSecrets } from "./redact.ts";
 import {
@@ -204,6 +205,12 @@ export interface BoardAgentOptions {
   readonly meter?: RunMeter;
   /** Called when a turn hit its item's cap (the driver records run.capped once). */
   readonly onItemCap?: (cap: RunCapReached) => void;
+  /**
+   * The run's shared rate-limit backoff (one per process): while it is
+   * backing off the agent takes no turn (it is held, and a turn it was about
+   * to take stays owed), and a rate-limited turn or edit spends no turn budget.
+   */
+  readonly rateLimit?: RateLimitBackoff;
 }
 
 /** The action types each role may return. */
@@ -543,8 +550,10 @@ export class BoardAgent {
   private stepping = false;
   /** True only while the agent is taking a TURN (the driver's quiescence check reads it). */
   private acting = false;
-  /** True while the driver holds the agent back (no step; see run's `hold`). */
+  /** True while the driver holds the agent back (no step; see run's `hold`), or the run backs off a rate limit. */
   private heldBack = false;
+  /** Set when this turn's edit was rate limited (the turn is refunded; see takeTurn). */
+  private editRateLimited = false;
   /** The tools this agent's claims may not wait for, as last seen (a change wakes it). */
   private lastUnavailable = "";
   /** The formation cues last seen (a new set wakes it once). */
@@ -1140,7 +1149,8 @@ export class BoardAgent {
     while (!options.signal.aborted && !this.stop) {
       let result: AgentStepResult;
       try {
-        this.heldBack = (await options.hold?.()) === true;
+        // The shared rate-limit backoff pauses every agent: no step, no model call.
+        this.heldBack = this.options.rateLimit?.backingOff === true || (await options.hold?.()) === true;
         result = this.heldBack ? "idle" : await this.step();
       } catch (error) {
         this.stop = { reason: "stopped", detail: `step failed: ${this.scrub(error instanceof Error ? error.message : String(error))}` };
@@ -1177,7 +1187,8 @@ export class BoardAgent {
 
   private record(entry: Omit<AgentTurnRecord, "agent">, history?: AgentTurnHistoryEntry): void {
     this.options.onTurn?.({ agent: this.id, ...entry });
-    if ((entry.action.type === "edit" || entry.action.type === "use_tool") && entry.outcome !== "posted" && entry.code !== undefined) {
+    // A rate-limited edit is not a failed edit: no model saw it.
+    if ((entry.action.type === "edit" || entry.action.type === "use_tool") && entry.outcome !== "posted" && entry.code !== undefined && entry.code !== "RATE_LIMITED") {
       const item = entry.action.itemId;
       if (item !== undefined) {
         this.failedEdits.set(item, (this.failedEdits.get(item) ?? 0) + 1);
@@ -1345,6 +1356,12 @@ export class BoardAgent {
       this.followUp = false;
       return;
     }
+    if (this.options.rateLimit?.backingOff) {
+      // The run is backing off a rate limit: no model call now, and the turn
+      // stays owed (taken once the pause ends). No budget is spent.
+      this.followUp = true;
+      return;
+    }
     budget.used += 1;
     this.turns += 1;
     this.acting = true;
@@ -1503,6 +1520,17 @@ export class BoardAgent {
     }
     const input = await this.turnInput(this.withoutExhausted(digest), state);
     const outcome = await this.options.transport(input);
+    if (outcome.rateLimited !== undefined) {
+      // The gateway refused the call (the provider's rate or quota limit): no
+      // model decided anything, so the turn is refunded (no run or item budget,
+      // no item attribution), recorded as a local RATE_LIMITED wait outside the
+      // capsule, and stays owed with the same cues once the backoff ends.
+      this.options.runBudget.used = Math.max(0, this.options.runBudget.used - 1);
+      const reason = outcome.invalid ?? `the turn call was rate limited (HTTP ${outcome.rateLimited.status})`;
+      this.record({ turn: this.turns, action: outcome.action, outcome: "local", code: "RATE_LIMITED", error: this.scrub(reason) });
+      this.followUp = true;
+      return;
+    }
     const action = outcome.action;
     this.pending = [];
     this.followUp = false;
@@ -1540,7 +1568,19 @@ export class BoardAgent {
         return;
       }
     }
+    this.editRateLimited = false;
     await this.act(action, digest, state, outcome.invalid);
+    if (this.editRateLimited) {
+      // The edit the turn chose was rate limited before any model wrote it:
+      // the turn is refunded (run and item budgets) and stays owed.
+      this.editRateLimited = false;
+      this.options.runBudget.used = Math.max(0, this.options.runBudget.used - 1);
+      if (item !== undefined) {
+        this.turnsByItem.set(item, Math.max(0, (this.turnsByItem.get(item) ?? 1) - 1));
+      }
+      this.followUp = true;
+      return;
+    }
     const limit = this.options.meter?.caps.maxCallsPerItem;
     if (item !== undefined && limit !== undefined && this.options.meter!.itemCalls(item) >= limit) {
       // This turn (its call, and any edit's executor calls) brought the item to
@@ -2507,6 +2547,11 @@ export class BoardAgent {
       }
     } catch (error) {
       await this.discard(worktree, head);
+      if (isRateLimitError(error)) {
+        this.editRateLimited = true;
+        local("RATE_LIMITED", bounded(this.scrub(error.message), 300));
+        return;
+      }
       local("EXECUTOR_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
       return;
     } finally {
@@ -2774,6 +2819,11 @@ export class BoardAgent {
       });
     } catch (error) {
       await this.discard(worktree, head);
+      if (isRateLimitError(error)) {
+        this.editRateLimited = true;
+        local("RATE_LIMITED", bounded(this.scrub(error.message), 300), note);
+        return;
+      }
       local("EXECUTOR_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300), note);
       return;
     } finally {
