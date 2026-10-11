@@ -43,6 +43,7 @@ import { RunMeter, type RunCapReached } from "../src/run-meter.ts";
 import { BoardOperatorClient, type BoardPage } from "../src/board-client.ts";
 import { createGenericBoardPolicy } from "../src/board-policy.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
+import type { PrePushCheckInput } from "@switchyard-change/verification";
 
 const run = promisify(execFile);
 const ID = "change-runtime";
@@ -793,6 +794,58 @@ describe("BoardAgent edits", () => {
     expect(stdout.trim()).toBe(""); // nothing was pushed
     await w1.step();
     expect(transport.inputs.at(-1)!.lastRejection).toMatchObject({ code: "OUTSIDE_INTENT", action: "edit" });
+  });
+
+  it("refuses an edit the pre-push check rejects: nothing is pushed, the worktree is discarded, and the errors feed the next turn", async () => {
+    const env = await setup();
+    const executor = new RecordingExecutor(() => ({ "src/a/x.ts": "export const x: string = 1;\n" }));
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "go" },
+    ]);
+    const asked: PrePushCheckInput[] = [];
+    const preEditCheck = async (input: PrePushCheckInput) => {
+      asked.push(input);
+      expect(await readFile(join(input.agentDir, "src/a/x.ts"), "utf8")).toBe("export const x: string = 1;\n");
+      return { ok: false as const, errors: ["src/a/x.ts(1,14): error TS2322: Type 'number' is not assignable to type 'string'."] };
+    };
+    const w1 = env.agent("w1", { transport, executor, preEditCheck });
+    await w1.join();
+    await w1.step();
+    await w1.step();
+    expect(asked).toHaveLength(1);
+    expect(asked[0]).toMatchObject({ baselineDir: env.projectDir, changed: ["src/a/x.ts"], fallbackNodeModulesDir: env.projectDir });
+    expect(env.turns.at(-1)).toMatchObject({ outcome: "local", code: "EXECUTOR_FAILED" });
+    expect(env.turns.at(-1)!.error).toMatch(/the edit does not typecheck: src\/a\/x\.ts\(1,14\): error TS2322.*nothing was pushed/);
+    expect((await env.log()).messages.some((m) => m.type === "push.announced")).toBe(false);
+    const { stdout } = await run("git", ["ls-remote", w1.joinedWorkspace!.gitUrl]);
+    expect(stdout.trim()).toBe(""); // nothing was pushed
+    const { stdout: status } = await run("git", ["-C", join(env.root, "work", "agents", "w1"), "status", "--porcelain"]);
+    expect(status.trim()).toBe(""); // the refused edit was discarded
+    await w1.step();
+    expect(transport.inputs.at(-1)!.lastRejection).toMatchObject({ code: "EXECUTOR_FAILED", action: "edit" });
+    expect(transport.inputs.at(-1)!.lastRejection!.error).toMatch(/TS2322/);
+  });
+
+  it("pushes an edit the pre-push check passes or skips, noting each skip reason once", async () => {
+    const env = await setup();
+    const executor = new RecordingExecutor((ctx) => ({ "src/a/x.ts": `export const x = ${ctx.objective.length};\n` }));
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "first" },
+      { type: "edit", itemId: "i1", instruction: "second edit" },
+      { type: "edit", itemId: "i1", instruction: "and a third edit" },
+    ]);
+    const answers = [{ ok: true as const, skipped: "the project has no tsconfig.json" }, { ok: true as const, skipped: "the project has no tsconfig.json" }, { ok: true as const }];
+    const w1 = env.agent("w1", { transport, executor, preEditCheck: async () => answers.shift()! });
+    await w1.join();
+    for (let i = 0; i < 5; i++) {
+      await w1.step();
+    }
+    expect((await env.log()).messages.filter((m) => m.type === "push.announced")).toHaveLength(3);
+    expect(answers).toHaveLength(0);
+    const notes = transport.inputs.at(-1)!.capsule.evidence.filter((e) => e.startsWith("pre-push typecheck skipped"));
+    expect(notes).toEqual(["pre-push typecheck skipped: the project has no tsconfig.json"]);
   });
 
   it("never pushes what another process wrote into its worktree: stray changes are discarded (and logged) before an edit, and only listed in-intent paths are staged", async () => {

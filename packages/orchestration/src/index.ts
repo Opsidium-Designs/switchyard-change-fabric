@@ -290,6 +290,7 @@ export type { RunBoardOfflineOptions } from "./run-board-offline.ts";
 export { FirstAttemptFailingGate, OFFLINE_BOARD_EPOCH, OFFLINE_GATE_FIXTURE_COMMAND, OFFLINE_TOOL_AUTHOR_LABEL, offlineFixtureGateLabel, runBoardOffline } from "./run-board-offline.ts";
 
 export { ChildProcessCommandRunner } from "@switchyard-change/verification";
+export { createPrePushTypecheck, type PrePushCheck } from "@switchyard-change/verification";
 export {
   formatDependencyInstall,
   InstallingCommandRunner,

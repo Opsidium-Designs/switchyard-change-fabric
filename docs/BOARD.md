@@ -547,6 +547,21 @@ is distributed changes: items are proposed and claimed, never assigned.
   failed to parse before the edit is not checked, so an edit can still move a
   broken file toward fixed; on a Node without that parser the check is
   skipped. It only refuses; the gate stays authoritative.
+  A live gated run also TYPECHECKS each edit before it is pushed
+  (`createPrePushTypecheck` in `pre-push-typecheck.ts`, the project's own
+  `tsc --noEmit -p tsconfig.json`): the tree the agent sees (its baseline,
+  overlaid with every file in its repo) is checked before and after the edit,
+  and a type error in a file the edit changed that the file did not have
+  before (same file, code, and message; line and column ignored) refuses the
+  edit as `EXECUTOR_FAILED` with the first errors, nothing pushed, so one
+  agent's compile error never hides everyone's test results at the gate.
+  Errors in other files, or ones already there, are never charged to the
+  edit. It is skipped (noted once in the agent's evidence) when the project
+  has no `tsconfig.json`, no installed dependencies (an integrated revision
+  borrows the project's only when its `package.json` is identical), no `tsc`,
+  or the edit changed no TypeScript file, and on a timeout (60 s) or output it
+  cannot read. It only refuses; the gate stays authoritative.
+  `--no-pre-push-typecheck` turns it off.
   Budgets: turns per item, and turns per run; a spent budget is recorded on the
   board (a handoff to another running worker when the board accepts it, else a
   help request with need `turn-budget` or `run-budget`, or `agent.left` when
@@ -1310,7 +1325,7 @@ switchyard-change run-board --offline [--fixture-gate] [--decide-contracts accep
 switchyard-change run-board "<goal>" --project <dir> --worker <url> [--min N] [--max N] \
   [--id <changeId>] [--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] \
   [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] \
-  [--speculate K] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] \
+  [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] \
   [--rate-limit-window-ms N] [--require-model-plan] [--allow-heuristic-planner]
 ```
 
@@ -1325,6 +1340,11 @@ and `0x10` are refused).
 batch gating (see "Speculative batch gating" below); `--speculate 1` integrates
 every pending push as one revision, exactly as before. The offline run accepts
 it too (`run-board --offline --speculate K`).
+
+`--no-pre-push-typecheck` turns off the pre-push typecheck a live gated run
+does on each edit (an edit whose changed files gain type errors is refused
+before it is pushed; see the edit notes above). It is on by default whenever
+the per-app gate is on.
 
 `--integrator local` (the default) integrates in the driver process;
 `--integrator cloud` leaves integration to the Worker's integration Workflow,

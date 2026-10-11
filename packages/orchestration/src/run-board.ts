@@ -143,7 +143,7 @@ import { BoardOperatorClient, type JoinedWorkspace } from "./board-client.ts";
 import { executorToolAuthor, ToolBench, type ToolAuthor, type ToolGateRecord } from "./board-tools.ts";
 import { frameAttributionInput, readTargetExcerpt, triageContract } from "./contract-triage.ts";
 import { deriveProtectedPaths, type ProtectedPaths } from "./protected-paths.ts";
-import type { TestInventory } from "@switchyard-change/verification";
+import type { PrePushCheck, TestInventory } from "@switchyard-change/verification";
 import { redactSecrets } from "./redact.ts";
 import {
   attributeImplicatedUnits,
@@ -582,6 +582,12 @@ export interface RunBoardOptions {
   readonly identity?: GitIdentity;
   /** The per-app gate run on the integrated tree, as argv. */
   readonly appGateCommand?: readonly string[];
+  /**
+   * A refusal-only check each worker's edit passes before it is pushed (the
+   * pre-push typecheck); unset, edits are pushed unchecked. The gate stays
+   * authoritative.
+   */
+  readonly preEditCheck?: PrePushCheck;
   /** The project declares a gate: without a command the verdict is cannot-pass. */
   readonly requireAppGate?: boolean;
   readonly verifyCommandRunner?: VerificationCommandRunner;
@@ -2406,6 +2412,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       tools: toolBench,
       toolAuthor,
       ...(options.escalationModels ? { escalationModels: options.escalationModels } : {}),
+      ...(options.preEditCheck ? { preEditCheck: options.preEditCheck } : {}),
       ...(role === "lead"
         ? {
             seed: async () => {

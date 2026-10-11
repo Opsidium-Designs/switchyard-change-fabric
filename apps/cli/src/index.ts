@@ -88,6 +88,7 @@ import {
   type TeardownApp,
   redactSecrets,
   ChildProcessCommandRunner,
+  createPrePushTypecheck,
   runJevSmoke,
   runToolSmoke,
   formatToolSmokeBuild,
@@ -927,7 +928,7 @@ const commands: Command[] = [
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
       `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--id <changeId>] ` +
-      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--watch] [--keep-work-root] [--rate-limit-window-ms N] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--rate-limit-window-ms N] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const goal = await resolveGoal(args);
@@ -1057,6 +1058,10 @@ const commands: Command[] = [
         ...(gateWiring.requireAppGate ? { requireAppGate: true } : {}),
         ...(gateWiring.verifyCommandRunner ? { verifyCommandRunner: gateWiring.verifyCommandRunner } : {}),
       };
+      // The pre-push typecheck rides on a live gated run: an edit whose changed
+      // files gain type errors is refused before it is pushed (refusal only;
+      // the gate decides). --no-pre-push-typecheck turns it off.
+      const prePushTypecheck = appGateCommand !== undefined && appGateCommand.length > 0 && !hasFlag(args, "--no-pre-push-typecheck");
       const gateLine = appGateCommand
         ? `per-app gate ON (${appGateCommand.join(" ")})`
         : gateWiring.requireAppGate
@@ -1210,6 +1215,11 @@ const commands: Command[] = [
               (speculate ?? DEFAULT_SPECULATE) > 1 ? `up to ${speculate ?? DEFAULT_SPECULATE} prefix candidates per round` : "off"
             })`,
       );
+      console.log(
+        prePushTypecheck
+          ? "  pre-push typecheck: ON (an edit whose changed files gain type errors is refused before it is pushed)"
+          : `  pre-push typecheck: OFF (${appGateCommand !== undefined && appGateCommand.length > 0 ? "disabled by --no-pre-push-typecheck" : "no per-app gate"})`,
+      );
       console.log("");
       const result = await runBoard({
         signal: stop.signal,
@@ -1253,6 +1263,7 @@ const commands: Command[] = [
         // Agents' repo tokens are refreshed before they expire unless turned off.
         ...(hasFlag(args, "--no-token-refresh") ? { refreshTokens: false } : {}),
         ...gateOptions,
+        ...(prePushTypecheck ? { preEditCheck: createPrePushTypecheck() } : {}),
         ...(hasFlag(args, "--watch") ? { skipCleanup: true } : {}),
         ...(deployAppDir ? { deployAppDir: resolve(deployAppDir) } : {}),
         ...(deployAppName ? { deployAppName } : {}),

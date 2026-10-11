@@ -114,6 +114,8 @@ export {
   validToolArg,
 } from "./tool-gate.ts";
 export { gateFailureLine } from "./gate-failure.ts";
+export type { PrePushCheck, PrePushCheckInput, PrePushCheckResult, PrePushTypecheckOptions } from "./pre-push-typecheck.ts";
+export { createPrePushTypecheck, DEFAULT_PRE_PUSH_TYPECHECK_TIMEOUT_MS } from "./pre-push-typecheck.ts";
 
 export type { GitIdentity } from "./git.ts";
 export { withoutCredentials } from "./git.ts";

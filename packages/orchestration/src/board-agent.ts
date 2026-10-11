@@ -66,7 +66,7 @@ import type {
 import { AGENT_ACTION_TYPES, isModelBudgetError, isRateLimitError } from "@switchyard-change/model-adapters";
 import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { authenticatedRemote, clone, push, type GitIdentity } from "@switchyard-change/local-runner";
-import { gateFailureLine, matchesGlob, partitionByScope, toolSkeleton } from "@switchyard-change/verification";
+import { gateFailureLine, matchesGlob, partitionByScope, toolSkeleton, type PrePushCheck } from "@switchyard-change/verification";
 
 import { boardReferenceFiles, type ReferenceFile } from "./board-references.ts";
 import { ToolUseError, type ToolAuthor, type ToolBench } from "./board-tools.ts";
@@ -211,6 +211,13 @@ export interface BoardAgentOptions {
    * to take stays owed), and a rate-limited turn or edit spends no turn budget.
    */
   readonly rateLimit?: RateLimitBackoff;
+  /**
+   * A refusal-only check of an edit before it is pushed (the pre-push
+   * typecheck): a refused edit is discarded and fails as EXECUTOR_FAILED with
+   * the errors, so the agent fixes them on its next turn. It never accepts
+   * anything; the gate stays authoritative. Unset, edits are pushed unchecked.
+   */
+  readonly preEditCheck?: PrePushCheck;
 }
 
 /** The action types each role may return. */
@@ -525,6 +532,8 @@ export class BoardAgent {
   private pending: BoardMessage[] = [];
   private history: AgentTurnHistoryEntry[] = [];
   private evidence: string[] = [];
+  /** The pre-push typecheck skip reasons already noted (each is noted once). */
+  private readonly typecheckSkips = new Set<string>();
   private lastRejection: { code: string; error: string; action: AgentActionType } | undefined;
   private followUp = true;
   private lastFreeKey: string | undefined;
@@ -2556,6 +2565,30 @@ export class BoardAgent {
       return;
     } finally {
       await rm(view, { recursive: true, force: true });
+    }
+    // PRE-PUSH CHECK: an edit whose changed files gain type errors is refused
+    // here, before it is pushed, so one agent's compile error never hides
+    // everyone's test results at the gate. A skipped check lets it proceed.
+    if (this.options.preEditCheck) {
+      const checked = await this.options.preEditCheck({
+        baselineDir: this.baseDir,
+        agentDir: worktree,
+        changed: await worktreeChanges(worktree),
+        fallbackNodeModulesDir: this.options.projectDir,
+        tempRoot: join(this.options.workRoot, "typecheck"),
+      });
+      if (!checked.ok) {
+        await this.discard(worktree, head);
+        local(
+          "EXECUTOR_FAILED",
+          bounded(this.scrub(`the edit does not typecheck: ${checked.errors.slice(0, 3).join("; ")} (fix these in your next edit; nothing was pushed)`), 300),
+        );
+        return;
+      }
+      if (checked.skipped !== undefined && !this.typecheckSkips.has(checked.skipped)) {
+        this.typecheckSkips.add(checked.skipped);
+        this.evidence.push(bounded(`pre-push typecheck skipped: ${checked.skipped}`, 300));
+      }
     }
     const model = rungs[usedRung];
     const tier = usedRung === ladder.length ? "strongest" : "stronger";
