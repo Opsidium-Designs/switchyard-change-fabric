@@ -158,8 +158,8 @@ base?, verdict: pass | fail, outcome: landed | passed | blamed | retest, rev?, b
 speculative candidate; see "Speculative batch gating"), `push.excluded {item, agent, commit, reason}` (engine,
 recorded, addressed to the holder: the integrator left its pending push out because it failed verification; see
 "Excluded pushes"), `push.regressed {item, agent, commit, rev, ratchet, from, to, candidate, evidence, seams?}` (engine,
-recorded, arbitration revision 5, before the first pass, addressed to the holder: the push alone regressed the pre-pass
-ratchet; see "The pre-pass progress ratchet"), `decision.recorded {juncture:
+recorded, arbitration revision 5, before the first pass, addressed to the holder: the stack of every latest push scored
+strictly better without this push; see "The pre-pass progress ratchet"), `decision.recorded {juncture:
 plan-review | attribution | fix-confidence | contract-triage, question, answer?, confidence?, accepted, error?, rev?,
 parsed?, contract?}` (engine, advisory), `decision.resolved {decisionSeq, rev, passed, answer, outcome:
 in-fixed-set | not-in-fixed-set, fixed, parsed, parseOutcome: in-fixed-set | not-in-fixed-set | none}` (engine, derived, advisory),
@@ -238,10 +238,12 @@ keeps its cooldown, and so does a stalled one another agent could take.
 Revision 3 runs were published live, so this is a new revision: it only
 accepts claims revision 3 refused, and a revision 3 log replays as recorded.
 Revision 5 (everything in revision 4, plus the PRE-PASS PROGRESS RATCHET; see
-"The pre-pass progress ratchet" below). Before the first passing revision the
-local integrator stacks new pushes on the best-scoring failing revision so
-far and isolates a push that alone makes it worse; such a push is recorded
-`push.regressed` and is not stacked again until its holder pushes again.
+"The pre-pass progress ratchet" below). Before the first passing revision,
+when the stack of every latest push scores worse than the best-scoring
+failing revision so far, the local integrator checks the new pushes
+leave-one-out; a push whose removal makes the stack strictly better is
+recorded `push.regressed` and is not stacked again until its holder pushes
+again. Pushes that only work together are never blamed.
 Revision 4 runs were published live (the storefront runs), so this is a new
 revision; a revision 4 log replays as recorded (it can carry no
 `push.regressed`: the board refuses one below revision 5).
@@ -693,7 +695,18 @@ is distributed changes: items are proposed and claimed, never assigned.
   (`fix-budget`), or the run budget, the round limit, quiescence, or the timeout
   ends it. The whole phase runs under try/finally: a throw (a refused join, an
   unreachable board) aborts every agent loop, marks the Change failed, and
-  archives every repo the run created before the error propagates. The verdict
+  archives every repo the run created before the error propagates. An operator
+  interrupt (`options.signal`; the CLI aborts it on the FIRST SIGINT or SIGTERM)
+  ends the phase with stop reason `interrupted`: every agent loop stops, no new
+  integration starts, the integration in flight gets `interruptGraceMs`
+  (default 60 s) to finish, and the usual ending runs (the verdict, the
+  `/integration` record, repo archiving, token revocation, and the work root as
+  the flags say). An interrupted run is verified only when its last gated
+  revision passed and everything else a verified run needs holds; an
+  integration still running when the grace period ends makes the result
+  partial and failed, so nothing from it is promoted. A SECOND signal exits at
+  once (130) without the ending (`cleanup-live` tears down what it left). The
+  CLI exits 130 for an interrupted run that is not verified. The verdict
   is the LAST revision's gate; it is posted to `/integration` and must be
   recorded (a verdict the control plane refused stops the run before
   promotion); only that revision, when it passed, is promoted (and redeployed in
@@ -1334,76 +1347,117 @@ What the local integrator does with it (`integrateRatchetRound`,
 and only before the first pass (without a scored failing revision it
 integrates exactly as before):
 
-1. The whole stack (every pending push, as before) is built and gated. A tree
-   that scores at least as well as the ratchet, or passes, is recorded exactly
-   as before, with the usual attribution: it may become the next ratchet, or
-   the first passing revision.
-2. A stack that scores WORSE is isolated. For each NEW push (an agent's unit
-   that carries a push the ratchet did not merge), in push order, up to K (the
-   `speculate` rule) and only while no run cap is reached (`stopCandidates`),
-   the tree of the ratchet's merged set plus that push alone is built and gated
-   with the same candidate machinery as speculation (`gateCandidateTree`: the
-   same verifier, integrator, immutable gate, contract restore, install, and
-   inventory, its own work directories, on the recorded head). The ratchet's
-   set is rebuilt from the log (`ratchetUnits`: each agent pinned to its latest
-   commit the ratchet merged); when it cannot be rebuilt exactly, the rebuilt
-   tree is gated first and its score is the reference. A push whose tree scores
-   worse than the reference REGRESSES the ratchet; one that ties or improves is
-   kept; one beyond K or after a cap is stacked as usual, never blamed.
-3. With regressing pushes, the whole stack is recorded as a failing revision
-   (it is the gated tree; base = the head) whose implicated items are the
-   regressing pushes' items only (attribution source `ratchet` in the summary),
-   so the board's fix loop asks, and charges the fix budget of, those holders
-   alone; its failing output leads with what the isolation showed. Each
-   regression is recorded `push.regressed {item, agent, commit, rev, ratchet,
-   from, to, candidate, evidence, seams?}` through the engine-record route,
-   addressed to the holder: `from` is the reference score, `to` the isolation
-   tree's, `candidate` its gated commit, `evidence` the failure lines the push
-   alone added (bounded, credential-scrubbed), `seams` the shared seams it
-   edits (blueprint seams, `src/contracts/**`, `src/store.ts`). The board
+1. The whole stack (every item's latest push, as before) is built and gated.
+   A tree that scores at least as well as the ratchet, or passes, is recorded
+   exactly as before, with the usual attribution: it may become the next
+   ratchet, or the first passing revision.
+2. A stack that scores WORSE is checked LEAVE-ONE-OUT. For the NEW pushes (an
+   agent's unit that carries a push the ratchet did not merge), the stack
+   WITHOUT that agent's pushes is built and gated with the same candidate
+   machinery as speculation (`gateCandidateTree`: the same verifier,
+   integrator, immutable gate, contract restore, install, and inventory, its
+   own work directories, on the recorded head). The order is deterministic
+   (`leaveOneOutPlan`): pushes whose items the whole stack's failure parse
+   attributes come first, then push order. At most K candidates are gated (the
+   `speculate` rule) and none once a run cap is reached (`stopCandidates`); a
+   push beyond that is stacked as usual, never blamed. A push is a REGRESSOR
+   only when removing it makes the stack score STRICTLY BETTER than the whole
+   stack. Removing a push puts its item back at the baseline (the board
+   integrates only an item's latest push), so pushes that need each other (a
+   seam change and the code that uses it) make the stack worse when either one
+   is removed: neither is ever blamed.
+3. SEAM GROUPS. A new push that edits a shared seam (a blueprint seam,
+   `src/contracts/**`, `src/store.ts`) has CONSUMERS among the other new
+   pushes (`seamConsumers`): a blueprint importer of the seam is in their
+   announced paths or write intent, one of their items waits on the seam push
+   (`seamWaits`), or a type error in a file they pushed names the seam's module
+   or a quoted name it exports. The seam push and its consumers are also
+   removed together as one candidate, right after the members' own. When
+   removing the group makes the stack strictly better, every member was tried
+   alone, and none alone did, the SEAM PUSH is the regressor (a seam change
+   that breaks importers nobody updated is still found); its consumers are
+   never blamed for needing it. When a member alone explains the improvement
+   the group blames no one (`improves` in the summary).
+4. The whole stack is recorded as the failing revision with the usual
+   attribution (the fix requests go to the items its failures point at, as
+   before the ratchet); its failing output leads with what each leave-one-out
+   tree scored. Each regressor is recorded `push.regressed {item, agent,
+   commit, rev, ratchet, from, to, candidate, evidence, seams?}` through the
+   engine-record route, addressed to the holder: `to` is the whole stack's
+   score (revision `rev`), `from` the score of the same stack without the push
+   (strictly better), `candidate` that tree's gated commit, `ratchet` the best
+   revision so far (context), `evidence` the failure lines that go away
+   without the push (bounded, credential-scrubbed), `seams` the shared seams
+   it edits. When one agent's unit carries several new items, only the items
+   whose paths the removed failures name are recorded (all of them when none
+   is named); a group records only the items that edit the seam. The board
    refuses it below revision 5, after a pass, for a push that is not the
-   item's latest gated one, or when `to` is not worse than `from`.
-4. The stack without the regressing pushes is built, gated, and recorded as
-   the next revision (attributed as any revision is: under revision 3 a failure
-   that maps only to the excluded item is `outstanding` and blames no one). It
-   may become the next ratchet, or pass.
+   item's latest gated one, or when `to` is not worse than `from` (the board's
+   check is unchanged from the first ratchet, so the revision stays 5).
+5. With at least one regressor, the stack without the regressors is recorded
+   as the next revision (attributed as any revision is). When it is exactly a
+   leave-one-out tree already gated (one regressor whose agent carried only
+   the blamed pushes), that tree is recorded as gated rather than gated twice.
+   Without a regressor nothing else is recorded and nothing is left out: the
+   next revision stacks every latest push again, so coupled work accumulates
+   and its remaining errors are fixed through ordinary attribution.
 
 A regressing push leaves every integration plan (`integrablePushItems`) until
 its holder pushes again; meanwhile the claim's lease runs (it renews at the
 record), the item's wait reason is `push-regressed`, and the holder's digest
 carries `claims[].regressed {commit, rev, from, to, evidence, seams?,
-instruction}`; the fix request's instruction quotes the regression ("your
-push adds 22 type errors: src/billing/payments.ts(25,12): error TS2339:
-Property 'auth' does not exist on type 'Ctx'..."), and the agent's edit
+instruction}`; the instruction says what the push did ("made revision 4
+WORSE: with it the stack scores 7 type errors, without it acceptance 16/129")
+and the fix request quotes it ("removing your push removes 22 type errors:
+src/billing/payments.ts(25,12): error TS2339: ..."), and the agent's edit
 objective carries the evidence. A push that edits a FROZEN shared seam (no
-item owns it), or whose new type errors point at one its item imports (read
-as the failing-revision cue reads them), also gets the existing seam contract
-cue (`seamCue`), so the agent proposes a seam contract instead of editing; the
+item owns it), or whose evidence points at one its item imports (read as the
+failing-revision cue reads them), also gets the existing seam contract cue
+(`seamCue`), so the agent proposes a seam contract instead of editing; the
 lead's seam-contract facts (`seamContractFacts`: does the failure name the
-seam?) read that evidence too, since the board's latest failure is then the
-stack without the push. A push that edits a shared file its own item owns is
-told to keep it backward compatible.
+seam?) read that evidence too. A push that edits a shared file its own item
+owns is told to keep it backward compatible.
+
+Why leave-one-out, candidly. The first version of the ratchet (same
+revision 5) gated "the ratchet's set plus one new push alone" and blamed any
+push whose tree scored worse than the ratchet. Because the score ranks
+"the acceptance suite runs" first, any push that introduced even one type
+error alone was worse, including COUPLED changes: the live storefront run
+board-live-sf12 stayed at its first revision's acceptance 16/129 through
+revision 9 while revision 2 blamed payments, invoices and cart, revision 4
+blamed refunds, products, history and the seam push to `src/store.ts` they
+needed, revision 6 blamed invoices and a second seam push, and revision 7
+merged a single push (back to the ratchet's tree). Nothing coupled could
+land, and agents were told their correct-but-coupled pushes were
+regressions. That log is the only one that carries a `push.regressed`, and
+it was abandoned, so the semantics changed under the same revision.
 
 What it is NOT, candidly. The ratchet never moves the integrated head (the
 head stays the baseline until a revision passes, and every revision is built
 on it: `STALE_BASE` applies), never promotes anything, and never changes a
 verdict: only a passing revision is verified, and only it is promoted
-(gate-equals-deploy is unchanged). Isolation trees are evidence, never
-verdicts; the ones that regress are named by their gated commit in
-`push.regressed`, the others appear only in the run summary. The ratchet only
-decides what the integrator stacks next and whom it asks to fix. It costs up
-to K + 2 gate runs in a round that regresses (the stack, K isolation trees,
-the stack without the regressing pushes). The board integrates only an item's
-LATEST push, so when a holder's new push for the same item regresses, that
-item's earlier, better push cannot be stacked in its place: the item is
-missing from the next revision until its holder pushes again (isolation still
-compares against the ratchet's tree, which carries the earlier push). The
+(gate-equals-deploy is unchanged). The ratchet is the best revision so far
+and is shown, but it no longer decides what is stacked: only a recorded
+regressor leaves the stack. Leave-one-out trees are evidence, never verdicts;
+a regressor's tree is named by its gated commit in `push.regressed`, the
+others appear only in the run summary and in the failing output's note. It
+costs up to K + 2 gate runs in a round with a regressor (the stack, K
+leave-one-out trees, the stack without the regressors, often reused). It is
+coarse in three ways: it removes an agent's whole unit (an agent holding
+several items loses all of them in that candidate); K bounds how many
+candidates a round tries, so with many new pushes a seam group (placed after
+its members) may not be reached; and a pair whose combination is bad cannot
+be split, so the group blames the seam push and its holder sees the
+failures in the consumer's file. A pair that is worse than the ratchet
+together but no better apart is stacked again (and fixed through
+attribution), so a revision can stay below the best one for a while. The
 integration Workflow on Cloudflare does not run the ratchet in this slice.
 After the first passing revision the ratchet is over and speculative gating
 takes over unchanged.
 
 Where it shows. The run summary prints the ratchet's history, a `best so far:
-rev N, acceptance x/129` line, and each isolation round; the console's board
+rev N, acceptance x/129` line, and each leave-one-out round (`without <items>
+(<agents>) regressed | improves | kept | unscored | skipped <score>`); the console's board
 pane shows the same `best so far` line (a count, never styled as a verdict)
 and the thread summarizes each `push.regressed`; the proof bundle lists the
 ratchet's history and the regressions as a record (`ratchet`), never part of
@@ -1967,8 +2021,8 @@ acts next), `waiting-for-gate` (the pending push's
 commit: the revision has no number yet, so none is invented),
 `push-excluded` (the holder's latest push was left out of integration, with
 the reason: the holder pushes again), `push-regressed` (arbitration revision
-5: the holder's latest push alone regressed the pre-pass ratchet in revision
-`rev`: the holder pushes a fix), `waiting-on-others` (arbitration
+5: revision `rev` scored strictly better without the holder's latest push:
+the holder pushes a fix), `waiting-on-others` (arbitration
 revision 3: the holder's push was gated in revision `rev` and owes no fix: it
 waits for the other items), `fix-budget-exhausted` (by whom), or
 `unclaimed`. A moving item has none.

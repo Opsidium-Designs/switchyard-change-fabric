@@ -286,7 +286,7 @@ describe("a regressing push in the generic policy (arbitration revision 5)", () 
     expect((await at({ fix, regressed })).action).toMatchObject({
       type: "edit",
       itemId: "y",
-      instruction: "Fix the regression my push abcdef0123 introduced on revision 2 (attempt 1; 22 type errors against the best acceptance 3/9): do y",
+      instruction: "Fix the regression my push abcdef0123 introduced on revision 2 (attempt 1; 22 type errors with it, acceptance 3/9 without it): do y",
     });
     expect((await at({ fix })).action).toMatchObject({ type: "edit", itemId: "y", instruction: "Fix what failed the integration gate on revision 2 (attempt 1): do y" });
   });

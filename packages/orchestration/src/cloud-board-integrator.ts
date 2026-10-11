@@ -245,6 +245,8 @@ export interface BoardIntegratorLike {
   wants(state: BoardState): boolean;
   kick(): void;
   idle(): Promise<void>;
+  /** Stop starting attempts (an interrupted run); the attempt in flight still finishes. */
+  halt?(): void;
 }
 
 /** Follows the revisions the integration Workflow records (it never integrates itself). */

@@ -147,13 +147,15 @@ export interface BoardRules {
    * none): the cooldown exists so another agent gets it first, and nobody can.
    * Revision 5 (what a new run posts) adds the PRE-PASS PROGRESS RATCHET:
    * before the first passing revision, the best-scoring failing revision (see
-   * prePassRatchet) is the set the local integrator stacks new pushes on. A
-   * stack that scores worse than it is isolated (the ratchet's set plus each
-   * new push alone); a push that alone regresses it is recorded
-   * `push.regressed` (addressed to its holder, who is asked for the fix by the
-   * failing revision that gated it) and is not stacked again until its holder
-   * pushes again. The ratchet never moves the integrated head, never
-   * promotes, and never changes a verdict: only a passing revision does.
+   * prePassRatchet) is the best so far. A stack of every latest push that
+   * scores worse than it is checked LEAVE-ONE-OUT (the stack without one new
+   * push, or without a seam push together with the pushes that import its
+   * seam); a push whose removal makes the stack score strictly better is
+   * recorded `push.regressed` (addressed to its holder) and is not stacked
+   * again until its holder pushes again. Pushes that only work together are
+   * never blamed: every other latest push is stacked as before. The ratchet
+   * never moves the integrated head, never promotes, and never changes a
+   * verdict: only a passing revision does.
    */
   readonly arbitration?: number;
 }
@@ -661,15 +663,16 @@ export interface BoardPayloads {
   /**
    * Engine (recorded by the operator, arbitration revision 5, before the first
    * passing revision), addressed to the holder: `agent`'s push `commit` for
-   * `item` REGRESSED the pre-pass ratchet. Failing revision `rev` gated it with
-   * the rest of the stack and scored worse than the ratchet (failing revision
-   * `ratchet`, score `from`); the isolation tree of the ratchet's set plus
-   * this push alone (`candidate`, a real gated tree) scored `to`, worse than
-   * `from`. `evidence` quotes the new failure lines (bounded); `seams` lists
-   * the shared seams the push edits. The push is not stacked again until the
-   * holder pushes again; meanwhile the claim's lease runs and the item's wait
-   * reason is `push-regressed`. Never a verdict: it decides only what is
-   * stacked and who is asked to fix.
+   * `item` made the stack WORSE. Failing revision `rev` gated it with the rest
+   * of the stack (every latest push) and scored `to`, worse than the best
+   * failing revision so far (revision `ratchet`); the same stack WITHOUT this
+   * push (`candidate`, a real gated tree; for a seam push, possibly without
+   * the pushes that import its seam too) scored `from`, strictly better than
+   * `to`. `evidence` quotes the failure lines the push's removal removes
+   * (bounded); `seams` lists the shared seams the push edits. The push is not
+   * stacked again until the holder pushes again; meanwhile the claim's lease
+   * runs and the item's wait reason is `push-regressed`. Never a verdict: it
+   * decides only what is stacked and who is told.
    */
   "push.regressed": {
     readonly item: string;
@@ -1211,7 +1214,7 @@ export interface BoardItemPush {
   unverifiedIn?: number;
   /** The integrator left this push out (push.excluded): not re-gated until the holder pushes again. */
   excluded?: { readonly seq: number; readonly reason: string };
-  /** Arbitration revision 5: this push regressed the pre-pass ratchet (push.regressed): not stacked until the holder pushes again. */
+  /** Arbitration revision 5: removing this push made its stack better (push.regressed): not stacked until the holder pushes again. */
   regressed?: { readonly seq: number } & Omit<BoardPayloads["push.regressed"], "item" | "agent" | "commit" | "candidate">;
   /** Its board clock under arbitration revision 2. */
   readonly tick?: number;
@@ -3266,7 +3269,7 @@ export type BoardWaitReason =
   | { readonly kind: "waiting-for-gate"; readonly commit: string }
   /** Its holder's latest push was left out of integration (push.excluded): the holder pushes again. */
   | { readonly kind: "push-excluded"; readonly commit: string; readonly reason: string }
-  /** Revision 5: its holder's latest push regressed the pre-pass ratchet in revision `rev` (push.regressed): the holder pushes a fix. */
+  /** Revision 5: its holder's latest push made revision `rev` worse (push.regressed: the stack scores better without it): the holder pushes a fix. */
   | { readonly kind: "push-regressed"; readonly commit: string; readonly rev: number }
   /** Revision 3: its holder's push was gated in revision `rev` and no fix is owed: it waits for the other items (see waitingOnOthers). */
   | { readonly kind: "waiting-on-others"; readonly commit: string; readonly rev: number }
@@ -3382,7 +3385,7 @@ export function describeWaitReason(reason: BoardWaitReason): string {
     case "push-excluded":
       return `push ${reason.commit.slice(0, 10)} was left out of integration (${reason.reason.slice(0, 160)}): its holder pushes again`;
     case "push-regressed":
-      return `push ${reason.commit.slice(0, 10)} regressed the best revision so far (revision ${reason.rev}): it is not stacked until its holder pushes a fix`;
+      return `push ${reason.commit.slice(0, 10)} made revision ${reason.rev} worse (the stack scores better without it): it is not stacked until its holder pushes a fix`;
     case "waiting-on-others":
       return `push ${reason.commit.slice(0, 10)} was gated in revision ${reason.rev} and owes no fix: it waits on the other items`;
     case "fix-budget-exhausted":
@@ -3470,8 +3473,8 @@ export function seamContractFacts(state: BoardState, contractId: string): { read
   if (contract?.seam === undefined) {
     return { namedInFailure: false };
   }
-  // Arbitration revision 5: the item's latest push regressed the pre-pass
-  // ratchet: the new failures its push alone added are failing output too.
+  // Arbitration revision 5: the item's latest push made its stack worse
+  // (push.regressed): the failures its removal removes are failing output too.
   const regression = contract.item !== undefined ? state.items[contract.item]?.lastPush?.regressed : undefined;
   const output = [state.lastFailure?.output ?? "", ...(regression?.evidence ?? [])].join("\n");
   const segments = contract.seam.split("/");
@@ -4079,7 +4082,7 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         fail("BAD_PAYLOAD", `the ratchet (revision ${p.ratchet}) must precede the regressing revision ${p.rev}`);
       }
       if (compareProgressScore(p.to, p.from) >= 0) {
-        fail("BAD_PAYLOAD", `a regression scores worse than the ratchet (${describeProgressScore(p.to)} is not worse than ${describeProgressScore(p.from)})`);
+        fail("BAD_PAYLOAD", `a regression is a stack that scores worse with the push than without it (${describeProgressScore(p.to)} is not worse than ${describeProgressScore(p.from)})`);
       }
       if (push.regressed !== undefined) {
         fail("DUPLICATE", `${p.agent}'s push ${p.commit.slice(0, 12)} for ${item.id} is already recorded regressed`);
@@ -6654,9 +6657,9 @@ export type EngineRecordType = (typeof ENGINE_RECORD_TYPES)[number];
  *     holder pushes again.
  *   - push.regressed {item, agent, commit, rev, ratchet, from, to, candidate,
  *     evidence, seams?}: under arbitration revision 5, before the first pass,
- *     the holder's push regressed the pre-pass ratchet (its isolation tree
- *     scored worse); addressed to the holder, it is not stacked again until
- *     the holder pushes again.
+ *     the holder's push made its stack worse (the same stack without it,
+ *     a gated tree, scored strictly better); addressed to the holder, it is
+ *     not stacked again until the holder pushes again.
  * Refused (nothing appended) when the record does not match the board.
  */
 export function appendEngineRecord(state: BoardState, input: unknown, at: string): BoardAppendResult {
@@ -6820,7 +6823,7 @@ function regressionSeams(state: BoardState, seams: readonly string[]): { readonl
 
 /**
  * Arbitration revision 5: the seam contract cue of a held item whose latest
- * push regressed the pre-pass ratchet by editing a FROZEN shared seam (the
+ * push made its stack worse (push.regressed) by editing a FROZEN shared seam (the
  * board accepts a seam contract for it), unless that seam was already asked
  * about for the item. Pure.
  */
@@ -6840,17 +6843,18 @@ function regressionSeamCue(
 }
 
 /**
- * The regression a push.regressed records, quoted for its holder:
- * `your push adds 22 type errors: src/billing/payments.ts(25,12): ...`. Pure.
+ * The regression a push.regressed records, quoted for its holder (`to` is the
+ * stack with the push, `from` the same stack without it):
+ * `removing your push removes 22 type errors: src/billing/payments.ts(25,12): ...`. Pure.
  */
 export function regressionQuote(r: Pick<BoardPayloads["push.regressed"], "from" | "to" | "evidence">): string {
-  const added = r.to.typeErrors - r.from.typeErrors;
+  const removed = r.to.typeErrors - (r.from.runs ? 0 : r.from.typeErrors);
   const what =
-    !r.to.runs && r.to.typeErrors > 0 && added > 0
-      ? `your push adds ${added} type error${added === 1 ? "" : "s"}`
+    !r.to.runs && r.to.typeErrors > 0 && removed > 0
+      ? `removing your push removes ${removed} type error${removed === 1 ? "" : "s"}${r.from.runs ? ` (the acceptance suite runs again: ${describeProgressScore(r.from)})` : ""}`
       : !r.to.runs && r.from.runs
-        ? `with your push the acceptance suite no longer runs (${describeProgressScore(r.to)})`
-        : `your push takes the best revision from ${describeProgressScore(r.from)} to ${describeProgressScore(r.to)}`;
+        ? `without your push the acceptance suite runs (${describeProgressScore(r.from)})`
+        : `removing your push takes the stack from ${describeProgressScore(r.to)} to ${describeProgressScore(r.from)}`;
   return r.evidence.length > 0 ? `${what}: ${r.evidence.slice(0, 3).join(" | ")}` : what;
 }
 
@@ -6883,10 +6887,10 @@ export interface BoardDigest {
     /** The integrator left this claim's latest push out (push.excluded): fix and push again. */
     readonly excluded?: { readonly commit: string; readonly reason: string; readonly instruction: string };
     /**
-     * Arbitration revision 5: this claim's latest push REGRESSED the pre-pass
-     * ratchet (push.regressed): `evidence` quotes the new failure lines;
-     * with `seams` the push edited a shared seam (propose a seam contract
-     * instead). Not stacked again until you push again.
+     * Arbitration revision 5: this claim's latest push made its stack WORSE
+     * (push.regressed: `to` with it, `from` without it): `evidence` quotes the
+     * failure lines its removal removes; with `seams` the push edited a shared
+     * seam (propose a seam contract instead). Not stacked again until you push again.
      */
     readonly regressed?: {
       readonly commit: string;
@@ -7240,8 +7244,8 @@ export function boardDigest(
             evidence: [...r.evidence],
             ...(r.seams !== undefined ? { seams: [...r.seams] } : {}),
             instruction:
-              `your push ${r.commit.slice(0, 10)} REGRESSED the best revision so far (revision ${r.ratchet}: ${describeProgressScore(r.from)}): ` +
-              `with your push alone it scores ${describeProgressScore(r.to)}${r.evidence.length > 0 ? `; new failures: ${r.evidence.slice(0, 3).join(" | ")}` : ""}. ` +
+              `your push ${r.commit.slice(0, 10)} made revision ${r.rev} WORSE: with it the stack scores ${describeProgressScore(r.to)}, without it ${describeProgressScore(r.from)} ` +
+              `(the best revision so far is ${r.ratchet})${r.evidence.length > 0 ? `; failures your push brings: ${r.evidence.slice(0, 3).join(" | ")}` : ""}. ` +
               `Fix exactly that (stay inside the write intent; use only APIs that exist) and push again; it is not stacked until you do.${seamHint}`,
           },
         };
@@ -7252,7 +7256,7 @@ export function boardDigest(
               n: i.fixRequested,
               attempt: i.fixAttempts ?? 1,
               instruction: regressions.has(i.id)
-                ? `revision ${i.fixRequested} FAILED the gate and your push alone regressed it (fix attempt ${i.fixAttempts ?? 1} of ${state.rules.maxFixAttempts}): ${regressionQuote(regressions.get(i.id)!)}. ` +
+                ? `revision ${i.fixRequested} FAILED the gate and the stack scores better without your push (fix attempt ${i.fixAttempts ?? 1} of ${state.rules.maxFixAttempts}): ${regressionQuote(regressions.get(i.id)!)}. ` +
                   "Edit it now to remove the regression (claims.regressed has the evidence). Your done proposal does not complete it, and you are not waiting for integration"
                 : `revision ${i.fixRequested} FAILED the gate and implicates this item (fix attempt ${i.fixAttempts ?? 1} of ${state.rules.maxFixAttempts}): ` +
                   "edit it now to make the gate pass (digest.failure has the output). Your done proposal does not complete it, and you are not waiting for integration",

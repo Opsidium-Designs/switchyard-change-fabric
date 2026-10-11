@@ -171,6 +171,10 @@ export interface RunBoardOfflineOptions {
   /** Pin Git author and committer dates for the run so commit ids repeat (default true). */
   readonly fixedGitDates?: boolean;
   readonly onEvent?: (event: BoardRunEvent) => void;
+  /** An operator stop (SIGINT/SIGTERM in the CLI): see RunBoardOptions.signal. */
+  readonly signal?: AbortSignal;
+  /** After an interrupt: the wait for the agents and the in-flight integration, in ms. */
+  readonly interruptGraceMs?: number;
 }
 
 /** Run a board offline and deterministically. */
@@ -243,6 +247,8 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       ...(options.toolTimeoutMs !== undefined ? { toolTimeoutMs: options.toolTimeoutMs } : {}),
       ...(options.toolAuthor === undefined ? { toolAuthorLabel: OFFLINE_TOOL_AUTHOR_LABEL } : {}),
       ...(options.onEvent ? { onEvent: options.onEvent } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.interruptGraceMs !== undefined ? { interruptGraceMs: options.interruptGraceMs } : {}),
     });
     // The whole scratch directory: the offline control's repos and the run's work root.
     return { ...result, scratchRoot: workRoot };

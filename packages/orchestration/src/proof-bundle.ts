@@ -26,8 +26,8 @@
  *
  * Under arbitration revision 5 it lists the PRE-PASS RATCHET's history (each
  * failing revision that became the best so far before the first pass) and
- * the pushes recorded as regressing it: a record of what was stacked and who
- * was asked to fix, never part of the proof (the ratchet never moves the head,
+ * the pushes recorded as regressors (the stack scored strictly better without
+ * them): a record of what was stacked and who was told, never part of the proof (the ratchet never moves the head,
  * promotes, or changes a verdict).
  */
 
@@ -437,7 +437,7 @@ export function formatProofSummary(bundle: ProofBundle): string[] {
     lines.push(
       `  pre-pass ratchet (best so far before the first pass; a record, not a verdict): ${bundle.ratchet.history.map((h) => `rev ${h.n} ${h.line}`).join(" -> ") || "none"}` +
         (bundle.ratchet.regressions.length > 0
-          ? `; regressions: ${bundle.ratchet.regressions.map((r) => `${r.item} (${r.agent}, ${r.commit.slice(0, 10)}) ${r.to} vs rev ${r.ratchet} ${r.from}, fix asked by rev ${r.rev}`).join("; ")}`
+          ? `; regressions: ${bundle.ratchet.regressions.map((r) => `${r.item} (${r.agent}, ${r.commit.slice(0, 10)}) rev ${r.rev} ${r.to} with it, ${r.from} without it`).join("; ")}`
           : ""),
     );
   }

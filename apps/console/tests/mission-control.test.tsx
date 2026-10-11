@@ -231,7 +231,7 @@ describe("replay", () => {
 });
 
 describe("pre-pass ratchet (arbitration revision 5)", () => {
-  /** A failing revision with acceptance 3/9 (the ratchet), then one whose stack regressed: a push.regressed record. */
+  /** A failing revision with acceptance 3/9 (the ratchet), then a worse stack that scores better without x's push: a push.regressed record. */
   function ratchetLog(): BoardMessage[] {
     const b = new FixtureBoard();
     b.human({ type: "goal.posted", payload: { objective: "o", rules: { arbitration: 5, maxFixAttempts: 3 } } });
@@ -267,7 +267,7 @@ describe("pre-pass ratchet (arbitration revision 5)", () => {
     const plain = renderToStaticMarkup(createElement(BoardPane, { model: buildBoardGraph(log), cards: [], selection: null, busy: false, onSelect: () => {}, onResolve: () => {}, log }));
     expect(plain).not.toContain("best so far");
     const markup = render({ log: rlog });
-    expect(markup).toContain("x c2 regressed the best revision so far (rev 1): not stacked until ag-1 pushes again");
+    expect(markup).toContain("x c2 made rev 2 worse (better without it): not stacked until ag-1 pushes again");
   });
 });
 

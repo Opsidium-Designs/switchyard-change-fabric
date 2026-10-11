@@ -345,7 +345,9 @@ export type BoardStopReason =
   | "quiescent"
   | "max-rounds"
   | "timeout"
-  | "all-agents-stopped";
+  | "all-agents-stopped"
+  /** The operator stopped the run (options.signal, for example SIGINT): no new turns, no new integration; cleanup still runs. */
+  | "interrupted";
 
 /** An integration recorded as a board revision. */
 export interface BoardRevision {
@@ -538,6 +540,17 @@ export interface RunBoardOptions {
   readonly toolTimeoutMs?: number;
   /** The project's own syntax or type check, run on a codemod's output in the codemod's gate (when declared). */
   readonly toolSyntaxCommand?: readonly string[];
+  /**
+   * An operator stop (the CLI aborts it on SIGINT/SIGTERM): the agent phase
+   * ends with stop reason "interrupted", agents stop, no new integration
+   * starts, the in-flight one is awaited for at most `interruptGraceMs`, and
+   * the usual ending runs (the verdict of what was gated, cleanup). An
+   * interrupted run is verified only when its last gated revision passed and
+   * every other condition of a verified run holds.
+   */
+  readonly signal?: AbortSignal;
+  /** After an interrupt: how long to wait for the agents and the in-flight integration, in ms (default 60 s). */
+  readonly interruptGraceMs?: number;
   readonly onEvent?: (event: BoardRunEvent) => void;
 }
 
@@ -621,7 +634,7 @@ export interface RunBoardResult {
   readonly proof?: ProofBundle;
   /** The speculation the run used (K) and every speculative round's candidates, in order. */
   readonly speculation?: { readonly speculate: number; readonly rounds: readonly (readonly CandidateOutcome[])[] };
-  /** Every pre-pass ratchet isolation round (arbitration revision 5), in order: what each new push alone scored. */
+  /** Every pre-pass ratchet leave-one-out round (arbitration revision 5), in order: what the stack without each candidate scored. */
   readonly ratchet?: { readonly rounds: readonly (readonly RatchetIsolation[])[] };
   /** Model calls and estimated spend the run's meter counted (unpriced calls are counted, never free). */
   readonly usage?: {
@@ -1413,6 +1426,8 @@ export class ContinuousBoardIntegrator {
   lastRequiresGate = false;
   private running: Promise<void> | undefined;
   private requested = false;
+  /** Set by halt (an interrupted run): no new attempt starts; the one in flight finishes. */
+  private halted = false;
   /** Pending-push sets already integrated, or deterministically refused (not retried until something changes). */
   private readonly attempted = new Set<string>();
   /** Transient-failure retries per pending-push set. */
@@ -1504,6 +1519,9 @@ export class ContinuousBoardIntegrator {
 
   /** Start a revision now, or (when one is running) coalesce into the next. */
   kick(): void {
+    if (this.halted) {
+      return;
+    }
     // Set the request first: a running loop always re-checks it after its
     // current attempt, so a kick can never be lost between the loop's last
     // check and its exit (both happen with no await in between).
@@ -1518,9 +1536,15 @@ export class ContinuousBoardIntegrator {
     }
   }
 
+  /** Stop starting attempts (an interrupted run): the attempt in flight, if any, still finishes and is recorded. */
+  halt(): void {
+    this.halted = true;
+    this.requested = false;
+  }
+
   private async loop(): Promise<void> {
     try {
-      while (this.requested) {
+      while (this.requested && !this.halted) {
         this.requested = false;
         await this.once();
       }
@@ -2597,6 +2621,52 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
 
   const lead = makeAgent("lead", "lead");
   const controller = new AbortController();
+  // An operator interrupt (options.signal) stops every agent loop at once and
+  // ends the agent phase with stop reason "interrupted"; the ending still runs.
+  const interrupted = (): boolean => options.signal?.aborted === true;
+  const interruptGraceMs = options.interruptGraceMs ?? 60_000;
+  const graceLine = interruptGraceMs < 1000 ? `${interruptGraceMs} ms` : `${Math.round(interruptGraceMs / 1000)} s`;
+  const onInterrupt = (): void => controller.abort();
+  if (interrupted()) {
+    controller.abort();
+  } else {
+    options.signal?.addEventListener("abort", onInterrupt, { once: true });
+  }
+  /**
+   * Wait for `work`, but once the run is interrupted (before or during the
+   * wait) for at most the grace period from the interrupt. True when it
+   * settled; a rejection propagates when it settles in time.
+   */
+  const withinGrace = async (work: Promise<unknown>): Promise<boolean> => {
+    if (options.signal === undefined) {
+      await work;
+      return true;
+    }
+    const signal = options.signal;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let onAbort: (() => void) | undefined;
+    const graceOver = new Promise<false>((resolve) => {
+      const start = (): void => {
+        timer = setTimeout(() => resolve(false), interruptGraceMs);
+      };
+      if (signal.aborted) {
+        start();
+      } else {
+        onAbort = start;
+        signal.addEventListener("abort", start, { once: true });
+      }
+    });
+    try {
+      return await Promise.race([work.then(() => true as const), graceOver]);
+    } finally {
+      clearTimeout(timer);
+      if (onAbort !== undefined) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    }
+  };
+  /** Set when the in-flight integration did not settle within the grace period after an interrupt. */
+  let integrationCutShort = false;
   const loops: Promise<void>[] = [];
   let stopReason: BoardStopReason | undefined;
   let stopDetail: string | undefined;
@@ -2693,6 +2763,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     };
     const started = Date.now();
     const check = (state: BoardState): BoardStopReason | undefined => {
+      if (interrupted()) {
+        return "interrupted";
+      }
       const owed = outstanding(state);
       // A worker's proposal awaiting the lead keeps the phase open (the lead
       // decides it next); once decided, only accepted items count.
@@ -2746,6 +2819,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         const joined = await recruit(state);
         let acted = false;
         for (const agent of [lead, ...lockstepOrder(workers, (await operator.page(0, 1)).state)]) {
+          if (interrupted()) {
+            break;
+          }
           if ((await agent.step()) === "acted") {
             acted = true;
           }
@@ -2754,9 +2830,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         // Integrate between rounds: every push announced this round is
         // coalesced into the next revision, deterministically.
         const before = integrator.revisions.length;
-        if (integrator.wants((await operator.page(0, 1)).state)) {
+        if (!interrupted() && integrator.wants((await operator.page(0, 1)).state)) {
           integrator.kick();
-          await integrator.idle();
+          // An interrupt during this integration bounds the wait (the ending re-checks it).
+          await withinGrace(integrator.idle());
         }
         const integrated = integrator.revisions.length > before;
         const decided = await settleContracts();
@@ -2835,7 +2912,16 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
               : `every agent was idle (none taking a turn), nothing was integrating, and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s${awaitingSubLeadDetail(state)}`;
           break;
         }
-        await new Promise((resolve) => setTimeout(resolve, pollMs));
+        // The poll wait ends early on an interrupt.
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(done, pollMs);
+          function done(): void {
+            clearTimeout(timer);
+            controller.signal.removeEventListener("abort", done);
+            resolve();
+          }
+          controller.signal.addEventListener("abort", done, { once: true });
+        });
       }
     }
   } catch (error) {
@@ -2845,14 +2931,20 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     // Whatever ended the agent phase (a stop condition or a throw), every agent
     // loop is aborted and awaited before anything else happens.
     controller.abort();
-    await Promise.allSettled(loops);
+    options.signal?.removeEventListener("abort", onInterrupt);
+    // After an interrupt an agent loop gets the grace period to wind down.
+    await withinGrace(Promise.allSettled(loops));
     for (const agent of [lead, ...workers]) {
       agent.halt();
+    }
+    if (interrupted()) {
+      // No new integration starts; the one in flight finishes (bounded below).
+      integrator.halt?.();
     }
     if (failure !== undefined) {
       // A throw (a refused join, an unreachable board) marks the Change failed
       // and cleans up every repo the run created before the error propagates.
-      await integrator.idle().catch(() => undefined);
+      await withinGrace(integrator.idle().catch(() => undefined));
       if (!planningMarked) {
         await failPlanningChange({
           workerUrl: base,
@@ -2870,6 +2962,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     stopDetail ??= `the ${cap.kind} cap was reached (${cap.used} of ${cap.limit}): no new turns; the in-flight work was integrated`;
     await recordCap(cap);
   }
+  if (stopReason === "interrupted") {
+    stopDetail ??=
+      `the operator interrupted the run: no new turns and no new integration; the integration in flight was given ${graceLine} to finish, ` +
+      "the verdict is the last gated revision's, and cleanup runs as usual";
+  }
   emit({ kind: "agents-done", reason: stopReason!, ...(stopDetail ? { detail: stopDetail } : {}) });
 
   let promotion: PromotionResult | undefined;
@@ -2885,10 +2982,15 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   try {
     // 4. The last integration: anything still pending is integrated once more,
     // so the final verdict is the gate of the revision that includes it.
-    await integrator.idle();
-    if (integrator.wants((await operator.page(0, 1)).state)) {
-      integrator.kick();
+    if (interrupted()) {
+      // Interrupted: nothing new is integrated; the in-flight integration gets the grace period.
+      integrationCutShort = !(await withinGrace(integrator.idle()));
+    } else {
       await integrator.idle();
+      if (integrator.wants((await operator.page(0, 1)).state)) {
+        integrator.kick();
+        await integrator.idle();
+      }
     }
     if (integrator.revisions.length === 0) {
       emit({ kind: "nothing-to-integrate" });
@@ -2907,7 +3009,13 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     incompleteReasons = incompleteItemReasons(finalState);
     // A child's push still awaiting its sub-lead's merge was never gated either.
     const ungated = [...pendingPushItems(finalState), ...awaitingSubLead(finalState)];
-    if (verdict === "verified" && ungated.length > 0) {
+    if (integrationCutShort) {
+      // An integration was still running when the grace period ended: what it
+      // may yet record is unknown, so nothing from this run is verified or promoted.
+      verdict = "failed";
+      partial = `the run was interrupted while an integration was still in flight (not settled within ${graceLine}): an interrupted, unsettled result is not verified`;
+      emit({ kind: "promotion-skipped", reason: partial });
+    } else if (verdict === "verified" && ungated.length > 0) {
       verdict = "failed";
       // A speculative candidate may have gated and blamed a pending push (its
       // fix is still owed): say so rather than "never gated".
@@ -3437,7 +3545,7 @@ function payloadSummary(m: BoardMessage): string {
       return `${String(p.agent)}'s push ${String(p.commit).slice(0, 10)} for ${String(p.item)} was left out of integration: ${String(p.reason).slice(0, 160)} (not re-gated until it pushes again)`;
     case "push.regressed": {
       const r = m.payload;
-      return `${r.agent}'s push ${r.commit.slice(0, 10)} for ${r.item} regressed the best revision so far (rev ${r.ratchet}: ${describeProgressScore(r.from)}) to ${describeProgressScore(r.to)} on its own (isolation tree ${r.candidate.slice(0, 10)}, rev ${r.rev} asks for the fix)${r.seams !== undefined ? `; edits the shared seam ${r.seams.join(", ")}` : ""} (not stacked until it pushes again; not a verdict)`;
+      return `${r.agent}'s push ${r.commit.slice(0, 10)} for ${r.item} made rev ${r.rev} worse: ${describeProgressScore(r.to)} with it, ${describeProgressScore(r.from)} without it (tree ${r.candidate.slice(0, 10)}; best so far rev ${r.ratchet})${r.seams !== undefined ? `; edits the shared seam ${r.seams.join(", ")}` : ""} (not stacked until it pushes again; not a verdict)`;
     }
     case "run.capped":
       return `${String(p.kind)} cap reached${p.item !== undefined ? ` for ${String(p.item)}` : ""}: ${String(p.used)} of ${String(p.limit)} (no new turns)`;
@@ -3834,8 +3942,8 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     }
     for (const round of result.ratchet?.rounds ?? []) {
       lines.push(
-        `    isolation: ${round
-          .map((i) => `${i.items.join("+")} (${i.agent}) ${i.outcome}${i.score ? ` ${describeProgressScore(i.score)}` : ""}${i.skipped ? ` (${i.skipped})` : ""}`)
+        `    leave-one-out: ${round
+          .map((i) => `without ${i.items.join("+")} (${i.agents.join("+")}${i.kind === "group" ? ", seam group" : ""}) ${i.outcome}${i.score ? ` ${describeProgressScore(i.score)}` : ""}${i.skipped ? ` (${i.skipped})` : ""}`)
           .join(", ")}`,
       );
     }

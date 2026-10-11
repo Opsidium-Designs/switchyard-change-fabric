@@ -1067,6 +1067,8 @@ const commands: Command[] = [
         // a live run always uses the project's declared gate.
         const fixtureGate = hasFlag(args, "--fixture-gate");
         const declaredGate = fixtureGate && (appGateCommand || gateWiring.requireAppGate) ? (appGateCommand ?? ["npm", "run", "gate"]) : undefined;
+        // Installed before the header is printed: once the header is out, SIGINT/SIGTERM interrupt the run.
+        const stop = interruptOnSignals();
         console.log("Offline board run (no network, deterministic)");
         console.log("  planner: heuristic decomposition (offline stub)");
         console.log("  agent turns: generic deterministic policy (offline stand-in for the turn model)");
@@ -1082,6 +1084,7 @@ const commands: Command[] = [
         );
         console.log("");
         const result = await runBoardOffline({
+          signal: stop.signal,
           goal,
           projectDir,
           ...(optionValue(args, "--id") ? { changeId: optionValue(args, "--id")! } : {}),
@@ -1096,7 +1099,7 @@ const commands: Command[] = [
           ...(fixtureGate ? { fixtureGate: true } : {}),
           ...(declaredGate ? { replacesDeclaredGate: declaredGate } : {}),
           ...(speculate !== undefined ? { speculate } : {}),
-        });
+        }).finally(stop.dispose);
         console.log("Board transcript:");
         console.log(redactSecrets(formatBoardTranscript(result.log)));
         console.log("");
@@ -1105,8 +1108,8 @@ const commands: Command[] = [
         // proof bundle is written there only when it is kept, else only with --proof-out.
         await writeProofBundle(result, optionValue(args, "--proof-out"), hasFlag(args, KEEP_WORK_ROOT_FLAG));
         console.log(await finishWorkRoot({ workRoot: result.scratchRoot ?? result.workRoot, keepAll: hasFlag(args, KEEP_WORK_ROOT_FLAG) }));
-        // Non-zero unless a gate ran and passed and every item completed.
-        return boardRunExitCode(result);
+        // Non-zero unless a gate ran and passed and every item completed (130 when interrupted).
+        return interruptedExitCode(result, boardRunExitCode(result));
       }
 
       // A live board run: the turn model, the planner, and the executor all run
@@ -1170,6 +1173,8 @@ const commands: Command[] = [
           return 1;
         }
       }
+      // Installed before the header is printed: once the header is out, SIGINT/SIGTERM interrupt the run.
+      const stop = interruptOnSignals();
       console.log(`Board run for ${changeId} under dial min ${dial.minConcurrency}, max ${dial.maxConcurrency} against Worker ${workerUrl}`);
       console.log(`  agent turns: ${turn.description}`);
       console.log(`  executor: ${selected.description}`);
@@ -1183,6 +1188,7 @@ const commands: Command[] = [
       );
       console.log("");
       const result = await runBoard({
+        signal: stop.signal,
         ...(integratorFlag === "cloud" ? { integrator: "cloud" as const, ...(gateTimeoutMs !== undefined ? { cloudGateTimeoutMs: gateTimeoutMs } : {}) } : {}),
         ...(speculate !== undefined ? { speculate } : {}),
         goal,
@@ -1310,7 +1316,7 @@ const commands: Command[] = [
               break;
           }
         },
-      });
+      }).finally(stop.dispose);
       console.log("");
       console.log("Board transcript:");
       console.log(redactSecrets(formatBoardTranscript(result.log)));
@@ -1325,8 +1331,8 @@ const commands: Command[] = [
           keep: [...(result.sourceRepoDir ? [result.sourceRepoDir] : []), ...(proofPath ? [proofPath] : [])],
         }),
       );
-      // Non-zero unless a gate ran and passed, every item completed, and it was promoted.
-      return boardRunExitCode(result, { requirePromotion: true });
+      // Non-zero unless a gate ran and passed, every item completed, and it was promoted (130 when interrupted).
+      return interruptedExitCode(result, boardRunExitCode(result, { requirePromotion: true }));
     },
   },
   {
@@ -1426,6 +1432,42 @@ const commands: Command[] = [
 ];
 
 const commandMap = new Map(commands.map((c) => [c.name, c]));
+
+/**
+ * SIGINT/SIGTERM during a board run: the FIRST signal aborts the run through
+ * its AbortSignal (agents stop, no new integration, the in-flight one is
+ * bounded, the verdict is the last gated revision's, and the usual cleanup
+ * archives the repos, revokes tokens, and handles the work root); a SECOND
+ * signal exits at once (130), skipping cleanup.
+ */
+function interruptOnSignals(): { readonly signal: AbortSignal; readonly dispose: () => void } {
+  const controller = new AbortController();
+  const onSignal = (name: NodeJS.Signals): void => {
+    if (controller.signal.aborted) {
+      console.error(`${name} again: exiting now without cleanup (repos this run created may be left in place; see cleanup-live).`);
+      process.exit(130);
+    }
+    console.error(
+      `${name}: interrupting the run: agents stop, no new integration starts, the integration in flight is given a bounded time, ` +
+        "then the run records its ending and cleans up. Send it again to exit immediately.",
+    );
+    controller.abort(new Error(`interrupted by ${name}`));
+  };
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+    },
+  };
+}
+
+/** An interrupted board run that is not a success exits 130 (the shell's convention for SIGINT). */
+function interruptedExitCode(result: { readonly stopReason: string }, code: 0 | 1): number {
+  return code !== 0 && result.stopReason === "interrupted" ? 130 : code;
+}
 
 function printHelp(): void {
   console.log(`${CLI_NAME} v${VERSION}: agent-native change coordination (spike)\n`);

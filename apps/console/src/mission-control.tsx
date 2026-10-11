@@ -286,7 +286,7 @@ export function payloadSummary(message: BoardMessage): string {
         message.payload.blamed !== undefined ? `; blamed ${message.payload.blamed.join(", ")}` : ""
       }`;
     case "push.regressed":
-      return `${message.payload.item} ${message.payload.commit.slice(0, 7)} regressed the best revision so far (rev ${message.payload.ratchet}): not stacked until ${message.payload.agent} pushes again`;
+      return `${message.payload.item} ${message.payload.commit.slice(0, 7)} made rev ${message.payload.rev} worse (better without it): not stacked until ${message.payload.agent} pushes again`;
     case "revision.promoted":
       return `rev ${message.payload.rev} promoted to ${message.payload.branch} (${message.payload.commit.slice(0, 7)}, gated ${message.payload.gatedCommit.slice(0, 7)})`;
     case "trunk.moved":

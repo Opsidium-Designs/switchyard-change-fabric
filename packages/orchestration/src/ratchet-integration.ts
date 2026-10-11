@@ -5,33 +5,43 @@
  * Before the first passing revision there is no passing head to protect, so
  * speculation does not run and every revision merges every item's latest
  * push on the baseline: one agent's bad push (an invented API, a duplicated
- * declaration) takes the whole tree backwards and the fix loop chases a moving
- * target. The ratchet is the best-scoring failing revision so far. One round:
+ * declaration) can take the whole tree backwards. The ratchet is the
+ * best-scoring failing revision so far; it is the REFERENCE that triggers a
+ * leave-one-out check, never a gate on what is stacked. One round:
  *
- *   1. the WHOLE STACK (every pending push, as before) is built and gated. A
- *      tree that scores at least as well as the ratchet (or passes) is
- *      recorded exactly as before (normal attribution): it may become the new
- *      ratchet, or the first passing revision;
- *   2. a stack that scores WORSE is ISOLATED: for each new push (an agent's
- *      unit carrying a push the ratchet did not merge), in push order and up
- *      to K (the speculate rule) while no run cap is reached, the tree of the
- *      ratchet's merged set plus that push alone is built and gated (a real
- *      gated tree). A push whose tree scores worse than the ratchet REGRESSES
- *      it;
- *   3. with regressing pushes, the whole stack is recorded as a failing
- *      revision that implicates ONLY the regressing pushes' items (their fix
- *      budgets alone are charged by it), each regression is recorded
- *      (`push.regressed`, addressed to the holder, quoting the new failures,
- *      with the seam hint when the push edits a shared seam), and the stack
- *      without them (they are not stacked until their holder pushes again) is
- *      built, gated, and recorded as the next revision, attributed as any
- *      revision is.
+ *   1. the WHOLE STACK (every item's latest push, as before) is built and
+ *      gated. A tree that scores at least as well as the ratchet (or passes)
+ *      is recorded exactly as before (normal attribution);
+ *   2. a stack that scores WORSE is checked LEAVE-ONE-OUT: for the new pushes
+ *      (an agent's unit carrying a push the ratchet did not merge), the stack
+ *      WITHOUT that agent's pushes is built and gated (a real gated tree).
+ *      Pushes the failure's parse attributes come first, then push order; the
+ *      round gates at most K (the speculate rule) and none once a run cap is
+ *      reached. A push is a REGRESSOR only when removing it makes the stack
+ *      score STRICTLY BETTER than the whole stack. Pushes that only work
+ *      together (removing either one is worse or equal) are never blamed;
+ *   3. SEAM GROUPS: a new push that edits a shared seam, together with the new
+ *      pushes from holders that import the seam (blueprint importers, a seam
+ *      wait, or a failure in their files naming the seam or a name it
+ *      exports), is also removed as one candidate after its members' own. When
+ *      removing the group makes the stack strictly better and no member alone
+ *      did (each was tried alone), the SEAM PUSH is the regressor: a broken
+ *      seam change is still found, and a consumer is never blamed for needing
+ *      the seam;
+ *   4. the whole stack is recorded as the failing revision with normal
+ *      attribution (the fix requests go to the items its failures point at),
+ *      each regressor is recorded `push.regressed` (addressed to the holder,
+ *      quoting what its removal removes; not stacked until the holder pushes
+ *      again), and, with at least one regressor, the stack without them is
+ *      gated and recorded as the next revision. Every other push stays in the
+ *      stack, so coupled work accumulates and is fixed through ordinary
+ *      attribution.
  *
  * Honesty: every recorded revision is exactly a gated tree on the integrated
  * head (the baseline: STALE_BASE applies), so gate-equals-deploy holds. The
  * ratchet never moves the head, never promotes, and never changes a verdict:
- * only a passing revision does, and only it is promoted. Isolation trees are
- * evidence (each regression names its gated commit and score), never
+ * only a passing revision does, and only it is promoted. Leave-one-out trees
+ * are evidence (each regression names its gated commit and score), never
  * verdicts. After the first pass, speculative gating takes over unchanged.
  */
 
@@ -40,17 +50,16 @@ import {
   compareProgressScore,
   describeProgressScore,
   integratedHead,
+  intentPath,
   pendingPushItems,
   planBoardIntegration,
   prePassRatchet,
   progressScore,
-  ratchetUnits,
+  seamWaits,
   type BoardIntegrationUnitPlan,
   type BoardItem,
-  type BoardMessage,
   type BoardProgressScore,
   type BoardState,
-  type PrePassRatchet,
 } from "@switchyard-change/change-core";
 import { gateFailureLine, inventoryAfterContracts, matchesGlob, type EvidenceSummary } from "@switchyard-change/verification";
 
@@ -70,51 +79,64 @@ import { candidateItems, gateCandidateTree, recordBuiltCandidate, type BuiltCand
 /** Shared files every domain imports: a push that edits one and regresses is told to propose a seam contract instead. */
 export const SHARED_SEAM_GLOBS: readonly string[] = ["src/contracts/**", "src/store.ts"];
 
-/** New failure lines quoted per regression (bounded by the board's limit). */
+/** Failure lines quoted per regression (bounded by the board's limit). */
 const EVIDENCE_LINES = 5;
 
 /** Inputs to one ratchet round. */
 export interface RatchetRoundOptions extends IntegrateBoardOptions {
-  /** Isolation candidates one round may gate (the speculate K; at least 1). */
+  /** Leave-one-out candidates one round may gate (the speculate K; at least 1). */
   readonly isolate: number;
-  /** Isolation candidates built and gated at once (default: isolate; 1 keeps the order deterministic). */
+  /** Candidates built and gated at once (default: isolate; 1 keeps the order deterministic). */
   readonly candidateConcurrency?: number;
-  /** A reason once a run cap is reached: no new isolation candidate starts. */
+  /** A reason once a run cap is reached: no new candidate starts. */
   readonly stopCandidates?: () => string | undefined;
 }
 
-/** One new push of an isolation round and what its isolation tree showed. */
+/** One leave-one-out candidate of a round: the whole stack WITHOUT these pushes, and what its tree showed. */
 export interface RatchetIsolation {
+  /** push: one agent's pushes; group: a seam push together with the new pushes that import its seam. */
+  readonly kind: "push" | "group";
+  /** The agent whose push the candidate removes (for a group: the seam push's). */
   readonly agent: string;
-  /** The items of the agent's new pushes (the ones the ratchet did not merge). */
+  /** Every agent whose pushes the candidate removes (sorted; the agent alone for a push). */
+  readonly agents: readonly string[];
+  /** The new items (pushes the ratchet did not merge) the candidate removes. */
   readonly items: readonly string[];
+  /** The removed agent's (for a group: the seam push's) unit commit. */
   readonly commit: string;
-  /** The isolation tree's gated commit (the ratchet's set plus this push alone). */
+  /** The candidate tree's gated commit (the whole stack without these pushes). */
   readonly candidate?: string;
   readonly score?: BoardProgressScore;
-  /** regressed: it scored worse than the ratchet; kept: at least as well; unscored: nothing comparable; skipped: not gated. */
-  readonly outcome: "regressed" | "kept" | "unscored" | "skipped";
+  /**
+   * regressed: removing it made the stack strictly better and it is blamed
+   * (a group blames its seam push); improves: a group whose removal made the
+   * stack better that is not blamed (a member alone explains it, or not every
+   * member was tried alone); kept: removing it is no better (coupled or
+   * harmless: never blamed); unscored: nothing comparable; skipped: not gated.
+   */
+  readonly outcome: "regressed" | "improves" | "kept" | "unscored" | "skipped";
   readonly skipped?: string;
 }
 
 /** The result of one ratchet round. */
 export interface RatchetRoundResult extends IntegrateBoardResult {
-  /** Every revision the round recorded, in order (the whole stack, then the stack without the regressing pushes). */
+  /** Every revision the round recorded, in order (the whole stack, then the stack without the regressors). */
   readonly revisions?: readonly BoardRevision[];
   /** The ratchet the round compared against. */
   readonly ratchet?: { readonly n: number; readonly score: BoardProgressScore };
   /** The whole stack's score (when it had one). */
   readonly stackScore?: BoardProgressScore;
-  /** The isolation round, when the whole stack scored worse than the ratchet. */
+  /** The leave-one-out candidates, in order, when the whole stack scored worse than the ratchet. */
   readonly isolation?: readonly RatchetIsolation[];
-  /** Items whose push the round recorded as regressing the ratchet (push.regressed). */
+  /** Items whose push the round recorded as a regressor (push.regressed). */
   readonly regressed?: readonly string[];
 }
 
 /**
  * The failure lines of a candidate's output that its reference's output does
  * not carry (type errors, failing tests, thrown errors), at most `max`, each
- * trimmed and bounded: what the push alone added. Pure.
+ * trimmed and bounded. With the whole stack as the candidate and the stack
+ * without a push as the reference: what removing the push removes. Pure.
  */
 export function regressionEvidence(candidate: string, reference: string, max = EVIDENCE_LINES): string[] {
   const known = new Set(reference.split(/\r?\n/).map((l) => l.trim()));
@@ -149,6 +171,114 @@ export function seamsEdited(state: BoardState, paths: readonly string[]): string
   return [...new Set(paths.filter((p) => seams.has(p) || SHARED_SEAM_GLOBS.some((g) => matchesGlob(p, g))))].sort().slice(0, BOARD_LIMITS.maxShortList);
 }
 
+/** One new push of a round as leave-one-out planning sees it. */
+export interface LeaveOneOutPush {
+  readonly agent: string;
+  /** Its new items (pushes the ratchet did not merge). */
+  readonly items: readonly BoardItem[];
+  /** Every path its new pushes announced. */
+  readonly paths: readonly string[];
+  /** The earliest seq of its new pushes (its place in push order). */
+  readonly seq: number;
+  /** The whole stack's failure parse attributes one of its items. */
+  readonly attributed: boolean;
+}
+
+/** A planned candidate: remove these agents' pushes (a group names its seam push's agent). */
+export interface LeaveOneOutCandidate {
+  readonly kind: "push" | "group";
+  readonly agent: string;
+  readonly agents: readonly string[];
+}
+
+/** A type error line: its file and message. */
+const ERROR_LINE = /^\s*(?:\.\/)?([^\s()]+)\(\d+,\d+\): error TS\d+: (.*)$/;
+
+/**
+ * The agents among `others` whose new pushes CONSUME a seam `seamPush` edits:
+ * a blueprint importer of the seam is in their announced paths or write
+ * intent, one of their items waits on the seam push's item (seamWaits), or a
+ * type error in a file they pushed names the seam's module or a quoted name
+ * it exports. Sorted. Pure.
+ */
+export function seamConsumers(state: BoardState, seamPush: LeaveOneOutPush, others: readonly LeaveOneOutPush[], output: string): string[] {
+  const seams = seamsEdited(state, seamPush.paths);
+  if (seams.length === 0) {
+    return [];
+  }
+  const blueprint = (state.seams ?? []).filter((s) => seams.includes(s.path));
+  const importers = new Set(blueprint.flatMap((s) => s.importers));
+  const symbols = [...new Set(blueprint.flatMap((s) => s.symbols ?? []))];
+  const modules = seams.map((p) => (p.split("/").pop() ?? p).replace(/\.[cm]?[jt]sx?$/, ""));
+  const errors = output
+    .split(/\r?\n/)
+    .map((l) => ERROR_LINE.exec(l))
+    .filter((m): m is RegExpExecArray => m !== null);
+  const seamItems = new Set(seamPush.items.map((i) => i.id));
+  const consumes = (other: LeaveOneOutPush): boolean => {
+    const writes = other.items.flatMap((i) => (i.intent?.write ?? i.scopeHint).map(intentPath));
+    if ([...importers].some((imp) => other.paths.includes(imp) || writes.some((w) => w === imp || matchesGlob(imp, w)))) {
+      return true;
+    }
+    if (other.items.some((i) => seamWaits(state, i.id).some((w) => seamItems.has(w.item)))) {
+      return true;
+    }
+    return errors.some(
+      (m) =>
+        other.paths.includes(m[1]!) &&
+        (modules.some((mod) => new RegExp(`["'][^"']*\\b${escapeRegExp(mod)}(\\.[cm]?[jt]sx?)?["']`).test(m[2]!)) ||
+          symbols.some((sym) => m[2]!.includes(`'${sym}'`) || m[2]!.includes(`"${sym}"`))),
+    );
+  };
+  return others
+    .filter((o) => o.agent !== seamPush.agent && consumes(o))
+    .map((o) => o.agent)
+    .sort();
+}
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * The round's leave-one-out candidates, in order (deterministic): each new
+ * push alone, those the failure's parse attributes first, then push order
+ * (then agent); each seam group right after the last of its members' own
+ * candidates. `consumersOf` names a push's seam consumers (empty for a push
+ * that edits no seam). Pure.
+ */
+export function leaveOneOutPlan(pushes: readonly LeaveOneOutPush[], consumersOf: (push: LeaveOneOutPush) => readonly string[]): LeaveOneOutCandidate[] {
+  const order = [...pushes].sort(
+    (a, b) => Number(b.attributed) - Number(a.attributed) || a.seq - b.seq || (a.agent < b.agent ? -1 : a.agent > b.agent ? 1 : 0),
+  );
+  const plan: LeaveOneOutCandidate[] = order.map((p) => ({ kind: "push", agent: p.agent, agents: [p.agent] }));
+  const seen = new Set<string>();
+  for (const seam of order) {
+    const consumers = consumersOf(seam).filter((a) => a !== seam.agent && pushes.some((p) => p.agent === a));
+    if (consumers.length === 0) {
+      continue;
+    }
+    const agents = [seam.agent, ...consumers].sort();
+    const key = agents.join(",");
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const after = Math.max(...agents.map((a) => plan.findIndex((c) => c.kind === "push" && c.agent === a)));
+    plan.splice(groupSlot(plan, after), 0, { kind: "group", agent: seam.agent, agents });
+  }
+  return plan;
+}
+
+/** The slot right after `after` and any groups already placed there (groups keep their planning order). */
+function groupSlot(plan: readonly LeaveOneOutCandidate[], after: number): number {
+  let slot = after + 1;
+  while (slot < plan.length && plan[slot]!.kind === "group") {
+    slot += 1;
+  }
+  return slot;
+}
+
 /** A gated candidate's output as one text (its gate's outputs and the integrator's summary). */
 function outputOf(evidence: EvidenceSummary | undefined): string {
   if (evidence === undefined) {
@@ -156,11 +286,6 @@ function outputOf(evidence: EvidenceSummary | undefined): string {
   }
   const check = evidence.integration.finalCheck;
   return [...check.outputs.map((o) => o.text), check.summary].join("\n");
-}
-
-/** The earliest push seq among a unit's items that the ratchet did not merge (its order in the isolation round). */
-function firstNewSeq(unit: BoardIntegrationUnitPlan, ratchetCommits: ReadonlySet<string>): number {
-  return Math.min(...unit.items.filter((i) => !ratchetCommits.has(i.lastPush!.commit)).map((i) => i.lastPush!.seq));
 }
 
 /** A stable key for a set of push commits (sorted, comma-joined), like pendingPushKey. */
@@ -293,8 +418,8 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
   });
   const wholeScore = progressScore(whole.progress);
 
-  /** Record a gated tree as a revision, attributed as any failing revision is. */
-  const recordAttributed = async (c: BuiltCandidate, s: BoardState, p: readonly BoardItem[], excluded: readonly { agent: string; reason: string }[]) => {
+  /** A failing gated tree's attribution (as any failing revision is attributed), with the advisory decisions it took. */
+  const attributionOf = async (c: BuiltCandidate, s: BoardState) => {
     const decisions: BoardDecisionRecord[] = [];
     const failingEvidence =
       c.gate === "fail"
@@ -309,6 +434,17 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
             ...(options.recordDecision ? { onDecision: async (decision: BoardDecisionRecord) => void decisions.push(decision) } : {}),
           })
         : undefined;
+    return { failingEvidence, decisions };
+  };
+  /** Record a gated tree as a revision, attributed as any failing revision is. */
+  const recordAttributed = async (
+    c: BuiltCandidate,
+    s: BoardState,
+    p: readonly BoardItem[],
+    excluded: readonly { agent: string; reason: string }[],
+    attribution?: Awaited<ReturnType<typeof attributionOf>>,
+  ) => {
+    const { failingEvidence, decisions } = attribution ?? (await attributionOf(c, s));
     return recordBuiltCandidate(recordCtx(s, p), c, {
       revExcluded: excluded,
       ...(failingEvidence ? { failingEvidence } : {}),
@@ -316,13 +452,13 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
       nFallback: s.lastRevN + 1,
     });
   };
-  /** Record the whole stack as before (no regression found, or none could be shown). */
-  const recordWhole = async (extra: Partial<RatchetRoundResult>): Promise<RatchetRoundResult> => {
+  /** Record the whole stack as before (no leave-one-out ran, or it found no regressor). */
+  const recordWhole = async (extra: Partial<RatchetRoundResult>, attribution?: Awaited<ReturnType<typeof attributionOf>>, note?: string): Promise<RatchetRoundResult> => {
     const moved = await superseded(candidateItems(whole));
     if (moved.length > 0) {
       return stale(moved, whole.evidence, extra);
     }
-    const result = await recordAttributed(whole, state, pending, revExcluded);
+    const result = await recordAttributed(whole, state, pending, revExcluded, withNote(attribution, note));
     if (!result.revision) {
       return { requiresIntegrationGate, key, evidence: whole.evidence!, ...(result.stale ? { stale: true } : {}), failure: result.failure!, ...extra };
     }
@@ -341,109 +477,114 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
 
   const ratchetCommits = new Set(ratchet.merged);
   const worse = whole.gate === "fail" && wholeScore !== undefined && compareProgressScore(wholeScore, ratchet.score) < 0;
-  const newEntries = stack
-    .filter((e) => whole.mergedAgents.includes(e.unit.agent) && e.unit.items.some((i) => !ratchetCommits.has(i.lastPush!.commit)))
-    .sort((a, b) => firstNewSeq(a.unit, ratchetCommits) - firstNewSeq(b.unit, ratchetCommits) || (a.unit.agent < b.unit.agent ? -1 : a.unit.agent > b.unit.agent ? 1 : 0));
+  const inWhole = stack.filter((e) => whole.mergedAgents.includes(e.unit.agent));
+  const newItemsOf = (e: StackEntry): BoardItem[] => e.unit.items.filter((i) => !ratchetCommits.has(i.lastPush!.commit));
+  const newEntries = inWhole.filter((e) => newItemsOf(e).length > 0);
   if (!worse || newEntries.length === 0) {
     return recordWhole({});
   }
 
-  // 2. Isolate: the ratchet's merged set plus each new push alone.
-  const newItemsOf = (e: StackEntry): BoardItem[] => e.unit.items.filter((i) => !ratchetCommits.has(i.lastPush!.commit));
-  const base = ratchetUnits(board.messages, state, ratchet);
-  const baseEntries: StackEntry[] = [];
-  let baseComplete = base.complete;
-  for (const unit of base.units) {
-    const entry = await entryOf(unit, false);
-    if (entry) {
-      baseEntries.push(entry);
-    } else {
-      baseComplete = false;
-    }
-  }
-  let reference: BoardProgressScore | undefined = baseComplete ? ratchet.score : undefined;
-  let referenceOutput = baseComplete ? ratchetOutput(board.messages, ratchet) : "";
-  const isolation: RatchetIsolation[] = [];
-  const skipAll = (reason: string): RatchetIsolation[] =>
-    newEntries.map((e) => ({ agent: e.unit.agent, items: newItemsOf(e).map((i) => i.id), commit: e.unit.commit, outcome: "skipped" as const, skipped: reason }));
-  if (reference === undefined) {
-    // The ratchet's set could not be rebuilt exactly from the board: gate what can be, as the reference.
-    const capped = options.stopCandidates?.();
-    if (capped !== undefined || baseEntries.length === 0) {
-      return recordWhole({ isolation: skipAll(capped !== undefined ? `not isolated: ${capped}` : "not isolated: the ratchet's set could not be rebuilt") });
-    }
-    const ref = await gateCandidateTree(ctx, 1, baseEntries);
-    reference = progressScore(ref.progress);
-    referenceOutput = outputOf(ref.evidence);
-    if (reference === undefined) {
-      return recordWhole({ isolation: skipAll("not isolated: the rebuilt ratchet's tree had no comparable score") });
-    }
-  }
-  const limit = Math.max(1, Math.floor(options.isolate));
-  const chosen = newEntries.slice(0, limit);
-  const gated = await inPool(chosen.length, Math.max(1, options.candidateConcurrency ?? limit), async (index): Promise<{ isolation: RatchetIsolation; built?: BuiltCandidate; entry?: StackEntry }> => {
-    const entry = chosen[index - 1]!;
-    const items = newItemsOf(entry);
-    const capped = options.stopCandidates?.();
-    if (capped !== undefined) {
-      return { isolation: { agent: entry.unit.agent, items: items.map((i) => i.id), commit: entry.unit.commit, outcome: "skipped" as const, skipped: `not built: ${capped}` } };
-    }
-    const carried = new Set(entry.unit.items.map((i) => i.id));
-    const entries = [...baseEntries.filter((b) => b.unit.agent !== entry.unit.agent && !b.unit.items.some((i) => carried.has(i.id))), entry].sort((a, b) =>
-      a.unit.agent < b.unit.agent ? -1 : a.unit.agent > b.unit.agent ? 1 : 0,
-    );
-    const c = await gateCandidateTree(ctx, index, entries);
-    if (c.commit === undefined || c.gate === undefined || !c.mergedAgents.includes(entry.unit.agent)) {
-      return { isolation: { agent: entry.unit.agent, items: items.map((i) => i.id), commit: entry.unit.commit, outcome: "skipped" as const, skipped: c.skipped ?? "its push was not in the gated tree" } };
-    }
-    const score = progressScore(c.progress);
-    const outcome: RatchetIsolation["outcome"] =
-      score === undefined ? "unscored" : c.gate === "fail" && compareProgressScore(score, reference!) < 0 ? "regressed" : "kept";
+  // 2. Leave-one-out: the whole stack without each new push (and each seam group), in a deterministic order.
+  const attribution = await attributionOf(whole, state);
+  const blamedByParse = new Set([...(attribution.failingEvidence?.failing.items ?? []), ...(attribution.failingEvidence?.implicated.items ?? [])]);
+  const wholeOutput = outputOf(whole.evidence);
+  const pushes: LeaveOneOutPush[] = newEntries.map((e) => {
+    const items = newItemsOf(e);
     return {
-      isolation: { agent: entry.unit.agent, items: items.map((i) => i.id), commit: entry.unit.commit, candidate: c.commit, ...(score ? { score } : {}), outcome },
-      built: c,
-      entry,
+      agent: e.unit.agent,
+      items,
+      paths: [...new Set(items.flatMap((i) => i.lastPush!.paths))].sort(),
+      seq: Math.min(...items.map((i) => i.lastPush!.seq)),
+      attributed: items.some((i) => blamedByParse.has(i.id)),
     };
   });
-  isolation.push(...gated.map((g) => g.isolation), ...skipAll(`not isolated: beyond this round's ${limit} isolation candidate(s); stacked as usual`).slice(chosen.length));
-  const regressing = gated.filter((g) => g.isolation.outcome === "regressed");
-  if (regressing.length === 0) {
-    return recordWhole({ isolation });
+  const pushOf = new Map(pushes.map((p) => [p.agent, p]));
+  const planned = leaveOneOutPlan(pushes, (p) => seamConsumers(state, p, pushes, wholeOutput));
+  const entryByAgent = new Map(inWhole.map((e) => [e.unit.agent, e]));
+  const removedItems = (agents: readonly string[]): string[] => agents.flatMap((a) => pushOf.get(a)!.items.map((i) => i.id));
+  const describe = (c: LeaveOneOutCandidate): Omit<RatchetIsolation, "outcome"> => ({
+    kind: c.kind,
+    agent: c.agent,
+    agents: [...c.agents],
+    items: removedItems(c.agents),
+    commit: entryByAgent.get(c.agent)!.unit.commit,
+  });
+  const limit = Math.max(1, Math.floor(options.isolate));
+  const chosen = planned.slice(0, limit);
+  const gated = await inPool(chosen.length, Math.max(1, options.candidateConcurrency ?? limit), async (index): Promise<{ isolation: RatchetIsolation; built?: BuiltCandidate }> => {
+    const c = chosen[index - 1]!;
+    const capped = options.stopCandidates?.();
+    if (capped !== undefined) {
+      return { isolation: { ...describe(c), outcome: "skipped", skipped: `not built: ${capped}` } };
+    }
+    const remaining = inWhole.filter((e) => !c.agents.includes(e.unit.agent));
+    if (remaining.length === 0) {
+      return { isolation: { ...describe(c), outcome: "skipped", skipped: "nothing would be left in the stack" } };
+    }
+    const built = await gateCandidateTree(ctx, index + 1, remaining);
+    if (built.commit === undefined || built.gate === undefined || remaining.some((e) => !built.mergedAgents.includes(e.unit.agent))) {
+      return { isolation: { ...describe(c), outcome: "skipped", skipped: built.skipped ?? "the tree without it left out other pushes too" } };
+    }
+    const score = progressScore(built.progress);
+    const outcome: RatchetIsolation["outcome"] = score === undefined ? "unscored" : compareProgressScore(score, wholeScore!) > 0 ? "regressed" : "kept";
+    return { isolation: { ...describe(c), candidate: built.commit, ...(score ? { score } : {}), outcome }, built };
+  });
+  // A group blames its seam push only when every member was tried alone and none alone made the stack better.
+  const alone = new Map(gated.filter((g) => g.isolation.kind === "push").map((g) => [g.isolation.agent, g.isolation]));
+  const decided = gated.map((g) => {
+    if (g.isolation.kind !== "group" || g.isolation.outcome !== "regressed") {
+      return g;
+    }
+    const explained = g.isolation.agents.some((a) => alone.get(a)?.outcome !== "kept");
+    return explained ? { ...g, isolation: { ...g.isolation, outcome: "improves" as const } } : g;
+  });
+  const isolation: RatchetIsolation[] = [
+    ...decided.map((g) => g.isolation),
+    ...planned.slice(chosen.length).map((c) => ({ ...describe(c), outcome: "skipped" as const, skipped: `not gated: beyond this round's ${limit} leave-one-out candidate(s); stacked as usual` })),
+  ];
+  // The regressors: a push whose removal alone improves the stack, or a group's seam push.
+  const regressors = decided.filter((g) => g.isolation.outcome === "regressed").map((g) => ({ agent: g.isolation.agent, isolation: g.isolation, built: g.built! }));
+  const blamedAgents = [...new Set(regressors.map((r) => r.agent))];
+  const tried = decided.filter((g) => g.built !== undefined);
+  const note =
+    tried.length === 0
+      ? undefined
+      : `pre-pass ratchet: this stack scores ${describeProgressScore(wholeScore!)}, worse than the best revision so far (revision ${ratchet.n}: ${describeProgressScore(ratchet.score)}); ` +
+        `the same stack without:\n` +
+        tried
+          .map((g) => {
+            const i = g.isolation;
+            const what =
+              i.outcome === "regressed"
+                ? `strictly better: ${i.kind === "group" ? `the seam push of ${i.agent} is` : "it is"} not stacked until its holder pushes again`
+                : i.outcome === "improves"
+                  ? "better, explained by a push alone (not blamed as a group)"
+                  : "no better: kept (pushes that work together are never blamed)";
+            return `  ${i.items.join(", ")} (${i.agents.join(", ")}): ${i.score ? describeProgressScore(i.score) : "no score"}: ${what}`;
+          })
+          .join("\n") +
+        "\n";
+  if (blamedAgents.length === 0) {
+    return recordWhole({ isolation }, attribution, note);
   }
 
-  // 3. The whole stack as the failing revision that asks only the regressing pushes for the fix.
-  const blamed = regressing.flatMap((g) => newItemsOf(g.entry!));
+  // 3. The whole stack as the failing revision, attributed as usual.
   const moved = await superseded(candidateItems(whole));
   if (moved.length > 0) {
     return stale(moved, whole.evidence, { isolation });
   }
-  const evidenceOf = new Map(regressing.map((g) => [g.entry!.unit.agent, regressionEvidence(outputOf(g.built!.evidence), referenceOutput)]));
-  const check = whole.evidence!.integration.finalCheck;
-  const keyLine = gateFailureLine(check.outputs.map((o) => o.text).join("\n"));
-  const raw = scrub([...(keyLine !== undefined ? [keyLine] : []), ...check.outputs.map((o) => o.text), check.summary].join("\n"));
-  const note =
-    `pre-pass ratchet: this stack scores ${describeProgressScore(wholeScore!)}, worse than the best revision so far (revision ${ratchet.n}: ${describeProgressScore(ratchet.score)}); ` +
-    `isolated on that revision's set, these pushes alone regress it:\n` +
-    regressing
-      .map((g) => `  ${newItemsOf(g.entry!).map((i) => i.id).join(", ")} (${g.entry!.unit.agent}, ${g.entry!.unit.commit.slice(0, 10)}): ${describeProgressScore(g.isolation.score!)}${(evidenceOf.get(g.entry!.unit.agent) ?? [])[0] ? `: ${evidenceOf.get(g.entry!.unit.agent)![0]}` : ""}`)
-      .join("\n") +
-    "\n";
-  const output = scrub(`${note}${raw}`);
-  const failing = { output: output.length > BOARD_LIMITS.maxFailingOutput ? `${output.slice(0, BOARD_LIMITS.maxFailingOutput - 40)}\n... (output truncated)` : output, items: blamed.map((i) => i.id) };
-  const first = await recordBuiltCandidate(recordCtx(state, pending), whole, {
-    revExcluded,
-    failingEvidence: { failing, implicated: { items: failing.items, source: "ratchet" } },
-    nFallback: state.lastRevN + 1,
-  });
+  const first = await recordAttributed(whole, state, pending, revExcluded, withNote(attribution, note));
   if (!first.revision) {
     return { requiresIntegrationGate, key, evidence: whole.evidence!, ...(first.stale ? { stale: true } : {}), failure: first.failure!, isolation };
   }
   const revisions: BoardRevision[] = [first.revision];
 
-  // 4. Each regression, addressed to its holder, with the evidence and the seam hint.
+  // 4. Each regressor, addressed to its holder, with what its removal removes and the seam hint.
   const regressed: string[] = [];
-  for (const g of regressing) {
-    for (const item of newItemsOf(g.entry!)) {
+  const blamedBy = new Map<string, string[]>();
+  for (const r of regressors) {
+    const evidence = regressionEvidence(wholeOutput, outputOf(r.built.evidence)).map((l) => scrub(l));
+    for (const item of blamedItems(state, pushOf.get(r.agent)!.items, r.isolation.kind, evidence)) {
       const seams = seamsEdited(state, item.lastPush!.paths);
       const outcome = await options.operator
         .recordEngine("push.regressed", {
@@ -452,20 +593,21 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
           commit: item.lastPush!.commit,
           rev: first.revision.n,
           ratchet: ratchet.n,
-          from: reference,
-          to: g.isolation.score!,
-          candidate: g.built!.commit!,
-          evidence: (evidenceOf.get(g.entry!.unit.agent) ?? []).map((l) => scrub(l)),
+          from: r.isolation.score!,
+          to: wholeScore!,
+          candidate: r.built.commit!,
+          evidence,
           ...(seams.length > 0 ? { seams } : {}),
         })
         .catch(() => undefined);
       if (outcome?.ok) {
         regressed.push(item.id);
+        blamedBy.set(r.agent, [...(blamedBy.get(r.agent) ?? []), item.id]);
       }
     }
   }
 
-  // 5. The stack without the regressing pushes (they wait for their holders' next push), as the next revision.
+  // 5. The stack without the regressors (they wait for their holders' next push), as the next revision.
   const after = await options.operator.log();
   const rest = planBoardIntegration(after.messages, after.state);
   const restKey = rest.key;
@@ -486,23 +628,29 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
   if (restKey === "" || restKey === keyOf(ratchet.merged) || restKey === key) {
     return done();
   }
-  const restEntries: StackEntry[] = [];
+  // A leave-one-out tree that is exactly this stack is recorded as it was gated (no second gate of the same tree).
+  const same = regressors.find((r) => keyOf(candidateItems(r.built).map((i) => i.lastPush!.commit)) === restKey);
+  let t: BuiltCandidate;
   const restExcluded: { agent: string; reason: string }[] = [];
-  for (const unit of rest.units) {
-    const entry = await entryOf(unit, false);
-    if (entry) {
-      restEntries.push(entry);
-    } else {
-      restExcluded.push({ agent: unit.agent, reason: "its repo could not be read for the stack without the regressing pushes" });
+  if (same !== undefined) {
+    t = same.built;
+  } else {
+    const restEntries: StackEntry[] = [];
+    for (const unit of rest.units) {
+      const entry = await entryOf(unit, false);
+      if (entry) {
+        restEntries.push(entry);
+      } else {
+        restExcluded.push({ agent: unit.agent, reason: "its repo could not be read for the stack without the regressors" });
+      }
     }
-  }
-  if (restEntries.length === 0) {
-    return done();
-  }
-  const restCtx: CandidateContext = { ...ctx, state: after.state };
-  const t = await gateCandidateTree(restCtx, 1, restEntries);
-  if (t.commit === undefined || t.gate === undefined) {
-    return done({ failure: t.skipped ?? "the stack without the regressing pushes could not be gated" });
+    if (restEntries.length === 0) {
+      return done();
+    }
+    t = await gateCandidateTree({ ...ctx, state: after.state }, chosen.length + 2, restEntries);
+    if (t.commit === undefined || t.gate === undefined) {
+      return done({ failure: t.skipped ?? "the stack without the regressors could not be gated" });
+    }
   }
   const movedRest = await superseded(candidateItems(t));
   if (movedRest.length > 0) {
@@ -512,7 +660,10 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
   const second = await recordAttributed(t, after.state, [...rest.pending], [
     ...restExcluded,
     ...t.excludedAgents,
-    ...regressing.map((g) => ({ agent: g.entry!.unit.agent, reason: `regressed the pre-pass ratchet in revision ${first.revision!.n} (push.regressed): not stacked until its holder pushes again` })),
+    ...[...blamedBy].map(([agent, ids]) => ({
+      agent,
+      reason: `its push for ${ids.join(", ")} made revision ${first.revision!.n} worse (push.regressed): not stacked until its holder pushes again`,
+    })),
   ]);
   if (!second.revision) {
     return { ...done(), key, ...(second.stale ? { stale: true } : {}), failure: second.failure! };
@@ -521,8 +672,38 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
   return done({ evidence: t.evidence! });
 }
 
-/** The ratchet revision's recorded failing output (the reference for what a push alone added). */
-function ratchetOutput(messages: readonly BoardMessage[], ratchet: Pick<PrePassRatchet, "seq">): string {
-  const m = messages.find((x) => x.seq === ratchet.seq);
-  return m?.type === "integrated.rev" ? (m.payload.failing?.output ?? "") : "";
+/**
+ * The items of a regressor's unit that are blamed: for a seam group, the
+ * items whose push edits a shared seam; for one push, the items whose
+ * announced paths the removed failures name (every new item when none is
+ * named, or when an agent's unit carries just one). Pure.
+ */
+export function blamedItems(state: BoardState, items: readonly BoardItem[], kind: RatchetIsolation["kind"], evidence: readonly string[]): BoardItem[] {
+  if (kind === "group") {
+    const seamItems = items.filter((i) => seamsEdited(state, i.lastPush!.paths).length > 0);
+    return seamItems.length > 0 ? seamItems : [...items];
+  }
+  if (items.length <= 1) {
+    return [...items];
+  }
+  const named = items.filter((i) => i.lastPush!.paths.some((p) => evidence.some((l) => l.includes(p))));
+  return named.length > 0 ? named : [...items];
+}
+
+/** An attribution with the round's leave-one-out note leading its failing output (bounded). */
+function withNote<T extends { failingEvidence?: { failing: { output: string } } }>(attribution: T | undefined, note: string | undefined): T | undefined {
+  if (attribution?.failingEvidence === undefined || note === undefined) {
+    return attribution;
+  }
+  const output = `${note}${attribution.failingEvidence.failing.output}`;
+  return {
+    ...attribution,
+    failingEvidence: {
+      ...attribution.failingEvidence,
+      failing: {
+        ...attribution.failingEvidence.failing,
+        output: output.length > BOARD_LIMITS.maxFailingOutput ? `${output.slice(0, BOARD_LIMITS.maxFailingOutput - 40)}\n... (output truncated)` : output,
+      },
+    },
+  };
 }

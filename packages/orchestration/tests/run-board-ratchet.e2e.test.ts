@@ -7,10 +7,11 @@
  * it when asked.
  *
  * Under arbitration revision 5 the bad push does not take the tree backwards:
- * the stack that carries it scores worse than the best revision so far, so it
- * is isolated, recorded push.regressed (the fix request goes to its holder
- * alone), and the other agents' pushes land on the ratchet in the next
- * revision. Once the saboteur's fix is in, the run verifies: the last
+ * the stack that carries it scores worse than the best revision so far, so
+ * the stack is checked leave-one-out: only without the bad push does it score
+ * better, so that push alone is recorded push.regressed (the parse attributes
+ * the failure to its item, so the fix request goes to its holder), and the
+ * other agents' pushes are stacked without it in the next revision. Once the saboteur's fix is in, the run verifies: the last
  * revision is the gated tree, and it is exactly what was promoted (PROVEN).
  */
 import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
@@ -104,7 +105,7 @@ class ConjunctiveTypedGate implements CommandRunner {
 const of = <T extends BoardMessage["type"]>(log: readonly BoardMessage[], type: T) => log.filter((m): m is Extract<BoardMessage, { type: T }> => m.type === type);
 
 describe("a conjunctive typed gate with one saboteur (arbitration revision 5: the pre-pass ratchet)", () => {
-  it("the saboteur's push is isolated and recorded regressed, the others land on the ratchet, and after its fix the run verifies with landed = gated = promoted", async () => {
+  it("the saboteur's push is the only regressor leave-one-out finds, the others are stacked without it, and after its fix the run verifies with landed = gated = promoted", async () => {
     const gate = new ConjunctiveTypedGate();
     const executor = new SaboteurExecutor();
     const result = await runBoardOffline({
@@ -121,7 +122,7 @@ describe("a conjunctive typed gate with one saboteur (arbitration revision 5: th
     expect(of(log, "goal.posted")[0]!.payload.rules.arbitration).toBe(5);
     expect(of(log, "goal.posted")[0]!.payload.immutable).toContain(ACCEPTANCE);
 
-    // The saboteur's bad push regressed the ratchet: recorded with typed evidence, addressed to its holder.
+    // Removing the saboteur's bad push makes the stack better: recorded with typed evidence, addressed to its holder.
     const regressions = of(log, "push.regressed");
     expect(regressions).toHaveLength(1);
     const r = regressions[0]!;
@@ -130,7 +131,7 @@ describe("a conjunctive typed gate with one saboteur (arbitration revision 5: th
     expect(r.payload.to).toMatchObject({ runs: false, typeErrors: 2 });
     expect(r.payload.from.runs).toBe(true);
     expect(r.payload.evidence.some((l) => /src\/part4\.ts\(1,\d+\): error TS2304: Cannot find name 'ctx'\./.test(l))).toBe(true);
-    // The whole stack's revision asked ONLY the saboteur's item for the fix.
+    // The whole stack's revision, attributed as usual (its errors are in part 4), asked only the saboteur's item for the fix.
     const regressingRev = of(log, "integrated.rev").find((m) => m.payload.n === r.payload.rev)!;
     expect(regressingRev.payload.gate).toBe("fail");
     expect(regressingRev.payload.failing?.items).toEqual([SABOTAGED]);
@@ -138,10 +139,11 @@ describe("a conjunctive typed gate with one saboteur (arbitration revision 5: th
     expect(fixes.map((m) => [m.payload.item, m.payload.n])).toEqual([[SABOTAGED, r.payload.rev]]);
     expect(of(log, "fix.exhausted")).toEqual([]);
     expect(of(log, "item.reopened")).toEqual([]);
-    // The next revision stacked the others on the ratchet, without the bad push.
+    // The next revision stacked the others without the bad push (the saboteur's agent's other pushes
+    // included, which the leave-one-out tree without that agent left out): at least as good as that tree.
     const next = of(log, "integrated.rev").find((m) => m.payload.n === r.payload.rev + 1)!;
     expect(next.payload.merged).not.toContain(r.payload.commit);
-    expect(next.payload.progress?.acceptance?.passed).toBeGreaterThan(r.payload.from.acceptance);
+    expect(next.payload.progress?.acceptance?.passed).toBeGreaterThanOrEqual(r.payload.from.acceptance);
     expect(next.payload.failing?.items).toEqual([]);
     // Before the first pass the head never moved: every revision until it was built on the baseline.
     const firstPass = of(log, "integrated.rev").find((m) => m.payload.gate === "pass")!;
@@ -151,10 +153,10 @@ describe("a conjunctive typed gate with one saboteur (arbitration revision 5: th
     }
     // The saboteur fixed it when asked (its second edit), and the run verified.
     expect(executor.edits.get(SABOTAGED)).toBe(2);
-    // Its fix edit carried the regression: the quote and the new failures its push alone added.
+    // Its fix edit carried the regression: the quote and the failures that go away without its push.
     const fixObjective = executor.objectives.get(SABOTAGED)![1]!;
     expect(fixObjective).toMatch(/Instruction: Fix the regression my push [0-9a-f]{10} introduced on revision \d+/);
-    expect(fixObjective).toMatch(/REGRESSED the best revision so far \(acceptance \d\/6; with your push alone: 2 type errors\)/);
+    expect(fixObjective).toMatch(/made revision \d+ WORSE \(with it: 2 type errors; without it: acceptance \d\/6\)/);
     expect(fixObjective).toMatch(/src\/part4\.ts\(1,\d+\): error TS2304: Cannot find name 'ctx'\./);
     expect(result.verdict).toBe("verified");
     expect(result.incompleteItems).toEqual([]);
@@ -179,12 +181,12 @@ describe("a conjunctive typed gate with one saboteur (arbitration revision 5: th
     expect(formatProofSummary(proof).some((l) => /^ {2}pre-pass ratchet \(best so far before the first pass; a record, not a verdict\): rev \d+ acceptance \d\/6 -> .*rev \d+ acceptance 5\/6; regressions: i4 /.test(l))).toBe(true);
     const summary = formatBoardRunSummary(result);
     expect(summary).toMatch(/pre-pass ratchet \(best so far before the first pass; it never moves the head, promotes, or decides a verdict\)/);
-    expect(summary).toMatch(/isolation: .*i4 \(\S+\) regressed 2 type errors/);
-    expect(summary).toMatch(/implicated \(ratchet\): i4/);
+    expect(summary).toMatch(/leave-one-out: without i4 \(\S+\) regressed acceptance \d\/6/);
+    expect(summary).not.toMatch(/implicated \(ratchet\)/);
     expect(reduceBoard(log)).toEqual(result.state);
   }, 240_000);
 
-  it("the same run under arbitration revision 4 (before the ratchet): the bad push sinks the whole stack and nothing isolates it", async () => {
+  it("the same run under arbitration revision 4 (before the ratchet): the bad push sinks the whole stack and nothing leaves it out", async () => {
     const gate = new ConjunctiveTypedGate();
     const result = await runBoardOffline({
       goal: "Make every part carry the fix",

@@ -3605,8 +3605,9 @@ describe("arbitration revision 3: an item waiting on others (conjunctive gates)"
 });
 
 describe("push.regressed (arbitration revision 5: the pre-pass progress ratchet)", () => {
-  const RATCHET = { runs: true, acceptance: 5, acceptanceTotal: 9, developer: 0, typeErrors: 0 };
-  const WORSE = { runs: false, acceptance: 0, developer: 0, typeErrors: 22 };
+  // The stack without the push (strictly better) and with it.
+  const WITHOUT = { runs: true, acceptance: 5, acceptanceTotal: 9, developer: 0, typeErrors: 0 };
+  const WITH = { runs: false, acceptance: 0, developer: 0, typeErrors: 22 };
   const regressed = (extra: Record<string, unknown> = {}) =>
     msg("engine", "push.regressed", {
       item: "two",
@@ -3614,8 +3615,8 @@ describe("push.regressed (arbitration revision 5: the pre-pass progress ratchet)
       commit: "c-two-2",
       rev: 2,
       ratchet: 1,
-      from: RATCHET,
-      to: WORSE,
+      from: WITHOUT,
+      to: WITH,
       candidate: "cand-two",
       evidence: ["src/two.ts(3,7): error TS2339: Property 'auth' does not exist on type 'Ctx'."],
       ...extra,
@@ -3643,26 +3644,26 @@ describe("push.regressed (arbitration revision 5: the pre-pass progress ratchet)
     const [record] = board.post(regressed({ seams: ["src/contracts/auth.ts"] }));
     expect(record).toMatchObject({ from: "engine", type: "push.regressed", to: ["b"] });
     const push2 = board.state.items.two!.lastPush!;
-    expect(push2.regressed).toMatchObject({ seq: record!.seq, rev: 2, ratchet: 1, from: RATCHET, to: WORSE });
+    expect(push2.regressed).toMatchObject({ seq: record!.seq, rev: 2, ratchet: 1, from: WITHOUT, to: WITH });
     expect(board.state.items.two!.lease!.progressSeq).toBe(record!.seq);
     expect(integrablePushItems(board.state).map((i) => i.id).sort()).toEqual(["one", "three"]);
     expect(planBoardIntegration(board.log, board.state).units.map((u) => u.agent)).toEqual(["a", "c"]);
     expect(itemWaitReason(board.state, "two")).toEqual({ kind: "push-regressed", commit: "c-two-2", rev: 2 });
-    expect(describeWaitReason(itemWaitReason(board.state, "two")!)).toMatch(/regressed the best revision so far \(revision 2\)/);
+    expect(describeWaitReason(itemWaitReason(board.state, "two")!)).toMatch(/made revision 2 worse \(the stack scores better without it\)/);
     expect(waitingOnOthers(board.state, board.state.items.two!)).toBe(false);
     expect(activeClaims(board.state, "b")).toEqual(["two"]);
     const claimTwo = boardDigest(board.state, board.log, "b", 0).claims.find((c) => c.item === "two")!;
     expect(claimTwo.regressed).toMatchObject({ commit: "c-two-2", rev: 2, from: "acceptance 5/9", to: "22 type errors", seams: ["src/contracts/auth.ts"] });
-    expect(claimTwo.regressed!.instruction).toMatch(/REGRESSED the best revision so far \(revision 1: acceptance 5\/9\)/);
+    expect(claimTwo.regressed!.instruction).toMatch(/made revision 2 WORSE: with it the stack scores 22 type errors, without it acceptance 5\/9 \(the best revision so far is 1\)/);
     expect(claimTwo.regressed!.instruction).toMatch(/Property 'auth' does not exist/);
     // The seam is in a held item's scope (owned): keep it compatible; no seam contract cue.
     expect(claimTwo.regressed!.instruction).toMatch(/shared file src\/contracts\/auth\.ts that other items import: keep it backward compatible/);
     expect(claimTwo.seamCue).toBeUndefined();
-    expect(claimTwo.fix!.instruction).toMatch(/your push adds 22 type errors: src\/two\.ts\(3,7\): error TS2339/);
+    expect(claimTwo.fix!.instruction).toMatch(/removing your push removes 22 type errors \(the acceptance suite runs again: acceptance 5\/9\): src\/two\.ts\(3,7\): error TS2339/);
     // Recorded once per push, only for a gated latest push, only when it scores worse.
     board.reject(regressed(), /already recorded regressed/, "DUPLICATE");
     board.reject(regressed({ commit: "c-two" }), /latest, gated, unintegrated push/, "INVALID_STATE");
-    board.reject(regressed({ item: "one", agent: "a", commit: "c-one", to: { ...RATCHET } }), /not worse than/, "BAD_PAYLOAD");
+    board.reject(regressed({ item: "one", agent: "a", commit: "c-one", to: { ...WITHOUT } }), /not worse than/, "BAD_PAYLOAD");
     board.reject(regressed({ item: "one", agent: "a", commit: "c-one", rev: 9 }), /not a recorded revision/, "UNKNOWN_REF");
     board.reject(regressed({ item: "one", agent: "a", commit: "c-one", ratchet: 2 }), /must precede/, "BAD_PAYLOAD");
     board.reject(regressed({ extra: 1 }), /a push\.regressed record is/, "BAD_PAYLOAD");

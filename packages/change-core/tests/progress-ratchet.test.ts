@@ -81,11 +81,15 @@ describe("progressScore and its total order", () => {
     expect(describeProgressScore(ordered[0]!)).toBe("26 type errors");
     expect(describeProgressScore(s({ typeErrors: 1 }))).toBe("1 type error");
     expect(describeProgressScore(progressScore(acceptance(51, 129))!)).toBe("acceptance 51/129");
+    // `to` is the stack with the push, `from` the same stack without it.
     expect(regressionQuote({ from: progressScore(typecheck(2))!, to: progressScore(typecheck(24))!, evidence: ["src/a.ts(1,1): error TS2339: x"] })).toBe(
-      "your push adds 22 type errors: src/a.ts(1,1): error TS2339: x",
+      "removing your push removes 22 type errors: src/a.ts(1,1): error TS2339: x",
+    );
+    expect(regressionQuote({ from: progressScore(acceptance(5))!, to: progressScore(typecheck(3))!, evidence: [] })).toBe(
+      "removing your push removes 3 type errors (the acceptance suite runs again: acceptance 5/9)",
     );
     expect(regressionQuote({ from: progressScore(acceptance(5))!, to: progressScore(acceptance(3))!, evidence: [] })).toBe(
-      "your push takes the best revision from acceptance 5/9 to acceptance 3/9",
+      "removing your push takes the stack from acceptance 3/9 to acceptance 5/9",
     );
   });
 });

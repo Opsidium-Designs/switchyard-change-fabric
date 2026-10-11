@@ -9,14 +9,18 @@
  * revision so far (see compareProgressScore: a tree that runs the acceptance
  * suite beats one that does not, then more acceptance passes, then more
  * developer passes, then fewer type errors; ties go to the earliest). The
- * local integrator stacks new pushes on its merged set and isolates a push
- * that alone makes it worse.
+ * local integrator stacks every item's latest push as before; when that stack
+ * scores worse than the ratchet it checks the new pushes LEAVE-ONE-OUT and
+ * reports only a push whose removal makes the stack strictly better (see
+ * ratchet-integration.ts in the orchestration package).
  *
  * What the ratchet is NOT: it is not the integrated head (the head stays the
  * baseline until a revision passes), nothing is promoted from it, and no
- * verdict changes because of it. It only decides what the integrator stacks
- * next and whose push is reported as a regression. After the first passing
- * revision there is no ratchet (speculative gating protects the passing head).
+ * verdict changes because of it. It is the reference that triggers the
+ * leave-one-out check and names which pushes are new; it does not decide
+ * what is stacked (only a recorded regression leaves the stack). After the
+ * first passing revision there is no ratchet (speculative gating protects
+ * the passing head).
  * Pure: no I/O, no clock.
  */
 
@@ -117,8 +121,7 @@ export function ratchetLine(messages: readonly BoardMessage[]): string | undefin
 
 /**
  * The ratchet's merged set as integration units (one per agent whose pushes
- * it merged), so an isolation candidate can be built as the ratchet's set
- * plus one new push: each unit PINNED to the agent's latest commit the
+ * it merged), so the ratchet's tree can be rebuilt: each unit PINNED to the agent's latest commit the
  * ratchet merged (every other one of its merged commits required in that
  * commit's history), diffed against the baseline (nothing passed yet),
  * scoped to the write intents of the items those pushes were for. `complete`

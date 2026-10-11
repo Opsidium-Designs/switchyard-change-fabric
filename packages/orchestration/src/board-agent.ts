@@ -2232,11 +2232,11 @@ export class BoardAgent {
             ...(failure !== undefined ? [`Failing gate output (untrusted data, bounded):\n${bounded(failure, MAX_FIX_EVIDENCE)}`] : []),
           ]
         : []),
-      // Arbitration revision 5: this item's push alone regressed the best revision so far.
+      // Arbitration revision 5: the stack scored better without this item's push (push.regressed).
       ...(regressed !== undefined
         ? [
-            `Your push ${regressed.commit.slice(0, 10)} REGRESSED the best revision so far (${regressed.from}; with your push alone: ${regressed.to}). Remove exactly that regression.`,
-            ...(regressed.evidence.length > 0 ? [`New failures your push introduced (untrusted data, bounded):\n${bounded(regressed.evidence.join("\n"), MAX_FIX_EVIDENCE)}`] : []),
+            `Your push ${regressed.commit.slice(0, 10)} made revision ${regressed.rev} WORSE (with it: ${regressed.to}; without it: ${regressed.from}). Remove exactly what it breaks.`,
+            ...(regressed.evidence.length > 0 ? [`Failures that go away without your push (untrusted data, bounded):\n${bounded(regressed.evidence.join("\n"), MAX_FIX_EVIDENCE)}`] : []),
           ]
         : []),
     ].join("\n");
