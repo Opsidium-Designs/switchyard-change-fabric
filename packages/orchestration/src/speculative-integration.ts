@@ -67,11 +67,13 @@ import {
   ChangeVerification,
   InstallingCommandRunner,
   inventoryAfterContracts,
+  isIntegrationAborted,
   isPromotionRefused,
   labelGateProgress,
   readTestProgress,
   type CommandOutcome,
   type CommandRunner,
+  type CommandRunOptions,
   type CompletedWorkUnit,
   type DependencyInstallOutcome,
   type EvidenceSummary,
@@ -145,11 +147,11 @@ export interface SpeculativeRoundResult extends IntegrateBoardResult {
 class CandidateCommandRunner implements CommandRunner {
   lastInstall: DependencyInstallOutcome | undefined;
   constructor(private readonly inner: CommandRunner) {}
-  async run(argv: readonly string[], cwd: string): Promise<CommandOutcome> {
+  async run(argv: readonly string[], cwd: string, options?: CommandRunOptions): Promise<CommandOutcome> {
     if (this.inner instanceof InstallingCommandRunner) {
-      this.lastInstall = await this.inner.installFor(cwd);
+      this.lastInstall = await this.inner.installFor(cwd, options);
     }
-    return this.inner.run(argv, cwd);
+    return options === undefined ? this.inner.run(argv, cwd) : this.inner.run(argv, cwd, options);
   }
 }
 
@@ -518,9 +520,13 @@ export async function gateCandidateTree(ctx: CandidateContext, index: number, en
       deferIntegrationPush: true,
       workRoot: options.worktreeRoot,
       identity: options.identity,
+      ...(options.signal ? { signal: options.signal } : {}),
     });
   } catch (error) {
-    const refused = scrub(`the integrator refused: ${error instanceof Error ? error.message : String(error)}`);
+    // An aborted candidate (the run stopped waiting) records nothing (see ABANDONED_REASON).
+    const refused = isIntegrationAborted(error)
+      ? ABANDONED_REASON
+      : scrub(`the integrator refused: ${error instanceof Error ? error.message : String(error)}`);
     return { index, entries, mergedAgents: [], excludedAgents: [], skipped: refused, refused };
   }
   const excluded = evidence.units

@@ -101,6 +101,7 @@ import { authenticatedRemote, type GitIdentity } from "@switchyard-change/local-
 import { defaultBranch, type PromotionResult } from "@switchyard-change/git-promotion";
 import {
   advanceIntegrationBranch,
+  isIntegrationAborted,
   isPromotionRefused,
   ChangeVerification,
   ChildProcessCommandRunner,
@@ -832,6 +833,12 @@ export interface IntegrateBoardOptions {
    * branch is not advanced (the run's verdict was already decided without it).
    */
   readonly abandoned?: () => boolean;
+  /**
+   * Aborts the attempt's running commands (the abandon of an interrupted run):
+   * the gate's and the install's process groups are stopped, the integrator's
+   * temp dirs are removed, and nothing is recorded.
+   */
+  readonly signal?: AbortSignal;
   /** The baseline gate run's test inventory (see IntegrateOptions.testInventory). */
   readonly testInventory?: TestInventory;
   readonly jev?: AskJev;
@@ -923,6 +930,9 @@ export function keyWithout(key: string, excluded: readonly { readonly items: rea
 }
 
 /** Why an attempt the run stopped waiting for (interrupt grace over) records nothing more. */
+/** How long an interrupted run waits for an abandoned integration's teardown (its commands stopped, its temp dirs removed). */
+export const ABANDON_TEARDOWN_MS = 5000;
+
 export const ABANDONED_REASON =
   "the run stopped waiting for this integration (the interrupt grace period ended): nothing more is recorded (no revision, excluded or regressed push, candidate, trunk move, or decision) and the integration branch is not advanced";
 
@@ -1478,8 +1488,14 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
       deferIntegrationPush: true,
       workRoot: options.worktreeRoot,
       identity: options.identity,
+      ...(options.signal ? { signal: options.signal } : {}),
     });
   } catch (error) {
+    if (isIntegrationAborted(error) || options.abandoned?.()) {
+      // Aborted (the run stopped waiting): its commands were stopped and its
+      // temp dirs removed; nothing is recorded.
+      return { requiresIntegrationGate, key, failure: ABANDONED_REASON };
+    }
     // The integrator refused (for example a fix was expected but nothing
     // changed). No gate ran on any recordable tree, so no revision is posted.
     return { requiresIntegrationGate, key, ...unreadKeyOf(key), failure: scrub(`the integrator refused: ${error instanceof Error ? error.message : String(error)}`) };
@@ -1696,6 +1712,8 @@ export class ContinuousBoardIntegrator {
   private halted = false;
   /** Set by abandon (the interrupt grace ended): the attempt in flight records nothing more. */
   private abandoned = false;
+  /** Aborted by abandon: stops the in-flight attempt's gate and install process groups. */
+  private readonly abort = new AbortController();
   /** Pending-push sets already integrated, or deterministically refused (not retried until something changes). */
   private readonly attempted = new Set<string>();
   /** Transient-failure retries per pending-push set. */
@@ -1738,7 +1756,15 @@ export class ContinuousBoardIntegrator {
       /** Called with each speculative round's candidates. */
       readonly onCandidates?: (candidates: readonly CandidateOutcome[]) => void;
     },
-  ) {}
+  ) {
+    // A caller's own signal aborts the attempt too.
+    const outer = options.signal;
+    if (outer?.aborted) {
+      this.abort.abort();
+    } else {
+      outer?.addEventListener("abort", () => this.abort.abort(), { once: true });
+    }
+  }
   /** Every speculative round's candidates, in order (empty without speculation). */
   readonly rounds: (readonly CandidateOutcome[])[] = [];
   /** Every pre-pass ratchet isolation round (arbitration revision 5), in order. */
@@ -1814,11 +1840,36 @@ export class ContinuousBoardIntegrator {
 
   /**
    * The run stopped waiting (the interrupt grace period ended): halt, and the
-   * attempt still in flight records no revision and advances no branch.
+   * attempt still in flight records no revision and advances no branch. Its
+   * running gate or install is aborted (the process group is stopped), so the
+   * attempt ends promptly and removes its temp dirs; `teardown` waits for that.
    */
   abandon(): void {
     this.halt();
     this.abandoned = true;
+    this.abort.abort();
+  }
+
+  /**
+   * Wait, at most `timeoutMs`, for the attempt in flight to end (after
+   * `abandon`, its aborted commands stop and its temp dirs are removed). True
+   * when it ended in time.
+   */
+  async teardown(timeoutMs = ABANDON_TEARDOWN_MS): Promise<boolean> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        this.idle().then(
+          () => true,
+          () => true,
+        ),
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), timeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   private async loop(): Promise<void> {
@@ -1859,6 +1910,7 @@ export class ContinuousBoardIntegrator {
         ...this.options,
         decided: this.attempted,
         abandoned: () => this.abandoned || this.options.abandoned?.() === true,
+        signal: this.abort.signal,
         ...(this.holdBack.size > 0 ? { holdBack: [...this.holdBack] } : {}),
       };
       result = this.speculatesOn(state)
@@ -3267,7 +3319,12 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     if (failure !== undefined) {
       // A throw (a refused join, an unreachable board) marks the Change failed
       // and cleans up every repo the run created before the error propagates.
-      await withinGrace(integrator.idle().catch(() => undefined));
+      if (!(await withinGrace(integrator.idle().catch(() => undefined))) && integrator instanceof ContinuousBoardIntegrator) {
+        // Interrupted and not settled in the grace period: abandon it (its
+        // gate is stopped) and wait, bounded, for its teardown.
+        integrator.abandon();
+        await integrator.teardown();
+      }
       if (!planningMarked) {
         await failPlanningChange({
           workerUrl: base,
@@ -3319,6 +3376,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         // The run no longer waits for it: whatever it still finishes is never
         // recorded or pushed (the cloud Workflow records on its own side).
         integrator.abandon();
+        // The abort stops its gate; wait (bounded) for its temp dirs to be
+        // removed before the run returns (the CLI exits right after).
+        await integrator.teardown();
       }
     } else {
       await integrator.idle();

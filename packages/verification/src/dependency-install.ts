@@ -30,7 +30,7 @@ import { constants } from "node:fs";
 import { createHash } from "node:crypto";
 import { delimiter, join } from "node:path";
 
-import { ChildProcessCommandRunner, type CommandOutcome, type CommandRunner } from "./command.ts";
+import { abortedOutcome, ChildProcessCommandRunner, type CommandOutcome, type CommandRunner, type CommandRunOptions } from "./command.ts";
 
 /** What the install step did for one tree. */
 export type DependencyInstallStatus = "installed" | "skipped" | "unsupported" | "failed";
@@ -47,7 +47,8 @@ export interface DependencyInstallOutcome {
 
 /** Installs a tree's dependencies before a gate runs on it. */
 export interface DependencyInstaller {
-  install(dir: string): Promise<DependencyInstallOutcome>;
+  /** Install for `dir`; `options.signal` aborts a running install (it then fails, never installs). */
+  install(dir: string, options?: CommandRunOptions): Promise<DependencyInstallOutcome>;
 }
 
 /** The default limit on one install (5 minutes). */
@@ -156,14 +157,17 @@ export class LockfileDependencyInstaller implements DependencyInstaller {
     this.now = options.now ?? Date.now;
   }
 
-  async install(dir: string): Promise<DependencyInstallOutcome> {
+  async install(dir: string, options: CommandRunOptions = {}): Promise<DependencyInstallOutcome> {
     const started = this.now();
     const plan = await planDependencyInstall(dir, this.options.hasProgram);
     if (plan.kind !== "run") {
       return { status: plan.kind, detail: plan.detail, durationMs: this.now() - started };
     }
-    const outcome = await this.runner.run(plan.argv, dir);
+    const outcome = await this.runner.run(plan.argv, dir, options.signal ? { signal: options.signal } : {});
     const durationMs = this.now() - started;
+    if (outcome.aborted) {
+      return { status: "failed", tool: plan.tool, detail: `${plan.argv.slice(0, 2).join(" ")}: aborted (the run was interrupted)`, durationMs };
+    }
     return outcome.code === 0
       ? { status: "installed", tool: plan.tool, detail: plan.argv.join(" "), durationMs }
       : { status: "failed", tool: plan.tool, detail: `${plan.argv.slice(0, 2).join(" ")}: ${failureReason(outcome)}`, durationMs };
@@ -205,16 +209,26 @@ export class InstallingCommandRunner implements CommandRunner {
     private readonly installer: DependencyInstaller,
   ) {}
 
-  /** Install for `dir` (once per manifest content), returning the outcome. */
-  async installFor(dir: string): Promise<DependencyInstallOutcome> {
+  /**
+   * Install for `dir` (once per manifest content), returning the outcome. An
+   * install the signal aborted is not remembered (a later run installs again).
+   */
+  async installFor(dir: string, options: CommandRunOptions = {}): Promise<DependencyInstallOutcome> {
     const key = `${dir}\0${await manifestHash(dir)}`;
     let found = this.done.get(key);
     if (found !== undefined && (await found).status === "installed" && !(await exists(join(dir, "node_modules")))) {
       found = undefined; // the tree was recreated: install again
     }
     if (found === undefined) {
-      found = this.installer.install(dir);
+      const signal = options.signal;
+      found = this.installer.install(dir, signal ? { signal } : {});
       this.done.set(key, found);
+      const mine = found;
+      void mine.then(() => {
+        if (signal?.aborted && this.done.get(key) === mine) {
+          this.done.delete(key);
+        }
+      }, () => undefined);
     }
     return found;
   }
@@ -226,13 +240,17 @@ export class InstallingCommandRunner implements CommandRunner {
     return last;
   }
 
-  async run(argv: readonly string[], cwd: string): Promise<CommandOutcome> {
-    const install = await this.installFor(cwd);
+  async run(argv: readonly string[], cwd: string, options: CommandRunOptions = {}): Promise<CommandOutcome> {
+    const install = await this.installFor(cwd, options);
     this.last = install;
+    if (options.signal?.aborted) {
+      // An interrupted run: neither the install nor the command decides anything.
+      return abortedOutcome("", install.status === "failed" ? dependencyInstallFailureLine(install) : "");
+    }
     if (install.status === "failed") {
       return { code: 1, stdout: "", stderr: dependencyInstallFailureLine(install) };
     }
-    return this.inner.run(argv, cwd);
+    return this.inner.run(argv, cwd, options);
   }
 }
 

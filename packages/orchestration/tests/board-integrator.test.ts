@@ -8,7 +8,8 @@
  * failure attribution narrows by parse, then by a confident typed decision.
  */
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,7 +20,7 @@ import { describe, expect, it } from "vitest";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 import { boardDigest, type BoardMessage, type BoardState } from "@switchyard-change/change-core";
 import type { AskJev } from "@switchyard-change/model-adapters";
-import { PromotionRefusedError, type CommandOutcome, type CommandRunner } from "@switchyard-change/verification";
+import { ChildProcessCommandRunner, PromotionRefusedError, type CommandOutcome, type CommandRunner } from "@switchyard-change/verification";
 
 import { BoardAgentClient, BoardOperatorClient } from "../src/board-client.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
@@ -530,6 +531,61 @@ describe("ContinuousBoardIntegrator: recorded base, transient retries, bounded s
     expect((await env.log()).some((m) => m.type === "integrated.rev")).toBe(false);
     expect(await env.branchHead()).toBe(baseline);
     expect(integrator.failures).toEqual([expect.stringMatching(/the interrupt grace period ended/)]);
+  });
+
+  it("abandon aborts a gate that is still running: its process is stopped, the temp dirs are removed, and nothing is recorded", async () => {
+    const env = await setup({ agents: ["a1"] });
+    await env.post("a1", { type: "item.claimed", payload: { item: "x", intent: { read: [], write: ["src/x/**"] } } });
+    const baseline = await env.branchHead();
+    // A real, long-lived gate process: it says where it runs, then hangs.
+    const marker = join(env.root, "gate-started.json");
+    const gateArgv = [
+      process.execPath,
+      "-e",
+      `require("node:fs").writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ cwd: process.cwd(), pid: process.pid })); setTimeout(() => {}, 60000);`,
+    ];
+    // The integrator's trusted repo and the runner's temp dir go to os.tmpdir():
+    // point it at a private dir for this test so their removal can be checked.
+    const privateTmp = join(env.root, "tmp");
+    await mkdir(privateTmp, { recursive: true });
+    const savedTmp = process.env.TMPDIR;
+    process.env.TMPDIR = privateTmp;
+    try {
+      const integrator = env.integrator({
+        appGateCommand: gateArgv,
+        verifyCommandRunner: new ChildProcessCommandRunner({ timeoutMs: 60_000 }),
+        predictClashes: false,
+      });
+      const c = await env.commit("a1", { "src/x/a.ts": "export const a = 1;\n" });
+      await env.announce("a1", "x", c, ["src/x/a.ts"]);
+      integrator.kick();
+      await until(() => existsSync(marker), 10_000);
+      const { cwd, pid } = JSON.parse(readFileSync(marker, "utf8")) as { cwd: string; pid: number };
+      expect(existsSync(cwd)).toBe(true);
+      expect((await readdir(privateTmp)).some((n) => n.startsWith("scf-trusted-"))).toBe(true);
+
+      const started = Date.now();
+      integrator.abandon();
+      expect(await integrator.teardown(4000)).toBe(true);
+      expect(Date.now() - started).toBeLessThan(3000);
+
+      // The gate process is gone, and so is every temp dir the attempt made.
+      expect(() => process.kill(pid, 0)).toThrow();
+      expect(existsSync(cwd)).toBe(false);
+      expect((await readdir(join(env.root, "worktrees"))).filter((n) => n.startsWith("scf-"))).toEqual([]);
+      expect((await readdir(privateTmp)).filter((n) => n.startsWith("scf-"))).toEqual([]);
+      // Nothing recorded, the branch never moved, and the reason is the abandon.
+      expect(integrator.revisions).toEqual([]);
+      expect((await env.log()).some((m) => m.type === "integrated.rev" || m.type === "push.excluded")).toBe(false);
+      expect(await env.branchHead()).toBe(baseline);
+      expect(integrator.failures).toEqual([expect.stringMatching(/the interrupt grace period ended/)]);
+    } finally {
+      if (savedTmp === undefined) {
+        delete process.env.TMPDIR;
+      } else {
+        process.env.TMPDIR = savedTmp;
+      }
+    }
   });
 
   it("a repo that stays unreadable is never re-gated as it was, and the retries are bounded", async () => {

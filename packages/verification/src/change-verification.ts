@@ -21,7 +21,7 @@ import {
 } from "@switchyard-change/change-core";
 import type { WorkspaceProvider, WorkspaceRef } from "@switchyard-change/artifact-workspace";
 
-import { Integrator, type UnitPart, type VerifiedWorkspace } from "./integrator.ts";
+import { IntegrationAbortedError, Integrator, type UnitPart, type VerifiedWorkspace } from "./integrator.ts";
 import type { GitIdentity } from "./git.ts";
 import type { TestInventory } from "./test-inventory.ts";
 import { VerificationProvider } from "./verifier.ts";
@@ -148,6 +148,12 @@ export interface VerifyAndIntegrateOptions {
   readonly testInventory?: TestInventory;
   readonly workRoot?: string;
   readonly identity?: GitIdentity;
+  /**
+   * Abort (an interrupted run): every running check and gate command is
+   * stopped, and verifyAndIntegrate rejects with IntegrationAbortedError
+   * (never evidence) once its temp dirs are removed.
+   */
+  readonly signal?: AbortSignal;
 }
 
 export class ChangeVerification {
@@ -242,8 +248,11 @@ export class ChangeVerification {
       if (!done) {
         continue;
       }
+      if (options.signal?.aborted) {
+        throw new IntegrationAbortedError();
+      }
       const contract = this.contractFor(change, done);
-      const verification = await this.verifyOne(done, contract, workRoot);
+      const verification = await this.verifyOne(done, contract, workRoot, options.signal);
       units.push(verification);
       if (verification.verdict === "verified") {
         verifiedWorkspaces.push({
@@ -277,6 +286,9 @@ export class ChangeVerification {
       options.requiresIntegrationGate ?? completed.some((c) => c.requiresAppGate === true);
     const integrationGateCommand = options.integrationGateCommand ?? unitGateCommand;
 
+    if (options.signal?.aborted) {
+      throw new IntegrationAbortedError();
+    }
     const integration: IntegrationResult = await this.integrator.integrate({
       integrationRef: options.integrationRef,
       integrationToken: options.integrationToken,
@@ -295,6 +307,7 @@ export class ChangeVerification {
       ...(options.testInventory ? { testInventory: options.testInventory } : {}),
       workRoot,
       identity: options.identity,
+      ...(options.signal ? { signal: options.signal } : {}),
     });
 
     return { changeId: change.id, units, integration, coordination };
@@ -322,6 +335,7 @@ export class ChangeVerification {
     done: CompletedWorkUnit,
     contract: VerificationContract,
     workRoot: string,
+    signal?: AbortSignal,
   ): Promise<WorkUnitVerification> {
     const worktreeDir = await mkdtemp(join(workRoot, `scf-verify-${sanitize(done.unitId)}-`));
     try {
@@ -347,6 +361,7 @@ export class ChangeVerification {
         worktreeDir,
         baselineRef: done.baselineRef,
         contract,
+        ...(signal ? { signal } : {}),
       });
     } finally {
       await rm(worktreeDir, { recursive: true, force: true });

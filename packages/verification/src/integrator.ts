@@ -25,6 +25,7 @@ import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import {
   ChildProcessCommandRunner,
   boundOutput,
+  runAbortable,
   type CommandOutcome,
   type CommandRunner,
 } from "./command.ts";
@@ -184,6 +185,37 @@ export interface IntegrateOptions {
   readonly workRoot?: string;
   /** Deterministic committer identity for the integration commit. */
   readonly identity?: GitIdentity;
+  /**
+   * Abort the integration (an interrupted run): the gate's process group is
+   * stopped, nothing is pushed, the temp dirs are removed, and `integrate`
+   * rejects with IntegrationAbortedError (never a verdict).
+   */
+  readonly signal?: AbortSignal;
+}
+
+/**
+ * The integration was aborted by its signal (an interrupted run). A distinct
+ * outcome: no verdict, nothing pushed, and the temp dirs removed.
+ */
+export class IntegrationAbortedError extends Error {
+  readonly aborted = true as const;
+
+  constructor() {
+    super("integration aborted: the run was interrupted, so nothing it gated is recorded or pushed");
+    this.name = "IntegrationAbortedError";
+  }
+}
+
+/** True for an IntegrationAbortedError (also across module copies). */
+export function isIntegrationAborted(error: unknown): error is IntegrationAbortedError {
+  return error instanceof IntegrationAbortedError || (error instanceof Error && error.name === "IntegrationAbortedError");
+}
+
+/** Throw IntegrationAbortedError when the signal aborted. */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw new IntegrationAbortedError();
+  }
 }
 
 /** Options for constructing the integrator. */
@@ -216,8 +248,10 @@ export class Integrator {
       integrationGateCommand,
       requiresIntegrationGate,
       identity,
+      signal,
     } = options;
 
+    throwIfAborted(signal);
     const workRoot = options.workRoot ?? tmpdir();
     const integrationDir = await mkdtemp(join(workRoot, "scf-integration-"));
     // A trusted bare repo OUTSIDE the checkout the gate runs in, under its own
@@ -260,6 +294,7 @@ export class Integrator {
       const applied: string[] = [];
       const appliedUnits: AppliedUnit[] = [];
       for (const unit of verified) {
+        throwIfAborted(signal);
         appliedUnits.push(await this.applyUnit(unit, integrationDir, workRoot, options.protectedPaths ?? [], refused, appliedReleased, applied));
       }
       // Gate-equals-deploy: a file a unit applied that the tree's ignore rules
@@ -360,13 +395,18 @@ export class Integrator {
         }
       }
 
+      throwIfAborted(signal);
       const ranGate = await this.runIntegrationGate(
         integrationGateCommand,
         requiresIntegrationGate ?? false,
         finalTestCommand,
         integrationDir,
         options.testInventory,
+        signal,
       );
+      // An interrupted run: whatever the gate reported, nothing is pushed and
+      // no verdict is returned (the finally below removes the temp dirs).
+      throwIfAborted(signal);
       // Gate-equals-deploy: the tracked files must be exactly the gated
       // commit's after the gate ran (agent code could rewrite itself, or commit
       // something else, while or after the tests ran). Checked from the trusted
@@ -607,11 +647,12 @@ export class Integrator {
     finalTestCommand: readonly string[] | undefined,
     integrationDir: string,
     baselineInventory?: TestInventory,
+    signal?: AbortSignal,
   ): Promise<CheckResult> {
     if (gateArgv && gateArgv.length > 0) {
       let outcome: CommandOutcome;
       try {
-        outcome = await this.commandRunner.run(gateArgv, integrationDir);
+        outcome = await runAbortable(this.commandRunner, gateArgv, integrationDir, signal);
       } catch (error) {
         const text = error instanceof Error ? error.message : String(error);
         return {
@@ -667,20 +708,21 @@ export class Integrator {
         outputs: [{ stream: "summary", text: "no integration app-gate for a tree that requires one" }],
       };
     }
-    return this.runFinalSuite(finalTestCommand, integrationDir);
+    return this.runFinalSuite(finalTestCommand, integrationDir, signal);
   }
 
   /** Run the final suite over the combined checkout, or skip when none set. */
   private async runFinalSuite(
     argv: readonly string[] | undefined,
     integrationDir: string,
+    signal?: AbortSignal,
   ): Promise<CheckResult> {
     if (!argv || argv.length === 0) {
       return { kind: "test", passed: true, skipped: true, summary: "no final test command configured", outputs: [] };
     }
     let outcome: CommandOutcome;
     try {
-      outcome = await this.commandRunner.run(argv, integrationDir);
+      outcome = await runAbortable(this.commandRunner, argv, integrationDir, signal);
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error);
       return {

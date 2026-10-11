@@ -24,6 +24,7 @@ import { join } from "node:path";
 import {
   ChildProcessCommandRunner,
   boundOutput,
+  runAbortable,
   type CommandOutcome,
   type CommandRunner,
 } from "./command.ts";
@@ -46,6 +47,8 @@ export interface VerifyOptions {
   readonly baselineRef: string;
   /** What the WorkUnit must satisfy. */
   readonly contract: VerificationContract;
+  /** Abort the checks' commands (an interrupted run): an aborted command fails its check. */
+  readonly signal?: AbortSignal;
 }
 
 /** Options for constructing the verifier. */
@@ -63,13 +66,13 @@ export class VerificationProvider {
 
   /** Verify one WorkUnit checkout and return its typed evidence. */
   async verify(options: VerifyOptions): Promise<WorkUnitVerification> {
-    const { worktreeDir, baselineRef, contract } = options;
+    const { worktreeDir, baselineRef, contract, signal } = options;
 
     const cleanState = await this.checkCleanState(worktreeDir, contract);
     const pathScope = await this.checkPathScope(worktreeDir, baselineRef, contract);
-    const test = await this.checkCommand("test", contract.testCommand, worktreeDir);
-    const lint = await this.checkCommand("lint", contract.lintCommand, worktreeDir);
-    const appGate = await this.checkAppGate(worktreeDir, contract);
+    const test = await this.checkCommand("test", contract.testCommand, worktreeDir, signal);
+    const lint = await this.checkCommand("lint", contract.lintCommand, worktreeDir, signal);
+    const appGate = await this.checkAppGate(worktreeDir, contract, signal);
 
     const checks: readonly CheckResult[] = [cleanState, pathScope, test, lint, appGate];
     const verdict: Verdict = checks.every((c) => c.skipped || c.passed) ? "verified" : "failed";
@@ -162,13 +165,14 @@ export class VerificationProvider {
     kind: Extract<CheckKind, "test" | "lint">,
     argv: readonly string[] | undefined,
     worktreeDir: string,
+    signal?: AbortSignal,
   ): Promise<CheckResult> {
     if (!argv || argv.length === 0) {
       return skipped(kind, `no ${kind} command configured`);
     }
     let outcome: CommandOutcome;
     try {
-      outcome = await this.commandRunner.run(argv, worktreeDir);
+      outcome = await runAbortable(this.commandRunner, argv, worktreeDir, signal);
     } catch (error) {
       return failed(kind, `${kind} command could not run: ${messageOf(error)}`, [
         { stream: "summary", text: messageOf(error) },
@@ -215,6 +219,7 @@ export class VerificationProvider {
   private async checkAppGate(
     worktreeDir: string,
     contract: VerificationContract,
+    signal?: AbortSignal,
   ): Promise<CheckResult> {
     const argv = contract.appGateCommand;
     if (!argv || argv.length === 0) {
@@ -231,7 +236,7 @@ export class VerificationProvider {
     }
     let outcome: CommandOutcome;
     try {
-      outcome = await this.commandRunner.run(argv, worktreeDir);
+      outcome = await runAbortable(this.commandRunner, argv, worktreeDir, signal);
     } catch (error) {
       return failed("app-gate", `app-gate command could not run: ${messageOf(error)}`, [
         { stream: "summary", text: messageOf(error) },

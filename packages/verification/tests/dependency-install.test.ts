@@ -14,6 +14,7 @@ import {
   planDependencyInstall,
   type CommandOutcome,
   type CommandRunner,
+  type CommandRunOptions,
 } from "../src/index.ts";
 
 async function tree(files: Record<string, string>): Promise<string> {
@@ -148,5 +149,41 @@ describe("InstallingCommandRunner", () => {
     await runner.run(["gate"], await tree({ "package-lock.json": "{}" }));
     expect(gate.calls).toHaveLength(1);
     expect(runner.takeLastInstall()).toMatchObject({ status: "skipped", detail: "dependency install disabled for this gate (it needs no dependencies)" });
+  });
+
+  it("passes the abort signal to the install and the gate; an install aborted mid-run neither runs the gate nor is remembered", async () => {
+    const dir = await tree({ "package.json": "{}", "package-lock.json": "{\"v\":1}" });
+    const controller = new AbortController();
+    const seen: (AbortSignal | undefined)[] = [];
+    let installs = 0;
+    const installer = {
+      async install(_d: string, options?: CommandRunOptions) {
+        installs += 1;
+        seen.push(options?.signal);
+        if (installs === 1) {
+          controller.abort(); // the run is interrupted while the install runs
+          return { status: "failed" as const, tool: "npm", detail: "npm ci: aborted (the run was interrupted)", durationMs: 1 };
+        }
+        return { status: "installed" as const, tool: "npm", detail: "npm ci", durationMs: 1 };
+      },
+    };
+    const gateSignals: (AbortSignal | undefined)[] = [];
+    const gate: CommandRunner = {
+      async run(_argv, _cwd, options) {
+        gateSignals.push(options?.signal);
+        return { code: 0, stdout: "", stderr: "" };
+      },
+    };
+    const runner = new InstallingCommandRunner(gate, installer);
+    const aborted = await runner.run(["gate"], dir, { signal: controller.signal });
+    expect(aborted).toMatchObject({ code: null, aborted: true });
+    expect(aborted.stderr).toMatch(/dependency install failed: npm ci: aborted/);
+    expect(seen).toEqual([controller.signal]);
+    expect(gateSignals).toEqual([]);
+    // A later run (another signal) installs again and the gate sees its signal.
+    const next = new AbortController();
+    expect(await runner.run(["gate"], dir, { signal: next.signal })).toEqual({ code: 0, stdout: "", stderr: "" });
+    expect(installs).toBe(2);
+    expect(gateSignals).toEqual([next.signal]);
   });
 });

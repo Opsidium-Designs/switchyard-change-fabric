@@ -36,10 +36,14 @@ export type {
 export type {
   CommandOutcome,
   CommandRunner,
+  CommandRunOptions,
 } from "./command.ts";
 export type { ChildProcessCommandRunnerOptions } from "./command.ts";
 export {
+  ABORT_KILL_GRACE_MS,
+  abortedOutcome,
   ChildProcessCommandRunner,
+  COMMAND_ABORTED_LINE,
   DEFAULT_COMMAND_TIMEOUT_MS,
   gateEnvironment,
   MAX_CAPTURED_CHARS,
@@ -138,7 +142,9 @@ export {
   advanceIntegrationBranch,
   GATED_REF_PREFIX,
   gatedRef,
+  IntegrationAbortedError,
   Integrator,
+  isIntegrationAborted,
   isPromotionRefused,
   PromotionRefusedError,
   recordBaselineInventory,

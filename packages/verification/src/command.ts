@@ -19,12 +19,47 @@ export interface CommandOutcome {
   readonly code: number | null;
   readonly stdout: string;
   readonly stderr: string;
+  /**
+   * True when the command was stopped because the caller's signal aborted (an
+   * interrupted run), not because it finished. An aborted command never
+   * passes: its code is null.
+   */
+  readonly aborted?: true;
+}
+
+/** Per-run options for a command. */
+export interface CommandRunOptions {
+  /**
+   * Abort the command: the runner stops it (and everything it started) and
+   * reports an aborted outcome (`aborted: true`, code null), never a pass.
+   */
+  readonly signal?: AbortSignal;
 }
 
 /** Runs an argv command in a working directory and captures its output. */
 export interface CommandRunner {
-  run(argv: readonly string[], cwd: string): Promise<CommandOutcome>;
+  run(argv: readonly string[], cwd: string, options?: CommandRunOptions): Promise<CommandOutcome>;
 }
+
+/**
+ * Run through `runner`, passing the signal only when there is one (so a
+ * runner called without a signal sees exactly the two-argument call it always
+ * did).
+ */
+export function runAbortable(runner: CommandRunner, argv: readonly string[], cwd: string, signal: AbortSignal | undefined): Promise<CommandOutcome> {
+  return signal === undefined ? runner.run(argv, cwd) : runner.run(argv, cwd, { signal });
+}
+
+/** The line an aborted command's outcome ends with. */
+export const COMMAND_ABORTED_LINE = "command was aborted (the run was interrupted) and was stopped";
+
+/** The outcome of a command aborted before or while it ran. */
+export function abortedOutcome(stdout = "", stderr = ""): CommandOutcome {
+  return { code: null, stdout, stderr: `${stderr}\n${COMMAND_ABORTED_LINE}`.trim(), aborted: true };
+}
+
+/** Grace between the polite stop (SIGTERM) of an aborted command's process group and the SIGKILL. */
+export const ABORT_KILL_GRACE_MS = 2000;
 
 /** Largest captured output kept per stream, so evidence stays bounded. */
 export const MAX_CAPTURED_CHARS = 4000;
@@ -133,7 +168,9 @@ export interface ChildProcessCommandRunnerOptions {
  * this run (removed afterwards). It runs in its own process group: at the
  * timeout, or when its output exceeds the buffer, the whole group (every
  * process it started) is killed and the outcome says which; when the command
- * exits normally, whatever it left running in its group is killed too.
+ * exits normally, whatever it left running in its group is killed too. When
+ * the caller's signal aborts, the group gets SIGTERM, then SIGKILL after
+ * ABORT_KILL_GRACE_MS, and the outcome is aborted (never a pass).
  */
 export class ChildProcessCommandRunner implements CommandRunner {
   private readonly timeoutMs: number;
@@ -144,21 +181,34 @@ export class ChildProcessCommandRunner implements CommandRunner {
     this.maxBuffer = options.maxBuffer ?? DEFAULT_COMMAND_MAX_BUFFER;
   }
 
-  async run(argv: readonly string[], cwd: string): Promise<CommandOutcome> {
+  async run(argv: readonly string[], cwd: string, options: CommandRunOptions = {}): Promise<CommandOutcome> {
     const [program, ...args] = argv;
     if (program === undefined) {
       return { code: null, stdout: "", stderr: "empty command" };
     }
+    if (options.signal?.aborted) {
+      return abortedOutcome();
+    }
     const temp = await mkdtemp(join(tmpdir(), "scf-cmd-"));
     try {
-      return await this.spawnIn(program, args, cwd, { ...gateEnvironment(this.options.parentEnv ?? process.env, temp), ...(this.options.extraEnv ?? {}) });
+      return await this.spawnIn(
+        program,
+        args,
+        cwd,
+        { ...gateEnvironment(this.options.parentEnv ?? process.env, temp), ...(this.options.extraEnv ?? {}) },
+        options.signal,
+      );
     } finally {
       await rm(temp, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 
-  private spawnIn(program: string, args: readonly string[], cwd: string, env: NodeJS.ProcessEnv): Promise<CommandOutcome> {
+  private spawnIn(program: string, args: readonly string[], cwd: string, env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<CommandOutcome> {
     return new Promise((resolve) => {
+      if (signal?.aborted) {
+        resolve(abortedOutcome());
+        return;
+      }
       const child = spawn(program, args, { cwd, env, detached: true, stdio: ["ignore", "pipe", "pipe"] });
       const out: Buffer[] = [];
       const err: Buffer[] = [];
@@ -194,6 +244,35 @@ export class ChildProcessCommandRunner implements CommandRunner {
       };
       child.on("exit", reapGroup);
       const timer = setTimeout(() => killGroup(`command timed out after ${this.timeoutMs} ms and was stopped`), this.timeoutMs);
+      // An aborted run (the caller's signal): stop the whole group politely
+      // (SIGTERM), then for good (SIGKILL) after a short grace. On a platform
+      // without process groups (Windows) the child alone is stopped.
+      let aborted = false;
+      let abortKill: ReturnType<typeof setTimeout> | undefined;
+      const signalGroup = (sig: NodeJS.Signals): void => {
+        try {
+          if (child.pid !== undefined) {
+            process.kill(-child.pid, sig);
+          }
+        } catch {
+          child.kill(sig);
+        }
+      };
+      const onAbort = (): void => {
+        if (stopped !== undefined) {
+          return;
+        }
+        stopped = COMMAND_ABORTED_LINE;
+        aborted = true;
+        signalGroup("SIGTERM");
+        abortKill = setTimeout(() => signalGroup("SIGKILL"), ABORT_KILL_GRACE_MS);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      const settle = (): void => {
+        clearTimeout(timer);
+        clearTimeout(abortKill);
+        signal?.removeEventListener("abort", onAbort);
+      };
       child.stdout.on("data", (chunk: Buffer) => {
         outBytes += chunk.length;
         if (outBytes > this.maxBuffer) {
@@ -211,15 +290,19 @@ export class ChildProcessCommandRunner implements CommandRunner {
         err.push(chunk);
       });
       child.on("error", (error) => {
-        clearTimeout(timer);
+        settle();
         // Spawn failure (for example the program was not found).
         resolve({ code: null, stdout: Buffer.concat(out).toString("utf8"), stderr: error.message });
       });
       child.on("close", (code) => {
-        clearTimeout(timer);
+        settle();
         reapGroup();
         const stdout = Buffer.concat(out).toString("utf8");
         const stderr = Buffer.concat(err).toString("utf8");
+        if (aborted) {
+          resolve(abortedOutcome(stdout, stderr));
+          return;
+        }
         if (stopped !== undefined) {
           resolve({ code: null, stdout, stderr: `${stderr}\n${stopped}`.trim() });
           return;

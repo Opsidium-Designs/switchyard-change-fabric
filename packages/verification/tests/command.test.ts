@@ -1,6 +1,7 @@
 /**
  * Checked commands run code agents wrote: they see an allowlisted environment
- * (never a credential) and are stopped at a timeout with an honest reason.
+ * (never a credential) and are stopped at a timeout, or when the caller's
+ * signal aborts, with an honest reason.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -8,7 +9,7 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { ChildProcessCommandRunner, gateEnvironment } from "../src/command.ts";
+import { ABORT_KILL_GRACE_MS, ChildProcessCommandRunner, COMMAND_ABORTED_LINE, gateEnvironment } from "../src/command.ts";
 
 const SECRETS = {
   SWITCHYARD_API_TOKEN: "bearer-secret",
@@ -103,5 +104,98 @@ describe("ChildProcessCommandRunner", () => {
     }
     expect(alive()).toBe(false);
   });
-});
 
+  describe("abort", () => {
+    /** Is `pid` a live (non-zombie) process? */
+    const alive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        return false;
+      }
+      try {
+        return !/^\d+ \([^)]*\) Z/.test(readFileSync(`/proc/${pid}/stat`, "utf8"));
+      } catch {
+        return false;
+      }
+    };
+    const until = async (check: () => boolean, ms: number): Promise<boolean> => {
+      const deadline = Date.now() + ms;
+      while (!check() && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      return check();
+    };
+    /**
+     * A long-lived command that starts a long-lived grandchild and writes both
+     * pids to a file once both run. `ignoreTerm` makes both ignore SIGTERM.
+     */
+    const treeCommand = (pids: string, ignoreTerm: boolean): string[] => {
+      const trap = ignoreTerm ? `process.on("SIGTERM", () => {});` : "";
+      const grandchild = `${trap} setTimeout(() => {}, 60000);`;
+      const parent =
+        `${trap} const c = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(grandchild)}], { stdio: "ignore" });` +
+        `c.on("spawn", () => require("node:fs").writeFileSync(${JSON.stringify(pids)}, process.pid + " " + c.pid));` +
+        "setTimeout(() => {}, 60000);";
+      return [process.execPath, "-e", parent];
+    };
+    const readPids = (file: string): number[] => readFileSync(file, "utf8").trim().split(" ").map(Number);
+
+    it("stops the command and its grandchild at once and reports an aborted outcome, never a pass", async () => {
+      const pids = join(tmpdir(), `scf-abort-${process.pid}-${Date.now()}`);
+      const controller = new AbortController();
+      const running = new ChildProcessCommandRunner({ timeoutMs: 60_000 }).run(treeCommand(pids, false), tmpdir(), { signal: controller.signal });
+      expect(await until(() => existsSync(pids), 4000)).toBe(true);
+      const [parentPid, grandchildPid] = readPids(pids);
+      expect(alive(parentPid!) && alive(grandchildPid!)).toBe(true);
+      const started = Date.now();
+      controller.abort();
+      const outcome = await running;
+      expect(Date.now() - started).toBeLessThan(1500);
+      expect(outcome.aborted).toBe(true);
+      expect(outcome.code).toBeNull();
+      expect(outcome.stderr).toContain(COMMAND_ABORTED_LINE);
+      expect(outcome.stderr).not.toMatch(/timed out/);
+      expect(await until(() => !alive(parentPid!) && !alive(grandchildPid!), 1500)).toBe(true);
+    });
+
+    it("kills a tree that ignores SIGTERM after the grace period", async () => {
+      const pids = join(tmpdir(), `scf-abort-term-${process.pid}-${Date.now()}`);
+      const controller = new AbortController();
+      const running = new ChildProcessCommandRunner({ timeoutMs: 60_000 }).run(treeCommand(pids, true), tmpdir(), { signal: controller.signal });
+      expect(await until(() => existsSync(pids), 4000)).toBe(true);
+      const [parentPid, grandchildPid] = readPids(pids);
+      const started = Date.now();
+      controller.abort();
+      const outcome = await running;
+      const took = Date.now() - started;
+      expect(took).toBeGreaterThanOrEqual(ABORT_KILL_GRACE_MS - 100);
+      expect(took).toBeLessThan(ABORT_KILL_GRACE_MS + 1500);
+      expect(outcome.aborted).toBe(true);
+      expect(outcome.code).toBeNull();
+      expect(await until(() => !alive(parentPid!) && !alive(grandchildPid!), 1500)).toBe(true);
+    });
+
+    it("an already-aborted signal runs nothing and reports aborted", async () => {
+      const marker = join(tmpdir(), `scf-abort-pre-${process.pid}-${Date.now()}`);
+      const controller = new AbortController();
+      controller.abort();
+      const outcome = await new ChildProcessCommandRunner().run(
+        [process.execPath, "-e", `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "x")`],
+        tmpdir(),
+        { signal: controller.signal },
+      );
+      expect(outcome).toMatchObject({ code: null, aborted: true });
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    it("a signal that never aborts changes nothing: output is captured and the exit code reported", async () => {
+      const outcome = await new ChildProcessCommandRunner().run(
+        [process.execPath, "-e", "process.stdout.write('out'); process.stderr.write('err'); process.exit(3)"],
+        tmpdir(),
+        { signal: new AbortController().signal },
+      );
+      expect(outcome).toEqual({ code: 3, stdout: "out", stderr: "err" });
+    });
+  });
+});

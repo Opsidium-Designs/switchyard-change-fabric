@@ -892,8 +892,13 @@ is distributed changes: items are proposed and claimed, never assigned.
   abandoned: whatever it still finishes records nothing more on the board
   (no revision, `push.excluded`, `push.regressed`, `candidate.gated`,
   `trunk.moved`, or attribution decision) and never advances the
-  integration branch (the gate process itself is not killed; it
-  runs to completion or its timeout in the background). A SECOND signal exits at
+  integration branch. Abandoning also aborts it: the running gate (and any
+  dependency install) is stopped by its process group (SIGTERM, then SIGKILL
+  after 2 s; a command stopped this way reports an aborted outcome, never a
+  pass), the integrator returns no verdict, and its temp dirs
+  (`scf-integration-*`, `scf-trusted-*`, the command's own temp dir) are
+  removed; the run waits for that teardown (at most 5 s) before it returns, so
+  the CLI's exit does not leave them behind. A SECOND signal exits at
   once (130) without the ending (`cleanup-live` tears down what it left). The
   CLI exits 130 for an interrupted run that is not verified. The verdict
   is the LAST revision's gate; it is posted to `/integration` and must be

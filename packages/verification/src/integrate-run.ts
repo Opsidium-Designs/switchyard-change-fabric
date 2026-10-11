@@ -45,7 +45,7 @@ import type { Change } from "@switchyard-change/change-core";
 import type { WorkspaceProvider } from "@switchyard-change/artifact-workspace";
 
 import { ChangeVerification, type CompletedWorkUnit } from "./change-verification.ts";
-import { ChildProcessCommandRunner, type CommandOutcome, type CommandRunner } from "./command.ts";
+import { ChildProcessCommandRunner, type CommandOutcome, type CommandRunner, type CommandRunOptions } from "./command.ts";
 import {
   dependencyInstallFailureLine,
   LockfileDependencyInstaller,
@@ -120,7 +120,7 @@ export class SandboxedCommandRunner implements CommandRunner {
     private readonly tempDir: string,
   ) {}
 
-  run(argv: readonly string[], cwd: string): Promise<CommandOutcome> {
+  run(argv: readonly string[], cwd: string, options?: CommandRunOptions): Promise<CommandOutcome> {
     const { uid, gid, home } = this.sandbox;
     return this.inner.run(
       [
@@ -141,6 +141,7 @@ export class SandboxedCommandRunner implements CommandRunner {
         ...argv,
       ],
       cwd,
+      options,
     );
   }
 }
@@ -280,7 +281,7 @@ class PhasedGateRunner implements CommandRunner {
     }
   }
 
-  async run(argv: readonly string[], cwd: string): Promise<CommandOutcome> {
+  async run(argv: readonly string[], cwd: string, options: CommandRunOptions = {}): Promise<CommandOutcome> {
     this.ran += 1;
     if (this.ran > 1) {
       // One gate per revision: a second command would run outside the phases.
@@ -290,11 +291,11 @@ class PhasedGateRunner implements CommandRunner {
     await this.enter("deps");
     let outcome: CommandOutcome;
     try {
-      const install = await this.installer.install(cwd);
+      const install = await this.installer.install(cwd, options);
       this.install = install;
       await this.reap();
       await this.enter("gate");
-      outcome = install.status === "failed" ? { code: 1, stdout: "", stderr: dependencyInstallFailureLine(install) } : await this.gate.run(argv, cwd);
+      outcome = install.status === "failed" ? { code: 1, stdout: "", stderr: dependencyInstallFailureLine(install) } : await this.gate.run(argv, cwd, options);
     } finally {
       // Nothing the install or the gate started survives into the push phase.
       await this.reap();
