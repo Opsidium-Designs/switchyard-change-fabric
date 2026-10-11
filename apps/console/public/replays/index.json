@@ -2,6 +2,14 @@
   "format": "switchyard-replay/v1",
   "runs": [
     {
+      "id": "board-live-sf21",
+      "title": "Storefront: correct and safe (passed)",
+      "app": "storefront",
+      "outcome": "verified",
+      "description": "Six agents on a local Claude CLI make the storefront correct and safe: a stale developer test is changed under a human-accepted contract, acceptance climbs 79, 103, 126, 128, then 129 of 129 at revision 6, which is gated and promoted.",
+      "messages": 137
+    },
+    {
       "id": "board-live-l3",
       "title": "service-api: 6 items, gate passed on revision 4, verified and promoted",
       "app": "service-api",
