@@ -37,6 +37,25 @@
  *      stack, so coupled work accumulates and is fixed through ordinary
  *      attribution.
  *
+ * Under arbitration revision 7:
+ *   - when the ratchet itself does not run the acceptance suite (its score is
+ *     runs:false: measurement is blocked), a stack that scores no better (a
+ *     tie included) is checked leave-one-out over EVERY push in it, the
+ *     ratchet's own included, so a blocking push already in the ratchet can
+ *     be isolated;
+ *   - a regressor's blamed items are chosen among every item whose push its
+ *     removal removed (the whole unit), preferring those the removed failures
+ *     name, then its new items;
+ *   - a seam consumer whose removal alone makes the stack better is not
+ *     blamed when the failures its removal removes name the seam's module or
+ *     a seam symbol: it defers to its seam group's result;
+ *   - when the stack did not run the acceptance suite only because a
+ *     developer suite failed first (not the typecheck), a push whose removal
+ *     removes only failures in developer TEST files it did not touch is not
+ *     blamed (a correct fix that makes a stale developer test fail first is
+ *     kept; the failing revision's attribution and contract cue handle the
+ *     stale test).
+ *
  * Honesty: every recorded revision is exactly a gated tree on the integrated
  * head (the baseline: STALE_BASE applies), so gate-equals-deploy holds. The
  * ratchet never moves the head, never promotes, and never changes a verdict:
@@ -46,6 +65,7 @@
  */
 
 import {
+  arbitrationV7,
   BOARD_LIMITS,
   compareProgressScore,
   describeProgressScore,
@@ -59,12 +79,14 @@ import {
   type BoardIntegrationUnitPlan,
   type BoardItem,
   type BoardProgressScore,
+  type BoardRevProgress,
   type BoardState,
 } from "@switchyard-change/change-core";
 import { gateFailureLine, inventoryAfterContracts, matchesGlob, type EvidenceSummary } from "@switchyard-change/verification";
 
 import { redactSecrets } from "./redact.ts";
 import {
+  ABANDONED_REASON,
   failingRevisionEvidence,
   integrateBoardRevision,
   keyWithout,
@@ -116,6 +138,8 @@ export interface RatchetIsolation {
    */
   readonly outcome: "regressed" | "improves" | "kept" | "unscored" | "skipped";
   readonly skipped?: string;
+  /** Arbitration revision 7: why a candidate whose removal made the stack better is not blamed (a seam consumer, a stale developer test). */
+  readonly reason?: string;
 }
 
 /** The result of one ratchet round. */
@@ -140,6 +164,19 @@ export interface RatchetRoundResult extends IntegrateBoardResult {
  */
 export function regressionEvidence(candidate: string, reference: string, max = EVIDENCE_LINES): string[] {
   const known = new Set(reference.split(/\r?\n/).map((l) => l.trim()));
+  const out = failureLinesNotIn(candidate, reference, Math.min(max, BOARD_LIMITS.maxRegressionEvidence));
+  if (out.length === 0) {
+    const key = gateFailureLine(candidate);
+    if (key !== undefined && !known.has(key.trim())) {
+      out.push(key.trim().slice(0, BOARD_LIMITS.maxRegressionEvidenceLine));
+    }
+  }
+  return out;
+}
+
+/** Failure lines of `candidate` that `reference` does not carry (trimmed, bounded, deduplicated), at most `max`. Pure. */
+function failureLinesNotIn(candidate: string, reference: string, max: number): string[] {
+  const known = new Set(reference.split(/\r?\n/).map((l) => l.trim()));
   const failure = (l: string): boolean =>
     /\(\d+,\d+\): error TS\d+:/.test(l) ||
     /^error TS\d+:/.test(l) ||
@@ -152,17 +189,60 @@ export function regressionEvidence(candidate: string, reference: string, max = E
       continue;
     }
     out.push(line.slice(0, BOARD_LIMITS.maxRegressionEvidenceLine));
-    if (out.length >= Math.min(max, BOARD_LIMITS.maxRegressionEvidence)) {
+    if (out.length >= max) {
       break;
     }
   }
-  if (out.length === 0) {
-    const key = gateFailureLine(candidate);
-    if (key !== undefined && !known.has(key.trim())) {
-      out.push(key.trim().slice(0, BOARD_LIMITS.maxRegressionEvidenceLine));
-    }
-  }
   return out;
+}
+
+/** Failure lines a stale-test or seam check reads (more than a regression quotes). */
+const ANALYSIS_LINES = 200;
+
+/** A source path in a failure line (`src/a.ts`, `tests/a.test.ts:12:5`). */
+const SOURCE_PATH = /(?:^|[\s'"(`])(?:\.\/)?((?:[\w@.-]+\/)*[\w@.-]+\.[cm]?[jt]sx?)\b/g;
+
+/** True for a test file path (`*.test.ts`, `*.spec.mjs`, or under a tests/ directory). */
+function isTestFile(path: string): boolean {
+  return /\.(test|spec)\.[cm]?[jt]sx?$/.test(path) || /(^|\/)(tests?|__tests__)\//.test(path);
+}
+
+/**
+ * Arbitration revision 7: true when a stack whose acceptance suite did not
+ * run only because a developer suite failed first (`progress`; a typecheck
+ * failure never qualifies) is made better by removing pushes whose removed
+ * failure lines (`removedLines`: what the removal removes) name only
+ * developer TEST files none of `removedPaths` touched: a correct fix that
+ * makes a stale developer test fail first, not a regression. Pure.
+ */
+export function staleDeveloperTestsOnly(progress: BoardRevProgress | undefined, removedLines: readonly string[], removedPaths: readonly string[]): boolean {
+  if (progress?.acceptanceNotRun === undefined || !/developer suite failed first/.test(progress.acceptanceNotRun)) {
+    return false;
+  }
+  if (removedLines.some((l) => /error TS\d+:/.test(l))) {
+    return false;
+  }
+  const files = [...new Set(removedLines.flatMap((l) => [...l.matchAll(SOURCE_PATH)].map((m) => m[1]!)))];
+  return files.length > 0 && files.every((f) => isTestFile(f) && !removedPaths.includes(f));
+}
+
+/**
+ * True when a failure line names one of the seams `seamPaths` edits: its
+ * module (`"../contracts/auth.ts"`, `src/contracts/auth.ts`) or a quoted name
+ * the blueprint says it exports. Pure.
+ */
+export function namesSeam(state: BoardState, seamPaths: readonly string[], line: string): boolean {
+  const seams = seamsEdited(state, seamPaths);
+  if (seams.length === 0) {
+    return false;
+  }
+  const symbols = [...new Set((state.seams ?? []).filter((s) => seams.includes(s.path)).flatMap((s) => s.symbols ?? []))];
+  const modules = seams.map((p) => (p.split("/").pop() ?? p).replace(/\.[cm]?[jt]sx?$/, ""));
+  return (
+    seams.some((p) => line.includes(p)) ||
+    modules.some((mod) => new RegExp(`["'][^"']*\\b${escapeRegExp(mod)}(\\.[cm]?[jt]sx?)?["']`).test(line)) ||
+    symbols.some((sym) => line.includes(`'${sym}'`) || line.includes(`"${sym}"`))
+  );
 }
 
 /** The shared seams a push's paths edit: the blueprint's seams and the shared seam files (sorted). Pure. */
@@ -182,6 +262,8 @@ export interface LeaveOneOutPush {
   readonly seq: number;
   /** The whole stack's failure parse attributes one of its items. */
   readonly attributed: boolean;
+  /** Arbitration revision 7: every item whose push removing this agent's unit removes (its new items and any the ratchet merged). */
+  readonly removed?: readonly BoardItem[];
 }
 
 /** A planned candidate: remove these agents' pushes (a group names its seam push's agent). */
@@ -389,7 +471,7 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
   const verificationExcluded = stack
     .filter((e) => whole.excludedAgents.some((x) => x.agent === e.unit.agent))
     .map((e) => ({ agent: e.unit.agent, items: [...e.unit.items], reason: whole.excludedAgents.find((x) => x.agent === e.unit.agent)!.reason }));
-  const excludedPushes = await recordExcludedPushes(options.operator, verificationExcluded);
+  const excludedPushes = await recordExcludedPushes(options.operator, verificationExcluded, options.abandoned);
   if (excludedPushes > 0) {
     key = keyWithout(key, verificationExcluded);
   }
@@ -476,9 +558,15 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
   };
 
   const ratchetCommits = new Set(ratchet.merged);
-  const worse = whole.gate === "fail" && wholeScore !== undefined && compareProgressScore(wholeScore, ratchet.score) < 0;
+  const v7 = arbitrationV7(state);
+  const versus = wholeScore !== undefined ? compareProgressScore(wholeScore, ratchet.score) : 0;
+  // Revision 7: with the ratchet's own measurement blocked (runs:false), a stack no better than it
+  // (a tie too) is checked over every push in it, the ratchet's own included.
+  const blocked = v7 && whole.gate === "fail" && wholeScore !== undefined && !ratchet.score.runs && !wholeScore.runs && versus <= 0;
+  const worse = (whole.gate === "fail" && wholeScore !== undefined && versus < 0) || blocked;
   const inWhole = stack.filter((e) => whole.mergedAgents.includes(e.unit.agent));
-  const newItemsOf = (e: StackEntry): BoardItem[] => e.unit.items.filter((i) => !ratchetCommits.has(i.lastPush!.commit));
+  const newItemsOf = (e: StackEntry): BoardItem[] =>
+    blocked ? [...e.unit.items] : e.unit.items.filter((i) => !ratchetCommits.has(i.lastPush!.commit));
   const newEntries = inWhole.filter((e) => newItemsOf(e).length > 0);
   if (!worse || newEntries.length === 0) {
     return recordWhole({});
@@ -496,6 +584,7 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
       paths: [...new Set(items.flatMap((i) => i.lastPush!.paths))].sort(),
       seq: Math.min(...items.map((i) => i.lastPush!.seq)),
       attributed: items.some((i) => blamedByParse.has(i.id)),
+      ...(v7 ? { removed: [...e.unit.items] } : {}),
     };
   });
   const pushOf = new Map(pushes.map((p) => [p.agent, p]));
@@ -529,13 +618,45 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
     const outcome: RatchetIsolation["outcome"] = score === undefined ? "unscored" : compareProgressScore(score, wholeScore!) > 0 ? "regressed" : "kept";
     return { isolation: { ...describe(c), candidate: built.commit, ...(score ? { score } : {}), outcome }, built };
   });
-  // A group blames its seam push only when every member was tried alone and none alone made the stack better.
-  const alone = new Map(gated.filter((g) => g.isolation.kind === "push").map((g) => [g.isolation.agent, g.isolation]));
-  const decided = gated.map((g) => {
+  // Revision 7: a candidate whose removal made the stack better is not blamed when that is a seam
+  // consumer's need of the seam (it defers to its seam group) or only a stale developer test.
+  const deferred = new Set<string>();
+  const reviewed = gated.map((g) => {
+    if (!v7 || g.isolation.outcome !== "regressed" || g.built === undefined) {
+      return g;
+    }
+    const removedLines = failureLinesNotIn(wholeOutput, outputOf(g.built.evidence), ANALYSIS_LINES);
+    if (g.isolation.kind === "push") {
+      const groups = planned.filter((c) => c.kind === "group" && c.agent !== g.isolation.agent && c.agents.includes(g.isolation.agent));
+      if (groups.some((c) => removedLines.some((l) => namesSeam(state, pushOf.get(c.agent)!.paths, l)))) {
+        deferred.add(g.isolation.agent);
+        return {
+          ...g,
+          isolation: { ...g.isolation, outcome: "improves" as const, reason: "a seam consumer: what its removal removes names the seam, so it defers to its seam group" },
+        };
+      }
+    }
+    const removedPaths = [...new Set(g.isolation.agents.flatMap((a) => (pushOf.get(a)!.removed ?? pushOf.get(a)!.items).flatMap((i) => i.lastPush!.paths)))];
+    if (staleDeveloperTestsOnly(whole.progress, removedLines, removedPaths)) {
+      return {
+        ...g,
+        isolation: {
+          ...g.isolation,
+          outcome: "kept" as const,
+          reason: "its removal only removes failures in developer test files it did not touch (a stale test that fails first): kept, never blamed",
+        },
+      };
+    }
+    return g;
+  });
+  // A group blames its seam push only when every member was tried alone and none alone made the stack better
+  // (a deferred consumer counts as no better).
+  const alone = new Map(reviewed.filter((g) => g.isolation.kind === "push").map((g) => [g.isolation.agent, g.isolation]));
+  const decided = reviewed.map((g) => {
     if (g.isolation.kind !== "group" || g.isolation.outcome !== "regressed") {
       return g;
     }
-    const explained = g.isolation.agents.some((a) => alone.get(a)?.outcome !== "kept");
+    const explained = g.isolation.agents.some((a) => alone.get(a)?.outcome !== "kept" && !deferred.has(a));
     return explained ? { ...g, isolation: { ...g.isolation, outcome: "improves" as const } } : g;
   });
   const isolation: RatchetIsolation[] = [
@@ -549,17 +670,19 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
   const note =
     tried.length === 0
       ? undefined
-      : `pre-pass ratchet: this stack scores ${describeProgressScore(wholeScore!)}, worse than the best revision so far (revision ${ratchet.n}: ${describeProgressScore(ratchet.score)}); ` +
+      : `pre-pass ratchet: this stack scores ${describeProgressScore(wholeScore!)}, ${versus < 0 ? "worse than" : "no better than"} the best revision so far (revision ${ratchet.n}: ${describeProgressScore(ratchet.score)}); ` +
         `the same stack without:\n` +
         tried
           .map((g) => {
             const i = g.isolation;
             const what =
-              i.outcome === "regressed"
-                ? `strictly better: ${i.kind === "group" ? `the seam push of ${i.agent} is` : "it is"} not stacked until its holder pushes again`
-                : i.outcome === "improves"
-                  ? "better, explained by a push alone (not blamed as a group)"
-                  : "no better: kept (pushes that work together are never blamed)";
+              i.reason !== undefined
+                ? `better, not blamed: ${i.reason}`
+                : i.outcome === "regressed"
+                  ? `strictly better: ${i.kind === "group" ? `the seam push of ${i.agent} is` : "it is"} not stacked until its holder pushes again`
+                  : i.outcome === "improves"
+                    ? "better, explained by a push alone (not blamed as a group)"
+                    : "no better: kept (pushes that work together are never blamed)";
             return `  ${i.items.join(", ")} (${i.agents.join(", ")}): ${i.score ? describeProgressScore(i.score) : "no score"}: ${what}`;
           })
           .join("\n") +
@@ -578,13 +701,34 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
     return { requiresIntegrationGate, key, evidence: whole.evidence!, ...(first.stale ? { stale: true } : {}), failure: first.failure!, isolation };
   }
   const revisions: BoardRevision[] = [first.revision];
+  // Abandoned (the interrupt grace ended) after the first revision: nothing
+  // more is recorded (no push.regressed, no second revision).
+  const abandonedAfterFirst = (): RatchetRoundResult => ({
+    revision: first.revision!,
+    revisions,
+    evidence: whole.evidence!,
+    requiresIntegrationGate,
+    key,
+    ratchet: ratchetInfo,
+    stackScore: wholeScore!,
+    isolation,
+    regressed: [],
+    ...(excludedPushes > 0 ? { excludedPushes } : {}),
+    failure: ABANDONED_REASON,
+  });
+  if (options.abandoned?.()) {
+    return abandonedAfterFirst();
+  }
 
   // 4. Each regressor, addressed to its holder, with what its removal removes and the seam hint.
   const regressed: string[] = [];
   const blamedBy = new Map<string, string[]>();
   for (const r of regressors) {
     const evidence = regressionEvidence(wholeOutput, outputOf(r.built.evidence)).map((l) => scrub(l));
-    for (const item of blamedItems(state, pushOf.get(r.agent)!.items, r.isolation.kind, evidence)) {
+    for (const item of blamedItems(state, pushOf.get(r.agent)!.items, r.isolation.kind, evidence, pushOf.get(r.agent)!.removed)) {
+      if (options.abandoned?.()) {
+        return { ...abandonedAfterFirst(), regressed };
+      }
       const seams = seamsEdited(state, item.lastPush!.paths);
       const outcome = await options.operator
         .recordEngine("push.regressed", {
@@ -608,6 +752,9 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
   }
 
   // 5. The stack without the regressors (they wait for their holders' next push), as the next revision.
+  if (options.abandoned?.()) {
+    return { ...abandonedAfterFirst(), regressed };
+  }
   const after = await options.operator.log();
   const rest = planBoardIntegration(after.messages, after.state);
   const restKey = rest.key;
@@ -676,18 +823,30 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
  * The items of a regressor's unit that are blamed: for a seam group, the
  * items whose push edits a shared seam; for one push, the items whose
  * announced paths the removed failures name (every new item when none is
- * named, or when an agent's unit carries just one). Pure.
+ * named, or when an agent's unit carries just one). Under arbitration
+ * revision 7 `removed` is every item whose push the removal removed (the
+ * whole unit: leave-one-out removes an agent's unit, pinned to its latest
+ * commit, not its new items alone): the named ones among them are blamed,
+ * else the new items, else (no new item: a ratchet push isolated while
+ * measurement is blocked) every removed item. Pure.
  */
-export function blamedItems(state: BoardState, items: readonly BoardItem[], kind: RatchetIsolation["kind"], evidence: readonly string[]): BoardItem[] {
+export function blamedItems(
+  state: BoardState,
+  items: readonly BoardItem[],
+  kind: RatchetIsolation["kind"],
+  evidence: readonly string[],
+  removed?: readonly BoardItem[],
+): BoardItem[] {
+  const pool = removed !== undefined && removed.length > 0 ? removed : items;
   if (kind === "group") {
-    const seamItems = items.filter((i) => seamsEdited(state, i.lastPush!.paths).length > 0);
-    return seamItems.length > 0 ? seamItems : [...items];
+    const seamItems = pool.filter((i) => seamsEdited(state, i.lastPush!.paths).length > 0);
+    return seamItems.length > 0 ? seamItems : [...(items.length > 0 ? items : pool)];
   }
-  if (items.length <= 1) {
-    return [...items];
+  if (pool.length <= 1) {
+    return [...pool];
   }
-  const named = items.filter((i) => i.lastPush!.paths.some((p) => evidence.some((l) => l.includes(p))));
-  return named.length > 0 ? named : [...items];
+  const named = pool.filter((i) => i.lastPush!.paths.some((p) => evidence.some((l) => l.includes(p))));
+  return named.length > 0 ? named : [...(items.length > 0 ? items : pool)];
 }
 
 /** An attribution with the round's leave-one-out note leading its failing output (bounded). */

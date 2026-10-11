@@ -1,6 +1,6 @@
 /** The pre-push typecheck: real tsc (the repo's own TypeScript) on tiny offline fixtures, before and after an agent's edit. */
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -94,6 +94,60 @@ describe("createPrePushTypecheck", () => {
       ok: true,
       skipped: "no installed dependencies to typecheck against",
     });
+  });
+
+  it("skips (does not refuse) an edit whose new errors are ALL imports from modules it did not change: another item may provide them", async () => {
+    const base = await baseline({ "src/shared.ts": "export const existing = 1;\n" });
+    const agent = await agentRepo(
+      {},
+      {
+        "src/x.ts":
+          'import { provided } from "./shared";\nimport * as ns from "./shared";\nimport { later } from "./not-yet";\nexport const x = [provided, ns.alsoProvided, later];\n',
+      },
+    );
+    const result = await check({ baselineDir: base, agentDir: agent, changed: ["src/x.ts"] });
+    expect(result).toEqual({
+      ok: true,
+      skipped: "the edit's new errors are all unresolved imports from modules it did not change (./shared, ./not-yet, src/shared); another item may provide them",
+    });
+  });
+
+  it("still refuses when a new error is not a cross-module import, or the missing export is in a module the edit changed", async () => {
+    const base = await baseline({ "src/shared.ts": "export const existing = 1;\n", "src/a.ts": "export const kept = 1;\n" });
+    const mixed = await agentRepo({}, { "src/x.ts": 'import { provided } from "./shared";\nexport const x: string = provided;\nexport const y: string = 1;\n' });
+    const refused = await check({ baselineDir: base, agentDir: mixed, changed: ["src/x.ts"] });
+    expect(refused.ok).toBe(false);
+    expect(refused.ok === false && refused.errors.map((e) => /error (TS\d+)/.exec(e)![1])).toEqual(["TS2305", "TS2322"]);
+    // The edit removed the export its own other file imports: that is the edit's doing.
+    const own = await agentRepo({}, { "src/a.ts": "export const renamed = 1;\n", "src/b.ts": 'import { kept } from "./a";\nexport const b = kept;\n' });
+    const ownResult = await check({ baselineDir: base, agentDir: own, changed: ["src/a.ts", "src/b.ts"] });
+    expect(ownResult).toMatchObject({ ok: false, errors: [expect.stringMatching(/^src\/b\.ts\(1,10\): error TS2305/)] });
+  });
+
+  it("skips when tsc reports a tsconfig/config error (a location-less error, or a diagnostic in tsconfig.json)", async () => {
+    const extendsMissing = await baseline({ "src/a.ts": "export const x = 1;\n", "tsconfig.json": JSON.stringify({ extends: "./missing-base.json", include: ["src/**/*.ts"] }) });
+    const agent = await agentRepo({}, { "src/a.ts": "export const x: string = 1;\n" });
+    expect(await check({ baselineDir: extendsMissing, agentDir: agent, changed: ["src/a.ts"] })).toEqual({
+      ok: true,
+      skipped: expect.stringMatching(/^tsc reported a configuration error \(.*TS5083/),
+    });
+    const unknownOption = await baseline({
+      "src/a.ts": "export const x = 1;\n",
+      "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true, notARealOption: true }, include: ["src/**/*.ts"] }),
+    });
+    expect(await check({ baselineDir: unknownOption, agentDir: agent, changed: ["src/a.ts"] })).toEqual({
+      ok: true,
+      skipped: expect.stringMatching(/^tsc reported a configuration error \(tsconfig\.json: TS5023/),
+    });
+  });
+
+  it("does not copy build output or tool state into the overlay trees", async () => {
+    const base = await baseline({ "src/a.ts": "export const x = 1;\n", ".wrangler/state/blob": "state\n", "dist/a.js": "x\n", "coverage/lcov.info": "c\n" });
+    // An unreadable file under a state directory would fail the copy if it were copied.
+    await chmod(join(base, ".wrangler/state/blob"), 0o000);
+    const agent = await agentRepo({}, { "src/a.ts": "export const x: string = 1;\n" });
+    expect(await check({ baselineDir: base, agentDir: agent, changed: ["src/a.ts"] })).toMatchObject({ ok: false, errors: [expect.stringMatching(/TS2322/)] });
+    await chmod(join(base, ".wrangler/state/blob"), 0o600);
   });
 
   it("skips a project with no tsconfig.json", async () => {

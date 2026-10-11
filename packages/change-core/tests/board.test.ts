@@ -27,6 +27,7 @@ import {
   seamContractFacts,
   releasedTargets,
   releasedForAgent,
+  releaseHolder,
   uncoveredFailureFiles,
   appendToolGated,
   appendToolUsed,
@@ -2300,6 +2301,268 @@ describe("a released developer test reaches the holder (claims[].released, contr
       }
       expect(reduceBoard(board.log)).toEqual(board.state);
     }
+  });
+});
+
+describe("revision 7: one writer per released test (heirs, every kind, pending races, merges, stuck holders)", () => {
+  /** A failing revision on `items` that merged the given commits. */
+  const failRev = (commit: string, merged: string[], items: string[]) =>
+    msg("engine", "integrated.rev", { commit, gate: "fail", merged, failing: { output: "AssertionError at tests/tax.test.ts:3", items } });
+
+  /** Items tax (a) and fee (b), both claimed, both scoped to tests/tax.test.ts. */
+  function twoWriters(rules: Record<string, number> = { arbitration: 7 }): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["tests/tax.test.ts"], rules }));
+    for (const agent of ["a", "b", "c"]) {
+      board.post(msg(agent, "agent.joined"));
+    }
+    board.post(msg("human", "item.proposed", { item: "tax", objective: "t", scopeHint: ["src/tax.ts", "tests/tax.test.ts"] }));
+    board.post(msg("human", "item.proposed", { item: "fee", objective: "f", scopeHint: ["src/fee.ts", "tests/tax.test.ts"] }));
+    board.post(claim("a", "tax", ["src/tax.ts"]));
+    board.post(claim("b", "fee", ["src/fee.ts"]));
+    return board;
+  }
+
+  it("an ancestor's release goes to ONE heir (the first child covering it): the sibling's push carrying it is refused and its contract names the heir", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["tests/tax.test.ts"], rules: { arbitration: 7, maxFixAttempts: 1 } }));
+    for (const agent of ["a", "b"]) {
+      board.post(msg(agent, "agent.joined"));
+    }
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "bill", objective: "bill", acceptance: [], scopeHint: ["src/**", "tests/**"] }));
+    board.post(claim("a", "bill", ["src/tax.ts"]));
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "bill" }));
+    board.post(msg("human", "contract.accepted", { contract: "k1" }));
+    board.post(push("a", "bill", "c1", ["src/tax.ts"]));
+    board.post(failRev("r1", ["c1"], ["bill"]));
+    board.post(push("a", "bill", "c2", ["src/tax.ts"]));
+    board.post(failRev("r2", ["c2"], ["bill"]));
+    expect(board.state.items.bill!.status).toBe("open");
+    board.post(
+      msg("lead", "item.replanned", {
+        item: "bill",
+        reason: "fix-budget-exhausted",
+        action: "split",
+        children: [
+          { item: "x", objective: "x", scopeHint: ["src/tax.ts", "tests/**"] },
+          { item: "y", objective: "y", scopeHint: ["src/fee.ts", "tests/**"] },
+        ],
+      }),
+    );
+    expect(releasedTargets(board.state, "x")).toEqual(["tests/tax.test.ts"]);
+    expect(releasedTargets(board.state, "y")).toEqual([]);
+    board.post(claim("a", "x", ["src/tax.ts"]));
+    board.post(claim("b", "y", ["src/fee.ts"]));
+    expect(board.types(push("a", "x", "c3", ["src/tax.ts", "tests/tax.test.ts"]))).toEqual(["push.announced"]);
+    board.reject(push("b", "y", "c4", ["src/fee.ts", "tests/tax.test.ts"]), /outside the claim's write intent: tests\/tax\.test\.ts/, "OUTSIDE_INTENT");
+    expect(releaseHolder(board.state, "y", "tests/tax.test.ts")).toMatchObject({ contract: "k1", item: "x" });
+    expect(releaseHolder(board.state, "x", "tests/tax.test.ts")).toBeUndefined();
+    board.reject(
+      msg("b", "contract.proposed", { contract: "k2", target: "tests/tax.test.ts", kind: "modify", item: "y" }),
+      /already released to item x \(contract k1, tests\/tax\.test\.ts\).*a question naming x/,
+      "TARGET_RELEASED",
+    );
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("refuses a second writer whatever the contract's kind (modify, add, remove); revision 6 accepts each as before", () => {
+    for (const arbitration of [6, 7]) {
+      const board = twoWriters({ arbitration });
+      board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "tax" }));
+      board.post(msg("human", "contract.accepted", { contract: "k1" }));
+      for (const kind of ["modify", "add", "remove"] as const) {
+        const second = msg("b", "contract.proposed", { contract: `k-${kind}`, target: "tests/tax.test.ts", kind, item: "fee" });
+        if (arbitration === 7) {
+          board.reject(second, /already released to item tax \(contract k1/, "TARGET_RELEASED");
+        } else {
+          expect(board.types(second)).toEqual(["contract.proposed", "contract.escalated"]);
+        }
+      }
+      if (arbitration === 7) {
+        expect(releasedTargets(board.state, "fee")).toEqual([]);
+        board.reject(push("b", "fee", "f1", ["src/fee.ts", "tests/tax.test.ts"]), /outside the claim's write intent/, "OUTSIDE_INTENT");
+      }
+      expect(reduceBoard(board.log)).toEqual(board.state);
+    }
+  });
+
+  it("a proposal is refused while another live item's contract on the same target is pending, and an acceptance is refused once another item holds the target", () => {
+    const board = twoWriters({ arbitration: 7, maxFixAttempts: 1 });
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "tax" }));
+    board.reject(
+      msg("b", "contract.proposed", { contract: "k2", target: "tests/tax.test.ts", kind: "modify", item: "fee" }),
+      /already asked for by item tax \(contract k1, tests\/tax\.test\.ts, waiting for a decision\)/,
+      "TARGET_RELEASED",
+    );
+    // tax's holder spends its fix budget: tax reopens with no live owner, so its pending ask holds nothing.
+    board.post(push("a", "tax", "c1", ["src/tax.ts"]));
+    board.post(failRev("r1", ["c1"], ["tax"]));
+    board.post(push("a", "tax", "c2", ["src/tax.ts"]));
+    expect(board.post(failRev("r2", ["c2"], ["tax"])).map((m) => m.type)).toEqual(["integrated.rev", "fix.exhausted", "item.reopened"]);
+    expect(board.types(msg("b", "contract.proposed", { contract: "k2", target: "tests/tax.test.ts", kind: "modify", item: "fee" }))).toEqual(["contract.proposed", "contract.escalated"]);
+    board.post(msg("human", "contract.accepted", { contract: "k2" }));
+    expect(releasedTargets(board.state, "fee")).toEqual(["tests/tax.test.ts"]);
+    // c takes tax; accepting its older pending ask now would make a second writer.
+    board.post(claim("c", "tax", ["src/tax.ts"]));
+    board.reject(msg("human", "contract.accepted", { contract: "k1" }), /already released to item fee \(contract k2/, "TARGET_RELEASED");
+    expect(board.types(msg("human", "contract.rejected", { contract: "k1" }))).toEqual(["contract.rejected"]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a merge's replacement inherits the merged neighbour's release (merge ancestry), and holds it against an unrelated item", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["tests/tax.test.ts", "tests/fee.test.ts"], rules: { arbitration: 7, maxFixAttempts: 1 } }));
+    for (const agent of ["a", "b", "c"]) {
+      board.post(msg(agent, "agent.joined"));
+    }
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "bill", objective: "bill", acceptance: [], scopeHint: ["src/tax.ts", "tests/tax.test.ts"] }));
+    board.post(msg("lead", "item.proposed", { item: "fee", objective: "fee", acceptance: [], scopeHint: ["src/fee.ts", "tests/fee.test.ts"] }));
+    board.post(msg("lead", "item.proposed", { item: "audit", objective: "audit", acceptance: [], scopeHint: ["src/audit.ts", "tests/fee.test.ts"] }));
+    board.post(claim("b", "fee", ["src/fee.ts"]));
+    board.post(msg("b", "contract.proposed", { contract: "kf", target: "tests/fee.test.ts", kind: "modify", item: "fee" }));
+    board.post(msg("human", "contract.accepted", { contract: "kf" }));
+    // Both items spend their fix budgets and reopen.
+    board.post(claim("a", "bill", ["src/tax.ts"]));
+    board.post(push("b", "fee", "f1", ["src/fee.ts"]));
+    board.post(push("a", "bill", "c1", ["src/tax.ts"]));
+    board.post(failRev("r1", ["f1", "c1"], ["fee", "bill"]));
+    board.post(push("b", "fee", "f2", ["src/fee.ts"]));
+    board.post(push("a", "bill", "c2", ["src/tax.ts"]));
+    board.post(failRev("r2", ["f2", "c2"], ["fee", "bill"]));
+    expect([board.state.items.bill!.status, board.state.items.fee!.status]).toEqual(["open", "open"]);
+    board.post(
+      msg("lead", "item.replanned", {
+        item: "bill",
+        reason: "fix-budget-exhausted",
+        action: "merge",
+        with: "fee",
+        children: [{ item: "m", objective: "m", scopeHint: ["src/tax.ts", "src/fee.ts", "tests/tax.test.ts", "tests/fee.test.ts"] }],
+      }),
+    );
+    expect(releasedTargets(board.state, "m")).toEqual(["tests/fee.test.ts"]);
+    expect(releaseHolder(board.state, "m", "tests/fee.test.ts")).toBeUndefined();
+    board.post(claim("c", "m", ["src/tax.ts", "src/fee.ts"]));
+    expect(board.types(push("c", "m", "c3", ["src/fee.ts", "tests/fee.test.ts"]))).toEqual(["push.announced"]);
+    // m may ask again for its own target (no TARGET_RELEASED against its own lineage).
+    expect(board.types(msg("c", "contract.proposed", { contract: "k9", target: "tests/fee.test.ts", kind: "modify", item: "m" }))).toEqual(["contract.proposed", "contract.escalated"]);
+    board.post(msg("human", "contract.rejected", { contract: "k9" }));
+    // An unrelated item asking for the same test is told m holds it.
+    board.post(claim("a", "audit", ["src/audit.ts"]));
+    board.reject(msg("a", "contract.proposed", { contract: "ka", target: "tests/fee.test.ts", kind: "modify", item: "audit" }), /already released to item m \(contract kf/, "TARGET_RELEASED");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("an escalated holder whose push changing the released test is not integrated yet keeps it: a second item's acceptance is refused until that push is integrated", () => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["tests/tax.test.ts"], rules: { arbitration: 7, maxFixAttempts: 1 } }));
+    for (const agent of ["a", "b", "c", "d"]) {
+      board.post(msg(agent, "agent.joined"));
+    }
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "bill", objective: "bill", acceptance: [], scopeHint: ["src/tax.ts", "tests/tax.test.ts"] }));
+    board.post(msg("lead", "item.proposed", { item: "fee", objective: "fee", acceptance: [], scopeHint: ["src/fee.ts", "tests/tax.test.ts"] }));
+    // bill spends its fix budget and is re-planned; the re-plan is released the test, then fails again (escalated).
+    board.post(claim("a", "bill", ["src/tax.ts"]));
+    board.post(push("a", "bill", "c1", ["src/tax.ts"]));
+    board.post(failRev("r1", ["c1"], ["bill"]));
+    board.post(push("a", "bill", "c2", ["src/tax.ts"]));
+    board.post(failRev("r2", ["c2"], ["bill"]));
+    board.post(msg("lead", "item.replanned", { item: "bill", reason: "fix-budget-exhausted", action: "rescope", children: [{ item: "bill-r", objective: "redo", acceptance: [], scopeHint: ["src/tax.ts", "tests/tax.test.ts"] }] }));
+    board.post(claim("c", "bill-r", ["src/tax.ts"]));
+    board.post(msg("c", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "bill-r" }));
+    board.post(msg("human", "contract.accepted", { contract: "k1" }));
+    board.post(push("c", "bill-r", "d1", ["src/tax.ts"]));
+    board.post(failRev("r3", ["d1"], ["bill-r"]));
+    board.post(push("c", "bill-r", "d2", ["src/tax.ts"]));
+    expect(board.post(failRev("r4", ["d2"], ["bill-r"])).map((m) => m.type)).toEqual(["integrated.rev", "fix.exhausted", "item.reopened", "item.escalated"]);
+    // d takes the escalated item and pushes a change to the released test.
+    board.post(claim("d", "bill-r", ["src/tax.ts"]));
+    expect(board.state.items["bill-r"]).toMatchObject({ status: "claimed", owner: "d" });
+    expect(board.state.items["bill-r"]!.escalatedSeq).toBeDefined();
+    expect(board.types(push("d", "bill-r", "d3", ["src/tax.ts", "tests/tax.test.ts"]))).toEqual(["push.announced"]);
+    // An escalated holder holds nothing live, so fee may ask...
+    expect(releaseHolder(board.state, "fee", "tests/tax.test.ts")).toBeUndefined();
+    board.post(claim("b", "fee", ["src/fee.ts"]));
+    expect(board.types(msg("b", "contract.proposed", { contract: "k2", target: "tests/tax.test.ts", kind: "modify", item: "fee" }))).toEqual(["contract.proposed", "contract.escalated"]);
+    // ...but accepting it now would supersede bill-r's release under its pending push (its test edit would be dropped).
+    board.reject(
+      msg("human", "contract.accepted", { contract: "k2" }),
+      /tests\/tax\.test\.ts is released to item bill-r \(contract k1, tests\/tax\.test\.ts\), whose push d3 changing it is not integrated yet/,
+      "TARGET_RELEASED",
+    );
+    expect(releasedTargets(board.state, "bill-r")).toEqual(["tests/tax.test.ts"]);
+    expect(releasedTargets(board.state, "fee")).toEqual([]);
+    // Once d3 is integrated, the acceptance goes through and fee is the one writer from then on.
+    board.post(msg("engine", "integrated.rev", { commit: "r5", gate: "pass", merged: ["d3"] }));
+    expect(board.types(msg("human", "contract.accepted", { contract: "k2" }))).toEqual(["contract.accepted"]);
+    expect(releasedTargets(board.state, "fee")).toEqual(["tests/tax.test.ts"]);
+    expect(releasedTargets(board.state, "bill-r")).toEqual([]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a stuck holder (fix budget spent, reopened with no live owner) holds nothing: another item may ask, and the old release is superseded when the item is taken again", () => {
+    const board = twoWriters({ arbitration: 7, maxFixAttempts: 1 });
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "tax" }));
+    board.post(msg("human", "contract.accepted", { contract: "k1" }));
+    // A live claimed holder still holds.
+    expect(releaseHolder(board.state, "fee", "tests/tax.test.ts")).toMatchObject({ contract: "k1", item: "tax" });
+    board.post(push("a", "tax", "c1", ["src/tax.ts"]));
+    board.post(failRev("r1", ["c1"], ["tax"]));
+    board.post(push("a", "tax", "c2", ["src/tax.ts"]));
+    board.post(failRev("r2", ["c2"], ["tax"]));
+    expect(board.state.items.tax!.status).toBe("open");
+    expect(releaseHolder(board.state, "fee", "tests/tax.test.ts")).toBeUndefined();
+    expect(board.types(msg("b", "contract.proposed", { contract: "k2", target: "tests/tax.test.ts", kind: "modify", item: "fee" }))).toEqual(["contract.proposed", "contract.escalated"]);
+    board.post(msg("human", "contract.accepted", { contract: "k2" }));
+    expect(releasedTargets(board.state, "fee")).toEqual(["tests/tax.test.ts"]);
+    // tax is taken again: its old release gave way to fee's later one (one writer at a time).
+    board.post(claim("c", "tax", ["src/tax.ts"]));
+    expect(releasedTargets(board.state, "tax")).toEqual([]);
+    board.reject(push("c", "tax", "c3", ["src/tax.ts", "tests/tax.test.ts"]), /outside the claim's write intent/, "OUTSIDE_INTENT");
+    board.reject(msg("c", "contract.proposed", { contract: "k3", target: "tests/tax.test.ts", kind: "modify", item: "tax" }), /already released to item fee \(contract k2/, "TARGET_RELEASED");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+});
+
+describe("revision 7: a fix is charged once per unanswered push", () => {
+  /** Item one (a) fails three revisions in a row while only b pushes (a never gets a turn). */
+  function refailing(arbitration: number): { board: TestBoard; revs: string[][] } {
+    const board = seeded({ arbitration, maxFixAttempts: 2 });
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(claim("b", "two", ["src/b/**"]));
+    board.post(push("a", "one", "c1", ["src/a/x.ts"]));
+    board.post(push("b", "two", "c2", ["src/b/y.ts"]));
+    const fail = (commit: string, merged: string[]) =>
+      board.types(msg("engine", "integrated.rev", { commit, gate: "fail", merged, failing: { output: `FAIL src/a/x.ts (${commit})`, items: ["one"] } }));
+    const revs = [fail("r1", ["c1", "c2"])];
+    board.post(push("b", "two", "c3", ["src/b/y.ts"]));
+    revs.push(fail("r2", ["c1", "c3"]));
+    board.post(push("b", "two", "c4", ["src/b/y.ts"]));
+    revs.push(fail("r3", ["c1", "c4"]));
+    return { board, revs };
+  }
+
+  it("re-gating the same unanswered push asks once (1 attempt, no exhaustion); revision 6 charged every revision", () => {
+    const v6 = refailing(6);
+    expect(v6.revs).toEqual([["integrated.rev", "fix.requested"], ["integrated.rev", "fix.requested"], ["integrated.rev", "fix.exhausted", "item.reopened"]]);
+    expect(v6.board.state.items.one!.status).toBe("open");
+
+    const { board, revs } = refailing(7);
+    expect(revs).toEqual([["integrated.rev", "fix.requested"], ["integrated.rev"], ["integrated.rev"]]);
+    const one = board.state.items.one!;
+    expect([one.status, one.owner, one.fixAttempts, one.fixRequested, one.exhaustedBy]).toEqual(["claimed", "a", 1, 1, undefined]);
+    // The owner still sees the failure (the freshest output implicating its push).
+    expect(boardDigest(board.state, board.log, "a", 0).failure).toMatchObject({ n: 3, output: "FAIL src/a/x.ts (r3)" });
+    // Once it answers with a push, the next failing revision charges its second attempt.
+    board.post(push("a", "one", "c5", ["src/a/x.ts"]));
+    expect(board.types(msg("engine", "integrated.rev", { commit: "r4", gate: "fail", merged: ["c5", "c4"], failing: { output: "FAIL src/a/x.ts", items: ["one"] } }))).toEqual([
+      "integrated.rev",
+      "fix.requested",
+    ]);
+    expect(board.state.items.one!.fixAttempts).toBe(2);
+    expect(reduceBoard(board.log)).toEqual(board.state);
   });
 });
 

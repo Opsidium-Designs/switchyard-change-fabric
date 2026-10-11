@@ -80,6 +80,7 @@ import {
 
 import { redactSecrets } from "./redact.ts";
 import {
+  ABANDONED_REASON,
   appliedForRevision,
   completedFromPlan,
   failingRevisionEvidence,
@@ -87,6 +88,7 @@ import {
   keyWithout,
   recordExcludedPushes,
   revisionFailure,
+  supersededAgentsNow,
   verifySubLeadMerges,
   type BoardDecisionRecord,
   type BoardRevision,
@@ -295,7 +297,7 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
   const excludedUnits = stack
     .filter((e) => excludedByVerification.has(e.unit.agent))
     .map((e) => ({ agent: e.unit.agent, items: [...e.unit.items], reason: excludedByVerification.get(e.unit.agent)! }));
-  const excludedPushes = await recordExcludedPushes(options.operator, excludedUnits);
+  const excludedPushes = await recordExcludedPushes(options.operator, excludedUnits, options.abandoned);
   if (excludedPushes > 0) {
     key = keyWithout(key, excludedUnits);
   }
@@ -345,7 +347,7 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
     c: BuiltCandidate,
     failingEvidence?: { failing: { output: string; items: string[]; outstanding?: string[] }; implicated: NonNullable<BoardRevision["implicated"]> },
     decisions: BoardDecisionRecord[] = [],
-  ): Promise<{ revision?: BoardRevision; failure?: string; stale?: boolean }> =>
+  ): Promise<{ revision?: BoardRevision; failure?: string; stale?: boolean; supersededAgents?: readonly string[] }> =>
     recordBuiltCandidate({ ...ctx, ...(head !== undefined ? { head } : {}), pending, ...(adjusted.relaxed !== undefined ? { inventoryNote: adjusted.relaxed } : {}) }, c, {
       revExcluded: [
         ...excludedAgents,
@@ -381,7 +383,13 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
     });
     const result = await record(blamed, evidence, decisions);
     if (!result.revision) {
-      return { requiresIntegrationGate, key, evidence: blamed.evidence!, ...(result.stale ? { stale: true } : {}), failure: result.failure! };
+      return {
+        requiresIntegrationGate,
+        key,
+        evidence: blamed.evidence!,
+        ...(result.stale ? { stale: true, ...(result.supersededAgents ? { supersededAgents: result.supersededAgents } : {}) } : {}),
+        failure: result.failure!,
+      };
     }
     revisions.push(result.revision);
     outcomes.set(blamed.index, { rev: result.revision.n, blamed: evidence.failing.items });
@@ -401,7 +409,7 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
         key,
         evidence: revisions.length > 0 ? blamed!.evidence! : landed.evidence!,
         ...(revisions.length > 0 ? { revision: revisions.at(-1)!, revisions } : {}),
-        ...(result.stale ? { stale: true } : {}),
+        ...(result.stale ? { stale: true, ...(result.supersededAgents ? { supersededAgents: result.supersededAgents } : {}) } : {}),
         failure: result.failure!,
       };
     }
@@ -426,7 +434,8 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
     const linked = outcomes.get(c.index);
     const candidate = outcomeOf(c, outcome, linked);
     candidates.push(candidate);
-    if (outcome === undefined) {
+    // An abandoned attempt records nothing more (see ABANDONED_REASON).
+    if (outcome === undefined || options.abandoned?.()) {
       continue;
     }
     await options.operator
@@ -563,7 +572,7 @@ export async function recordBuiltCandidate(
     /** The revision number to report when the board's reply does not carry it. */
     readonly nFallback: number;
   },
-): Promise<{ revision?: BoardRevision; failure?: string; stale?: boolean }> {
+): Promise<{ revision?: BoardRevision; failure?: string; stale?: boolean; supersededAgents?: readonly string[] }> {
   const { options, state, scrub, head, pending } = ctx;
   const failingEvidence = input.failingEvidence;
   const decisions = input.decisions ?? [];
@@ -577,6 +586,11 @@ export async function recordBuiltCandidate(
     scrub,
   });
   const applied = appliedForRevision(c.evidence, c.mergedAgents);
+  if (options.abandoned?.()) {
+    // Nothing more is recorded: the buffered decisions are dropped with the revision.
+    decisions.length = 0;
+    return { failure: ABANDONED_REASON };
+  }
   const recorded = await options.operator.recordRevision({
     commit: c.commit!,
     gate: c.gate!,
@@ -589,9 +603,10 @@ export async function recordBuiltCandidate(
     ...(unverified.length > 0 ? { unverified } : {}),
   });
   if (!recorded.ok) {
-    await flushAttributionDecisions(options.operator, options.recordDecision, decisions, undefined);
+    await flushAttributionDecisions(options.operator, options.recordDecision, decisions, undefined, options.abandoned);
+    // A stale refusal names the agents whose pushes moved, so the hold-back bound applies to them.
     return recorded.code === "UNKNOWN_REF" || recorded.code === "STALE_BASE"
-      ? { stale: true, failure: scrub(`the board refused the revision: ${recorded.error}`) }
+      ? { stale: true, supersededAgents: await supersededAgentsNow(options.operator, items), failure: scrub(`the board refused the revision: ${recorded.error}`) }
       : { failure: scrub(`the board refused the revision (${recorded.code}): ${recorded.error}`) };
   }
   const rev = recorded.appended.find((m) => m.type === "integrated.rev");
@@ -602,18 +617,24 @@ export async function recordBuiltCandidate(
     // Only now, with the revision recorded, does the integration branch move
     // to exactly the landed candidate's gated commit (a compare-and-swap).
     try {
+      if (options.abandoned?.()) {
+        throw new Error(ABANDONED_REASON);
+      }
       await (options.advanceBranch ?? advanceIntegrationBranch)(options.integration.integrationRef, options.integration.integrationToken, c.commit!, options.worktreeRoot);
     } catch (error) {
       if (isPromotionRefused(error, "trunk-moved")) {
         trunkMoved = { expected: error.expected, ...(error.actual !== undefined ? { actual: error.actual } : {}) };
-        await options.operator
-          .recordEngine("trunk.moved", {
-            rev: n,
-            commit: c.commit!,
-            ...(error.expected !== null ? { expected: error.expected } : {}),
-            ...(error.actual !== undefined && error.actual !== null ? { actual: error.actual } : {}),
-          })
-          .catch(() => undefined);
+        // An abandoned attempt records nothing more (see ABANDONED_REASON).
+        if (!options.abandoned?.()) {
+          await options.operator
+            .recordEngine("trunk.moved", {
+              rev: n,
+              commit: c.commit!,
+              ...(error.expected !== null ? { expected: error.expected } : {}),
+              ...(error.actual !== undefined && error.actual !== null ? { actual: error.actual } : {}),
+            })
+            .catch(() => undefined);
+        }
       }
       revExcluded.push({
         agent: "(integration)",
@@ -625,7 +646,7 @@ export async function recordBuiltCandidate(
       });
     }
   }
-  await flushAttributionDecisions(options.operator, options.recordDecision, decisions, rev ? n : undefined);
+  await flushAttributionDecisions(options.operator, options.recordDecision, decisions, rev ? n : undefined, options.abandoned);
   const revision: BoardRevision = {
     n,
     gate: c.gate!,

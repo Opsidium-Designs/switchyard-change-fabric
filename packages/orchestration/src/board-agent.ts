@@ -63,7 +63,7 @@ import type {
   AgentTurnTransport,
   ExecutorProvider,
 } from "@switchyard-change/model-adapters";
-import { AGENT_ACTION_TYPES, isModelBudgetError, isRateLimitError } from "@switchyard-change/model-adapters";
+import { AGENT_ACTION_TYPES, isModelBudgetError, isRateLimitError, UnusableModelOutputError } from "@switchyard-change/model-adapters";
 import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { authenticatedRemote, clone, push, type GitIdentity } from "@switchyard-change/local-runner";
 import { gateFailureLine, matchesGlob, partitionByScope, toolSkeleton, type PrePushCheck } from "@switchyard-change/verification";
@@ -331,6 +331,9 @@ export const LARGE_ITEM_FILES = 3;
 export const MAX_SEAM_DEFERRALS = 3;
 /** The failing gate output a fix edit hands the executor, in characters. */
 const MAX_FIX_EVIDENCE = 4000;
+/** An edit refused before push is carried into that item's next edit: at most this many diagnostics, bounded. */
+const MAX_REFUSAL_DIAGNOSTICS = 8;
+const MAX_REFUSAL_CHARS = 1200;
 
 /**
  * The HELD WORK cue the driver's nudge delivers, kind-specific per item: a
@@ -442,6 +445,17 @@ async function gitOut(dir: string, args: readonly string[]): Promise<string> {
   return stdout;
 }
 
+/**
+ * Whether the board's failing revision is the evidence for `item`'s open fix
+ * request: the revision that asked, or one that implicates the item (under
+ * arbitration revision 7 a later failing revision implicating the same
+ * unanswered push asks nothing new, so the request keeps the older number).
+ * Mirrors the board's own rule for showing it. Pure.
+ */
+function fixShows(failure: BoardDigest["failure"] | undefined, item: string, fix: { readonly n: number } | undefined): boolean {
+  return fix !== undefined && failure != null && (failure.n === fix.n || failure.items.includes(item));
+}
+
 function bounded(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
@@ -544,6 +558,13 @@ export class BoardAgent {
   private evidence: string[] = [];
   /** The pre-push typecheck skip reasons already noted (each is noted once). */
   private readonly typecheckSkips = new Set<string>();
+  /**
+   * Per item: why its last edit was refused before push (the pre-push check's
+   * new errors, or a file the edit left unparsable), bounded. The item's next
+   * edit is told; cleared once an edit for it is pushed, or when this agent
+   * loses the claim.
+   */
+  private readonly refusedEdits = new Map<string, string>();
   private lastRejection: { code: string; error: string; action: AgentActionType } | undefined;
   private followUp = true;
   private lastFreeKey: string | undefined;
@@ -832,10 +853,28 @@ export class BoardAgent {
       if (m.type === "claim.lapsed" && m.payload.agent !== this.id && m.payload.commit !== undefined) {
         this.inherited.set(m.payload.item, { from: m.payload.agent, commit: m.payload.commit, seeded: false });
       }
+      // A claim this agent lost (handed off, lapsed, reopened, or granted to
+      // someone else): its stored pre-push refusal is stale, even if this
+      // agent claims the item again later.
+      if (
+        (m.type === "handoff" && m.from === this.id) ||
+        (m.type === "claim.lapsed" && m.payload.agent === this.id) ||
+        (m.type === "item.reopened" && m.payload.previousOwner === this.id) ||
+        (m.type === "claim.granted" && m.payload.agent !== this.id)
+      ) {
+        this.refusedEdits.delete(m.payload.item);
+      }
       if (m.type === "claim.lapsed" && m.payload.agent === this.id) {
         this.evidence.push(
           `my claim on ${m.payload.item} LAPSED (${m.payload.reason === "deadline" ? "its deadline passed" : `no progress on it since board seq ${m.payload.lastProgressSeq}`}): it is open for any agent now; claim it again only if I can move it now`,
         );
+      }
+    }
+    // Any other way the claim went (a release, a re-plan, a reassignment): a
+    // refusal is kept only for an item this agent still holds.
+    for (const item of [...this.refusedEdits.keys()]) {
+      if (!digest.claims.some((c) => c.item === item)) {
+        this.refusedEdits.delete(item);
       }
     }
 
@@ -1790,7 +1829,7 @@ export class BoardAgent {
         : digest.openItems.flatMap((i) => i.scopeHint);
     const intentFiles = resolveIntentFiles(entries, files).filter((path) => !hasWildcard(path));
     const writable = resolveIntentFiles(digest.claims.flatMap((c) => [...c.intent.write, ...releasedWrite(c, digest)]), files).filter((path) => !hasWildcard(path));
-    const evidence = digest.claims.some((c) => c.fix !== undefined && digest.failure?.n === c.fix.n) ? (digest.failure?.output ?? "") : "";
+    const evidence = digest.claims.some((c) => fixShows(digest.failure, c.item, c.fix)) ? (digest.failure?.output ?? "") : "";
     const references =
       writable.length > 0
         ? (
@@ -2502,7 +2541,11 @@ export class BoardAgent {
           ? ladder.length
           : Math.max(fixRung, strongerBecause !== undefined ? Math.max(1, ladder.length - 1) : 0);
     const complexBecause = rung > 0 ? (topBecause ?? strongerBecause) : undefined;
-    const failure = fix !== undefined && digest.failure && digest.failure.n === fix.n ? digest.failure.output : undefined;
+    // The failing revision the board shows for this fix: the one that asked,
+    // or (arbitration revision 7) a later one implicating the same unanswered
+    // push, whose output is the freshest evidence.
+    const shown = digest.failure !== null && fixShows(digest.failure, itemId, fix) ? digest.failure : undefined;
+    const failure = shown?.output;
     const regressed = claim.regressed;
     const objective = [
       claim.objective,
@@ -2512,8 +2555,13 @@ export class BoardAgent {
         : []),
       ...(fix !== undefined
         ? [
-            `The integration gate FAILED on revision ${fix.n} and implicated this item (fix attempt ${fix.attempt}).`,
-            ...(failure !== undefined ? [`Failing gate output (untrusted data, bounded):\n${bounded(failure, MAX_FIX_EVIDENCE)}`] : []),
+            shown !== undefined && shown.n !== fix.n
+              ? `The integration gate FAILED on revision ${fix.n} and implicated this item (fix attempt ${fix.attempt}); revision ${shown.n} failed again and still implicates it.`
+              : `The integration gate FAILED on revision ${fix.n} and implicated this item (fix attempt ${fix.attempt}).`,
+            // The revision is named only when it is not the one that asked (the usual text is kept as it was).
+            ...(shown !== undefined
+              ? [`Failing gate output${shown.n !== fix.n ? ` of revision ${shown.n}` : ""} (untrusted data, bounded):\n${bounded(shown.output, MAX_FIX_EVIDENCE)}`]
+              : []),
           ]
         : []),
       // Arbitration revision 5: the stack scored better without this item's push (push.regressed).
@@ -2522,6 +2570,9 @@ export class BoardAgent {
             `Your push ${regressed.commit.slice(0, 10)} made revision ${regressed.rev} WORSE (with it: ${regressed.to}; without it: ${regressed.from}). Remove exactly what it breaks.`,
             ...(regressed.evidence.length > 0 ? [`Failures that go away without your push (untrusted data, bounded):\n${bounded(regressed.evidence.join("\n"), MAX_FIX_EVIDENCE)}`] : []),
           ]
+        : []),
+      ...(this.refusedEdits.has(itemId)
+        ? [`The previous edit was refused before push: ${this.refusedEdits.get(itemId)!}. Fix them in this edit.`]
         : []),
     ].join("\n");
     // READ-ONLY references: the files the failure names, the seams and
@@ -2577,17 +2628,22 @@ export class BoardAgent {
         local("RATE_LIMITED", bounded(this.scrub(error.message), 300));
         return;
       }
+      // An edit refused for leaving a file unparsable reaches the item's next edit.
+      if (error instanceof UnusableModelOutputError && /unparsable/.test(error.message)) {
+        this.refusedEdits.set(itemId, bounded(this.scrub(error.message), MAX_REFUSAL_CHARS));
+      }
       local("EXECUTOR_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
       return;
     } finally {
       await rm(view, { recursive: true, force: true });
     }
-    // PRE-PUSH CHECK: an edit whose changed files gain type errors is refused
-    // here, before it is pushed, so one agent's compile error never hides
-    // everyone's test results at the gate. A skipped check lets it proceed.
+    // PRE-PUSH CHECK: an edit that adds type errors to a file it changed is
+    // refused here, before it is pushed (errors elsewhere, and errors a file
+    // already had, are not its doing). A skipped check lets it proceed.
     if (this.options.preEditCheck) {
+      const baseline = await this.prePushBaseline(digest);
       const checked = await this.options.preEditCheck({
-        baselineDir: this.baseDir,
+        baselineDir: baseline.dir,
         agentDir: worktree,
         changed: await worktreeChanges(worktree),
         fallbackNodeModulesDir: this.options.projectDir,
@@ -2595,6 +2651,19 @@ export class BoardAgent {
       });
       if (!checked.ok) {
         await this.discard(worktree, head);
+        // Errors found against a newer integrated revision than this agent
+        // reads from: the next edit reads from that revision (the rebase the
+        // board would ask for), so it sees the files the errors are about.
+        if (baseline.rev !== undefined) {
+          this.baseDir = baseline.dir;
+          this.rebasedTo = baseline.rev.n;
+          this.evidence.push(`rebased onto integrated revision ${baseline.rev.n} (${baseline.rev.commit}): the pre-push check refused the edit against it`);
+        }
+        const against = baseline.rev !== undefined ? ` (against integrated revision ${baseline.rev.n}, which the next edit reads from)` : "";
+        this.refusedEdits.set(
+          itemId,
+          bounded(this.scrub(`${checked.errors.slice(0, MAX_REFUSAL_DIAGNOSTICS).join("\n")}${against}`), MAX_REFUSAL_CHARS),
+        );
         local(
           "EXECUTOR_FAILED",
           bounded(this.scrub(`the edit does not typecheck: ${checked.errors.slice(0, 3).join("; ")} (fix these in your next edit; nothing was pushed)`), 300),
@@ -2616,6 +2685,7 @@ export class BoardAgent {
     if (pushed === undefined) {
       return;
     }
+    this.refusedEdits.delete(itemId);
     // Every edit records the model it used (and why a complex item got a stronger one).
     this.evidence.push(
       `pushed ${pushed.commit} for ${itemId}: ${pushed.changed.join(", ")} on ${model ?? "the base model"}` +
@@ -3168,6 +3238,25 @@ export class BoardAgent {
         email: `${this.id.replace(/[^A-Za-z0-9._-]+/g, "-")}@agents.switchyard.local`,
       }
     );
+  }
+
+  /**
+   * The baseline the pre-push check types an edit against: the latest
+   * integrated revision when it is newer than the one this agent reads from
+   * (fetched the same way a rebase fetches it), so an export another item's
+   * integrated push provides is visible (`rev` names it); else this agent's
+   * own baseline. A passing check leaves the agent's reading baseline where it
+   * is (that stays the rebase's decision); a refusal moves it there (edit).
+   */
+  private async prePushBaseline(digest: BoardDigest): Promise<{ readonly dir: string; readonly rev?: { readonly n: number; readonly commit: string } }> {
+    if (digest.integrated && digest.integrated.n > this.rebasedTo && this.options.fetchRevision) {
+      const rev = { n: digest.integrated.n, commit: digest.integrated.commit };
+      const dir = await this.options.fetchRevision(rev.n, rev.commit).catch(() => undefined);
+      if (dir !== undefined) {
+        return { dir, rev };
+      }
+    }
+    return { dir: this.baseDir };
   }
 
   /**

@@ -167,14 +167,27 @@ export interface BoardRules {
    *     again for the identical errors;
    *   - a plain question (help.requested with no scope) records whom it asks
    *     (`askedOf`), and the addressee's digest lists it until answered.
-   * Revision 7 (what a new run posts) adds ONE WRITER PER RELEASED TEST:
-   *   - a contract (kind modify) on a protected target an accepted contract
-   *     already released to another live item (not done, not rejected, and
-   *     neither an ancestor nor a descendant of the asking item) is refused
-   *     TARGET_RELEASED, naming that item, so two agents never write the same
-   *     protected file unarbitrated;
-   *   - a child of a split or re-planned item inherits its ancestors'
-   *     releases only for the targets inside the child's own scope hint.
+   * Revision 7 (what a new run posts) adds ONE WRITER PER RELEASED TEST and
+   * ONE CHARGE PER UNANSWERED PUSH:
+   *   - a contract of any kind on a protected target another LIVE holder
+   *     holds (see releaseHolder: claimed by an active owner, not escalated,
+   *     fix budget not spent; outside the asking item's lineage through
+   *     splits, re-plans, and merges) is refused TARGET_RELEASED, naming that
+   *     item, so two agents never write the same protected file
+   *     unarbitrated; so is a proposal while another live item's contract on
+   *     the target is pending, and an acceptance once another live holder
+   *     holds it;
+   *   - a later accepted contract supersedes an earlier release of an
+   *     overlapping target held outside its lineage, but never under a push
+   *     of the earlier holder (live or not, such as an escalated one) that
+   *     changes the target and is not integrated yet: accepting a guarded
+   *     contract on it is refused TARGET_RELEASED until that push is
+   *     integrated or left out;
+   *   - a child of a split or re-planned item, or a merge's replacement,
+   *     inherits an ancestor's release only as its HEIR (at each step, the
+   *     first child in order whose scope hint covers the target);
+   *   - a failing revision does not charge a fix attempt again to an item
+   *     whose fix request is still unanswered (no push since).
    */
   readonly arbitration?: number;
 }
@@ -2884,27 +2897,184 @@ export function mergedChildrenWrite(state: BoardState, merges: readonly { readon
 /**
  * The targets of ACCEPTED contracts for `item` (all items when omitted): the
  * protected paths those contracts released for writing. Under arbitration
- * revision 7 an item also inherits the releases of its ancestors (a split or
- * re-planned item) for the targets inside its own scope hint.
+ * revision 7, for one item:
+ *   - an item also INHERITS an ancestor's release (a split or re-planned
+ *     item, or either item a merge replaces) only as its HEIR: at each step
+ *     down from the ancestor, the first child in the split or re-plan's order
+ *     whose scope hint covers the target; a sibling never inherits it (it asks
+ *     by contract, and releaseHolder names the heir);
+ *   - a release is SUPERSEDED by a later accepted contract on an overlapping
+ *     target that is held by an item outside its lineage (accepted while it
+ *     held nothing live), so one item writes a released file at a time;
+ *     never while the item's push changing the target, announced before
+ *     that acceptance, is still to be integrated.
  */
 export function releasedTargets(state: BoardState, item?: string): string[] {
-  const own = Object.values(state.contracts)
+  const accepted = Object.values(state.contracts).filter(
     // A seam contract releases nothing to the item that asked: its SEAM ITEM carries the change.
-    .filter((c) => c.status === "accepted" && c.item !== undefined && c.seam === undefined && (item === undefined || c.item === item))
-    .map((c) => c.target);
-  const child = item !== undefined && arbitrationV7(state) ? state.items[item] : undefined;
-  if (child === undefined) {
-    return own;
+    (c) => c.status === "accepted" && c.item !== undefined && c.seam === undefined,
+  );
+  if (item === undefined || !arbitrationV7(state) || state.items[item] === undefined) {
+    return accepted.filter((c) => item === undefined || c.item === item).map((c) => c.target);
   }
-  const inherited: string[] = [];
-  for (let parent = child.parent; parent !== undefined; parent = state.items[parent]?.parent) {
-    for (const c of Object.values(state.contracts)) {
-      if (c.status === "accepted" && c.item === parent && c.seam === undefined && child.scopeHint.some((hint) => entryWithin(c.target, intentPath(hint)))) {
-        inherited.push(c.target);
-      }
+  const own = accepted.filter((c) => c.item === item && !releaseSuperseded(state, c, item)).map((c) => c.target);
+  const inherited = accepted
+    .filter((c) => c.item !== item && inheritsRelease(state, item, c.item!, c.target, new Set()) && !releaseSuperseded(state, c, item))
+    .map((c) => c.target);
+  return inherited.length > 0 ? [...own, ...[...new Set(inherited)].filter((t) => !own.includes(t))] : own;
+}
+
+/**
+ * Arbitration revision 7: the items `id` descends from directly: its parent
+ * and every item a merge replaced into it (the neighbour whose children
+ * include it). Pure.
+ */
+function lineageParents(state: BoardState, id: string): string[] {
+  const item = state.items[id];
+  if (item === undefined) {
+    return [];
+  }
+  return [...new Set([...(item.parent !== undefined ? [item.parent] : []), ...(item.replaces ?? [])])].filter((p) => p !== id);
+}
+
+/** True when `ancestor` is a (transitive) lineage parent of `item` (parents and merge neighbours). */
+function isLineageAncestor(state: BoardState, ancestor: string, item: string): boolean {
+  const seen = new Set<string>();
+  const queue = lineageParents(state, item);
+  while (queue.length > 0) {
+    const next = queue.shift()!;
+    if (next === ancestor) {
+      return true;
+    }
+    if (!seen.has(next)) {
+      seen.add(next);
+      queue.push(...lineageParents(state, next));
     }
   }
-  return inherited.length > 0 ? [...own, ...inherited.filter((t) => !own.includes(t))] : own;
+  return false;
+}
+
+/** True when one item descends from the other (either way) through splits, re-plans, or merges. */
+function lineageRelated(state: BoardState, a: string, b: string): boolean {
+  return isLineageAncestor(state, a, b) || isLineageAncestor(state, b, a);
+}
+
+/** The HEIR of `parent`'s release of `target`: its first child (in the split or re-plan's order) whose scope hint covers the target. */
+function releaseHeir(state: BoardState, parent: string, target: string): string | undefined {
+  return state.items[parent]?.children.find((c) => (state.items[c]?.scopeHint ?? []).some((hint) => entryWithin(target, intentPath(hint))));
+}
+
+/** True when `item` inherits `ancestor`'s release of `target`: it is the heir at every step down from the ancestor. */
+function inheritsRelease(state: BoardState, item: string, ancestor: string, target: string, seen: Set<string>): boolean {
+  if (seen.has(item)) {
+    return false;
+  }
+  seen.add(item);
+  return lineageParents(state, item).some(
+    (p) => releaseHeir(state, p, target) === item && (p === ancestor || inheritsRelease(state, p, ancestor, target, seen)),
+  );
+}
+
+/**
+ * The item that holds contract `c`'s release now: its own item, or, once
+ * that item was split, re-planned, or merged, the heir at every step down
+ * (undefined when a step has no heir: nobody inherits it). Pure.
+ */
+function releaseOwner(state: BoardState, c: BoardContract): string | undefined {
+  let holder = c.item;
+  const seen = new Set<string>();
+  while (holder !== undefined && (state.items[holder]?.children.length ?? 0) > 0 && !seen.has(holder)) {
+    seen.add(holder);
+    holder = releaseHeir(state, holder, c.target);
+  }
+  return holder;
+}
+
+/**
+ * True when `c`'s release (as held by `holder`) gave way to a later accepted
+ * contract on an overlapping target held outside its lineage. Never while
+ * `holder` has a push touching the target that was announced before that
+ * acceptance and is not integrated yet (see pendingReleasedPush): the
+ * integration still applies it with the target in the holder's scope.
+ */
+function releaseSuperseded(state: BoardState, c: BoardContract, holder: string): boolean {
+  const pending = pendingReleasedPush(state, holder, c.target);
+  return Object.values(state.contracts).some((later) => {
+    if (later === c || later.status !== "accepted" || later.item === undefined || later.seam !== undefined || (later.decidedSeq ?? 0) <= (c.decidedSeq ?? 0)) {
+      return false;
+    }
+    if (pending !== undefined && pending.seq < (later.decidedSeq ?? 0)) {
+      return false;
+    }
+    const owner = releaseOwner(state, later);
+    return owner !== undefined && owner !== holder && !lineageRelated(state, owner, holder) && entriesOverlap(later.target, c.target);
+  });
+}
+
+/**
+ * Arbitration revision 7: `item`'s latest push when it touches `target` and
+ * an integration may still gate it: held by the agent that pushed it (a
+ * claimed item's owner, or a split item's sub-lead), not integrated, not left
+ * out (push.excluded), and not waiting as a regression (push.regressed).
+ * Undefined otherwise. Pure.
+ */
+function pendingReleasedPush(state: BoardState, item: string, target: string): BoardItemPush | undefined {
+  const it = state.items[item];
+  const push = it?.lastPush;
+  if (
+    it === undefined ||
+    push === undefined ||
+    push.integratedIn !== undefined ||
+    push.excluded !== undefined ||
+    push.regressed !== undefined ||
+    !(it.status === "claimed" || it.status === "split") ||
+    (it.owner !== push.agent && it.subLead !== push.agent)
+  ) {
+    return undefined;
+  }
+  return push.paths.some((p) => entriesOverlap(p, target)) ? push : undefined;
+}
+
+/**
+ * Arbitration revision 7: an accepted release of a target overlapping
+ * `target`, held by an item outside `item`'s lineage (live or not: an
+ * escalated holder too) whose pending push touches it (see
+ * pendingReleasedPush), or undefined. Accepting `item`'s contract on the
+ * target now would make a second writer while that push is still applied
+ * with the target in its holder's scope. Pure.
+ */
+function pendingReleaseWriter(state: BoardState, item: string, target: string): { readonly contract: BoardContract; readonly holder: string; readonly commit: string } | undefined {
+  for (const c of Object.values(state.contracts)) {
+    if (c.status !== "accepted" || c.seam !== undefined || c.item === undefined || !entriesOverlap(c.target, target)) {
+      continue;
+    }
+    const owner = releaseOwner(state, c);
+    if (owner === undefined || owner === item || lineageRelated(state, owner, item) || releaseSuperseded(state, c, owner)) {
+      continue;
+    }
+    const push = pendingReleasedPush(state, owner, c.target);
+    if (push !== undefined && push.paths.some((p) => entriesOverlap(p, target))) {
+      return { contract: c, holder: owner, commit: push.commit };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Arbitration revision 7: true while `item` can write what it holds: claimed
+ * (or contested) by an active owner, not escalated, and its fix budget not
+ * spent. An open item with no live owner, an escalated one, or one whose fix
+ * budget ran out holds nothing. Pure.
+ */
+function holdsRelease(state: BoardState, item: BoardItem | undefined): boolean {
+  return (
+    item !== undefined &&
+    (item.status === "claimed" || item.status === "contested") &&
+    item.owner !== undefined &&
+    activeAgent(state, item.owner) &&
+    item.escalatedSeq === undefined &&
+    item.fixExhausted !== true
+  );
 }
 
 /**
@@ -2926,7 +3096,14 @@ export function releasedUnchanged(state: BoardState, item: BoardItem): string[] 
   const push = item.lastPush;
   return writable.filter((target) => {
     const decided = Object.values(state.contracts)
-      .filter((c) => c.status === "accepted" && c.item !== undefined && (c.item === item.id || isAncestor(state, c.item, item.id)) && c.seam === undefined && c.target === target)
+      .filter(
+        (c) =>
+          c.status === "accepted" &&
+          c.item !== undefined &&
+          (c.item === item.id || (arbitrationV7(state) ? isLineageAncestor(state, c.item, item.id) : isAncestor(state, c.item, item.id))) &&
+          c.seam === undefined &&
+          c.target === target,
+      )
       .reduce((latest, c) => Math.max(latest, c.decidedSeq ?? 0), 0);
     return !(push !== undefined && push.seq > decided && push.paths.some((p) => entryWithin(p, intentPath(target))));
   });
@@ -2934,24 +3111,49 @@ export function releasedUnchanged(state: BoardState, item: BoardItem): string[] 
 
 /**
  * Arbitration revision 7: the accepted contract that released `target` to
- * another LIVE item (not done, not rejected, neither an ancestor nor a
- * descendant of `item`), or undefined. Pure.
+ * another LIVE holder, or undefined. Its `item` is the item that holds the
+ * release now (the contract's own item, or the heir that inherited it, see
+ * releasedTargets): neither `item` nor an ancestor or descendant of it
+ * (through splits, re-plans, and merges), and live (see holdsRelease: an
+ * escalated item, one whose fix budget ran out, or an open one with no live
+ * owner holds nothing). A release superseded by a later accepted contract is
+ * not held. Pure.
  */
 export function releaseHolder(state: BoardState, item: string, target: string): BoardContract | undefined {
-  return Object.values(state.contracts).find((c) => {
-    const other = c.item !== undefined ? state.items[c.item] : undefined;
-    return (
-      c.status === "accepted" &&
+  for (const c of Object.values(state.contracts)) {
+    if (c.status !== "accepted" || c.seam !== undefined || c.item === undefined || !entriesOverlap(c.target, target)) {
+      continue;
+    }
+    const owner = releaseOwner(state, c);
+    if (owner === undefined || owner === item || lineageRelated(state, owner, item) || !holdsRelease(state, state.items[owner]) || releaseSuperseded(state, c, owner)) {
+      continue;
+    }
+    return { ...c, item: owner };
+  }
+  return undefined;
+}
+
+/** The TARGET_RELEASED refusal naming the item that holds `target`'s release. */
+function targetReleasedMessage(target: string, holder: BoardContract): string {
+  return `${target} is already released to item ${holder.item} (contract ${holder.contract}, ${holder.target}): only that item changes it; ask its owner (a question naming ${holder.item}) instead of a second contract`;
+}
+
+/**
+ * Arbitration revision 7: a PENDING contract another live item (outside
+ * `item`'s lineage) proposed on a target overlapping `target`, or undefined:
+ * one item asks for a protected file at a time. Pure.
+ */
+function pendingReleaseRival(state: BoardState, item: string, target: string): BoardContract | undefined {
+  return Object.values(state.contracts).find(
+    (c) =>
+      c.status === "proposed" &&
       c.seam === undefined &&
-      other !== undefined &&
-      other.id !== item &&
-      other.status !== "done" &&
-      other.status !== "rejected" &&
-      !isAncestor(state, other.id, item) &&
-      !isAncestor(state, item, other.id) &&
-      entriesOverlap(c.target, target)
-    );
-  });
+      c.item !== undefined &&
+      c.item !== item &&
+      entriesOverlap(c.target, target) &&
+      !lineageRelated(state, c.item, item) &&
+      holdsRelease(state, state.items[c.item]),
+  );
 }
 
 /** The item whose latest, not yet integrated push has this commit. */
@@ -3229,6 +3431,19 @@ export function arbitrationV6(state: Pick<BoardState, "rules">): boolean {
 /** True under arbitration revision 7 or later (one writer per released test; see BoardRules.arbitration). Pure. */
 export function arbitrationV7(state: Pick<BoardState, "rules">): boolean {
   return (state.rules.arbitration ?? 1) >= 7;
+}
+
+/**
+ * True when `failure` is the failing revision `item`'s open fix request is
+ * about: the revision that asked, or, under arbitration revision 7, a later
+ * failing revision implicating the same unanswered push (it asked nothing
+ * new; its output is the freshest evidence). Pure.
+ */
+function fixOwedFor(state: BoardState, item: BoardItem, failure: NonNullable<BoardState["lastFailure"]>): boolean {
+  if (item.fixRequested === undefined) {
+    return false;
+  }
+  return item.fixRequested === failure.n || (arbitrationV7(state) && failure.items.includes(item.id));
 }
 
 /**
@@ -4654,14 +4869,20 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
             `${target} is outside item ${item.id}'s scope hint (${item.scopeHint.join(", ")}) and is not the failing check of a revision implicating it`,
           );
         }
-        // Revision 7: one writer per released protected file. Another live
-        // item (not this one's ancestor or descendant) already holds it.
-        if (arbitrationV7(state) && draft.payload.kind === "modify") {
+        // Revision 7: one writer per released protected file, whatever the
+        // contract's kind (each releases the path for writing). Another live
+        // item (not this one's ancestor or descendant) already holds it, or
+        // already asked for it and waits for the decision.
+        if (arbitrationV7(state)) {
           const holder = releaseHolder(state, item.id, target);
           if (holder) {
+            fail("TARGET_RELEASED", targetReleasedMessage(target, holder));
+          }
+          const rival = pendingReleaseRival(state, item.id, target);
+          if (rival) {
             fail(
               "TARGET_RELEASED",
-              `${target} is already released to item ${holder.item} (contract ${holder.contract}, ${holder.target}): only that item changes it; ask its owner (a question naming ${holder.item}) instead of a second contract`,
+              `${target} is already asked for by item ${rival.item} (contract ${rival.contract}, ${rival.target}, waiting for a decision): only one item changes it; ask its owner (a question naming ${rival.item}) instead of a second contract`,
             );
           }
         }
@@ -4684,6 +4905,25 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       if (contract.guarded && draft.from !== BOARD_HUMAN) {
         fail("NOT_ALLOWED", `contract ${contract.contract} changes the original tests or the gate's configuration: only a human decides it`);
+      }
+      // Revision 7: accepting it must not make a second writer of a protected
+      // file another live item holds now (it may have been released since the
+      // proposal: two contracts raced while both were pending).
+      if (draft.type === "contract.accepted" && arbitrationV7(state) && contract.guarded && contract.item !== undefined) {
+        const holder = releaseHolder(state, contract.item, contract.target);
+        if (holder) {
+          fail("TARGET_RELEASED", targetReleasedMessage(contract.target, holder));
+        }
+        // Nor while an earlier holder (even one that holds nothing live now,
+        // such as an escalated one) has a push touching it that is still to
+        // be integrated: that push is applied with the target in its scope.
+        const writer = pendingReleaseWriter(state, contract.item, contract.target);
+        if (writer) {
+          fail(
+            "TARGET_RELEASED",
+            `${contract.target} is released to item ${writer.holder} (contract ${writer.contract.contract}, ${writer.contract.target}), whose push ${writer.commit} changing it is not integrated yet: decide this contract once that push is integrated or left out`,
+          );
+        }
       }
       return;
     }
@@ -6300,6 +6540,13 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
           if (!item || item.status !== "claimed" || item.owner === undefined || item.fixExhausted) {
             continue;
           }
+          // Revision 7: a fix request its owner has not answered yet (no push
+          // since) is charged once. Implicating the same push again is
+          // evidence only: no second request, and never an exhausted budget
+          // for an owner that did not get a turn.
+          if (arbitrationV7(work) && item.fixRequested !== undefined) {
+            continue;
+          }
           const attempt = (item.fixAttempts ?? 0) + 1;
           if (attempt <= rules.maxFixAttempts && activeAgent(work, item.owner)) {
             emit({
@@ -7446,7 +7693,7 @@ export function boardDigest(
     }
   }
   const failure = state.lastFailure;
-  const askedToFix = failure !== null && held.some((i) => i.fixRequested === failure.n);
+  const askedToFix = failure !== null && held.some((i) => fixOwedFor(state, i, failure));
   return {
     agent,
     ...(record?.role !== undefined ? { role: record.role } : {}),
@@ -7527,7 +7774,7 @@ export function boardDigest(
         // Revision 7: never cue a contract the board refuses (released to another live item).
         const paths =
           i.fixRequested !== undefined
-            ? contractCue(state, i.id).filter((p) => !releasedTargets(state, i.id).includes(p) && !(arbitrationV7(state) && releaseHolder(state, i.id, p) !== undefined))
+            ? contractCue(state, i.id).filter((p) => !releasedTargets(state, i.id).includes(p) && !(arbitrationV7(state) && (releaseHolder(state, i.id, p) !== undefined || pendingReleaseRival(state, i.id, p) !== undefined)))
             : [];
         return paths.length > 0
           ? {
@@ -7810,7 +8057,7 @@ export function boardDigest(
         }
         const failureLine =
           report?.lastFailure ??
-          (fixing && state.lastFailure?.n === i.fixRequested
+          (fixing && state.lastFailure !== null && fixOwedFor(state, i, state.lastFailure)
             ? // Skip command echoes (npm's "> pkg@1.0.0 gate", "$ cmd") and npm noise.
               (state.lastFailure!.output.split("\n").find((l) => l.trim() !== "" && !/^\s*[>$] /.test(l) && !/^\s*npm (error|ERR!)/.test(l)) ?? "").slice(0, 200)
             : undefined);

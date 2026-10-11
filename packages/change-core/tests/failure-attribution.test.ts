@@ -102,6 +102,49 @@ describe("outstanding items: failures of work not in the revision blame no merge
   });
 });
 
+describe("a failing TEST file under a broad outstanding scope never clears the merged code it tests", () => {
+  const failing = [
+    " FAIL  tests/orders.test.ts > orders > rejects an empty cart",
+    "AssertionError: expected 200 to be 400",
+    " ❯ tests/orders.test.ts:12:20",
+  ].join("\n");
+
+  it("a merged unit's test subject wins over an outstanding unit matched only through a test file", () => {
+    const merged = [{ unitId: "orders", paths: ["src/orders.ts"] }];
+    const outstanding = [{ unitId: "tests-item", paths: ["tests/**"] }];
+    const parse = attributeFailure(merged, failing, outstanding);
+    expect(parse.units.map((u) => u.unitId)).toEqual(["orders"]);
+    expect(parse.outstanding).toEqual([]);
+  });
+
+  it("only hinted outstanding units matched (test file only) and no merged unit is the test subject: no merged unit is blamed, never a re-fan of all", () => {
+    const merged = [
+      { unitId: "users", paths: ["src/users.ts"] },
+      { unitId: "billing", paths: ["src/billing.ts"] },
+    ];
+    const outstanding = [{ unitId: "anything", paths: ["**"], hinted: true }];
+    const parse = attributeFailure(merged, failing, outstanding);
+    expect(parse).toEqual({ units: [], attributed: true, outstanding });
+    // The shared combiner records it as the outstanding items' failure: no merged item is asked to fix.
+    expect(
+      combineAttribution({ merged: ["users", "billing"], parsed: parse.units.map((u) => u.unitId), attributed: parse.attributed, picks: ["users"], outstanding: ["anything"] }),
+    ).toEqual({ items: [], source: "outstanding" });
+  });
+
+  it("an outstanding unit that CLAIMED the test file (a write intent) still takes it when no merged unit is its subject", () => {
+    const merged = [{ unitId: "users", paths: ["src/users.ts"] }];
+    const outstanding = [{ unitId: "orders-tests", paths: ["tests/orders.test.ts"] }];
+    expect(attributeFailure(merged, failing, outstanding)).toEqual({ units: [], attributed: true, outstanding });
+  });
+
+  it("a failure in an outstanding unit's SOURCE file stays outstanding-only (unchanged)", () => {
+    const merged = [{ unitId: "orders", paths: ["src/orders.ts"] }];
+    const outstanding = [{ unitId: "search", paths: ["src/search.ts"], hinted: true }];
+    const parse = attributeFailure(merged, "TypeError: boom\n    at search (src/search.ts:4:2)\n", outstanding);
+    expect(parse).toEqual({ units: [], attributed: true, outstanding });
+  });
+});
+
 describe("type-checker locations", () => {
   const tscOutput = [
     "> storefront@0.0.0 gate",

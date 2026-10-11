@@ -120,7 +120,10 @@ describe("the proof bundle (pure, from the log)", () => {
     const unrecorded = verifiedRun().messages.filter((m) => m.type !== "revision.promoted");
     const reported = buildProofBundle(unrecorded, { promotion: { rev: 2, gatedCommit: "elsewhere", commit: "p1", branch: "b" } });
     expect(reported.status).toBe("not-proven");
-    expect(buildProofBundle(unrecorded, { promotion: { rev: 2, gatedCommit: "r2", commit: "p1", branch: "b" } }).status).toBe("proven");
+    // Even when it names the gated commit, it is not proof: no revision.promoted backs it.
+    const matching = buildProofBundle(unrecorded, { promotion: { rev: 2, gatedCommit: "r2", commit: "p1", branch: "b" } });
+    expect(matching).toMatchObject({ status: "not-proven", promotion: { matchesGated: true } });
+    expect(matching.reasons).toEqual(["promotion reported by the run but not recorded on the board (no revision.promoted backs it)"]);
   });
 
   it("is NOT proven without a recorded promotion, when the last revision failed, or when no gate ran", () => {

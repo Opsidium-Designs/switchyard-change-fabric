@@ -24,7 +24,16 @@ import type { CommandOutcome, CommandRunner } from "@switchyard-change/verificat
 
 import { BoardAgentClient, BoardOperatorClient } from "../src/board-client.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
-import { leaveOneOutPlan, regressionEvidence, seamConsumers, seamsEdited, type LeaveOneOutPush } from "../src/ratchet-integration.ts";
+import {
+  blamedItems,
+  leaveOneOutPlan,
+  namesSeam,
+  regressionEvidence,
+  seamConsumers,
+  seamsEdited,
+  staleDeveloperTestsOnly,
+  type LeaveOneOutPush,
+} from "../src/ratchet-integration.ts";
 import { ContinuousBoardIntegrator, type BoardAgentRepo } from "../src/run-board.ts";
 import { createIntegrationWorkspace } from "../src/run-live.ts";
 
@@ -291,6 +300,32 @@ describe("the pre-pass progress ratchet (arbitration revision 5)", () => {
     expect(reduceBoard(log)).toEqual(state);
   }, 120_000);
 
+  it("abandoned (the interrupt grace ended) after the round's first revision: nothing further is recorded (no push.regressed, no second revision, no decision)", async () => {
+    const env = await setup();
+    await env.firstRatchet();
+    await env.threePushes();
+    // Abandon the moment the whole stack's revision is recorded.
+    let recorded = 0;
+    const recordRevision = env.operator.recordRevision.bind(env.operator);
+    env.operator.recordRevision = async (input) => {
+      const outcome = await recordRevision(input);
+      recorded += 1;
+      return outcome;
+    };
+    const before = (await env.log()).length;
+    const decisions: unknown[] = [];
+    const integrator = await env.run({ abandoned: () => recorded >= 1, recordDecision: async (d) => void decisions.push(d) });
+    const after = (await env.log()).slice(before);
+    expect(of(after, "integrated.rev").map((r) => [r.payload.n, r.payload.gate])).toEqual([[2, "fail"]]);
+    expect(of(after, "push.regressed")).toEqual([]);
+    expect(of(after, "push.excluded")).toEqual([]);
+    expect(of(after, "candidate.gated")).toEqual([]);
+    expect(after.filter((m) => m.from !== "engine" || !["integrated.rev", "fix.requested", "decision.resolved"].includes(m.type))).toEqual([]);
+    expect(decisions).toEqual([]);
+    expect(await env.branchHead()).toBe(env.remote);
+    expect(integrator.revisions.map((r) => r.n)).toEqual([2]);
+  }, 120_000);
+
   it("coupled seam + consumer (each alone would regress the best revision, together they improve it): neither is blamed, the saboteur is, and the next revision stacks both", async () => {
     const env = await setup({ arbitration: 5, maxFixAttempts: 3 }, AUTH_SEAM);
     // Rev 1: x uses the context's `user` (the seam declares it): acceptance 3/9.
@@ -471,6 +506,76 @@ describe("the pre-pass progress ratchet (arbitration revision 5)", () => {
   }, 120_000);
 });
 
+describe("the pre-pass progress ratchet under arbitration revision 7", () => {
+  it("a blocking push already in the ratchet (the ratchet does not run the acceptance suite): a tie is checked over every push, and it is isolated; revision 6 records the tie as before", async () => {
+    for (const arbitration of [6, 7]) {
+      const env = await setup({ arbitration, maxFixAttempts: 3 });
+      // Rev 1 (the ratchet): x's push carries 2 type errors, so the acceptance suite never runs.
+      const x1 = await env.push("a1", "x", { [FILES.x!]: "PASS 1\nERR 2\n" });
+      await env.push("a2", "y", { [FILES.y!]: "PASS 1\n" });
+      await env.push("a3", "z", { [FILES.z!]: "PASS 1\n" });
+      await env.run();
+      expect(prePassRatchet(await env.log())).toMatchObject({ n: 1, score: { runs: false, typeErrors: 2 } });
+      // y and z improve, but x's errors still block the measurement: the stack ties the ratchet.
+      await env.push("a2", "y", { [FILES.y!]: "PASS 2\n" });
+      await env.push("a3", "z", { [FILES.z!]: "PASS 2\n" });
+      env.gate.ran.length = 0;
+      const integrator = await env.run();
+      const log = await env.log();
+      if (arbitration === 6) {
+        expect(env.gate.ran).toEqual(["tsc 2"]);
+        expect(of(log, "push.regressed")).toEqual([]);
+        continue;
+      }
+      // The whole stack, then without x (the parse attributes it; the ratchet's own push), without y, without z.
+      expect(env.gate.ran).toEqual(["tsc 2", "acceptance 4", "tsc 2", "tsc 2"]);
+      expect(integrator.isolations[0]!.map((i) => [i.items.join(","), i.outcome])).toEqual([
+        ["x", "regressed"],
+        ["y", "kept"],
+        ["z", "kept"],
+      ]);
+      expect(of(log, "push.regressed").map((m) => [m.payload.item, m.payload.commit, m.payload.ratchet, m.payload.rev])).toEqual([["x", x1, 1, 2]]);
+      expect(of(log, "integrated.rev").at(-2)!.payload.failing?.output).toMatch(/^pre-pass ratchet: this stack scores 2 type errors, no better than the best revision so far/);
+      expect(of(log, "integrated.rev").at(-1)!.payload.progress?.acceptance?.passed).toBe(4);
+      expect(reduceBoard(log)).toEqual(await env.state());
+    }
+  }, 240_000);
+
+  it("a seam consumer whose removal removes failures naming the seam defers to its seam group: the seam push is blamed, not the consumer; revision 5 blamed the consumer", async () => {
+    for (const arbitration of [5, 7]) {
+      const env = await setup({ arbitration, maxFixAttempts: 3 }, AUTH_SEAM);
+      await env.firstRatchet();
+      // x starts using the context's new field `auth`; y's seam push renames `user` to `token` (not what x needs).
+      const p1 = await env.push("a1", "x", { [FILES.x!]: "PASS 2\nNEEDS auth\n" });
+      const p2 = await env.push("a2", "y", { [FILES.y!]: "PASS 2\n", "src/contracts/auth.ts": "export interface Ctx { readonly token: string }\n" });
+      env.gate.ran.length = 0;
+      const integrator = await env.run();
+      // The whole stack (x needs `auth`: 1 type error), without x (acceptance runs), without y (x still needs `auth`), without both.
+      expect(env.gate.ran.slice(0, 4)).toEqual(["tsc 1", "acceptance 3", "tsc 1", "acceptance 1"]);
+      const log = await env.log();
+      const outcomes = integrator.isolations[0]!.map((i) => [i.kind, i.agents.join(","), i.outcome]);
+      if (arbitration === 5) {
+        expect(outcomes).toEqual([
+          ["push", "a1", "regressed"],
+          ["push", "a2", "kept"],
+          ["group", "a1,a2", "improves"],
+        ]);
+        expect(of(log, "push.regressed").map((m) => [m.payload.item, m.payload.commit])).toEqual([["x", p1]]);
+        continue;
+      }
+      expect(outcomes).toEqual([
+        ["push", "a1", "improves"],
+        ["push", "a2", "kept"],
+        ["group", "a1,a2", "regressed"],
+      ]);
+      expect(integrator.isolations[0]![0]!.reason).toMatch(/seam consumer/);
+      expect(of(log, "push.regressed").map((m) => [m.payload.item, m.payload.commit])).toEqual([["y", p2]]);
+      expect(of(log, "integrated.rev")[1]!.payload.failing?.output).toMatch(/x \(a1\): acceptance 3\/9: better, not blamed: a seam consumer/);
+      expect(reduceBoard(log)).toEqual(await env.state());
+    }
+  }, 240_000);
+});
+
 describe("ratchet evidence helpers", () => {
   it("quotes only the failure lines the reference did not have, bounded", () => {
     const reference = "src/a.ts(1,1): error TS2339: old\n✖ a: case 1";
@@ -526,6 +631,43 @@ describe("ratchet evidence helpers", () => {
     expect(seamConsumers(blueprint, seamPush, [x, z], "src/z/c.ts(40,5): error TS2339: Property 'user' does not exist on type 'Ctx'.")).toEqual(["a3"]);
     // A push that edits no seam has no consumers.
     expect(seamConsumers(blueprint, x, [seamPush, z], "")).toEqual([]);
+  });
+
+  it("revision 7: a stale developer test is not a regression only when the acceptance suite did not run because a developer suite failed first and the removal removes only test files the push did not touch", () => {
+    const developerFirst = { passed: 40, failed: 1, total: 41, suites: [{ passed: 40, failed: 1, total: 41, suite: "developer" as const }], acceptanceNotRun: "the developer suite failed first (1 failed)" };
+    const stale = ["FAIL  tests/orders.test.ts > orders > totals include tax", "AssertionError: expected 10 to be 11"];
+    expect(staleDeveloperTestsOnly(developerFirst, stale, ["src/orders/totals.ts"])).toBe(true);
+    // The push touched that test: its own change, so a regression stands.
+    expect(staleDeveloperTestsOnly(developerFirst, stale, ["src/orders/totals.ts", "tests/orders.test.ts"])).toBe(false);
+    // A failure in a source file, a type error, or no file at all is not "only a stale test".
+    expect(staleDeveloperTestsOnly(developerFirst, [...stale, "Error: boom at src/orders/totals.ts:3:1"], [])).toBe(false);
+    expect(staleDeveloperTestsOnly(developerFirst, ["src/a.ts(1,1): error TS2339: x"], [])).toBe(false);
+    expect(staleDeveloperTestsOnly(developerFirst, ["AssertionError: expected 10 to be 11"], [])).toBe(false);
+    // A typecheck failure (or an acceptance suite that ran) is scored as before.
+    expect(staleDeveloperTestsOnly({ ...developerFirst, acceptanceNotRun: "typecheck failed (3 errors)" }, stale, [])).toBe(false);
+    expect(staleDeveloperTestsOnly({ passed: 1, failed: 1, total: 2, acceptance: { passed: 1, failed: 1, total: 2 } }, stale, [])).toBe(false);
+  });
+
+  it("names a seam in a failure line by its path, its module, or a blueprint symbol", () => {
+    const state = { seams: [{ path: "src/contracts/auth.ts", importers: [], symbols: ["Ctx"] }], items: {} } as unknown as Parameters<typeof namesSeam>[0];
+    const seam = ["src/contracts/auth.ts"];
+    expect(namesSeam(state, seam, "src/x/a.ts(40,5): error TS2339: Property 'auth' does not exist on type 'Ctx'.")).toBe(true);
+    expect(namesSeam(state, seam, `src/x/a.ts(3,10): error TS2305: Module '"../contracts/auth.ts"' has no exported member 'isAuthenticated'.`)).toBe(true);
+    expect(namesSeam(state, seam, "Error: src/contracts/auth.ts failed to load")).toBe(true);
+    expect(namesSeam(state, seam, "src/x/a.ts(1,1): error TS2304: Cannot find name 'total'.")).toBe(false);
+    expect(namesSeam(state, ["src/x/a.ts"], "src/x/a.ts(40,5): error TS2339: Property 'auth' does not exist on type 'Ctx'.")).toBe(false);
+  });
+
+  it("blames among every removed item under revision 7 (the named ones, else the new ones, else all); revision 6 blames only new items", () => {
+    const state = { seams: [], items: {} } as unknown as Parameters<typeof blamedItems>[0];
+    const pushed = (id: string, paths: string[]) => ({ id, lastPush: { paths } }) as unknown as LeaveOneOutPush["items"][number];
+    const old = pushed("old", ["src/old.ts"]);
+    const fresh = pushed("fresh", ["src/fresh.ts"]);
+    const named = ["src/old.ts(3,1): error TS2304: Cannot find name 'x'."];
+    expect(blamedItems(state, [fresh], "push", named).map((i) => i.id)).toEqual(["fresh"]);
+    expect(blamedItems(state, [fresh], "push", named, [old, fresh]).map((i) => i.id)).toEqual(["old"]);
+    expect(blamedItems(state, [fresh], "push", ["Error: boom"], [old, fresh]).map((i) => i.id)).toEqual(["fresh"]);
+    expect(blamedItems(state, [], "push", ["Error: boom"], [old, fresh]).map((i) => i.id)).toEqual(["old", "fresh"]);
   });
 
   it("names the shared seams a push edits", () => {

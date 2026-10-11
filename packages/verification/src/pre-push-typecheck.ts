@@ -14,7 +14,12 @@
  * It is a refusal only: it never accepts anything, and the gate stays
  * authoritative. Anything that keeps it from giving a clear answer (no
  * tsconfig, no installed dependencies, no tsc, a timeout, output it cannot
- * read) skips it with a reason, never throws, and lets the edit proceed.
+ * read, a tsconfig/config error in either run) skips it with a reason, never
+ * throws, and lets the edit proceed. So does an edit whose new errors are ALL
+ * unresolved imports from modules it did not change (another item may be
+ * providing that module or export, and the gate decides once both are in).
+ * Build and tool state directories (dist, build, coverage, .wrangler, .turbo,
+ * .next, .cache) are not copied into the overlay trees.
  */
 
 import { execFile } from "node:child_process";
@@ -36,6 +41,18 @@ const TYPESCRIPT_FILE = /\.(ts|tsx|mts|cts)$/i;
 /** One tsc diagnostic line (non-pretty output): `path(line,col): error TSxxxx: message`. */
 const DIAGNOSTIC = /^(.+?)\((\d+),(\d+)\): error (TS\d+): (.*)$/;
 const SKIPPED_SEGMENTS = new Set(["node_modules", ".git"]);
+/** Build output and tool state the overlay copy of the baseline leaves out (never source tsc needs). */
+const UNCOPIED_SEGMENTS = new Set([...SKIPPED_SEGMENTS, "dist", "build", "coverage", ".wrangler", ".turbo", ".next", ".cache"]);
+/** A diagnostic with no file location (`error TS5083: ...`): about the configuration, not a file. */
+const GLOBAL_DIAGNOSTIC = /^error (TS\d+): (.*)$/;
+/**
+ * Configuration diagnostics: the project's tsconfig (or a file it names)
+ * cannot be read or used, so neither run's answer is about the edit.
+ */
+const CONFIG_CODES = new Set(["TS5023", "TS5024", "TS5025", "TS5058", "TS5069", "TS5070", "TS5083", "TS5095", "TS5101", "TS6046", "TS6053", "TS6059", "TS6306", "TS6307", "TS18002", "TS18003"]);
+/** Cross-module resolution codes: an import names a module or export tsc cannot find. */
+const RESOLUTION_CODES = new Set(["TS2305", "TS2307", "TS2614", "TS2724"]);
+const TS_OR_JS_EXTENSION = /\.(d\.ts|ts|tsx|mts|cts|js|jsx|mjs|cjs)$/i;
 
 /** What one pre-push check is asked about. */
 export interface PrePushCheckInput {
@@ -136,6 +153,21 @@ function parseDiagnostics(output: string, cwd: string): Diagnostic[] {
   return diagnostics;
 }
 
+/**
+ * A configuration problem in tsc's output (a location-less error, a
+ * diagnostic in a tsconfig file, or a configuration code), as a skip reason.
+ */
+function configProblem(output: string, diagnostics: readonly Diagnostic[]): string | undefined {
+  for (const raw of output.split(/\r?\n/)) {
+    const match = GLOBAL_DIAGNOSTIC.exec(raw.trim());
+    if (match) {
+      return `${match[1]}: ${match[2]!.trim()}`.slice(0, MAX_ERROR_CHARS);
+    }
+  }
+  const bad = diagnostics.find((d) => CONFIG_CODES.has(d.code) || /(^|\/)tsconfig[^/]*\.json$/i.test(d.file));
+  return bad === undefined ? undefined : `${bad.file}: ${bad.code}: ${bad.message}`.slice(0, MAX_ERROR_CHARS);
+}
+
 /** Run `tsc --noEmit -p tsconfig.json` in `cwd`; never throws. */
 function runTsc(tsc: string, cwd: string, timeoutMs: number): Promise<TscOutcome> {
   return new Promise((resolvePromise) => {
@@ -157,7 +189,13 @@ function runTsc(tsc: string, cwd: string, timeoutMs: number): Promise<TscOutcome
           resolvePromise({ skipped: `tsc could not run (${String(failure.code ?? failure.message).slice(0, 120)})` });
           return;
         }
-        const diagnostics = parseDiagnostics(`${stdout}\n${stderr}`, cwd);
+        const output = `${stdout}\n${stderr}`;
+        const diagnostics = parseDiagnostics(output, cwd);
+        const config = configProblem(output, diagnostics);
+        if (config !== undefined) {
+          resolvePromise({ skipped: `tsc reported a configuration error (${config})` });
+          return;
+        }
         resolvePromise(diagnostics.length > 0 ? { diagnostics } : { skipped: `tsc exited ${failure.code} with output that names no diagnostic` });
       },
     );
@@ -170,7 +208,7 @@ async function baselineOverlay(baselineDir: string, overlay: string, nodeModules
     recursive: true,
     filter: (source) => {
       const rel = relative(baselineDir, source);
-      return rel === "" || !rel.split(sep).some((s) => SKIPPED_SEGMENTS.has(s));
+      return rel === "" || !rel.split(sep).some((s) => UNCOPIED_SEGMENTS.has(s));
     },
   });
   await symlink(nodeModules, join(overlay, "node_modules"), "dir");
@@ -186,6 +224,44 @@ async function placeFile(from: string, overlay: string, rel: string): Promise<vo
   } else if (info === undefined) {
     await rm(target, { force: true });
   }
+}
+
+/**
+ * The module a cross-module resolution error points at (TS2305, TS2307,
+ * TS2614, TS2724, or TS2339 on a namespace-imported binding's
+ * `typeof import("...")`), else undefined: the specifier as written.
+ */
+function resolutionTarget(d: Diagnostic): string | undefined {
+  if (RESOLUTION_CODES.has(d.code)) {
+    // `Cannot find module './x'`, `Module '"./x"' has no exported member`, `'"./x"' has no exported member named`.
+    const quoted = /^(?:Cannot find module |Module |)'"?([^'"]+)"?'/.exec(d.message);
+    return quoted?.[1];
+  }
+  if (d.code === "TS2339") {
+    return /typeof import\("([^"]+)"\)/.exec(d.message)?.[1];
+  }
+  return undefined;
+}
+
+/**
+ * Whether `specifier`, imported by `fromFile` (relative to the tree `cwd`),
+ * names a module OUTSIDE the edit's changed files. A bare specifier (a
+ * package or an alias) is never a changed file.
+ */
+function outsideChanged(specifier: string, fromFile: string, cwd: string, changed: ReadonlySet<string>): boolean {
+  let target: string;
+  if (isAbsolute(specifier)) {
+    target = relative(cwd, specifier);
+  } else if (specifier.startsWith("./") || specifier.startsWith("../")) {
+    target = join(dirname(fromFile), specifier);
+  } else {
+    return true;
+  }
+  const stem = normalize(target).split(sep).join("/").replace(TS_OR_JS_EXTENSION, "");
+  return ![...changed].some((file) => {
+    const own = file.replace(TS_OR_JS_EXTENSION, "");
+    return own === stem || own === `${stem}/index`;
+  });
 }
 
 /**
@@ -253,6 +329,7 @@ export function createPrePushTypecheck(options: PrePushTypecheckOptions = {}): P
         existing.set(key(d), (existing.get(key(d)) ?? 0) + 1);
       }
       const errors: string[] = [];
+      const fresh: Diagnostic[] = [];
       for (const d of now.diagnostics) {
         if (!changedSet.has(d.file)) {
           continue;
@@ -262,9 +339,23 @@ export function createPrePushTypecheck(options: PrePushTypecheckOptions = {}): P
           existing.set(key(d), left - 1);
           continue;
         }
+        fresh.push(d);
         errors.push(`${d.file}(${d.line},${d.col}): error ${d.code}: ${d.message}`.slice(0, MAX_ERROR_CHARS));
       }
-      return errors.length > 0 ? { ok: false, errors: errors.slice(0, MAX_REPORTED_ERRORS) } : { ok: true };
+      if (errors.length === 0) {
+        return { ok: true };
+      }
+      // Every new error is an import of a module the edit did not change: that
+      // module or export may be another item's work, not yet in this tree.
+      const targets = fresh.map((d) => resolutionTarget(d));
+      if (targets.every((t, i) => t !== undefined && outsideChanged(t, fresh[i]!.file, after, changedSet))) {
+        const modules = [...new Set(targets.map((t) => (isAbsolute(t!) ? relative(after, t!).split(sep).join("/") : t!)))];
+        return {
+          ok: true,
+          skipped: `the edit's new errors are all unresolved imports from modules it did not change (${modules.slice(0, 3).join(", ")}${modules.length > 3 ? ", ..." : ""}); another item may provide them`,
+        };
+      }
+      return { ok: false, errors: errors.slice(0, MAX_REPORTED_ERRORS) };
     } catch (error) {
       return { ok: true, skipped: `the typecheck could not be prepared (${(error instanceof Error ? error.message : String(error)).slice(0, 160)})` };
     } finally {

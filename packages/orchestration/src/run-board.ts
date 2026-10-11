@@ -67,6 +67,8 @@ import {
   type BoardDigest,
   type BoardItem,
   combineAttribution,
+  attributeFailure,
+  releasedTargets,
   type ImplicationSource,
   arbitrationV3,
   arbitrationV5,
@@ -146,7 +148,6 @@ import { deriveProtectedPaths, type ProtectedPaths } from "./protected-paths.ts"
 import type { PrePushCheck, TestInventory } from "@switchyard-change/verification";
 import { redactSecrets } from "./redact.ts";
 import {
-  attributeImplicatedUnits,
   createIntegrationWorkspace,
   createPlanningChange,
   failPlanningChange,
@@ -818,6 +819,19 @@ export interface IntegrateBoardOptions {
    * pushes stay pending for a later revision.
    */
   readonly holdBack?: readonly string[];
+  /**
+   * Pending-push sets already decided (integrated or refused). When the
+   * pushes this attempt could read form one of them (the rest still
+   * unreadable or held back), nothing is gated again: the same pushes would
+   * only be re-gated as they were.
+   */
+  readonly decided?: ReadonlySet<string>;
+  /**
+   * True once the run stopped waiting for this attempt (an interrupt's grace
+   * period ended): nothing more is recorded on the board and the integration
+   * branch is not advanced (the run's verdict was already decided without it).
+   */
+  readonly abandoned?: () => boolean;
   /** The baseline gate run's test inventory (see IntegrateOptions.testInventory). */
   readonly testInventory?: TestInventory;
   readonly jev?: AskJev;
@@ -851,6 +865,13 @@ export interface IntegrateBoardResult {
   /** With `stale`: the agents whose pushes were superseded while the gate ran. */
   readonly supersededAgents?: readonly string[];
   /**
+   * When some agents' pushes were never read (their repo could not be read,
+   * or they were held back): the pending-push key WITHOUT those pushes. Only
+   * that set is what this attempt decided, so only it is marked attempted and
+   * the unread pushes are retried later (bounded by the caller).
+   */
+  readonly unreadKey?: string;
+  /**
    * How many pending pushes this attempt recorded excluded (push.excluded):
    * they leave the next plan, so the integrator runs again at once on what
    * is left instead of waiting for a new push.
@@ -863,15 +884,20 @@ export interface IntegrateBoardResult {
  * left out because it failed verification (or, alone, made the integrator
  * refuse), addressed to its holder: each item's latest push, once. A refusal
  * (the push was superseded meanwhile, or is already recorded) is ignored.
- * Returns how many were recorded.
+ * Nothing is recorded once the attempt is `abandoned`. Returns how many were
+ * recorded.
  */
 export async function recordExcludedPushes(
   operator: BoardOperatorClient,
   excluded: readonly { readonly agent: string; readonly items: readonly BoardItem[]; readonly reason: string }[],
+  abandoned?: () => boolean,
 ): Promise<number> {
   let recorded = 0;
   for (const unit of excluded) {
     for (const item of unit.items) {
+      if (abandoned?.()) {
+        return recorded;
+      }
       if (item.lastPush === undefined || item.lastPush.excluded !== undefined) {
         continue;
       }
@@ -894,6 +920,25 @@ export async function recordExcludedPushes(
 export function keyWithout(key: string, excluded: readonly { readonly items: readonly BoardItem[] }[]): string {
   const gone = new Set(excluded.flatMap((u) => u.items.flatMap((i) => (i.lastPush ? [i.lastPush.commit] : []))));
   return gone.size === 0 ? key : key.split(",").filter((c) => c !== "" && !gone.has(c)).join(",");
+}
+
+/** Why an attempt the run stopped waiting for (interrupt grace over) records nothing more. */
+export const ABANDONED_REASON =
+  "the run stopped waiting for this integration (the interrupt grace period ended): nothing more is recorded (no revision, excluded or regressed push, candidate, trunk move, or decision) and the integration branch is not advanced";
+
+/**
+ * The agents whose pushes among `items` are no longer their item's latest
+ * pending push (superseded since they were read), sorted; empty when the
+ * board cannot be read. Used when the board refuses a revision as stale, so
+ * the hold-back bound applies to those agents too.
+ */
+export async function supersededAgentsNow(operator: BoardOperatorClient, items: readonly BoardItem[]): Promise<string[]> {
+  const page = await operator.page(0, 1).catch(() => undefined);
+  if (page === undefined) {
+    return [];
+  }
+  const now = new Set(pendingPushItems(page.state).map((i) => i.lastPush!.commit));
+  return [...new Set(items.filter((i) => i.lastPush !== undefined && !now.has(i.lastPush.commit)).map((i) => i.lastPush!.agent))].sort();
 }
 
 /** A stable key for the set of pending pushes (what one integration would merge). */
@@ -959,7 +1004,7 @@ function head(text: string, max: number): string {
 export async function attributeRevisionFailure(input: {
   readonly items: readonly { readonly id: string; readonly objective: string; readonly paths: readonly string[] }[];
   /** Items NOT in the revision (their work is not in the gated tree), for the parse only. */
-  readonly outstanding?: readonly { readonly id: string; readonly objective: string; readonly paths: readonly string[] }[];
+  readonly outstanding?: readonly { readonly id: string; readonly objective: string; readonly paths: readonly string[]; readonly hinted?: boolean }[];
   readonly output: string;
   readonly changeId: string;
   readonly jev?: AskJev;
@@ -967,17 +1012,25 @@ export async function attributeRevisionFailure(input: {
   /** Record the typed decision's outcome (accepted, low-confidence, or an error): never silent. */
   readonly onDecision?: (decision: BoardDecisionRecord) => Promise<unknown>;
 }): Promise<{ readonly items: readonly string[]; readonly source: ImplicationSource; readonly pick?: string; readonly outstanding?: readonly string[] }> {
-  const unitOf = (i: { readonly id: string; readonly objective: string; readonly paths: readonly string[] }): GatedUnitInput => ({
+  const unitOf = (i: {
+    readonly id: string;
+    readonly objective: string;
+    readonly paths: readonly string[];
+    readonly hinted?: boolean;
+  }): GatedUnitInput & { readonly hinted?: boolean } => ({
     unitId: i.id,
     objective: i.objective,
     paths: i.paths,
     authRemote: "",
     gateCommand: [],
     requiredExports: [],
+    ...(i.hinted === true ? { hinted: true } : {}),
   });
-  const units: GatedUnitInput[] = input.items.map(unitOf);
+  const units = input.items.map(unitOf);
   const outstandingItems = input.outstanding ?? [];
-  const parsed = attributeImplicatedUnits(units, input.output, outstandingItems.map(unitOf));
+  // A scope-hinted outstanding item (no write intent) never takes a failure
+  // from a test-file match alone (see attributeFailure).
+  const parsed = attributeFailure(units, input.output, outstandingItems.map(unitOf));
   const parsedItems = parsed.attributed ? inOrder(parsed.units.map((u) => u.unitId), input.items) : [];
   const outstanding = inOrder(parsed.outstanding.map((u) => u.unitId), outstandingItems);
   let pick: string | undefined;
@@ -1117,9 +1170,11 @@ export async function flushAttributionDecisions(
   recordDecision: RecordBoardDecision | undefined,
   decisions: BoardDecisionRecord[],
   n: number | undefined,
+  abandoned?: () => boolean,
 ): Promise<void> {
   const record = recordDecision;
-  if (!record) {
+  // An abandoned attempt records nothing more: its buffered decisions are dropped.
+  if (!record || abandoned?.()) {
     decisions.length = 0;
     return;
   }
@@ -1197,9 +1252,22 @@ export async function failingRevisionEvidence(input: {
   // maps only to them is theirs, not the merged items'.
   const outstanding = arbitrationV3(state) ? outstandingItems(state, input.inTree ?? input.items) : [];
   const attribution = await attributeRevisionFailure({
-    items: input.items.map((i) => ({ id: i.id, objective: i.objective, paths: (i.intent?.write ?? []).map(intentPath) })),
+    // A merged item's paths include the protected targets a human released to
+    // it (a developer-test contract): a failure in a released test it edited is its.
+    items: input.items.map((i) => ({
+      id: i.id,
+      objective: i.objective,
+      paths: [...new Set([...(i.intent?.write ?? []).map(intentPath), ...releasedTargets(state, i.id)])],
+    })),
     ...(outstanding.length > 0
-      ? { outstanding: outstanding.map((i) => ({ id: i.id, objective: i.objective, paths: (i.intent?.write ?? i.scopeHint).map(intentPath) })) }
+      ? {
+          outstanding: outstanding.map((i) => ({
+            id: i.id,
+            objective: i.objective,
+            paths: (i.intent?.write ?? i.scopeHint).map(intentPath),
+            ...(i.intent?.write === undefined ? { hinted: true } : {}),
+          })),
+        }
       : {}),
     output: raw,
     changeId: input.changeId,
@@ -1323,6 +1391,8 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   const units: { id: string; objective: string; dependsOn: string[]; paths: string[] }[] = [];
   const completed: CompletedWorkUnit[] = [];
   const itemsByAgent = new Map<string, BoardItem[]>();
+  // Units whose pushes this attempt never read (held back, or an unreadable repo).
+  const unread: { items: BoardItem[] }[] = [];
   for (const unit of plan.units) {
     const agent = unit.agent;
     const mine = [...unit.items];
@@ -1334,6 +1404,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     }
     if (options.holdBack?.includes(agent)) {
       excludedAgents.push({ agent, reason: "held back: its pushes kept being superseded while the gate ran; they stay pending" });
+      unread.push({ items: mine });
       continue;
     }
     let remote: string;
@@ -1341,6 +1412,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
       remote = await options.readRemote(agent);
     } catch (error) {
       excludedAgents.push({ agent, reason: scrub(`could not read its repo: ${error instanceof Error ? error.message : String(error)}`) });
+      unread.push({ items: mine });
       continue;
     }
     units.push({ id: agent, objective: `the announced pushes of ${agent} (items ${mine.map((i) => i.id).join(", ")})`, dependsOn: [], paths: [...unit.scope] });
@@ -1352,6 +1424,17 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
       key,
       transient: true,
       failure: `no pending push could be read: ${excludedAgents.map((e) => `${e.agent}: ${e.reason}`).join("; ")}`,
+    };
+  }
+  // Every result below carries the key without the unread pushes (see unreadKey).
+  const unreadKeyOf = (k: string): { unreadKey?: string } => (unread.length > 0 ? { unreadKey: keyWithout(k, unread) } : {});
+  if (unread.length > 0 && options.decided?.has(keyWithout(key, unread))) {
+    return {
+      requiresIntegrationGate,
+      key,
+      ...unreadKeyOf(key),
+      transient: true,
+      failure: `the pushes read were already gated as they are; the rest could not be read: ${excludedAgents.map((e) => `${e.agent}: ${e.reason}`).join("; ")}`,
     };
   }
 
@@ -1399,7 +1482,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   } catch (error) {
     // The integrator refused (for example a fix was expected but nothing
     // changed). No gate ran on any recordable tree, so no revision is posted.
-    return { requiresIntegrationGate, key, failure: scrub(`the integrator refused: ${error instanceof Error ? error.message : String(error)}`) };
+    return { requiresIntegrationGate, key, ...unreadKeyOf(key), failure: scrub(`the integrator refused: ${error instanceof Error ? error.message : String(error)}`) };
   }
   const verificationExcluded: { agent: string; items: BoardItem[]; reason: string }[] = [];
   for (const u of evidence.units) {
@@ -1411,7 +1494,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     }
   }
   // Tell each holder its push was left out (it is not re-gated as it is).
-  const excludedPushes = await recordExcludedPushes(options.operator, verificationExcluded);
+  const excludedPushes = await recordExcludedPushes(options.operator, verificationExcluded, options.abandoned);
   if (excludedPushes > 0) {
     key = keyWithout(key, verificationExcluded);
   }
@@ -1421,6 +1504,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     return {
       requiresIntegrationGate,
       key,
+      ...unreadKeyOf(key),
       evidence,
       ...(excludedPushes > 0 ? { excludedPushes } : {}),
       failure:
@@ -1452,7 +1536,8 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   const gate: "pass" | "fail" = evidence.integration.verdict === "verified" ? "pass" : "fail";
   const install = evidence.integration.finalCheck.skipped ? undefined : installing?.takeLastInstall();
   const attributionDecisions: BoardDecisionRecord[] = [];
-  const flushDecisions = (n: number | undefined): Promise<void> => flushAttributionDecisions(options.operator, options.recordDecision, attributionDecisions, n);
+  const flushDecisions = (n: number | undefined): Promise<void> =>
+    flushAttributionDecisions(options.operator, options.recordDecision, attributionDecisions, n, options.abandoned);
   let failing: { output: string; items: string[]; outstanding?: string[] } | undefined;
   let implicated: BoardRevision["implicated"];
   if (gate === "fail") {
@@ -1491,6 +1576,11 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   // integration started): the board refuses it if the head moved since.
   const base = integratedHead(state);
   const applied = appliedForRevision(evidence, mergedAgents);
+  if (options.abandoned?.()) {
+    // Nothing more is recorded: the buffered decisions are dropped with the revision.
+    attributionDecisions.length = 0;
+    return { requiresIntegrationGate, key, evidence, failure: ABANDONED_REASON };
+  }
   const recorded = await options.operator.recordRevision({
     commit,
     gate,
@@ -1505,10 +1595,19 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   if (!recorded.ok) {
     await flushDecisions(undefined);
     if (recorded.code === "UNKNOWN_REF" || recorded.code === "STALE_BASE") {
-      // Superseded pushes, or a head that moved while the gate ran: run again on the current board.
-      return { requiresIntegrationGate, key, evidence, stale: true, failure: scrub(`the board refused the revision: ${recorded.error}`) };
+      // Superseded pushes, or a head that moved while the gate ran: run again
+      // on the current board (the agents whose pushes moved count toward the
+      // hold-back bound, as for a push superseded before recording).
+      return {
+        requiresIntegrationGate,
+        key,
+        evidence,
+        stale: true,
+        supersededAgents: await supersededAgentsNow(options.operator, mergedItems),
+        failure: scrub(`the board refused the revision: ${recorded.error}`),
+      };
     }
-    return { requiresIntegrationGate, key, evidence, failure: scrub(`the board refused the revision (${recorded.code}): ${recorded.error}`) };
+    return { requiresIntegrationGate, key, ...unreadKeyOf(key), evidence, failure: scrub(`the board refused the revision (${recorded.code}): ${recorded.error}`) };
   }
   const rev = recorded.appended.find((m) => m.type === "integrated.rev");
   const n = rev && rev.type === "integrated.rev" ? rev.payload.n : state.lastRevN + 1;
@@ -1518,19 +1617,25 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     // (a compare-and-swap: the advance leases the value it reads, never the
     // board's integrated commit, which the branch only reaches after this).
     try {
+      if (options.abandoned?.()) {
+        throw new Error(ABANDONED_REASON);
+      }
       await (options.advanceBranch ?? advanceIntegrationBranch)(options.integration.integrationRef, options.integration.integrationToken, commit, options.worktreeRoot);
     } catch (error) {
       if (isPromotionRefused(error, "trunk-moved")) {
         // A distinct, typed outcome: another writer moved the trunk. Nothing was pushed.
         trunkMoved = { expected: error.expected, ...(error.actual !== undefined ? { actual: error.actual } : {}) };
-        await options.operator
-          .recordEngine("trunk.moved", {
-            rev: n,
-            commit,
-            ...(error.expected !== null ? { expected: error.expected } : {}),
-            ...(error.actual !== undefined && error.actual !== null ? { actual: error.actual } : {}),
-          })
-          .catch(() => undefined);
+        // An abandoned attempt records nothing more (see ABANDONED_REASON).
+        if (!options.abandoned?.()) {
+          await options.operator
+            .recordEngine("trunk.moved", {
+              rev: n,
+              commit,
+              ...(error.expected !== null ? { expected: error.expected } : {}),
+              ...(error.actual !== undefined && error.actual !== null ? { actual: error.actual } : {}),
+            })
+            .catch(() => undefined);
+        }
       }
       excludedAgents.push({
         agent: "(integration)",
@@ -1570,7 +1675,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
         }
       : {}),
   };
-  return { revision, evidence, requiresIntegrationGate, key };
+  return { revision, evidence, requiresIntegrationGate, key, ...unreadKeyOf(key) };
 }
 
 /**
@@ -1589,10 +1694,14 @@ export class ContinuousBoardIntegrator {
   private requested = false;
   /** Set by halt (an interrupted run): no new attempt starts; the one in flight finishes. */
   private halted = false;
+  /** Set by abandon (the interrupt grace ended): the attempt in flight records nothing more. */
+  private abandoned = false;
   /** Pending-push sets already integrated, or deterministically refused (not retried until something changes). */
   private readonly attempted = new Set<string>();
   /** Transient-failure retries per pending-push set. */
   private readonly retries = new Map<string, number>();
+  /** Per pending-push set: attempts that left some pushes unread (see IntegrateBoardResult.unreadKey). */
+  private readonly unreadRetries = new Map<string, number>();
   /** Consecutive superseded-while-gating results. */
   private staleRuns = 0;
   /** Agents left out of the next attempts because their pushes kept being superseded. */
@@ -1703,6 +1812,15 @@ export class ContinuousBoardIntegrator {
     this.requested = false;
   }
 
+  /**
+   * The run stopped waiting (the interrupt grace period ended): halt, and the
+   * attempt still in flight records no revision and advances no branch.
+   */
+  abandon(): void {
+    this.halt();
+    this.abandoned = true;
+  }
+
   private async loop(): Promise<void> {
     try {
       while (this.requested && !this.halted) {
@@ -1737,7 +1855,12 @@ export class ContinuousBoardIntegrator {
           this.options.onClashes?.(clashes);
         }
       }
-      const attempt = { ...this.options, ...(this.holdBack.size > 0 ? { holdBack: [...this.holdBack] } : {}) };
+      const attempt = {
+        ...this.options,
+        decided: this.attempted,
+        abandoned: () => this.abandoned || this.options.abandoned?.() === true,
+        ...(this.holdBack.size > 0 ? { holdBack: [...this.holdBack] } : {}),
+      };
       result = this.speculatesOn(state)
         ? await integrateSpeculativeRound({
             ...attempt,
@@ -1766,6 +1889,20 @@ export class ContinuousBoardIntegrator {
     }
     // Mark the set the attempt actually read (it may have moved since `key`).
     const tried = result.key ?? key;
+    // What to mark attempted: with pushes left unread (an unreadable repo, or
+    // held back), only the set without them, so they are retried later; after
+    // maxRetries such attempts on the same set, the whole set (never a loop).
+    const decided = (): string => {
+      if (result.unreadKey === undefined || result.unreadKey === tried) {
+        return tried;
+      }
+      const used = this.unreadRetries.get(tried) ?? 0;
+      if (used >= (this.options.maxRetries ?? 3)) {
+        return tried;
+      }
+      this.unreadRetries.set(tried, used + 1);
+      return result.unreadKey;
+    };
     this.staleRuns = result.stale ? this.staleRuns + 1 : 0;
     if (result.stale && this.staleRuns >= (this.options.maxStaleRuns ?? 3)) {
       // Bounded re-gating: leave the agents whose pushes keep moving out of the
@@ -1796,7 +1933,7 @@ export class ContinuousBoardIntegrator {
     if (result.revision) {
       // One revision per pending-push set: the same set is never gated twice
       // (the next revision needs a new push).
-      this.attempted.add(tried);
+      this.attempted.add(decided());
       for (const revision of result.revisions ?? [result.revision]) {
         this.revisions.push(revision);
         this.options.onRevision?.(revision);
@@ -1821,7 +1958,7 @@ export class ContinuousBoardIntegrator {
       this.requested = true;
       return;
     }
-    this.attempted.add(tried);
+    this.attempted.add(decided());
     if (result.failure !== undefined && result.failure !== "nothing is pending") {
       this.failures.push(result.failure);
       this.options.onFailure?.(result.failure);
@@ -3178,6 +3315,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     if (interrupted()) {
       // Interrupted: nothing new is integrated; the in-flight integration gets the grace period.
       integrationCutShort = !(await withinGrace(integrator.idle()));
+      if (integrationCutShort && integrator instanceof ContinuousBoardIntegrator) {
+        // The run no longer waits for it: whatever it still finishes is never
+        // recorded or pushed (the cloud Workflow records on its own side).
+        integrator.abandon();
+      }
     } else {
       await integrator.idle();
       if (integrator.wants((await operator.page(0, 1)).state)) {
@@ -3311,25 +3453,34 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           emit({ kind: "promotion-unrecorded", reason: scrub(recorded && !recorded.ok ? `${recorded.code}: ${recorded.error}` : "the board was unreachable") });
         }
       }
-      deployment = await redeployIfPreviouslyDeployed({
-        evidence,
-        promotion,
-        sourceRepoDir,
-        projectDir: options.projectDir,
-        workRoot,
-        ...(options.deployAppDir ? { deployAppDir: options.deployAppDir } : {}),
-        ...(options.deployAppName ? { deployAppName: options.deployAppName } : {}),
-        ...(options.deployApp ? { deployApp: options.deployApp } : {}),
-        ...(options.appAlreadyDeployed ? { appAlreadyDeployed: options.appAlreadyDeployed } : {}),
-        recordDeployment: async (d) => {
-          await withWorkerAuth(rawFetch)(`${base}/changes/${encodeURIComponent(changeId)}/deployment`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(d),
-          }).catch(() => undefined);
-        },
-        emit,
-      });
+      // A promotion the board did not record has no backing revision.promoted:
+      // nothing is deployed from it (the proof bundle reports it unproven too).
+      if (promotionUnrecorded) {
+        emit({
+          kind: "deploy-skipped",
+          reason: "the promotion was not recorded on the board (no backing revision.promoted): not redeploying; the commit was still promoted to Git",
+        });
+      } else {
+        deployment = await redeployIfPreviouslyDeployed({
+          evidence,
+          promotion,
+          sourceRepoDir,
+          projectDir: options.projectDir,
+          workRoot,
+          ...(options.deployAppDir ? { deployAppDir: options.deployAppDir } : {}),
+          ...(options.deployAppName ? { deployAppName: options.deployAppName } : {}),
+          ...(options.deployApp ? { deployApp: options.deployApp } : {}),
+          ...(options.appAlreadyDeployed ? { appAlreadyDeployed: options.appAlreadyDeployed } : {}),
+          recordDeployment: async (d) => {
+            await withWorkerAuth(rawFetch)(`${base}/changes/${encodeURIComponent(changeId)}/deployment`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(d),
+            }).catch(() => undefined);
+          },
+          emit,
+        });
+      }
     } else {
       emit({ kind: "promotion-skipped", reason: "nothing was integrated: not promoting (no delivery branch was created)" });
     }

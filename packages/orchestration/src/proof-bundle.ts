@@ -158,7 +158,9 @@ export function buildProofBundle(log: readonly BoardMessage[], options: ProofBun
     reasons.push(`no gate ran on the last revision (${last.payload.n}): its pass checked nothing`);
   }
 
-  // The promotion: the board's record, else what the run reports (checked the same way).
+  // The promotion: the board's record, else what the run reports (listed and
+  // checked the same way, but never proof: only a recorded revision.promoted
+  // backs a promotion).
   const recorded = of(log, "revision.promoted").at(-1);
   const promoted = recorded ? { ...recorded.payload, seq: recorded.seq } : options.promotion;
   let promotion: ProofBundle["promotion"];
@@ -167,6 +169,9 @@ export function buildProofBundle(log: readonly BoardMessage[], options: ProofBun
       reasons.push("no promotion of the last revision was recorded");
     }
   } else {
+    if (recorded === undefined) {
+      reasons.push("promotion reported by the run but not recorded on the board (no revision.promoted backs it)");
+    }
     const rev = promoted.rev ?? last?.payload.n ?? 0;
     const matchesGated = last !== undefined && rev === last.payload.n && promoted.gatedCommit === last.payload.commit;
     promotion = {

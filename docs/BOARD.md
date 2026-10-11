@@ -264,17 +264,60 @@ QUESTIONS; the storefront run sf13 deadlocked without them):
   request), and the runtime wakes it for each, bounded (`MAX_QUESTION_CUES`).
 Revision 5 runs were published live (sf13), so this is a new revision; a
 revision 5 log replays as recorded.
-Revision 7 (everything in revision 6, plus ONE WRITER PER RELEASED TEST; in
-the live run sf19 accepted contracts released nothing to the agents):
-- a `contract.proposed` of kind `modify` on a protected target that an
-  accepted contract already released to ANOTHER live item (not done, not
-  rejected, and neither an ancestor nor a descendant of the asking item) is
-  refused `TARGET_RELEASED`, naming that item and its contract, so two agents
-  never write the same protected file unarbitrated; once that item is done
-  the target may be asked for again;
-- a child of a split or re-planned item inherits its ancestors' releases
-  (`releasedTargets`) only for the targets inside the child's own scope
-  hint, so its pushes may carry them and its integration unit applies them.
+Revision 7 (everything in revision 6, plus ONE WRITER PER RELEASED TEST and
+ONE CHARGE PER UNANSWERED PUSH; in the live run sf19 accepted contracts
+released nothing to the agents):
+- a `contract.proposed` of ANY kind (`modify`, `add`, `remove`: each releases
+  the path for writing) on a protected target that another LIVE holder
+  already holds is refused `TARGET_RELEASED`, naming that item and its
+  contract, so two agents never write the same protected file unarbitrated
+  (`releaseHolder`). The holder is the item the release belongs to now (the
+  contract's own item, or the heir that inherited it, below), outside the
+  asking item's lineage (neither an ancestor nor a descendant through splits,
+  re-plans, and merges). Only a live holder counts: claimed by an active
+  owner, not escalated, and its fix budget not spent; an open item with no
+  live owner (for example reopened after `fix.exhausted`) holds nothing, and
+  once the holder is done the target may be asked for again;
+- a proposal is also refused `TARGET_RELEASED` while another live item
+  (outside the lineage) has a PENDING contract on an overlapping target, and
+  a `contract.accepted` is refused `TARGET_RELEASED` when, since the
+  proposal, another live holder came to hold the target (two asks that raced
+  while neither was live);
+- a later accepted contract SUPERSEDES an earlier release of an overlapping
+  target held outside its lineage (it was accepted while that holder held
+  nothing live), so when the stuck item is taken again its old release no
+  longer lets it write the file. Never under a pending push: while the
+  earlier holder (live or not, for example an escalated item someone took
+  again) has a push changing the target that is not integrated yet (not
+  left out, not waiting as a regression), a `contract.accepted` of a guarded
+  contract on it from an item outside that lineage is refused
+  `TARGET_RELEASED`, naming the holder and the push, so the integration never
+  drops that push's test edit while another item gets the file; decide it
+  once the push is integrated or left out;
+- a child of a split or re-planned item, or the replacement of a merge (its
+  `replaces`: the merged neighbour counts as an ancestor), inherits an
+  ancestor's release only as its HEIR: at each step down, the first child in
+  the split or re-plan's order whose scope hint covers the target. A sibling
+  whose scope also covers it inherits nothing (its pushes carrying the file
+  are refused `OUTSIDE_INTENT`); it asks by contract, and that contract is
+  refused `TARGET_RELEASED` naming the heir while the heir is live;
+- a failing revision charges a fix attempt at most once per unanswered push:
+  an implicated item whose fix request its owner has not answered yet (no
+  push since) gets no second `fix.requested` and never `fix.exhausted` from
+  a later failing revision that re-gates the same push (common before the
+  first pass, when every revision stacks every latest push). The repeated
+  implication is evidence only: the owner's digest shows the latest failing
+  output implicating it, and the agent's fix edit carries that output (its
+  objective names both revisions: the one that asked and the later one
+  shown) and reads the files it names. Its next push answers the request,
+  and the next failing revision implicating it charges the next attempt.
+Revision 7 was amended before any recorded run used it: it was published
+briefly at fe0de67, no recorded run used it, so its final semantics are those
+documented here.
+The local integrator's pre-pass ratchet also changes under revision 7 (see
+"The pre-pass progress ratchet"): a blocked ratchet isolates its own pushes,
+blame is chosen among every removed item, a seam consumer defers to its seam
+group, and a stale developer test that fails first is not a regression.
 Revision 6 runs were recorded live (the sf14 fixture pins it), so this is a new
 revision; a revision 6 log replays as recorded.
 The three published replays and the K = 1 golden demo log carry no
@@ -384,7 +427,8 @@ need no acceptance from the lead.
    paths. A failing one completes nothing; for each item its evidence implicates
    whose owner is active, the engine appends `fix.requested` addressed (`to`) to
    that owner while the item's attempts are within `maxFixAttempts`, else
-   `fix.exhausted`. The owner's next push answers the request.
+   `fix.exhausted`. The owner's next push answers the request; under
+   revision 7 an item whose request is still unanswered is not charged again.
 10. Tools (see "Agent-built tools"): a `tool.proposed` creates the tool item
     `tool-<capability>` (scope `tools/<capability>/**`), decided by the lead
     like any worker proposal. Only its owner posts `tool.built`, with paths
@@ -567,7 +611,8 @@ is distributed changes: items are proposed and claimed, never assigned.
   written (`brokenByEdit` in `syntax-check.ts`, a syntax-only parse with
   Node's built-in TypeScript parser, no type checking): the edit fails as
   `EXECUTOR_FAILED` naming the file and the parse error, so the agent repairs
-  it on its next turn instead of pushing it to the gate. A file that already
+  it on its next turn instead of pushing it to the gate (the item's next edit
+  is also told, see below). A file that already
   failed to parse before the edit is not checked, so an edit can still move a
   broken file toward fixed; on a Node without that parser the check is
   skipped. It only refuses; the gate stays authoritative.
@@ -577,15 +622,37 @@ is distributed changes: items are proposed and claimed, never assigned.
   overlaid with every file in its repo) is checked before and after the edit,
   and a type error in a file the edit changed that the file did not have
   before (same file, code, and message; line and column ignored) refuses the
-  edit as `EXECUTOR_FAILED` with the first errors, nothing pushed, so one
-  agent's compile error never hides everyone's test results at the gate.
-  Errors in other files, or ones already there, are never charged to the
-  edit. It is skipped (noted once in the agent's evidence) when the project
-  has no `tsconfig.json`, no installed dependencies (an integrated revision
-  borrows the project's only when its `package.json` is identical), no `tsc`,
-  or the edit changed no TypeScript file, and on a timeout (60 s) or output it
-  cannot read. It only refuses; the gate stays authoritative.
-  `--no-pre-push-typecheck` turns it off.
+  edit as `EXECUTOR_FAILED` with the first errors, nothing pushed. It covers
+  only new errors in the files the edit changed: errors in other files, or
+  ones already there, are never charged to the edit. The baseline is the
+  agent's own, or the latest integrated revision when that is newer (fetched
+  the same way a rebase fetches it), so an export another item's integrated
+  push added is visible. A passing check leaves the agent's reading baseline
+  where it is; a refusal found against that newer revision rebases the agent
+  onto it, so its next edit reads the files the errors are about (the stored
+  refusal says "against integrated revision N").
+  When EVERY new error is a cross-module import (TS2305, TS2307, TS2614,
+  TS2724, or TS2339 on a namespace import) of a module the edit did not
+  change, the check is skipped with that reason rather than refusing: another
+  item may be providing it, and the gate decides once both are in. It is
+  also skipped (noted once in the agent's evidence) when the project has no
+  `tsconfig.json`, no installed dependencies (an integrated revision borrows
+  the project's only when its `package.json` is identical), no `tsc`, or the
+  edit changed no TypeScript file, when either run reports a tsconfig or
+  configuration error (a location-less error, a diagnostic in a tsconfig
+  file, or a configuration code such as TS5083, TS6053, TS5058, TS18003, or
+  TS6046), and on a timeout (60 s) or output it cannot read. The overlay
+  trees leave out build output and tool state (`dist`, `build`, `coverage`,
+  `.wrangler`, `.turbo`, `.next`, `.cache`). It only refuses; the gate stays
+  authoritative. `--no-pre-push-typecheck` turns it off.
+  A refused edit (by this check, or for leaving a file unparsable) is kept per
+  item, bounded (up to 8 diagnostics, 1200 characters), and the item's NEXT
+  edit carries it in the executor's objective ("The previous edit was refused
+  before push: ... Fix them in this edit."); it is cleared once an edit for
+  the item is pushed, and when the agent loses the claim (handed off,
+  lapsed, reopened, granted to another agent, or no longer among its claims
+  for any other reason), even if it claims the item again later. The refusal
+  still ends its own turn as `EXECUTOR_FAILED`.
   Budgets: turns per item, and turns per run; a spent budget is recorded on the
   board (a handoff to another running worker when the board accepts it, else a
   help request with need `turn-budget` or `run-budget`, or `agent.left` when
@@ -821,7 +888,12 @@ is distributed changes: items are proposed and claimed, never assigned.
   the flags say). An interrupted run is verified only when its last gated
   revision passed and everything else a verified run needs holds; an
   integration still running when the grace period ends makes the result
-  partial and failed, so nothing from it is promoted. A SECOND signal exits at
+  partial and failed, so nothing from it is promoted, and that integration is
+  abandoned: whatever it still finishes records nothing more on the board
+  (no revision, `push.excluded`, `push.regressed`, `candidate.gated`,
+  `trunk.moved`, or attribution decision) and never advances the
+  integration branch (the gate process itself is not killed; it
+  runs to completion or its timeout in the background). A SECOND signal exits at
   once (130) without the ending (`cleanup-live` tears down what it left). The
   CLI exits 130 for an interrupted run that is not verified. The verdict
   is the LAST revision's gate; it is posted to `/integration` and must be
@@ -833,7 +905,9 @@ is distributed changes: items are proposed and claimed, never assigned.
   evidence it would promote is exactly the last RECORDED revision's (its gated
   commit is that revision's commit), and that the board would accept
   `revision.promoted` for it (`promotionRefusal`); otherwise it promotes and
-  redeploys nothing and says why. A speculative round whose landed pass the
+  redeploys nothing and says why. A promotion the board then refuses to
+  record (`promotion-unrecorded`) is never redeployed (`deploy-skipped`: no
+  backing `revision.promoted`), and its proof bundle is NOT-PROVEN. A speculative round whose landed pass the
   board refused after its blamed failure was recorded returns the failure's
   evidence, never the unrecorded candidate's. A worker's proposal awaiting the lead keeps the
   phase open (`all-items-done` waits for the lead's decision).
@@ -1069,9 +1143,15 @@ is distributed changes: items are proposed and claimed, never assigned.
   bounded: after 3 in a row the integrator holds the superseded agents back and
   integrates the rest WITHOUT their units (named in the revision; their newer
   pushes stay pending), so a recorded tree never contains content `merged`
-  does not list. Transient failures (a read-token 5xx, an
+  does not list. A revision the board refuses as stale (`UNKNOWN_REF`,
+  `STALE_BASE`) names the agents whose pushes moved, so the same bound applies.
+  Transient failures (a read-token 5xx, an
   unreachable repo or board) are retried with backoff (3 times per push set);
-  only a deterministic refusal marks a push set as attempted.
+  only a deterministic refusal marks a push set as attempted. When some
+  agents' pushes were not read (an unreadable repo, or held back), only the
+  set WITHOUT them is marked attempted, so they are retried later; the same
+  readable pushes are never re-gated as they were, and after 3 such attempts
+  on one set the whole set is marked attempted.
 - `ContinuousBoardIntegrator` serializes revisions (one at a time) and coalesces
   pushes that land while one runs into the next; the same pending set is never
   gated twice. In `lockstep` it integrates between rounds; in `concurrent` the
@@ -1112,7 +1192,17 @@ is distributed changes: items are proposed and claimed, never assigned.
   the speculative blame path): the same parse also runs over every board item
   whose work is NOT in the gated tree (accepted change items not merged into
   it, not integrated by an earlier pass, not done; their write intent, else
-  their scope hint). A failure that maps ONLY to such items implicates no
+  their scope hint). A merged item's paths are its write intent plus the
+  protected targets a human released to it (a developer-test contract), so a
+  failure in a released test it edited is its. A failure that names only TEST
+  files does not make an outstanding item responsible on that alone: the
+  failing tests' subjects are matched first (`tests/orders.test.ts` is about
+  a merged `src/orders.ts`), and an item known only by its scope hint (often
+  broad, such as `tests/**`) yields a test-file match to an outstanding item
+  that claimed the file. When only such hinted items match and no merged
+  item is the failing tests' subject, the failure stays outstanding (theirs),
+  never a re-fan of every merged item. A
+  failure that maps ONLY to outstanding items implicates no
   merged item: the revision is recorded with `failing.items: []` and
   `failing.outstanding` listing them, no fix is requested and no fix budget is
   charged, the summary says `implicated (outstanding): none`, and the typed
@@ -1546,6 +1636,39 @@ integrates exactly as before):
    Without a regressor nothing else is recorded and nothing is left out: the
    next revision stacks every latest push again, so coupled work accumulates
    and its remaining errors are fixed through ordinary attribution.
+
+Under revision 7 the round differs in four ways (a revision 5 or 6 goal is
+integrated exactly as above):
+- BLOCKED RATCHET. When the ratchet itself does not run the acceptance suite
+  (its score is `runs: false`), a failing stack that also does not and scores
+  no better (a tie included) is checked leave-one-out over EVERY agent's unit
+  in it, the ratchet's own pushes included, so a push already in the ratchet
+  that blocks the measurement can be isolated (`push.regressed` for a push the
+  ratchet merged passes the board's check: it is that item's latest gated
+  push and the ratchet precedes the revision).
+- BLAME AMONG WHAT WAS REMOVED. Leave-one-out removes an agent's whole unit
+  (pinned to its latest commit), not only its new items, so the blamed items
+  are chosen among every item whose push the removal removed: those whose
+  paths the removed failures name, else the new items, else (no new item, a
+  blocked ratchet) every removed item. Pinning the unit to its previous
+  commit instead was not done: a candidate whose items' latest pushes are not
+  the commits it built could be mistaken for the stack without the
+  regressors and recorded as it.
+- SEAM CONSUMERS DEFER. A seam consumer whose removal alone makes the stack
+  better is not blamed when the failure lines its removal removes name the
+  seam (its path, its module, or a blueprint symbol): it is `improves` with a
+  reason, it counts as no better for its seam group, and the group's result
+  decides (the seam push is blamed when removing the group is strictly
+  better).
+- STALE DEVELOPER TESTS. When the whole stack did not run the acceptance
+  suite only because a developer suite failed first (a typecheck failure
+  never qualifies), a candidate whose removed failure lines name only
+  developer TEST files the removed pushes did not touch (no type error, no
+  other source file) is `kept` with a reason, never blamed: a correct fix that
+  makes a stale developer test fail first is not a regression. The whole
+  stack is still recorded as the failing revision with the usual attribution,
+  so the stale test reaches the holder through the fix request and the
+  contract cue.
 
 A regressing push leaves every integration plan (`integrablePushItems`) until
 its holder pushes again; meanwhile the claim's lease runs (it renews at the
@@ -2304,7 +2427,9 @@ decisions, and the lapses, re-plans, escalations, clash predictions, trunk
 moves, token refreshes, and caps. It is PROVEN only when the last revision
 passed a gate that ran and the recorded promotion's gated commit is that
 revision's commit (and, when both are known, it executed at least the
-baseline's tests); otherwise NOT-PROVEN with each reason. With speculative
+baseline's tests); otherwise NOT-PROVEN with each reason. A promotion the run
+reports but the board did not record is listed and checked, but is never
+proof ("promotion reported by the run but not recorded on the board"). With speculative
 batch gating it also lists the candidates of the round that landed the final
 revision and the landed one (whose commit must be the revision's and the
 promoted gated commit, else NOT-PROVEN). The CLI prints a

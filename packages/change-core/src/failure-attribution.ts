@@ -15,6 +15,13 @@
 export interface AttributableUnit {
   readonly unitId: string;
   readonly paths: readonly string[];
+  /**
+   * The paths are only a planner's scope HINT (often broad, such as
+   * `tests/**`), not files the unit claimed to write: a failing TEST file
+   * under such a path alone never takes the failure from a gated unit that is
+   * the test's subject, or from an outstanding unit that claimed the file.
+   */
+  readonly hinted?: boolean;
 }
 
 /**
@@ -43,8 +50,32 @@ export function attributeFailure<U extends AttributableUnit>(
     return { units: implicated, attributed: true, outstanding };
   }
   if (outstanding.length > 0) {
-    // Every named failure is an outstanding unit's (its fix is not in this
-    // tree yet): no gated unit is implicated.
+    // A failure that names only TEST files is the contract failing, not proof
+    // the code under test is outstanding: the failing tests' subjects decide
+    // first (`tests/orders.test.ts` is about the merged `src/orders.ts`).
+    const firmly = (unit: U) =>
+      failingNames.some((name) => unitCoversName(unit, name)) ||
+      unit.paths.some((declared) => failingFiles.some((file) => !isTestPath(file) && pathCovers(declared, file)));
+    if (outstanding.some(firmly)) {
+      // Every named failure is an outstanding unit's (its fix is not in this
+      // tree yet): no gated unit is implicated.
+      return { units: [], attributed: true, outstanding };
+    }
+    const tested = testSubjectMatches([...gatedUnits, ...outstandingUnits], (unit) => unit.paths, evidence);
+    const gatedTested = gatedUnits.filter((u) => tested.has(u));
+    if (gatedTested.length > 0) {
+      return { units: gatedTested, attributed: true, outstanding: outstandingUnits.filter((u) => tested.has(u)) };
+    }
+    // A unit whose paths are only a scope hint yields to one that claimed the
+    // test file.
+    const claimed = outstanding.filter((u) => u.hinted !== true || tested.has(u));
+    if (claimed.length > 0) {
+      return { units: [], attributed: true, outstanding: claimed };
+    }
+    // Only scope hints matched, and no gated unit is the failing tests'
+    // subject: nothing here is evidence against any gated unit, so none is
+    // blamed (never a re-fan of every gated unit). The failure stays with the
+    // outstanding units it mapped to, as before hints were weighed.
     return { units: [], attributed: true, outstanding };
   }
   // Nothing named a declared file or resource directly: the failing TESTS
@@ -671,6 +702,11 @@ export function failingRepoFiles(evidence: string, repoFiles: readonly string[])
   // Last: the source files the failing tests exercise (their files and
   // describe names, most specific match first).
   return [...testSubjectMatches(sources, (file) => [file], evidence)].sort();
+}
+
+/** A test file by its name or its directory (a failing test, not the code under test). */
+function isTestPath(path: string): boolean {
+  return isTestNamed(path) || isTestFile(path);
 }
 
 /** A test-shaped path (never a module a failure is "in"). */

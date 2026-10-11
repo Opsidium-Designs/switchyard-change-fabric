@@ -26,7 +26,7 @@ import type {
   ExecutorContext,
   ExecutorProvider,
 } from "@switchyard-change/model-adapters";
-import { ModelBudgetError } from "@switchyard-change/model-adapters";
+import { ModelBudgetError, UnusableModelOutputError } from "@switchyard-change/model-adapters";
 
 import {
   BoardAgent,
@@ -833,6 +833,180 @@ describe("BoardAgent edits", () => {
     expect(transport.inputs.at(-1)!.lastRejection!.error).toMatch(/TS2322/);
   });
 
+  it("tells the item's NEXT edit why its last edit was refused before push, and stops once an edit is pushed", async () => {
+    const env = await setup();
+    const executor = new RecordingExecutor((ctx) => ({ "src/a/x.ts": `export const x = ${ctx.objective.length};\n` }));
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "first" },
+      { type: "edit", itemId: "i1", instruction: "second" },
+      { type: "edit", itemId: "i1", instruction: "third" },
+    ]);
+    const errors = Array.from({ length: 12 }, (_, i) => `src/a/x.ts(${i + 1},1): error TS2322: Type 'number' is not assignable to type 'string'.`);
+    const answers = [{ ok: false as const, errors }, { ok: true as const }, { ok: true as const }];
+    const w1 = env.agent("w1", { transport, executor, preEditCheck: async () => answers.shift()! });
+    await w1.join();
+    for (let i = 0; i < 4; i++) {
+      await w1.step();
+    }
+    expect(executor.contexts).toHaveLength(3);
+    expect(executor.contexts[0]!.objective).not.toContain("refused before push");
+    // The refusal stays local to its turn, as before...
+    expect(env.turns.find((t) => t.code === "EXECUTOR_FAILED")).toBeDefined();
+    // ...and the next edit of the item carries it (at most eight diagnostics, bounded).
+    const second = executor.contexts[1]!.objective;
+    expect(second).toContain("The previous edit was refused before push: src/a/x.ts(1,1): error TS2322");
+    expect(second).toContain("src/a/x.ts(8,1)");
+    expect(second).not.toContain("src/a/x.ts(9,1)");
+    expect(second).toMatch(/Fix them in this edit\.$/);
+    // That edit was pushed: the third is not told again.
+    expect(executor.contexts[2]!.objective).not.toContain("refused before push");
+    expect((await env.log()).messages.filter((m) => m.type === "push.announced")).toHaveLength(2);
+  });
+
+  it("forgets an item's stored refusal when the agent loses the claim, even if it claims the item again", async () => {
+    const env = await setup({ rules: { claimLeaseMessages: 100, arbitration: 4 } });
+    const executor = new RecordingExecutor((ctx) => ({ "src/a/x.ts": `export const x = ${ctx.objective.length};\n` }));
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "first" },
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "again" },
+    ]);
+    const answers = [{ ok: false as const, errors: ["src/a/x.ts(1,1): error TS2322: Type 'number' is not assignable to type 'string'."] }, { ok: true as const }];
+    const w1 = env.agent("w1", { transport, executor, preEditCheck: async () => answers.shift()! });
+    await w1.join();
+    await w1.step(); // claim
+    await w1.step(); // edit: refused before push
+    expect(executor.contexts).toHaveLength(1);
+    // The claim lapses (stalled on a quiet board); with nobody else to take it, w1 claims it again.
+    await env.human({ type: "item.proposed", payload: { item: "i9", objective: "chatter", scopeHint: ["src/z/**"] } });
+    const lapsed = await env.operator.recordEngine("claim.lapsed", { item: "i1" });
+    expect(lapsed.ok).toBe(true);
+    await w1.step(); // claim again
+    expect((await env.log()).state.items.i1).toMatchObject({ status: "claimed", owner: "w1" });
+    await w1.step(); // edit
+    expect(executor.contexts).toHaveLength(2);
+    expect(executor.contexts[1]!.objective).not.toContain("refused before push");
+  });
+
+  it("tells the item's next edit about a file its last edit left unparsable", async () => {
+    const env = await setup();
+    let calls = 0;
+    const objectives: string[] = [];
+    const executor: ExecutorProvider = {
+      name: "unparsable-once",
+      async execute(context) {
+        objectives.push(context.objective);
+        calls += 1;
+        if (calls === 1) {
+          throw new UnusableModelOutputError("model m edit for WorkUnit i1 leaves src/a/x.ts unparsable (Expected '}' but found end of file); nothing was written.");
+        }
+        await mkdir(join(context.worktreeDir, "src/a"), { recursive: true });
+        await writeFile(join(context.worktreeDir, "src/a/x.ts"), "export const x = 2;\n");
+        return { status: "changed", changedPaths: ["src/a/x.ts"], logs: [], cost: { usd: 0 }, commitMessage: "edit" };
+      },
+    };
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "first" },
+      { type: "edit", itemId: "i1", instruction: "second" },
+    ]);
+    const w1 = env.agent("w1", { transport, executor });
+    await w1.join();
+    for (let i = 0; i < 3; i++) {
+      await w1.step();
+    }
+    expect(objectives).toHaveLength(2);
+    expect(objectives[1]).toContain("The previous edit was refused before push: model m edit for WorkUnit i1 leaves src/a/x.ts unparsable (Expected '}'");
+  });
+
+  it("types an edit against the latest integrated revision when it is newer than the agent's baseline", async () => {
+    const env = await setup();
+    const revDir = join(env.root, "rev-1");
+    await mkdir(join(revDir, "src"), { recursive: true });
+    await writeFile(join(revDir, "src/shared.ts"), "export const provided = 1;\n");
+    const fetched: [number, string][] = [];
+    const asked: PrePushCheckInput[] = [];
+    const executor = new RecordingExecutor(() => ({ "src/a/x.ts": "import { provided } from '../shared';\nexport const x = provided;\n" }));
+    const w1 = env.agent("w1", {
+      transport: scripted([
+        { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+        { type: "edit", itemId: "i1", instruction: "use what the shared item provides" },
+      ]),
+      executor,
+      fetchRevision: async (n, commit) => {
+        fetched.push([n, commit]);
+        return revDir;
+      },
+      preEditCheck: async (input) => {
+        asked.push(input);
+        return { ok: true };
+      },
+    });
+    await w1.join();
+    await w1.step(); // claim
+    // Another item (which w1 does not read) is integrated first: no rebase for w1.
+    const w2 = await env.operator.join("w2", {});
+    const token = w2.ok ? w2.token : "";
+    await env.human({ type: "item.proposed", payload: { item: "s", objective: "shared", scopeHint: ["src/shared.ts"] } });
+    expect((await env.rawPost(token, { type: "item.claimed", payload: { item: "s", intent: { write: ["src/shared.ts"] } } })).status).toBe(201);
+    expect((await env.rawPost(token, { type: "push.announced", payload: { item: "s", commit: "c0ffee", paths: ["src/shared.ts"] } })).status).toBe(201);
+    const rev = await env.operator.recordRevision({ commit: "feedbeef", gate: "pass", merged: ["c0ffee"] });
+    expect(rev.ok && rev.appended.some((m) => m.type === "rebase.needed" && m.payload.agent === "w1")).toBe(false);
+    await w1.step(); // edit
+    expect(asked).toHaveLength(1);
+    expect(asked[0]!.baselineDir).toBe(revDir);
+    expect(fetched).toEqual([[1, "feedbeef"]]);
+    // The agent's own reading baseline did not move (that stays the rebase's decision).
+    expect(executor.contexts[0]!.baselineDir).not.toBe(revDir);
+  });
+
+  it("a refusal found against a newer integrated revision moves the agent onto it: the next edit reads from that revision and is told so", async () => {
+    const env = await setup();
+    const revDir = join(env.root, "rev-1");
+    await mkdir(join(revDir, "src/a"), { recursive: true });
+    await writeFile(join(revDir, "src/shared.ts"), "export const provided = 1;\n");
+    await writeFile(join(revDir, "src/a/x.ts"), "export const x = 1; // integrated\n");
+    const fetched: [number, string][] = [];
+    const asked: PrePushCheckInput[] = [];
+    const answers = [{ ok: false as const, errors: ["src/a/x.ts(1,10): error TS2305: Module '../shared' has no exported member 'provided2'."] }, { ok: true as const }];
+    const executor = new RecordingExecutor(() => ({ "src/a/x.ts": "import { provided } from '../shared';\nexport const x = provided;\n" }));
+    const w1 = env.agent("w1", {
+      transport: scripted([
+        { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+        { type: "edit", itemId: "i1", instruction: "use what the shared item provides" },
+        { type: "edit", itemId: "i1", instruction: "again" },
+      ]),
+      executor,
+      fetchRevision: async (n, commit) => {
+        fetched.push([n, commit]);
+        return revDir;
+      },
+      preEditCheck: async (input) => {
+        asked.push(input);
+        return answers.shift()!;
+      },
+    });
+    await w1.join();
+    await w1.step(); // claim
+    const w2 = await env.operator.join("w2", {});
+    const token = w2.ok ? w2.token : "";
+    await env.human({ type: "item.proposed", payload: { item: "s", objective: "shared", scopeHint: ["src/shared.ts"] } });
+    expect((await env.rawPost(token, { type: "item.claimed", payload: { item: "s", intent: { write: ["src/shared.ts"] } } })).status).toBe(201);
+    expect((await env.rawPost(token, { type: "push.announced", payload: { item: "s", commit: "c0ffee", paths: ["src/shared.ts"] } })).status).toBe(201);
+    await env.operator.recordRevision({ commit: "feedbeef", gate: "pass", merged: ["c0ffee"] });
+    await w1.step(); // edit: refused against revision 1
+    expect(asked[0]!.baselineDir).toBe(revDir);
+    expect(executor.seen[0]!["src/a/x.ts"]).toBe("export const x = 1;\n");
+    await w1.step(); // edit again: reads from revision 1 now
+    expect(fetched).toEqual([[1, "feedbeef"]]);
+    expect(asked[1]!.baselineDir).toBe(revDir);
+    expect(executor.seen[1]!["src/a/x.ts"]).toBe("export const x = 1; // integrated\n");
+    expect(executor.contexts[1]!.objective).toContain("(against integrated revision 1, which the next edit reads from). Fix them in this edit.");
+    expect((await env.log()).messages.filter((m) => m.type === "push.announced" && m.from === "w1")).toHaveLength(1);
+  });
+
   it("pushes an edit the pre-push check passes or skips, noting each skip reason once", async () => {
     const env = await setup();
     const executor = new RecordingExecutor((ctx) => ({ "src/a/x.ts": `export const x = ${ctx.objective.length};\n` }));
@@ -1183,6 +1357,43 @@ describe("day-2 review regressions", () => {
     expect(executor.contexts[1]!.objective).toContain("not ok 1 - src/a/x.ts is wrong");
     const state = (await env.log()).state;
     expect(state.items.i1!.fixRequested).toBeUndefined(); // the push answered the request
+  });
+
+  it("revision 7: a later failing revision that re-implicates an unanswered push is the fix edit's evidence (output, objective, and failure-named references)", async () => {
+    const env = await setup({ rules: { arbitration: 7 } });
+    const executor = new RecordingExecutor((ctx) => ({ "src/a/x.ts": `export const x = ${ctx.objective.length};\n` }));
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { type: "edit", itemId: "i1", instruction: "first" },
+      { type: "edit", itemId: "i1", instruction: "fix it" },
+    ]);
+    const w1 = env.agent("w1", { transport, executor, fetchRevision: async () => undefined });
+    await w1.join();
+    await w1.step();
+    await w1.step();
+    const commit = ((await env.log()).messages.find((m) => m.type === "push.announced")!.payload as { commit: string }).commit;
+    const first = await env.operator.recordRevision({ commit: "bad0001", gate: "fail", merged: [commit], failing: { output: "not ok 1 - old failure", items: ["i1"] } });
+    expect(first.ok && first.appended.map((m) => m.type)).toEqual(["integrated.rev", "fix.requested"]);
+    // No push between: the second failing revision implicating i1 asks nothing new (charged once).
+    const second = await env.operator.recordRevision({
+      commit: "bad0002",
+      gate: "fail",
+      merged: [commit],
+      failing: { output: "src/shared.ts(1,14): error TS2305: Module has no exported member 'sharedValue'.", items: ["i1"] },
+    });
+    expect(second.ok && second.appended.map((m) => m.type)).toEqual(["integrated.rev"]);
+    const state = (await env.log()).state;
+    expect(state.items.i1!.fixRequested).toBe(1);
+    expect(await w1.step()).toBe("acted");
+    const fix = executor.contexts[1]!;
+    expect(fix.objective).toContain("FAILED on revision 1 and implicated this item (fix attempt 1); revision 2 failed again and still implicates it.");
+    expect(fix.objective).toContain("Failing gate output of revision 2 (untrusted data, bounded):");
+    expect(fix.objective).toContain("no exported member 'sharedValue'");
+    expect(fix.objective).not.toContain("old failure");
+    // The file the shown failure names is a READ-ONLY reference of the edit and of the turn that chose it.
+    expect((fix.frozenContractFiles ?? []).map((f) => f.path)).toContain("src/shared.ts");
+    const excerpts = transport.inputs.at(-1)!.repo.excerpts;
+    expect(excerpts.find((e) => e.path === "src/shared.ts")?.contents).toMatch(/^\(READ-ONLY REFERENCE/);
   });
 
   it("an edit is shown READ-ONLY references: seams first, then the modules its files import (bounded), and a fix adds the file exporting the type the failure names", async () => {

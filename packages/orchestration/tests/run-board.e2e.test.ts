@@ -480,7 +480,8 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
         return runs === 1 ? { code: 1, stdout: "not ok 1 - a\nok 2 - b\n", stderr: "" } : { code: 0, stdout: "ok 1 - b\n", stderr: "" };
       },
     };
-    const result = await offline({ goal: GOAL, projectDir, seed, appGateCommand: ["gate"], verifyCommandRunner: exiting });
+    // The gate can never pass here, so bound the fix budget to end the run quickly.
+    const result = await offline({ goal: GOAL, projectDir, seed, appGateCommand: ["gate"], verifyCommandRunner: exiting, budgets: { maxFixAttemptsPerItem: 1 } });
     // Count and format only on the board: names stay with the integrator.
     expect(of(result.log, "goal.posted")[0]!.payload.testInventory).toEqual({ status: "recorded", format: "tap", count: 2 });
     expect(result.revisions.every((r) => r.gate === "fail")).toBe(true);
@@ -2187,6 +2188,69 @@ describe("runBoard never promotes or redeploys a candidate the board did not rec
     expect(events.some((e) => e.kind === "promoting")).toBe(false);
     expect(result.proof?.status).not.toBe("proven");
     expect(boardRunExitCode(result)).toBe(1);
+  }, 120_000);
+
+  it("a promotion the board refused to record is never redeployed (deploy-skipped) and is not proven", async () => {
+    const root = await mkdtemp(join(tmpdir(), "scf-unrecorded-promotion-"));
+    const projectDir = join(root, "p");
+    for (const [rel, body] of Object.entries({ "package.json": '{"name":"p","scripts":{}}\n', "src/w.ts": "w\n", "src/x.ts": "x\n" })) {
+      await mkdir(dirname(join(projectDir, rel)), { recursive: true });
+      await writeFile(join(projectDir, rel), body);
+    }
+    const control = new LocalChangeControl(new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "repos") }));
+    const inner = control.fetch as unknown as typeof fetch;
+    // The board refuses the engine's revision.promoted record (and nothing else).
+    let refusedPromotion = 0;
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      if (String(url).endsWith("/board/record") && init?.method === "POST" && (JSON.parse(String(init.body)) as { type: string }).type === "revision.promoted") {
+        refusedPromotion += 1;
+        return new Response(JSON.stringify({ code: "INVALID_STATE", error: "refused for the test" }), { status: 409, headers: { "content-type": "application/json" } });
+      }
+      return inner(url as never, init);
+    }) as unknown as typeof fetch;
+    const passing: CommandRunner = { run: async () => ({ code: 0, stdout: "ok 1 - all\n", stderr: "" }) };
+    const deploys: string[] = [];
+    const events: BoardRunEvent[] = [];
+    const result = await runBoard({
+      goal: GOAL,
+      changeId: "unrecorded-promotion",
+      workerUrl: "http://local-control",
+      fetchFn,
+      dial: { minConcurrency: 1, maxConcurrency: 2 },
+      transport: createGenericBoardPolicy(),
+      seed: async () => ({
+        source: "planner",
+        model: "fake-planner",
+        items: ["w", "x"].map((item) => ({ item, objective: `do ${item}`, acceptance: ["gate passes"], scopeHint: [`src/${item}.ts`] })),
+      }),
+      resolveContract: reject,
+      workRoot: join(root, "work"),
+      projectDir,
+      executor: new AttemptStamp(),
+      schedule: "lockstep",
+      appGateCommand: ["gate"],
+      verifyCommandRunner: passing,
+      budgets: { maxRunTurns: 200, maxRounds: 200 },
+      deployAppDir: projectDir,
+      deployAppName: "unrecorded-app",
+      deployApp: async ({ appName }) => {
+        deploys.push(appName);
+        return { url: `https://${appName}.example.workers.dev` };
+      },
+      appAlreadyDeployed: async ({ appName }) => `https://${appName}.example.workers.dev`,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(result.verdict).toBe("verified");
+    expect(result.promotion).toMatchObject({ committed: true });
+    expect(refusedPromotion).toBe(1);
+    expect(of(result.log, "revision.promoted")).toEqual([]);
+    expect(events.some((e) => e.kind === "promotion-unrecorded")).toBe(true);
+    expect(deploys).toEqual([]);
+    expect(result.deployment).toBeUndefined();
+    expect(events.find((e) => e.kind === "deploy-skipped")).toMatchObject({ reason: expect.stringMatching(/not recorded on the board/) });
+    expect(result.proof?.status).toBe("not-proven");
+    expect(result.proof!.reasons.join("\n")).toMatch(/promotion reported by the run but not recorded on the board/);
   }, 120_000);
 });
 
