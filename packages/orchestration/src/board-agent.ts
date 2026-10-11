@@ -418,6 +418,16 @@ export function resolveIntentFiles(entries: readonly string[], files: readonly s
   return out;
 }
 
+/**
+ * The protected paths a human released to a held claim by an accepted
+ * contract (`claims[].released`), never any part of the immutable acceptance
+ * gate: the agent writes them as if they were in the write intent.
+ */
+export function releasedWrite(claim: BoardDigest["claims"][number], digest: Pick<BoardDigest, "immutable">): string[] {
+  const immutable = digest.immutable ?? [];
+  return [...new Set((claim.released ?? []).map(intentPath))].filter((p) => !immutable.some((i) => entriesOverlap(p, i)));
+}
+
 async function exists(path: string): Promise<boolean> {
   try {
     await stat(path);
@@ -1689,7 +1699,7 @@ export class BoardAgent {
       capsule: {
         objective: this.options.goal,
         constraints: [
-          `write only inside the write intent of an item you hold`,
+          `write only inside the write intent of an item you hold (and the protected paths released to it: claims[].released)`,
           `at most ${this.options.maxTurnsPerItem} turns per item`,
           `contests escalate to a human after ${state.rules.maxContestTurns} turns`,
         ],
@@ -1776,10 +1786,10 @@ export class BoardAgent {
     const granted = (digest.help?.granted ?? []).filter((g) => g.live).flatMap((g) => g.scope);
     const entries =
       digest.claims.length > 0 || granted.length > 0
-        ? [...digest.claims.flatMap((c) => [...c.intent.write, ...c.intent.read]), ...granted]
+        ? [...digest.claims.flatMap((c) => [...c.intent.write, ...releasedWrite(c, digest), ...c.intent.read]), ...granted]
         : digest.openItems.flatMap((i) => i.scopeHint);
     const intentFiles = resolveIntentFiles(entries, files).filter((path) => !hasWildcard(path));
-    const writable = resolveIntentFiles(digest.claims.flatMap((c) => c.intent.write), files).filter((path) => !hasWildcard(path));
+    const writable = resolveIntentFiles(digest.claims.flatMap((c) => [...c.intent.write, ...releasedWrite(c, digest)]), files).filter((path) => !hasWildcard(path));
     const evidence = digest.claims.some((c) => c.fix !== undefined && digest.failure?.n === c.fix.n) ? (digest.failure?.output ?? "") : "";
     const references =
       writable.length > 0
@@ -2433,7 +2443,10 @@ export class BoardAgent {
     }
     const head = (await gitOut(worktree, ["rev-parse", "--verify", "-q", "HEAD"]).catch(() => "")).trim() || undefined;
     await this.cleanStray(worktree, head, `editing ${itemId}`);
-    const writeGlobs = [...new Set(claim.intent.write.map(intentPath))];
+    // The write intent plus the protected paths a human released to this item
+    // by an accepted contract (never the immutable acceptance gate).
+    const released = releasedWrite(claim, digest);
+    const writeGlobs = [...new Set([...claim.intent.write.map(intentPath), ...released])];
     // A handed-off item starts from the previous owner's latest pushed version
     // of its files: copy them into this agent's worktree before the first edit.
     const inherited = this.inherited.get(itemId);
@@ -2494,6 +2507,9 @@ export class BoardAgent {
     const objective = [
       claim.objective,
       `Instruction: ${instruction}`,
+      ...(released.length > 0
+        ? [`A human accepted changing ${released.join(", ")} for this item: it is writable in this edit; change only what the goal changes there.`]
+        : []),
       ...(fix !== undefined
         ? [
             `The integration gate FAILED on revision ${fix.n} and implicated this item (fix attempt ${fix.attempt}).`,

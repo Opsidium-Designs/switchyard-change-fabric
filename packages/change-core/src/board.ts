@@ -167,12 +167,20 @@ export interface BoardRules {
    *     again for the identical errors;
    *   - a plain question (help.requested with no scope) records whom it asks
    *     (`askedOf`), and the addressee's digest lists it until answered.
+   * Revision 7 (what a new run posts) adds ONE WRITER PER RELEASED TEST:
+   *   - a contract (kind modify) on a protected target an accepted contract
+   *     already released to another live item (not done, not rejected, and
+   *     neither an ancestor nor a descendant of the asking item) is refused
+   *     TARGET_RELEASED, naming that item, so two agents never write the same
+   *     protected file unarbitrated;
+   *   - a child of a split or re-planned item inherits its ancestors'
+   *     releases only for the targets inside the child's own scope hint.
    */
   readonly arbitration?: number;
 }
 
 /** The arbitration revision a new board run posts (see BoardRules.arbitration). */
-export const CURRENT_ARBITRATION = 6;
+export const CURRENT_ARBITRATION = 7;
 
 export const DEFAULT_BOARD_RULES: BoardRules = { maxContestTurns: 3, contestIdleMessages: 25, maxFixAttempts: 2 };
 
@@ -1162,6 +1170,7 @@ export type BoardErrorCode =
   | "OUTSIDE_SCOPE"
   | "PROTECTED"
   | "CONTRACT_REJECTED"
+  | "TARGET_RELEASED"
   | "NOT_WITHIN"
   | "INVALID_STATE"
   | "LIMIT"
@@ -2874,13 +2883,75 @@ export function mergedChildrenWrite(state: BoardState, merges: readonly { readon
 
 /**
  * The targets of ACCEPTED contracts for `item` (all items when omitted): the
- * protected paths those contracts released for writing.
+ * protected paths those contracts released for writing. Under arbitration
+ * revision 7 an item also inherits the releases of its ancestors (a split or
+ * re-planned item) for the targets inside its own scope hint.
  */
 export function releasedTargets(state: BoardState, item?: string): string[] {
-  return Object.values(state.contracts)
+  const own = Object.values(state.contracts)
     // A seam contract releases nothing to the item that asked: its SEAM ITEM carries the change.
     .filter((c) => c.status === "accepted" && c.item !== undefined && c.seam === undefined && (item === undefined || c.item === item))
     .map((c) => c.target);
+  const child = item !== undefined && arbitrationV7(state) ? state.items[item] : undefined;
+  if (child === undefined) {
+    return own;
+  }
+  const inherited: string[] = [];
+  for (let parent = child.parent; parent !== undefined; parent = state.items[parent]?.parent) {
+    for (const c of Object.values(state.contracts)) {
+      if (c.status === "accepted" && c.item === parent && c.seam === undefined && child.scopeHint.some((hint) => entryWithin(c.target, intentPath(hint)))) {
+        inherited.push(c.target);
+      }
+    }
+  }
+  return inherited.length > 0 ? [...own, ...inherited.filter((t) => !own.includes(t))] : own;
+}
+
+/**
+ * The paths released to `item` by its accepted protected contracts that an
+ * agent may write (releasedTargets without any part of the immutable
+ * acceptance gate). Pure.
+ */
+export function releasedForAgent(state: BoardState, item: string): string[] {
+  return [...new Set(releasedTargets(state, item))].filter((t) => !(state.immutable ?? []).some((p) => entriesOverlap(t, p)));
+}
+
+/**
+ * The released paths of `item` its latest push has not changed since the
+ * contract that released each was accepted (a push before the acceptance
+ * never counts). Pure.
+ */
+export function releasedUnchanged(state: BoardState, item: BoardItem): string[] {
+  const writable = releasedForAgent(state, item.id);
+  const push = item.lastPush;
+  return writable.filter((target) => {
+    const decided = Object.values(state.contracts)
+      .filter((c) => c.status === "accepted" && c.item !== undefined && (c.item === item.id || isAncestor(state, c.item, item.id)) && c.seam === undefined && c.target === target)
+      .reduce((latest, c) => Math.max(latest, c.decidedSeq ?? 0), 0);
+    return !(push !== undefined && push.seq > decided && push.paths.some((p) => entryWithin(p, intentPath(target))));
+  });
+}
+
+/**
+ * Arbitration revision 7: the accepted contract that released `target` to
+ * another LIVE item (not done, not rejected, neither an ancestor nor a
+ * descendant of `item`), or undefined. Pure.
+ */
+export function releaseHolder(state: BoardState, item: string, target: string): BoardContract | undefined {
+  return Object.values(state.contracts).find((c) => {
+    const other = c.item !== undefined ? state.items[c.item] : undefined;
+    return (
+      c.status === "accepted" &&
+      c.seam === undefined &&
+      other !== undefined &&
+      other.id !== item &&
+      other.status !== "done" &&
+      other.status !== "rejected" &&
+      !isAncestor(state, other.id, item) &&
+      !isAncestor(state, item, other.id) &&
+      entriesOverlap(c.target, target)
+    );
+  });
 }
 
 /** The item whose latest, not yet integrated push has this commit. */
@@ -3153,6 +3224,11 @@ export function arbitrationV5(state: Pick<BoardState, "rules">): boolean {
 /** True under arbitration revision 6 or later (settled seam items, addressed questions; see BoardRules.arbitration). Pure. */
 export function arbitrationV6(state: Pick<BoardState, "rules">): boolean {
   return (state.rules.arbitration ?? 1) >= 6;
+}
+
+/** True under arbitration revision 7 or later (one writer per released test; see BoardRules.arbitration). Pure. */
+export function arbitrationV7(state: Pick<BoardState, "rules">): boolean {
+  return (state.rules.arbitration ?? 1) >= 7;
 }
 
 /**
@@ -4577,6 +4653,17 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
             "OUTSIDE_SCOPE",
             `${target} is outside item ${item.id}'s scope hint (${item.scopeHint.join(", ")}) and is not the failing check of a revision implicating it`,
           );
+        }
+        // Revision 7: one writer per released protected file. Another live
+        // item (not this one's ancestor or descendant) already holds it.
+        if (arbitrationV7(state) && draft.payload.kind === "modify") {
+          const holder = releaseHolder(state, item.id, target);
+          if (holder) {
+            fail(
+              "TARGET_RELEASED",
+              `${target} is already released to item ${holder.item} (contract ${holder.contract}, ${holder.target}): only that item changes it; ask its owner (a question naming ${holder.item}) instead of a second contract`,
+            );
+          }
         }
         // A human said no for this item: asking again is only legitimate once
         // new evidence (a failing revision implicating the item) exists.
@@ -7061,6 +7148,14 @@ export interface BoardDigest {
     readonly waitsFor?: readonly string[];
     /** The failing check is in a protected path (the contract): propose a contract change if it pins old behavior. */
     readonly contractCue?: { readonly paths: readonly string[]; readonly hint: string };
+    /**
+     * Protected paths a human RELEASED to this item by an accepted contract
+     * (never the immutable acceptance gate): writable for this item as if in
+     * its write intent, and integrated with its push.
+     */
+    readonly released?: readonly string[];
+    /** Released paths the item's latest push has not changed since the acceptance: edit them with the code fix. */
+    readonly contractReleased?: { readonly paths: readonly string[]; readonly hint: string };
     /** The failing type error involves a frozen shared seam: propose a seam contract with the exact change (the lead decides). */
     readonly seamCue?: { readonly seams: readonly string[]; readonly errors: readonly string[]; readonly hint: string };
     /** The item's fix budget is spent. */
@@ -7429,7 +7524,11 @@ export function boardDigest(
         return waits.length > 0 ? { waitsFor: waits } : {};
       })(),
       ...((): { contractCue?: { paths: string[]; hint: string } } => {
-        const paths = i.fixRequested !== undefined ? contractCue(state, i.id).filter((p) => !releasedTargets(state, i.id).includes(p)) : [];
+        // Revision 7: never cue a contract the board refuses (released to another live item).
+        const paths =
+          i.fixRequested !== undefined
+            ? contractCue(state, i.id).filter((p) => !releasedTargets(state, i.id).includes(p) && !(arbitrationV7(state) && releaseHolder(state, i.id, p) !== undefined))
+            : [];
         return paths.length > 0
           ? {
               contractCue: {
@@ -7438,6 +7537,26 @@ export function boardDigest(
               },
             }
           : {};
+      })(),
+      ...((): { released?: string[]; contractReleased?: { paths: string[]; hint: string } } => {
+        const released = releasedForAgent(state, i.id);
+        if (released.length === 0) {
+          return {};
+        }
+        const pending = releasedUnchanged(state, i);
+        return {
+          released,
+          ...(pending.length > 0
+            ? {
+                contractReleased: {
+                  paths: pending,
+                  hint:
+                    `a human accepted changing ${pending.join(", ")} for ${i.id}: it is writable for this item now; edit it in the same edit as the code fix so they integrate together, ` +
+                    "changing only the assertions that encode the behavior the goal changes",
+                },
+              }
+            : {}),
+        };
       })(),
       ...((): { seamCue?: { seams: string[]; errors: string[]; hint: string } } => {
         const cue = i.fixRequested !== undefined ? (seamContractCue(state, i.id) ?? regressionSeamCue(state, i, regressions.get(i.id))) : undefined;

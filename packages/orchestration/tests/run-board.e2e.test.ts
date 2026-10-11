@@ -628,7 +628,7 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     expect(result.revisions.some((r) => r.gate === "pass")).toBe(true);
     expect(result.verdict).toBe("failed");
     expect(result.partial).toMatch(/never gated/);
-    expect(result.promotion).toBeUndefined();
+    expect(result.promotion?.committed).not.toBe(true);
   });
 
   it("retries a transient read-token failure and revokes every read token once integration is done with it", async () => {
@@ -675,7 +675,7 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     expect(types(result.log)).not.toContain("push.announced");
     expect(result.revision).toBeUndefined();
     expect(result.verdict).toBe("failed");
-    expect(result.promotion).toBeUndefined();
+    expect(result.promotion?.committed).not.toBe(true);
   });
 
   it("stops at the run-wide budget", async () => {
@@ -2201,5 +2201,102 @@ describe("runBoard meters the planner pass's plan-review decisions", () => {
     });
     expect(of(reviewed.log, "decision.recorded").filter((m) => m.payload.juncture === "plan-review")).toHaveLength(2);
     expect(reviewed.usage!.calls - plain.usage!.calls).toBe(2);
+  }, 120_000);
+});
+
+describe("a developer test a human released reaches the agent (live regression sf19)", () => {
+  /**
+   * A project whose developer test pins the OLD rate outside the item's scope
+   * (tests/tax.test.ts) while the immutable acceptance gate asks for the new
+   * one. The gate runs the developer suite, then the acceptance suite.
+   */
+  async function taxProject(): Promise<string> {
+    const dir = await mkdtemp(join(tmpdir(), "scf-board-sf19-"));
+    for (const [rel, body] of Object.entries({
+      "package.json": '{"name":"p","scripts":{}}\n',
+      "src/tax.ts": "export const RATE = 7;\n",
+      "tests/tax.test.ts": "expect(RATE).toBe(7);\n",
+      "gate/acceptance.test.ts": "expect(RATE).toBe(8);\n",
+    })) {
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      await writeFile(join(dir, rel), body);
+    }
+    return dir;
+  }
+  const taxSeed = async (): Promise<BoardSeed> => ({
+    source: "planner",
+    model: "fake-planner",
+    items: [{ item: "billing-tax-correctness", objective: "the tax rate is 8", acceptance: ["gate passes"], scopeHint: ["src/tax.ts"] }],
+  });
+  const valueIn = async (file: string): Promise<number> => Number(/(\d+)/.exec(await readFile(file, "utf8"))?.[1] ?? NaN);
+  /** Developer suite (the test's pinned value equals the code), then acceptance (the code is 8). */
+  const taxGate: CommandRunner = {
+    async run(_argv, cwd) {
+      const rate = await valueIn(join(cwd, "src/tax.ts"));
+      const pinned = await valueIn(join(cwd, "tests/tax.test.ts"));
+      const developer = rate === pinned ? " ✓ tests/tax.test.ts (1 test)\n" : ` FAIL tests/tax.test.ts > rate\nAssertionError: expected ${rate} to be ${pinned}\n at tests/tax.test.ts:1:14\n`;
+      const acceptance = rate === 8 ? " ✓ gate/acceptance.test.ts (1 test)\n" : ` FAIL gate/acceptance.test.ts > rate\nAssertionError: expected ${rate} to be 8\n at gate/acceptance.test.ts:1:14\n`;
+      return { code: rate === pinned && rate === 8 ? 0 : 1, stdout: `${developer}${acceptance}`, stderr: "" };
+    },
+  };
+  /** Writes the new rate, and the released test's new expectation when the test is in its paths. */
+  class TaxExecutor implements ExecutorProvider {
+    readonly name = "tax";
+    readonly contexts: ExecutorContext[] = [];
+    async execute(context: ExecutorContext): Promise<ExecutionResult> {
+      this.contexts.push(context);
+      const files: Record<string, string> = {
+        "src/tax.ts": "export const RATE = 8;\n",
+        ...(context.paths.includes("tests/tax.test.ts") ? { "tests/tax.test.ts": "expect(RATE).toBe(8);\n" } : {}),
+      };
+      for (const [rel, body] of Object.entries(files)) {
+        await mkdir(dirname(join(context.worktreeDir, rel)), { recursive: true });
+        await writeFile(join(context.worktreeDir, rel), body);
+      }
+      return { status: "changed", changedPaths: Object.keys(files), logs: [], cost: { usd: 0 }, commitMessage: "rate 8" };
+    }
+  }
+  const options = async (executor: TaxExecutor) => ({
+    goal: "Charge the new tax rate",
+    projectDir: await taxProject(),
+    seed: taxSeed,
+    executor,
+    appGateCommand: ["vitest", "run", "gate"],
+    verifyCommandRunner: taxGate,
+  });
+
+  it("accepted: the push carrying the released test integrates with the code fix, the promoted tree has both, verified, and nothing is recorded regressed", async () => {
+    const executor = new TaxExecutor();
+    const result = await runBoardOffline({ ...(await options(executor)), resolveContract: async () => "accept" });
+    expect(result.state.protected).toContain("tests/tax.test.ts");
+    expect(result.state.immutable).toContain("gate/acceptance.test.ts");
+    expect(of(result.log, "contract.accepted").map((m) => m.from)).toEqual(["human"]);
+    expect(executor.contexts.some((c) => c.paths.includes("tests/tax.test.ts") && /A human accepted changing tests\/tax\.test\.ts/.test(c.objective))).toBe(true);
+    const both = of(result.log, "push.announced").filter((m) => m.payload.paths.includes("tests/tax.test.ts"));
+    // The released test lands with the code fix: the item's last push (the code
+    // fix already in its repo) is the one the passing revision integrated.
+    expect(both).toHaveLength(1);
+    expect(of(result.log, "push.announced").at(-1)).toBe(both[0]);
+    const passed = of(result.log, "integrated.rev").at(-1)!;
+    expect(passed.payload.gate).toBe("pass");
+    expect(passed.payload.merged).toContain(both[0]!.payload.commit);
+    expect(of(result.log, "push.regressed")).toEqual([]);
+    expect(result.verdict).toBe("verified");
+    expect(result.incompleteItems).toEqual([]);
+    for (const [rel, body] of [["src/tax.ts", "export const RATE = 8;\n"], ["tests/tax.test.ts", "expect(RATE).toBe(8);\n"], ["gate/acceptance.test.ts", "expect(RATE).toBe(8);\n"]] as const) {
+      const { stdout } = await git("git", ["-C", result.sourceRepoDir!, "show", `${result.promotion!.commit}:${rel}`]);
+      expect(stdout).toBe(body);
+    }
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  }, 120_000);
+
+  it("rejected: the developer test is untouched and the run is not verified", async () => {
+    const executor = new TaxExecutor();
+    const result = await runBoardOffline({ ...(await options(executor)), resolveContract: reject });
+    expect(of(result.log, "contract.rejected").length).toBeGreaterThan(0);
+    expect(executor.contexts.every((c) => !c.paths.includes("tests/tax.test.ts"))).toBe(true);
+    expect(of(result.log, "push.announced").every((m) => !m.payload.paths.includes("tests/tax.test.ts"))).toBe(true);
+    expect(result.verdict).not.toBe("verified");
+    expect(result.promotion?.committed).not.toBe(true);
   }, 120_000);
 });

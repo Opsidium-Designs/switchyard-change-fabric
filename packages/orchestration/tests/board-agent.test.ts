@@ -108,6 +108,7 @@ async function setup(
     readonly seams?: readonly { path: string; importers: string[] }[];
     readonly rules?: Record<string, unknown>;
     readonly files?: Readonly<Record<string, string>>;
+    readonly protected?: readonly string[];
   } = {},
 ): Promise<Env> {
   const root = await mkdtemp(join(tmpdir(), "scf-board-agent-"));
@@ -139,7 +140,12 @@ async function setup(
   };
   await human({
     type: "goal.posted",
-    payload: { objective: "runtime", ...(options.seams ? { seams: options.seams } : {}), ...(options.rules ? { rules: options.rules } : {}) },
+    payload: {
+      objective: "runtime",
+      ...(options.seams ? { seams: options.seams } : {}),
+      ...(options.rules ? { rules: options.rules } : {}),
+      ...(options.protected ? { protected: options.protected } : {}),
+    },
   });
   await human({ type: "item.proposed", payload: { item: "i1", objective: "do a", scopeHint: ["src/a/**"] } });
   await human({ type: "item.proposed", payload: { item: "i2", objective: "do b", scopeHint: ["src/b/**"] } });
@@ -979,6 +985,74 @@ describe("BoardAgent edits", () => {
     expect(fetched).toEqual([[1, "feedbeef"]]);
     expect(executor.seen[0]).toEqual({ "src/a/x.ts": "export const x = 1; // integrated\n" });
     expect((await env.log()).messages.some((m) => m.type === "push.announced" && m.from === "w1")).toBe(true);
+  });
+});
+
+describe("a developer test a human released to an item", () => {
+  const FILES = { "src/a/x.test.ts": "expect(x).toBe(1);\n", "src/b/y.test.ts": "expect(y).toBe(2);\n" };
+  const PROTECTED = ["src/a/x.test.ts", "src/b/y.test.ts"];
+  const contractId = async (env: Env, target: string): Promise<string> => {
+    const proposed = (await env.log()).messages.find((m) => m.type === "contract.proposed" && m.payload.target === target);
+    expect(proposed).toBeDefined();
+    return (proposed!.payload as { contract: string }).contract;
+  };
+
+  it("is in the holder's edit scope: the executor may write it with the code fix, and one push carries both", async () => {
+    const env = await setup({ files: FILES, protected: PROTECTED });
+    const executor = new RecordingExecutor(() => ({ "src/a/x.ts": "export const x = 3;\n", "src/a/x.test.ts": "expect(x).toBe(3);\n" }));
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/x.ts"] } },
+      { type: "message", kind: "contract", payload: { target: "src/a/x.test.ts", change: "modify", itemId: "i1" }, rationale: "the test pins the old value" },
+      { type: "edit", itemId: "i1", instruction: "x is 3 now" },
+    ]);
+    const w1 = env.agent("w1", { transport, executor });
+    await w1.join();
+    await w1.step();
+    await w1.step();
+    await env.human({ type: "contract.accepted", payload: { contract: await contractId(env, "src/a/x.test.ts") } });
+    await w1.step();
+    // The turn saw the release and its cue.
+    const claim = transport.inputs.at(-1)!.digest.claims[0]!;
+    expect(claim.released).toEqual(["src/a/x.test.ts"]);
+    expect(claim.contractReleased?.paths).toEqual(["src/a/x.test.ts"]);
+    expect(transport.inputs.at(-1)!.repo.excerpts.map((e) => e.path)).toContain("src/a/x.test.ts");
+    expect(executor.contexts[0]!.paths).toEqual(["src/a/x.ts", "src/a/x.test.ts"]);
+    expect(executor.contexts[0]!.objective).toMatch(/A human accepted changing src\/a\/x\.test\.ts for this item/);
+    // Writable, so never also a read-only reference.
+    expect((executor.contexts[0]!.frozenContractFiles ?? []).map((f) => f.path)).not.toContain("src/a/x.test.ts");
+    expect(env.turns.some((t) => t.code === "OUTSIDE_INTENT")).toBe(false);
+    const pushed = (await env.log()).messages.find((m) => m.type === "push.announced")!;
+    expect(pushed).toMatchObject({ from: "w1", payload: { item: "i1", paths: ["src/a/x.test.ts", "src/a/x.ts"] } });
+  });
+
+  it("released to ANOTHER item, it stays outside this agent's scope and a write to it is refused", async () => {
+    const env = await setup({ files: FILES, protected: PROTECTED });
+    const w2 = env.agent("w2", {
+      transport: scripted([
+        { type: "claim", itemId: "i2", intent: { read: [], write: ["src/b/y.ts"] } },
+        { type: "message", kind: "contract", payload: { target: "src/b/y.test.ts", change: "modify", itemId: "i2" }, rationale: "pins the old value" },
+      ]),
+    });
+    await w2.join();
+    await w2.step();
+    await w2.step();
+    await env.human({ type: "contract.accepted", payload: { contract: await contractId(env, "src/b/y.test.ts") } });
+    const executor = new RecordingExecutor(() => ({ "src/a/x.ts": "export const x = 3;\n", "src/b/y.test.ts": "stray\n" }));
+    const w1 = env.agent("w1", {
+      transport: scripted([
+        { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/x.ts"] } },
+        { type: "edit", itemId: "i1", instruction: "x is 3 now" },
+      ]),
+      executor,
+    });
+    await w1.join();
+    await w1.step();
+    await w1.step();
+    expect(executor.contexts[0]!.paths).toEqual(["src/a/x.ts"]);
+    expect(executor.contexts[0]!.objective).not.toMatch(/A human accepted changing/);
+    expect(env.turns.at(-1)).toMatchObject({ agent: "w1", outcome: "local", code: "OUTSIDE_INTENT" });
+    expect(env.turns.at(-1)!.error).toMatch(/src\/b\/y\.test\.ts/);
+    expect((await env.log()).messages.some((m) => m.type === "push.announced" && m.from === "w1")).toBe(false);
   });
 });
 

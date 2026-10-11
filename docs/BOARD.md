@@ -108,7 +108,7 @@ write, leaves all of them untouched. Rejections carry a machine-readable code:
 `{code, error}` with codes such as `BAD_PAYLOAD`, `AUTH`, `NOT_ALLOWED`,
 `NO_GOAL`, `UNKNOWN_AGENT`, `UNKNOWN_REF`, `DUPLICATE`, `ITEM_NOT_OPEN`,
 `NOT_OWNER`, `CONTEST_OPEN`, `CONTEST_CLOSED`, `INTENT_OVERLAP`,
-`OUTSIDE_INTENT`, `OUTSIDE_SCOPE`, `PROTECTED`, `CONTRACT_REJECTED`, `NOT_WITHIN`, `INVALID_STATE`,
+`OUTSIDE_INTENT`, `OUTSIDE_SCOPE`, `PROTECTED`, `CONTRACT_REJECTED`, `TARGET_RELEASED`, `NOT_WITHIN`, `INVALID_STATE`,
 `LIMIT`, `NOT_SUPPORTED` (a split, or a goal with `speculate` above 1, under the cloud integrator), `CLAIM_CAP`, `SEAM_FIRST`,
 `SEAM_OVERLAP` (a claim writing a shared seam another holder's scope covers),
 `STALE_BASE` (a revision not built on the board's integrated head). `AUTH` is 401,
@@ -189,8 +189,8 @@ self-describing.
 ARBITRATION REVISION (`rules.arbitration`). A recorded log replays under the
 rules it was recorded with, so arbitration changes that alter what a log
 derives sit behind this rule. Absent (revision 1) is how every earlier board
-was arbitrated; a new `run-board` posts revision 6 (pinning
-`rules: {arbitration: 1}` through `{arbitration: 5}` reproduces that
+was arbitrated; a new `run-board` posts revision 7 (pinning
+`rules: {arbitration: 1}` through `{arbitration: 6}` reproduces that
 revision).
 Revision 2:
 - a DIFFERENT agent granted (or handed) an item starts with a fresh fix
@@ -264,6 +264,19 @@ QUESTIONS; the storefront run sf13 deadlocked without them):
   request), and the runtime wakes it for each, bounded (`MAX_QUESTION_CUES`).
 Revision 5 runs were published live (sf13), so this is a new revision; a
 revision 5 log replays as recorded.
+Revision 7 (everything in revision 6, plus ONE WRITER PER RELEASED TEST; in
+the live run sf19 accepted contracts released nothing to the agents):
+- a `contract.proposed` of kind `modify` on a protected target that an
+  accepted contract already released to ANOTHER live item (not done, not
+  rejected, and neither an ancestor nor a descendant of the asking item) is
+  refused `TARGET_RELEASED`, naming that item and its contract, so two agents
+  never write the same protected file unarbitrated; once that item is done
+  the target may be asked for again;
+- a child of a split or re-planned item inherits its ancestors' releases
+  (`releasedTargets`) only for the targets inside the child's own scope
+  hint, so its pushes may carry them and its integration unit applies them.
+Revision 6 runs were recorded live (the sf14 fixture pins it), so this is a new
+revision; a revision 6 log replays as recorded.
 The three published replays and the K = 1 golden demo log carry no
 `arbitration` and reduce (and fold at every seq) exactly as before
 (`recorded-replay-compat.test.ts` pins their state hashes); the coverage-run
@@ -310,7 +323,18 @@ need no acceptance from the lead.
    (`claims[].contractCue`, whose hint names the action to send: `message`
    kind `contract {target, change: modify, itemId}`), and once a human accepts it the released path is
    writable for that item even outside its scope (its pushes may carry it and
-   its integration unit applies it). New test files are never protected.
+   its integration unit applies it). The holder's digest lists every path
+   released to the claim (`claims[].released`: accepted, non-seam, never part
+   of the immutable acceptance gate), and the agent runtime adds them to the
+   edit's scope: the executor's writable paths, the push's scope check, the
+   files a handed-off item is seeded from, and the turn's writable excerpts
+   (so a released test is never shown as a read-only reference). The edit
+   objective names the released file(s) and that a human accepted changing
+   them for this item. Until the item's latest push since the acceptance
+   changes a released path, the claim carries `claims[].contractReleased`
+   (`{paths, hint}`), whose hint says to edit it in the same edit as the code
+   fix so they integrate together, changing only the assertions that encode
+   the behavior the goal changes. New test files are never protected.
    TWO CLASSES: the IMMUTABLE acceptance gate (`goal.posted.immutable`: the
    files the declared gate command runs or references by name, the test
    files and runner configs in those gate directories, the harness they

@@ -26,6 +26,7 @@ import {
   replanEligible,
   seamContractFacts,
   releasedTargets,
+  releasedForAgent,
   uncoveredFailureFiles,
   appendToolGated,
   appendToolUsed,
@@ -2172,6 +2173,136 @@ describe("failures the plan missed, and the contract cue", () => {
   });
 });
 
+describe("a released developer test reaches the holder (claims[].released, contractReleased)", () => {
+  const TAX_FAIL = { output: "> s@0 gate\nAssertionError: expected 73 to be 72\n at tests/tax.test.ts:12:5", items: ["tax"] };
+  /** A goal protecting tests/tax.test.ts, item tax (src/tax.ts) held by a, failing on the protected test. */
+  function failingTax(rules?: Record<string, number>, extra: Record<string, unknown> = {}): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["tests/tax.test.ts", "tests/other.test.ts"], ...extra, ...(rules ? { rules } : {}) }));
+    board.post(msg("a", "agent.joined"));
+    board.post(msg("b", "agent.joined"));
+    board.post(msg("human", "item.proposed", { item: "tax", objective: "round tax", scopeHint: ["src/tax.ts"] }));
+    board.post(msg("human", "item.proposed", { item: "fee", objective: "fees", scopeHint: ["src/fee.ts"] }));
+    board.post(claim("a", "tax", ["src/tax.ts"]));
+    board.post(claim("b", "fee", ["src/fee.ts"]));
+    board.post(push("a", "tax", "c1", ["src/tax.ts"]));
+    board.post(push("b", "fee", "f1", ["src/fee.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1", "f1"], failing: { ...TAX_FAIL, items: ["tax", "fee"] } }));
+    return board;
+  }
+  const claimOf = (board: TestBoard, agent: string, item: string) => boardDigest(board.state, board.log, agent, 0).claims.find((c) => c.item === item)!;
+
+  it("lists the item's own accepted release and cues it until a push after the acceptance changes it", () => {
+    const board = failingTax();
+    expect(claimOf(board, "a", "tax").released).toBeUndefined();
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "tax" }));
+    expect(claimOf(board, "a", "tax").released).toBeUndefined(); // proposed, not accepted
+    board.post(msg("human", "contract.accepted", { contract: "k1" }));
+    const tax = claimOf(board, "a", "tax");
+    expect(tax.released).toEqual(["tests/tax.test.ts"]);
+    expect(tax.contractReleased).toMatchObject({ paths: ["tests/tax.test.ts"], hint: expect.stringMatching(/a human accepted changing tests\/tax\.test\.ts for tax: .*same edit as the code fix/) });
+    expect(tax.contractCue).toBeUndefined();
+    // Another item's holder sees nothing released to it.
+    expect(claimOf(board, "b", "fee").released).toBeUndefined();
+    expect(claimOf(board, "b", "fee").contractReleased).toBeUndefined();
+    // A push of the code alone keeps the cue; one carrying the test clears it.
+    board.post(push("a", "tax", "c2", ["src/tax.ts"]));
+    expect(claimOf(board, "a", "tax").contractReleased?.paths).toEqual(["tests/tax.test.ts"]);
+    board.post(push("a", "tax", "c3", ["src/tax.ts", "tests/tax.test.ts"]));
+    expect(claimOf(board, "a", "tax").released).toEqual(["tests/tax.test.ts"]);
+    expect(claimOf(board, "a", "tax").contractReleased).toBeUndefined();
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("a rejected contract, a seam contract, and the immutable gate release nothing to the agent", () => {
+    const board = failingTax(undefined, { immutable: ["gate/**"] });
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "tax" }));
+    board.post(msg("human", "contract.rejected", { contract: "k1" }));
+    expect(claimOf(board, "a", "tax").released).toBeUndefined();
+    expect(claimOf(board, "a", "tax").contractReleased).toBeUndefined();
+    // releasedForAgent drops any immutable path even if a release named one.
+    const forged: BoardState = structuredClone(board.state);
+    forged.contracts.kx = { contract: "kx", target: "gate/accept.test.ts", kind: "modify", item: "tax", guarded: true, proposedBy: "a", status: "accepted", decidedSeq: 1 };
+    forged.contracts.ks = { contract: "ks", target: "src/shared.ts", kind: "modify", item: "tax", seam: "src/shared.ts", proposedBy: "a", status: "accepted", decidedSeq: 1 };
+    expect(releasedForAgent(forged, "tax")).toEqual([]);
+    expect(boardDigest(forged, board.log, "a", 0).claims[0]!.released).toBeUndefined();
+  });
+
+  it("revision 7 refuses a second item's contract on a test released to another live item (TARGET_RELEASED); revision 6 accepts it as before", () => {
+    for (const arbitration of [6, 7]) {
+      const board = failingTax({ arbitration });
+      board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "tax" }));
+      board.post(msg("human", "contract.accepted", { contract: "k1" }));
+      const second = msg("b", "contract.proposed", { contract: "k2", target: "tests/tax.test.ts", kind: "modify", item: "fee" });
+      if (arbitration === 7) {
+        board.reject(second, /already released to item tax \(contract k1/, "TARGET_RELEASED");
+        // fee's holder is not cued toward the refused contract.
+        expect(claimOf(board, "b", "fee").contractCue).toBeUndefined();
+      } else {
+        expect(claimOf(board, "b", "fee").contractCue?.paths).toEqual(["tests/tax.test.ts"]);
+        expect(board.types(second)).toEqual(["contract.proposed", "contract.escalated"]);
+      }
+      expect(reduceBoard(board.log)).toEqual(board.state);
+    }
+  });
+
+  it("revision 7 frees a released test once its item is done", () => {
+    const board = failingTax({ arbitration: 7 });
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "tax" }));
+    board.post(msg("human", "contract.accepted", { contract: "k1" }));
+    board.post(push("a", "tax", "c2", ["src/tax.ts", "tests/tax.test.ts"]));
+    board.post(msg("a", "done.proposed", { item: "tax" }));
+    board.post(push("b", "fee", "f2", ["src/fee.ts"]));
+    board.post(rev("pass", ["c2", "f2"], "r2"));
+    expect(board.state.items.tax!.status).toBe("done");
+    board.post(push("b", "fee", "f3", ["src/fee.ts"]));
+    board.post(msg("engine", "integrated.rev", { commit: "r3", gate: "fail", merged: ["f3"], failing: { output: "AssertionError at tests/tax.test.ts:3", items: ["fee"] } }));
+    expect(board.types(msg("b", "contract.proposed", { contract: "k2", target: "tests/tax.test.ts", kind: "modify", item: "fee" }))).toEqual(["contract.proposed", "contract.escalated"]);
+  });
+
+  it("revision 7: a re-planned item's child inherits a release only for targets inside its own scope", () => {
+    for (const arbitration of [6, 7]) {
+      const board = new TestBoard();
+      board.post(msg("human", "goal.posted", { objective: "o", protected: ["tests/tax.test.ts", "tests/fee.test.ts"], rules: { arbitration, maxFixAttempts: 1 } }));
+      board.post(msg("a", "agent.joined"));
+      board.post(msg("lead", "agent.joined", { role: "lead" }));
+      board.post(msg("lead", "item.proposed", { item: "bill", objective: "bill", acceptance: [], scopeHint: ["src/**", "tests/**"] }));
+      board.post(claim("a", "bill", ["src/tax.ts", "src/fee.ts"]));
+      board.post(msg("a", "contract.proposed", { contract: "k1", target: "tests/tax.test.ts", kind: "modify", item: "bill" }));
+      board.post(msg("a", "contract.proposed", { contract: "k2", target: "tests/fee.test.ts", kind: "modify", item: "bill" }));
+      board.post(msg("human", "contract.accepted", { contract: "k1" }));
+      board.post(msg("human", "contract.accepted", { contract: "k2" }));
+      board.post(push("a", "bill", "c1", ["src/tax.ts"]));
+      board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "fail", merged: ["c1"], failing: { output: "src/tax.ts failed", items: ["bill"] } }));
+      board.post(push("a", "bill", "c2", ["src/tax.ts"]));
+      board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c2"], failing: { output: "src/tax.ts failed", items: ["bill"] } }));
+      expect(board.state.items.bill!.status).toBe("open");
+      board.post(
+        msg("lead", "item.replanned", {
+          item: "bill",
+          reason: "fix-budget-exhausted",
+          action: "split",
+          children: [
+            { item: "bill-tax", objective: "tax", scopeHint: ["src/tax.ts", "tests/tax.test.ts"] },
+            { item: "bill-fee", objective: "fee", scopeHint: ["src/fee.ts"] },
+          ],
+        }),
+      );
+      expect(releasedTargets(board.state, "bill-tax")).toEqual(arbitration === 7 ? ["tests/tax.test.ts"] : []);
+      expect(releasedTargets(board.state, "bill-fee")).toEqual([]);
+      board.post(claim("a", "bill-tax", ["src/tax.ts"]));
+      const pushed = push("a", "bill-tax", "c3", ["src/tax.ts", "tests/tax.test.ts"]);
+      if (arbitration === 7) {
+        expect(claimOf(board, "a", "bill-tax")).toMatchObject({ released: ["tests/tax.test.ts"], contractReleased: { paths: ["tests/tax.test.ts"] } });
+        expect(board.types(pushed)).toEqual(["push.announced"]);
+      } else {
+        board.reject(pushed, /outside the claim's write intent/, "OUTSIDE_INTENT");
+      }
+      expect(reduceBoard(board.log)).toEqual(board.state);
+    }
+  });
+});
+
 describe("the immutable acceptance gate", () => {
   it("refuses any contract on it (even one a human would accept), and never cues it", () => {
     const board = new TestBoard();
@@ -3591,7 +3722,7 @@ describe("arbitration revision 2 (rules.arbitration)", () => {
     }
   }
 
-  it("only revisions 1 to 6 are accepted; revision 1 is the default and is not recorded", () => {
+  it("only revisions 1 to 7 are accepted; revision 1 is the default and is not recorded", () => {
     const one = seeded({ arbitration: 1 });
     expect(one.state.rules.arbitration).toBeUndefined();
     expect(one.log[0]!.type === "goal.posted" && one.log[0]!.payload.rules.arbitration).toBeUndefined();
@@ -3602,8 +3733,9 @@ describe("arbitration revision 2 (rules.arbitration)", () => {
     expect(seeded({ arbitration: 4 }).state.rules.arbitration).toBe(4);
     expect(seeded({ arbitration: 5 }).state.rules.arbitration).toBe(5);
     expect(seeded({ arbitration: 6 }).state.rules.arbitration).toBe(6);
+    expect(seeded({ arbitration: 7 }).state.rules.arbitration).toBe(7);
     const board = new TestBoard();
-    board.reject(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 7 } }), /arbitration/, "BAD_PAYLOAD");
+    board.reject(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 8 } }), /arbitration/, "BAD_PAYLOAD");
   });
 
   for (const arbitration of [1, 2]) {
