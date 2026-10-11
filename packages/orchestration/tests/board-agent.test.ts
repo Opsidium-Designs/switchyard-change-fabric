@@ -103,7 +103,11 @@ interface Env {
 }
 
 async function setup(
-  options: { readonly seams?: readonly { path: string; importers: string[] }[]; readonly rules?: Record<string, unknown> } = {},
+  options: {
+    readonly seams?: readonly { path: string; importers: string[] }[];
+    readonly rules?: Record<string, unknown>;
+    readonly files?: Readonly<Record<string, string>>;
+  } = {},
 ): Promise<Env> {
   const root = await mkdtemp(join(tmpdir(), "scf-board-agent-"));
   const projectDir = join(root, "project");
@@ -111,6 +115,7 @@ async function setup(
     "src/a/x.ts": "export const x = 1;\n",
     "src/b/y.ts": "export const y = 2;\n",
     "src/shared.ts": "export const shared = 0;\n",
+    ...options.files,
   })) {
     await mkdir(dirname(join(projectDir, rel)), { recursive: true });
     await writeFile(join(projectDir, rel), body);
@@ -1051,6 +1056,98 @@ describe("day-2 review regressions", () => {
     expect(executor.contexts[1]!.objective).toContain("not ok 1 - src/a/x.ts is wrong");
     const state = (await env.log()).state;
     expect(state.items.i1!.fixRequested).toBeUndefined(); // the push answered the request
+  });
+
+  it("an edit is shown READ-ONLY references: seams first, then the modules its files import (bounded), and a fix adds the file exporting the type the failure names", async () => {
+    const big = `export const big = 1;\n${"// padding line for a large seam file\n".repeat(600)}`;
+    const invoices = [
+      'import { getOrder } from "../store.ts";',
+      'import { tax } from "./tax.ts";',
+      'import { a } from "../lib/a.ts";',
+      'import { b } from "../lib/b.js";',
+      'import { c } from "../lib/c";',
+      'import { d } from "../lib/d.ts";',
+      'import { big } from "../lib/e.ts";',
+      "export function invoiceTotal(id: string): number {",
+      "  return getOrder(id).total + tax + a + b + c + d + big;",
+      "}",
+      "",
+    ].join("\n");
+    const env = await setup({
+      seams: [{ path: "src/lib/e.ts", importers: ["src/billing/invoices.ts"] }],
+      files: {
+        "src/billing/invoices.ts": invoices,
+        "src/billing/tax.ts": 'import { a } from "../lib/a.ts";\nexport const tax = a;\n',
+        "src/store.ts": 'import type { Order } from "./models/order.ts";\nexport type { Order } from "./models/order.ts";\nexport function getOrder(id: string): Order {\n  return { id, total: 1 };\n}\n',
+        "src/models/order.ts": "export interface Order {\n  readonly id: string;\n  readonly total: number;\n}\n",
+        "src/lib/a.ts": "export const a = 1;\n",
+        "src/lib/b.ts": "export const b = 1;\n",
+        "src/lib/c.ts": "export const c = 1;\n",
+        "src/lib/d.ts": "export const d = 1;\n",
+        "src/lib/e.ts": big,
+      },
+    });
+    await env.human({ type: "item.proposed", payload: { item: "i3", objective: "bill orders", scopeHint: ["src/billing/**"] } });
+    const executor = new RecordingExecutor((ctx) => ({ "src/billing/invoices.ts": `${invoices}// ${ctx.objective.length}\n` }));
+    const transport = scripted([
+      { type: "claim", itemId: "i3", intent: { read: [], write: ["src/billing/**"] } },
+      { type: "edit", itemId: "i3", instruction: "add totals" },
+      { type: "edit", itemId: "i3", instruction: "fix it" },
+    ]);
+    const w1 = env.agent("w1", { transport, executor, fetchRevision: async () => undefined });
+    await w1.join();
+    await w1.step();
+    await w1.step();
+    const first = executor.contexts[0]!;
+    expect(first.paths).toEqual(["src/billing/invoices.ts", "src/billing/tax.ts"]);
+    const refPaths = (ctx: ExecutorContext) => (ctx.frozenContractFiles ?? []).map((f) => f.path);
+    // The seam first, then the imports in source order; bounded at 5; the writable tax.ts is never a reference.
+    expect(refPaths(first)).toEqual(["src/lib/e.ts", "src/store.ts", "src/lib/a.ts", "src/lib/b.ts", "src/lib/c.ts"]);
+    expect(first.frozenContracts).toEqual(refPaths(first));
+    expect(first.boardReferences).toBe(true);
+    expect(first.frozenContractFiles!.find((f) => f.path === "src/store.ts")!.contents).toContain("export function getOrder");
+    // A large seam is truncated with a marker, never skipped.
+    const seam = first.frozenContractFiles!.find((f) => f.path === "src/lib/e.ts")!.contents;
+    expect(seam.length).toBeLessThan(12 * 1024 + 200);
+    expect(seam).toMatch(/\.\.\. \(read-only reference truncated at 12288 characters of \d+\)$/);
+    // The turn that chose the edit saw the imported seam and store as read-only excerpts.
+    const excerpts = transport.inputs[1]!.repo.excerpts;
+    expect(excerpts.map((e) => e.path)).toEqual(["src/billing/invoices.ts", "src/billing/tax.ts", "src/lib/e.ts", "src/store.ts"]);
+    expect(excerpts.find((e) => e.path === "src/store.ts")!.contents).toMatch(/^\(READ-ONLY REFERENCE/);
+
+    const push = (await env.log()).messages.find((m) => m.type === "push.announced")!;
+    const rev = await env.operator.recordRevision({
+      commit: "badc0de",
+      gate: "fail",
+      merged: [(push.payload as { commit: string }).commit],
+      failing: { output: "src/billing/invoices.ts(9,22): error TS2339: Property 'totalAmount' does not exist on type 'Order'.", items: ["i3"] },
+    });
+    expect(rev.ok && rev.appended.map((m) => m.type)).toEqual(["integrated.rev", "fix.requested"]);
+    expect(await w1.step()).toBe("acted");
+    const fix = executor.contexts[1]!;
+    expect(fix.objective).toContain("does not exist on type 'Order'");
+    // The module DECLARING Order (two imports deep) comes first; the bound still holds.
+    expect(refPaths(fix)).toEqual(["src/models/order.ts", "src/lib/e.ts", "src/store.ts", "src/lib/a.ts", "src/lib/b.ts"]);
+    expect(fix.frozenContractFiles![0]!.contents).toContain("export interface Order");
+    expect(refPaths(fix)).not.toContain("src/billing/invoices.ts");
+  });
+
+  it("an edit whose files import nothing outside the write scope gets no reference fields (the executor prompt is unchanged)", async () => {
+    const env = await setup();
+    const executor = new RecordingExecutor(() => ({ "src/a/x.ts": "export const x = 2;\n" }));
+    const w1 = env.agent("w1", {
+      transport: scripted([
+        { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+        { type: "edit", itemId: "i1", instruction: "bump x" },
+      ]),
+      executor,
+    });
+    await w1.join();
+    await w1.step();
+    await w1.step();
+    expect(executor.contexts[0]!.frozenContractFiles).toBeUndefined();
+    expect(executor.contexts[0]!.frozenContracts).toBeUndefined();
+    expect(executor.contexts[0]!.boardReferences).toBeUndefined();
   });
 
   it("a large item starts one rung below the top; a model whose budget is spent retries the same edit once a rung down, never charged to the item", async () => {

@@ -226,6 +226,51 @@ describe("WorkersAiExecutor", () => {
     expect(seenUser).toContain("src/contracts/auth.js");
   });
 
+  it("renders a board edit's READ-ONLY reference files: labeled as references, use only what they declare, a seam contract to change one, 12 KB each", async () => {
+    await mkdir(join(worktree, "src/billing"), { recursive: true });
+    await writeFile(join(worktree, "src/billing/invoices.ts"), "export const total = 0;\n", "utf8");
+
+    let seenSystem = "";
+    let seenUser = "";
+    const invoke: WorkersAiInvoke = async (request) => {
+      seenSystem = request.messages.find((m) => m.role === "system")?.content ?? "";
+      seenUser = request.messages.find((m) => m.role === "user")?.content ?? "";
+      return {
+        text: JSON.stringify({ edits: [{ path: "src/billing/invoices.ts", search: "export const total = 0;", replace: "export const total = 1;" }] }),
+      };
+    };
+    const store = "export interface Order {\n  readonly id: string;\n  readonly total: number;\n}\n";
+    const longSeam = `export const big = 1;\n${"x".repeat(13 * 1024)}`;
+    // The shape board-agent passes: the reference set in frozenContracts/frozenContractFiles plus boardReferences.
+    await new WorkersAiExecutor({ invoke }).execute({
+      worktreeDir: worktree,
+      workUnitId: "i3",
+      objective: "bill orders",
+      paths: ["src/billing/invoices.ts"],
+      baselineRef: "HEAD",
+      frozenContracts: ["src/store.ts", "src/lib/e.ts"],
+      frozenContractFiles: [
+        { path: "src/store.ts", contents: store },
+        { path: "src/lib/e.ts", contents: longSeam },
+      ],
+      boardReferences: true,
+    });
+
+    expect(seenSystem).toMatch(/READ-ONLY REFERENCE files outside your write scope/);
+    expect(seenSystem).toMatch(/Use ONLY the fields, properties, functions, and types that actually exist in them/);
+    expect(seenSystem).toMatch(/changing one requires a seam contract on the board, not an edit/);
+    expect(seenUser).toContain("Read-only reference files (outside your write scope; never edit them):\nsrc/store.ts\nsrc/lib/e.ts");
+    expect(seenUser).toMatch(/Read-only reference files \(READ-ONLY: use ONLY the fields, functions, and types declared here/);
+    expect(seenUser).toContain(`--- READ-ONLY REFERENCE: src/store.ts ---\n${store}`);
+    expect(seenUser).not.toContain("--- FROZEN CONTRACT:");
+    // A long reference is cut at 12 KB with a marker, never dropped.
+    expect(seenUser).toContain("--- READ-ONLY REFERENCE: src/lib/e.ts ---\nexport const big = 1;");
+    expect(seenUser).toContain(`${"x".repeat(12 * 1024 - "export const big = 1;\n".length)}\n... (reference truncated)`);
+    expect(seenUser).not.toContain("x".repeat(12 * 1024));
+    // The writable file is still shown under its own (unchanged) limit.
+    expect(seenUser).toContain("--- FILE: src/billing/invoices.ts ---\nexport const total = 0;");
+  });
+
   it("is empty-safe: with no frozen contract files the prompt carries no contents block", async () => {
     await mkdir(join(worktree, "src"), { recursive: true });
     await writeFile(join(worktree, "src/leaf2.ts"), "const internal = 1;\n", "utf8");

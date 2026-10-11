@@ -233,6 +233,14 @@ export interface WorkersAiExecutorOptions {
 
 const DEFAULT_MAX_CONTEXT_FILES = 6;
 const DEFAULT_MAX_FILE_BYTES = 8 * 1024;
+/**
+ * The characters of one READ-ONLY reference file (a frozen contract or a board
+ * reference) rendered at most. Larger than the writable-file cap because a
+ * shared seam is often the longest file a module imports, and a truncated
+ * type is the one a model then invents members for; a longer one is truncated
+ * with a marker, never dropped.
+ */
+const DEFAULT_MAX_REFERENCE_BYTES = 12 * 1024;
 const DEFAULT_MAX_RETRIES = 2;
 const DEFAULT_RETRY_BACKOFF_MS = 500;
 
@@ -659,6 +667,11 @@ function buildMessages(
     "START FROM THE CURRENT CONTENTS of the in-scope file shown below and make the MINIMAL change needed to satisfy the objective. Do NOT regenerate the file from scratch and do NOT rewrite a whole file when a focused change is enough. Preserve the existing imports EXACTLY (keep importing the frozen contracts), keep every existing export, and do not restyle or reformat code unrelated to the objective.",
     "Some files are FROZEN CONTRACTS: shared read-only interfaces other modules import. You must IMPORT and honor a frozen contract as it is; never rewrite, re-export, or change its shape, and never list it as an edit.",
     "Call ONLY functions these contracts actually export; do not invent helper names. The frozen contract contents are shown below as read-only reference, so import and call the real exported names with their real signatures rather than guessing.",
+    ...(context.boardReferences === true && (context.frozenContractFiles ?? []).length > 0
+      ? [
+          "Some files are READ-ONLY REFERENCE files outside your write scope (the types, shared seams, and modules your files import, or files the failure names). Use ONLY the fields, properties, functions, and types that actually exist in them, exactly as declared; never invent a field or member they do not declare. You may not edit them: changing one requires a seam contract on the board, not an edit, so write your change against them as they are.",
+        ]
+      : []),
     "Honor each frozen contract function's actual return semantics; read its source before you branch on its result. A guard that returns a Response ONLY when it rejects (and a null-ish value when it accepts) must be short-circuited ONLY when it returns a truthy Response: capture its result, return that result when it is non-null, otherwise fall through and keep going. Do not treat a null-ish accept return as a failure and do not invert the check.",
     "A valid, authorized, well-formed request MUST perform the real work and return a 2xx success (for example a success helper like `json(entity, 201)` or `json(result)`); never return an error helper like `problem(400, ...)` on the authorized, valid path. Reject with an error helper ONLY when the input is genuinely missing or invalid, and validate only the fields named in the objective. Read the request body with a tolerant body reader exactly once and reuse that value; do not read it twice.",
     "Preserve the exported interface your module already provides.",
@@ -684,16 +697,17 @@ function buildMessages(
   // prompt stays small (contract files are tiny), and the block is empty-safe:
   // a Change with no contract files produces the exact same prompt as before.
   const frozenContractFiles = context.frozenContractFiles ?? [];
-  const maxFileBytes = DEFAULT_MAX_FILE_BYTES;
+  const maxFileBytes = DEFAULT_MAX_REFERENCE_BYTES;
+  const boardReferences = context.boardReferences === true;
   const frozenContractBlocks =
     frozenContractFiles.length > 0
       ? frozenContractFiles
           .map((file) => {
             const bounded =
               file.contents.length > maxFileBytes
-                ? `${file.contents.slice(0, maxFileBytes)}\n... (contract truncated)`
+                ? `${file.contents.slice(0, maxFileBytes)}\n... (${boardReferences ? "reference" : "contract"} truncated)`
                 : file.contents;
-            return `--- FROZEN CONTRACT: ${file.path} ---\n${bounded}`;
+            return `--- ${boardReferences ? "READ-ONLY REFERENCE" : "FROZEN CONTRACT"}: ${file.path} ---\n${bounded}`;
           })
           .join("\n\n")
       : "";
@@ -713,7 +727,9 @@ function buildMessages(
     "Declared path scope (you may only write these paths):",
     scopeLines,
     "",
-    "Frozen contract files (READ-ONLY; import and honor these, never rewrite or edit them):",
+    boardReferences
+      ? "Read-only reference files (outside your write scope; never edit them):"
+      : "Frozen contract files (READ-ONLY; import and honor these, never rewrite or edit them):",
     frozenLines,
     // The frozen contract CONTENTS block only appears when the caller threaded
     // the real file bodies, so a Change with no contract files produces the
@@ -723,7 +739,9 @@ function buildMessages(
     ...(frozenContractBlocks !== ""
       ? [
           "",
-          "Frozen contract files (READ-ONLY REFERENCE - import and call these exactly; do NOT edit them, do NOT invent other names):",
+          boardReferences
+            ? "Read-only reference files (READ-ONLY: use ONLY the fields, functions, and types declared here, exactly as declared; do NOT edit them; changing one requires a seam contract on the board):"
+            : "Frozen contract files (READ-ONLY REFERENCE - import and call these exactly; do NOT edit them, do NOT invent other names):",
           frozenContractBlocks,
         ]
       : []),

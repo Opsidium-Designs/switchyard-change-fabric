@@ -516,6 +516,27 @@ is distributed changes: items are proposed and claimed, never assigned.
   the integrated revision after a rebase), checks the changed paths against the
   write intent with the verification path scope, commits, pushes to its own
   repo, and announces the push. A refused announcement rolls the repo back.
+  Next to the writable files the executor is shown READ-ONLY reference files
+  (`boardReferenceFiles` in `board-references.ts`, passed as the executor's
+  `frozenContractFiles` with `boardReferences`), read the same way (the
+  agent's own version, else the baseline, so an accepted seam change it
+  rebased onto is what it sees). In priority order: files the current failure
+  evidence (a fix's failing output, a `push.regressed`'s lines) locates
+  outside the write scope, and the imported module that exports a type the
+  evidence names (`on type 'Order'` finds the file declaring `Order`, else one
+  re-exporting it); then the shared seams the writable files import; then
+  their other relative imports (depth 1, then depth 2), resolved like the
+  runtime (`.js` naming a `.ts`, extensionless, a directory's `index`).
+  Bounded at 5 files (`MAX_REFERENCE_FILES`) of 12 KB each
+  (`MAX_REFERENCE_BYTES`; a longer one is truncated with a marker, never
+  skipped); a writable file is never repeated; the writable files keep the
+  executor's own limits. The prompt labels them read-only: only the fields
+  and functions they declare may be used, and changing one takes a seam
+  contract, not an edit. A helper's edit in its fork gets the same set. The
+  agent's TURN sees up to 2 of them (`MAX_TURN_REFERENCES`, seams first) among
+  its `MAX_EXCERPTS` file excerpts, after its claims' write and read intent
+  files, each marked as a read-only reference, so it plans against the real
+  types.
   Budgets: turns per item, and turns per run; a spent budget is recorded on the
   board (a handoff to another running worker when the board accepts it, else a
   help request with need `turn-budget` or `run-budget`, or `agent.left` when

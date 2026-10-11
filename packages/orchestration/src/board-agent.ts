@@ -68,6 +68,7 @@ import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { authenticatedRemote, clone, push, type GitIdentity } from "@switchyard-change/local-runner";
 import { gateFailureLine, matchesGlob, partitionByScope, toolSkeleton } from "@switchyard-change/verification";
 
+import { boardReferenceFiles, type ReferenceFile } from "./board-references.ts";
 import { ToolUseError, type ToolAuthor, type ToolBench } from "./board-tools.ts";
 import type { RefreshableToken } from "./token-refresh.ts";
 import type { RunCapReached, RunMeter } from "./run-meter.ts";
@@ -226,6 +227,8 @@ const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "out", "cove
 const MAX_LISTED_FILES = 2000;
 const MAX_EXCERPTS = 6;
 const MAX_EXCERPT_CHARS = 3000;
+/** Of the MAX_EXCERPTS turn excerpts, how many may be read-only reference files a held claim imports. */
+const MAX_TURN_REFERENCES = 2;
 const MAX_PENDING_MESSAGES = 200;
 /**
  * How many times a passed push is cued for propose_done if the agent ignores
@@ -1626,7 +1629,7 @@ export class BoardAgent {
       };
     });
     const files = await listRepoFiles(this.baseDir);
-    const excerpts = await this.excerpts(digest, files);
+    const excerpts = await this.excerpts(digest, files, state);
     const replan = this.role === "lead" ? await this.replanFacts(digest, files) : [];
     return {
       agent: this.id,
@@ -1713,22 +1716,48 @@ export class BoardAgent {
     });
   }
 
-  /** Bounded file contents inside the agent's intents (or the open items it may claim). */
-  private async excerpts(digest: BoardDigest, files: readonly string[]): Promise<AgentRepoExcerpt[]> {
+  /**
+   * Bounded file contents inside the agent's intents (or the open items it may
+   * claim), then, for held claims, the READ-ONLY reference files their write
+   * intents import (seams first, `boardReferenceFiles`), so the turn plans
+   * against the real types. References keep up to MAX_TURN_REFERENCES of the
+   * MAX_EXCERPTS slots; all excerpts share the same per-file bound.
+   */
+  private async excerpts(digest: BoardDigest, files: readonly string[], state?: BoardState): Promise<AgentRepoExcerpt[]> {
     const granted = (digest.help?.granted ?? []).filter((g) => g.live).flatMap((g) => g.scope);
     const entries =
       digest.claims.length > 0 || granted.length > 0
         ? [...digest.claims.flatMap((c) => [...c.intent.write, ...c.intent.read]), ...granted]
         : digest.openItems.flatMap((i) => i.scopeHint);
+    const intentFiles = resolveIntentFiles(entries, files).filter((path) => !hasWildcard(path));
+    const writable = resolveIntentFiles(digest.claims.flatMap((c) => c.intent.write), files).filter((path) => !hasWildcard(path));
+    const evidence = digest.claims.some((c) => c.fix !== undefined && digest.failure?.n === c.fix.n) ? (digest.failure?.output ?? "") : "";
+    const references =
+      writable.length > 0
+        ? (
+            await boardReferenceFiles({
+              writable,
+              files,
+              seams: (state?.seams ?? []).map((seam) => seam.path),
+              ...(evidence !== "" ? { evidence } : {}),
+              read: (path) => this.readCurrent(path),
+              maxFiles: MAX_TURN_REFERENCES,
+              maxBytes: MAX_EXCERPT_CHARS,
+            })
+          ).filter((r) => !intentFiles.includes(r.path))
+        : [];
     const out: AgentRepoExcerpt[] = [];
-    for (const path of resolveIntentFiles(entries, files)) {
-      if (out.length >= MAX_EXCERPTS || hasWildcard(path)) {
-        continue;
+    for (const path of intentFiles) {
+      if (out.length >= MAX_EXCERPTS - references.length) {
+        break;
       }
       const contents = await this.readCurrent(path);
       if (contents !== undefined) {
         out.push({ path, contents: bounded(contents, MAX_EXCERPT_CHARS) });
       }
+    }
+    for (const ref of references) {
+      out.push({ path: ref.path, contents: bounded(`(READ-ONLY REFERENCE: imported by a file you hold; use only what it declares; changing it takes a seam contract)\n${ref.contents}`, MAX_EXCERPT_CHARS) });
     }
     return out;
   }
@@ -2010,7 +2039,7 @@ export class BoardAgent {
         // A helper edits the requester's item only inside its grant, in its fork.
         const grant = digest.help?.granted.find((g) => g.item === action.itemId && g.live);
         if (grant && !digest.claims.some((c) => c.item === action.itemId)) {
-          await this.helperEdit(grant, action.instruction, local, posted);
+          await this.helperEdit(grant, action.instruction, local, posted, state);
           return;
         }
         await this.edit(action.itemId, action.instruction, digest, local, posted, state);
@@ -2248,6 +2277,38 @@ export class BoardAgent {
   }
 
   /**
+   * The bounded READ-ONLY reference files for an edit of `allowed`
+   * (`boardReferenceFiles`): files the failure evidence names, then the shared
+   * seams, then the other modules the allowed files import. Each is read the
+   * way the edit view reads (the agent's own version in `worktree`, else the
+   * shared baseline, which is the integrated revision after a rebase, so an
+   * accepted seam change it rebased onto is what it sees). Never writable.
+   */
+  private async referencesFor(
+    allowed: readonly string[],
+    files: readonly string[],
+    worktree: string,
+    state: BoardState | undefined,
+    evidence: readonly string[],
+  ): Promise<ReferenceFile[]> {
+    return boardReferenceFiles({
+      writable: allowed.filter((f) => !hasWildcard(f)),
+      files,
+      seams: (state?.seams ?? []).map((seam) => seam.path),
+      ...(evidence.length > 0 ? { evidence: evidence.join("\n") } : {}),
+      read: async (path) => {
+        for (const dir of [worktree, this.baseDir]) {
+          const text = await readFile(join(dir, path), "utf8").catch(() => undefined);
+          if (text !== undefined) {
+            return text;
+          }
+        }
+        return undefined;
+      },
+    });
+  }
+
+  /**
    * Before this agent changes its worktree: anything uncommitted there was not
    * written by this agent's current operation (another process could have
    * written into it), so it is reset and cleaned, and logged, never pushed.
@@ -2398,6 +2459,12 @@ export class BoardAgent {
           ]
         : []),
     ].join("\n");
+    // READ-ONLY references: the files the failure names, the seams and
+    // modules the allowed files import, read as this agent sees them.
+    const references = await this.referencesFor(allowed, files, worktree, state, [
+      ...(failure !== undefined ? [failure] : []),
+      ...(regressed?.evidence ?? []),
+    ]);
     const executor = this.options.executor;
     const runOn = (model: string | undefined) =>
       executor.execute({
@@ -2407,6 +2474,7 @@ export class BoardAgent {
         paths: allowed,
         baselineRef: "HEAD",
         baselineDir: view,
+        ...referenceContext(references),
         ...(model !== undefined ? { model } : {}),
       });
     let usedRung = rung;
@@ -2674,6 +2742,7 @@ export class BoardAgent {
     instruction: string,
     local: (code: string, error: string, note?: Record<string, string>) => void,
     posted: (draft: Record<string, unknown>, note?: Record<string, string>) => Promise<boolean>,
+    state?: BoardState,
   ): Promise<void> {
     const note = { request: grant.request };
     const fork = this.forks.get(grant.request);
@@ -2692,6 +2761,7 @@ export class BoardAgent {
     const files = [...new Set([...(await listRepoFiles(this.baseDir)), ...(await listRepoFiles(worktree))])].sort();
     const allowed = resolveIntentFiles(scope, files);
     const view = await this.editView(allowed, worktree);
+    const references = await this.referencesFor(allowed, files, worktree, state, []);
     try {
       await this.options.executor.execute({
         worktreeDir: worktree,
@@ -2700,6 +2770,7 @@ export class BoardAgent {
         paths: allowed,
         baselineRef: "HEAD",
         baselineDir: view,
+        ...referenceContext(references),
       });
     } catch (error) {
       await this.discard(worktree, head);
@@ -3446,4 +3517,9 @@ export class BoardAgent {
       }
     }
   }
+}
+
+/** The executor context fields for an edit's read-only reference files (none: nothing, so the prompt is unchanged). */
+function referenceContext(references: readonly ReferenceFile[]): { frozenContracts?: string[]; frozenContractFiles?: ReferenceFile[]; boardReferences?: true } {
+  return references.length > 0 ? { frozenContracts: references.map((r) => r.path), frozenContractFiles: [...references], boardReferences: true } : {};
 }

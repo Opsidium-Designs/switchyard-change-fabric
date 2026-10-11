@@ -58,6 +58,17 @@ export interface ExecutorContext {
     readonly contents: string;
   }[];
   /**
+   * Optional: the `frozenContractFiles` are a Change board's READ-ONLY
+   * REFERENCE set for this edit (the modules and shared seams the writable
+   * files import, and the files the current failure names) rather than only a
+   * blueprint's contracts. An inference executor then labels them as reference
+   * files outside the write scope, says only the fields and functions they
+   * declare may be used, and that changing one takes a seam contract on the
+   * board, not an edit. Optional and defaulting to false, so every existing
+   * caller's prompt is unchanged.
+   */
+  readonly boardReferences?: boolean;
+  /**
    * Optional names of the symbols THIS unit's module must keep exporting: its
    * EXPORTED INTERFACE, which other modules (and the entry point) import by
    * name. An inference executor lists these in the prompt so the model changes

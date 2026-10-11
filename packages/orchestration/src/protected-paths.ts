@@ -264,7 +264,8 @@ export function importCandidates(abs: string): string[] {
   return out;
 }
 
-function relativeImports(source: string): string[] {
+/** The relative specifiers a module imports (static, dynamic, and `require`), in source order. */
+export function relativeImports(source: string): string[] {
   const out: string[] = [];
   const re = /(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)["'](\.{1,2}\/[^"']+)["']/g;
   let match: RegExpExecArray | null;
