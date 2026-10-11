@@ -192,3 +192,4 @@ export {
   RateLimitError,
   rateLimitErrorFor,
 } from "./rate-limit.ts";
+export { brokenByEdit, syntaxCheckAvailable, syntaxError } from "./syntax-check.ts";

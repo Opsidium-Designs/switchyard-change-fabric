@@ -8,6 +8,9 @@ import {
   createWorkersAiRestInvoke,
   DEFAULT_WORKERS_AI_MODEL,
   isTransientWorkersAiError,
+  syntaxCheckAvailable,
+  syntaxError,
+  brokenByEdit,
   UnusableModelOutputError,
   WorkersAiExecutor,
   WorkersAiTimeoutError,
@@ -1025,5 +1028,85 @@ describe("WorkersAiExecutor per-attempt model id (so a retry can escalate, offli
     });
     expect(seen).toEqual([escalationModel]);
     expect(result.cost.model).toBe(escalationModel);
+  });
+});
+describe("WorkersAiExecutor refuses an edit that leaves a file unparsable (offline)", () => {
+  const HANDLER =
+    'export function handle(id: string): string {\n  if (id === "") {\n    return "missing";\n  }\n  return "found";\n}\n';
+
+  async function seed(contents: string): Promise<void> {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/handler.ts"), contents, "utf8");
+  }
+
+  function run(search: string, replace: string): Promise<unknown> {
+    const invoke: WorkersAiInvoke = async () => ({
+      text: JSON.stringify({ commitMessage: "c", edits: [{ path: "src/handler.ts", search, replace }] }),
+    });
+    return new WorkersAiExecutor({ invoke }).execute({
+      worktreeDir: worktree,
+      workUnitId: "handler",
+      objective: "tweak the handler",
+      paths: ["src/handler.ts"],
+      baselineRef: "HEAD",
+    });
+  }
+
+  it.skipIf(!syntaxCheckAvailable())("rejects a whole-file replace that drops the final closing brace, writing nothing", async () => {
+    await seed(HANDLER);
+    await expect(run(HANDLER, HANDLER.slice(0, -2))).rejects.toThrow(UnusableModelOutputError);
+    await expect(run(HANDLER, HANDLER.slice(0, -2))).rejects.toThrow(/src\/handler\.ts unparsable.*nothing was written/);
+    expect(await readFile(join(worktree, "src/handler.ts"), "utf8")).toBe(HANDLER);
+  });
+
+  it.skipIf(!syntaxCheckAvailable())("rejects a replace that covers more than its search and duplicates a block ending", async () => {
+    await seed(HANDLER);
+    await expect(run('    return "missing";\n', '    return "missing";\n  }\n')).rejects.toThrow(/unparsable/);
+    expect(await readFile(join(worktree, "src/handler.ts"), "utf8")).toBe(HANDLER);
+  });
+
+  it("keeps the closing brace exactly for a valid whole-file edit and for an edit anchored at the end of the file", async () => {
+    await seed(HANDLER);
+    const renamed = HANDLER.replace('"found"', '"present"');
+    await run(HANDLER, renamed);
+    expect(await readFile(join(worktree, "src/handler.ts"), "utf8")).toBe(renamed);
+    await run('  return "present";\n}\n', '  return "here";\n}\n');
+    expect(await readFile(join(worktree, "src/handler.ts"), "utf8")).toBe(HANDLER.replace('"found"', '"here"'));
+  });
+
+  it("still edits a file that was already unparsable, so a fix can append the missing brace", async () => {
+    const broken = HANDLER.slice(0, -2);
+    await seed(broken);
+    await run('  return "found";\n', '  return "found";\n}\n');
+    expect(await readFile(join(worktree, "src/handler.ts"), "utf8")).toBe(HANDLER);
+    // A non-fixing edit to an already-broken file is not refused here either:
+    // the gate, not this check, judges it.
+    await seed(broken);
+    await run('    return "missing";', '    return "absent";');
+    expect(await readFile(join(worktree, "src/handler.ts"), "utf8")).toBe(broken.replace('"missing"', '"absent"'));
+  });
+});
+
+describe("syntaxError / brokenByEdit", () => {
+  it.skipIf(!syntaxCheckAvailable())("reports a TypeScript syntax error and accepts valid TypeScript, including non-erasable syntax", () => {
+    expect(syntaxError("a.ts", "export enum E { A }\nexport const x: number = 1;\n")).toBeUndefined();
+    expect(syntaxError("a.ts", "function f() {\n  return 1;\n")).toMatch(/Expected '}'/);
+  });
+
+  it("checks only TypeScript files", () => {
+    expect(syntaxError("a.json", "{")).toBeUndefined();
+    expect(syntaxError("a.md", "function f() {")).toBeUndefined();
+  });
+
+  it.skipIf(!syntaxCheckAvailable())("flags only files the edit broke, not files already broken before it", () => {
+    const ok = "const a = 1;\n";
+    const bad = "const a = (1;\n";
+    expect(
+      brokenByEdit([
+        { path: "x.ts", before: ok, after: bad },
+        { path: "y.ts", before: bad, after: bad },
+        { path: "z.ts", before: ok, after: ok },
+      ]).map((b) => b.path),
+    ).toEqual(["x.ts"]);
   });
 });

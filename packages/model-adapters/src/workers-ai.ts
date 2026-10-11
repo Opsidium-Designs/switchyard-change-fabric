@@ -28,6 +28,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 
 import { withCallUsage } from "./call-usage.ts";
 import { isRateLimitError } from "./rate-limit.ts";
+import { brokenByEdit } from "./syntax-check.ts";
 import type {
   ExecutionResult,
   ExecutorContext,
@@ -558,6 +559,7 @@ export class WorkersAiExecutor implements ExecutorProvider {
     };
 
     const changedPaths: string[] = [];
+    const before = new Map<string, string>();
     for (const edit of parsed.edits) {
       // Resolve (and containment-check) the path up front so an escaping path
       // fails exactly as before.
@@ -570,10 +572,26 @@ export class WorkersAiExecutor implements ExecutorProvider {
         );
       }
       const applied = applyAnchoredEdit(current, edit, usedModel, context.workUnitId, this.options.providerLabel ?? "Workers AI");
+      if (!before.has(edit.path)) {
+        before.set(edit.path, current);
+      }
       working.set(edit.path, applied);
       if (!changedPaths.includes(edit.path)) {
         changedPaths.push(edit.path);
       }
+    }
+
+    // Refuse an edit that leaves a file unparsable (it parsed before): it would
+    // fail the gate on syntax alone, so it is unusable output, not a push.
+    const broken = brokenByEdit(
+      changedPaths.map((path) => ({ path, before: before.get(path)!, after: working.get(path)! })),
+    );
+    if (broken.length > 0) {
+      throw new UnusableModelOutputError(
+        `${this.options.providerLabel ?? "Workers AI"} model ${usedModel} edit for WorkUnit ${context.workUnitId} leaves ` +
+          `${broken.map((b) => `${b.path} unparsable (${b.error})`).join("; ")}; nothing was written. ` +
+          `Check that each \`replace\` keeps every bracket its \`search\` covered, including a closing brace at the end of the file`,
+      );
     }
 
     for (const relPath of changedPaths) {

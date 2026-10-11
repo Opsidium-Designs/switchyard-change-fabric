@@ -537,6 +537,16 @@ is distributed changes: items are proposed and claimed, never assigned.
   its `MAX_EXCERPTS` file excerpts, after its claims' write and read intent
   files, each marked as a read-only reference, so it plans against the real
   types.
+  An edit that applies cleanly but leaves a TypeScript file unparsable (a
+  `replace` that drops a closing brace, or one that covers more than its
+  `search` and duplicates a block ending) is refused before anything is
+  written (`brokenByEdit` in `syntax-check.ts`, a syntax-only parse with
+  Node's built-in TypeScript parser, no type checking): the edit fails as
+  `EXECUTOR_FAILED` naming the file and the parse error, so the agent repairs
+  it on its next turn instead of pushing it to the gate. A file that already
+  failed to parse before the edit is not checked, so an edit can still move a
+  broken file toward fixed; on a Node without that parser the check is
+  skipped. It only refuses; the gate stays authoritative.
   Budgets: turns per item, and turns per run; a spent budget is recorded on the
   board (a handoff to another running worker when the board accepts it, else a
   help request with need `turn-budget` or `run-budget`, or `agent.left` when
