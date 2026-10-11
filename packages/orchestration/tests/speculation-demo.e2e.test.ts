@@ -41,10 +41,22 @@ async function demo(speculate?: number, rules?: Parameters<typeof runBoardOfflin
 describe("speculative batch gating on the offline demo board", () => {
   it("K = 1 (arbitration revision 1 pinned) records exactly the board log of the run before speculation", async () => {
     const golden = JSON.parse(await readFile(join(HERE, "fixtures", "board-audit-speculate1.log.json"), "utf8")) as unknown[];
-    // The golden log predates the arbitration revision rule: pinning revision 1 reproduces it byte for byte.
+    // The golden log predates the arbitration revision rule: pinning revision 1 reproduces it byte for byte,
+    // apart from the per-unit `applied` record a revision now carries (an additive record, never a verdict),
+    // which the golden also predates.
     const result = await demo(1, { arbitration: 1 });
     expect(result.verdict).toBe("verified");
-    expect(JSON.parse(JSON.stringify(result.log))).toEqual(golden);
+    const revs = result.log.filter((m) => m.type === "integrated.rev");
+    expect(revs.length).toBeGreaterThan(0);
+    expect(revs.every((m) => m.type === "integrated.rev" && m.payload.applied !== undefined)).toBe(true);
+    const withoutApplied = (JSON.parse(JSON.stringify(result.log)) as { type: string; payload: Record<string, unknown> }[]).map((m) => {
+      if (m.type !== "integrated.rev") {
+        return m;
+      }
+      const { applied: _applied, ...payload } = m.payload;
+      return { ...m, payload };
+    });
+    expect(withoutApplied).toEqual(golden);
     expect(result.speculation).toBeUndefined();
     expect(result.log.some((m) => m.type === "candidate.gated")).toBe(false);
     expect(result.log.find((m) => m.type === "goal.posted")!.payload).not.toHaveProperty("rules.speculate");

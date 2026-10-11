@@ -490,6 +490,7 @@ export async function runIntegrateJob(job: IntegrateJob, options: RunGateJobOpti
       includes: [...u.includes],
       ...(u.yieldedScope ? { yieldedScope: [...u.yieldedScope] } : {}),
       ...(u.releasedPaths ? { releasedPaths: [...u.releasedPaths] } : {}),
+      ...(u.parts ? { parts: u.parts.map((p) => ({ item: p.item, commit: p.commit, baselineRef: p.baselineRef, scope: [...p.scope] })) } : {}),
     }));
     const adjusted = job.testInventory ? inventoryAfterContracts(job.testInventory, [...(job.acceptedContracts ?? [])]) : {};
     const verification = new ChangeVerification(NO_PROVISIONING, { commandRunner: gateRunner });

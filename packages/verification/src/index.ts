@@ -19,6 +19,7 @@
  */
 
 export type {
+  AppliedUnit,
   CheckKind,
   CheckResult,
   CoordinationDecision,
@@ -150,6 +151,7 @@ export type {
   CompletedWorkUnit,
   VerifyAndIntegrateOptions,
 } from "./change-verification.ts";
+export type { UnitPart } from "./integrator.ts";
 export { ChangeVerification } from "./change-verification.ts";
 
 export type {
@@ -160,6 +162,7 @@ export type {
   GateJobResult,
   IntegrateJob,
   IntegrateJobResult,
+  IntegrateJobPart,
   IntegrateJobUnit,
   IntegrationJobKeyInput,
   JobInstallOutcome,

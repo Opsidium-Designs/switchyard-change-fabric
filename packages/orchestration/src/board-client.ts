@@ -12,6 +12,7 @@
  */
 
 import type {
+  BoardAppliedUnit,
   BoardRevProgress,
   BoardDigest,
   BoardMessage,
@@ -205,6 +206,8 @@ export class BoardOperatorClient {
     readonly base?: string;
     /** Sub-lead merges the integrator could not verify in the gated tree. */
     readonly unverified?: readonly { readonly item: string; readonly reason: string }[];
+    /** What each merged agent's unit applied to the gated tree (and yielded): a record. */
+    readonly applied?: readonly BoardAppliedUnit[];
   }): Promise<BoardPostOutcome> {
     const { res, body } = await this.post("/integration/revision", input);
     return res.status === 201 ? { ok: true, appended: (body.appended as BoardMessage[] | undefined) ?? [] } : rejection(res, body);

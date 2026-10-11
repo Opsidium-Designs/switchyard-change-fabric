@@ -153,6 +153,21 @@ export interface IntegrationResult {
    * committed, or a deferred push to a candidate ref).
    */
   readonly promotion?: PromotionPush;
+  /**
+   * Per verified unit, in integration order: the files it applied to the
+   * integrated tree (copied or deleted, before the contract restore) and the
+   * changed files it yielded (left to the items or owners they belong to).
+   */
+  readonly appliedUnits?: readonly AppliedUnit[];
+}
+
+/** What one verified unit put into the integrated tree, and what it left out. */
+export interface AppliedUnit {
+  readonly unitId: string;
+  /** Files applied from the unit (sorted). */
+  readonly applied: readonly string[];
+  /** Changed files of the unit that were not applied from it (sorted). */
+  readonly yielded: readonly string[];
 }
 
 /**

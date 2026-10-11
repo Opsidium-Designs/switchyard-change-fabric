@@ -191,7 +191,15 @@
         "failed": 0,
         "total": 1
       },
-      "base": "57ddadc5f4183e4e551441a18f219fcfe72fb816"
+      "base": "57ddadc5f4183e4e551441a18f219fcfe72fb816",
+      "applied": [
+        {
+          "agent": "a0",
+          "paths": [
+            "src/w/d.ts"
+          ]
+        }
+      ]
     },
     "seq": 15,
     "at": "2026-01-01T00:00:13.000Z"
@@ -428,7 +436,22 @@
         "failed": 1,
         "total": 1
       },
-      "base": "b6dc1865f3acce752014ebc7003a8b37fa4dc4e0"
+      "base": "b6dc1865f3acce752014ebc7003a8b37fa4dc4e0",
+      "applied": [
+        {
+          "agent": "a1",
+          "paths": [
+            "src/common.ts",
+            "src/x/a.ts"
+          ]
+        },
+        {
+          "agent": "a3",
+          "paths": [
+            "src/z/c.ts"
+          ]
+        }
+      ]
     },
     "seq": 29,
     "at": "2026-01-01T00:00:23.000Z"
@@ -470,7 +493,16 @@
         "failed": 0,
         "total": 1
       },
-      "base": "b6dc1865f3acce752014ebc7003a8b37fa4dc4e0"
+      "base": "b6dc1865f3acce752014ebc7003a8b37fa4dc4e0",
+      "applied": [
+        {
+          "agent": "a1",
+          "paths": [
+            "src/common.ts",
+            "src/x/a.ts"
+          ]
+        }
+      ]
     },
     "seq": 31,
     "at": "2026-01-01T00:00:24.000Z"
@@ -640,7 +672,15 @@
         "failed": 1,
         "total": 1
       },
-      "base": "612465056029196cece18beb6b8b75bd9fc480c9"
+      "base": "612465056029196cece18beb6b8b75bd9fc480c9",
+      "applied": [
+        {
+          "agent": "a3",
+          "paths": [
+            "src/z/c.ts"
+          ]
+        }
+      ]
     },
     "seq": 37,
     "at": "2026-01-01T00:00:29.000Z"
@@ -799,7 +839,15 @@
         "failed": 0,
         "total": 1
       },
-      "base": "612465056029196cece18beb6b8b75bd9fc480c9"
+      "base": "612465056029196cece18beb6b8b75bd9fc480c9",
+      "applied": [
+        {
+          "agent": "a0",
+          "paths": [
+            "src/z/c.ts"
+          ]
+        }
+      ]
     },
     "seq": 46,
     "at": "2026-01-01T00:00:35.000Z"
@@ -1128,7 +1176,15 @@
         "failed": 0,
         "total": 1
       },
-      "base": "8c254e7f3c76915359f290b196bac7520248496e"
+      "base": "8c254e7f3c76915359f290b196bac7520248496e",
+      "applied": [
+        {
+          "agent": "a1",
+          "paths": [
+            "src/y/b.ts"
+          ]
+        }
+      ]
     },
     "seq": 68,
     "at": "2026-01-01T00:00:53.000Z"

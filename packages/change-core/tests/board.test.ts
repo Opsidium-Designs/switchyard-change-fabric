@@ -59,6 +59,7 @@ import {
   integrablePushItems,
   splitCue,
   planBoardIntegration,
+  boardAppliedRecord,
   decideSpeculativeLanding,
   speculationStateKey,
   speculativeUnits,
@@ -2683,6 +2684,95 @@ describe("integration plans for an agent that lost an item", () => {
     const unit = planBoardIntegration(board.log, board.state).units.find((u) => u.agent === "a")!;
     expect(unit).toMatchObject({ commit: "c3", scope: ["src/two/**"], yieldedScope: ["src/one/x.ts"] });
   });
+});
+
+describe("integration plans for an agent holding several items in one repo", () => {
+  function holding(): TestBoard {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o" }));
+    for (const agent of ["a", "b"]) board.post(msg(agent, "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("lead", "item.proposed", { item: "A", objective: "a", acceptance: [], scopeHint: ["src/a.ts"] }));
+    board.post(msg("lead", "item.proposed", { item: "S", objective: "s", acceptance: [], scopeHint: ["src/s.ts"] }));
+    board.post(msg("lead", "item.proposed", { item: "Z", objective: "z", acceptance: [], scopeHint: ["src/z.ts"] }));
+    board.post(claim("a", "A", ["src/a.ts"]));
+    board.post(claim("a", "S", ["src/s.ts"]));
+    return board;
+  }
+
+  it("a push for one item yields the files of the agent's other held items (not pushed yet): they ride with their own pushes", () => {
+    const board = holding();
+    board.post(push("a", "S", "c1", ["src/s.ts"]));
+    const unit = planBoardIntegration(board.log, board.state).units.find((u) => u.agent === "a")!;
+    expect(unit).toMatchObject({ commit: "c1", scope: ["src/s.ts"], yieldedScope: ["src/a.ts"] });
+    expect(unit.parts).toEqual([{ item: "S", commit: "c1", baselineRef: "HEAD", scope: ["src/s.ts"] }]);
+  });
+
+  it("an excluded push of the other item is yielded too; another agent's item is not (still a scope violation)", () => {
+    const board = holding();
+    board.post(claim("b", "Z", ["src/z.ts"]));
+    board.post(push("a", "A", "c1", ["src/a.ts"]));
+    board.post(msg("engine", "push.excluded", { item: "A", agent: "a", commit: "c1", reason: "failed verification" }));
+    board.post(push("a", "S", "c2", ["src/s.ts"]));
+    const unit = planBoardIntegration(board.log, board.state).units.find((u) => u.agent === "a")!;
+    expect(unit).toMatchObject({ commit: "c2", items: [expect.objectContaining({ id: "S" })], scope: ["src/s.ts"], yieldedScope: ["src/a.ts"] });
+    expect(unit.yieldedScope).not.toContain("src/z.ts");
+  });
+
+  it("both items pending: one unit, each item's files from its own push commit, nothing yielded", () => {
+    const board = holding();
+    board.post(push("a", "A", "c1", ["src/a.ts"]));
+    board.post(push("a", "S", "c2", ["src/s.ts"]));
+    const unit = planBoardIntegration(board.log, board.state).units.find((u) => u.agent === "a")!;
+    expect(unit).toMatchObject({ commit: "c2", includes: ["c1"], scope: ["src/a.ts", "src/s.ts"] });
+    expect(unit.yieldedScope).toBeUndefined();
+    expect(unit.parts).toEqual([
+      { item: "A", commit: "c1", baselineRef: "HEAD", scope: ["src/a.ts"] },
+      { item: "S", commit: "c2", baselineRef: "HEAD", scope: ["src/s.ts"] },
+    ]);
+  });
+
+  it("an item's files are diffed from ITS OWN last passing push, not the agent's later passing push that yielded them", () => {
+    const board = holding();
+    board.post(push("a", "A", "c1", ["src/a.ts"]));
+    board.post(rev("pass", ["c1"], "r1"));
+    // a keeps working on A (not done) and pushes S: S passes while A's newer
+    // edit rides in its repo, yielded.
+    board.post(push("a", "S", "c2", ["src/s.ts"]));
+    expect(planBoardIntegration(board.log, board.state).units[0]).toMatchObject({ commit: "c2", yieldedScope: ["src/a.ts"] });
+    board.post(rev("pass", ["c2"], "r2"));
+    board.post(push("a", "A", "c3", ["src/a.ts"]));
+    const unit = planBoardIntegration(board.log, board.state).units.find((u) => u.agent === "a")!;
+    // The scope check diffs from c2 (the agent's last passing push), but A's
+    // files diff from c1 (A's own): src/a.ts as of c3 is applied even when c3
+    // did not touch it after c2.
+    expect(unit).toMatchObject({ commit: "c3", baselineRef: "c2" });
+    expect(unit.parts).toEqual([{ item: "A", commit: "c3", baselineRef: "c1", scope: ["src/a.ts"] }]);
+  });
+});
+
+describe("a revision's applied record", () => {
+  it("names only agents the revision merged, with concrete paths, and replays", () => {
+    const board = holding2();
+    board.post(push("a", "one", "c1", ["src/one/x.ts"]));
+    expect(() =>
+      appendIntegratedRev(board.state, { commit: "r1", gate: "pass", merged: ["c1"], applied: [{ agent: "b", paths: ["src/one/x.ts"] }] }, AT),
+    ).toThrow(/applied names agent\(s\) b with no push/);
+    expect(() => appendIntegratedRev(board.state, { commit: "r1", gate: "pass", merged: ["c1"], applied: [{ agent: "a", paths: ["src/**"] }] }, AT)).toThrow(/concrete/);
+    const appended = board.post(msg("engine", "integrated.rev", { commit: "r1", gate: "pass", merged: ["c1"], applied: [{ agent: "a", paths: ["src/one/x.ts"], yielded: ["src/two/y.ts"] }] }));
+    const revMsg = appended.find((m) => m.type === "integrated.rev")!;
+    expect(revMsg.type === "integrated.rev" && revMsg.payload.applied).toEqual([{ agent: "a", paths: ["src/one/x.ts"], yielded: ["src/two/y.ts"] }]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+    expect(boardAppliedRecord([{ unitId: "a", applied: ["src/one/x.ts", "src/**"], yielded: [] }, { unitId: "b", applied: ["x"], yielded: [] }], ["a"])).toEqual([
+      { agent: "a", paths: ["src/one/x.ts"] },
+    ]);
+  });
+
+  function holding2(): TestBoard {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/one/**"]));
+    return board;
+  }
 });
 
 describe("integration plans after a sub-lead merge", () => {

@@ -12,6 +12,13 @@
  *     (`baselineRef`), so earlier, already integrated work is not re-applied;
  *   - scoped to the WRITE INTENTS of the items it integrates (announced paths
  *     never widen scope), with the files of items it handed off yielded;
+ *   - applied PER ITEM (`parts`): one agent has ONE repo for every item it
+ *     holds, so its head may carry work for several of them. Each pending
+ *     item's files (its write intents) are applied from that item's own push
+ *     commit, diffed from that item's own last integrated push; files of the
+ *     agent's OTHER held items (not in this unit) are yielded: they ride with
+ *     those items' own pushes. A file outside every item the agent holds is
+ *     still a path-scope violation;
  *   - carrying the contract paths a human released for those items only.
  * Pure: no I/O, no clock.
  */
@@ -19,6 +26,26 @@
 import { mergedChildrenWrite, releasedTargets, routedToSubLead, type BoardItem, type BoardMessage, type BoardState } from "./board.ts";
 import { attributeFailure } from "./failure-attribution.ts";
 import { entriesOverlap, intentPath } from "./path-overlap.ts";
+
+/**
+ * One pending item of a unit: its files are applied from exactly its own push
+ * commit, never from the agent's later head (which may carry unannounced work
+ * for it, or work for another item the agent holds).
+ */
+export interface BoardIntegrationPart {
+  readonly item: string;
+  /** The item's pending push commit (the pin, or one of `includes`). */
+  readonly commit: string;
+  /**
+   * The item's own last push (by this agent) a passing revision merged, or
+   * "HEAD" (the empty tree): its files are diffed from here, so a file a
+   * passing revision yielded while it rode in another item's push is still
+   * applied when its own item is integrated.
+   */
+  readonly baselineRef: string;
+  /** The item's write intents (and its released contract paths), sorted. */
+  readonly scope: readonly string[];
+}
 
 /** One agent's pending pushes, as one unit of the next revision. */
 export interface BoardIntegrationUnitPlan {
@@ -33,7 +60,17 @@ export interface BoardIntegrationUnitPlan {
   readonly includes: readonly string[];
   /** The write intents of the items this unit integrates (sorted, unique). */
   readonly scope: readonly string[];
-  /** Files of items the agent handed off (never applied from it). */
+  /**
+   * Per item, in push order: which files are applied from which commit (see
+   * BoardIntegrationPart). Absent on units built elsewhere (the whole pin is
+   * then applied, as before).
+   */
+  readonly parts?: readonly BoardIntegrationPart[];
+  /**
+   * Files never applied from this unit: those of items the agent handed off
+   * or lost, and the write intents of the agent's other held items whose
+   * pushes are not in this unit (they ride with those items' own pushes).
+   */
   readonly yieldedScope?: readonly string[];
   /** Contract paths a human released for these items, for this unit only. */
   readonly releasedPaths?: readonly string[];
@@ -106,7 +143,7 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
 
   // Facts from the log: each agent's announced commits, the commits passing
   // revisions merged, and the items each agent handed off.
-  const announced = new Map<string, { commit: string; seq: number }[]>();
+  const announced = new Map<string, { commit: string; seq: number; item: string }[]>();
   const passingMerged = new Set<string>();
   const handedOff = new Map<string, Set<string>>();
   // Each agent's own announced paths per item: an item it no longer holds
@@ -118,7 +155,7 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
   const mergesOf = new Map<string, readonly { item: string; commit: string }[]>();
   for (const m of messages) {
     if (m.type === "push.announced") {
-      announced.set(m.from, [...(announced.get(m.from) ?? []), { commit: m.payload.commit, seq: m.seq }]);
+      announced.set(m.from, [...(announced.get(m.from) ?? []), { commit: m.payload.commit, seq: m.seq, item: m.payload.item }]);
       const byItem = pushedPaths.get(m.from) ?? new Map<string, Set<string>>();
       byItem.set(m.payload.item, new Set([...(byItem.get(m.payload.item) ?? []), ...m.payload.paths]));
       pushedPaths.set(m.from, byItem);
@@ -157,6 +194,21 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
         : // A released contract path (possibly outside the scope: a failing check) is in scope for its item.
           [...(i.intent?.write ?? []).map(intentPath), ...releasedTargets(state, i.id).filter((t) => !(state.immutable ?? []).includes(t))];
     const scope = [...new Set(mine.flatMap(writeOf))].sort();
+    // Each item's files come from its own push commit, diffed from its own
+    // last push a passing revision merged (so a file yielded while it rode in
+    // another item's push is never silently dropped from its own item).
+    const parts = mine.map((i) => {
+      const ownBase = (announced.get(agent) ?? []).filter((p) => p.item === i.id && p.seq < i.lastPush!.seq && passingMerged.has(p.commit)).at(-1)?.commit;
+      return { item: i.id, commit: i.lastPush!.commit, baselineRef: ownBase ?? "HEAD", scope: [...new Set(writeOf(i))].sort() };
+    });
+    // The agent's OTHER held items (claimed, or split under it as sub-lead)
+    // whose pushes this unit does not integrate (none yet, excluded,
+    // regressed): their files may sit at its head, but they are not this
+    // unit's to apply, nor a scope violation of it.
+    const inUnit = new Set(mine.map((i) => i.id));
+    const otherHeld = Object.values(state.items).filter(
+      (i) => !inUnit.has(i.id) && ((i.status === "claimed" && i.owner === agent) || (i.status === "split" && i.subLead === agent)),
+    );
     // Items this agent handed to someone else: their files are not its to apply.
     // Nor are the files it pushed for an item it no longer holds (its claim was
     // reopened, lapsed, or re-planned): that work stays in its repo, unapplied.
@@ -169,6 +221,7 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
         .map((id) => state.items[id])
         .flatMap((item) => (item ? [...(item.intent?.write ?? []).map(intentPath), ...(item.lastPush?.paths ?? [])] : [])),
       ...lost.flatMap(([, paths]) => [...paths]),
+      ...otherHeld.flatMap((item) => (item.intent?.write ?? item.scopeHint).map(intentPath)),
     ].filter((entry) => !scope.some((own) => entriesOverlap(entry, own)));
     // Contract paths released for the items this unit integrates, including the
     // children a sub-lead's push merges (their accepted changes ship through it).
@@ -185,6 +238,7 @@ export function planBoardIntegration(messages: readonly BoardMessage[], state: B
       baselineRef: base ?? "HEAD",
       includes: mine.slice(0, -1).map((i) => i.lastPush!.commit),
       scope,
+      parts,
       ...(yieldedScope.length > 0 ? { yieldedScope: [...new Set(yieldedScope)].sort() } : {}),
       ...(released.length > 0 ? { releasedPaths: released } : {}),
     });

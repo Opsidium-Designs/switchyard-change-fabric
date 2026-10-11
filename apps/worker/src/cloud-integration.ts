@@ -24,12 +24,14 @@
 
 import {
   attributeFailure,
+  boardAppliedRecord,
   combineAttribution,
   BOARD_LIMITS,
   intentPath,
   pendingPushItems,
   planBoardIntegration,
   narrowToSplitChildren,
+  type BoardAppliedUnit,
   type BoardMessage,
   type BoardRevProgress,
   type BoardState,
@@ -271,6 +273,8 @@ export async function planCloudJob(input: {
       items: u.items.map((i) => i.id),
       ...(u.yieldedScope ? { yieldedScope: [...u.yieldedScope] } : {}),
       ...(u.releasedPaths ? { releasedPaths: [...u.releasedPaths] } : {}),
+      // The same per-item path selection as the local integrator.
+      ...(u.parts ? { parts: u.parts.map((p) => ({ item: p.item, commit: p.commit, baselineRef: p.baselineRef, scope: [...p.scope] })) } : {}),
     })),
     ...(config.gateCommand ? { gateCommand: config.gateCommand } : {}),
     requireGate: config.requireGate,
@@ -384,6 +388,8 @@ export type CloudRevisionDecision =
         readonly gated?: false;
         /** The commit the revision was built on (the board refuses a stale one: STALE_BASE). */
         readonly base?: string;
+        /** What each merged unit applied to the gated tree (and yielded): a record. */
+        readonly applied?: readonly BoardAppliedUnit[];
       };
       readonly integratedItems: readonly string[];
       readonly excludedItems: readonly string[];
@@ -456,10 +462,13 @@ export function decideCloudRevision(plan: CloudJobPlan, result: IntegrateJobResu
   // refuses a revision whose base is not its integrated head NOW (STALE_BASE).
   const builtOn = plan.job.baseCommit ?? stateNow.baseline;
   const withBase = builtOn !== undefined ? { base: builtOn } : {};
+  // What each merged unit applied to the gated tree (and yielded): a record.
+  const appliedRecord = boardAppliedRecord(result.evidence.integration.appliedUnits, [...mergedAgents]);
+  const withApplied = appliedRecord.length > 0 ? { applied: appliedRecord } : {};
   if (result.gate === "pass") {
     return {
       kind: "record",
-      input: { commit: result.commit, gate: "pass", merged, ...(result.gated === false ? { gated: false as const } : {}), ...withUnverified, ...withProgress, ...withBase },
+      input: { commit: result.commit, gate: "pass", merged, ...(result.gated === false ? { gated: false as const } : {}), ...withUnverified, ...withProgress, ...withBase, ...withApplied },
       integratedItems,
       excludedItems,
       excludedAgents,
@@ -484,7 +493,7 @@ export function decideCloudRevision(plan: CloudJobPlan, result: IntegrateJobResu
   const source: AttributionSource = combined.source;
   return {
     kind: "record",
-    input: { commit: result.commit, gate: "fail", merged, failing: { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: ordered }, ...withUnverified, ...withProgress, ...withBase },
+    input: { commit: result.commit, gate: "fail", merged, failing: { output: head(`${note}${raw}`, BOARD_LIMITS.maxFailingOutput), items: ordered }, ...withUnverified, ...withProgress, ...withBase, ...withApplied },
     integratedItems,
     excludedItems,
     excludedAgents,

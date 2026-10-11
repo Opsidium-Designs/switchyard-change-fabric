@@ -29,6 +29,7 @@ import {
   type CommandRunner,
 } from "./command.ts";
 import {
+  changedPathsBetween,
   changedPathsSinceBaseline,
   checkoutCommit,
   clone,
@@ -44,7 +45,7 @@ import {
   runnerResolutionViolations,
 } from "./runner-resolution.ts";
 import { inventoryShortfall, readStreamInventory, readTestProgress, type TestInventory } from "./test-inventory.ts";
-import type { CheckResult, IntegrationResult, OutputRef, PromotionPush, Verdict } from "./types.ts";
+import type { AppliedUnit, CheckResult, IntegrationResult, OutputRef, PromotionPush, Verdict } from "./types.ts";
 
 /** One verified WorkUnit's workspace to feed into integration. */
 export interface VerifiedWorkspace {
@@ -77,6 +78,29 @@ export interface VerifiedWorkspace {
    * are refused like any protected change.
    */
   readonly releasedPaths?: readonly string[];
+  /**
+   * Per-item path selection (one agent's repo can carry work for several
+   * items it holds). When given, a file is applied from this unit only when it
+   * is inside a part's scope, and then from THAT part's commit (diffed from the
+   * part's own baseline; a file in several parts' scopes comes from the last
+   * one). Every other file the pinned commit changed is yielded: never applied
+   * from this unit (the verifier already refused a unit whose changed files
+   * are neither in its scope nor yielded). Absent: every changed, non-yielded
+   * file of the pinned commit is applied, as before.
+   */
+  readonly parts?: readonly UnitPart[];
+}
+
+/** One item's files of a unit: applied from exactly `commit`, diffed from `baselineRef`. */
+export interface UnitPart {
+  /** The item the part applies (for the record only). */
+  readonly item?: string;
+  /** The commit the part's files are read from (the pinned commit or an ancestor of it). */
+  readonly commit: string;
+  /** The part's diff base ("HEAD": the empty tree). */
+  readonly baselineRef: string;
+  /** The part's write scope (globs). */
+  readonly scope: readonly string[];
 }
 
 /** Inputs to integrate verified WorkUnits into one combined workspace. */
@@ -234,8 +258,9 @@ export class Integrator {
       const refused: string[] = [];
       const appliedReleased: string[] = [];
       const applied: string[] = [];
+      const appliedUnits: AppliedUnit[] = [];
       for (const unit of verified) {
-        await this.applyUnit(unit, integrationDir, workRoot, options.protectedPaths ?? [], refused, appliedReleased, applied);
+        appliedUnits.push(await this.applyUnit(unit, integrationDir, workRoot, options.protectedPaths ?? [], refused, appliedReleased, applied));
       }
       // Gate-equals-deploy: a file a unit applied that the tree's ignore rules
       // match would sit in the checkout the gate runs in, but the commit (git
@@ -426,6 +451,8 @@ export class Integrator {
         ...(commit !== "" ? { commit } : {}),
         ...(protectedViolations.length > 0 ? { protectedViolations } : {}),
         ...(promotion !== undefined ? { promotion } : {}),
+        // What each unit put into the gated tree (and left out), for the record.
+        appliedUnits,
       };
     } finally {
       await rm(integrationDir, { recursive: true, force: true });
@@ -440,7 +467,9 @@ export class Integrator {
    * clobber one another. Any path this unit yielded to a lease owner is skipped
    * so the owner is the only contributor of a contested path. A changed path
    * that no longer exists in the unit's tree is a deletion, so it is removed
-   * from the integration checkout rather than copied.
+   * from the integration checkout rather than copied. With `parts`, only the
+   * files inside a part's scope are applied, each from its part's commit.
+   * Returns what the unit applied (copied or deleted) and yielded.
    */
   private async applyUnit(
     unit: VerifiedWorkspace,
@@ -450,11 +479,12 @@ export class Integrator {
     refused: string[],
     appliedReleased: string[],
     applied: string[] = [],
-  ): Promise<void> {
+  ): Promise<AppliedUnit> {
     const released = unit.releasedPaths ?? [];
     const root = await realpath(integrationDir);
     const yielded = new Set(unit.yieldedPaths ?? []);
     const yieldedScope = unit.yieldedScope ?? [];
+    const record = { unitId: unit.unitId, applied: [] as string[], yielded: [] as string[] };
     const unitDir = await mkdtemp(join(workRoot, `scf-unit-${sanitize(unit.unitId)}-`));
     try {
       await clone(unit.gitUrl, unitDir);
@@ -464,62 +494,97 @@ export class Integrator {
       }
       const unitRoot = await realpath(unitDir);
       const changed = await changedPathsSinceBaseline(unitDir, unit.baselineRef);
-      for (const rel of changed) {
-        if (yielded.has(rel) || (yieldedScope.length > 0 && matchesAny(rel, yieldedScope))) {
-          // This contested path belongs to another lease owner; skip it so the
-          // single owner's version is the one that lands in the integration.
-          continue;
+      // Which commit each applied file is read from: the pinned checkout, or
+      // (with parts) the commit of the last part whose scope holds the file.
+      const plan: { commit?: string; paths: string[] }[] = [];
+      if (unit.parts === undefined) {
+        plan.push({ paths: [...changed] });
+      } else {
+        const source = new Map<string, number>();
+        for (const [k, part] of unit.parts.entries()) {
+          for (const rel of await changedPathsBetween(unitDir, part.baselineRef, part.commit)) {
+            if (part.scope.length > 0 && matchesAny(rel, part.scope)) {
+              source.set(rel, k);
+            }
+          }
         }
-        const from = join(unitDir, rel);
-        const to = join(integrationDir, rel);
-        if (rel.split("/").some((segment) => segment === "node_modules" || segment === ".git") || /(^|\/)(\.bin|vendor\/bin)\//.test(rel)) {
-          refused.push(`${rel} (dependency or tool tree: never applied from a unit)`);
-          continue;
+        // Parts at the same commit are applied once (their files together).
+        const commits = [...new Set(unit.parts.map((p) => p.commit))];
+        for (const commit of commits) {
+          const paths = [...source].filter(([, k]) => unit.parts![k]!.commit === commit).map(([rel]) => rel).sort();
+          if (paths.length > 0) {
+            plan.push({ commit, paths });
+          }
         }
-        if (protectedPaths.length > 0 && matchesAny(rel, protectedPaths)) {
-          if (released.length === 0 || !matchesAny(rel, released)) {
-            // Not this unit's to change: the baseline version stays (the
-            // restore below would put it back anyway; this keeps it from
-            // ever being written).
-            refused.push(rel);
+        // Files the pin changed that no part applies: yielded (the verifier
+        // refused the unit if any of them was neither in scope nor yielded).
+        record.yielded.push(...changed.filter((rel) => !source.has(rel)));
+      }
+      for (const step of plan) {
+        if (step.commit !== undefined) {
+          await checkoutCommit(unitDir, step.commit);
+        }
+        for (const rel of step.paths) {
+          if (yielded.has(rel) || (yieldedScope.length > 0 && matchesAny(rel, yieldedScope))) {
+            // This contested path belongs to another lease owner; skip it so the
+            // single owner's version is the one that lands in the integration.
+            record.yielded.push(rel);
             continue;
           }
-          appliedReleased.push(rel);
+          const from = join(unitDir, rel);
+          const to = join(integrationDir, rel);
+          if (rel.split("/").some((segment) => segment === "node_modules" || segment === ".git") || /(^|\/)(\.bin|vendor\/bin)\//.test(rel)) {
+            refused.push(`${rel} (dependency or tool tree: never applied from a unit)`);
+            continue;
+          }
+          if (protectedPaths.length > 0 && matchesAny(rel, protectedPaths)) {
+            if (released.length === 0 || !matchesAny(rel, released)) {
+              // Not this unit's to change: the baseline version stays (the
+              // restore below would put it back anyway; this keeps it from
+              // ever being written).
+              refused.push(rel);
+              continue;
+            }
+            appliedReleased.push(rel);
+          }
+          if ((await lstat(from).catch(() => undefined))?.isSymbolicLink()) {
+            refused.push(`${rel} (a symlink: never applied)`);
+            continue;
+          }
+          // Every read stays inside the unit's checkout (a symlinked parent
+          // directory could point anywhere) ...
+          const fromParent = await deepestRealpath(dirname(from));
+          if (!within(unitRoot, fromParent)) {
+            refused.push(`${rel} (its directory resolves outside the unit's checkout)`);
+            continue;
+          }
+          // ... and every write inside the integration checkout, checked BEFORE
+          // any directory is created, so nothing is ever made outside it.
+          if (!within(root, await deepestRealpath(dirname(to)))) {
+            refused.push(`${rel} (resolves outside the integration checkout)`);
+            continue;
+          }
+          await mkdir(dirname(to), { recursive: true });
+          if ((await lstat(to).catch(() => undefined))?.isSymbolicLink()) {
+            refused.push(`${rel} (would write through a symlink)`);
+            continue;
+          }
+          if (!(await pathExists(from))) {
+            // The unit deleted this file: carry the deletion into the integrated
+            // tree so it matches the unit's verified result.
+            await rm(to, { force: true });
+            record.applied.push(rel);
+            continue;
+          }
+          await cp(from, to, { recursive: true });
+          applied.push(rel);
+          record.applied.push(rel);
         }
-        if ((await lstat(from).catch(() => undefined))?.isSymbolicLink()) {
-          refused.push(`${rel} (a symlink: never applied)`);
-          continue;
-        }
-        // Every read stays inside the unit's checkout (a symlinked parent
-        // directory could point anywhere) ...
-        const fromParent = await deepestRealpath(dirname(from));
-        if (!within(unitRoot, fromParent)) {
-          refused.push(`${rel} (its directory resolves outside the unit's checkout)`);
-          continue;
-        }
-        // ... and every write inside the integration checkout, checked BEFORE
-        // any directory is created, so nothing is ever made outside it.
-        if (!within(root, await deepestRealpath(dirname(to)))) {
-          refused.push(`${rel} (resolves outside the integration checkout)`);
-          continue;
-        }
-        await mkdir(dirname(to), { recursive: true });
-        if ((await lstat(to).catch(() => undefined))?.isSymbolicLink()) {
-          refused.push(`${rel} (would write through a symlink)`);
-          continue;
-        }
-        if (!(await pathExists(from))) {
-          // The unit deleted this file: carry the deletion into the integrated
-          // tree so it matches the unit's verified result.
-          await rm(to, { force: true });
-          continue;
-        }
-        await cp(from, to, { recursive: true });
-        applied.push(rel);
       }
     } finally {
       await rm(unitDir, { recursive: true, force: true });
     }
+    return { unitId: record.unitId, applied: [...new Set(record.applied)].sort(), yielded: [...new Set(record.yielded)].sort() };
   }
 
   /**

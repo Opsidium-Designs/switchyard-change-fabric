@@ -950,7 +950,29 @@ is distributed changes: items are proposed and claimed, never assigned.
   passing revision already merged, scoped to the WRITE INTENTS of those items
   only (announced paths never widen it), with the files of items the agent
   handed off yielded (never applied from it, never failing it), and read with a
-  fresh operator read token (revoked afterwards). The existing verifier and
+  fresh operator read token (revoked afterwards). An agent has ONE repo for
+  every item it holds, so its head can carry work for several of them; the
+  unit therefore selects paths PER ITEM (`parts`): each pending item's files
+  (its write intents and released contract paths) are applied from that
+  item's OWN push commit (never the agent's later head, which may carry
+  unannounced work), diffed from that item's own last push a passing revision
+  merged (or the empty tree), so a file that rode in another item's push is
+  never silently dropped when its own item is integrated. Both items pending:
+  both sets of paths land in the one revision, each from its own commit (parts
+  at the same commit are applied once). The write intents of the agent's OTHER
+  held items whose pushes are not in the unit (none yet, excluded, regressed)
+  are yielded: never applied from this unit and never a path-scope violation of
+  it; they ride with those items' own pushes. A changed file outside every item
+  the agent holds is still a path-scope violation (the push is excluded, as
+  before). Speculative candidates and the leave-one-out ratchet build their
+  trees from the same units (`completedFromPlan`), so removing a unit removes
+  exactly its paths, and the cloud integration job carries the same `parts`.
+  The revision records, per merged agent, the files its unit applied to the
+  gated tree and the changed files it yielded (`integrated.rev` `applied`, a
+  record only, never a verdict; the proof bundle and the console's proof panel
+  show it for the final revision). This closes the board-live-sf14 deadlock:
+  every seam push of an agent that also held an invoices item was excluded for
+  the invoices file at its head, so the seam change never landed. The existing verifier and
   integrator compose the verified units onto the last RECORDED passing revision
   (the board's `integrated.commit`, never whatever the integration branch head
   is; only that revision's candidate ref is fetched), restore the contract from
@@ -1812,7 +1834,7 @@ refused at startup (see "Speculative batch gating"):
   queue path is unchanged (it drives run-live's recruitment, not the board).
 - **Plan.** A durable step plans the next revision's job from the board with
   `planBoardIntegration`, exactly as the local integrator does (pins, includes,
-  diff bases, write-intent scope, yielded files, released contract paths, the
+  diff bases, write-intent scope, per-item parts, yielded files, released contract paths, the
   last recorded passing revision as the base). The job's idempotency key is the
   Change, the base commit, the pinned commits, every gate-defining field (the
   integration repo and branch, the gate command, whether a gate is required,

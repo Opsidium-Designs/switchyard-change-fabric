@@ -276,6 +276,7 @@ describe("integration on Cloudflare", () => {
         includes: [],
         scope: ["src/a.js"],
         items: ["fix-a"],
+        parts: [{ item: "fix-a", commit: PIN_2, baselineRef: "HEAD", scope: ["src/a.js"] }],
       },
     ]);
     expect(JSON.stringify(integrate.job)).not.toMatch(/read-secret|write-secret/);
@@ -604,6 +605,24 @@ describe("integration on Cloudflare", () => {
     expect(failing.kind === "record" && failing.input.base).toBe("b".repeat(40));
     // Built on the branch head before any pass: the goal's baseline.
     expect(decideCloudRevision(planned.plan, passResult(), { ...state, baseline: "a".repeat(40) })).toMatchObject({ kind: "record", input: { base: "a".repeat(40) } });
+    // The cloud job carries the same per-item path selection as the local integrator,
+    // and the revision records what each merged unit applied (only merged agents).
+    expect(planned.plan.job.units[0]!.parts).toEqual([{ item: "fix-a", commit: PIN_1, baselineRef: "HEAD", scope: ["src/a.js"] }]);
+    const withApplied = passResult();
+    const appliedResult: IntegrateJobResult = {
+      ...withApplied,
+      evidence: {
+        ...withApplied.evidence!,
+        integration: {
+          ...withApplied.evidence!.integration,
+          appliedUnits: [
+            { unitId: "agent-1", applied: ["src/a.js"], yielded: ["src/b.js"] },
+            { unitId: "agent-9", applied: ["src/x.js"], yielded: [] },
+          ],
+        },
+      },
+    };
+    expect(decideCloudRevision(onBase, appliedResult, state)).toMatchObject({ kind: "record", input: { applied: [{ agent: "agent-1", paths: ["src/a.js"], yielded: ["src/b.js"] }] } });
     // Revision 1 passes; then a job built on anything but its commit is stale.
     await runIntegrationLoop(workerIntegrationPorts(s.h.env, ID), fakeSteps(), s.workflow.created[0]!.id);
     expect((await s.board()).state.integrated?.commit).toBe(GATED);

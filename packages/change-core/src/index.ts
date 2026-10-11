@@ -130,6 +130,7 @@ export type {
   BoardDigestHelp,
   BoardDigestStruggle,
   BoardRevProgress,
+  BoardAppliedUnit,
   BoardProgressScore,
   BoardSeam,
   BoardVolunteer,
@@ -177,6 +178,7 @@ export {
   progressHeadline,
   appendDecisionRecorded,
   appendIntegratedRev,
+  boardAppliedRecord,
   appendToolGated,
   appendToolUsed,
   appendSeamStalled,
@@ -317,7 +319,7 @@ export {
   toolsWorkspaceName,
 } from "./board-join.ts";
 
-export type { BoardIntegrationPlan, BoardIntegrationUnitPlan, CandidateVerdict, SpeculativeLanding } from "./board-integration-plan.ts";
+export type { BoardIntegrationPart, BoardIntegrationPlan, BoardIntegrationUnitPlan, CandidateVerdict, SpeculativeLanding } from "./board-integration-plan.ts";
 export {
   awaitingSubLead,
   decideSpeculativeLanding,

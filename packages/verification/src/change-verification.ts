@@ -21,7 +21,7 @@ import {
 } from "@switchyard-change/change-core";
 import type { WorkspaceProvider, WorkspaceRef } from "@switchyard-change/artifact-workspace";
 
-import { Integrator, type VerifiedWorkspace } from "./integrator.ts";
+import { Integrator, type UnitPart, type VerifiedWorkspace } from "./integrator.ts";
 import type { GitIdentity } from "./git.ts";
 import type { TestInventory } from "./test-inventory.ts";
 import { VerificationProvider } from "./verifier.ts";
@@ -74,6 +74,12 @@ export interface CompletedWorkUnit {
   readonly yieldedScope?: readonly string[];
   /** Protected paths an accepted contract released for this unit only. */
   readonly releasedPaths?: readonly string[];
+  /**
+   * Per-item path selection (see VerifiedWorkspace.parts): each part's files
+   * are applied from its own commit, which must be the pinned commit or one of
+   * `includes` (anything else fails the integration).
+   */
+  readonly parts?: readonly UnitPart[];
   /**
    * The per-app behavioral gate command, as argv (optional). When supplied, the
    * verifier runs it as the real mechanical check that the planted bug is fixed.
@@ -247,6 +253,7 @@ export class ChangeVerification {
           ...(done.commit !== undefined ? { commit: done.commit } : {}),
           ...(done.yieldedScope !== undefined ? { yieldedScope: done.yieldedScope } : {}),
           ...(done.releasedPaths !== undefined ? { releasedPaths: done.releasedPaths } : {}),
+          ...(done.parts !== undefined ? { parts: done.parts } : {}),
           // Keep this unit's yielded contested paths out of integration so the
           // single lease owner is the only contributor of that path.
           yieldedPaths: leaseViews.get(done.unitId)?.yields ?? [],
@@ -330,7 +337,7 @@ export class ChangeVerification {
         } catch {
           return refuse(`the pinned commit ${done.commit} is not in the unit's repo`);
         }
-        for (const earlier of done.includes ?? []) {
+        for (const earlier of [...new Set([...(done.includes ?? []), ...(done.parts ?? []).map((p) => p.commit)])]) {
           if (!(await isAncestor(worktreeDir, earlier, done.commit))) {
             return refuse(`commit ${earlier} is not in the history of the pinned commit ${done.commit}`);
           }

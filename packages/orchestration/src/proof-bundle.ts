@@ -48,7 +48,16 @@ export interface ProofBundle {
   readonly reasons: readonly string[];
   readonly goal?: { readonly objective: string; readonly seq: number };
   /** The final (last) integrated revision. */
-  readonly revision?: { readonly n: number; readonly commit: string; readonly gate: "pass" | "fail"; readonly gated: boolean; readonly seq: number; readonly base?: string };
+  readonly revision?: {
+    readonly n: number;
+    readonly commit: string;
+    readonly gate: "pass" | "fail";
+    readonly gated: boolean;
+    readonly seq: number;
+    readonly base?: string;
+    /** Per merged agent: the files its unit applied to the gated tree, and the changed files it yielded (a record). */
+    readonly applied?: readonly { readonly agent: string; readonly paths: readonly string[]; readonly yielded?: readonly string[] }[];
+  };
   /** The recorded promotion and whether its gated commit is the revision's. */
   readonly promotion?: { readonly rev: number; readonly gatedCommit: string; readonly commit: string; readonly branch: string; readonly seq?: number; readonly matchesGated: boolean };
   readonly gate: { readonly command?: readonly string[]; readonly verdict: "pass" | "fail" | "none"; readonly gated: boolean };
@@ -353,6 +362,9 @@ export function buildProofBundle(log: readonly BoardMessage[], options: ProofBun
             gated,
             seq: last.seq,
             ...(last.payload.base !== undefined ? { base: last.payload.base } : {}),
+            ...(last.payload.applied !== undefined
+              ? { applied: last.payload.applied.map((u) => ({ agent: u.agent, paths: [...u.paths], ...(u.yielded ? { yielded: [...u.yielded] } : {}) })) }
+              : {}),
           },
         }
       : {}),

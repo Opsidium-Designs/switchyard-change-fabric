@@ -80,6 +80,8 @@ import {
 
 import { redactSecrets } from "./redact.ts";
 import {
+  appliedForRevision,
+  completedFromPlan,
   failingRevisionEvidence,
   flushAttributionDecisions,
   keyWithout,
@@ -480,15 +482,9 @@ export async function gateCandidateTree(ctx: CandidateContext, index: number, en
       paths: [...e.unit.scope],
     })),
   };
-  const completed: CompletedWorkUnit[] = entries.map((e) => ({
-    unitId: e.unit.agent,
-    gitUrl: e.remote,
-    baselineRef: e.unit.baselineRef,
-    commit: e.unit.commit,
-    includes: [...e.unit.includes],
-    ...(e.unit.yieldedScope ? { yieldedScope: [...e.unit.yieldedScope] } : {}),
-    ...(e.unit.releasedPaths ? { releasedPaths: [...e.unit.releasedPaths] } : {}),
-  }));
+  // The same per-unit path selection as a revision: removing a unit (a
+  // leave-one-out candidate, a shorter prefix) removes exactly its paths.
+  const completed: CompletedWorkUnit[] = entries.map((e) => completedFromPlan(e.unit, e.remote));
   const runner = options.verifyCommandRunner ? new CandidateCommandRunner(options.verifyCommandRunner) : undefined;
   const verification = new ChangeVerification(options.integration.workspaces, runner ? { commandRunner: runner } : {});
   let evidence: EvidenceSummary;
@@ -580,10 +576,12 @@ export async function recordBuiltCandidate(
     workRoot: options.worktreeRoot,
     scrub,
   });
+  const applied = appliedForRevision(c.evidence, c.mergedAgents);
   const recorded = await options.operator.recordRevision({
     commit: c.commit!,
     gate: c.gate!,
     merged,
+    ...(applied.length > 0 ? { applied } : {}),
     ...(head !== undefined ? { base: head } : {}),
     ...(c.progress ? { progress: c.progress } : {}),
     ...(failingEvidence ? { failing: failingEvidence.failing } : {}),

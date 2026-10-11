@@ -62,6 +62,16 @@ export interface IntegrateJobUnit {
   readonly items: readonly string[];
   readonly yieldedScope?: readonly string[];
   readonly releasedPaths?: readonly string[];
+  /** Per item, which files are applied from which commit (see the integrator's UnitPart). */
+  readonly parts?: readonly IntegrateJobPart[];
+}
+
+/** One item's files of a job unit: applied from exactly `commit`, diffed from `baselineRef`. */
+export interface IntegrateJobPart {
+  readonly item: string;
+  readonly commit: string;
+  readonly baselineRef: string;
+  readonly scope: readonly string[];
 }
 
 /** A protected JSON file's gate-defining keys. */
@@ -302,7 +312,7 @@ function unit(value: unknown, i: number): IntegrateJobUnit {
   if (!isRecord(value)) {
     throw new JobError(`${where} must be an object`);
   }
-  only(value, ["agent", "repoUrl", "commit", "baselineRef", "includes", "scope", "items", "yieldedScope", "releasedPaths"], where);
+  only(value, ["agent", "repoUrl", "commit", "baselineRef", "includes", "scope", "items", "yieldedScope", "releasedPaths", "parts"], where);
   const agent = str(value.agent, `${where}.agent`, 128);
   if (!AGENT.test(agent)) {
     throw new JobError(`${where}.agent is not an agent id`);
@@ -318,7 +328,27 @@ function unit(value: unknown, i: number): IntegrateJobUnit {
     items: strList(value.items, `${where}.items`),
     ...(value.yieldedScope !== undefined ? { yieldedScope: strList(value.yieldedScope, `${where}.yieldedScope`) } : {}),
     ...(value.releasedPaths !== undefined ? { releasedPaths: strList(value.releasedPaths, `${where}.releasedPaths`) } : {}),
+    ...(value.parts !== undefined ? { parts: jobParts(value.parts, `${where}.parts`) } : {}),
   };
+}
+
+function jobParts(value: unknown, where: string): IntegrateJobPart[] {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new JobError(`${where} must be a non-empty array`);
+  }
+  return value.map((part, k) => {
+    const at = `${where}[${k}]`;
+    if (!isRecord(part)) {
+      throw new JobError(`${at} must be an object {item, commit, baselineRef, scope}`);
+    }
+    only(part, ["item", "commit", "baselineRef", "scope"], at);
+    return {
+      item: str(part.item, `${at}.item`, 200),
+      commit: commit(part.commit, `${at}.commit`),
+      baselineRef: part.baselineRef === "HEAD" ? "HEAD" : commit(part.baselineRef, `${at}.baselineRef`),
+      scope: strList(part.scope, `${at}.scope`),
+    };
+  });
 }
 
 function inventory(value: unknown): TestInventory {

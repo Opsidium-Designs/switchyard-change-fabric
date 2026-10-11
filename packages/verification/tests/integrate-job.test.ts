@@ -81,6 +81,14 @@ describe("integration job schema", () => {
     expect(parsed).toEqual({ ok: true, value: original });
   });
 
+  it("round-trips per-item parts and refuses an unpinned part commit", () => {
+    const base = job();
+    const withParts = job({ units: [{ ...base.units[0]!, parts: [{ item: "item-a", commit: SHA_A, baselineRef: "HEAD", scope: ["src/a.js"] }] }] });
+    expect(parseGateJob(JSON.parse(serializeGateJob(withParts)))).toEqual({ ok: true, value: withParts });
+    expect(parseGateJob({ ...withParts, units: [{ ...withParts.units[0]!, parts: [{ item: "item-a", commit: "main", baselineRef: "HEAD", scope: [] }] }] }).ok).toBe(false);
+    expect(parseGateJob({ ...withParts, units: [{ ...withParts.units[0]!, parts: [] }] }).ok).toBe(false);
+  });
+
   it("refuses a URL that carries a credential (jobs are tokenless)", () => {
     const tokened = job({ integration: { repoUrl: "https://token:secret@acct.artifacts.cloudflare.net/git/ns/x.git", defaultBranch: "main" } });
     const parsed = parseGateJob(tokened);

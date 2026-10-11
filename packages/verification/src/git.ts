@@ -103,6 +103,25 @@ export async function changedPathsSinceBaseline(
   }
 }
 
+/**
+ * The repository-relative paths that differ between `baselineRef` ("HEAD":
+ * the empty tree, i.e. every file) and `commit`, without checking anything
+ * out. A baseline that cannot be resolved falls back to every file tracked at
+ * `commit`, as changedPathsSinceBaseline does.
+ */
+export async function changedPathsBetween(worktreeDir: string, baselineRef: string, commit: string): Promise<readonly string[]> {
+  if (!/^[0-9a-f]{7,64}$/.test(commit)) {
+    throw new Error(`not a commit id: ${commit}`);
+  }
+  const ref = baselineRef.trim() === "" ? "HEAD" : baselineRef;
+  try {
+    const resolved = ref === "HEAD" ? await emptyTreeHash(worktreeDir) : ref;
+    return splitLines(await git(worktreeDir, ["diff", "--name-only", "--no-renames", resolved, `${commit}^{commit}`]));
+  } catch {
+    return splitLines(await git(worktreeDir, ["ls-tree", "-r", "--name-only", `${commit}^{commit}`]));
+  }
+}
+
 /** The hash of Git's empty tree, used as a "no baseline" diff base. */
 export async function emptyTreeHash(worktreeDir: string): Promise<string> {
   return (await git(worktreeDir, ["hash-object", "-t", "tree", "/dev/null"])).trim();

@@ -1583,6 +1583,20 @@ export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSel
             "not recorded"
           )}
         </dd>
+        {bundle.revision?.applied ? (
+          <>
+            <dt>applied</dt>
+            <dd>
+              {bundle.revision.applied.map((u, i) => (
+                <span key={u.agent}>
+                  {i > 0 ? "; " : ""}
+                  {u.agent}: {u.paths.join(", ") || "nothing"}
+                  {u.yielded && u.yielded.length > 0 ? ` (yielded ${u.yielded.join(", ")})` : ""}
+                </span>
+              ))}
+            </dd>
+          </>
+        ) : null}
         <dt>tests</dt>
         <dd>
           baseline {bundle.inventory.baseline?.count ?? "unknown"}; final{" "}

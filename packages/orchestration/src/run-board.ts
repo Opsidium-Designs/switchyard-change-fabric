@@ -60,6 +60,9 @@ import {
   entryWithin,
   formatAttributionTally,
   intentPath,
+  boardAppliedRecord,
+  type BoardAppliedUnit,
+  type BoardIntegrationUnitPlan,
   type BoardDecisionJuncture,
   type BoardDigest,
   type BoardItem,
@@ -1220,6 +1223,34 @@ export function outstandingItems(state: BoardState, inTree: readonly BoardItem[]
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
+/**
+ * One planned unit as the verifier and integrator take it (shared by the
+ * revision, every speculative and leave-one-out candidate, and the cloud job):
+ * pinned to its commit, each item's files applied from that item's own push
+ * commit (`parts`), the agent's other held items' files yielded, and the
+ * contract paths a HUMAN released for these items, for this unit only.
+ */
+export function completedFromPlan(unit: BoardIntegrationUnitPlan, remote: string): CompletedWorkUnit {
+  return {
+    unitId: unit.agent,
+    gitUrl: remote,
+    baselineRef: unit.baselineRef,
+    commit: unit.commit,
+    includes: [...unit.includes],
+    ...(unit.yieldedScope ? { yieldedScope: [...unit.yieldedScope] } : {}),
+    ...(unit.releasedPaths ? { releasedPaths: [...unit.releasedPaths] } : {}),
+    ...(unit.parts ? { parts: unit.parts.map((p) => ({ item: p.item, commit: p.commit, baselineRef: p.baselineRef, scope: [...p.scope] })) } : {}),
+  };
+}
+
+/**
+ * What each merged unit applied to a gated tree (and yielded), as a revision
+ * records it (see boardAppliedRecord). A record only; never a verdict.
+ */
+export function appliedForRevision(evidence: EvidenceSummary | undefined, mergedAgents: readonly string[]): BoardAppliedUnit[] {
+  return boardAppliedRecord(evidence?.integration.appliedUnits, mergedAgents);
+}
+
 /** Keep `chosen` in the items' order. */
 function inOrder(chosen: readonly string[], items: readonly { readonly id: string }[]): string[] {
   return items.map((i) => i.id).filter((id) => chosen.includes(id));
@@ -1240,6 +1271,10 @@ function inOrder(chosen: readonly string[], items: readonly { readonly id: strin
  *   - scoped to the WRITE INTENTS of the items it integrates (announced paths
  *     never widen scope), with the files of items it handed off yielded (never
  *     applied from it, never failing it);
+ *   - applied per item: each pending item's files from that item's own push
+ *     commit, the write intents of the agent's other held items yielded (they
+ *     ride with those items' own pushes), and what each unit applied recorded
+ *     on the revision (`applied`);
  *   - read with a fresh operator read token.
  * The existing verifier and integrator compose the verified units onto the
  * latest passing revision, restore the gate's own files from the baseline, and
@@ -1287,16 +1322,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
       continue;
     }
     units.push({ id: agent, objective: `the announced pushes of ${agent} (items ${mine.map((i) => i.id).join(", ")})`, dependsOn: [], paths: [...unit.scope] });
-    completed.push({
-      unitId: agent,
-      gitUrl: remote,
-      baselineRef: unit.baselineRef,
-      commit: unit.commit,
-      includes: [...unit.includes],
-      ...(unit.yieldedScope ? { yieldedScope: [...unit.yieldedScope] } : {}),
-      // Contract paths a HUMAN released for these items, for this unit only.
-      ...(unit.releasedPaths ? { releasedPaths: [...unit.releasedPaths] } : {}),
-    });
+    completed.push(completedFromPlan(unit, remote));
   }
   if (completed.length === 0) {
     return {
@@ -1442,10 +1468,12 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   // The base this revision was built on (the board's integrated head when the
   // integration started): the board refuses it if the head moved since.
   const base = integratedHead(state);
+  const applied = appliedForRevision(evidence, mergedAgents);
   const recorded = await options.operator.recordRevision({
     commit,
     gate,
     merged,
+    ...(applied.length > 0 ? { applied } : {}),
     ...(base !== undefined ? { base } : {}),
     ...(progress ? { progress } : {}),
     ...(failing ? { failing } : {}),

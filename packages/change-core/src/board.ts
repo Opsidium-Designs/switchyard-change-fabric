@@ -887,6 +887,13 @@ export interface BoardPayloads {
      * integration is never recorded as current. Absent on boards before it.
      */
     readonly base?: string;
+    /**
+     * A RECORD of what each merged agent's unit put into the gated tree: the
+     * files applied from its repo, and the changed files it yielded (files of
+     * the agent's other held items ride with those items' own pushes). Never
+     * a verdict. Absent on boards before it.
+     */
+    readonly applied?: readonly BoardAppliedUnit[];
   };
   "rebase.needed": { readonly agent: string; readonly n: number; readonly paths: readonly string[] };
   "review.requested": { readonly review: string; readonly item: string };
@@ -1787,6 +1794,57 @@ function ungatedFlag(raw: Raw): boolean {
 }
 
 /** A revision's unverified sub-lead merges: [{item, reason}], bounded. */
+/** What one merged unit applied to a revision's gated tree (see integrated.rev). */
+export interface BoardAppliedUnit {
+  readonly agent: string;
+  /** Files applied from the agent's repo (concrete paths). */
+  readonly paths: readonly string[];
+  /** Changed files of the agent's repo that were not applied from it. */
+  readonly yielded?: readonly string[];
+}
+
+/**
+ * The applied record a revision carries, from the integrator's per-unit
+ * result (unit id = agent): only the agents the revision merged, each path
+ * list concrete, sorted, and bounded as the board accepts it (a path the
+ * board could not hold is left out of the record, never failing the
+ * revision). Pure.
+ */
+export function boardAppliedRecord(
+  units: readonly { readonly unitId: string; readonly applied: readonly string[]; readonly yielded: readonly string[] }[] | undefined,
+  mergedAgents: readonly string[],
+): BoardAppliedUnit[] {
+  const max = BOARD_LIMITS.maxPaths * BOARD_LIMITS.maxIntentEntries;
+  const concrete = (paths: readonly string[]): string[] =>
+    [...new Set(paths.map((p) => normalizeIntentEntry(p)).filter((p): p is string => p !== undefined && !hasWildcard(p) && !p.includes("#")))].sort().slice(0, max);
+  return (units ?? [])
+    .filter((u) => mergedAgents.includes(u.unitId) && ID_PATTERN.test(u.unitId))
+    .slice(0, BOARD_LIMITS.maxAgents)
+    .map((u) => {
+      const yielded = concrete(u.yielded);
+      return { agent: u.unitId, paths: concrete(u.applied), ...(yielded.length > 0 ? { yielded } : {}) };
+    });
+}
+
+/** A revision's applied record: one entry per agent, each a concrete, bounded path list. */
+function appliedUnits(value: unknown): BoardAppliedUnit[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > BOARD_LIMITS.maxAgents) {
+    fail("BAD_PAYLOAD", `applied must be a non-empty array of at most ${BOARD_LIMITS.maxAgents} {agent, paths, yielded?}`);
+  }
+  const out = value.map((entry) => {
+    if (!isRecord(entry) || Object.keys(entry).some((k) => !["agent", "paths", "yielded"].includes(k))) {
+      fail("BAD_PAYLOAD", "each applied entry must be an object {agent, paths, yielded?}");
+    }
+    const max = BOARD_LIMITS.maxPaths * BOARD_LIMITS.maxIntentEntries;
+    const yielded = pathList(entry, "yielded", { concrete: true, optional: true, max });
+    return { agent: id(entry, "agent"), paths: pathList(entry, "paths", { concrete: true, max }), ...(yielded.length > 0 ? { yielded } : {}) };
+  });
+  if (new Set(out.map((u) => u.agent)).size !== out.length) {
+    fail("BAD_PAYLOAD", "applied names an agent twice");
+  }
+  return out;
+}
+
 function unverifiedMerges(value: unknown): { item: string; reason: string }[] {
   if (!Array.isArray(value) || value.length === 0 || value.length > BOARD_LIMITS.maxChildren) {
     fail("BAD_PAYLOAD", `unverified must be a non-empty array of at most ${BOARD_LIMITS.maxChildren} {item, reason}`);
@@ -2436,6 +2494,7 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         ...(raw.unverified !== undefined ? { unverified: unverifiedMerges(raw.unverified) } : {}),
         ...(raw.progress !== undefined ? { progress: revProgress(raw.progress) } : {}),
         ...(raw.base !== undefined ? { base: id(raw, "base") } : {}),
+        ...(raw.applied !== undefined ? { applied: appliedUnits(raw.applied) } : {}),
       };
     }
     case "rebase.needed":
@@ -4659,6 +4718,7 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
         ...(draft.payload.unverified !== undefined ? { unverified: draft.payload.unverified } : {}),
         ...(draft.payload.progress !== undefined ? { progress: draft.payload.progress } : {}),
         ...(draft.payload.base !== undefined ? { base: draft.payload.base } : {}),
+        ...(draft.payload.applied !== undefined ? { applied: draft.payload.applied } : {}),
       });
       if (!sameJson(expected, draft.payload)) {
         fail("LOG_MISMATCH", "integrated.rev does not match the pushes it claims to merge");
@@ -6278,6 +6338,8 @@ export interface IntegratedRevInput {
   readonly progress?: BoardRevProgress;
   /** The commit the revision was built on (must be the board's integrated head). */
   readonly base?: string;
+  /** What each merged agent's unit applied (and yielded): a record (see integrated.rev). */
+  readonly applied?: readonly BoardAppliedUnit[];
 }
 
 /** The commit the next integrated revision must be built on: the latest passing revision's, else the goal's baseline. */
@@ -6349,6 +6411,11 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
       fail("UNKNOWN_REF", `unverified names ${u.item}, which no merged sub-lead push merges`);
     }
   }
+  // The applied record names only agents whose pushes this revision merged.
+  const strangerUnits = (input.applied ?? []).filter((u) => !contributors.includes(u.agent)).map((u) => u.agent);
+  if (strangerUnits.length > 0) {
+    fail("UNKNOWN_REF", `applied names agent(s) ${strangerUnits.join(", ")} with no push in this revision`);
+  }
   if (input.failing !== undefined) {
     if (input.gate !== "fail") {
       fail("BAD_PAYLOAD", "only a failing revision carries failing evidence");
@@ -6382,6 +6449,7 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
     ...(input.unverified !== undefined ? { unverified: input.unverified.map((u) => ({ ...u })) } : {}),
     ...(input.progress !== undefined ? { progress: JSON.parse(JSON.stringify(input.progress)) as BoardRevProgress } : {}),
     ...(input.base !== undefined ? { base: input.base } : {}),
+    ...(input.applied !== undefined ? { applied: input.applied.map((u) => ({ agent: u.agent, paths: [...u.paths], ...(u.yielded ? { yielded: [...u.yielded] } : {}) })) } : {}),
   };
 }
 
@@ -6544,7 +6612,7 @@ export function appendIntegratedRev(state: BoardState, input: unknown, at: strin
     fail("BAD_PAYLOAD", "an integration result must be an object {commit, gate, merged}");
   }
   for (const key of Object.keys(input)) {
-    if (!["commit", "gate", "merged", "failing", "gated", "unverified", "progress", "base"].includes(key)) {
+    if (!["commit", "gate", "merged", "failing", "gated", "unverified", "progress", "base", "applied"].includes(key)) {
       fail("BAD_PAYLOAD", `an integration result has an unknown field ${JSON.stringify(key)}`);
     }
   }
@@ -6558,6 +6626,7 @@ export function appendIntegratedRev(state: BoardState, input: unknown, at: strin
     ...(input.unverified !== undefined ? { unverified: unverifiedMerges(input.unverified) } : {}),
     ...(input.progress !== undefined ? { progress: revProgress(input.progress) } : {}),
     ...(input.base !== undefined ? { base: id(input, "base") } : {}),
+    ...(input.applied !== undefined ? { applied: appliedUnits(input.applied) } : {}),
   };
   if (state.goal === null) {
     fail("NO_GOAL", "the board has no goal yet");

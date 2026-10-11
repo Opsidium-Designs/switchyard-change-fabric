@@ -757,3 +757,95 @@ describe("Integrator", () => {
     });
   });
 });
+
+describe("Integrator: per-item path selection (one agent's repo, several items)", () => {
+  /** A unit repo whose baseline holds a.txt, s.txt, z.txt and gone.txt. */
+  async function unitRepo(dir: string): Promise<string> {
+    await mkdir(dir, { recursive: true });
+    await run("git", ["-C", dir, "init", "--initial-branch=main"]);
+    for (const name of ["a.txt", "s.txt", "z.txt", "gone.txt"]) {
+      await writeFile(join(dir, name), `${name} baseline\n`, "utf8");
+    }
+    return commit(dir, "baseline");
+  }
+
+  async function show(gitUrl: string, dir: string, commitSha: string, rel: string): Promise<string | undefined> {
+    await run("git", ["clone", "-q", gitUrl, dir]);
+    return run("git", ["-C", dir, "show", `${commitSha}:${rel}`]).then(
+      (r) => r.stdout,
+      () => undefined,
+    );
+  }
+
+  it("applies each part's files from its own commit; files of no part are yielded and recorded", async () => {
+    const unitDir = join(root, "unit");
+    const baseline = await unitRepo(unitDir);
+    // c1: item A's push (a.txt v1, deletes gone.txt).
+    await writeFile(join(unitDir, "a.txt"), "a v1\n", "utf8");
+    await rm(join(unitDir, "gone.txt"));
+    const c1 = await commit(unitDir, "A");
+    // c2: item S's push; the head also carries unannounced a.txt work and z.txt (another item's).
+    await writeFile(join(unitDir, "a.txt"), "a v2 (unannounced)\n", "utf8");
+    await writeFile(join(unitDir, "s.txt"), "s v1\n", "utf8");
+    await writeFile(join(unitDir, "z.txt"), "z (another item's)\n", "utf8");
+    const c2 = await commit(unitDir, "S");
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+
+    const integrator = new Integrator(provider, { commandRunner: new FakeCommandRunner([]) });
+    const result = await integrator.integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [
+        {
+          unitId: "agent",
+          gitUrl: pathToFileURL(unitDir).href,
+          baselineRef: baseline,
+          commit: c2,
+          parts: [
+            { item: "A", commit: c1, baselineRef: baseline, scope: ["a.txt", "gone.txt"] },
+            { item: "S", commit: c2, baselineRef: baseline, scope: ["s.txt"] },
+          ],
+        },
+      ],
+      excludedUnits: [],
+      workRoot: root,
+    });
+    expect(result.verdict).toBe("verified");
+    expect(result.appliedUnits).toEqual([{ unitId: "agent", applied: ["a.txt", "gone.txt", "s.txt"], yielded: ["z.txt"] }]);
+    const check = join(root, "check");
+    expect(await show(ref.gitUrl, check, result.commit!, "a.txt")).toBe("a v1\n");
+    expect((await run("git", ["-C", check, "show", `${result.commit!}:s.txt`])).stdout).toBe("s v1\n");
+    expect((await run("git", ["-C", check, "show", `${result.commit!}:z.txt`])).stdout).toBe("z.txt baseline\n");
+    expect(await run("git", ["-C", check, "show", `${result.commit!}:gone.txt`]).then(() => "present", () => "deleted")).toBe("deleted");
+  });
+
+  it("parts at the same commit are applied once, together", async () => {
+    const unitDir = join(root, "unit");
+    const baseline = await unitRepo(unitDir);
+    await writeFile(join(unitDir, "a.txt"), "a v1\n", "utf8");
+    await writeFile(join(unitDir, "s.txt"), "s v1\n", "utf8");
+    const c1 = await commit(unitDir, "A and S");
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+    const result = await new Integrator(provider, { commandRunner: new FakeCommandRunner([]) }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [
+        {
+          unitId: "agent",
+          gitUrl: pathToFileURL(unitDir).href,
+          baselineRef: baseline,
+          commit: c1,
+          parts: [
+            { item: "A", commit: c1, baselineRef: baseline, scope: ["a.txt"] },
+            { item: "S", commit: c1, baselineRef: baseline, scope: ["s.txt"] },
+          ],
+        },
+      ],
+      excludedUnits: [],
+      workRoot: root,
+    });
+    expect(result.appliedUnits).toEqual([{ unitId: "agent", applied: ["a.txt", "s.txt"], yielded: [] }]);
+  });
+});
