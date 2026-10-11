@@ -28,7 +28,17 @@ import type {
 } from "@switchyard-change/model-adapters";
 import { ModelBudgetError } from "@switchyard-change/model-adapters";
 
-import { BoardAgent, MAX_EXHAUSTED_ITEMS, MAX_MERGE_CUES, RunTurnBudget, type AgentTurnRecord, type BoardAgentOptions } from "../src/board-agent.ts";
+import {
+  BoardAgent,
+  heldWorkCue,
+  MAX_CONTRACT_CUES,
+  MAX_EXHAUSTED_ITEMS,
+  MAX_MERGE_CUES,
+  MAX_QUESTION_CUES,
+  RunTurnBudget,
+  type AgentTurnRecord,
+  type BoardAgentOptions,
+} from "../src/board-agent.ts";
 import { RunMeter, type RunCapReached } from "../src/run-meter.ts";
 import { BoardOperatorClient, type BoardPage } from "../src/board-client.ts";
 import { createGenericBoardPolicy } from "../src/board-policy.ts";
@@ -579,6 +589,88 @@ describe("the lead", () => {
     expect(calls[0]!.allowed).toEqual(["decide_contract", "decide_item", "extend_claim", "replan_item", "propose_item", "message", "wait"]);
     expect(calls[0]!.board.pendingContracts).toEqual([{ contract: "k1", target: "src/shared.ts", kind: "modify", proposedBy: "w9" }]);
     expect((await env.log()).messages.find((m) => m.type === "contract.accepted")).toMatchObject({ from: "lead", payload: { contract: "k1" } });
+  });
+
+  it("a lead that answers a pending contract with a wait is re-cued at once, with the contract named, and decides it", async () => {
+    const env = await setup({ seams: [{ path: "src/shared.ts", importers: ["src/a/x.ts", "src/b/y.ts"] }] });
+    const transport = scripted([
+      { type: "wait", reason: "nothing to decide" },
+      { type: "decide_contract", contractId: "k1", decision: "reject", rationale: "not what the error needs" },
+    ]);
+    const lead = env.agent("lead", { role: "lead", transport, seed: async () => [] });
+    await lead.join();
+    await lead.step(); // seeds nothing
+    const w = await env.operator.join("w9", {});
+    const token = w.ok ? w.token : "";
+    await env.rawPost(token, { type: "item.claimed", payload: { item: "i1", intent: { read: [], write: ["src/a/**"] } } });
+    await env.rawPost(token, { type: "contract.proposed", payload: { contract: "k1", target: "src/shared.ts", kind: "modify", item: "i1", description: "add a shared field" } });
+    expect(await lead.step()).toBe("acted"); // the fresh proposal wakes it: it waits
+    expect(lead.turnPending).toBe(true); // re-cued at once
+    expect(await lead.step()).toBe("acted");
+    expect(transport.inputs[1]!.capsule.evidence.at(-1)).toMatch(
+      /^PENDING CONTRACT\(S\) TO DECIDE: k1 \(modify src\/shared\.ts, for i1\): decide_contract now; waiting leaves that item blocked \(its claim cannot lapse, its holder cannot propose another\)/,
+    );
+    expect((await env.log()).messages.find((m) => m.type === "contract.rejected")).toMatchObject({ from: "lead", payload: { contract: "k1" } });
+    expect(await lead.step()).toBe("acted"); // its decision keeps the initiative: one follow-up turn (it waits)
+    expect(transport.inputs[2]!.capsule.evidence.filter((e) => /^PENDING CONTRACT/.test(e))).toHaveLength(1); // nothing pending: no new cue
+    expect(await lead.step()).toBe("idle");
+  });
+
+  it("a lead that always waits takes exactly 1 + MAX_CONTRACT_CUES turns on its own; the driver's nudges are bounded per contract set and never decide", async () => {
+    const env = await setup({ seams: [{ path: "src/shared.ts", importers: ["src/a/x.ts", "src/b/y.ts"] }] });
+    const transport = scripted([]);
+    const lead = env.agent("lead", { role: "lead", transport, seed: async () => [] });
+    await lead.join();
+    await lead.step();
+    const w = await env.operator.join("w9", {});
+    const token = w.ok ? w.token : "";
+    await env.rawPost(token, { type: "item.claimed", payload: { item: "i1", intent: { read: [], write: ["src/a/**"] } } });
+    await env.rawPost(token, { type: "contract.proposed", payload: { contract: "k1", target: "src/shared.ts", kind: "modify", item: "i1", description: "add a shared field" } });
+    let steps = 0;
+    while ((await lead.step()) === "acted" && steps < 10) steps += 1;
+    expect(transport.inputs).toHaveLength(1 + MAX_CONTRACT_CUES);
+    expect(transport.inputs.slice(1).every((i) => /^PENDING CONTRACT/.test(i.capsule.evidence.at(-1) ?? ""))).toBe(true);
+    // The driver's nudges: one turn each, bounded per set of contracts.
+    for (let n = 0; n < MAX_CONTRACT_CUES; n += 1) {
+      expect(lead.nudgeContracts(["k1"])).toBe(true);
+      expect(lead.turnPending).toBe(true);
+      expect(await lead.step()).toBe("acted");
+      expect(transport.inputs.at(-1)!.capsule.evidence.at(-1)).toMatch(/^PENDING CONTRACT\(S\) TO DECIDE: k1 /);
+      expect(await lead.step()).toBe("idle");
+    }
+    expect(lead.nudgeContracts(["k1"])).toBe(false);
+    // Nothing decided it: it is still the lead's.
+    expect((await env.log()).state.contracts.k1).toMatchObject({ status: "proposed" });
+    // A worker is never nudged to decide a contract.
+    expect(env.agent("w1", { transport: scripted([]) }).nudgeContracts(["k1"])).toBe(false);
+  });
+
+  it("a failing revision that points only at a shared seam no item covers cues the lead (bounded) to give it an owner, with the failing line; it is not a refused action", async () => {
+    const env = await setup({ seams: [{ path: "src/shared.ts", importers: ["src/a/x.ts", "src/b/y.ts"] }] });
+    const transport = scripted([]);
+    const lead = env.agent("lead", { role: "lead", transport, seed: async () => [] });
+    await lead.join();
+    await lead.step(); // seeds nothing
+    const w = await env.operator.join("w9", {});
+    const token = w.ok ? w.token : "";
+    await env.rawPost(token, { type: "item.claimed", payload: { item: "i1", intent: { read: [], write: ["src/a/**"] } } });
+    await env.rawPost(token, { type: "push.announced", payload: { item: "i1", commit: "c0ffee00", paths: ["src/a/x.ts"] } });
+    const rev = await env.operator.recordRevision({
+      commit: "badc0de",
+      gate: "fail",
+      merged: ["c0ffee00"],
+      failing: { output: "AssertionError: expected 1072 to be 1073\n    at src/shared.ts:3:9", items: [] },
+    });
+    expect(rev.ok).toBe(true);
+    expect(await lead.step()).toBe("acted");
+    expect(transport.inputs.at(-1)!.capsule.evidence.at(-1)).toMatch(
+      /^SEAM FAILURE NOBODY OWNS: revision 1 failed \(AssertionError: expected 1072 to be 1073\) and points only at the shared seam\(s\) src\/shared\.ts, which no item covers.*propose_item \{scopeHint: \[src\/shared\.ts\]/,
+    );
+    const seamOnly = env.turns.filter((t) => t.agent === "lead" && t.action.type === "wait" && /points only at the shared seam/.test((t.action as { reason: string }).reason));
+    expect(seamOnly).toHaveLength(1);
+    expect(seamOnly[0]!.code).toBeUndefined(); // a cue, never counted as a refused action
+    // Nothing was proposed on the lead's behalf.
+    expect((await env.log()).messages.some((m) => m.type === "item.proposed" && m.from === "lead")).toBe(false);
   });
 
   it("decide_contract takes the contract id or the seam item id derived from it; an already decided one is refused locally with what carries it", async () => {
@@ -1193,5 +1285,61 @@ describe("help forks that did not start where the requester is", () => {
     const state = (await env.log()).state;
     expect(state.help.h1!.grant).toBeUndefined();
     expect(state.help.h1!.forkMismatches).toEqual([expect.objectContaining({ agent: "w1", expected: "aaaaaaa", realized: "bbbbbbb" })]);
+  });
+});
+
+describe("held-work and question cues", () => {
+  it("the driver's held-work cue names what the holder must act on: a regressed push, a left-out push, a fix request, or no push", () => {
+    const base = { objective: "o", intent: { read: [], write: ["src/a/**"] }, doneProposed: false };
+    const digest = {
+      claims: [
+        { ...base, item: "reg", regressed: { commit: "abcdef1234567890", rev: 4, from: "x", to: "y", evidence: [], instruction: "" } },
+        { ...base, item: "out", excluded: { commit: "1234567890abcdef", reason: "merge conflict on src/a/x.ts", instruction: "" } },
+        { ...base, item: "fix", fix: { n: 7, attempt: 1, instruction: "" } },
+        { ...base, item: "idle" },
+      ],
+    } as unknown as BoardDigest;
+    const cue = heldWorkCue(digest, ["reg", "out", "fix", "idle"]);
+    expect(cue).toMatch(/^HELD WORK: the board went quiet and I hold idle with no push: edit it now/);
+    expect(cue).toMatch(/my push abcdef1234 for reg made revision 4 worse \(claims\.regressed has the evidence\): push a fix now or hand it off/);
+    expect(cue).toMatch(/my push 1234567890 for out was left out of integration \(merge conflict on src\/a\/x\.ts\): push a fix now or hand it off/);
+    expect(cue).toMatch(/revision 7 failed and implicates fix: push a fix now \(claims\.fix\) or hand it off/);
+    expect(heldWorkCue(digest, ["reg"])).toMatch(/^HELD WORK: the board went quiet and my push abcdef1234 for reg made revision 4 worse/);
+    expect(heldWorkCue(digest, ["reg"])).not.toMatch(/with no push/);
+  });
+
+  it("offer_help is not offered to an agent with no other agent's busy item (it could only name itself)", async () => {
+    const env = await setup();
+    const transport = scripted([{ type: "offer_help", itemId: "i1", toAgent: "w1", why: "me" }]);
+    const w1 = env.agent("w1", { transport });
+    await w1.join();
+    expect(await w1.step()).toBe("acted");
+    expect(transport.inputs[0]!.allowed).not.toContain("offer_help");
+  });
+
+  it("revision 6: a question addressed to an agent wakes it a bounded number of times until it replies", async () => {
+    const env = await setup({ rules: { arbitration: 6 } });
+    const transport = scripted([]);
+    const w1 = env.agent("w1", { transport });
+    await w1.join();
+    await w1.step(); // first look after joining
+    const steps = transport.inputs.length;
+    const w2 = await env.operator.join("w2", { role: "worker" });
+    const token = w2.ok ? w2.token : "";
+    expect((await env.rawPost(token, { type: "item.claimed", payload: { item: "i2", intent: { write: ["src/b/**"] } } })).status).toBe(201);
+    expect(
+      (await env.rawPost(token, { type: "help.requested", payload: { request: "q1", item: "i2", need: "where-is-shared-typed" }, to: ["w1"] })).status,
+    ).toBe(201);
+    let acted = 0;
+    while ((await w1.step()) === "acted" && acted < 20) acted += 1;
+    expect(acted).toBeLessThan(20);
+    expect(transport.inputs.length).toBeGreaterThan(steps);
+    expect((transport.inputs.at(-1)!.digest as BoardDigest).questions?.map((q) => q.request)).toEqual(["q1"]);
+    // Bounded: one cue per turn it woke for, MAX_QUESTION_CUES in all; then an unanswered question no longer wakes it.
+    const cues = transport.inputs.at(-1)!.capsule.evidence.filter((e) =>
+      /^QUESTION FOR ME: w2 asked you about i2 \(where-is-shared-typed\): answer it with message kind reply \{requestId: q1\}/.test(e),
+    );
+    expect(cues).toHaveLength(MAX_QUESTION_CUES);
+    expect(await w1.step()).toBe("idle");
   });
 });

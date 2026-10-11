@@ -206,7 +206,7 @@ export type {
   BoardJoiner,
   BoardSeedItem,
 } from "./board-agent.ts";
-export { BoardAgent, listRepoFiles, resolveIntentFiles, RunTurnBudget } from "./board-agent.ts";
+export { BoardAgent, heldWorkCue, listRepoFiles, MAX_CONTRACT_CUES, pendingContractCue, resolveIntentFiles, RunTurnBudget } from "./board-agent.ts";
 
 export { coveredByOutstanding, createGenericBoardPolicy } from "./board-policy.ts";
 export { selectToolFiller } from "./executor-select.ts";
@@ -226,6 +226,7 @@ export type {
   BoardSeed,
   BoardStopReason,
   IntegrateBoardOptions,
+  QuietBoardAction,
   IntegrateBoardResult,
   RecordBoardDecision,
   RunBoardOptions,
@@ -257,7 +258,9 @@ export {
   formatBoardTranscript,
   integrateBoardRevision,
   pendingPushKey,
+  quietBoardActions,
   runBoard,
+  undecidedContractLines,
 } from "./run-board.ts";
 export type { ModelPrice, RunCapReached, RunCaps } from "./run-meter.ts";
 export { meteredExecutor, meteredJev, meteredToolAuthor, meteredTransport, parsePrice, parsePrices, RunMeter, validateSpendCap } from "./run-meter.ts";

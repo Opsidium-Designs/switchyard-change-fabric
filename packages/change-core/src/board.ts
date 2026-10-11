@@ -156,12 +156,23 @@ export interface BoardRules {
    * never blamed: every other latest push is stacked as before. The ratchet
    * never moves the integrated head, never promotes, and never changes a
    * verdict: only a passing revision does.
+   * Revision 6 (what a new run posts) adds SETTLED SEAM ITEMS and ADDRESSED
+   * QUESTIONS:
+   *   - a seam item (an accepted seam contract's item) whose latest push was
+   *     gated with no fix owed (it waits on others) no longer owns its seam:
+   *     a follow-up change to that seam is a seam contract the lead decides,
+   *     never refused as "ask its owner";
+   *   - a seam contract records the type-mismatch lines of the failing output
+   *     it was proposed for (`failingErrors`), so a rejected one is not cued
+   *     again for the identical errors;
+   *   - a plain question (help.requested with no scope) records whom it asks
+   *     (`askedOf`), and the addressee's digest lists it until answered.
    */
   readonly arbitration?: number;
 }
 
 /** The arbitration revision a new board run posts (see BoardRules.arbitration). */
-export const CURRENT_ARBITRATION = 5;
+export const CURRENT_ARBITRATION = 6;
 
 export const DEFAULT_BOARD_RULES: BoardRules = { maxContestTurns: 3, contestIdleMessages: 25, maxFixAttempts: 2 };
 
@@ -1368,6 +1379,8 @@ export interface BoardHelpRequest {
   readonly scope?: readonly string[];
   /** A grant addressed to these agents (for example a volunteer): only they may take it. */
   readonly to?: readonly string[];
+  /** Arbitration revision 6: a plain question (no scope) addressed to these agents; their digest lists it until they reply. */
+  readonly askedOf?: readonly string[];
   /** The helper that took the grant by forking the requester's repo. */
   grant?: {
     readonly agent: string;
@@ -1400,6 +1413,12 @@ export interface BoardContract {
   readonly description?: string;
   /** The failing revision a seam contract was proposed for (one seam change per failing cause). */
   readonly failingRev?: number;
+  /**
+   * Arbitration revision 6: the type-mismatch lines of the failing output a
+   * seam contract was proposed for (bounded), so a rejected one is not cued
+   * again while the failing errors are the identical ones.
+   */
+  readonly failingErrors?: readonly string[];
   /** The ADVISORY triage recommendation recorded for it (decision.recorded, contract-triage). */
   triage?: string;
   readonly proposedBy: string;
@@ -3072,6 +3091,11 @@ export function arbitrationV5(state: Pick<BoardState, "rules">): boolean {
   return (state.rules.arbitration ?? 1) >= 5;
 }
 
+/** True under arbitration revision 6 or later (settled seam items, addressed questions; see BoardRules.arbitration). Pure. */
+export function arbitrationV6(state: Pick<BoardState, "rules">): boolean {
+  return (state.rules.arbitration ?? 1) >= 6;
+}
+
 /**
  * The board's clock now: participant (non-engine) messages so far under
  * arbitration revision 2, else the board seq. Every clock (lease, deadline,
@@ -3507,11 +3531,38 @@ function seamTarget(state: BoardState, target: string): string | undefined {
   return (state.seams ?? []).find((seam) => seam.path === path)?.path;
 }
 
-/** The live item whose scope covers a seam (its owner may change it), if any. */
+/**
+ * The live item whose scope covers a seam (its owner may change it), if any.
+ * Under arbitration revision 6 a SETTLED seam item does not own it: an
+ * accepted seam contract's item whose latest push was gated with no fix owed
+ * (it waits on the other items) has done its change, so a follow-up change to
+ * the seam is a seam contract the lead decides (asking that holder would be
+ * a dead route: nothing owed on its item wakes it).
+ */
 function seamOwner(state: BoardState, seam: string): string | undefined {
   return Object.values(state.items).find(
-    (i) => i.status !== "done" && i.status !== "rejected" && i.tool === undefined && itemCovers(i, seam),
+    (i) => i.status !== "done" && i.status !== "rejected" && i.tool === undefined && itemCovers(i, seam) && !seamItemSettled(state, i),
   )?.id;
+}
+
+/** Revision 6: a seam contract's item that waits on others (its push gated, no fix owed) no longer owns its seam. Pure. */
+function seamItemSettled(state: BoardState, item: BoardItem): boolean {
+  return arbitrationV6(state) && item.fromContract !== undefined && waitingOnOthers(state, item);
+}
+
+/** The type-mismatch lines of a failing output (trimmed, bounded): what a seam contract was proposed for. */
+function typeMismatchLines(output: string): string[] {
+  const out: string[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const m = /^\s*(?:\.\/)?([^\s()]+)\(\d+,\d+\): error (TS\d+): /.exec(line);
+    if (m && TYPE_MISMATCH_CODES.has(m[2]!) && !out.includes(line.trim().slice(0, 300))) {
+      out.push(line.trim().slice(0, 300));
+      if (out.length >= 8) {
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 /** TypeScript diagnostics that mean a type or contract MISMATCH (a field, member, or signature the code expects but the type lacks). */
@@ -3525,7 +3576,13 @@ const TYPE_MISMATCH_CODES = new Set(["TS2339", "TS2551", "TS2322", "TS2345", "TS
  * item's scope covers it). Instead of using undeclared fields or casts, the
  * owner proposes a seam contract with the exact change; the lead decides it.
  * A seam already asked about for this item (a pending or accepted contract,
- * or one rejected since the item was last implicated) is not cued again. Pure.
+ * or one rejected since the item was last implicated; under arbitration
+ * revision 6 an accepted one whose seam item settled, see seamOwner, asks
+ * nothing once a later failing revision implicates the item) is not cued again; no
+ * seam is cued while the item has a seam contract waiting for the lead; and
+ * (arbitration revision 6) no seam is cued again after the lead rejected a
+ * seam contract for the item proposed for these identical failing errors.
+ * Pure.
  */
 export function seamContractCue(state: BoardState, itemId: string): { readonly seams: readonly string[]; readonly errors: readonly string[] } | undefined {
   const failure = state.lastFailure;
@@ -3533,13 +3590,30 @@ export function seamContractCue(state: BoardState, itemId: string): { readonly s
   if (failure === null || item === undefined || !failure.items.includes(itemId) || (state.seams ?? []).length === 0) {
     return undefined;
   }
+  const mine = Object.values(state.contracts).filter((c) => c.seam !== undefined && c.item === itemId);
+  if (mine.some((c) => c.status === "proposed")) {
+    return undefined;
+  }
   const { seams, errors } = frozenSeamMismatches(state, item, failure.output.split(/\r?\n/));
+  const current = typeMismatchLines(failure.output);
+  if (
+    current.length > 0 &&
+    mine.some((c) => c.status === "rejected" && c.failingErrors !== undefined && current.every((line) => c.failingErrors!.includes(line)))
+  ) {
+    return undefined;
+  }
+  // Asked: pending; accepted (under revision 6, unless its seam item settled
+  // and a later failing revision implicated the item again); or rejected
+  // since the item was last implicated.
+  const settledSince = (c: (typeof mine)[number]) => {
+    const seamItem = state.items[seamItemId(c.contract)];
+    return seamItem !== undefined && seamItemSettled(state, seamItem) && (c.decidedSeq ?? 0) < (item.implicatedSeq ?? 0);
+  };
   const asked = (seam: string) =>
-    Object.values(state.contracts).some(
+    mine.some(
       (c) =>
         c.seam === seam &&
-        c.item === itemId &&
-        (c.status !== "rejected" || (c.decidedSeq ?? 0) >= (item.implicatedSeq ?? 0)),
+        (c.status === "proposed" || (c.status === "accepted" && !settledSince(c)) || (c.status === "rejected" && (c.decidedSeq ?? 0) >= (item.implicatedSeq ?? 0))),
     );
   const open = [...seams].filter((seam) => !asked(seam)).sort();
   return open.length > 0 ? { seams: open, errors } : undefined;
@@ -3549,7 +3623,11 @@ export function seamContractCue(state: BoardState, itemId: string): { readonly s
  * The FROZEN shared seams the type/contract mismatches among `lines` point at
  * (`path(line,col): error TS2339: ...` located in a seam, or in a file of the
  * item that imports one, named by a type the seam exports), and the first
- * few of those error lines. Pure.
+ * few of those error lines. A seam is matched by a symbol the error NAMES:
+ * an error in an importing file that names no symbol of any seam it imports
+ * (a local annotation error such as `Type 'Record<string, unknown>' is
+ * missing ...`) points at no seam. Only a seam whose exports are unknown (no
+ * recorded symbols) falls back to being matched by the import alone. Pure.
  */
 function frozenSeamMismatches(state: BoardState, item: BoardItem, lines: readonly string[]): { readonly seams: Set<string>; readonly errors: string[] } {
   const seams = new Set<string>();
@@ -3564,7 +3642,7 @@ function frozenSeamMismatches(state: BoardState, item: BoardItem, lines: readonl
     // A type the error names (`on type 'Ctx'`) that a seam exports points at THAT seam.
     const named = new Set([...line.matchAll(/['"`]([A-Za-z_$][\w$]*)(?:<[^'"`]*>)?['"`]/g)].map((n) => n[1]!));
     const byName = imported.filter((seam) => seam.path === file || (seam.symbols ?? []).some((sym) => named.has(sym)));
-    const hit = byName.length > 0 ? byName : imported;
+    const hit = byName.length > 0 ? byName : imported.filter((seam) => seam.symbols === undefined);
     const frozen = hit.filter((seam) => seamOwner(state, seam.path) === undefined);
     if (frozen.length === 0) {
       continue;
@@ -5220,6 +5298,8 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
         ...tickStamp(state),
         ...(message.payload.scope !== undefined ? { scope: [...message.payload.scope] } : {}),
         ...(message.payload.scope !== undefined && message.to !== undefined && message.to.length > 0 ? { to: [...message.to] } : {}),
+        // Revision 6: a plain question remembers whom it asks (their digest lists it until they reply).
+        ...(message.payload.scope === undefined && message.to !== undefined && message.to.length > 0 && arbitrationV6(state) ? { askedOf: [...message.to] } : {}),
       };
       renewLease(state, message.payload.item, message.seq, from);
       // A grant addressed to a volunteer answers its offer.
@@ -5304,7 +5384,14 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
             })()),
         ...(message.payload.description !== undefined ? { description: message.payload.description } : {}),
         ...(seamTarget(state, message.payload.target) !== undefined && !state.protected.some((p) => entriesOverlap(message.payload.target, p)) && state.lastFailure !== null
-          ? { failingRev: state.lastFailure.n }
+          ? {
+              failingRev: state.lastFailure.n,
+              ...((): { failingErrors?: string[] } => {
+                // Revision 6: the failing errors it was proposed for (a rejection then stands for those errors).
+                const lines = arbitrationV6(state) ? typeMismatchLines(state.lastFailure!.output) : [];
+                return lines.length > 0 ? { failingErrors: lines } : {};
+              })(),
+            }
           : {}),
         proposedBy: from,
         proposedSeq: message.seq,
@@ -7049,6 +7136,11 @@ export interface BoardDigest {
   readonly busyOwners?: readonly (BoardDigestStruggle & { readonly agent: string; readonly scope: readonly string[] })[];
   /** Volunteers waiting for this agent's answer on its items. */
   readonly volunteers?: readonly { readonly agent: string; readonly item: string; readonly seq: number }[];
+  /**
+   * Arbitration revision 6: plain questions addressed to this agent that it
+   * has not replied to yet (the asker still holds the item it asked about).
+   */
+  readonly questions?: readonly { readonly request: string; readonly item: string; readonly by: string; readonly need: string; readonly seq: number; readonly hint: string }[];
   /** Messages after `after` addressed to this agent or touching its work. */
   readonly messages: readonly BoardMessage[];
 }
@@ -7603,6 +7695,32 @@ export function boardDigest(
         .filter((h) => h.by !== agent && h.grant === undefined && helpGrantLive(state, h) && !h.offers.includes(agent) && (h.to === undefined || h.to.includes(agent)))
         .map(view);
       return mineHelp.length + granted.length + wanted.length > 0 ? { help: { mine: mineHelp, granted, wanted } } : {};
+    })(),
+    ...((): Pick<BoardDigest, "questions"> => {
+      // Revision 6: questions asked of this agent and not answered yet (only recorded under it).
+      const asked = Object.values(state.help).filter(
+        (h) =>
+          h.scope === undefined &&
+          (h.askedOf ?? []).includes(agent) &&
+          h.by !== agent &&
+          !h.offers.includes(agent) &&
+          h.closed === undefined &&
+          activeAgent(state, h.by) &&
+          state.items[h.item]?.owner === h.by &&
+          (state.items[h.item]?.status === "claimed" || state.items[h.item]?.status === "split"),
+      );
+      return asked.length > 0
+        ? {
+            questions: asked.slice(0, 8).map((h) => ({
+              request: h.request,
+              item: h.item,
+              by: h.by,
+              need: h.need,
+              seq: h.seq ?? 0,
+              hint: `${h.by} asked you about ${h.item} (${h.need}): answer it with message kind reply {requestId: ${h.request}} and what you know (or that you cannot help); it is waiting on your reply`,
+            })),
+          }
+        : {};
     })(),
     messages: messages.filter((m) => m.seq > after && relevant(m)),
   };

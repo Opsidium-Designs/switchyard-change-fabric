@@ -245,6 +245,7 @@ export {
   arbitrationV3,
   arbitrationV4,
   arbitrationV5,
+  arbitrationV6,
   progressScore,
   compareProgressScore,
   describeProgressScore,

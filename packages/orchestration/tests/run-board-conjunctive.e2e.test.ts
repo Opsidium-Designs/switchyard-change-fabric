@@ -20,7 +20,7 @@ import { dirname, join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { activeClaims, foldBoard, reduceBoard, waitingOnOthers, type BoardMessage } from "@switchyard-change/change-core";
+import { activeClaims, CURRENT_ARBITRATION, foldBoard, reduceBoard, waitingOnOthers, type BoardMessage } from "@switchyard-change/change-core";
 import type { ExecutionResult, ExecutorContext, ExecutorProvider } from "@switchyard-change/model-adapters";
 import type { CommandOutcome, CommandRunner } from "@switchyard-change/verification";
 
@@ -109,7 +109,7 @@ function expectAllSixLanded(result: Awaited<ReturnType<typeof runBoardOffline>>)
   const log = result.log;
   const goal = of(log, "goal.posted")[0]!.payload;
   expect(goal.rules.maxActiveClaims).toBe(1);
-  expect(goal.rules.arbitration).toBe(5); // the current revision (revision 3 rules hold under it)
+  expect(goal.rules.arbitration).toBe(CURRENT_ARBITRATION); // the current revision (revision 3 rules hold under it)
   const parts = Array.from({ length: PARTS }, (_, i) => `i${i}`);
   // A passing revision merges all six fixes (its gated tree carries every part's fix).
   const pass = of(log, "integrated.rev").find((m) => m.payload.gate === "pass");

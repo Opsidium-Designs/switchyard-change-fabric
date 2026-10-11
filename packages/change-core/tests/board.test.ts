@@ -2226,12 +2226,14 @@ describe("seam first", () => {
 });
 
 describe("seam contracts: a change to a frozen shared seam, decided by the lead", () => {
+  const CTX_ERROR = "> tsc --noEmit\nsrc/orders/cart.ts(44,12): error TS2339: Property 'user' does not exist on type 'Ctx'.\n";
   /** The storefront shape: Ctx lives in the shared src/store.ts no item owns; cart and invoices import it. */
-  function storefront(): TestBoard {
+  function storefront(options: { readonly output?: string; readonly rules?: Record<string, number> } = {}): TestBoard {
     const board = new TestBoard();
     board.post(
       msg("human", "goal.posted", {
         objective: "o",
+        ...(options.rules ? { rules: options.rules } : {}),
         seams: [
           { path: "src/store.ts", importers: ["src/orders/cart.ts", "src/billing/invoices.ts"], symbols: ["Ctx", "Store", "Order"] },
           { path: "src/contracts/money.ts", importers: ["src/orders/cart.ts"], symbols: ["Money", "toCents"] },
@@ -2251,13 +2253,108 @@ describe("seam contracts: a change to a frozen shared seam, decided by the lead"
         gate: "fail",
         merged: ["c1"],
         failing: {
-          output: "> tsc --noEmit\nsrc/orders/cart.ts(44,12): error TS2339: Property 'user' does not exist on type 'Ctx'.\n",
+          output: options.output ?? CTX_ERROR,
           items: ["cart"],
         },
       }),
     );
     return board;
   }
+
+  it("a local annotation error that names no seam symbol (the sf13 TS2739 on Record) cues no seam, though the file imports three", () => {
+    const board = storefront({
+      output:
+        "src/orders/cart.ts(58,11): error TS2739: Type 'Record<string, unknown>' is missing the following properties from type '{ name: string; categoryId: string; priceCents: number; }': name, categoryId, priceCents\n",
+    });
+    expect(seamContractCue(board.state, "cart")).toBeUndefined();
+    expect(boardDigest(board.state, board.log, "a", 0).claims.find((c) => c.item === "cart")!.seamCue).toBeUndefined();
+    // An error naming a seam's export still cues exactly that seam.
+    const named = storefront({ output: "src/orders/cart.ts(9,3): error TS2322: Type 'number' is not assignable to type 'Money'.\n" });
+    expect(seamContractCue(named.state, "cart")?.seams).toEqual(["src/contracts/money.ts"]);
+  });
+
+  it("no seam is cued while the item has a seam contract waiting for the lead", () => {
+    const board = storefront({ output: `${CTX_ERROR}src/orders/cart.ts(9,3): error TS2322: Type 'number' is not assignable to type 'Money'.\n` });
+    expect(seamContractCue(board.state, "cart")?.seams).toEqual(["src/contracts/money.ts", "src/store.ts"]);
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user to Ctx" }));
+    // money.ts was not asked about, yet nothing is cued until the lead decides k1.
+    expect(seamContractCue(board.state, "cart")).toBeUndefined();
+    board.post(msg("lead", "contract.rejected", { contract: "k1" }));
+    expect(seamContractCue(board.state, "cart")?.seams).toEqual(["src/contracts/money.ts"]);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
+  it("revision 6: after the lead rejects a seam contract, the identical failing errors cue no seam again (revision 5 re-cues on the next implication)", () => {
+    for (const arbitration of [5, 6]) {
+      const board = storefront({ rules: { arbitration } });
+      board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user" }));
+      expect(board.state.contracts.k1!.failingErrors).toEqual(arbitration === 6 ? ["src/orders/cart.ts(44,12): error TS2339: Property 'user' does not exist on type 'Ctx'."] : undefined);
+      board.post(msg("lead", "contract.rejected", { contract: "k1" }));
+      board.post(push("a", "cart", "c2", ["src/orders/cart.ts"]));
+      board.post(msg("engine", "integrated.rev", { commit: "r2", gate: "fail", merged: ["c2"], failing: { output: CTX_ERROR, items: ["cart"] } }));
+      expect(seamContractCue(board.state, "cart")?.seams).toEqual(arbitration === 6 ? undefined : ["src/store.ts"]);
+      // A different error (a new line) is a new cause: cued again under both.
+      board.post(push("a", "cart", "c3", ["src/orders/cart.ts"]));
+      board.post(
+        msg("engine", "integrated.rev", {
+          commit: "r3",
+          gate: "fail",
+          merged: ["c3"],
+          failing: { output: "src/orders/cart.ts(70,5): error TS2339: Property 'session' does not exist on type 'Ctx'.\n", items: ["cart"] },
+        }),
+      );
+      expect(seamContractCue(board.state, "cart")?.seams).toEqual(["src/store.ts"]);
+      expect(reduceBoard(board.log)).toEqual(board.state);
+    }
+  });
+
+  it("revision 6: a seam item whose push was gated with no fix owed no longer owns its seam, so a follow-up change goes to the lead (refused under revision 5)", () => {
+    for (const arbitration of [5, 6]) {
+      const board = storefront({ rules: { arbitration } });
+      board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/store.ts", kind: "modify", item: "cart", description: "add user to Ctx" }));
+      board.post(msg("lead", "contract.accepted", { contract: "k1" }));
+      board.post(push("a", seamItemId("k1"), "s1", ["src/store.ts"]));
+      board.post(
+        msg("engine", "integrated.rev", {
+          commit: "r2",
+          gate: "fail",
+          merged: ["c1", "s1"],
+          failing: { output: "src/orders/cart.ts(60,3): error TS2339: Property 'session' does not exist on type 'Ctx'.\n", items: ["cart"] },
+        }),
+      );
+      const seamItem = board.state.items[seamItemId("k1")]!;
+      expect(waitingOnOthers(board.state, seamItem)).toBe(true);
+      const followUp = msg("a", "contract.proposed", { contract: "k2", target: "src/store.ts", kind: "modify", item: "cart", description: "add session to Ctx" });
+      if (arbitration === 5) {
+        expect(seamContractCue(board.state, "cart")).toBeUndefined();
+        board.reject(followUp, /in item seam-k1's scope: ask its owner/, "NOT_ALLOWED");
+      } else {
+        expect(seamContractCue(board.state, "cart")?.seams).toEqual(["src/store.ts"]);
+        expect(board.types(followUp)).toEqual(["contract.proposed"]);
+        expect(board.state.contracts.k2).toMatchObject({ seam: "src/store.ts", status: "proposed", item: "cart" });
+        expect(itemWaitReason(board.state, "cart")).toEqual({ kind: "waiting-for-lead", contract: "k2" });
+      }
+      expect(reduceBoard(board.log)).toEqual(board.state);
+    }
+  });
+
+  it("revision 6: a plain question addressed to an agent stays in its digest until it replies (not listed under revision 5)", () => {
+    for (const arbitration of [5, 6]) {
+      const board = storefront({ rules: { arbitration } });
+      board.post(claim("b", "invoices", ["src/billing/invoices.ts"]));
+      board.post(msg("b", "help.requested", { request: "q1", item: "invoices", need: "how-is-ctx-user-typed" }, { to: ["a"] }));
+      const listed = boardDigest(board.state, board.log, "a", 0).questions;
+      if (arbitration === 5) {
+        expect(listed).toBeUndefined();
+        continue;
+      }
+      expect(listed).toEqual([expect.objectContaining({ request: "q1", item: "invoices", by: "b", need: "how-is-ctx-user-typed", hint: expect.stringMatching(/message kind reply \{requestId: q1\}/) })]);
+      expect(boardDigest(board.state, board.log, "b", 0).questions).toBeUndefined(); // the asker is not asked
+      board.post(msg("a", "help.offered", { request: "q1" }, { to: ["b"] }));
+      expect(boardDigest(board.state, board.log, "a", 0).questions).toBeUndefined();
+      expect(reduceBoard(board.log)).toEqual(board.state);
+    }
+  });
 
   it("cues the implicated owner with the seam the type error names, the lead decides, and the accepted contract becomes a seam item scheduled first", () => {
     const board = storefront();
@@ -3404,7 +3501,7 @@ describe("arbitration revision 2 (rules.arbitration)", () => {
     }
   }
 
-  it("only revisions 1 to 5 are accepted; revision 1 is the default and is not recorded", () => {
+  it("only revisions 1 to 6 are accepted; revision 1 is the default and is not recorded", () => {
     const one = seeded({ arbitration: 1 });
     expect(one.state.rules.arbitration).toBeUndefined();
     expect(one.log[0]!.type === "goal.posted" && one.log[0]!.payload.rules.arbitration).toBeUndefined();
@@ -3414,8 +3511,9 @@ describe("arbitration revision 2 (rules.arbitration)", () => {
     expect(three.state.rules.arbitration).toBe(3);
     expect(seeded({ arbitration: 4 }).state.rules.arbitration).toBe(4);
     expect(seeded({ arbitration: 5 }).state.rules.arbitration).toBe(5);
+    expect(seeded({ arbitration: 6 }).state.rules.arbitration).toBe(6);
     const board = new TestBoard();
-    board.reject(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 6 } }), /arbitration/, "BAD_PAYLOAD");
+    board.reject(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 7 } }), /arbitration/, "BAD_PAYLOAD");
   });
 
   for (const arbitration of [1, 2]) {

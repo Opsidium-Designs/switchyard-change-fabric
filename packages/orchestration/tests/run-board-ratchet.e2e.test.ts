@@ -20,13 +20,14 @@ import { dirname, join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { reduceBoard, type BoardMessage } from "@switchyard-change/change-core";
-import type { ExecutionResult, ExecutorContext, ExecutorProvider } from "@switchyard-change/model-adapters";
+import { CURRENT_ARBITRATION, reduceBoard, type BoardDigest, type BoardMessage } from "@switchyard-change/change-core";
+import type { AgentTurnTransport, ExecutionResult, ExecutorContext, ExecutorProvider } from "@switchyard-change/model-adapters";
 import type { CommandOutcome, CommandRunner } from "@switchyard-change/verification";
 
+import { createGenericBoardPolicy } from "../src/board-policy.ts";
 import { formatProofSummary } from "../src/proof-bundle.ts";
 import { runBoardOffline } from "../src/run-board-offline.ts";
-import { formatBoardRunSummary, type BoardSeed } from "../src/run-board.ts";
+import { formatBoardRunSummary, type BoardRunEvent, type BoardSeed } from "../src/run-board.ts";
 
 const PARTS = 6;
 const SABOTAGED = "i4";
@@ -119,7 +120,7 @@ describe("a conjunctive typed gate with one saboteur (arbitration revision 5: th
       resolveContract: async () => "reject",
     });
     const log = result.log;
-    expect(of(log, "goal.posted")[0]!.payload.rules.arbitration).toBe(5);
+    expect(of(log, "goal.posted")[0]!.payload.rules.arbitration).toBe(CURRENT_ARBITRATION); // the current revision (revision 5 rules hold under it)
     expect(of(log, "goal.posted")[0]!.payload.immutable).toContain(ACCEPTANCE);
 
     // Removing the saboteur's bad push makes the stack better: recorded with typed evidence, addressed to its holder.
@@ -184,6 +185,46 @@ describe("a conjunctive typed gate with one saboteur (arbitration revision 5: th
     expect(summary).toMatch(/leave-one-out: without i4 \(\S+\) regressed acceptance \d\/6/);
     expect(summary).not.toMatch(/implicated \(ratchet\)/);
     expect(reduceBoard(log)).toEqual(result.state);
+  }, 240_000);
+
+  it("a regressed holder that waits past its fix re-cues is nudged by the quiet-board driver with what its push made worse, then fixes it", async () => {
+    const policy = createGenericBoardPolicy();
+    const saboteurInputs: string[][] = [];
+    // The holder of the regressed push waits on every turn until the driver's held-work nudge arrives.
+    const waitsOnRegression: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      const regressed = input.digest.claims.some((c) => c.item === SABOTAGED && c.regressed !== undefined);
+      if (regressed) {
+        saboteurInputs.push([...input.capsule.evidence]);
+        if (!input.capsule.evidence.some((e) => /^HELD WORK: /.test(e))) {
+          return { action: { type: "wait", reason: "waiting for the next revision" } };
+        }
+      }
+      return policy(input);
+    };
+    const events: BoardRunEvent[] = [];
+    const result = await runBoardOffline({
+      goal: "Make every part carry the fix",
+      projectDir: await project(),
+      seed: sixItems,
+      executor: new SaboteurExecutor(),
+      transport: waitsOnRegression,
+      dial: { minConcurrency: 1, maxConcurrency: 3 },
+      appGateCommand: ["node", "--test", ACCEPTANCE],
+      verifyCommandRunner: new ConjunctiveTypedGate(),
+      resolveContract: async () => "reject",
+      onEvent: (e) => events.push(e),
+    });
+    const regression = of(result.log, "push.regressed")[0]!;
+    expect(regression.payload.item).toBe(SABOTAGED);
+    // It waited past its fix re-cues (FIX REQUIRED), then the driver nudged it with the regression named.
+    expect(saboteurInputs.some((evidence) => evidence.some((e) => /^FIX REQUIRED: /.test(e)))).toBe(true);
+    expect(events).toContainEqual({ kind: "held-work-nudged", item: SABOTAGED, agent: regression.payload.agent });
+    const nudged = saboteurInputs.find((evidence) => evidence.some((e) => /^HELD WORK: /.test(e)))!;
+    expect(nudged.find((e) => /^HELD WORK: /.test(e))).toMatch(/made revision \d+ worse \(claims\.regressed has the evidence\): push a fix now or hand it off/);
+    expect(nudged.find((e) => /^HELD WORK: /.test(e))).not.toMatch(/with no push/);
+    expect(result.verdict).toBe("verified");
+    expect(result.incompleteItems).toEqual([]);
+    expect(reduceBoard(result.log)).toEqual(result.state);
   }, 240_000);
 
   it("the same run under arbitration revision 4 (before the ratchet): the bad push sinks the whole stack and nothing leaves it out", async () => {

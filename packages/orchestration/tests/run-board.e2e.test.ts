@@ -1705,6 +1705,114 @@ describe("seam first (shared seams from the cohesion blueprint)", () => {
     expect(reduceBoard(result.log)).toEqual(result.state);
   }, 120_000);
 
+  /** The Ctx project (a frozen shared seam three resources import) for the lead-contract tests. */
+  async function ctxProject(prefix: string): Promise<{ dir: string; ctxSeed: () => Promise<BoardSeed> }> {
+    const dir = await mkdtemp(join(tmpdir(), prefix));
+    const files: Record<string, string> = {
+      "package.json": '{"name":"p","type":"module","scripts":{}}\n',
+      "src/shared/ctx.ts": "export interface Ctx {\n  store: string;\n}\n",
+    };
+    for (const name of ["a", "b", "c"]) {
+      files[`src/res/${name}.ts`] = `import type { Ctx } from "../shared/ctx.ts";\nexport const ${name} = (ctx: Ctx) => ctx.store;\n`;
+    }
+    for (const [rel, body] of Object.entries(files)) {
+      await mkdir(dirname(join(dir, rel)), { recursive: true });
+      await writeFile(join(dir, rel), body);
+    }
+    const ctxSeed = async (): Promise<BoardSeed> => ({
+      source: "planner",
+      model: "fake-planner",
+      items: ["a", "b", "c"].map((n) => ({ item: `res-${n}`, objective: `greet the user in ${n}`, acceptance: ["gate passes"], scopeHint: [`src/res/${n}.ts`] })),
+    });
+    return { dir, ctxSeed };
+  }
+
+  it("concurrent schedule: a lead that never decides a pending seam contract is re-cued, then nudged on the quiet board, and the quiet ending names the contract and the item it blocks (nothing decides it)", async () => {
+    const { dir, ctxSeed } = await ctxProject("scf-lead-never-decides-");
+    const policy = createGenericBoardPolicy();
+    const leadInputs: string[][] = [];
+    const absentLead: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      if (input.role === "lead") {
+        leadInputs.push([...input.capsule.evidence]);
+        return { action: { type: "wait", reason: "nothing to decide" } };
+      }
+      return policy(input);
+    };
+    const events: BoardRunEvent[] = [];
+    const { base } = await direct("change-lead-never-decides");
+    const result = await runBoard({
+      ...base,
+      projectDir: dir,
+      seed: ctxSeed,
+      transport: absentLead,
+      executor: new CtxUserExecutor(),
+      appGateCommand: ["gate"],
+      verifyCommandRunner: new CtxTypecheckGate(),
+      dial: { minConcurrency: 1, maxConcurrency: 3 },
+      schedule: "concurrent",
+      pollMs: 20,
+      budgets: { quiescenceMs: 600, timeoutMs: 100_000 },
+      onEvent: (e) => events.push(e),
+    });
+    const proposal = of(result.log, "contract.proposed").find((m) => m.payload.target === "src/shared/ctx.ts")!;
+    expect(proposal).toBeDefined();
+    const contract = proposal.payload.contract;
+    const nudges = events.filter((e): e is Extract<BoardRunEvent, { kind: "lead-contracts-nudged" }> => e.kind === "lead-contracts-nudged");
+    expect(nudges.length).toBeGreaterThanOrEqual(1);
+    expect(nudges[0]).toEqual({ kind: "lead-contracts-nudged", contracts: [contract], items: [proposal.payload.item] });
+    expect(leadInputs.some((evidence) => evidence.some((e) => /^PENDING CONTRACT\(S\) TO DECIDE: /.test(e)))).toBe(true);
+    // Nothing decided it, and the quiet ending says so.
+    expect(result.state.contracts[contract]!.status).toBe("proposed");
+    expect(of(result.log, "contract.accepted").concat(of(result.log, "contract.rejected") as never[])).toEqual([]);
+    expect(result.stopReason).toBe("quiescent");
+    expect(result.stopDetail).toMatch(new RegExp(`the lead never decided seam contract ${contract} \\(src/shared/ctx\\.ts\\) blocking ${proposal.payload.item} after ${nudges.length} nudge\\(s\\)`));
+    expect(result.stopDetail).toMatch(/never decided seam contract .* blocking/);
+    expect(formatBoardRunSummary(result)).toMatch(/undecided: the lead never decided seam contract .* blocking res-a/);
+    expect(result.verdict).not.toBe("verified");
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  }, 120_000);
+
+  it("concurrent schedule: a lead that decides the pending seam contract on the driver's nudge keeps the run going to completion", async () => {
+    const { dir, ctxSeed } = await ctxProject("scf-lead-decides-on-nudge-");
+    const policy = createGenericBoardPolicy();
+    const events: BoardRunEvent[] = [];
+    let decidedAfterNudge = false;
+    const lateLead: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      if (input.role === "lead" && input.board.pendingContracts.length > 0) {
+        if (!events.some((e) => e.kind === "lead-contracts-nudged")) {
+          return { action: { type: "wait", reason: "not yet" } };
+        }
+        decidedAfterNudge = true;
+      }
+      return policy(input);
+    };
+    const { base } = await direct("change-lead-decides-on-nudge");
+    const result = await runBoard({
+      ...base,
+      projectDir: dir,
+      seed: ctxSeed,
+      transport: lateLead,
+      executor: new CtxUserExecutor(),
+      appGateCommand: ["gate"],
+      verifyCommandRunner: new CtxTypecheckGate(),
+      dial: { minConcurrency: 1, maxConcurrency: 3 },
+      schedule: "concurrent",
+      pollMs: 20,
+      budgets: { quiescenceMs: 600, timeoutMs: 100_000 },
+      onEvent: (e) => events.push(e),
+    });
+    expect(events.some((e) => e.kind === "lead-contracts-nudged")).toBe(true);
+    expect(decidedAfterNudge).toBe(true);
+    const proposal = of(result.log, "contract.proposed").find((m) => m.payload.target === "src/shared/ctx.ts")!;
+    const accepted = of(result.log, "contract.accepted").find((m) => m.payload.contract === proposal.payload.contract)!;
+    expect(accepted.from).toBe("lead");
+    // The run continued past the decision: the seam item landed in a passing revision.
+    expect(result.state.items[`seam-${proposal.payload.contract}`]!.status).toBe("done");
+    expect(of(result.log, "integrated.rev").at(-1)!.payload.gate).toBe("pass");
+    expect(result.stopReason).toBe("all-items-done");
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  }, 120_000);
+
   it("a seam contract gets an ADVISORY triage before the lead decides: recorded on the board, kept on the contract, shown in the lead's turn", async () => {
     const dir = await mkdtemp(join(tmpdir(), "scf-seam-triage-"));
     const files: Record<string, string> = {

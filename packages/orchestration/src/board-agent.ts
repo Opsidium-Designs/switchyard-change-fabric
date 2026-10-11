@@ -274,6 +274,38 @@ export const MAX_MERGE_CUES = 3;
 /** Items the lead may propose for failing files no item covers, per run. */
 export const MAX_UNCOVERED_PROPOSALS = 4;
 /**
+ * How many times the lead that answers PENDING CONTRACTS (not protected: the
+ * lead decides them) with a wait is given another turn at once, per set of
+ * pending contracts; and, separately, how many times the driver may nudge it
+ * on a quiet board. Bounded: nothing ever decides a contract on its behalf;
+ * a quiet board then ends the run naming each undecided contract.
+ */
+export const MAX_CONTRACT_CUES = 2;
+/** How many turns an agent is woken for one unanswered question addressed to it (arbitration revision 6 digests list them). */
+export const MAX_QUESTION_CUES = 2;
+/** How many times per run the lead is cued about a failing revision that points only at shared seams no item covers. */
+export const MAX_SEAM_FAILURE_CUES = 2;
+
+/**
+ * The lead's cue for the contracts waiting for its decision (protected ones
+ * are a human's, never cued), sorted by id, or undefined when none waits.
+ */
+export function pendingContractCue(state: BoardState): { readonly key: string; readonly contracts: readonly string[]; readonly text: string } | undefined {
+  const pending = Object.values(state.contracts)
+    .filter((c) => c.status === "proposed" && !c.guarded)
+    .sort((a, b) => (a.contract < b.contract ? -1 : a.contract > b.contract ? 1 : 0));
+  if (pending.length === 0) {
+    return undefined;
+  }
+  const contracts = pending.map((c) => c.contract);
+  const text =
+    `PENDING CONTRACT(S) TO DECIDE: ${pending
+      .map((c) => `${c.contract} (${c.kind} ${c.target}${c.item !== undefined ? `, for ${c.item}` : ""}${c.triage !== undefined ? `; triage ${c.triage}` : ""})`)
+      .join("; ")}: ` +
+    "decide_contract now; waiting leaves that item blocked (its claim cannot lapse, its holder cannot propose another)";
+  return { key: contracts.join(","), contracts, text: bounded(text, 1200) };
+}
+/**
  * An item whose write intent covers at least this many files starts one rung
  * above the base model (below the top rung when the ladder has two or more).
  */
@@ -282,6 +314,35 @@ export const LARGE_ITEM_FILES = 3;
 export const MAX_SEAM_DEFERRALS = 3;
 /** The failing gate output a fix edit hands the executor, in characters. */
 const MAX_FIX_EVIDENCE = 4000;
+
+/**
+ * The HELD WORK cue the driver's nudge delivers, kind-specific per item: a
+ * push that made a revision worse (push.regressed), a push left out of
+ * integration (push.excluded), a failing revision that asks for a fix, or
+ * (none of those) held work with no push.
+ */
+export function heldWorkCue(digest: BoardDigest, items: readonly string[]): string {
+  const plain: string[] = [];
+  const parts: string[] = [];
+  for (const item of items) {
+    const claim = digest.claims.find((c) => c.item === item);
+    if (claim?.regressed !== undefined) {
+      parts.push(`my push ${claim.regressed.commit.slice(0, 10)} for ${item} made revision ${claim.regressed.rev} worse (claims.regressed has the evidence): push a fix now or hand it off`);
+    } else if (claim?.excluded !== undefined) {
+      parts.push(`my push ${claim.excluded.commit.slice(0, 10)} for ${item} was left out of integration (${claim.excluded.reason.slice(0, 160)}): push a fix now or hand it off`);
+    } else if (claim?.fix !== undefined) {
+      parts.push(`revision ${claim.fix.n} failed and implicates ${item}: push a fix now (claims.fix) or hand it off`);
+    } else {
+      plain.push(item);
+    }
+  }
+  if (plain.length > 0) {
+    parts.unshift(`the board went quiet and I hold ${plain.join(", ")} with no push: edit it now (or hand it off), or the claim lapses`);
+  } else {
+    parts[0] = `the board went quiet and ${parts[0]}`;
+  }
+  return bounded(`HELD WORK: ${parts.join("; ")}`, 600);
+}
 
 /** List repo-relative files under `dir` (sorted, bounded, skipping build and VCS dirs). */
 export async function listRepoFiles(dir: string, limit = MAX_LISTED_FILES): Promise<string[]> {
@@ -531,6 +592,16 @@ export class BoardAgent {
   private readonly offerNudges = new Map<string, number>();
   /** Set by the driver: open items nobody holds were offered; look at them on the next step. */
   private offerNudge = false;
+  /** Lead: re-cues after a wait while contracts wait for its decision, per set of contracts (bounded by MAX_CONTRACT_CUES). */
+  private readonly contractCues = new Map<string, number>();
+  /** Lead: the driver's nudges per set of pending contracts (bounded by MAX_CONTRACT_CUES). */
+  private readonly driverContractNudges = new Map<string, number>();
+  /** Set by the driver: the lead takes a turn on the next step to decide the pending contracts. */
+  private contractNudge = false;
+  /** Turns an unanswered question addressed to this agent woke it, per request (bounded by MAX_QUESTION_CUES). */
+  private readonly questionCues = new Map<string, number>();
+  /** Lead: cues for failing revisions that point only at shared seams no item covers (bounded by MAX_SEAM_FAILURE_CUES). */
+  private seamFailureCues = 0;
   /** Whether the agent was free (could claim) at its latest observation. */
   private freeSeen = false;
   /** Lead: the undecided worker proposals it last saw (a change wakes it). */
@@ -582,7 +653,7 @@ export class BoardAgent {
    * judges a held claim stalled while its holder is about to act.
    */
   get turnPending(): boolean {
-    return !this.stop && !this.heldBack && (this.followUp || this.heldWorkNudge.size > 0 || this.mergeNudge || this.offerNudge || this.openSeamNudge);
+    return !this.stop && !this.heldBack && (this.followUp || this.heldWorkNudge.size > 0 || this.mergeNudge || this.offerNudge || this.openSeamNudge || this.contractNudge);
   }
 
   /** The agent's workspace (its own repo), once joined. */
@@ -764,7 +835,13 @@ export class BoardAgent {
       this.lastDeadlines = deadlines;
       // Items to re-plan the lead has not had a turn on yet: one bounded turn each.
       const newReplans = (digest.replan ?? []).some((r) => !this.replanCued.has(replanKey(r)));
-      if (!(this.followUp || addressed || newProposals || newDeadlines || newReplans || (undecided && fresh.some((m) => m.type === "contract.proposed")))) {
+      // The driver's nudge on a quiet board while contracts wait for the lead (bounded per set).
+      const contractCue = this.contractNudge ? pendingContractCue(state) : undefined;
+      this.contractNudge = false;
+      if (contractCue) {
+        this.evidence.push(contractCue.text);
+      }
+      if (!(this.followUp || addressed || newProposals || newDeadlines || newReplans || contractCue || (undecided && fresh.some((m) => m.type === "contract.proposed")))) {
         return "idle";
       }
       await this.turn(digest, state);
@@ -874,7 +951,7 @@ export class BoardAgent {
     this.heldWorkNudge.clear();
     const heldCue = heldNudged.length > 0;
     if (heldCue) {
-      this.evidence.push(bounded(`HELD WORK: the board went quiet and I hold ${heldNudged.join(", ")} with no push: edit it now (or hand it off), or the claim lapses`, 600));
+      this.evidence.push(heldWorkCue(digest, heldNudged));
     }
     // SUB-LEAD: children's pushes (by other agents) wait for this agent to
     // merge them; nothing integrates them until it pulls. Cued when the set
@@ -897,7 +974,33 @@ export class BoardAgent {
         ),
       );
     }
-    if (!(this.followUp || relevant || nudged || newlyUnavailable || newCue || claimNudge || openSeamCue || offerCue || heldCue || mergeCue || (freeKey !== undefined && freeKey !== this.lastFreeKey))) {
+    // QUESTIONS addressed to this agent and not answered yet (arbitration
+    // revision 6 digests list them): a bounded number of turns per question,
+    // so a question to it never becomes a dead route.
+    const questions = (digest.questions ?? []).filter((q) => (this.questionCues.get(q.request) ?? 0) < MAX_QUESTION_CUES);
+    const questionCue = questions.length > 0;
+    if (questionCue) {
+      for (const q of questions) {
+        this.questionCues.set(q.request, (this.questionCues.get(q.request) ?? 0) + 1);
+      }
+      this.evidence.push(bounded(`QUESTION FOR ME: ${questions.map((q) => q.hint).join(" ")}`, 1000));
+    }
+    if (
+      !(
+        this.followUp ||
+        relevant ||
+        nudged ||
+        newlyUnavailable ||
+        newCue ||
+        claimNudge ||
+        openSeamCue ||
+        offerCue ||
+        heldCue ||
+        mergeCue ||
+        questionCue ||
+        (freeKey !== undefined && freeKey !== this.lastFreeKey)
+      )
+    ) {
       return "idle";
     }
     // A cue counts as delivered only on a turn it caused by itself (not a
@@ -952,14 +1055,9 @@ export class BoardAgent {
   }
 
   /**
-   * The driver's OFFER on a quiet board: open items nobody holds (unclaimed,
-   * or a claim that lapsed) are waiting; a free worker takes a turn on its
-   * next step to claim one (bounded by MAX_OFFER_CUES per set of items).
-   * Returns false when it has no offer left for the set.
-   */
-  /**
-   * The driver's NUDGE on a quiet board, before a held claim with no stated
-   * wait reason could lapse: this agent's next step takes a turn told to edit
+   * The driver's NUDGE on a quiet board, before a held claim its holder must
+   * act on (no stated wait reason, or a push that made a revision worse or was
+   * left out) could lapse: this agent's next step takes a turn told to act on
    * `item` now (or hand it off). Bounded by MAX_HELD_WAIT_CUES per item;
    * returns false when it has no nudge left (the driver may then lapse it).
    */
@@ -987,6 +1085,30 @@ export class BoardAgent {
     return true;
   }
 
+  /**
+   * The driver's NUDGE on a quiet board while contracts wait for the lead's
+   * decision and block held items: the lead's next step takes a turn told to
+   * decide them (bounded by MAX_CONTRACT_CUES per set of contracts). Nothing
+   * decides a contract for it. Returns false when it is not the lead or has no
+   * nudge left for the set.
+   */
+  nudgeContracts(contracts: readonly string[]): boolean {
+    const key = [...contracts].sort().join(",");
+    const count = this.driverContractNudges.get(key) ?? 0;
+    if (this.role !== "lead" || this.stop || key === "" || count >= MAX_CONTRACT_CUES) {
+      return false;
+    }
+    this.driverContractNudges.set(key, count + 1);
+    this.contractNudge = true;
+    return true;
+  }
+
+  /**
+   * The driver's OFFER on a quiet board: open items nobody holds (unclaimed,
+   * or a claim that lapsed) are waiting; a free worker takes a turn on its
+   * next step to claim one (bounded by MAX_OFFER_CUES per set of items).
+   * Returns false when it has no offer left for the set.
+   */
   offerOpenItems(items: readonly string[]): boolean {
     const key = items.join(",");
     // Only a worker that was free when it last looked can take one (an offer to a busy one changes nothing).
@@ -1085,20 +1207,32 @@ export class BoardAgent {
     if (files.length === 0) {
       // Only shared seams were left: they change through a seam contract (the
       // implicated owner's cue), never as uncovered work. Recorded, not proposed.
+      // Nobody would be asked at all (the integrator implicated no item for
+      // it): the lead is cued, bounded, to give the seam an owner (an item
+      // scoped to it), with the failing line. Recorded, never auto-proposed.
       const seams = pointed.filter((f) => (state.seams ?? []).some((seam) => seam.path === f));
       const uncoveredSeams = seams.filter((f) => uncoveredFailureFiles({ ...state, seams: [] }, [f]).length > 0);
-      if (uncoveredSeams.length > 0) {
+      if (uncoveredSeams.length > 0 && this.seamFailureCues < MAX_SEAM_FAILURE_CUES) {
+        this.seamFailureCues += 1;
+        const line = this.scrub(gateFailureLine(output) ?? "the gate failed");
+        this.followUp = true;
+        this.evidence.push(
+          bounded(
+            `SEAM FAILURE NOBODY OWNS: revision ${message.payload.n} failed (${line}) and points only at the shared seam(s) ${uncoveredSeams.join(", ")}, which no item covers, so no agent was asked to fix it. ` +
+              `Unless an item in board.items already covers that failure, propose_item {scopeHint: [${uncoveredSeams[0]}], objective: fix exactly that failure in ${uncoveredSeams[0]}, keeping it compatible for the files that import it} so an agent takes it (an item covering a seam goes first)`,
+            1000,
+          ),
+        );
         this.record({
           turn: this.turns,
           action: {
             type: "wait",
             reason: bounded(
-              `revision ${message.payload.n} points only at the shared seam(s) ${uncoveredSeams.join(", ")} outside every item: no uncovered item proposed (a seam changes only through a seam contract)`,
+              `revision ${message.payload.n} points only at the shared seam(s) ${uncoveredSeams.join(", ")} outside every item: cued to give it an owner (an item scoped to it), with the failing line`,
               500,
             ),
           },
           outcome: "local",
-          code: "SEAM_ONLY",
         });
       }
       return false;
@@ -1532,7 +1666,13 @@ export class BoardAgent {
       },
       repo: { files, excerpts },
       ...(this.lastRejection ? { lastRejection: this.lastRejection } : {}),
-      allowed: this.role === "lead" ? LEAD_ACTIONS : WORKER_ACTIONS,
+      allowed:
+        this.role === "lead"
+          ? LEAD_ACTIONS
+          : // offer_help goes to another agent's busy item: without one it could only name itself (refused).
+            (digest.busyOwners ?? []).some((b) => b.agent !== this.id)
+            ? WORKER_ACTIONS
+            : WORKER_ACTIONS.filter((t) => t !== "offer_help"),
     };
   }
 
@@ -1683,6 +1823,20 @@ export class BoardAgent {
               !state.tools.published.some((p) => p.capability === t.capability) &&
               (t.inputs.length === 0 || write.some((w) => t.inputs.some((i) => entriesOverlap(intentPath(w), i)))),
           );
+        // The lead answering pending contracts with a wait: each blocks a held
+        // item (its claim cannot lapse, its holder cannot propose another), and
+        // nothing else would wake the lead for them. Re-cue at once, with the
+        // contracts named (bounded per set; nothing decides them for it).
+        if (this.role === "lead") {
+          const cue = pendingContractCue(state);
+          const cues = cue ? (this.contractCues.get(cue.key) ?? 0) : 0;
+          if (cue && cues < MAX_CONTRACT_CUES) {
+            this.contractCues.set(cue.key, cues + 1);
+            this.followUp = true;
+            this.evidence.push(cue.text);
+          }
+          return;
+        }
         // A fix request is never answered with a wait: the item FAILED the
         // gate. Re-cue at once, with the fix stated plainly (bounded).
         if (this.role === "worker") {
@@ -1804,6 +1958,10 @@ export class BoardAgent {
         await this.message(action, posted, state);
         return;
       case "offer_help":
+        if (action.toAgent === this.id) {
+          local("NOT_ALLOWED", "you cannot offer help to yourself: offer_help goes to the owner of an item in digest.busyOwners");
+          return;
+        }
         await posted(
           { type: "help.volunteered", payload: { item: action.itemId }, rationale: action.why, to: [action.toAgent] },
           { item: action.itemId, to: action.toAgent },

@@ -279,6 +279,8 @@ export type BoardRunEvent =
   | { readonly kind: "sub-lead-merge-nudged"; readonly agents: readonly string[]; readonly items: readonly string[] }
   /** A quiet board with open items nobody holds (unclaimed, or a lapsed claim): free workers were offered them. */
   | { readonly kind: "open-items-offered"; readonly items: readonly string[] }
+  /** A quiet board with held items blocked on contracts waiting for the lead: the lead was nudged to decide them (nothing decides them for it). */
+  | { readonly kind: "lead-contracts-nudged"; readonly contracts: readonly string[]; readonly items: readonly string[] }
   /** The run reached a cost or time cap (recorded as run.capped). */
   | { readonly kind: "capped"; readonly cap: RunCapReached }
   /** The run promoted, but the board refused to record the promotion (the proof bundle says not proven). */
@@ -305,6 +307,115 @@ export interface BoardRunEffectiveBudgets extends ScaledBudgets {
  * a clause for the stop detail ("" when none): a quiet end never claims
  * nothing was pending while they wait.
  */
+/**
+ * What a QUIET board acts on, derived from recorded state only (never a
+ * guess), in the order the driver takes them, one step per quiet period:
+ *   - `lead-contracts`: held items whose stated reason is waiting for the
+ *     lead's decision on a contract (the lead is nudged; nothing decides it);
+ *   - `seam-holds`: seam items holding dependents (recorded stalled);
+ *   - `open-seams`: seam items nobody holds (workers are nudged to look);
+ *   - `offer-open`: items nobody holds, unclaimed or lapsed (offered);
+ *   - `sub-lead-merges`: children's pushes awaiting their sub-lead's pull;
+ *   - `held`: leased claims whose HOLDER must act (no stated wait reason, or
+ *     its push made a revision worse or was left out), not suspended and not
+ *     released for not moving too often already: nudged first, judged later.
+ * Pure: the driver applies its own bounds (each agent's cue budgets, and
+ * whether the holder is taking a turn) when it acts on them.
+ */
+export type QuietBoardAction =
+  | { readonly kind: "lead-contracts"; readonly contracts: readonly string[]; readonly items: readonly string[] }
+  | { readonly kind: "seam-holds"; readonly holds: readonly { readonly item: string; readonly dependents: readonly string[] }[] }
+  | { readonly kind: "open-seams"; readonly items: readonly string[] }
+  | { readonly kind: "offer-open"; readonly items: readonly string[] }
+  | { readonly kind: "sub-lead-merges"; readonly agents: readonly string[]; readonly items: readonly string[] }
+  | { readonly kind: "held"; readonly item: string; readonly agent: string; readonly progressSeq: number; readonly reason: "no-push" | "fix-requested" | "push-regressed" | "push-excluded" };
+
+/** The quiet-board actions of `state`, in the order the driver takes them (see QuietBoardAction). Pure. */
+export function quietBoardActions(state: BoardState): QuietBoardAction[] {
+  const out: QuietBoardAction[] = [];
+  const blocked = Object.values(state.items).flatMap((i) => {
+    const why = i.status === "claimed" ? itemWaitReason(state, i.id) : undefined;
+    return why?.kind === "waiting-for-lead" && why.contract !== undefined ? [{ item: i.id, contract: why.contract }] : [];
+  });
+  if (blocked.length > 0) {
+    out.push({
+      kind: "lead-contracts",
+      contracts: [...new Set(blocked.map((b) => b.contract))].sort(),
+      items: blocked.map((b) => b.item).sort(),
+    });
+  }
+  const holds = seamHolds(state);
+  if (holds.length > 0) {
+    out.push({ kind: "seam-holds", holds });
+  }
+  const openSeams = Object.values(state.items)
+    .filter((i) => i.status === "open" && i.fromContract !== undefined)
+    .map((i) => i.id)
+    .sort();
+  if (openSeams.length > 0) {
+    out.push({ kind: "open-seams", items: openSeams });
+  }
+  const offered = Object.values(state.items)
+    .filter((i) => {
+      const why = itemWaitReason(state, i.id);
+      return why?.kind === "unclaimed" || why?.kind === "lease-lapsed";
+    })
+    .map((i) => i.id)
+    .sort();
+  if (offered.length > 0) {
+    out.push({ kind: "offer-open", items: offered });
+  }
+  const awaiting = awaitingSubLead(state);
+  if (awaiting.length > 0) {
+    const agents = [...new Set(awaiting.map((i) => state.items[i.parent!]?.subLead).filter((a): a is string => a !== undefined))].sort();
+    out.push({ kind: "sub-lead-merges", agents, items: awaiting.map((i) => i.id) });
+  }
+  if (leasesOn(state)) {
+    for (const item of Object.values(state.items)) {
+      if (
+        item.status !== "claimed" ||
+        item.owner === undefined ||
+        item.lease === undefined ||
+        // Released for not moving twice already: an item the lead may re-plan
+        // is released ONCE more (re-planning needs it open: replanEligible);
+        // one it may not (a tool, a seam item, a re-plan's child) is left.
+        (item.stallReleases ?? 0) > BOARD_LIMITS.stallReleasesBeforeReplan ||
+        ((item.stallReleases ?? 0) === BOARD_LIMITS.stallReleasesBeforeReplan &&
+          (item.tool !== undefined || item.fromContract !== undefined || item.replanOf !== undefined || item.replanned !== undefined)) ||
+        leaseSuspension(state, item) !== undefined
+      ) {
+        continue;
+      }
+      // Only a holder that must act: no stated reason, or a push that made a
+      // revision worse (push.regressed) or was left out (push.excluded).
+      // Waiting for a human, the lead, the gate, or another item is left alone.
+      const why = itemWaitReason(state, item.id);
+      if (why !== undefined && why.kind !== "push-regressed" && why.kind !== "push-excluded") {
+        continue;
+      }
+      const reason = why?.kind ?? (item.fixRequested !== undefined ? "fix-requested" : "no-push");
+      out.push({ kind: "held", item: item.id, agent: item.owner, progressSeq: item.lease.progressSeq, reason });
+    }
+  }
+  return out;
+}
+
+/**
+ * The contracts still waiting for the lead (protected ones are a human's), one
+ * line each naming the item it blocks and, when counted, the driver's nudges:
+ * what a quiet ending reports (nothing decided them). Pure.
+ */
+export function undecidedContractLines(state: BoardState, nudges?: ReadonlyMap<string, number>): string[] {
+  return Object.values(state.contracts)
+    .filter((c) => c.status === "proposed" && !c.guarded)
+    .sort((a, b) => (a.contract < b.contract ? -1 : a.contract > b.contract ? 1 : 0))
+    .map(
+      (c) =>
+        `the lead never decided ${c.seam !== undefined ? "seam contract" : "contract"} ${c.contract} (${c.target})` +
+        `${c.item !== undefined ? ` blocking ${c.item}` : ""}${nudges !== undefined ? ` after ${nudges.get(c.contract) ?? 0} nudge(s)` : ""}`,
+    );
+}
+
 export function awaitingSubLeadDetail(state: BoardState): string {
   const awaiting = awaitingSubLead(state);
   if (awaiting.length === 0) {
@@ -2459,8 +2570,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   // SEAM_FIRST holds never end a run quiescent: when the board goes quiet
   // while a seam item holds dependents, the operator records it stalled (the
   // engine ends the hold, and releases the item when its owner pushed nothing).
-  const releaseStalledSeams = async (): Promise<boolean> => {
-    const holds = seamHolds((await operator.page(0, 1)).state);
+  const releaseStalledSeams = async (holds: readonly { readonly item: string; readonly dependents: readonly string[] }[]): Promise<boolean> => {
     let released = false;
     for (const hold of holds) {
       const recorded = await operator.recordSeamStalled(hold.item);
@@ -2474,15 +2584,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   };
   // Never end quiet while a seam item is OPEN (nobody holds it) and agents
   // could take it: nudge the workers to look (bounded per open set).
-  const nudgeOpenSeamItems = async (): Promise<boolean> => {
-    const state = (await operator.page(0, 1)).state;
-    const open = Object.values(state.items)
-      .filter((i) => i.status === "open" && i.fromContract !== undefined)
-      .map((i) => i.id)
-      .sort();
-    if (open.length === 0) {
-      return false;
-    }
+  const nudgeOpenSeamItems = (open: readonly string[]): boolean => {
     let nudged = false;
     for (const worker of workers) {
       if (worker.nudgeOpenSeams(open)) {
@@ -2494,6 +2596,24 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     }
     return nudged;
   };
+  // Never end quiet while held items are blocked on contracts the lead has not
+  // decided: nudge the lead (bounded per set of contracts; nothing decides a
+  // contract for it). The nudges per contract name it if the run ends quiet.
+  const contractNudges = new Map<string, number>();
+  const nudgeLeadContracts = (contracts: readonly string[], items: readonly string[]): boolean => {
+    if (!lead.nudgeContracts(contracts)) {
+      return false;
+    }
+    for (const contract of contracts) {
+      contractNudges.set(contract, (contractNudges.get(contract) ?? 0) + 1);
+    }
+    emit({ kind: "lead-contracts-nudged", contracts, items });
+    return true;
+  };
+  const undecidedDetail = (state: BoardState): string => {
+    const lines = undecidedContractLines(state, contractNudges);
+    return lines.length > 0 ? `; ${lines.join("; ")}` : "";
+  };
 
   // Held claims judged on a quiet board: what their holder had done when it
   // was last judged (its lease progress and its local turns on the item, such
@@ -2504,9 +2624,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     turns.filter((t) => t.agent === agent && t.action.type !== "wait" && (t.action as { itemId?: unknown }).itemId === item).length;
   // Children's pushes awaiting their sub-lead's merge: the sub-lead is nudged
   // to pull (bounded by its merge cues).
-  const nudgeSubLeadMerges = (state: BoardState): boolean => {
-    const awaiting = awaitingSubLead(state);
-    const subLeads = [...new Set(awaiting.map((i) => state.items[i.parent!]?.subLead).filter((a): a is string => a !== undefined))].sort();
+  const nudgeSubLeadMerges = (subLeads: readonly string[], items: readonly string[]): boolean => {
     let nudged = false;
     for (const worker of workers) {
       if (subLeads.includes(worker.id) && worker.nudgeSubLeadMerge()) {
@@ -2514,92 +2632,83 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       }
     }
     if (nudged) {
-      emit({ kind: "sub-lead-merge-nudged", agents: subLeads, items: awaiting.map((i) => i.id) });
+      emit({ kind: "sub-lead-merge-nudged", agents: subLeads, items });
     }
     return nudged;
   };
 
-  // A quiet board acts on each waiting item's STATED reason (itemWaitReason),
-  // never on a guess: a seam hold that stopped moving is recorded stalled; an
-  // open seam item, an unclaimed item, or one whose claim lapsed is offered to
-  // the free workers; a child's push awaiting its sub-lead's merge nudges the
-  // sub-lead; a leased claim with NO stated reason whose holder sat the quiet
-  // period out is nudged first (its holder is told to edit it now), and only
-  // recorded stalled (it lapses: a quiet board advances no message count) when
-  // a later quiet period finds it still not moving. A holder taking a turn is
-  // never judged. Waiting for a human, the lead, the gate, or another item is
+  // A quiet board acts on each waiting item's STATED reason (quietBoardActions,
+  // from itemWaitReason), never on a guess: held items blocked on contracts the
+  // lead has not decided nudge the lead; a seam hold that stopped moving is
+  // recorded stalled; an open seam item, an unclaimed item, or one whose claim
+  // lapsed is offered to the free workers; a child's push awaiting its
+  // sub-lead's merge nudges the sub-lead; a leased claim whose HOLDER must act
+  // (no stated reason, or its push made a revision worse or was left out) and
+  // who sat the quiet period out is nudged first (told what to act on), and
+  // only recorded stalled (it lapses: a quiet board advances no message count)
+  // when a later quiet period finds it still not moving. A holder taking a
+  // turn is never judged. Waiting for a human, the gate, or another item is
   // left alone: someone else acts next.
   // One step per quiet period, in this order, so each holder gets a chance to
   // act on what the previous step changed before the next one judges it.
   const actOnStalls = async (): Promise<boolean> => {
-    if (seamHolds((await operator.page(0, 1)).state).length > 0 && (await releaseStalledSeams())) {
-      return true;
-    }
-    if (await nudgeOpenSeamItems()) {
-      return true;
-    }
     const state = (await operator.page(0, 1)).state;
-    const offered = Object.values(state.items)
-      .filter((i) => {
-        const why = itemWaitReason(state, i.id);
-        return why?.kind === "unclaimed" || why?.kind === "lease-lapsed";
-      })
-      .map((i) => i.id)
-      .sort();
-    if (offered.length > 0) {
+    const plan = quietBoardActions(state);
+    const step = <K extends QuietBoardAction["kind"]>(kind: K) => plan.find((a): a is Extract<QuietBoardAction, { kind: K }> => a.kind === kind);
+    const blocked = step("lead-contracts");
+    if (blocked && nudgeLeadContracts(blocked.contracts, blocked.items)) {
+      return true;
+    }
+    const holds = step("seam-holds");
+    if (holds && (await releaseStalledSeams(holds.holds))) {
+      return true;
+    }
+    const openSeams = step("open-seams");
+    if (openSeams && nudgeOpenSeamItems(openSeams.items)) {
+      return true;
+    }
+    const offered = step("offer-open");
+    if (offered) {
       let nudged = false;
       for (const worker of workers) {
-        if (worker.offerOpenItems(offered)) {
+        if (worker.offerOpenItems(offered.items)) {
           nudged = true;
         }
       }
       if (nudged) {
-        emit({ kind: "open-items-offered", items: offered });
+        emit({ kind: "open-items-offered", items: offered.items });
         return true;
       }
     }
-    if (nudgeSubLeadMerges(state)) {
+    const merges = step("sub-lead-merges");
+    if (merges && nudgeSubLeadMerges(merges.agents, merges.items)) {
       return true;
     }
     let acted = false;
-    if (leasesOn(state)) {
-      for (const item of Object.values(state.items)) {
-        if (
-          item.status !== "claimed" ||
-          item.owner === undefined ||
-          item.lease === undefined ||
-          // Released for not moving twice already: an item the lead may re-plan
-          // is released ONCE more (re-planning needs it open: replanEligible);
-          // one it may not (a tool, a seam item, a re-plan's child) is left.
-          ((item.stallReleases ?? 0) > BOARD_LIMITS.stallReleasesBeforeReplan ||
-            ((item.stallReleases ?? 0) === BOARD_LIMITS.stallReleasesBeforeReplan &&
-              (item.tool !== undefined || item.fromContract !== undefined || item.replanOf !== undefined || item.replanned !== undefined))) ||
-          itemWaitReason(state, item.id) !== undefined ||
-          leaseSuspension(state, item) !== undefined
-        ) {
-          continue;
+    for (const held of plan) {
+      if (held.kind !== "held") {
+        continue;
+      }
+      const owner = workers.find((w) => w.id === held.agent);
+      if (owner?.busy || owner?.turnPending) {
+        continue; // taking a turn (an edit in flight), or about to: not stalled
+      }
+      const judged = { agent: held.agent, progressSeq: held.progressSeq, activity: localActivity(held.agent, held.item) };
+      const prior = heldJudged.get(held.item);
+      if (prior === undefined || prior.agent !== judged.agent || prior.progressSeq !== judged.progressSeq || prior.activity !== judged.activity) {
+        // First seen not moving (or it moved since): nudge its holder and
+        // judge it again on a later quiet period, never lapse it now.
+        heldJudged.set(held.item, judged);
+        acted = true;
+        if (owner?.nudgeHeldWork(held.item)) {
+          emit({ kind: "held-work-nudged", item: held.item, agent: held.agent });
         }
-        const owner = workers.find((w) => w.id === item.owner);
-        if (owner?.busy || owner?.turnPending) {
-          continue; // taking a turn (an edit in flight), or about to: not stalled
-        }
-        const judged = { agent: item.owner, progressSeq: item.lease.progressSeq, activity: localActivity(item.owner, item.id) };
-        const prior = heldJudged.get(item.id);
-        if (prior === undefined || prior.agent !== judged.agent || prior.progressSeq !== judged.progressSeq || prior.activity !== judged.activity) {
-          // First seen not moving (or it moved since): nudge its holder and
-          // judge it again on a later quiet period, never lapse it now.
-          heldJudged.set(item.id, judged);
-          acted = true;
-          if (owner?.nudgeHeldWork(item.id)) {
-            emit({ kind: "held-work-nudged", item: item.id, agent: item.owner });
-          }
-          continue;
-        }
-        const recorded = await operator.recordEngine("claim.lapsed", { item: item.id });
-        if (recorded.ok) {
-          acted = true;
-          emit({ kind: "claim-stalled", item: item.id, agent: item.owner });
-        }
+        continue;
+      }
+      const recorded = await operator.recordEngine("claim.lapsed", { item: held.item });
+      if (recorded.ok) {
+        acted = true;
+        emit({ kind: "claim-stalled", item: held.item, agent: held.agent });
       }
     }
     return acted;
@@ -2840,7 +2949,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         if (!acted && joined === 0 && !integrated && !decided && !(await actOnStalls())) {
           const quietState = (await operator.page(0, 1)).state;
           stopReason = check(quietState) ?? "quiescent";
-          stopDetail = `no agent had anything to do and no integration was pending${awaitingSubLeadDetail(quietState)}`;
+          stopDetail = `no agent had anything to do and no integration was pending${awaitingSubLeadDetail(quietState)}${undecidedDetail(quietState)}`;
         }
       }
       stopReason ??= check((await operator.page(0, 1)).state) ?? "max-rounds";
@@ -2907,9 +3016,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         } else if (Date.now() - quietSince >= budgets.quiescenceMs) {
           stopReason = "quiescent";
           stopDetail =
-            awaitingSubLead(state).length === 0
+            (awaitingSubLead(state).length === 0
               ? `every agent was idle (none taking a turn), nothing was integrating or pending, and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s`
-              : `every agent was idle (none taking a turn), nothing was integrating, and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s${awaitingSubLeadDetail(state)}`;
+              : `every agent was idle (none taking a turn), nothing was integrating, and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s${awaitingSubLeadDetail(state)}`) +
+            undecidedDetail(state);
           break;
         }
         // The poll wait ends early on an interrupt.
@@ -3867,6 +3977,10 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
   ];
   for (const r of rejected) {
     lines.push(`    refused: ${r.agent} turn ${r.turn} ${r.action.type}: ${r.code} ${r.error ?? ""}`.trimEnd());
+  }
+  // Contracts nothing decided (the lead's to decide; nothing decides them for it).
+  for (const line of undecidedContractLines(result.state)) {
+    lines.push(`  undecided: ${line}`);
   }
   if (result.revisions.length > 0) {
     let previous: { passed: number; acceptance: boolean } | undefined;

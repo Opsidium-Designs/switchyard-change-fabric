@@ -177,7 +177,7 @@ two symbols in one file contest.
 default 3; `contestIdleMessages`, default 25; `maxFixAttempts`, default 2;
 the optional `maxActiveClaims`, `claimLeaseMessages`, `claimDeadlineMessages`,
 `claimOverlap`, `speculate` (speculative batch gating, 1 to 8; absent
-means 1), and `arbitration` (the arbitration revision, 1 to 5; absent means
+means 1), and `arbitration` (the arbitration revision, 1 to 6; absent means
 1), each absent on a board posted before it, which then behaves as
 before), the integration `baseline` commit and the `gateCommand`
 (both optional), and
@@ -189,8 +189,8 @@ self-describing.
 ARBITRATION REVISION (`rules.arbitration`). A recorded log replays under the
 rules it was recorded with, so arbitration changes that alter what a log
 derives sit behind this rule. Absent (revision 1) is how every earlier board
-was arbitrated; a new `run-board` posts revision 5 (pinning
-`rules: {arbitration: 1}` through `{arbitration: 4}` reproduces that
+was arbitrated; a new `run-board` posts revision 6 (pinning
+`rules: {arbitration: 1}` through `{arbitration: 5}` reproduces that
 revision).
 Revision 2:
 - a DIFFERENT agent granted (or handed) an item starts with a fresh fix
@@ -247,6 +247,23 @@ again. Pushes that only work together are never blamed.
 Revision 4 runs were published live (the storefront runs), so this is a new
 revision; a revision 4 log replays as recorded (it can carry no
 `push.regressed`: the board refuses one below revision 5).
+Revision 6 (everything in revision 5, plus SETTLED SEAM ITEMS and ADDRESSED
+QUESTIONS; the storefront run sf13 deadlocked without them):
+- a seam item (an accepted seam contract's item, `fromContract`) whose latest
+  push was gated with no fix owed (it waits on others) no longer OWNS its
+  seam: a follow-up change to that seam is a seam contract the lead decides
+  (and the owner of a failing item importing it is cued for one), never
+  refused as "ask its owner" (a question to a holder that owes nothing on
+  its item had no wait reason, no digest entry, and no cue: a dead route);
+- a seam contract records the type-mismatch lines of the failing output it
+  was proposed for (`failingErrors`), so after the lead rejects it no seam is
+  cued again for the identical errors;
+- a plain question (`help.requested` with no scope) addressed to agents
+  records whom it asks (`askedOf`); the addressee's digest lists it
+  (`questions`, with a reply hint) until it replies (`help.offered` on the
+  request), and the runtime wakes it for each, bounded (`MAX_QUESTION_CUES`).
+Revision 5 runs were published live (sf13), so this is a new revision; a
+revision 5 log replays as recorded.
 The three published replays and the K = 1 golden demo log carry no
 `arbitration` and reduce (and fold at every seq) exactly as before
 (`recorded-replay-compat.test.ts` pins their state hashes); the coverage-run
@@ -641,7 +658,14 @@ is distributed changes: items are proposed and claimed, never assigned.
   (the agent action that becomes `contract.proposed`) instead of using
   undeclared fields or casts. Only the owner of the implicated item
   proposes it, one pending per seam; a seam another item owns is refused
-  (ask its owner). Bounded: one seam contract waiting per agent, three per
+  (ask its owner; under revision 6 a SETTLED seam item, one whose push was
+  gated with no fix owed, owns nothing, so the change goes to the lead).
+  The cue names a seam only by a symbol the error names (or the error is in
+  the seam itself): a local annotation error that names no seam export, such
+  as `Type 'Record<string, unknown>' is missing ...` in an importing file,
+  cues no seam (only a seam whose exports are unknown, no `symbols`, falls
+  back to the import alone). No seam is cued while the item has a seam
+  contract waiting for the lead. Bounded: one seam contract waiting per agent, three per
   Change, and one seam change per failing cause (a second one from the same
   agent for the same failing revision is refused while the first is
   unfinished). It is not escalated: the lead decides it. The lead's turn
@@ -667,7 +691,21 @@ is distributed changes: items are proposed and claimed, never assigned.
   quiescence window): the hold ends, and a seam item its owner pushed nothing
   for is released (open, `seam` first) for an idle agent. A rejected seam
   contract is cued again only after a newer failing revision implicates the
-  item.
+  item (under revision 6, and only when the failing errors are not the
+  identical ones it was proposed for).
+- The lead never sits on a pending contract: a lead turn that answers
+  contracts waiting for it (not protected: those are a human's) with a wait
+  is re-cued at once, bounded per set of contracts (`MAX_CONTRACT_CUES`), with
+  `PENDING CONTRACT(S) TO DECIDE: <id> (<kind> <target>, for <item>; triage
+  <recommendation>): decide_contract now; waiting leaves that item blocked`
+  (the item's claim cannot lapse while the contract waits, and its holder may
+  not propose another). On a quiet board the driver's FIRST step nudges the
+  lead (`lead.nudgeContracts`, bounded per set; the `lead-contracts-nudged`
+  event names the contracts and the items they block). Nothing ever decides a
+  contract for the lead: when its cues and nudges are spent and the board
+  stays quiet, the run ends `quiescent` and the stop detail and the summary
+  name each one: `the lead never decided seam contract <id> (<target>)
+  blocking <item> after N nudge(s)`.
 - Failures the plan missed become work: when a failing revision's evidence
   points at repo files that no item covers in any status, the lead proposes
   ONE item for them per revision (at most 4 per run), scoped to those files,
@@ -678,8 +716,12 @@ is distributed changes: items are proposed and claimed, never assigned.
   non-test repo frame (the caller): a file seen only as a deeper callee (a
   shared helper the failing code called) is never where a failure is. Shared
   seams are never proposed as uncovered work (they change only through a
-  seam contract); when only seams are left, nothing is proposed and the lead
-  records why (`SEAM_ONLY`). Struggling reports carry the gate's failing line
+  seam contract); when only seams no item covers are left, nobody would be
+  asked to fix that failure, so the lead is cued (bounded,
+  `MAX_SEAM_FAILURE_CUES` per run) with the failing line to give the seam an
+  owner: propose an item scoped to it, unless an item already covers the
+  failure. It is a cue, never an automatic proposal, and it is not counted as
+  a refused action. Struggling reports carry the gate's failing line
   (`gateFailureLine`), never a command echo.
 - The lead joins with role `lead`. Its first turn is the existing planner (the
   LLM planner live; a live run without one fails unless
@@ -1970,11 +2012,22 @@ recorded state only.
   with `HELD WORK: I hold <item> with no push: edit it now (or hand it off)`
   (and, for an invalid reply, `my last reply was invalid: <reason>`),
   bounded by `MAX_HELD_WAIT_CUES` (2) per held set.
-- A QUIET board advances no message count, so the driver acts there: a leased,
-  unsuspended claim with no stated wait reason whose holder sat the quiet
-  period out is first NUDGED (`nudgeHeldWork`: the holder's next step is a
-  turn told to edit it now or hand it off, bounded per item; event
-  `held-work-nudged`), and only when a LATER quiet period finds it still not
+- A QUIET board advances no message count, so the driver acts there, one
+  step per quiet period in the order `quietBoardActions(state)` (a pure
+  planner over recorded state) lists them: held items blocked on contracts
+  the lead has not decided (the lead is nudged), seam holds (recorded
+  stalled), open seam items, open items nobody holds (offered), children's
+  pushes awaiting their sub-lead, and then held claims whose HOLDER must act.
+  A leased, unsuspended claim whose holder must act (no stated wait reason,
+  or its push made a revision worse, `push-regressed`, or was left out,
+  `push-excluded`) and who sat the quiet period out is first NUDGED
+  (`nudgeHeldWork`: the holder's next step is a turn told what to act on,
+  kind-specific: `HELD WORK: my push <commit> for <item> made revision <n>
+  worse (claims.regressed has the evidence): push a fix now or hand it off`,
+  the left-out variant, `revision <n> failed and implicates <item>: push a fix
+  now (claims.fix) or hand it off`, or with no push at all `... I hold <item>
+  with no push: edit it now`; bounded per item; event `held-work-nudged`),
+  and only when a LATER quiet period finds it still not
   moving (neither its lease progress nor the holder's local turns on it,
   such as a failed edit that never reached the board) is it recorded stalled
   (the engine-record route, `claim.lapsed {reason: stalled}`). A holder that
