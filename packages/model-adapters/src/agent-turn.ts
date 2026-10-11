@@ -20,7 +20,7 @@
 
 import { callGatewayJsonSchema } from "./gateway-json-schema.ts";
 import { isReasoningModel } from "./model-budget.ts";
-import { isRateLimitError } from "./rate-limit.ts";
+import { isQuotaExhaustedError, isRateLimitError, quotaReasonCode } from "./rate-limit.ts";
 import { DEFAULT_WORKERS_AI_TIMEOUT_MS, type WorkersAiMessage } from "./workers-ai.ts";
 
 // ---------------------------------------------------------------------------
@@ -873,6 +873,12 @@ export interface AgentTurnRateLimit {
   readonly model: string;
   /** The Retry-After delay the gateway asked for, in ms. */
   readonly retryAfterMs?: number;
+  /**
+   * Set when the 429 said the provider account has no credits (a
+   * QuotaExhaustedError): the provider's code (for example
+   * "credit_balance_exhausted"). Waiting never helps, so the run ends at once.
+   */
+  readonly quotaExhausted?: string;
 }
 
 /** What a turn produced. */
@@ -1317,7 +1323,12 @@ export function createAiGatewayAgentTurnInvoke(options: AiGatewayAgentTurnOption
           action: { type: "wait", reason },
           invalid: reason,
           model: options.model,
-          rateLimited: { status: error.status, model: error.model, ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}) },
+          rateLimited: {
+            status: error.status,
+            model: error.model,
+            ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+            ...(isQuotaExhaustedError(error) ? { quotaExhausted: quotaReasonCode(error) } : {}),
+          },
         };
       }
       return { action: { type: "wait", reason }, invalid: reason, model: options.model };

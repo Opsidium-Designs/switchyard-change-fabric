@@ -29,7 +29,7 @@
  * change-core stays pure and the whole decision path is faked offline.
  */
 
-import { rateLimitErrorFor } from "./rate-limit.ts";
+import { rateLimitErrorFromResponse } from "./rate-limit.ts";
 import {
   DEFAULT_WORKERS_AI_TIMEOUT_MS,
   WorkersAiTimeoutError,
@@ -277,13 +277,16 @@ export function createAiGatewayJevInvoke(options: AiGatewayJevOptions): JevInvok
       }
     }
     if (res.status >= 400) {
+      // A rate limit (a 429 classified from a bounded slice of its body, so an
+      // exhausted provider balance is a QuotaExhaustedError) is thrown as such.
+      const limited = await rateLimitErrorFromResponse(res, DEFAULT_JEV_MODEL, "decision").catch(() => undefined);
+      if (limited !== undefined) {
+        await res.text().catch(() => "");
+        throw limited;
+      }
       // Read the error MESSAGE from the body (never headers or the request), so
       // the caller can record why the call failed.
       const errorText = await res.text().catch(() => "");
-      const limited = rateLimitErrorFor(res, DEFAULT_JEV_MODEL, "decision");
-      if (limited !== undefined) {
-        throw limited;
-      }
       throw new Error(`AI Gateway decision call failed for ${DEFAULT_JEV_MODEL} (HTTP ${res.status}): ${errorMessageOf(errorText)}`);
     }
     const text = await res.text();

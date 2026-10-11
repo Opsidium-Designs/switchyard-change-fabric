@@ -808,7 +808,8 @@ is distributed changes: items are proposed and claimed, never assigned.
   integrates CONTINUOUSLY while the agents work (below). The agent phase ends
   when every item is completed, or every outstanding item's fix budget is spent
   (`fix-budget`), or the run budget, a cost or time cap (`capped`), persistent
-  rate limiting (`rate-limited`, see "Rate limits"), the round limit,
+  rate limiting (`rate-limited`, see "Rate limits"), a provider account with
+  no credits left (`quota-exhausted`, same section), the round limit,
   quiescence, or the timeout ends it. The whole phase runs under try/finally: a throw (a refused join, an
   unreachable board) aborts every agent loop, marks the Change failed, and
   archives every repo the run created before the error propagates. An operator
@@ -2400,6 +2401,28 @@ In a board run (`packages/orchestration/src/rate-limit-backoff.ts`):
   decided by a model in that window". The normal ending runs: the in-flight
   integration finishes, every repo is cleaned up, and the verdict is only what
   was gated.
+
+Quota exhaustion (`quota-exhausted`): one 429 is not waited out. When the
+provider account behind the gateway has no credits left, OpenAI answers HTTP
+429 with no `Retry-After` and a body whose `error.type` is
+`insufficient_quota` (or `error.code` is `insufficient_quota`,
+`credit_balance_exhausted`, or `billing_hard_limit_reached`). Waiting never
+refills a balance, so for a 429 only, the transports read at most 4 KB of the
+body (`rateLimitErrorFromResponse`, `MAX_RATE_LIMIT_BODY_BYTES`) to classify it,
+and nothing else: a body that cannot be read or parsed, or names no such code,
+stays an ordinary `RateLimitError`. A match is a `QuotaExhaustedError` (a
+`RateLimitError` subtype, so it is still not billed and spends no turn budget)
+that keeps only the model, the status, and the provider's `code`/`type`
+identifiers, never the message. The executor does not retry it. In a board run
+the first one starts no pause: every agent is held from then on (no further
+model call, the rest of a lockstep round is skipped), and the agent phase ends
+at once with stop reason `quota-exhausted` and the detail "the provider account
+has no credits left (<code> from <model>): add credits and re-run; nothing was
+decided by a model after it". The normal ending runs as for `rate-limited`.
+The planner fails fast on it too: planning stops at the first such refusal
+(every ladder model bills the same account) and the run fails with that error
+instead of falling back to the heuristic plan; the CLI prints it as
+`Error: quota-exhausted: ...`.
 
 The planner: when every planner ladder model fails with a rate limit, the
 fall-back banner says "All planner calls were rate limited (HTTP 429)" (each

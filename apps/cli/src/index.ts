@@ -93,7 +93,7 @@ import {
   runToolSmoke,
   formatToolSmokeBuild,
 } from "@switchyard-change/orchestration";
-import { DEFAULT_JEV_MODEL, describeRetryAfter, DiscoveringExecutor } from "@switchyard-change/model-adapters";
+import { DEFAULT_JEV_MODEL, describeRetryAfter, DiscoveringExecutor, isQuotaExhaustedError } from "@switchyard-change/model-adapters";
 
 const CLI_NAME = "switchyard-change";
 const VERSION = "0.0.0";
@@ -2043,7 +2043,11 @@ async function main(argv: string[]): Promise<number> {
     refuseInlineFlags(rest);
     return await command.run(rest);
   } catch (error) {
-    console.error(`Error: ${redactSecrets(error instanceof Error ? error.message : String(error))}`);
+    // A call refused because the provider account has no credits (the planner
+    // fails fast on it): named as such, since no model decided anything after it.
+    const quota = isQuotaExhaustedError(error) ? "quota-exhausted: " : "";
+    const tail = quota !== "" ? "; nothing was decided by a model after it" : "";
+    console.error(`Error: ${quota}${redactSecrets(error instanceof Error ? error.message : String(error))}${tail}`);
     if (process.env.SCF_DEBUG && error instanceof Error && error.stack) {
       console.error(redactSecrets(error.stack));
     }

@@ -27,7 +27,7 @@ import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 
 import { withCallUsage } from "./call-usage.ts";
-import { isRateLimitError } from "./rate-limit.ts";
+import { isQuotaExhaustedError, isRateLimitError } from "./rate-limit.ts";
 import { brokenByEdit } from "./syntax-check.ts";
 import type {
   ExecutionResult,
@@ -320,9 +320,11 @@ export class WorkersAiTimeoutError extends Error {
  * aborted/timed-out call, or a network-level fetch failure is transient and
  * worth a bounded retry. A UnusableModelOutputError (a bad model reply) is NOT
  * transient: retrying it would not help and would hide an honest failure.
+ * Nor is a QuotaExhaustedError (the provider account has no credits): waiting
+ * never refills it.
  */
 export function isTransientWorkersAiError(error: unknown): boolean {
-  if (error instanceof UnusableModelOutputError) {
+  if (error instanceof UnusableModelOutputError || isQuotaExhaustedError(error)) {
     return false;
   }
   if (error instanceof WorkersAiTimeoutError || isRateLimitError(error)) {

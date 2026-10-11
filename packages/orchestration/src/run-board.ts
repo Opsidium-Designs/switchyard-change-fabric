@@ -459,6 +459,8 @@ export type BoardStopReason =
   | "capped"
   /** The AI Gateway rate limited every call for the bounded window: no model decided anything in it. */
   | "rate-limited"
+  /** The AI Gateway refused a call because the provider account has no credits left (HTTP 429 insufficient_quota): ended at once, never waited out. */
+  | "quota-exhausted"
   | "fix-budget"
   | "run-budget"
   | "quiescent"
@@ -1980,7 +1982,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   // Cost and time caps: every model call is metered (plan-scaled defaults are set once planned).
   const meter = new RunMeter(options.caps ?? {}, options.capsClock ?? Date.now);
   // One rate-limit backoff for the whole process: a 429 pauses every agent,
-  // spends no turn budget, and past the window ends the run "rate-limited".
+  // spends no turn budget, and past the window ends the run "rate-limited"; a
+  // 429 saying the provider account has no credits ends it "quota-exhausted" at once.
   const rateLimit = new RateLimitBackoff({ ...options.rateLimit, onBackoff: (event) => emit({ kind: "rate-limited", ...event }) });
   const executor = meteredExecutor(rateLimitedExecutor(options.executor ?? new ScopedNoopExecutor(), rateLimit), meter);
   const transport = meteredTransport(rateLimitedTransport(options.transport, rateLimit), meter);
@@ -2935,6 +2938,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       if (Object.values(state.items).some(isChangeItem) && owed.length === 0 && !awaitingLead) {
         return "all-items-done";
       }
+      // The provider account has no credits left: waiting never refills it, so
+      // the agent phase ends at once (no 429 window); cleanup and the verdict as usual.
+      if (rateLimit.quotaExhausted) {
+        return "quota-exhausted";
+      }
       // Every outstanding item was spent by every agent still running: nobody
       // can take it again (reopening only hands it to fresh eyes).
       // Judged on the LEAF items: a split (or re-planned) parent is carried by
@@ -2992,7 +3000,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         const joined = await recruit(state);
         let acted = false;
         for (const agent of [lead, ...lockstepOrder(workers, (await operator.page(0, 1)).state)]) {
-          if (interrupted()) {
+          // No credits left: nobody else calls a model this round.
+          if (interrupted() || rateLimit.quotaExhausted) {
             break;
           }
           if ((await agent.step()) === "acted") {
@@ -3141,6 +3150,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   }
   if (stopReason === "rate-limited") {
     stopDetail ??= rateLimit.stopDetail();
+  }
+  if (stopReason === "quota-exhausted") {
+    // Overrides a generic detail (a quiet round that saw the refusal).
+    stopDetail = rateLimit.quotaStopDetail();
   }
   if (stopReason === "interrupted") {
     stopDetail ??=

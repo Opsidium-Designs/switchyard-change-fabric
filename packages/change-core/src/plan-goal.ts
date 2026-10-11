@@ -269,7 +269,9 @@ const MAX_REJECTION_FEEDBACK = 500;
  * the base model then the ordered escalation ladder on an invalid plan), and
  * projects the first valid plan onto a Change. If no model returns a usable
  * plan, it FALLS BACK to the deterministic heuristic `decompose` so a run never
- * ships a broken plan. The returned result always carries a RecordedPlan naming
+ * ships a broken plan. The one exception is a planner call refused because the
+ * provider account has no credits left (an error named "QuotaExhaustedError"):
+ * that is rethrown at once, since no model can plan until credits are added. The returned result always carries a RecordedPlan naming
  * how it was produced.
  */
 export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult> {
@@ -325,6 +327,14 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
     try {
       proposed = await options.plan({ model, messages: asked });
     } catch (error) {
+      // The provider account has no credits left (an error named
+      // "QuotaExhaustedError": HTTP 429 insufficient_quota). Every ladder model
+      // bills the same account, and the heuristic plan is never a silent live
+      // substitute, so the pass fails fast with that error instead of falling back.
+      if (error instanceof Error && error.name === "QuotaExhaustedError") {
+        record({ model, kind: "transport-error", reason: error.message, rateLimited: true });
+        throw error;
+      }
       // A transport/schema error on this model: record WHY, then try the next
       // model in the ordered ladder rather than failing the whole pass. The
       // message is the thrown error's text (no credential), so a live run can

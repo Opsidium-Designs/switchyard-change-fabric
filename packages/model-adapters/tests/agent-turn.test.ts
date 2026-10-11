@@ -293,6 +293,19 @@ describe("createAiGatewayAgentTurnInvoke", () => {
     expect(plain.invalid).toMatch(/HTTP 503/);
   });
 
+  it("flags a no-credits 429 (insufficient_quota) as a rate limit carrying the provider code", async () => {
+    const body = JSON.stringify({
+      error: { message: "You have no credits remaining. Add credits gw-secret", type: "insufficient_quota", param: null, code: "credit_balance_exhausted" },
+    });
+    const fetchFn = (async () => new Response(body, { status: 429 })) as unknown as typeof fetch;
+    const outcome = await createAiGatewayAgentTurnInvoke({ gatewayUrl: "https://gw", gatewayToken: "gw-secret", model: "gpt-4o", fetchFn })(input);
+    expect(outcome.action.type).toBe("wait");
+    expect(outcome.rateLimited).toEqual({ status: 429, model: "gpt-4o", quotaExhausted: "credit_balance_exhausted" });
+    expect(outcome.invalid).toMatch(/refused for gpt-4o \(HTTP 429, credit_balance_exhausted\): the provider account has no credits left/);
+    expect(JSON.stringify(outcome)).not.toContain("gw-secret");
+    expect(JSON.stringify(outcome)).not.toContain("You have no credits");
+  });
+
   it("records an off-schema or disallowed reply as a wait", async () => {
     const reply = (content: string) =>
       (async () => new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 })) as unknown as typeof fetch;

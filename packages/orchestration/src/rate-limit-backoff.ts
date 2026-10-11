@@ -16,9 +16,15 @@
  * with no call getting through, the driver stops the run with stop reason
  * "rate-limited" and `stopDetail()` says so honestly. The clock and the
  * jitter source are injected, so tests stay deterministic.
+ *
+ * One 429 is not waited out: a QuotaExhaustedError (the provider account has
+ * no credits left) never recovers by waiting. It is recorded as the run's
+ * quota exhaustion instead of a pause: every agent holds from then on (no
+ * further model call), and the driver ends the agent phase at once with stop
+ * reason "quota-exhausted" (`quotaStopDetail()` says so).
  */
 
-import { isRateLimitError, describeRetryAfter, type AgentTurnTransport, type ExecutionResult, type ExecutorContext, type ExecutorProvider } from "@switchyard-change/model-adapters";
+import { isQuotaExhaustedError, isRateLimitError, describeRetryAfter, quotaReasonCode, type AgentTurnTransport, type ExecutionResult, type ExecutorContext, type ExecutorProvider } from "@switchyard-change/model-adapters";
 
 /** The default first backoff delay (doubles per escalation). */
 export const DEFAULT_RATE_LIMIT_BASE_MS = 5_000;
@@ -32,6 +38,8 @@ export interface RateLimitNote {
   readonly model: string;
   readonly status: number;
   readonly retryAfterMs?: number;
+  /** The provider's code when the 429 said the account has no credits left (see the module comment). */
+  readonly quotaExhausted?: string;
 }
 
 /** A backoff the shared gate started or extended. */
@@ -75,6 +83,8 @@ export class RateLimitBackoff {
   total = 0;
   /** The last rate-limited call. */
   last?: RateLimitNote;
+  /** The first call refused because the provider account has no credits (the run ends on it). */
+  quota?: RateLimitNote & { readonly quotaExhausted: string };
   readonly windowMs: number;
   private readonly baseMs: number;
   private readonly maxMs: number;
@@ -109,6 +119,13 @@ export class RateLimitBackoff {
     this.consecutive += 1;
     this.total += 1;
     this.last = limit;
+    if (limit.quotaExhausted !== undefined) {
+      // No credits left: waiting never helps, so no pause is started; the run
+      // ends on it (the first such call is the one reported).
+      this.quota ??= { ...limit, quotaExhausted: limit.quotaExhausted };
+      this.streakStart ??= now;
+      return 0;
+    }
     this.statuses.add(limit.status);
     this.streakStart ??= now;
     const retryAfter = limit.retryAfterMs !== undefined && limit.retryAfterMs > 0 ? Math.min(limit.retryAfterMs, this.windowMs) : undefined;
@@ -129,7 +146,7 @@ export class RateLimitBackoff {
     return backoffMs;
   }
 
-  /** A call got through (anything but a rate limit): the streak and the pause end. */
+  /** A call got through (anything but a rate limit): the streak and the pause end (a quota exhaustion stays). */
   succeeded(): void {
     this.consecutive = 0;
     this.streakStart = undefined;
@@ -138,9 +155,14 @@ export class RateLimitBackoff {
     this.statuses.clear();
   }
 
-  /** True while every agent is paused. */
+  /** True while every agent is paused (for good once the provider account has no credits). */
   get backingOff(): boolean {
-    return this.now() < this.until;
+    return this.quota !== undefined || this.now() < this.until;
+  }
+
+  /** True once a call was refused because the provider account has no credits: the run stops (quota-exhausted). */
+  get quotaExhausted(): boolean {
+    return this.quota !== undefined;
   }
 
   /** The pause left, in ms (0 when not paused). */
@@ -148,9 +170,9 @@ export class RateLimitBackoff {
     return Math.max(0, this.until - this.now());
   }
 
-  /** True while a rate-limit streak is open (no call got through since the first 429). */
+  /** True while a rate-limit streak is open (no call got through since the first 429), or the account has no credits. */
   get limited(): boolean {
-    return this.streakStart !== undefined;
+    return this.streakStart !== undefined || this.quota !== undefined;
   }
 
   /** How long the current streak has lasted, in ms (0 with no streak). */
@@ -172,6 +194,13 @@ export class RateLimitBackoff {
       `the AI Gateway returned ${status} for every call for ${duration(this.limitedForMs)} (last: ${last}; ${this.consecutive} rate-limited call(s)): ` +
       "the provider's rate or quota limit; nothing was decided by a model in that window"
     );
+  }
+
+  /** The honest stop detail for a run ended because the provider account has no credits left. */
+  quotaStopDetail(): string {
+    const quota = this.quota;
+    const what = quota ? `${quota.quotaExhausted} from ${quota.model}` : "insufficient_quota";
+    return `the provider account has no credits left (${what}): add credits and re-run; nothing was decided by a model after it`;
   }
 
   /** Wait out the current pause (resolves early on `signal`). */
@@ -224,7 +253,12 @@ export function rateLimitedExecutor(executor: ExecutorProvider, backoff: RateLim
         result = await executor.execute(context);
       } catch (error) {
         if (isRateLimitError(error)) {
-          backoff.note({ model: error.model, status: error.status, ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}) });
+          backoff.note({
+            model: error.model,
+            status: error.status,
+            ...(error.retryAfterMs !== undefined ? { retryAfterMs: error.retryAfterMs } : {}),
+            ...(isQuotaExhaustedError(error) ? { quotaExhausted: quotaReasonCode(error) } : {}),
+          });
         }
         throw error;
       }

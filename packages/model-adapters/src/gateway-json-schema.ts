@@ -13,7 +13,7 @@
  */
 
 import type { ReasoningEffort } from "./model-budget.ts";
-import { rateLimitErrorFor } from "./rate-limit.ts";
+import { rateLimitErrorFromResponse } from "./rate-limit.ts";
 import { WorkersAiTimeoutError, type WorkersAiMessage } from "./workers-ai.ts";
 
 /** One schema-constrained call. */
@@ -95,10 +95,12 @@ export async function callGatewayJsonSchema(call: GatewayJsonSchemaCall): Promis
     }
   }
   if (res.status >= 400) {
+    // A rate limit (HTTP 429, or 503 with Retry-After) is a RateLimitError; a
+    // 429 whose bounded body says the provider balance is spent is a QuotaExhaustedError.
+    const limited = await rateLimitErrorFromResponse(res, call.model, call.label).catch(() => undefined);
     // Drain the body (do not include it in the error) and fail without leaking.
     await res.text().catch(() => "");
-    // A rate limit (HTTP 429, or 503 with Retry-After) is a RateLimitError.
-    throw rateLimitErrorFor(res, call.model, call.label) ?? new Error(`AI Gateway ${call.label} call failed for ${call.model} (HTTP ${res.status})`);
+    throw limited ?? new Error(`AI Gateway ${call.label} call failed for ${call.model} (HTTP ${res.status})`);
   }
   const text = await res.text();
   let body: {

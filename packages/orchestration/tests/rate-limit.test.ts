@@ -11,7 +11,7 @@
 import { describe, expect, it } from "vitest";
 
 import { planGoal } from "@switchyard-change/change-core";
-import { RateLimitError, type AgentTurnInput, type AgentTurnOutcome, type ExecutorContext, type ExecutorProvider } from "@switchyard-change/model-adapters";
+import { QuotaExhaustedError, RateLimitError, type AgentTurnInput, type AgentTurnOutcome, type ExecutorContext, type ExecutorProvider } from "@switchyard-change/model-adapters";
 
 import { allPlannerCallsRateLimited, modelPlanRefusal, plannerFallbackBanner, REQUIRE_MODEL_PLAN_FLAG } from "../src/executor-select.ts";
 import { RateLimitBackoff, rateLimitedExecutor, rateLimitedTransport, type RateLimitBackoffEvent } from "../src/rate-limit-backoff.ts";
@@ -100,6 +100,55 @@ describe("RateLimitBackoff", () => {
   });
 });
 
+describe("an exhausted provider balance (quota-exhausted)", () => {
+  it("starts no pause, holds every agent for good, survives a later success, and says so honestly", () => {
+    const now = 0;
+    const events: RateLimitBackoffEvent[] = [];
+    const backoff = new RateLimitBackoff({ now: () => now, random: () => 0.5, onBackoff: (e) => events.push(e) });
+    expect(backoff.quotaExhausted).toBe(false);
+    expect(backoff.note({ model: "gpt-4o", status: 429, quotaExhausted: "credit_balance_exhausted" })).toBe(0);
+    expect(events).toEqual([]);
+    expect(backoff.remainingMs).toBe(0);
+    expect(backoff.quotaExhausted).toBe(true);
+    expect(backoff.backingOff).toBe(true);
+    expect(backoff.limited).toBe(true);
+    // Not the window: it is not "exceeded" (that is the waited-out rate limit).
+    expect(backoff.exceeded).toBe(false);
+    // A later refusal on another model does not replace the first one reported.
+    backoff.note({ model: "gpt-4.1", status: 429, quotaExhausted: "insufficient_quota" });
+    backoff.succeeded();
+    expect(backoff.quotaExhausted).toBe(true);
+    expect(backoff.quotaStopDetail()).toBe(
+      "the provider account has no credits left (credit_balance_exhausted from gpt-4o): add credits and re-run; nothing was decided by a model after it",
+    );
+  });
+
+  it("the transport and executor wrappers record it from a flagged outcome or a thrown QuotaExhaustedError", async () => {
+    const viaTurn = new RateLimitBackoff({ now: () => 0 });
+    const transport = rateLimitedTransport(
+      async (): Promise<AgentTurnOutcome> => ({ action: { type: "wait", reason: "no credits" }, rateLimited: { status: 429, model: "m", quotaExhausted: "insufficient_quota" } }),
+      viaTurn,
+    );
+    await transport({} as AgentTurnInput);
+    expect(viaTurn.quotaExhausted).toBe(true);
+    const viaEdit = new RateLimitBackoff({ now: () => 0 });
+    const failing: ExecutorProvider = {
+      name: "fake",
+      execute: async () => {
+        throw new QuotaExhaustedError("no credits", { status: 429, model: "gpt-4o", providerCode: "credit_balance_exhausted", providerType: "insufficient_quota" });
+      },
+    };
+    await expect(rateLimitedExecutor(failing, viaEdit).execute({} as ExecutorContext)).rejects.toThrow("no credits");
+    expect(viaEdit.quotaExhausted).toBe(true);
+    expect(viaEdit.quotaStopDetail()).toContain("(credit_balance_exhausted from gpt-4o)");
+    // Metered like any rate limit: an attempt, never a billed call.
+    const meter = new RunMeter({});
+    await expect(meteredExecutor(failing, meter).execute({ workUnitId: "a" } as ExecutorContext)).rejects.toThrow();
+    expect(meter.calls).toBe(0);
+    expect(meter.rateLimitedCalls).toBe(1);
+  });
+});
+
 describe("the meter reports rate-limited attempts separately", () => {
   it("a rate-limited turn, edit, or decision is an attempt: not a billed call, not unpriced, not against the call cap", async () => {
     const meter = new RunMeter({ maxCalls: 1 });
@@ -158,6 +207,29 @@ describe("the planner under rate limits", () => {
     const mixed = [...planned.diagnostics, { model: "gpt-5", reason: "invalid plan" }];
     expect(allPlannerCallsRateLimited(mixed)).toBe(false);
     expect(plannerFallbackBanner(mixed)).not.toContain("rate limited (HTTP 429) on");
+  });
+
+  it("fails fast on an exhausted provider balance: no further ladder model and no heuristic fall-back", async () => {
+    const asked: string[] = [];
+    const error = await planGoal({
+      goal: "add audit logging",
+      repo: [
+        { path: "src/a.ts", content: "export const a = 1;\n" },
+        { path: "src/b.ts", content: "export const b = 2;\n" },
+      ],
+      baseModel: "gpt-4o",
+      escalationModels: ["gpt-4.1", "gpt-5"],
+      plan: async ({ model }) => {
+        asked.push(model);
+        throw new QuotaExhaustedError(`AI Gateway plan call was refused for ${model} (HTTP 429, credit_balance_exhausted)`, {
+          status: 429,
+          model,
+          providerCode: "credit_balance_exhausted",
+        });
+      },
+    }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(QuotaExhaustedError);
+    expect(asked).toEqual(["gpt-4o"]);
   });
 
   it(`${REQUIRE_MODEL_PLAN_FLAG} refuses a heuristic-fallback plan and accepts a model plan`, () => {

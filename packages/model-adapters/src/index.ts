@@ -187,9 +187,16 @@ export {
 
 export {
   describeRetryAfter,
+  isQuotaExhaustedError,
   isRateLimitError,
+  MAX_RATE_LIMIT_BODY_BYTES,
   parseRetryAfter,
+  QUOTA_EXHAUSTED_CODES,
+  QuotaExhaustedError,
+  quotaExhaustionIn,
+  quotaReasonCode,
   RateLimitError,
   rateLimitErrorFor,
+  rateLimitErrorFromResponse,
 } from "./rate-limit.ts";
 export { brokenByEdit, syntaxCheckAvailable, syntaxError } from "./syntax-check.ts";
