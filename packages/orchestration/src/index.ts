@@ -182,6 +182,18 @@ export {
   selectJev,
 } from "./executor-select.ts";
 export type { SelectedJev } from "./executor-select.ts";
+export type { CliInference } from "./executor-select.ts";
+export {
+  cliInferenceModels,
+  DEFAULT_CLI_AGENT_MODEL,
+  DEFAULT_CLI_ESCALATION_MODELS,
+  DEFAULT_CLI_MODEL,
+  DEFAULT_CLI_PLANNER_MODEL,
+  DEFAULT_CLI_TOOL_MODELS,
+  describeInference,
+  selectCliInference,
+  selectInferenceMode,
+} from "./executor-select.ts";
 
 export type { AppGateWiring, AppGateWiringInput } from "./app-gate-wiring.ts";
 export {
@@ -346,6 +358,7 @@ export {
   runtimeCredentialNames,
   runtimeEnv,
   setRuntimeCredentials,
+  setRuntimeOverrides,
   withoutCredentials as withoutCredentialEnv,
 } from "./credentials.ts";
 export type { CandidateOutcome, SpeculativeRoundOptions, SpeculativeRoundResult } from "./speculative-integration.ts";

@@ -22,7 +22,7 @@
  * gateway token is held in the closure only and is never logged or returned.
  */
 
-import { callGatewayJsonSchema } from "./gateway-json-schema.ts";
+import { callGatewayJsonSchema, type JsonSchemaCaller } from "./gateway-json-schema.ts";
 import {
   DEFAULT_REASONING_PLANNER_MAX_TOKENS,
   modelBudget,
@@ -218,6 +218,25 @@ export function createAiGatewayPlannerInvoke(options: AiGatewayPlannerOptions): 
       ...(budget.reasoningEffort !== undefined ? { reasoningEffort: budget.reasoningEffort } : {}),
       timeoutMs,
       fetchFn,
+      label: "plan",
+      responseError: (message) => new PlannerResponseError(message),
+    });
+    return parsePlannerPlan(reply.content);
+  };
+}
+
+/**
+ * Build a plan transport over any schema-constrained caller (the AI Gateway's,
+ * or an operator-selected local CLI's): the same strict plan schema, the same
+ * reply parsing. The caller decides how the call is made.
+ */
+export function createPlannerInvoke(call: JsonSchemaCaller): PlannerInvoke {
+  return async (request: PlannerRequest): Promise<PlannerPlan> => {
+    const reply = await call({
+      model: request.model,
+      messages: request.messages,
+      schemaName: PLANNER_PLAN_SCHEMA_NAME,
+      schema: PLANNER_PLAN_JSON_SCHEMA,
       label: "plan",
       responseError: (message) => new PlannerResponseError(message),
     });

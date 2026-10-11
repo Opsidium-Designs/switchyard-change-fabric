@@ -114,6 +114,18 @@ export function setRuntimeCredentials(values: Readonly<Record<string, string>>):
   loaded = { ...values };
 }
 
+/** Values the CLI set from its own flags (for example --inference); they win over everything. */
+let overrides: Record<string, string> = {};
+
+/**
+ * Hold values a command-line flag set (for example `--inference claude-cli`
+ * sets SWITCHYARD_INFERENCE). They win over the process environment and
+ * `.env`, so an explicit flag always decides. In memory only, like `.env`.
+ */
+export function setRuntimeOverrides(values: Readonly<Record<string, string>>): void {
+  overrides = { ...values };
+}
+
 /** The names loaded from `.env` (names only). */
 export function runtimeCredentialNames(): string[] {
   return Object.keys(loaded).sort();
@@ -121,11 +133,12 @@ export function runtimeCredentialNames(): string[] {
 
 /**
  * The environment the CLI's own code reads configuration and credentials
- * from: the process environment over the values loaded from `.env`. Never
+ * from: the process environment over the values loaded from `.env`, with any
+ * flag overrides (setRuntimeOverrides) on top. Never
  * pass this to a child process wholesale.
  */
 export function runtimeEnv(): Record<string, string | undefined> {
-  return { ...loaded, ...process.env };
+  return { ...loaded, ...process.env, ...overrides };
 }
 
 /**

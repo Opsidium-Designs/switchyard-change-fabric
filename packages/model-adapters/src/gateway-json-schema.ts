@@ -41,6 +41,26 @@ export interface GatewayJsonSchemaCall {
   readonly responseError: (message: string) => Error;
 }
 
+/**
+ * A schema-constrained call independent of its transport: the AI Gateway (the
+ * per-model token ceiling and reasoning effort are the gateway closure's
+ * business) or an operator-selected local CLI (see cli-transport.ts). The
+ * planner, the agent turn, and the tool filler are built over one of these.
+ */
+export interface JsonSchemaRequest {
+  readonly model: string;
+  readonly messages: readonly WorkersAiMessage[];
+  readonly schemaName: string;
+  readonly schema: unknown;
+  /** What the call is for, used in error messages (for example "plan"). */
+  readonly label: string;
+  /** Builds the error thrown for a missing or non-JSON reply. */
+  readonly responseError: (message: string) => Error;
+}
+
+/** Runs one schema-constrained call and returns the reply JSON (as a string) and usage. */
+export type JsonSchemaCaller = (request: JsonSchemaRequest) => Promise<GatewayJsonSchemaReply>;
+
 /** The reply content (a JSON string) and the token usage the gateway reported. */
 export interface GatewayJsonSchemaReply {
   readonly content: string;

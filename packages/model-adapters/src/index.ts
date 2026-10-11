@@ -100,6 +100,7 @@ export type {
 } from "./planner.ts";
 export {
   createAiGatewayPlannerInvoke,
+  createPlannerInvoke,
   DEFAULT_AI_GATEWAY_PLANNER_MAX_TOKENS,
   DEFAULT_AI_GATEWAY_PLANNER_MODEL,
   parsePlannerPlan,
@@ -131,7 +132,7 @@ export {
   serializeJevQuestion,
 } from "./jev.ts";
 
-export type { GatewayJsonSchemaCall, GatewayJsonSchemaReply } from "./gateway-json-schema.ts";
+export type { GatewayJsonSchemaCall, GatewayJsonSchemaReply, JsonSchemaCaller, JsonSchemaRequest } from "./gateway-json-schema.ts";
 export { callGatewayJsonSchema } from "./gateway-json-schema.ts";
 
 export type {
@@ -164,6 +165,7 @@ export {
   agentActionOrWait,
   buildAgentTurnMessages,
   createAiGatewayAgentTurnInvoke,
+  createAgentTurnInvoke,
   agentTurnMaxTokens,
   DEFAULT_AGENT_TURN_MAX_TOKENS,
   DEFAULT_REASONING_AGENT_TURN_MAX_TOKENS,
@@ -179,6 +181,7 @@ export {
   buildToolRegionMessages,
   CODEMOD_REGION_EXAMPLES,
   createAiGatewayToolRegionFiller,
+  createToolRegionFiller,
   MAX_REGION_CODE,
   parseToolRegionFills,
   TOOL_REGIONS_JSON_SCHEMA,
@@ -200,3 +203,40 @@ export {
   rateLimitErrorFromResponse,
 } from "./rate-limit.ts";
 export { brokenByEdit, syntaxCheckAvailable, syntaxError } from "./syntax-check.ts";
+
+export type {
+  CliDriver,
+  CliDriverName,
+  CliInvokeOptions,
+  CliProbe,
+  CliRequest,
+  CliResult,
+  CliSpawn,
+  ClaudeCliDriverOptions,
+  InferenceMode,
+  RunCliOptions,
+} from "./cli-transport.ts";
+export {
+  callCliJsonSchema,
+  CLI_ENV_ALLOWLIST,
+  CliAuthError,
+  cliChildEnv,
+  cliDriverFor,
+  CliNotFoundError,
+  cliStdinPrompt,
+  cliSystemPrompt,
+  createClaudeCliDriver,
+  createCliInvoke,
+  createCliJsonSchemaCaller,
+  DEFAULT_CLI_TIMEOUT_MS,
+  INFERENCE_MODES,
+  isCliAuthError,
+  isCliNotFoundError,
+  MAX_CLI_STDERR_BYTES,
+  MAX_CLI_STDOUT_BYTES,
+  MAX_CLI_SYSTEM_PROMPT_BYTES,
+  parseCliResetMs,
+  parseInferenceMode,
+  probeCli,
+  runCli,
+} from "./cli-transport.ts";

@@ -55,6 +55,13 @@ static assets). See [docs/REPLAY.md](./docs/REPLAY.md).
    `ai-gateway | workers-ai | noop` (unset means `noop`); anything else is an
    error. Only `ai-gateway` provides the LLM planner and the Jev decision model.
 
+   **Or use your local Claude Code CLI** instead of the gateway for every model
+   role (planner, agent turns, edits, tool authoring): log in with `claude`
+   once, then set `SWITCHYARD_INFERENCE=claude-cli` in `.env` (or pass
+   `--inference claude-cli`). No AI Gateway URL or token is needed; the
+   Cloudflare account and token still are. Jev is off in this mode by default.
+   See [`docs/LOCAL-CLI.md`](docs/LOCAL-CLI.md).
+
 2. **Start the local Worker and console** and leave them running:
    ```bash
    make dev-all

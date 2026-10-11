@@ -14,6 +14,7 @@
  */
 
 import { runtimeEnv } from "./credentials.ts";
+import { selectCliInference, selectInferenceMode } from "./executor-select.ts";
 
 import { execFile } from "node:child_process";
 
@@ -81,6 +82,9 @@ export async function runDoctor(options: DoctorEnv = {}): Promise<DoctorReport> 
 
   // Executor modes.
   checks.push(...executorChecks(env));
+
+  // The inference path (the AI Gateway, or the operator's local CLI).
+  checks.push(...(await inferenceChecks(env, runCommand)));
 
   const ready = checks.filter((c) => c.required).every((c) => c.status === "ok");
   return { checks, ready };
@@ -259,6 +263,77 @@ function executorChecks(env: Record<string, string | undefined>): DoctorCheck[] 
       detail:
         "not configured (set AI_GATEWAY_MODEL or WORKERS_AI_MODEL and provide a transport to enable)",
     });
+  }
+  return checks;
+}
+
+/**
+ * Report the inference path. In gateway mode: whether the AI Gateway URL and
+ * token are set (names only). In a local-CLI mode the gateway credentials are
+ * NOT needed: instead the CLI binary must run (`<bin> --version`) and be
+ * logged in (`<bin> auth status`; only the login flag and method are read,
+ * never the account). No model call is made. Never throws.
+ */
+async function inferenceChecks(
+  env: Record<string, string | undefined>,
+  runCommand: (program: string, args: readonly string[]) => Promise<string>,
+): Promise<DoctorCheck[]> {
+  let mode;
+  let cli;
+  try {
+    mode = selectInferenceMode(env);
+    cli = selectCliInference(env);
+  } catch (error) {
+    return [{ name: "Inference", status: "missing", required: false, detail: error instanceof Error ? error.message : String(error) }];
+  }
+  if (mode === "gateway" || cli === undefined) {
+    const configured = (env.CLOUDFLARE_AI_GATEWAY_URL ?? "").trim() !== "" && (env.CLOUDFLARE_AI_GATEWAY_TOKEN ?? "").trim() !== "";
+    return [
+      {
+        name: "Inference: AI Gateway",
+        status: configured ? "ok" : "unknown",
+        required: false,
+        detail: configured
+          ? "selected (SWITCHYARD_INFERENCE=gateway, the default); CLOUDFLARE_AI_GATEWAY_URL and CLOUDFLARE_AI_GATEWAY_TOKEN are set"
+          : "selected (the default) but not configured: set CLOUDFLARE_AI_GATEWAY_URL and CLOUDFLARE_AI_GATEWAY_TOKEN for a live run, or SWITCHYARD_INFERENCE=claude-cli",
+      },
+    ];
+  }
+  const checks: DoctorCheck[] = [];
+  const name = `Inference: local ${cli.driver.label}`;
+  let version: string;
+  try {
+    version = firstLine(await runCommand(cli.driver.bin, cli.driver.versionArgs));
+  } catch {
+    return [
+      {
+        name,
+        status: "missing",
+        required: false,
+        detail: `selected (SWITCHYARD_INFERENCE=${cli.mode}) but ${JSON.stringify(cli.driver.bin)} did not run: install it (or set CLAUDE_CLI_BIN); no AI Gateway URL or token is needed in this mode`,
+      },
+    ];
+  }
+  checks.push({
+    name,
+    status: "ok",
+    required: false,
+    detail: `selected (SWITCHYARD_INFERENCE=${cli.mode}), present (${version}); no AI Gateway URL or token is needed in this mode`,
+  });
+  if (cli.driver.authStatusArgs !== undefined && cli.driver.parseAuthStatus !== undefined) {
+    let status;
+    try {
+      status = cli.driver.parseAuthStatus(await runCommand(cli.driver.bin, cli.driver.authStatusArgs));
+    } catch {
+      status = undefined;
+    }
+    checks.push(
+      status === undefined
+        ? { name: `${cli.driver.label} login`, status: "unknown", required: false, detail: "could not read the login state" }
+        : status.loggedIn
+          ? { name: `${cli.driver.label} login`, status: "ok", required: false, detail: `logged in${status.method !== undefined ? ` (${status.method})` : ""}` }
+          : { name: `${cli.driver.label} login`, status: "missing", required: false, detail: "not logged in: run `claude` in a terminal and log in" },
+    );
   }
   return checks;
 }

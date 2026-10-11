@@ -17,6 +17,13 @@
  * Caps: total model calls, estimated spend in USD, the run's wall-clock time,
  * and calls per item (across agents).
  *
+ * A call on an operator's local CLI subscription (a model listed in
+ * `caps.subscriptionModels`) that has no explicit `--price` is not billed per
+ * call: it is counted as a SUBSCRIPTION call (`subscriptionCalls`, with its
+ * tokens), where USD is not applicable, never as an unpriced or a free call.
+ * An explicit `--price` for that model still prices it. `--max-calls` counts
+ * it like any other call.
+ *
  * A call the gateway refused with a rate limit (HTTP 429, or 503 with
  * Retry-After) is a call ATTEMPT, reported separately (`rateLimitedCalls`):
  * no model ran and nothing is billed, so it is neither priced, nor unpriced,
@@ -114,6 +121,11 @@ export interface RunCaps {
   readonly maxCallsPerItem?: number;
   /** Prices per model id, for the spend estimate. */
   readonly prices?: Readonly<Record<string, ModelPrice>>;
+  /**
+   * Models served by the operator's local CLI subscription: an unpriced call
+   * on one is a subscription call (USD not applicable), not an unpriced one.
+   */
+  readonly subscriptionModels?: readonly string[];
 }
 
 /** A cap the run reached. */
@@ -132,6 +144,11 @@ export class RunMeter {
   unpricedCalls = 0;
   /** Call attempts the gateway refused with a rate limit (no model ran; not billed, not capped). */
   rateLimitedCalls = 0;
+  /** Unpriced calls on a local CLI subscription model (USD not applicable). */
+  subscriptionCalls = 0;
+  /** The tokens those subscription calls reported. */
+  subscriptionInputTokens = 0;
+  subscriptionOutputTokens = 0;
   /** Warnings recorded while counting (an unpriced model under an active spend cap), once each. */
   readonly warnings: string[] = [];
   /** Called once per new warning (the driver may record it on the board). */
@@ -166,6 +183,11 @@ export class RunMeter {
       this.spendUsd += tokenCost;
     } else if (usable(call.usd) && call.usd > 0) {
       this.spendUsd += call.usd;
+    } else if (call.model !== undefined && (this.caps.subscriptionModels ?? []).includes(call.model)) {
+      // The operator's local CLI subscription: not billed per call, so USD does not apply.
+      this.subscriptionCalls += 1;
+      this.subscriptionInputTokens += usable(call.inputTokens) ? call.inputTokens : 0;
+      this.subscriptionOutputTokens += usable(call.outputTokens) ? call.outputTokens : 0;
     } else {
       this.unpricedCalls += 1;
       if (this.caps.maxSpendUsd !== undefined) {
@@ -244,6 +266,7 @@ export class RunMeter {
     const c = this.caps;
     const spend =
       `${this.spendUsd.toFixed(4)} USD estimated${this.unpricedCalls > 0 ? ` (+${this.unpricedCalls} unpriced call(s))` : ""}` +
+      `${this.subscriptionCalls > 0 ? ` (+${this.subscriptionCalls} local CLI subscription call(s), USD not applicable)` : ""}` +
       `${c.maxSpendUsd !== undefined && this.unpricedCalls > 0 ? "; the spend cap does not bound the unpriced calls" : ""}`;
     return (
       `caps: ${c.maxCalls !== undefined ? `${c.maxCalls} model call(s)` : "no call cap"} (used ${this.calls}), ` +

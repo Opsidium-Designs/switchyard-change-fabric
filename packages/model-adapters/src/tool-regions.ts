@@ -15,7 +15,7 @@
  */
 
 import { withCallUsage } from "./call-usage.ts";
-import { callGatewayJsonSchema } from "./gateway-json-schema.ts";
+import { callGatewayJsonSchema, type JsonSchemaCaller } from "./gateway-json-schema.ts";
 import { DEFAULT_WORKERS_AI_TIMEOUT_MS, type WorkersAiMessage } from "./workers-ai.ts";
 
 /** One region to fill: where it is, what it is for, and the signature its code must define. */
@@ -247,23 +247,38 @@ export interface AiGatewayToolRegionOptions {
 /** The live filler: one strict json_schema call, strongest model first. */
 export function createAiGatewayToolRegionFiller(options: AiGatewayToolRegionOptions): ToolRegionFiller {
   const fetchFn = options.fetchFn ?? fetch;
+  return createToolRegionFiller({
+    models: options.models,
+    call: (request) =>
+      callGatewayJsonSchema({
+        ...request,
+        gatewayUrl: options.gatewayUrl,
+        gatewayToken: options.gatewayToken,
+        maxTokens: options.maxTokens ?? 8192,
+        timeoutMs: options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS,
+        fetchFn,
+      }),
+  });
+}
+
+/**
+ * The filler over any schema-constrained caller (the AI Gateway's, or an
+ * operator-selected local CLI's): one strict json_schema call, strongest model
+ * first; the next model is tried only after a transport error.
+ */
+export function createToolRegionFiller(options: { readonly models: readonly string[]; readonly call: JsonSchemaCaller }): ToolRegionFiller {
   return async (request) => {
     let lastError: unknown = new Error("no model configured for tool authoring");
     let attempts = 0;
     for (const model of options.models) {
-      let reply: Awaited<ReturnType<typeof callGatewayJsonSchema>>;
+      let reply: Awaited<ReturnType<JsonSchemaCaller>>;
       attempts += 1;
       try {
-        reply = await callGatewayJsonSchema({
-          gatewayUrl: options.gatewayUrl,
-          gatewayToken: options.gatewayToken,
+        reply = await options.call({
           model,
           messages: buildToolRegionMessages(request),
           schemaName: TOOL_REGIONS_SCHEMA_NAME,
           schema: TOOL_REGIONS_JSON_SCHEMA,
-          maxTokens: options.maxTokens ?? 8192,
-          timeoutMs: options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS,
-          fetchFn,
           label: "tool fill",
           responseError: (message) => new ToolRegionError(message),
         });

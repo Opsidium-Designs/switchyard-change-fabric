@@ -777,6 +777,8 @@ export interface RunBoardResult {
     readonly calls: number;
     readonly spendUsd: number;
     readonly unpricedCalls: number;
+    /** Unpriced calls on the operator's local CLI subscription (USD not applicable), with their tokens. */
+    readonly subscription?: { readonly calls: number; readonly inputTokens: number; readonly outputTokens: number };
     /** Call attempts the gateway refused with a rate limit (HTTP 429): not billed, not capped, reported separately. */
     readonly rateLimitedCalls?: number;
     readonly capped: readonly RunCapReached[];
@@ -3600,6 +3602,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       calls: meter.calls,
       spendUsd: Math.round(meter.spendUsd * 1e6) / 1e6,
       unpricedCalls: meter.unpricedCalls,
+      ...(meter.subscriptionCalls > 0
+        ? { subscription: { calls: meter.subscriptionCalls, inputTokens: meter.subscriptionInputTokens, outputTokens: meter.subscriptionOutputTokens } }
+        : {}),
       ...(meter.rateLimitedCalls > 0 ? { rateLimitedCalls: meter.rateLimitedCalls } : {}),
       capped: [...capsReached],
       ...(meter.warnings.length > 0 ? { warnings: [...meter.warnings] } : {}),
@@ -4260,6 +4265,9 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     ...(result.usage
       ? [
           `  usage: ${result.usage.calls} model call(s), ${result.usage.spendUsd.toFixed(4)} USD estimated${result.usage.unpricedCalls > 0 ? ` (+${result.usage.unpricedCalls} unpriced call(s))` : ""}` +
+            (result.usage.subscription !== undefined
+              ? ` (+${result.usage.subscription.calls} local CLI subscription call(s), ${result.usage.subscription.inputTokens} input / ${result.usage.subscription.outputTokens} output tokens, USD not applicable)`
+              : "") +
             ((result.usage.rateLimitedCalls ?? 0) > 0 ? `; ${result.usage.rateLimitedCalls} rate-limited call attempt(s) (HTTP 429: not billed, no turn budget spent)` : "") +
             (result.usage.capped.length > 0 ? `; caps reached: ${result.usage.capped.map((c) => `${c.kind}${c.item ? ` (${c.item})` : ""} ${c.used} of ${c.limit}`).join(", ")}` : ""),
           ...(result.usage.warnings ?? []).map((w) => `  meter warning: ${w}`),

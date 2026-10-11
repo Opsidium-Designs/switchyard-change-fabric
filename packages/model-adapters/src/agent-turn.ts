@@ -18,7 +18,7 @@
  * the prompt describes the rules, not any particular repository.
  */
 
-import { callGatewayJsonSchema } from "./gateway-json-schema.ts";
+import { callGatewayJsonSchema, type JsonSchemaCaller } from "./gateway-json-schema.ts";
 import { isReasoningModel } from "./model-budget.ts";
 import { isQuotaExhaustedError, isRateLimitError, quotaReasonCode } from "./rate-limit.ts";
 import { DEFAULT_WORKERS_AI_TIMEOUT_MS, type WorkersAiMessage } from "./workers-ai.ts";
@@ -1295,19 +1295,37 @@ export function createAiGatewayAgentTurnInvoke(options: AiGatewayAgentTurnOption
   const fetchFn = options.fetchFn ?? fetch;
   const timeoutMs = options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS;
   const maxTokens = options.maxTokens ?? agentTurnMaxTokens(options.model, options.maxTokensByModel);
+  return createAgentTurnInvoke({
+    model: options.model,
+    call: (request) =>
+      callGatewayJsonSchema({
+        ...request,
+        gatewayUrl: options.gatewayUrl,
+        gatewayToken: options.gatewayToken,
+        maxTokens,
+        timeoutMs,
+        fetchFn,
+      }),
+  });
+}
+
+/**
+ * Build a turn transport over any schema-constrained caller (the AI Gateway's,
+ * or an operator-selected local CLI's). Each turn is one strict json_schema
+ * call; the reply is validated with `parseAgentAction` against the turn's
+ * allowed actions. A failed call or an invalid reply is returned as a `wait`
+ * carrying the reason (never thrown), and a rate-limited call is such a wait
+ * flagged `rateLimited`, exactly as on the gateway path.
+ */
+export function createAgentTurnInvoke(options: { readonly model: string; readonly call: JsonSchemaCaller }): AgentTurnTransport {
   return async (input) => {
     let reply;
     try {
-      reply = await callGatewayJsonSchema({
-        gatewayUrl: options.gatewayUrl,
-        gatewayToken: options.gatewayToken,
+      reply = await options.call({
         model: options.model,
         messages: buildAgentTurnMessages(input),
         schemaName: AGENT_TURN_SCHEMA_NAME,
         schema: AGENT_TURN_JSON_SCHEMA,
-        maxTokens,
-        timeoutMs,
-        fetchFn,
         label: "agent turn",
         responseError: (message) => new AgentActionError(message),
       });

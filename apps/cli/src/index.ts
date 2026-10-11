@@ -36,6 +36,11 @@ import {
   runtimeCredentialNames,
   runtimeEnv,
   setRuntimeCredentials,
+  setRuntimeOverrides,
+  describeInference,
+  selectCliInference,
+  selectInferenceMode,
+  cliInferenceModels,
   changeToSpecYaml,
   cleanupLive,
   formatAttributionTally,
@@ -93,7 +98,7 @@ import {
   runToolSmoke,
   formatToolSmokeBuild,
 } from "@switchyard-change/orchestration";
-import { DEFAULT_JEV_MODEL, describeRetryAfter, DiscoveringExecutor, isQuotaExhaustedError } from "@switchyard-change/model-adapters";
+import { DEFAULT_JEV_MODEL, describeRetryAfter, DiscoveringExecutor, isQuotaExhaustedError, parseInferenceMode, probeCli } from "@switchyard-change/model-adapters";
 
 const CLI_NAME = "switchyard-change";
 const VERSION = "0.0.0";
@@ -148,7 +153,7 @@ const commands: Command[] = [
   },
   {
     name: "tool-smoke",
-    summary: "Live check: build one agent tool (default: the service-api codemod) with the live region filler and run its own gate, N times, printing pass/fail (needs EXECUTOR=ai-gateway and credentials; no board, no Worker, no Cloudflare resource).",
+    summary: "Live check: build one agent tool (default: the service-api codemod) with the live region filler and run its own gate, N times, printing pass/fail (needs EXECUTOR=ai-gateway and credentials, or --inference claude-cli; no board, no Worker, no Cloudflare resource).",
     usage: `${CLI_NAME} tool-smoke [--attempts N] [--rebuilds N] [--project <dir> --inputs <glob,...>] [--goal-file <file>] [--kind codemod|scanner|check] [--capability <name>]`,
     async run(args) {
       const tools = selectToolFiller();
@@ -205,7 +210,7 @@ const commands: Command[] = [
   {
     name: "env-check",
     summary: "Confirm no credential is in this process's environment (names only); .env is read into memory instead.",
-    usage: `${CLI_NAME} env-check`,
+    usage: `${CLI_NAME} env-check [--inference gateway|claude-cli|codex-cli]`,
     async run() {
       // Handled in main before anything else runs (it needs the startup environment).
       return 0;
@@ -214,7 +219,7 @@ const commands: Command[] = [
   {
     name: "doctor",
     summary: "Check local prerequisites and print a readiness report.",
-    usage: `${CLI_NAME} doctor`,
+    usage: `${CLI_NAME} doctor [--inference gateway|claude-cli|codex-cli]`,
     async run() {
       const report = await runDoctor();
       console.log(formatDoctorReport(report));
@@ -406,8 +411,12 @@ const commands: Command[] = [
   {
     name: "recruit-live",
     summary: "Recruit agents into real Cloudflare Artifact repos via a running Worker (wrangler dev).",
-    usage: `${CLI_NAME} recruit-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+    usage: `${CLI_NAME} recruit-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--inference gateway|claude-cli|codex-cli] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
+      // A local CLI inference path must be installed and logged in before anything is created.
+      if (!(await preflightInference())) {
+        return 1;
+      }
       // A live run: the LLM is the planner (fail without one unless opted in).
       if (!enforceLivePlanner(args)) {
         return 1;
@@ -433,6 +442,7 @@ const commands: Command[] = [
         `Recruiting for ${liveChange.id} under dial min ${dial.minConcurrency}, max ${dial.maxConcurrency} ` +
           `against live Worker ${workerUrl}...`,
       );
+      console.log(`  ${describeInference()}`);
       console.log("");
       const result = await runRecruitmentLive({
         change: liveChange,
@@ -462,7 +472,7 @@ const commands: Command[] = [
     name: "run-live",
     summary:
       "Full live run: decompose -> recruit real agents (Workers AI) -> escalate -> verify -> integrate -> promote -> cleanup.",
-    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--id <changeId>] [--watch] [--await-escalation] [--gate|--no-gate] [--max-model-retries N] [--keep-work-root] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+    usage: `${CLI_NAME} run-live "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--owner <unitId>] [--id <changeId>] [--watch] [--await-escalation] [--gate|--no-gate] [--max-model-retries N] [--keep-work-root] [--inference gateway|claude-cli|codex-cli] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
@@ -483,6 +493,10 @@ const commands: Command[] = [
         selected = selectExecutor();
       } catch (error) {
         console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      }
+      // A local CLI inference path must be installed and logged in before anything is created.
+      if (!(await preflightInference())) {
         return 1;
       }
       // On a live goal-driven run the LLM is the planner (see enforceLivePlanner).
@@ -640,6 +654,7 @@ const commands: Command[] = [
         `Full live run for ${liveChange.id} under dial min ${dial.minConcurrency}, max ${dial.maxConcurrency} ` +
           `against Worker ${workerUrl}`,
       );
+      console.log(`  ${describeInference()}`);
       console.log(`  executor: ${selected.description}`);
       console.log("");
 
@@ -928,7 +943,7 @@ const commands: Command[] = [
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
       `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--id <changeId>] ` +
-      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--rate-limit-window-ms N] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--rate-limit-window-ms N] [--inference gateway|claude-cli|codex-cli] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const goal = await resolveGoal(args);
@@ -1134,7 +1149,8 @@ const commands: Command[] = [
       if (!turn.live || !turn.transport) {
         console.error(
           `Error: a live board run needs a live turn model, but none is available (${turn.description}). ` +
-            "Set EXECUTOR=ai-gateway with CLOUDFLARE_AI_GATEWAY_URL and CLOUDFLARE_AI_GATEWAY_TOKEN, or pass --offline.",
+            "Set EXECUTOR=ai-gateway with CLOUDFLARE_AI_GATEWAY_URL and CLOUDFLARE_AI_GATEWAY_TOKEN, " +
+            "or SWITCHYARD_INFERENCE=claude-cli (or --inference claude-cli) for the local Claude Code CLI, or pass --offline.",
         );
         return 1;
       }
@@ -1146,6 +1162,14 @@ const commands: Command[] = [
         return 1;
       }
       const requireModelPlan = hasFlag(args, REQUIRE_MODEL_PLAN_FLAG);
+      // A local CLI inference path must be installed and logged in before anything is created.
+      if (!(await preflightInference())) {
+        return 1;
+      }
+      // Calls on the operator's local CLI subscription are counted (calls and
+      // tokens) with USD not applicable, unless a --price explicitly prices them.
+      const cliInference = selectCliInference();
+      const meterCaps = cliInference !== undefined ? { ...caps, subscriptionModels: cliInferenceModels(cliInference) } : caps;
       if (requireModelPlan && hasFlag(args, ALLOW_HEURISTIC_PLANNER_FLAG)) {
         console.error(`Error: ${REQUIRE_MODEL_PLAN_FLAG} refuses a heuristic plan, ${ALLOW_HEURISTIC_PLANNER_FLAG} allows one: pass one of them`);
         return 1;
@@ -1205,6 +1229,7 @@ const commands: Command[] = [
       // Installed before the header is printed: once the header is out, SIGINT/SIGTERM interrupt the run.
       const stop = interruptOnSignals();
       console.log(`Board run for ${changeId} under dial min ${dial.minConcurrency}, max ${dial.maxConcurrency} against Worker ${workerUrl}`);
+      console.log(`  ${describeInference()}`);
       console.log(`  agent turns: ${turn.description}`);
       console.log(`  executor: ${selected.description}`);
       console.log(`  ${gateLine}`);
@@ -1257,7 +1282,7 @@ const commands: Command[] = [
         },
         schedule: hasFlag(args, "--lockstep") ? "lockstep" : "concurrent",
         budgets,
-        caps,
+        caps: meterCaps,
         ...rateLimit,
         ...(ttl !== undefined ? { workspaceTtlSeconds: ttl } : {}),
         // Agents' repo tokens are refreshed before they expire unless turned off.
@@ -1917,6 +1942,61 @@ function wranglerEnv(): NodeJS.ProcessEnv {
   };
 }
 
+/** The flag that picks the inference path for every model role (overrides SWITCHYARD_INFERENCE). */
+const INFERENCE_FLAG = "--inference";
+
+/** The commands that call (or check) a model and so accept --inference. */
+const INFERENCE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "tool-smoke", "recruit-live", "run-live", "run-board"]);
+
+/**
+ * Apply `--inference <mode>` (validated strictly: gateway, claude-cli, or
+ * codex-cli) as an in-memory override of SWITCHYARD_INFERENCE, so the flag
+ * always wins over the environment and `.env`. Refused on a command that
+ * makes no model call.
+ */
+function applyInferenceFlag(command: string, args: readonly string[]): void {
+  if (!args.some((arg) => arg === INFERENCE_FLAG || arg.startsWith(`${INFERENCE_FLAG}=`))) {
+    return;
+  }
+  if (!INFERENCE_COMMANDS.has(command)) {
+    throw new Error(`${INFERENCE_FLAG} applies only to the commands that call a model: ${[...INFERENCE_COMMANDS].join(", ")}`);
+  }
+  const raw = optionValue(args, INFERENCE_FLAG);
+  if (optionValues(args, INFERENCE_FLAG).length > 1) {
+    throw new Error(`${INFERENCE_FLAG} is given more than once`);
+  }
+  const mode = parseInferenceMode(raw, INFERENCE_FLAG);
+  if ((raw ?? "").trim() === "") {
+    throw new Error(`${INFERENCE_FLAG} needs a value: gateway, claude-cli, or codex-cli`);
+  }
+  setRuntimeOverrides({ SWITCHYARD_INFERENCE: mode });
+}
+
+/**
+ * Before a live run creates anything: when the inference path is a local CLI,
+ * check the binary runs and is logged in (no model call). Prints the reason
+ * and returns false when it is not ready; true otherwise (and always in
+ * gateway mode).
+ */
+async function preflightInference(): Promise<boolean> {
+  let cli;
+  try {
+    cli = selectCliInference();
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+  if (cli === undefined) {
+    return true;
+  }
+  const probe = await probeCli(cli.driver);
+  if (!probe.ok) {
+    console.error(`Error: the local ${cli.driver.label} is not ready: ${probe.reason ?? "unknown reason"}`);
+    return false;
+  }
+  return true;
+}
+
 /** The commands that read `.env`: they talk to the live Worker, Cloudflare, or the AI Gateway. */
 const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "tool-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "cleanup-live"]);
 
@@ -2007,10 +2087,30 @@ async function main(argv: string[]): Promise<number> {
         "Put them in .env instead (the CLI reads it into memory) and do not export them into the CLI's environment.",
     );
   }
+  try {
+    applyInferenceFlag(args[0] ?? "", args.slice(1));
+  } catch (error) {
+    console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
   if (args[0] === "env-check") {
     // Names only, never values.
     console.log(`credential names in this process's environment: ${exposed.length > 0 ? exposed.join(", ") : "none"}`);
     console.log(`names loaded into memory from .env (values never shown): ${runtimeCredentialNames().join(", ") || "none"}`);
+    // The inference path, and which credentials it does NOT need.
+    let mode;
+    try {
+      mode = selectInferenceMode(runtimeEnv());
+    } catch (error) {
+      console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+      return 1;
+    }
+    console.log(
+      mode === "gateway"
+        ? "inference: gateway (the AI Gateway; a live run needs CLOUDFLARE_AI_GATEWAY_URL and CLOUDFLARE_AI_GATEWAY_TOKEN)"
+        : `inference: ${mode} (the operator's local CLI login; no AI Gateway URL or token is needed; ` +
+            "CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN are still needed for Artifacts and the Worker)",
+    );
     return exposed.length > 0 ? 1 : 0;
   }
 

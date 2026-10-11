@@ -21,6 +21,17 @@
  *
  * Any other value (or an unset `EXECUTOR`) selects the deterministic scoped-noop
  * executor, so an offline run and `make check` never call the network.
+ *
+ * `SWITCHYARD_INFERENCE` picks the inference path for EVERY model role (the
+ * executor and its escalation ladder, the planner, the agent turns, and tool
+ * authoring): `gateway` (the default) keeps the `EXECUTOR` selection above;
+ * `claude-cli` runs every role through the operator's own locally installed,
+ * logged-in Claude Code CLI (see model-adapters cli-transport.ts), ignoring
+ * `EXECUTOR` and needing no gateway credential; `codex-cli` is refused as not
+ * supported yet. In CLI mode the models come from CLI_MODEL,
+ * CLI_ESCALATION_MODELS, CLI_PLANNER_MODEL, CLI_AGENT_MODEL, and
+ * CLI_TOOL_MODELS, the binary from CLAUDE_CLI_BIN, the per-call timeout from
+ * CLI_TIMEOUT_MS, and the advisory Jev layer is off unless CLI_JEV=gateway.
  */
 
 import { runtimeEnv } from "./credentials.ts";
@@ -44,6 +55,16 @@ import {
   ScopedNoopExecutor,
   WorkersAiExecutor,
   type AskJev,
+  cliDriverFor,
+  createAgentTurnInvoke,
+  createCliInvoke,
+  createCliJsonSchemaCaller,
+  createPlannerInvoke,
+  createToolRegionFiller,
+  DEFAULT_CLI_TIMEOUT_MS,
+  parseInferenceMode,
+  type CliDriver,
+  type InferenceMode,
 } from "@switchyard-change/model-adapters";
 
 /**
@@ -83,6 +104,119 @@ export interface ExecutorEnv {
   readonly CLOUDFLARE_AI_GATEWAY_TOKEN?: string;
   readonly CF_AIG_GATEWAY_ID?: string;
   readonly JEV_CONFIDENCE_THRESHOLD?: string;
+  /** The inference path for every model role: gateway (default), claude-cli, or codex-cli. */
+  readonly SWITCHYARD_INFERENCE?: string;
+  /** CLI mode: the executor's base model (default sonnet). */
+  readonly CLI_MODEL?: string;
+  /** CLI mode: the ordered escalation ladder, comma separated (default opus). */
+  readonly CLI_ESCALATION_MODELS?: string;
+  /** CLI mode: the planner's base model (default sonnet). */
+  readonly CLI_PLANNER_MODEL?: string;
+  /** CLI mode: the board agents' turn model (default sonnet). */
+  readonly CLI_AGENT_MODEL?: string;
+  /** CLI mode: the tool authoring models, strongest first, comma separated (default opus,sonnet). */
+  readonly CLI_TOOL_MODELS?: string;
+  /** CLI mode: the Claude Code binary (default `claude` on PATH). */
+  readonly CLAUDE_CLI_BIN?: string;
+  /** CLI mode: the per-call timeout in ms (a positive integer; default 300000). */
+  readonly CLI_TIMEOUT_MS?: string;
+  /** CLI mode: `gateway` keeps the advisory Jev layer on the AI Gateway (needs its credentials); default off. */
+  readonly CLI_JEV?: string;
+}
+
+/** CLI mode defaults (Claude Code model aliases). */
+export const DEFAULT_CLI_MODEL = "sonnet";
+export const DEFAULT_CLI_ESCALATION_MODELS: readonly string[] = ["opus"];
+export const DEFAULT_CLI_PLANNER_MODEL = "sonnet";
+export const DEFAULT_CLI_AGENT_MODEL = "sonnet";
+export const DEFAULT_CLI_TOOL_MODELS: readonly string[] = ["opus", "sonnet"];
+
+/** The resolved local-CLI inference configuration (no secrets: the CLI holds its own login). */
+export interface CliInference {
+  readonly mode: Exclude<InferenceMode, "gateway">;
+  readonly driver: CliDriver;
+  readonly timeoutMs: number;
+  readonly executorModel: string;
+  readonly escalationModels: readonly string[];
+  readonly plannerModel: string;
+  readonly agentModel: string;
+  /** Strongest first. */
+  readonly toolModels: readonly string[];
+  /** Whether the advisory Jev layer stays on the AI Gateway (opt-in) or is off. */
+  readonly jev: "off" | "gateway";
+}
+
+/** The inference mode from the environment (SWITCHYARD_INFERENCE; default gateway). Throws on an unknown value. */
+export function selectInferenceMode(env: ExecutorEnv = runtimeEnv()): InferenceMode {
+  return parseInferenceMode(env.SWITCHYARD_INFERENCE);
+}
+
+/** A comma-separated model list (blank entries dropped), or the fallback when empty. */
+function parseModelList(raw: string | undefined, fallback: readonly string[]): readonly string[] {
+  const list = (raw ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry !== "");
+  return list.length > 0 ? list : fallback;
+}
+
+/**
+ * The local-CLI inference configuration, or undefined in gateway mode. Throws
+ * a clear error for an unknown mode, for codex-cli (not supported yet), and
+ * for a CLI_TIMEOUT_MS that is not a positive integer.
+ */
+export function selectCliInference(env: ExecutorEnv = runtimeEnv()): CliInference | undefined {
+  const mode = selectInferenceMode(env);
+  if (mode === "gateway") {
+    return undefined;
+  }
+  const bin = (env.CLAUDE_CLI_BIN ?? "").trim();
+  const driver = cliDriverFor(mode, bin !== "" ? { claudeBin: bin } : {});
+  const timeoutRaw = (env.CLI_TIMEOUT_MS ?? "").trim();
+  const timeoutMs = timeoutRaw === "" ? DEFAULT_CLI_TIMEOUT_MS : /^[0-9]+$/.test(timeoutRaw) ? Number(timeoutRaw) : Number.NaN;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    throw new Error(`CLI_TIMEOUT_MS must be a positive integer number of milliseconds (got ${JSON.stringify(env.CLI_TIMEOUT_MS ?? "")})`);
+  }
+  const jevRaw = (env.CLI_JEV ?? "").trim().toLowerCase();
+  if (jevRaw !== "" && jevRaw !== "off" && jevRaw !== "gateway") {
+    throw new Error(`CLI_JEV must be off or gateway (got ${JSON.stringify(env.CLI_JEV ?? "")})`);
+  }
+  return {
+    mode,
+    driver,
+    timeoutMs,
+    executorModel: (env.CLI_MODEL ?? "").trim() || DEFAULT_CLI_MODEL,
+    escalationModels: parseModelList(env.CLI_ESCALATION_MODELS, DEFAULT_CLI_ESCALATION_MODELS),
+    plannerModel: (env.CLI_PLANNER_MODEL ?? "").trim() || DEFAULT_CLI_PLANNER_MODEL,
+    agentModel: (env.CLI_AGENT_MODEL ?? "").trim() || DEFAULT_CLI_AGENT_MODEL,
+    toolModels: parseModelList(env.CLI_TOOL_MODELS, DEFAULT_CLI_TOOL_MODELS),
+    jev: jevRaw === "gateway" ? "gateway" : "off",
+  };
+}
+
+/** Every model a CLI-mode run may call (for the meter's subscription accounting). */
+export function cliInferenceModels(cli: CliInference): string[] {
+  return [...new Set([cli.executorModel, ...cli.escalationModels, cli.plannerModel, cli.agentModel, ...cli.toolModels])];
+}
+
+/**
+ * One line naming the inference path a run uses, for the run header (no
+ * secrets), for example "inference: local claude CLI (executor sonnet ->
+ * opus; planner sonnet; agent turns sonnet; tools opus, sonnet); Jev off".
+ */
+export function describeInference(env: ExecutorEnv = runtimeEnv()): string {
+  const cli = selectCliInference(env);
+  const jev = selectJev(env);
+  const jevPart = jev.live ? `Jev on (${jev.description})` : "Jev off";
+  if (cli !== undefined) {
+    return (
+      `inference: local ${cli.driver.label} on this machine's own login (executor ${[cli.executorModel, ...cli.escalationModels].join(" -> ")}; ` +
+      `planner ${cli.plannerModel}; agent turns ${cli.agentModel}; tools ${cli.toolModels.join(", ")}); ${jevPart}`
+    );
+  }
+  const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
+  const path = choice === "ai-gateway" ? "AI Gateway" : choice === "workers-ai" ? "Workers AI (executor only)" : "none (deterministic noop executor)";
+  return `inference: ${path}; ${jevPart}`;
 }
 
 /** The outcome of selecting an executor: the provider plus a readable label. */
@@ -133,6 +267,22 @@ export const SUPPORTED_EXECUTORS: readonly string[] = ["ai-gateway", "workers-ai
  * mask a real edit as deterministic. Unset or "noop" selects the noop stub.
  */
 export function selectExecutor(env: ExecutorEnv = runtimeEnv()): SelectedExecutor {
+  const cli = selectCliInference(env);
+  if (cli !== undefined) {
+    // The operator's own local CLI: the same executor shape (prompt building,
+    // anchored edit parsing, bounded same-model retry) over the CLI transport.
+    const invoke = createCliInvoke(cli.driver, { timeoutMs: cli.timeoutMs });
+    const executor = new WorkersAiExecutor({ model: cli.executorModel, invoke, providerLabel: cli.driver.label });
+    return {
+      executor,
+      description: `${cli.mode} (base ${cli.executorModel}, escalation ${cli.escalationModels.join(" -> ")})`,
+      live: true,
+      baseModel: cli.executorModel,
+      escalationModel: cli.escalationModels[0] ?? cli.executorModel,
+      escalationModels: cli.escalationModels,
+      maxModelRetries: DEFAULT_AI_GATEWAY_MAX_MODEL_RETRIES,
+    };
+  }
   const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
   if (choice === "workers-ai") {
     const accountId = (env.CLOUDFLARE_ACCOUNT_ID ?? "").trim();
@@ -334,6 +484,17 @@ export interface SelectedPlanner {
  * cannot authenticate.
  */
 export function selectPlanner(env: ExecutorEnv = runtimeEnv()): SelectedPlanner {
+  const cli = selectCliInference(env);
+  if (cli !== undefined) {
+    const invoke = createPlannerInvoke(createCliJsonSchemaCaller(cli.driver, { timeoutMs: cli.timeoutMs }));
+    return {
+      live: true,
+      description: `${cli.mode} planner (base ${cli.plannerModel}, escalation ${cli.escalationModels.join(" -> ")})`,
+      plan: (request) => invoke(request),
+      baseModel: cli.plannerModel,
+      escalationModels: cli.escalationModels,
+    };
+  }
   const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
   if (choice !== "ai-gateway") {
     return {
@@ -403,6 +564,19 @@ export interface SelectedAgentTurn {
  * policy, which only `run-board --offline` (the demo and tests) uses.
  */
 export function selectAgentTurn(env: ExecutorEnv = runtimeEnv()): SelectedAgentTurn {
+  const cli = selectCliInference(env);
+  if (cli !== undefined) {
+    const invoke = createAgentTurnInvoke({
+      model: cli.agentModel,
+      call: createCliJsonSchemaCaller(cli.driver, { timeoutMs: cli.timeoutMs }),
+    });
+    return {
+      live: true,
+      description: `${cli.mode} agent turns (model ${cli.agentModel}, local ${cli.driver.label})`,
+      model: cli.agentModel,
+      transport: (input) => invoke(input),
+    };
+  }
   const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
   const gatewayUrl = (env.CLOUDFLARE_AI_GATEWAY_URL ?? "").trim();
   const gatewayToken = (env.CLOUDFLARE_AI_GATEWAY_TOKEN ?? "").trim();
@@ -470,7 +644,8 @@ export function decideLivePlanner(input: {
     kind: "refused",
     error:
       `a live run needs the LLM planner, but none is available (${input.planner.description}). ` +
-      "Set EXECUTOR=ai-gateway with CLOUDFLARE_AI_GATEWAY_URL and CLOUDFLARE_AI_GATEWAY_TOKEN, " +
+      "Set EXECUTOR=ai-gateway with CLOUDFLARE_AI_GATEWAY_URL and CLOUDFLARE_AI_GATEWAY_TOKEN " +
+      "(or SWITCHYARD_INFERENCE=claude-cli for the local Claude Code CLI), " +
       `pass --change <change.yaml> to run a hand-authored Change, or pass ${ALLOW_HEURISTIC_PLANNER_FLAG} ` +
       "to knowingly use the heuristic decomposition.",
   };
@@ -593,8 +768,13 @@ export function selectJev(env: ExecutorEnv = runtimeEnv()): SelectedJev {
     env.JEV_CONFIDENCE_THRESHOLD,
     DEFAULT_JEV_CONFIDENCE_THRESHOLD,
   );
+  const cli = selectCliInference(env);
+  if (cli !== undefined && cli.jev === "off") {
+    // Advisory only: a CLI-mode run works without it. CLI_JEV=gateway opts in.
+    return { live: false, description: `jev off (local ${cli.driver.label} inference; CLI_JEV=gateway keeps it on the AI Gateway)`, threshold };
+  }
   const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
-  if (choice !== "ai-gateway") {
+  if (cli === undefined && choice !== "ai-gateway") {
     return { live: false, description: "jev off (heuristic + gate path)", threshold };
   }
   const gatewayUrl = (env.CLOUDFLARE_AI_GATEWAY_URL ?? "").trim();
@@ -659,6 +839,16 @@ export interface SelectedToolFiller {
  * transport error. Tools are small but must be correct.
  */
 export function selectToolFiller(env: ExecutorEnv = runtimeEnv()): SelectedToolFiller {
+  const cli = selectCliInference(env);
+  if (cli !== undefined) {
+    const models = [...new Set(cli.toolModels)];
+    return {
+      live: true,
+      description: `${cli.mode} tool fills (models, strongest first: ${models.join(", ")})`,
+      models,
+      filler: createToolRegionFiller({ models, call: createCliJsonSchemaCaller(cli.driver, { timeoutMs: cli.timeoutMs }) }),
+    };
+  }
   const choice = (env.EXECUTOR ?? "").trim().toLowerCase();
   const gatewayUrl = (env.CLOUDFLARE_AI_GATEWAY_URL ?? "").trim();
   const gatewayToken = (env.CLOUDFLARE_AI_GATEWAY_TOKEN ?? "").trim();
