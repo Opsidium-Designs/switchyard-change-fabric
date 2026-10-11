@@ -54,7 +54,7 @@ describe("speculative batch gating on the offline demo board", () => {
     expect(result.speculation?.speculate).toBe(3);
     const goal = result.log.find((m) => m.type === "goal.posted")!;
     expect(goal.type === "goal.posted" && goal.payload.rules.speculate).toBe(3);
-    expect(goal.type === "goal.posted" && goal.payload.rules.arbitration).toBe(3);
+    expect(goal.type === "goal.posted" && goal.payload.rules.arbitration).toBe(4);
     const proof = result.proof!;
     expect(proof.status).toBe("proven");
     const landed = proof.speculation!.landed!;

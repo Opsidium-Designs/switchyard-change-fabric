@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 import {
   createAiGatewayPlannerInvoke,
   DEFAULT_AI_GATEWAY_PLANNER_MAX_TOKENS,
+  plannerModelBudget,
   DEFAULT_AI_GATEWAY_PLANNER_MODEL,
   parsePlannerPlan,
   PLANNER_PLAN_JSON_SCHEMA,
@@ -133,6 +134,29 @@ describe("createAiGatewayPlannerInvoke (BYOK json_schema, offline fake fetch)", 
     await expect(
       invoke({ model: "m", messages: [{ role: "user", content: "x" }] }),
     ).rejects.toBeInstanceOf(PlannerResponseError);
+  });
+
+  it("sends a reasoning planner model 16384+ tokens with reasoning_effort medium, and other models the default ceiling", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const fakeFetch = (async (_url: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response(JSON.stringify({ choices: [{ message: { content: planDoc } }] }), { status: 200 });
+    }) as unknown as typeof fetch;
+    const invoke = createAiGatewayPlannerInvoke({ gatewayUrl: "https://gw/base", gatewayToken: "t", fetchFn: fakeFetch });
+    await invoke({ model: "gpt-5", messages: [{ role: "user", content: "x" }] });
+    await invoke({ model: "gpt-4o", messages: [{ role: "user", content: "x" }] });
+    expect(bodies[0]).toMatchObject({ model: "gpt-5", reasoning_effort: "medium" });
+    expect(bodies[0]!.max_completion_tokens).toBeGreaterThanOrEqual(16384);
+    expect(bodies[1]).toMatchObject({ model: "gpt-4o", max_completion_tokens: DEFAULT_AI_GATEWAY_PLANNER_MAX_TOKENS });
+    expect(bodies[1]!.reasoning_effort).toBeUndefined();
+    expect(plannerModelBudget("o3", { reasoningMaxTokens: 20000 })).toEqual({ maxTokens: 20000, reasoningEffort: "medium" });
+  });
+
+  it("names finish_reason and the ceiling when a plan reply is empty", async () => {
+    const fakeFetch = (async () =>
+      new Response(JSON.stringify({ choices: [{ message: { content: "" }, finish_reason: "length" }] }), { status: 200 })) as unknown as typeof fetch;
+    const invoke = createAiGatewayPlannerInvoke({ gatewayUrl: "https://gw/base", gatewayToken: "t", fetchFn: fakeFetch });
+    await expect(invoke({ model: "gpt-5", messages: [{ role: "user", content: "x" }] })).rejects.toThrow(/finish_reason: length.*max_completion_tokens \(16384\)/);
   });
 
   it("exposes the documented planner defaults", () => {

@@ -971,6 +971,42 @@ describe("completion is derived from a passing revision", () => {
     expect(narrowToSplitChildren(board.state, ["one", "two"], "it failed")).toEqual(["one-x", "two"]);
   });
 
+  it("a child the sub-lead pushes itself integrates directly: pending, not awaiting a merge, accepted by a revision, and its cap frees after a pass", () => {
+    const board = seeded({ maxActiveClaims: 1, arbitration: 3 });
+    board.post(claim("a", "one", ["src/a/**"]));
+    board.post(
+      msg("a", "item.split", {
+        item: "one",
+        children: [
+          { item: "one-x", objective: "x", scopeHint: ["src/a/x.ts"] },
+          { item: "one-y", objective: "y", scopeHint: ["src/a/y.ts"] },
+        ],
+      }),
+    );
+    board.post(claim("a", "one-x", ["src/a/x.ts"]));
+    board.post(push("a", "one-x", "px", ["src/a/x.ts"]));
+    expect(pendingPushItems(board.state).map((i) => i.id)).toEqual(["one-x"]);
+    expect(awaitingSubLead(board.state)).toEqual([]);
+    expect(itemWaitReason(board.state, "one-x")).toEqual({ kind: "waiting-for-gate", commit: "px" });
+    expect(claimCapReached(board.state, "a")).toBeDefined();
+    const appended = board.post(rev("pass", ["px"], "r1"));
+    expect(appended.find((m) => m.type === "integrated.rev")!.payload).toMatchObject({ merged: ["px"], contributors: ["a"] });
+    expect(board.state.items["one-x"]!.lastPush).toMatchObject({ integratedIn: 1 });
+    expect(claimCapReached(board.state, "a")).toBeUndefined();
+    // Another agent's child still routes to the sub-lead: it waits for the
+    // sub-lead's merge (named), and the parent is not "blocked by" it.
+    board.post(claim("b", "one-y", ["src/a/y.ts"]));
+    board.post(push("b", "one-y", "py", ["src/a/y.ts"]));
+    expect(awaitingSubLead(board.state).map((i) => i.id)).toEqual(["one-y"]);
+    expect(itemWaitReason(board.state, "one-y")).toEqual({ kind: "waiting-for-sub-lead", item: "one", agent: "a", merged: false });
+    expect(describeWaitReason(itemWaitReason(board.state, "one-y")!)).toBe("its push waits for sub-lead a to merge it into one (pull)");
+    expect(itemWaitReason(board.state, "one")).toBeUndefined();
+    board.post(msg("a", "push.announced", { item: "one", commit: "pa", paths: ["src/a/y.ts"], merges: [{ item: "one-y", commit: "py" }] }));
+    expect(itemWaitReason(board.state, "one-y")).toMatchObject({ kind: "waiting-for-sub-lead", merged: true });
+    expect(itemWaitReason(board.state, "one")).toEqual({ kind: "blocked-by", item: "one-x" });
+    expect(reduceBoard(board.log)).toEqual(board.state);
+  });
+
   it("when the sub-lead leaves, its children integrate directly and the parent completes with them", () => {
     const board = splitAndPush();
     board.post(msg("a", "agent.left"));
@@ -2688,6 +2724,37 @@ describe("claim leases: a claim stays live only while its holder makes progress"
     expect(() => reduceBoard(forged)).toThrow(/was not produced by arbitration/);
   });
 
+  for (const arbitration of [3, 4]) {
+    it(`after a stalled lapse with every other agent capped, the holder's re-claim is ${arbitration === 4 ? "accepted (revision 4)" : "refused for the cooldown (revision 3)"}`, () => {
+      const board = seeded({ claimLeaseMessages: 100, maxActiveClaims: 1, arbitration });
+      board.post(claim("a", "one", ["src/one.ts"]));
+      board.post(claim("b", "two", ["src/two.ts"]));
+      board.post(claim("c", "three", ["src/three.ts"]));
+      chatter(board, 1);
+      board.post(msg("engine", "claim.lapsed", { item: "one" }));
+      expect(board.state.items.one).toMatchObject({ status: "open", lastLapse: { agent: "a", reason: "stalled" } });
+      // b and c each hold an unfinished item at a cap of one: nobody else can take it.
+      expect(claimCapReached(board.state, "b")).toBeDefined();
+      expect(claimCapReached(board.state, "c")).toBeDefined();
+      if (arbitration === 4) {
+        expect(board.types(claim("a", "one", ["src/one.ts"]))).toEqual(["item.claimed", "claim.granted"]);
+        expect(reduceBoard(board.log)).toEqual(board.state);
+      } else {
+        board.reject(claim("a", "one", ["src/one.ts"]), /a's claim on one lapsed at seq \d+: another agent takes it first/, "NOT_ALLOWED");
+      }
+    });
+  }
+
+  it("revision 4 keeps the cooldown when another agent could take the stalled item, or the lapse was not a stall", () => {
+    const board = seeded({ claimLeaseMessages: 100, maxActiveClaims: 1, arbitration: 4 });
+    board.post(claim("a", "one", ["src/one.ts"]));
+    board.post(claim("b", "two", ["src/two.ts"]));
+    chatter(board, 1, "c");
+    board.post(msg("engine", "claim.lapsed", { item: "one" }));
+    // c holds nothing: it can take the item, so a waits for it (or the cooldown).
+    board.reject(claim("a", "one", ["src/one.ts"]), /another agent takes it first/, "NOT_ALLOWED");
+  });
+
   it("a claim on a seam item is leased too: an absent owner never blocks importers forever", () => {
     const board = new TestBoard();
     board.post(msg("human", "goal.posted", { objective: "o", rules: { claimLeaseMessages: 4 }, seams: [{ path: "src/contracts.ts", importers: ["src/a.ts"] }] }));
@@ -3321,7 +3388,7 @@ describe("arbitration revision 2 (rules.arbitration)", () => {
     }
   }
 
-  it("only revisions 1 to 3 are accepted; revision 1 is the default and is not recorded", () => {
+  it("only revisions 1 to 4 are accepted; revision 1 is the default and is not recorded", () => {
     const one = seeded({ arbitration: 1 });
     expect(one.state.rules.arbitration).toBeUndefined();
     expect(one.log[0]!.type === "goal.posted" && one.log[0]!.payload.rules.arbitration).toBeUndefined();
@@ -3329,8 +3396,9 @@ describe("arbitration revision 2 (rules.arbitration)", () => {
     expect(two.state.rules.arbitration).toBe(2);
     const three = seeded({ arbitration: 3 });
     expect(three.state.rules.arbitration).toBe(3);
+    expect(seeded({ arbitration: 4 }).state.rules.arbitration).toBe(4);
     const board = new TestBoard();
-    board.reject(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 4 } }), /arbitration/, "BAD_PAYLOAD");
+    board.reject(msg("human", "goal.posted", { objective: "o", rules: { arbitration: 5 } }), /arbitration/, "BAD_PAYLOAD");
   });
 
   for (const arbitration of [1, 2]) {

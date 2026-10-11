@@ -13,7 +13,8 @@
  *     key is stored in the Cloudflare account (BYOK) and injected by the gateway
  *     on the way out; it never lives in this repo;
  *   - body: it sends the OpenAI chat-completions shape
- *     `{ model, messages, max_completion_tokens }`. It uses
+ *     `{ model, messages, max_completion_tokens }` (plus `reasoning_effort` for
+ *     a reasoning model; the ceiling is per model, see model-budget.ts). It uses
  *     `max_completion_tokens` (not the legacy `max_tokens`) for ALL calls
  *     because gpt-5 / o-series reject `max_tokens`, while gpt-4o / gpt-4.1
  *     accept `max_completion_tokens`, so one body shape works for every model
@@ -21,6 +22,9 @@
  *
  * The response is the OpenAI top-level `choices[0].message.content`, which the
  * reused `extractReplyText` already handles, so there is no new parser here.
+ * `choices[0].finish_reason` and the ceiling sent are returned with the text, so
+ * the executor can tell an empty or truncated reply (a spent budget) apart from
+ * an unusable one.
  *
  * No credential lives in this package at rest. The gateway token is held in this
  * closure only (read from the environment by `selectExecutor`) and is never
@@ -28,8 +32,8 @@
  * without being included in the thrown error, so a token can never leak.
  */
 
+import { executorModelBudget, type ModelBudgetCeilings } from "./model-budget.ts";
 import {
-  DEFAULT_WORKERS_AI_MAX_TOKENS,
   DEFAULT_WORKERS_AI_TIMEOUT_MS,
   extractReplyText,
   WorkersAiTimeoutError,
@@ -69,11 +73,16 @@ export interface AiGatewayRestOptions {
    */
   readonly timeoutMs?: number;
   /**
-   * The maximum tokens the model may generate for one call. A full-file edit
-   * must fit the whole new contents, so this defaults to a generous value to
-   * avoid a truncated, unparseable reply.
+   * The maximum tokens a NON-reasoning model may generate for one call. An
+   * anchored edit must fit whole, so this defaults to DEFAULT_EXECUTOR_MAX_TOKENS.
    */
   readonly maxTokens?: number;
+  /**
+   * The maximum tokens a REASONING model may spend (hidden reasoning plus the
+   * reply) for one call; defaults to DEFAULT_REASONING_EXECUTOR_MAX_TOKENS. A
+   * reasoning model is also sent `reasoning_effort: "low"`.
+   */
+  readonly reasoningMaxTokens?: number;
   /** Injectable fetch, for tests. Defaults to the global fetch. */
   readonly fetchFn?: typeof fetch;
 }
@@ -90,12 +99,16 @@ export function createAiGatewayRestInvoke(options: AiGatewayRestOptions): Worker
   const fetchFn = options.fetchFn ?? fetch;
   const base = options.gatewayUrl.replace(/\/$/, "");
   const timeoutMs = options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS;
-  const maxTokens = options.maxTokens ?? DEFAULT_WORKERS_AI_MAX_TOKENS;
+  const ceilings: ModelBudgetCeilings = {
+    ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
+    ...(options.reasoningMaxTokens !== undefined ? { reasoningMaxTokens: options.reasoningMaxTokens } : {}),
+  };
   return async (
     request: WorkersAiInvokeRequest,
     _callbacks?: WorkersAiStreamCallbacks,
   ): Promise<WorkersAiInvokeResult> => {
     const url = `${base}/openai/chat/completions`;
+    const budget = executorModelBudget(request.model, ceilings);
     // Bound the call with an AbortController so a slow or hung model cannot hang
     // the agent forever. The timer is always cleared on settle, and an abort is
     // surfaced as a distinct timeout error rather than an opaque fetch failure.
@@ -119,9 +132,11 @@ export function createAiGatewayRestInvoke(options: AiGatewayRestOptions): Worker
           // gpt-5 / o-series REJECT `max_tokens` and require
           // `max_completion_tokens`; gpt-4o / gpt-4.1 accept
           // `max_completion_tokens` too, so we send it for ALL gateway calls so
-          // every model on the ladder works. The value is generous (gpt-5 spends
-          // some of this budget on hidden reasoning tokens before the reply).
-          max_completion_tokens: maxTokens,
+          // every model on the ladder works. The value is per model: a
+          // reasoning model spends hidden reasoning tokens from this budget
+          // before the reply, so it gets a larger ceiling and a low effort.
+          max_completion_tokens: budget.maxTokens,
+          ...(budget.reasoningEffort !== undefined ? { reasoning_effort: budget.reasoningEffort } : {}),
         }),
         ...(controller ? { signal: controller.signal } : {}),
       });
@@ -149,6 +164,7 @@ export function createAiGatewayRestInvoke(options: AiGatewayRestOptions): Worker
       choices?: ReadonlyArray<{
         message?: { content?: unknown; reasoning?: unknown };
         text?: unknown;
+        finish_reason?: unknown;
       }>;
       usage?: { prompt_tokens?: number; completion_tokens?: number };
     };
@@ -161,8 +177,14 @@ export function createAiGatewayRestInvoke(options: AiGatewayRestOptions): Worker
     // `choices[0].message.content` shape, which extractReplyText already handles.
     const response = extractReplyText(body);
     const usage = body.usage;
+    // Why the model stopped: a short provider token only (never reply text).
+    const rawFinish = body.choices?.[0]?.finish_reason;
+    const finishReason =
+      typeof rawFinish === "string" && /^[A-Za-z_-]{1,40}$/.test(rawFinish) ? rawFinish : undefined;
     return {
       text: response,
+      maxTokens: budget.maxTokens,
+      ...(finishReason !== undefined ? { finishReason } : {}),
       ...(usage
         ? {
             usage: {

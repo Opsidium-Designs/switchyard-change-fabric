@@ -12,6 +12,7 @@
  * returned.
  */
 
+import type { ReasoningEffort } from "./model-budget.ts";
 import { WorkersAiTimeoutError, type WorkersAiMessage } from "./workers-ai.ts";
 
 /** One schema-constrained call. */
@@ -25,6 +26,11 @@ export interface GatewayJsonSchemaCall {
   readonly schemaName: string;
   readonly schema: unknown;
   readonly maxTokens: number;
+  /**
+   * The reasoning effort for a reasoning model (sent as `reasoning_effort`).
+   * Omitted for a non-reasoning model, which rejects the field.
+   */
+  readonly reasoningEffort?: ReasoningEffort;
   /** Abort after this many ms (0 disables the timeout). */
   readonly timeoutMs: number;
   readonly fetchFn: typeof fetch;
@@ -65,6 +71,7 @@ export async function callGatewayJsonSchema(call: GatewayJsonSchemaCall): Promis
         model: call.model,
         messages: call.messages,
         max_completion_tokens: call.maxTokens,
+        ...(call.reasoningEffort !== undefined ? { reasoning_effort: call.reasoningEffort } : {}),
         // `strict: true` makes the gateway reject a reply that does not conform.
         response_format: {
           type: "json_schema",

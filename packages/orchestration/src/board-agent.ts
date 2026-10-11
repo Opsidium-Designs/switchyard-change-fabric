@@ -63,7 +63,7 @@ import type {
   AgentTurnTransport,
   ExecutorProvider,
 } from "@switchyard-change/model-adapters";
-import { AGENT_ACTION_TYPES } from "@switchyard-change/model-adapters";
+import { AGENT_ACTION_TYPES, isModelBudgetError } from "@switchyard-change/model-adapters";
 import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { authenticatedRemote, clone, push, type GitIdentity } from "@switchyard-change/local-runner";
 import { gateFailureLine, matchesGlob, partitionByScope, toolSkeleton } from "@switchyard-change/verification";
@@ -259,9 +259,18 @@ export const MAX_FIX_CUES = 2;
 export const MAX_OPEN_SEAM_CUES = 2;
 /** How many times the driver may offer one set of open items (unclaimed, or a lapsed claim) to a worker on a quiet board. */
 export const MAX_OFFER_CUES = 2;
+/**
+ * How many times a sub-lead is told that children's pushes wait for its merge
+ * (`pull`), per set of such pushes: when the set appears, then by the driver
+ * on a quiet board. Bounded: then a quiet board may end the run, naming them.
+ */
+export const MAX_MERGE_CUES = 3;
 /** Items the lead may propose for failing files no item covers, per run. */
 export const MAX_UNCOVERED_PROPOSALS = 4;
-/** An item whose write intent covers at least this many files starts on the strongest model. */
+/**
+ * An item whose write intent covers at least this many files starts one rung
+ * above the base model (below the top rung when the ladder has two or more).
+ */
 export const LARGE_ITEM_FILES = 3;
 /** Edits a held item defers while a shared seam change it depends on is on its way. */
 export const MAX_SEAM_DEFERRALS = 3;
@@ -404,6 +413,29 @@ function actionItem(action: AgentAction, digest: BoardDigest): string | undefine
   }
 }
 
+/** The model one pushed edit used (see BoardAgent.editModels). */
+export interface BoardEditModel {
+  readonly item: string;
+  readonly commit: string;
+  readonly model: string;
+  readonly why?: string;
+  /** The model that spent its completion budget first (`<model> (finish_reason: <reason>)`); the edit ran one rung down. */
+  readonly budgetFallbackFrom?: string;
+}
+
+/**
+ * The children's pushes waiting for `agent`'s merge as sub-lead: pushed by
+ * another agent, not integrated, not in its latest push, and not recorded
+ * unverified (a child it pushed itself integrates directly). Pure.
+ */
+export function subLeadMergesDue(digest: BoardDigest, agent: string): { readonly parent: string; readonly child: string; readonly commit: string; readonly agent: string }[] {
+  return (digest.subLead ?? []).flatMap((s) =>
+    s.children
+      .filter((c) => c.lastPush !== undefined && c.lastPush.integratedIn === undefined && !c.merged && c.unverified !== true && c.lastPush.agent !== agent)
+      .map((c) => ({ parent: s.item, child: c.item, commit: c.lastPush!.commit, agent: c.lastPush!.agent })),
+  );
+}
+
 /** One agent on a board. */
 export class BoardAgent {
   readonly id: string;
@@ -439,6 +471,8 @@ export class BoardAgent {
   private stepping = false;
   /** True only while the agent is taking a TURN (the driver's quiescence check reads it). */
   private acting = false;
+  /** True while the driver holds the agent back (no step; see run's `hold`). */
+  private heldBack = false;
   /** The tools this agent's claims may not wait for, as last seen (a change wakes it). */
   private lastUnavailable = "";
   /** The formation cues last seen (a new set wakes it once). */
@@ -453,13 +487,29 @@ export class BoardAgent {
   private readonly seamWaited = new Set<string>();
   /** Edits deferred per item for a seam change (bounded by MAX_SEAM_DEFERRALS). */
   private readonly seamDeferrals = new Map<string, number>();
-  /** The model each pushed edit used (and why a complex item got the strongest). */
-  readonly editModels: { readonly item: string; readonly commit: string; readonly model: string; readonly why?: string }[] = [];
+  /**
+   * The model each pushed edit used (and why a complex item got a stronger
+   * one); `budgetFallbackFrom` names the model whose spent completion budget
+   * sent the edit one rung down, and why it stopped.
+   */
+  readonly editModels: BoardEditModel[] = [];
   /** Lead: items proposed for failures no item covered, and the revisions already examined. */
   private uncoveredProposals = 0;
   private readonly uncoveredSeen = new Set<number>();
   /** Waits taken while holding unpushed work, per held item set (bounded re-cues). */
   private readonly heldWaitCues = new Map<string, number>();
+  /** Waits (or invalid replies) while holding work with nothing to wait for, per held item set (bounded by MAX_HELD_WAIT_CUES). */
+  private readonly idleHeldCues = new Map<string, number>();
+  /** The driver's held-work nudges per item (bounded by MAX_HELD_WAIT_CUES). */
+  private readonly heldWorkNudges = new Map<string, number>();
+  /** Set by the driver: held items to edit (or hand off) on the next step. */
+  private readonly heldWorkNudge = new Set<string>();
+  /** Sub-lead: merge cues per set of children's pushes awaiting its pull (bounded by MAX_MERGE_CUES). */
+  private readonly mergeCues = new Map<string, number>();
+  /** Sub-lead: the children's pushes awaiting its pull as last seen ("" when none). */
+  private lastMergeKey = "";
+  /** Set by the driver: re-deliver the merge cue on the next step. */
+  private mergeNudge = false;
   /** Re-cues after a wait while a fix request is open, per `item@revision` (bounded by MAX_FIX_CUES). */
   private readonly fixCues = new Map<string, number>();
   private lastOpenSeamKey = "";
@@ -516,6 +566,15 @@ export class BoardAgent {
    */
   get busy(): boolean {
     return this.acting;
+  }
+
+  /**
+   * True when the agent's next step will take a turn on its own (a follow-up
+   * it was given, or a driver nudge not yet delivered). The driver never
+   * judges a held claim stalled while its holder is about to act.
+   */
+  get turnPending(): boolean {
+    return !this.stop && !this.heldBack && (this.followUp || this.heldWorkNudge.size > 0 || this.mergeNudge || this.offerNudge || this.openSeamNudge);
   }
 
   /** The agent's workspace (its own repo), once joined. */
@@ -801,7 +860,36 @@ export class BoardAgent {
     if (offerCue) {
       this.evidence.push(`OPEN ITEMS nobody holds: ${offers.map((i) => `${i.item} (${i.wait!.line})`).join("; ")}. Claim one now if you can move it.`.slice(0, 1000));
     }
-    if (!(this.followUp || relevant || nudged || newlyUnavailable || newCue || claimNudge || openSeamCue || offerCue || (freeKey !== undefined && freeKey !== this.lastFreeKey))) {
+    // The driver found held work of this agent's not moving on a quiet board:
+    // it edits it now (or hands it off) before the claim could lapse.
+    const heldNudged = [...this.heldWorkNudge].filter((item) => digest.claims.some((c) => c.item === item));
+    this.heldWorkNudge.clear();
+    const heldCue = heldNudged.length > 0;
+    if (heldCue) {
+      this.evidence.push(bounded(`HELD WORK: the board went quiet and I hold ${heldNudged.join(", ")} with no push: edit it now (or hand it off), or the claim lapses`, 600));
+    }
+    // SUB-LEAD: children's pushes (by other agents) wait for this agent to
+    // merge them; nothing integrates them until it pulls. Cued when the set
+    // appears and when the driver nudges, bounded per set.
+    const mergeDue = this.role === "worker" ? subLeadMergesDue(digest, this.id) : [];
+    const mergeKey = mergeDue.map((m) => `${m.parent}:${m.child}@${m.commit}`).join(",");
+    const mergeCue =
+      mergeKey !== "" && (this.mergeNudge || mergeKey !== this.lastMergeKey) && (this.mergeCues.get(mergeKey) ?? 0) < MAX_MERGE_CUES;
+    this.lastMergeKey = mergeKey;
+    this.mergeNudge = false;
+    if (mergeCue) {
+      this.mergeCues.set(mergeKey, (this.mergeCues.get(mergeKey) ?? 0) + 1);
+      const parents = [...new Set(mergeDue.map((m) => m.parent))];
+      this.evidence.push(
+        bounded(
+          `SUB-LEAD MERGE DUE: ${parents
+            .map((p) => `pull {itemId: ${p}} merges ${mergeDue.filter((m) => m.parent === p).map((m) => `${m.child}@${m.commit.slice(0, 10)} (pushed by ${m.agent})`).join(", ")}`)
+            .join("; ")}. Their pushes integrate only through my merge: pull now.`,
+          800,
+        ),
+      );
+    }
+    if (!(this.followUp || relevant || nudged || newlyUnavailable || newCue || claimNudge || openSeamCue || offerCue || heldCue || mergeCue || (freeKey !== undefined && freeKey !== this.lastFreeKey))) {
       return "idle";
     }
     // A cue counts as delivered only on a turn it caused by itself (not a
@@ -861,6 +949,36 @@ export class BoardAgent {
    * next step to claim one (bounded by MAX_OFFER_CUES per set of items).
    * Returns false when it has no offer left for the set.
    */
+  /**
+   * The driver's NUDGE on a quiet board, before a held claim with no stated
+   * wait reason could lapse: this agent's next step takes a turn told to edit
+   * `item` now (or hand it off). Bounded by MAX_HELD_WAIT_CUES per item;
+   * returns false when it has no nudge left (the driver may then lapse it).
+   */
+  nudgeHeldWork(item: string): boolean {
+    const count = this.heldWorkNudges.get(item) ?? 0;
+    if (this.role !== "worker" || this.stop || count >= MAX_HELD_WAIT_CUES) {
+      return false;
+    }
+    this.heldWorkNudges.set(item, count + 1);
+    this.heldWorkNudge.add(item);
+    return true;
+  }
+
+  /**
+   * The driver's NUDGE on a quiet board while children's pushes wait for this
+   * sub-lead's merge: its next step re-delivers the merge cue (bounded by
+   * MAX_MERGE_CUES per set). Returns false when it leads no such merge or has
+   * no cue left.
+   */
+  nudgeSubLeadMerge(): boolean {
+    if (this.role !== "worker" || this.stop || this.lastMergeKey === "" || (this.mergeCues.get(this.lastMergeKey) ?? 0) >= MAX_MERGE_CUES) {
+      return false;
+    }
+    this.mergeNudge = true;
+    return true;
+  }
+
   offerOpenItems(items: readonly string[]): boolean {
     const key = items.join(",");
     // Only a worker that was free when it last looked can take one (an offer to a busy one changes nothing).
@@ -889,7 +1007,8 @@ export class BoardAgent {
     while (!options.signal.aborted && !this.stop) {
       let result: AgentStepResult;
       try {
-        result = (await options.hold?.()) ? "idle" : await this.step();
+        this.heldBack = (await options.hold?.()) === true;
+        result = this.heldBack ? "idle" : await this.step();
       } catch (error) {
         this.stop = { reason: "stopped", detail: `step failed: ${this.scrub(error instanceof Error ? error.message : String(error))}` };
         return;
@@ -1077,6 +1196,8 @@ export class BoardAgent {
       return;
     }
     if (await this.skipCappedTurn(digest)) {
+      // No model call on capped items: no follow-up is owed either.
+      this.followUp = false;
       return;
     }
     budget.used += 1;
@@ -1541,6 +1662,36 @@ export class BoardAgent {
             );
           }
         }
+        // Waiting (or an invalid reply) while holding work it owes, with
+        // nothing to wait for (no push of its own, no fix request, no stated
+        // wait reason): nothing on the board would ever wake it again, so it
+        // gets another turn at once, told plainly (bounded).
+        const idleHeld = digest.claims
+          .filter(
+            (c) =>
+              !state.items[c.item]?.tool &&
+              !c.doneProposed &&
+              (!c.lastPush || c.lastPush.agent !== this.id) &&
+              c.fix === undefined &&
+              c.wait === undefined &&
+              !unpushed.includes(c.item),
+          )
+          .map((c) => c.item);
+        if (this.role === "worker" && idleHeld.length > 0) {
+          const key = idleHeld.join(",");
+          const cues = this.idleHeldCues.get(key) ?? 0;
+          if (cues < MAX_HELD_WAIT_CUES) {
+            this.idleHeldCues.set(key, cues + 1);
+            this.followUp = true;
+            this.evidence.push(
+              bounded(
+                `HELD WORK: I hold ${key} with no push: edit it now (or hand it off); nothing else will wake me for it` +
+                  (invalid !== undefined ? `. My last reply was invalid: ${this.scrub(invalid)}` : ""),
+                600,
+              ),
+            );
+          }
+        }
         return;
       }
       case "claim":
@@ -1984,31 +2135,39 @@ export class BoardAgent {
     const view = await this.editView(allowed, worktree);
 
     // A fix attempt carries the failing gate output and escalates the model one
-    // step per attempt along the configured ladder. A COMPLEX item starts on the
-    // strongest configured model: a large one (many files), one touching the
-    // contract (a contract proposed or accepted for it), a reopened one, or one
-    // whose first fix already failed. Small items keep the cheap base model.
+    // step per attempt along the configured ladder (rung 0 is the base model).
+    // A COMPLEX item starts higher: a large one (many files) or one touching the
+    // contract starts one rung above the base (below the top rung when the
+    // ladder has two or more), and only a reopened or re-planned item, or one
+    // whose first fix already failed, starts on the top rung. Small items keep
+    // the cheap base model. The top rung is often a reasoning model whose
+    // budget is the likeliest to be spent, so it is kept for proven-hard work.
     const ladder = this.options.escalationModels ?? [];
+    const rungs: readonly (string | undefined)[] = [undefined, ...ladder];
     const item = state?.items[itemId];
     const touchesContract = state !== undefined && Object.values(state.contracts).some((c) => c.item === itemId && c.status !== "rejected");
-    const complexBecause =
+    const topBecause =
+      item?.reopenedFrom !== undefined
+        ? "it was reopened after another agent's fix budget"
+        : item?.replanOf !== undefined
+          ? `it re-plans ${item.replanOf}`
+          : fix !== undefined && fix.attempt >= 2
+            ? "its first fix already failed"
+            : undefined;
+    const strongerBecause =
       allowed.filter((f) => !hasWildcard(f)).length >= LARGE_ITEM_FILES
         ? `it spans ${allowed.length} files`
         : touchesContract
           ? "it touches the contract"
-          : item?.reopenedFrom !== undefined
-            ? "it was reopened after another agent's fix budget"
-            : fix !== undefined && fix.attempt >= 2
-              ? "its first fix already failed"
-              : undefined;
-    const model =
+          : undefined;
+    const fixRung = fix !== undefined ? Math.min(fix.attempt, ladder.length) : 0;
+    const rung =
       ladder.length === 0
-        ? undefined
-        : complexBecause !== undefined
-          ? ladder[ladder.length - 1]
-          : fix !== undefined
-            ? ladder[Math.min(fix.attempt, ladder.length) - 1]
-            : undefined;
+        ? 0
+        : topBecause !== undefined
+          ? ladder.length
+          : Math.max(fixRung, strongerBecause !== undefined ? Math.max(1, ladder.length - 1) : 0);
+    const complexBecause = rung > 0 ? (topBecause ?? strongerBecause) : undefined;
     const failure = fix !== undefined && digest.failure && digest.failure.n === fix.n ? digest.failure.output : undefined;
     const objective = [
       claim.objective,
@@ -2020,9 +2179,9 @@ export class BoardAgent {
           ]
         : []),
     ].join("\n");
-    let result;
-    try {
-      result = await this.options.executor.execute({
+    const executor = this.options.executor;
+    const runOn = (model: string | undefined) =>
+      executor.execute({
         worktreeDir: worktree,
         workUnitId: itemId,
         objective,
@@ -2031,6 +2190,34 @@ export class BoardAgent {
         baselineDir: view,
         ...(model !== undefined ? { model } : {}),
       });
+    let usedRung = rung;
+    let budgetFallbackFrom: string | undefined;
+    let result;
+    try {
+      try {
+        result = await runOn(rungs[rung]);
+      } catch (error) {
+        // A spent completion budget (an empty reply, or one cut off at the
+        // ceiling) says nothing about the item: retry the SAME edit once, one
+        // rung down. It is recorded as a model failure (evidence and the
+        // pushed edit's model record), never charged to the item's failed
+        // edits, so it cannot feed the struggling report or a split. The
+        // executor writes nothing before it throws one, so nothing is discarded.
+        if (!isModelBudgetError(error) || rung === 0) {
+          throw error;
+        }
+        usedRung = rung - 1;
+        const spent = rungs[rung] ?? "the base model";
+        budgetFallbackFrom = `${spent} (finish_reason: ${error.finishReason})`;
+        this.evidence.push(
+          bounded(
+            `model ${spent} spent its completion budget on ${itemId} (finish_reason: ${error.finishReason}, ceiling ${error.maxTokens ?? "unset"}); ` +
+              `retried the same edit once on ${rungs[usedRung] ?? "the base model"} (a model failure, not a failed edit)`,
+            400,
+          ),
+        );
+        result = await runOn(rungs[usedRung]);
+      }
     } catch (error) {
       await this.discard(worktree, head);
       local("EXECUTOR_FAILED", bounded(this.scrub(error instanceof Error ? error.message : String(error)), 300));
@@ -2038,20 +2225,30 @@ export class BoardAgent {
     } finally {
       await rm(view, { recursive: true, force: true });
     }
-
+    const model = rungs[usedRung];
+    const tier = usedRung === ladder.length ? "strongest" : "stronger";
     const pushed = await this.commitPushAnnounce(itemId, worktree, head, writeGlobs, result.commitMessage, local, posted, `the edit for ${itemId}`, {
-      rationale: `(model: ${model ?? "base"}${complexBecause !== undefined && model !== undefined ? `, strongest: ${complexBecause}` : ""})`,
+      rationale:
+        `(model: ${model ?? "base"}${complexBecause !== undefined && model !== undefined ? `, ${tier}: ${complexBecause}` : ""}` +
+        `${budgetFallbackFrom !== undefined ? `, after ${budgetFallbackFrom} spent its budget` : ""})`,
     });
     if (pushed === undefined) {
       return;
     }
-    // Every edit records the model it used (and why a complex item got the strongest).
+    // Every edit records the model it used (and why a complex item got a stronger one).
     this.evidence.push(
       `pushed ${pushed.commit} for ${itemId}: ${pushed.changed.join(", ")} on ${model ?? "the base model"}` +
-        (complexBecause !== undefined && model !== undefined ? ` (the strongest model: ${complexBecause})` : "") +
+        (complexBecause !== undefined && model !== undefined ? ` (the ${tier} model: ${complexBecause})` : "") +
+        (budgetFallbackFrom !== undefined ? ` (after ${budgetFallbackFrom} spent its budget)` : "") +
         (fix !== undefined ? ` (fix attempt ${fix.attempt} for revision ${fix.n})` : ""),
     );
-    this.editModels.push({ item: itemId, commit: pushed.commit, model: model ?? "base", ...(complexBecause !== undefined ? { why: complexBecause } : {}) });
+    this.editModels.push({
+      item: itemId,
+      commit: pushed.commit,
+      model: model ?? "base",
+      ...(complexBecause !== undefined ? { why: complexBecause } : {}),
+      ...(budgetFallbackFrom !== undefined ? { budgetFallbackFrom } : {}),
+    });
   }
 
   /**
@@ -2488,7 +2685,9 @@ export class BoardAgent {
     }
     // A push a revision recorded unverified is never merged again at the same
     // commit (its child pushes again first).
-    const pending = led.children.filter((c) => c.lastPush !== undefined && c.lastPush.integratedIn === undefined && c.unverified !== true);
+    // A child this agent pushed itself integrates directly (never through its
+    // own merge), so only other agents' pushes are merged here.
+    const pending = led.children.filter((c) => c.lastPush !== undefined && c.lastPush.integratedIn === undefined && c.unverified !== true && c.lastPush.agent !== this.id);
     const fresh = pending.filter((c) => !c.merged);
     if (fresh.length === 0) {
       local("NO_CHANGE", `no child of ${action.itemId} has a push to merge`);

@@ -74,6 +74,13 @@ export interface WorkersAiInvokeResult {
   readonly text: string;
   /** Usage, when the provider reports it. */
   readonly usage?: WorkersAiUsage;
+  /**
+   * Why the model stopped (`choices[0].finish_reason`), when the provider
+   * reports it. "length" means the completion ceiling was reached.
+   */
+  readonly finishReason?: string;
+  /** The completion-token ceiling the transport sent, when it set one. */
+  readonly maxTokens?: number;
 }
 
 /**
@@ -246,6 +253,36 @@ export class UnusableModelOutputError extends Error {
     super(message);
     this.name = "UnusableModelOutputError";
   }
+}
+
+/**
+ * Thrown when the model's reply is empty or was cut off at the completion-token
+ * ceiling (`finish_reason: "length"`): the model spent its budget (often on
+ * hidden reasoning) before it wrote a usable edit. It is an UnusableModelOutputError
+ * (so it is never retried on the same model), but a distinct type so a caller
+ * can retry the same edit on a different model instead of charging the item.
+ */
+export class ModelBudgetError extends UnusableModelOutputError {
+  readonly model: string;
+  readonly finishReason: string;
+  readonly maxTokens?: number;
+  constructor(model: string, finishReason: string, maxTokens: number | undefined, detail: string) {
+    super(
+      `${detail}: model ${model} reply was empty or truncated (finish_reason: ${finishReason}, ` +
+        `max_completion_tokens ${maxTokens ?? "unset"})`,
+    );
+    this.name = "ModelBudgetError";
+    this.model = model;
+    this.finishReason = finishReason;
+    if (maxTokens !== undefined) {
+      this.maxTokens = maxTokens;
+    }
+  }
+}
+
+/** True for a ModelBudgetError (by type, or by name across module copies). */
+export function isModelBudgetError(error: unknown): error is ModelBudgetError {
+  return error instanceof ModelBudgetError || (error instanceof Error && error.name === "ModelBudgetError");
 }
 
 /**
@@ -450,6 +487,18 @@ export class WorkersAiExecutor implements ExecutorProvider {
       track.outputTokens = result.usage.outputTokens;
     }
 
+    // An empty reply, or one cut off at the completion ceiling, is a spent
+    // budget, not an unusable edit: report it distinctly (naming why the model
+    // stopped and the ceiling) so a caller can retry on another model. A
+    // truncated reply is never applied, even when a prefix happens to parse.
+    if (result.text.trim() === "" || result.finishReason === "length") {
+      throw new ModelBudgetError(
+        usedModel,
+        result.finishReason ?? "unknown",
+        result.maxTokens,
+        `${this.options.providerLabel ?? "Workers AI"} returned no usable edit for WorkUnit ${context.workUnitId}`,
+      );
+    }
     const parsed = parseEdits(result.text);
     if (parsed.edits.length === 0) {
       throw new UnusableModelOutputError(

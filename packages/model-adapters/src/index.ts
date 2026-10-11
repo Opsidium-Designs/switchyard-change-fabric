@@ -61,11 +61,26 @@ export {
   DEFAULT_WORKERS_AI_MODEL,
   DEFAULT_WORKERS_AI_TIMEOUT_MS,
   extractReplyText,
+  isModelBudgetError,
   isTransientWorkersAiError,
+  ModelBudgetError,
   UnusableModelOutputError,
   WorkersAiExecutor,
   WorkersAiTimeoutError,
 } from "./workers-ai.ts";
+
+export type { ModelBudget, ModelBudgetCeilings, ReasoningEffort } from "./model-budget.ts";
+export {
+  DEFAULT_EXECUTOR_MAX_TOKENS,
+  DEFAULT_REASONING_EXECUTOR_MAX_TOKENS,
+  DEFAULT_REASONING_PLANNER_MAX_TOKENS,
+  EXECUTOR_REASONING_EFFORT,
+  executorModelBudget,
+  isReasoningModel,
+  modelBudget,
+  parseTokenCeiling,
+  PLANNER_REASONING_EFFORT,
+} from "./model-budget.ts";
 
 export type { AiGatewayRestOptions } from "./ai-gateway.ts";
 export {
@@ -87,6 +102,7 @@ export {
   DEFAULT_AI_GATEWAY_PLANNER_MAX_TOKENS,
   DEFAULT_AI_GATEWAY_PLANNER_MODEL,
   parsePlannerPlan,
+  plannerModelBudget,
   PLANNER_PLAN_JSON_SCHEMA,
   PLANNER_PLAN_SCHEMA_NAME,
   PlannerResponseError,
@@ -135,6 +151,7 @@ export type {
 } from "./agent-turn.ts";
 export {
   AGENT_ACTION_LIMITS,
+  CLAMP_MARKER,
   AGENT_ACTION_TYPES,
   AGENT_MESSAGE_KINDS,
   AGENT_TOOL_KINDS,

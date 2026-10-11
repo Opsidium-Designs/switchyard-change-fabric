@@ -7,8 +7,10 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  AGENT_ACTION_LIMITS,
   AGENT_ACTION_TYPES,
   AGENT_TURN_JSON_SCHEMA,
+  CLAMP_MARKER,
   agentActionOrWait,
   agentTurnMaxTokens,
   buildAgentTurnMessages,
@@ -192,7 +194,7 @@ describe("parseAgentAction", () => {
     [{ type: "contest_reply", contestId: "c1", reply: "narrow" }, /narrowed write/],
     [{ type: "message", kind: "help", payload: {}, rationale: "r" }, /itemId/],
     [{ type: "message", kind: "shout", payload: {}, rationale: "r" }, /kind must be one of/],
-    [{ type: "edit", itemId: "i1", instruction: "x".repeat(3000) }, /at most/],
+    [{ type: "propose_done", itemId: "i1", rationale: "x".repeat(3000) }, /at most/],
     [{ type: "wait" }, /reason/],
     [{ type: "decide_item", itemId: "i1", decision: "accept" }, /rationale/],
     [{ type: "decide_item", itemId: "i1", decision: "maybe", rationale: "r" }, /decision must be one of/],
@@ -217,6 +219,22 @@ describe("agentActionOrWait", () => {
 
   it("passes a valid action through untouched", () => {
     expect(agentActionOrWait({ type: "wait", reason: "idle" })).toEqual({ action: { type: "wait", reason: "idle" } });
+  });
+
+  it("cuts an over-long edit instruction to the limit (marked) instead of refusing the turn, and the prompt states the limit", () => {
+    const long = `${"rewrite the money helpers to use integer cents; ".repeat(60)}END`;
+    expect(long.length).toBeGreaterThan(2500);
+    const outcome = agentActionOrWait(JSON.stringify({ action: { type: "edit", itemId: "i1", instruction: long } }), ["edit", "wait"]);
+    expect(outcome.invalid).toBeUndefined();
+    expect(outcome.action.type).toBe("edit");
+    const instruction = (outcome.action as { instruction: string }).instruction;
+    expect(instruction.length).toBeLessThanOrEqual(AGENT_ACTION_LIMITS.maxInstruction);
+    expect(instruction.endsWith(CLAMP_MARKER)).toBe(true);
+    expect(instruction.startsWith("rewrite the money helpers to use integer cents;")).toBe(true);
+    // A short instruction is untouched.
+    expect(agentActionOrWait({ action: { type: "edit", itemId: "i1", instruction: "go" } }).action).toEqual({ type: "edit", itemId: "i1", instruction: "go" });
+    const system = buildAgentTurnMessages(input).find((m) => m.role === "system")!.content;
+    expect(system).toContain(`Keep edit.instruction to at most ${AGENT_ACTION_LIMITS.maxInstruction} characters`);
   });
 });
 

@@ -26,8 +26,9 @@ import type {
   ExecutorContext,
   ExecutorProvider,
 } from "@switchyard-change/model-adapters";
+import { ModelBudgetError } from "@switchyard-change/model-adapters";
 
-import { BoardAgent, RunTurnBudget, type AgentTurnRecord, type BoardAgentOptions } from "../src/board-agent.ts";
+import { BoardAgent, MAX_MERGE_CUES, RunTurnBudget, type AgentTurnRecord, type BoardAgentOptions } from "../src/board-agent.ts";
 import { RunMeter, type RunCapReached } from "../src/run-meter.ts";
 import { BoardOperatorClient, type BoardPage } from "../src/board-client.ts";
 import { createGenericBoardPolicy } from "../src/board-policy.ts";
@@ -180,7 +181,11 @@ describe("BoardAgent scheduling", () => {
     expect(await w1.step()).toBe("acted"); // waited while open items exist: nudged to claim -> claims i1
     expect(transport.inputs.at(-1)!.capsule.evidence.at(-1)).toMatch(/claim one now.*never wait for a tool/);
     expect(await w1.step()).toBe("acted"); // its accepted claim keeps the initiative -> waits
-    expect(await w1.step()).toBe("idle"); // holding work, nothing new
+    // Waiting while holding i1 with no push and nothing to wait for: re-cued at once, bounded.
+    expect(await w1.step()).toBe("acted");
+    expect(transport.inputs.at(-1)!.capsule.evidence.at(-1)).toMatch(/^HELD WORK: I hold i1 with no push: edit it now \(or hand it off\)/);
+    expect(await w1.step()).toBe("acted");
+    expect(await w1.step()).toBe("idle"); // the held-work cues are spent: holding work, nothing new
 
     // A message addressed to it wakes it; a context-only broadcast does not.
     const w2 = await env.operator.join("w2", { role: "worker" });
@@ -210,6 +215,78 @@ describe("BoardAgent scheduling", () => {
     const last = transport.inputs.at(-1)!;
     expect(last.messages.some((m) => m.type === "help.requested" && m.to?.includes("w1"))).toBe(true);
     expect(last.allowed).not.toContain("decide_contract");
+  });
+
+  it("an invalid reply while holding work it owes is re-cued at once with the reason, bounded", async () => {
+    const env = await setup();
+    const invalid = "invalid model output: instruction must be a string";
+    const transport = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      { action: { type: "wait", reason: invalid }, invalid },
+      { action: { type: "wait", reason: invalid }, invalid },
+      { action: { type: "wait", reason: invalid }, invalid },
+    ]);
+    const w1 = env.agent("w1", { transport });
+    await w1.join();
+    const results: string[] = [];
+    for (let i = 0; i < 5; i += 1) results.push(await w1.step());
+    expect(results).toEqual(["acted", "acted", "acted", "acted", "idle"]);
+    const cued = transport.inputs.filter((i) => i.capsule.evidence.some((e) => e.startsWith("HELD WORK: I hold i1 with no push")));
+    expect(cued).toHaveLength(2);
+    expect(cued[0]!.capsule.evidence.at(-1)).toBe(`HELD WORK: I hold i1 with no push: edit it now (or hand it off); nothing else will wake me for it. My last reply was invalid: ${invalid}`);
+    // The cues are spent: no turn is pending (a quiet board may judge it now).
+    expect(w1.turnPending).toBe(false);
+  });
+
+  it("a sub-lead whose child another agent pushed is cued to pull (once per set), and the driver may re-cue it, bounded", async () => {
+    const env = await setup();
+    const lead = scripted([
+      { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+      {
+        type: "split",
+        itemId: "i1",
+        children: [
+          { objective: "x", acceptance: ["x works"], scopeHint: ["src/a/x.ts"] },
+          { objective: "y", acceptance: ["y works"], scopeHint: ["src/a/y.ts"] },
+        ],
+      },
+    ]);
+    const w1 = env.agent("w1", { transport: lead });
+    const w2 = env.agent("w2", {
+      transport: scripted([
+        { type: "claim", itemId: "i1.1", intent: { read: [], write: ["src/a/x.ts"] } },
+        { type: "edit", itemId: "i1.1", instruction: "do x" },
+      ]),
+      executor: new RecordingExecutor(() => ({ "src/a/x.ts": "export const x = 2;\n" })),
+    });
+    await w1.join();
+    await w2.join();
+    await w1.step(); // claim
+    await w1.step(); // split: w1 is the sub-lead of i1
+    expect((await env.log()).state.items.i1).toMatchObject({ status: "split", subLead: "w1" });
+    await w2.step(); // claim i1.1
+    await w2.step(); // edit + push
+    const push = (await env.log()).messages.find((m) => m.type === "push.announced" && m.from === "w2")!;
+    const commit = (push.payload as { commit: string }).commit;
+    const merge = new RegExp(`^SUB-LEAD MERGE DUE: pull \\{itemId: i1\\} merges i1\\.1@${commit.slice(0, 10)} \\(pushed by w2\\)`);
+    while ((await w1.step()) === "acted" && !lead.inputs.at(-1)!.capsule.evidence.some((e) => merge.test(e))) {
+      // earlier follow-ups (the split) settle first
+    }
+    expect(lead.inputs.at(-1)!.capsule.evidence.some((e) => merge.test(e))).toBe(true);
+    const cues = () => lead.inputs.at(-1)!.capsule.evidence.filter((e) => merge.test(e)).length;
+    expect(cues()).toBe(1);
+    // It waited (the script is done): other cues settle, and the same set is not cued again by itself...
+    for (let i = 0; i < 5 && (await w1.step()) === "acted"; i += 1) {
+      // bounded
+    }
+    expect(await w1.step()).toBe("idle");
+    expect(cues()).toBe(1);
+    // ...but the driver may re-cue it, up to MAX_MERGE_CUES deliveries in all.
+    while (w1.nudgeSubLeadMerge()) {
+      expect(await w1.step()).toBe("acted");
+    }
+    expect(cues()).toBe(MAX_MERGE_CUES);
+    expect(w1.nudgeSubLeadMerge()).toBe(false);
   });
 
   it("feeds a board rejection back into the next turn", async () => {
@@ -789,6 +866,91 @@ describe("day-2 review regressions", () => {
     expect(executor.contexts[1]!.objective).toContain("not ok 1 - src/a/x.ts is wrong");
     const state = (await env.log()).state;
     expect(state.items.i1!.fixRequested).toBeUndefined(); // the push answered the request
+  });
+
+  it("a large item starts one rung below the top; a model whose budget is spent retries the same edit once a rung down, never charged to the item", async () => {
+    const env = await setup();
+    for (const rel of ["src/a/p.ts", "src/a/q.ts"]) await writeFile(join(env.projectDir, rel), `export const ${rel.slice(6, 7)} = 0;\n`);
+    // gpt-4.1 spends its budget on every call; the base model edits.
+    let edits = 0;
+    const executor = new RecordingExecutor((ctx): Record<string, string> => {
+      if (ctx.model === "gpt-4.1") {
+        throw new ModelBudgetError("gpt-4.1", "length", 8192, "AI Gateway returned no usable edit for WorkUnit i1");
+      }
+      edits += 1;
+      return { "src/a/x.ts": `export const x = '${ctx.model ?? "base"}-${edits}';\n` };
+    });
+    const w1 = env.agent("w1", {
+      transport: scripted([
+        { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+        { type: "edit", itemId: "i1", instruction: "first" },
+        { type: "edit", itemId: "i1", instruction: "second" },
+        { type: "edit", itemId: "i1", instruction: "third" },
+      ]),
+      executor,
+      escalationModels: ["gpt-4.1", "gpt-5"],
+    });
+    await w1.join();
+    for (let i = 0; i < 4; i += 1) await w1.step();
+    // Never the top rung for a large item's first edits: the middle rung, then the base model.
+    expect(executor.contexts.map((c) => c.model)).toEqual(["gpt-4.1", undefined, "gpt-4.1", undefined, "gpt-4.1", undefined]);
+    const log = await env.log();
+    expect(log.messages.filter((m) => m.type === "push.announced" && m.from === "w1")).toHaveLength(3);
+    // Three spent budgets on one item are model failures, not failed edits: no struggling report.
+    expect(log.messages.filter((m) => m.type === "item.struggling")).toHaveLength(0);
+    expect(env.turns.filter((t) => t.code === "EXECUTOR_FAILED")).toHaveLength(0);
+    expect(w1.editModels).toHaveLength(3);
+    expect(w1.editModels[0]).toMatchObject({ item: "i1", model: "base", budgetFallbackFrom: "gpt-4.1 (finish_reason: length)" });
+    expect(log.messages.find((m) => m.type === "push.announced")!.rationale).toMatch(/model: base, after gpt-4\.1 \(finish_reason: length\) spent its budget/);
+  });
+
+  it("the top rung runs a second fix attempt; a spent budget there falls back to the next model down for the same edit", async () => {
+    const env = await setup();
+    let calls = 0;
+    const executor = new RecordingExecutor((ctx): Record<string, string> => {
+      calls += 1;
+      if (ctx.model === "gpt-5") {
+        throw new ModelBudgetError("gpt-5", "length", 32768, "AI Gateway returned no usable edit for WorkUnit i1");
+      }
+      return { "src/a/x.ts": `export const x = '${ctx.model ?? "base"}-${calls}';\n` };
+    });
+    const w1 = env.agent("w1", {
+      transport: scripted([
+        { type: "claim", itemId: "i1", intent: { read: [], write: ["src/a/**"] } },
+        { type: "edit", itemId: "i1", instruction: "first" },
+        { type: "edit", itemId: "i1", instruction: "fix one" },
+        { type: "edit", itemId: "i1", instruction: "fix two" },
+      ]),
+      executor,
+      escalationModels: ["gpt-4.1", "gpt-5"],
+      fetchRevision: async () => undefined,
+    });
+    await w1.join();
+    await w1.step();
+    await w1.step();
+    const fail = async () => {
+      const pushes = (await env.log()).messages.filter((m) => m.type === "push.announced");
+      const rev = await env.operator.recordRevision({
+        commit: `bad${pushes.length}`,
+        gate: "fail",
+        merged: [(pushes.at(-1)!.payload as { commit: string }).commit],
+        failing: { output: "not ok 1 - src/a/x.ts is wrong", items: ["i1"] },
+      });
+      expect(rev.ok).toBe(true);
+    };
+    await fail();
+    for (let i = 0; i < 3 && executor.contexts.length < 2; i += 1) await w1.step();
+    await fail();
+    for (let i = 0; i < 3 && executor.contexts.length < 4; i += 1) await w1.step();
+    expect(executor.contexts.map((c) => c.model)).toEqual([undefined, "gpt-4.1", "gpt-5", "gpt-4.1"]);
+    const log = await env.log();
+    const fixPushes = log.messages.filter((m) => m.type === "push.announced" && m.from === "w1");
+    expect(fixPushes).toHaveLength(3);
+    expect(w1.editModels.at(-1)).toMatchObject({ model: "gpt-4.1", why: "its first fix already failed", budgetFallbackFrom: "gpt-5 (finish_reason: length)" });
+    // Any struggling report is for the failing revision, never for failed edits.
+    for (const m of log.messages.filter((x) => x.type === "item.struggling")) {
+      expect(m.payload).toMatchObject({ reason: "failing-revision", failedEdits: 0 });
+    }
   });
 
   it("a fix request answered with a wait (or an invalid reply) after proposing done is re-cued at once, bounded, with the fix stated plainly", async () => {

@@ -187,8 +187,9 @@ self-describing.
 ARBITRATION REVISION (`rules.arbitration`). A recorded log replays under the
 rules it was recorded with, so arbitration changes that alter what a log
 derives sit behind this rule. Absent (revision 1) is how every earlier board
-was arbitrated; a new `run-board` posts revision 3 (pinning
-`rules: {arbitration: 1}` or `{arbitration: 2}` reproduces that revision).
+was arbitrated; a new `run-board` posts revision 4 (pinning
+`rules: {arbitration: 1}`, `{arbitration: 2}`, or `{arbitration: 3}`
+reproduces that revision).
 Revision 2:
 - a DIFFERENT agent granted (or handed) an item starts with a fresh fix
   budget (`fixAttempts`, `fixExhausted`, a tool's build failures), whatever
@@ -223,6 +224,17 @@ implicated by a failing revision since the push). Then:
 - the local integrator implicates no merged item when a failing gate's output
   maps only to items NOT in the revision (attribution source `outstanding`,
   below).
+Revision 4 (everything in revision 3, plus NOBODY ELSE CAN TAKE IT). A claim
+that lapsed as `stalled` on a quiet board normally bars its holder from
+claiming the item again for one lease period, so another agent gets it first.
+Under revision 4 that cooldown does not apply when no other active worker
+could take the item (`stalledLapseUntakeable`: every other active, non-lead
+agent not barred from it by its fix budget is at its claim cap, or there is
+none): on a quiet three-agent board with a cap of one, the holder of a lapsed
+claim could otherwise never get it back. A `no-progress` or `deadline` lapse
+keeps its cooldown, and so does a stalled one another agent could take.
+Revision 3 runs were published live, so this is a new revision: it only
+accepts claims revision 3 refused, and a revision 3 log replays as recorded.
 The three published replays and the K = 1 golden demo log carry no
 `arbitration` and reduce (and fold at every seq) exactly as before
 (`recorded-replay-compat.test.ts` pins their state hashes); the coverage-run
@@ -360,8 +372,9 @@ need no acceptance from the lead.
     carries a symlink inside its write intent (the runtime refuses the commit
     before pushing, and a pull or merge that would bring one), so a
     sub-lead's mirror and the integrator's check agree. While the sub-lead
-    is on the board, a child's push is NOT integrated directly (an integrated
-    revision merging it is refused): the sub-lead merges children's pushes
+    is on the board, a child's push by ANOTHER agent is NOT integrated
+    directly (an integrated revision merging it is refused): the sub-lead
+    merges children's pushes
     into its own repo and announces ONE `push.announced` for the split item
     with `merges` (each a child's latest, unintegrated push; a split item's
     push must carry merges, and only a split item's may). A passing revision
@@ -372,7 +385,14 @@ need no acceptance from the lead.
     the merged children whose write intents the failing output names (all of
     them when it names none), so the fix goes to the child owners. When the
     sub-lead has left, its children integrate directly and the split item
-    completes with them.
+    completes with them. A child the sub-lead itself pushed (or holds,
+    before any push) is never routed to it: its work is already in the
+    sub-lead's own repo and nobody else would merge it, so it integrates
+    directly like any claimed item (`routedToSubLead`). This decides only
+    what an integration may merge (and digests' wait reasons), never reduced
+    state: a recorded log replays unchanged (run board-live-sf9, where every
+    sub-lead pushed its own child and nothing was ever pending, is kept as a
+    fixture).
 12. Help with a fork: `help.requested` with `scope` GRANTS a sub-scope of the
     requester's write intent on its item (`OUTSIDE_INTENT` otherwise; never
     overlapping another live grant). The first `help.offered` with `forkOf`
@@ -511,11 +531,36 @@ is distributed changes: items are proposed and claimed, never assigned.
   (`describeProgress`), and the console shows it on revision nodes and the
   ticker. It never decides a verdict.
 - A stronger executor for complex items: an item whose write intent covers
-  at least 3 files, one with a contract proposed or accepted for it, a
-  reopened item, or one whose first fix failed starts its app edits on the
-  strongest configured model of the ladder; small items keep the base model.
-  Every push records the model in its rationale, and the summary prints
-  `edit models: ...`.
+  at least 3 files, or one with a contract proposed or accepted for it,
+  starts its app edits one rung above the base model (below the top rung
+  when the ladder has two or more: `gpt-4.1` of `gpt-4.1,gpt-5`); only a
+  reopened item, a re-plan's replacement child, or one whose first fix
+  failed starts on the strongest configured model. A fix attempt otherwise
+  steps one rung per attempt; small items keep the base model. Every push
+  records the model in its rationale, and the summary prints `edit models:
+  ...`.
+- Model budgets: each completion-token ceiling is chosen per model. A
+  reasoning model (gpt-5, the o-series, deepseek-r1, qwq: `isReasoningModel`)
+  spends hidden reasoning tokens from `max_completion_tokens` before it
+  replies, so an edit call sends it 32768 tokens with `reasoning_effort:
+  "low"` and a plan call 16384 with `reasoning_effort: "medium"`; any other
+  model gets 8192 for an edit and 4096 for a plan, and never
+  `reasoning_effort`. `AI_GATEWAY_EXECUTOR_MAX_TOKENS`,
+  `AI_GATEWAY_EXECUTOR_REASONING_MAX_TOKENS`, `AI_GATEWAY_PLANNER_MAX_TOKENS`,
+  and `AI_GATEWAY_PLANNER_REASONING_MAX_TOKENS` override each family
+  separately. An edit reply that is empty, or was cut off at the ceiling
+  (`finish_reason: "length"`), is a `ModelBudgetError` naming the finish
+  reason and the ceiling, never applied (even when a prefix parses). The
+  agent retries that SAME edit once on the next model down the ladder (top
+  rung to the middle one, then the base model): it is a model failure,
+  recorded in the agent's evidence and the pushed edit's model record
+  (`budgetFallbackFrom`, the summary's `budget fallbacks:`), and never
+  counted as a failed edit, so it cannot feed a struggling report or a split.
+  A plan model's validation rejection is handed to the next ladder model as
+  one-shot feedback (the reason, then "fix exactly this problem").
+- An edit instruction longer than 2000 characters is cut to the limit
+  (ending ` [truncated]`) rather than refusing the turn, and the turn prompt
+  states the limit.
 - Budgets scale with the plan (bounded; explicit flags win): the lead plans
   BEFORE the goal is posted, so the goal's fix budget is 3 + floor(items / 5)
   (at most 6), without an explicit `--max` the dial's max is min(items, 6)
@@ -1466,8 +1511,13 @@ an announced push the integrator gates.
 - **Split.** The owner posts `item.split`; children are open at once (inside
   its scope and write intent, so no lead decision). Other agents claim them.
   Children push to their own repos as usual, but the integrators do not merge
-  those pushes (`pendingPushItems` routes them to the sub-lead;
-  `awaitingSubLead` lists them). The sub-lead's `pull` is a mini-integration
+  another agent's child push (`pendingPushItems` routes it to the sub-lead;
+  `awaitingSubLead` lists it); a child the sub-lead pushes itself integrates
+  directly. Nothing integrates a routed push until the sub-lead pulls, so the
+  runtime CUES the sub-lead (`SUB-LEAD MERGE DUE: pull {itemId: <split
+  item>} merges <child>@<commit> (pushed by <agent>)`) when such a set of
+  pushes appears, and the driver re-cues it on a quiet board, bounded by
+  `MAX_MERGE_CUES` (3) per set. The sub-lead's `pull` is a mini-integration
   in its own repo: it copies each child's pushed files inside that child's
   write intent and announces ONE push for the split item (`merges`). No gate
   runs in the sub-lead's repo in this slice; the main integration gates the
@@ -1723,10 +1773,23 @@ recorded state only.
   with a reason, at most twice, each a full period), or the claim lapses
   (`reason: deadline`). The offline lead extends a progressing claim and lets
   a stalled one lapse. Defaults keep normal work far from it.
+- Held work is never left idle silently: a worker that answers with a wait
+  (or an invalid reply) while it holds a claim it owes work on (no push of
+  its own, no fix request, no stated wait reason) gets another turn at once
+  with `HELD WORK: I hold <item> with no push: edit it now (or hand it off)`
+  (and, for an invalid reply, `my last reply was invalid: <reason>`),
+  bounded by `MAX_HELD_WAIT_CUES` (2) per held set.
 - A QUIET board advances no message count, so the driver acts there: a leased,
   unsuspended claim with no stated wait reason whose holder sat the quiet
-  period out is recorded stalled (the engine-record route, `claim.lapsed
-  {reason: stalled}`), at most `stallReleasesBeforeReplan` (2) times per item,
+  period out is first NUDGED (`nudgeHeldWork`: the holder's next step is a
+  turn told to edit it now or hand it off, bounded per item; event
+  `held-work-nudged`), and only when a LATER quiet period finds it still not
+  moving (neither its lease progress nor the holder's local turns on it,
+  such as a failed edit that never reached the board) is it recorded stalled
+  (the engine-record route, `claim.lapsed {reason: stalled}`). A holder that
+  is taking a turn (an edit in flight) or about to (a follow-up or nudge not
+  yet delivered) is never judged, and such turns count as activity for
+  quiescence. A claim is recorded stalled at most `stallReleasesBeforeReplan` (2) times per item,
   plus ONCE more for an item the lead may re-plan (re-planning needs it open:
   without that release a held, stalled item could never be re-planned and the
   run would end quiet while a re-plan was possible); a tool, a seam item, or a
@@ -1760,7 +1823,10 @@ A pure function of the board names why an item is not moving:
 take it is at its cap), `lease-lapsed` (whose claim, why), `waiting-for-human`
 (a protected contract, or an escalated contest), `waiting-for-lead` (a seam
 contract, or a worker's proposal), `blocked-by` (a contest's owner item, a
-split's unfinished child, a sub-lead), `waiting-for-gate` (the pending push's
+split's unfinished child), `waiting-for-sub-lead` (a child's push by another
+agent waits for its sub-lead to merge it with `pull`, or, `merged`, for the
+gate on that merge; the split item itself then states no wait: its sub-lead
+acts next), `waiting-for-gate` (the pending push's
 commit: the revision has no number yet, so none is invented),
 `push-excluded` (the holder's latest push was left out of integration, with
 the reason: the holder pushes again), `waiting-on-others` (arbitration
@@ -1772,8 +1838,15 @@ one short line), and the console shows the line on every card. On a quiet
 board the driver acts on the stated reason, one step per quiet period: a seam
 hold that stopped moving is recorded stalled; an open seam item, or an
 `unclaimed` or `lease-lapsed` item, is offered to the free workers (bounded);
-a claim with no stated reason is recorded stalled (above). Waiting for a
-human, the lead, the gate, or another item is left alone.
+a child's push awaiting its sub-lead's merge re-cues that sub-lead (bounded,
+event `sub-lead-merge-nudged`); a claim with no stated reason is nudged, then
+recorded stalled (above). Waiting for a human, the lead, the gate, or another
+item is left alone. A quiet end never claims nothing was pending while
+children's pushes still await their sub-lead: once its merge cues are spent
+the stop detail names each awaiting push, and the summary says `integrated
+revision: none (nothing was integrated (N push(es) awaited their sub-lead))`
+rather than "nothing was pushed"; such a push also makes a passing run
+partial (never gated), like any ungated push.
 
 ### Re-plan instead of giving up (`item.replanned`, `item.escalated`)
 

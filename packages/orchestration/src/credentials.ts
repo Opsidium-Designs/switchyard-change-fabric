@@ -23,7 +23,15 @@ import { readFileSync } from "node:fs";
 const CREDENTIAL_NAME = /(TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|AUTHORIZATION|BEARER|ACCOUNT_ID|COOKIE)/i;
 
 /** Names that look credential-shaped but are not secrets (for example token-count settings). */
-const NOT_CREDENTIAL: ReadonlySet<string> = new Set(["AI_GATEWAY_MAX_TOKENS", "WORKERS_AI_MAX_TOKENS"]);
+const NOT_CREDENTIAL: ReadonlySet<string> = new Set([
+  "AI_GATEWAY_MAX_TOKENS",
+  "WORKERS_AI_MAX_TOKENS",
+  "AI_GATEWAY_AGENT_MAX_TOKENS",
+  "AI_GATEWAY_EXECUTOR_MAX_TOKENS",
+  "AI_GATEWAY_EXECUTOR_REASONING_MAX_TOKENS",
+  "AI_GATEWAY_PLANNER_MAX_TOKENS",
+  "AI_GATEWAY_PLANNER_REASONING_MAX_TOKENS",
+]);
 
 /** Credentials whose name does not say so. */
 const KNOWN_CREDENTIALS: ReadonlySet<string> = new Set(["AI_GATEWAY_URL", "CLOUDFLARE_ACCOUNT_ID"]);

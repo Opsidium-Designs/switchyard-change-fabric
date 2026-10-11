@@ -325,7 +325,8 @@ function formationAction(input: Input): AgentAction | undefined {
   }
   // A sub-lead merges its children's new pushes into one push upward.
   for (const led of d.subLead ?? []) {
-    const fresh = led.children.filter((c) => c.lastPush !== undefined && c.lastPush.integratedIn === undefined && !c.merged && c.unverified !== true);
+    // A child the sub-lead pushed itself integrates directly: only others' pushes are merged.
+    const fresh = led.children.filter((c) => c.lastPush !== undefined && c.lastPush.integratedIn === undefined && !c.merged && c.unverified !== true && c.lastPush.agent !== d.agent);
     if (fresh.length > 0 && failed((a) => a.type === "pull" && a.itemId === led.item && a.requestId === undefined) < 3) {
       return {
         type: "pull",

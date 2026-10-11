@@ -23,6 +23,13 @@
  */
 
 import { callGatewayJsonSchema } from "./gateway-json-schema.ts";
+import {
+  DEFAULT_REASONING_PLANNER_MAX_TOKENS,
+  modelBudget,
+  PLANNER_REASONING_EFFORT,
+  type ModelBudget,
+  type ModelBudgetCeilings,
+} from "./model-budget.ts";
 import { DEFAULT_WORKERS_AI_TIMEOUT_MS, type WorkersAiMessage } from "./workers-ai.ts";
 
 /** The default plan model when the caller does not pass one. */
@@ -35,6 +42,24 @@ export const DEFAULT_AI_GATEWAY_PLANNER_MODEL = "gpt-4o-mini";
  * tokens on an o-series model.
  */
 export const DEFAULT_AI_GATEWAY_PLANNER_MAX_TOKENS = 4096;
+
+/**
+ * The plan budget for `model`: a reasoning model gets
+ * DEFAULT_REASONING_PLANNER_MAX_TOKENS (or the reasoning override) and
+ * `reasoning_effort: "medium"`; any other model gets
+ * DEFAULT_AI_GATEWAY_PLANNER_MAX_TOKENS (or the non-reasoning override).
+ */
+export function plannerModelBudget(model: string, ceilings: ModelBudgetCeilings = {}): ModelBudget {
+  return modelBudget(
+    model,
+    {
+      maxTokens: DEFAULT_AI_GATEWAY_PLANNER_MAX_TOKENS,
+      reasoningMaxTokens: DEFAULT_REASONING_PLANNER_MAX_TOKENS,
+      effort: PLANNER_REASONING_EFFORT,
+    },
+    ceilings,
+  );
+}
 
 /**
  * The schema-constrained plan the model returns, before it is validated against
@@ -99,8 +124,10 @@ export interface AiGatewayPlannerOptions {
   readonly gatewayToken: string;
   /** How long a single plan call may run before it is aborted, in ms. */
   readonly timeoutMs?: number;
-  /** The maximum tokens the plan reply may use. */
+  /** The plan ceiling for a non-reasoning model (default DEFAULT_AI_GATEWAY_PLANNER_MAX_TOKENS). */
   readonly maxTokens?: number;
+  /** The plan ceiling for a reasoning model (default DEFAULT_REASONING_PLANNER_MAX_TOKENS). */
+  readonly reasoningMaxTokens?: number;
   /** Injectable fetch, for tests. Defaults to the global fetch. */
   readonly fetchFn?: typeof fetch;
 }
@@ -169,8 +196,14 @@ export class PlannerResponseError extends Error {
 export function createAiGatewayPlannerInvoke(options: AiGatewayPlannerOptions): PlannerInvoke {
   const fetchFn = options.fetchFn ?? fetch;
   const timeoutMs = options.timeoutMs ?? DEFAULT_WORKERS_AI_TIMEOUT_MS;
-  const maxTokens = options.maxTokens ?? DEFAULT_AI_GATEWAY_PLANNER_MAX_TOKENS;
+  const ceilings: ModelBudgetCeilings = {
+    ...(options.maxTokens !== undefined ? { maxTokens: options.maxTokens } : {}),
+    ...(options.reasoningMaxTokens !== undefined ? { reasoningMaxTokens: options.reasoningMaxTokens } : {}),
+  };
   return async (request: PlannerRequest): Promise<PlannerPlan> => {
+    // The ceiling is per model: a reasoning model's hidden reasoning spends the
+    // completion budget, so it gets a larger ceiling and an explicit effort.
+    const budget = plannerModelBudget(request.model, ceilings);
     // The shared schema-constrained call (see gateway-json-schema.ts): the same
     // gateway header (no provider key), the strict json_schema response_format,
     // the timeout, and the no-leak error drain the plan call always used.
@@ -181,7 +214,8 @@ export function createAiGatewayPlannerInvoke(options: AiGatewayPlannerOptions): 
       messages: request.messages,
       schemaName: PLANNER_PLAN_SCHEMA_NAME,
       schema: PLANNER_PLAN_JSON_SCHEMA,
-      maxTokens,
+      maxTokens: budget.maxTokens,
+      ...(budget.reasoningEffort !== undefined ? { reasoningEffort: budget.reasoningEffort } : {}),
       timeoutMs,
       fetchFn,
       label: "plan",

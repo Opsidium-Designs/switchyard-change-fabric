@@ -18,6 +18,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
   createAiGatewayRestInvoke,
+  DEFAULT_EXECUTOR_MAX_TOKENS,
+  DEFAULT_REASONING_EXECUTOR_MAX_TOKENS,
+  isModelBudgetError,
+  isReasoningModel,
+  ModelBudgetError,
+  UnusableModelOutputError,
   DEFAULT_AI_GATEWAY_ESCALATION_MODEL,
   DEFAULT_AI_GATEWAY_MAX_MODEL_RETRIES,
   DEFAULT_AI_GATEWAY_MODEL,
@@ -131,6 +137,80 @@ describe("createAiGatewayRestInvoke (BYOK, offline fake fetch)", () => {
     expect(DEFAULT_AI_GATEWAY_MODEL).toBe("gpt-4o-mini");
     expect(DEFAULT_AI_GATEWAY_ESCALATION_MODEL).toBe("gpt-4o");
     expect(DEFAULT_AI_GATEWAY_MAX_MODEL_RETRIES).toBe(3);
+  });
+});
+
+describe("per-model completion budget (reasoning models)", () => {
+  const bodies: Record<string, unknown>[] = [];
+  const replying = (reply: Record<string, unknown>) =>
+    (async (_url: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response(JSON.stringify(reply), { status: 200 });
+    }) as unknown as typeof fetch;
+  beforeEach(() => {
+    bodies.length = 0;
+  });
+
+  it("sends a reasoning model a large ceiling and reasoning_effort low, and any other model 8192 with no effort", async () => {
+    const invoke = createAiGatewayRestInvoke({ gatewayUrl: "https://gw/base", gatewayToken: "t", fetchFn: replying({ choices: [{ message: { content: editDoc }, finish_reason: "stop" }] }) });
+    const five = await invoke({ model: "gpt-5", messages: [{ role: "user", content: "x" }] });
+    await invoke({ model: "gpt-4o", messages: [{ role: "user", content: "x" }] });
+    await invoke({ model: "o3-mini", messages: [{ role: "user", content: "x" }] });
+    expect(bodies[0]).toMatchObject({ model: "gpt-5", reasoning_effort: "low" });
+    expect(bodies[0]!.max_completion_tokens).toBeGreaterThanOrEqual(32768);
+    expect(bodies[1]).toMatchObject({ model: "gpt-4o", max_completion_tokens: 8192 });
+    expect(bodies[1]!.reasoning_effort).toBeUndefined();
+    expect(bodies[2]).toMatchObject({ reasoning_effort: "low", max_completion_tokens: DEFAULT_REASONING_EXECUTOR_MAX_TOKENS });
+    // The ceiling and why the model stopped come back with the reply.
+    expect(five).toMatchObject({ finishReason: "stop", maxTokens: DEFAULT_REASONING_EXECUTOR_MAX_TOKENS });
+    expect(DEFAULT_EXECUTOR_MAX_TOKENS).toBe(8192);
+    expect(["gpt-5", "gpt-5-mini", "o1", "o3-mini", "deepseek-r1"].every(isReasoningModel)).toBe(true);
+    expect(["gpt-4o", "gpt-4.1", "gpt-4o-mini"].some(isReasoningModel)).toBe(false);
+  });
+
+  it("honors separate reasoning and non-reasoning ceiling overrides", async () => {
+    const invoke = createAiGatewayRestInvoke({
+      gatewayUrl: "https://gw/base",
+      gatewayToken: "t",
+      maxTokens: 12000,
+      reasoningMaxTokens: 50000,
+      fetchFn: replying({ choices: [{ message: { content: editDoc } }] }),
+    });
+    await invoke({ model: "gpt-5", messages: [{ role: "user", content: "x" }] });
+    await invoke({ model: "gpt-4.1", messages: [{ role: "user", content: "x" }] });
+    expect(bodies.map((b) => b.max_completion_tokens)).toEqual([50000, 12000]);
+  });
+
+  it("an empty reply or one cut off at the ceiling is a ModelBudgetError naming finish_reason and the ceiling", async () => {
+    await mkdir(join(worktree, "src"), { recursive: true });
+    await writeFile(join(worktree, "src/x.ts"), "export const x = 0;\n", "utf8");
+    const run = async (reply: Record<string, unknown>) => {
+      const invoke = createAiGatewayRestInvoke({ gatewayUrl: "https://gw/base", gatewayToken: "t", fetchFn: replying(reply) });
+      return new WorkersAiExecutor({ model: "gpt-5", invoke, providerLabel: "AI Gateway" })
+        .execute({ worktreeDir: worktree, workUnitId: "x", objective: "set x", paths: ["src/x.ts"], baselineRef: "HEAD" })
+        .then(
+          () => undefined,
+          (error: unknown) => error,
+        );
+    };
+    const empty = await run({ choices: [{ message: { content: "" }, finish_reason: "length" }], usage: { completion_tokens: 32768 } });
+    expect(empty).toBeInstanceOf(ModelBudgetError);
+    expect(empty).toBeInstanceOf(UnusableModelOutputError);
+    expect(isModelBudgetError(empty)).toBe(true);
+    expect(String((empty as Error).message)).toMatch(/finish_reason: length/);
+    expect(String((empty as Error).message)).toMatch(new RegExp(`max_completion_tokens ${DEFAULT_REASONING_EXECUTOR_MAX_TOKENS}`));
+    expect(empty).toMatchObject({ model: "gpt-5", finishReason: "length", maxTokens: DEFAULT_REASONING_EXECUTOR_MAX_TOKENS });
+    // A truncated reply is never applied, even if a prefix parses.
+    const truncated = await run({ choices: [{ message: { content: editDoc }, finish_reason: "length" }] });
+    expect(isModelBudgetError(truncated)).toBe(true);
+    expect(await readFile(join(worktree, "src/x.ts"), "utf8")).toBe("export const x = 0;\n");
+    // An empty reply that stopped for another reason is still a spent budget, named as such.
+    const blank = await run({ choices: [{ message: { content: "" }, finish_reason: "stop" }] });
+    expect(String((blank as Error).message)).toMatch(/finish_reason: stop/);
+    // A reply with content that is simply not an edit stays a plain unusable output.
+    const prose = await run({ choices: [{ message: { content: "I cannot help" }, finish_reason: "stop" }] });
+    expect(prose).toBeInstanceOf(UnusableModelOutputError);
+    expect(isModelBudgetError(prose)).toBe(false);
   });
 });
 

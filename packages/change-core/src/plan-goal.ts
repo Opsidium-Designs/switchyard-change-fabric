@@ -254,6 +254,9 @@ export interface PlanGoalResult extends DecomposeResult {
   readonly diagnostics: readonly PlanDiagnostic[];
 }
 
+/** The validation rejection reason handed to the next ladder model, in characters. */
+const MAX_REJECTION_FEEDBACK = 500;
+
 /**
  * Run the inference-backed, schema-constrained plan pass. It builds the
  * structural module map from the snapshot, asks the planner for a plan (trying
@@ -333,6 +336,12 @@ export async function planGoal(options: PlanGoalOptions): Promise<PlanGoalResult
       // contract, a bad dependency): record the specific rejection reason, then
       // escalate to the next model.
       record({ model, kind: "validation-rejected", reason: validation.reason });
+      // The next ladder model is told why (one shot): without the reason it
+      // tends to repeat the same unreal plan.
+      feedback = [
+        `A previous plan for this goal was REJECTED by the repository check: ${validation.reason.slice(0, MAX_REJECTION_FEEDBACK)}`,
+        "Fix exactly this problem and return the full plan: every path must exist in the structural map, each path is owned by one unit, no unit owns a frozen contract, and every dependency names a unit of the plan.",
+      ].join("\n");
       continue;
     }
     const projected = withDiagnostics(

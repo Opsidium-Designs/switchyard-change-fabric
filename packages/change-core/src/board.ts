@@ -140,12 +140,17 @@ export interface BoardRules {
    * The local integrator, under it, implicates no merged item when a failing
    * gate's output maps only to items not in the revision (see
    * failure-attribution's "outstanding" source).
+   * Revision 4 (what a new run posts) adds NOBODY ELSE CAN TAKE IT: a claim
+   * that lapsed as STALLED on a quiet board does not bar its holder from
+   * claiming it again when no other active worker could take it (every other
+   * active worker not barred from the item is at its claim cap, or there is
+   * none): the cooldown exists so another agent gets it first, and nobody can.
    */
   readonly arbitration?: number;
 }
 
 /** The arbitration revision a new board run posts (see BoardRules.arbitration). */
-export const CURRENT_ARBITRATION = 3;
+export const CURRENT_ARBITRATION = 4;
 
 export const DEFAULT_BOARD_RULES: BoardRules = { maxContestTurns: 3, contestIdleMessages: 25, maxFixAttempts: 2 };
 
@@ -2910,6 +2915,11 @@ export function arbitrationV3(state: BoardState): boolean {
   return (state.rules.arbitration ?? 1) >= 3;
 }
 
+/** True under arbitration revision 4 or later (a stalled lapse nobody else can take; see BoardRules.arbitration). Pure. */
+export function arbitrationV4(state: BoardState): boolean {
+  return (state.rules.arbitration ?? 1) >= 4;
+}
+
 /**
  * The board's clock now: participant (non-engine) messages so far under
  * arbitration revision 2, else the board seq. Every clock (lease, deadline,
@@ -3011,6 +3021,22 @@ function lapseCooldown(state: BoardState): number {
   return state.rules.claimLeaseMessages ?? Math.ceil((state.rules.claimDeadlineMessages ?? 0) / 4);
 }
 
+/**
+ * Under arbitration revision 4: true when `agent`'s claim on `item` lapsed as
+ * STALLED and no other active worker could take the item (each other active,
+ * non-lead agent not barred from it is at its claim cap, or there is none), so
+ * the lapse cooldown, which exists to let another agent take it first, does
+ * not apply. Always false before revision 4. Pure.
+ */
+export function stalledLapseUntakeable(state: BoardState, item: BoardItem, agent: string): boolean {
+  if (!arbitrationV4(state) || item.lastLapse?.reason !== "stalled" || item.lastLapse.agent !== agent) {
+    return false;
+  }
+  return Object.values(state.agents)
+    .filter((a) => a.id !== agent && a.leftSeq === undefined && a.role !== LEAD_ROLE && !(item.exhaustedBy ?? []).includes(a.id))
+    .every((a) => claimCapReached(state, a.id) !== undefined);
+}
+
 /** A fresh lease for a claim granted (or handed off) at `seq`, under the board's lease rules. */
 function newLease(state: BoardState, seq: number): BoardItem["lease"] {
   const deadline = state.rules.claimDeadlineMessages;
@@ -3085,6 +3111,8 @@ export type BoardWaitReason =
   | { readonly kind: "waiting-for-lead"; readonly contract?: string }
   /** Another item holds it: a contest's owner item, a split item's unfinished child, a sub-lead's parent. */
   | { readonly kind: "blocked-by"; readonly item: string }
+  /** Its holder's push waits for the sub-lead `agent` of `item` (its parent): to merge it (pull), or (`merged`) for the gate on the merge. */
+  | { readonly kind: "waiting-for-sub-lead"; readonly item: string; readonly agent: string; readonly merged: boolean }
   /** Its holder's latest push waits for an integrated revision to gate it (the revision has no number yet). */
   | { readonly kind: "waiting-for-gate"; readonly commit: string }
   /** Its holder's latest push was left out of integration (push.excluded): the holder pushes again. */
@@ -3116,6 +3144,11 @@ export function itemWaitReason(state: BoardState, itemId: string): BoardWaitReas
     return contest !== undefined ? { kind: "blocked-by", item: contest.ownerItem } : undefined;
   }
   if (item.status === "split") {
+    // A child's push waiting for this item's sub-lead to merge it: the
+    // sub-lead acts next (never "blocked by" that child, which waits on it).
+    if (item.children.some((c) => state.items[c] !== undefined && awaitsSubLeadMerge(state, state.items[c]!))) {
+      return undefined;
+    }
     const open = item.children.filter((c) => state.items[c]?.status !== "done");
     if (open.length > 0) {
       return { kind: "blocked-by", item: open[0]! };
@@ -3156,7 +3189,11 @@ export function itemWaitReason(state: BoardState, itemId: string): BoardWaitReas
     return { kind: "push-excluded", commit: push.commit, reason: push.excluded.reason };
   }
   if (push !== undefined && push.agent === item.owner && push.gatedIn === undefined) {
-    return routedToSubLead(state, item) ? { kind: "blocked-by", item: item.parent! } : { kind: "waiting-for-gate", commit: push.commit };
+    if (routedToSubLead(state, item)) {
+      const parent = state.items[item.parent!]!;
+      return { kind: "waiting-for-sub-lead", item: parent.id, agent: parent.subLead!, merged: !awaitsSubLeadMerge(state, item) && push.unverifiedIn === undefined };
+    }
+    return { kind: "waiting-for-gate", commit: push.commit };
   }
   if (item.fixExhausted) {
     return { kind: "fix-budget-exhausted", by: item.owner !== undefined ? [item.owner] : [] };
@@ -3182,6 +3219,10 @@ export function describeWaitReason(reason: BoardWaitReason): string {
       return reason.contract !== undefined ? `waits for the lead's decision on contract ${reason.contract}` : "proposed: waits for the lead's decision";
     case "blocked-by":
       return `blocked by ${reason.item}`;
+    case "waiting-for-sub-lead":
+      return reason.merged
+        ? `its push is in sub-lead ${reason.agent}'s push for ${reason.item}, which waits for the gate`
+        : `its push waits for sub-lead ${reason.agent} to merge it into ${reason.item} (pull)`;
     case "waiting-for-gate":
       return `push ${reason.commit.slice(0, 10)} waits for the gate`;
     case "push-excluded":
@@ -3387,14 +3428,33 @@ export function takenHelpGrants(state: BoardState, item: string): BoardHelpReque
 /**
  * True when an item's pushes go to its parent's SUB-LEAD rather than straight
  * to integration: the parent is split and its sub-lead is still on the board.
- * When the sub-lead has left, its children integrate directly.
+ * When the sub-lead has left, its children integrate directly; so does a
+ * child the sub-lead itself pushed (or holds, before any push): its work is
+ * already in the sub-lead's own repo, and nobody else would ever merge it.
  */
-export function routedToSubLead(state: BoardState, item: Pick<BoardItem, "parent">): boolean {
+export function routedToSubLead(state: BoardState, item: Pick<BoardItem, "parent" | "owner" | "lastPush">): boolean {
   if (item.parent === undefined) {
     return false;
   }
   const parent = state.items[item.parent];
-  return parent !== undefined && parent.status === "split" && parent.subLead !== undefined && activeAgent(state, parent.subLead);
+  if (parent === undefined || parent.status !== "split" || parent.subLead === undefined || !activeAgent(state, parent.subLead)) {
+    return false;
+  }
+  return (item.lastPush?.agent ?? item.owner) !== parent.subLead;
+}
+
+/**
+ * True when a child's latest push waits for its sub-lead to merge it (routed
+ * to the sub-lead, not integrated, not in the sub-lead's latest push, and not
+ * recorded unverified at this commit). Pure.
+ */
+export function awaitsSubLeadMerge(state: BoardState, item: BoardItem): boolean {
+  const push = item.lastPush;
+  if (push === undefined || push.integratedIn !== undefined || push.unverifiedIn !== undefined || !routedToSubLead(state, item)) {
+    return false;
+  }
+  const parent = state.items[item.parent!]!;
+  return !(parent.lastPush?.merges ?? []).some((m) => m.item === item.id && m.commit === push.commit);
 }
 
 /**
@@ -3530,7 +3590,7 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       // A lapsed holder does not take the item straight back: another agent
       // gets it first, or the lease period passes (counted in board messages).
       const sinceLapse = item.lastLapse !== undefined ? boardClock(state) - anchorClock(state, item.lastLapse.seq, item.lastLapse.tick) : 0;
-      if (item.lastLapse?.agent === draft.from && sinceLapse < lapseCooldown(state)) {
+      if (item.lastLapse?.agent === draft.from && sinceLapse < lapseCooldown(state) && !stalledLapseUntakeable(state, item, draft.from)) {
         fail(
           "NOT_ALLOWED",
           arbitrationV2(state)
@@ -5955,7 +6015,9 @@ function integratedRevPayload(state: BoardState, input: IntegratedRevInput): Boa
       if ((input.unverified ?? []).some((u) => u.item === merge.item)) {
         continue; // not in the gated tree as pushed: not integrated by this revision
       }
-      mergedItems.push(merge.item);
+      if (!mergedItems.includes(merge.item)) {
+        mergedItems.push(merge.item);
+      }
       const author = state.items[merge.item]!.lastPush!.agent;
       if (!contributors.includes(author)) {
         contributors.push(author);

@@ -815,6 +815,105 @@ describe("runBoard (concurrent schedule)", () => {
   });
 });
 
+describe("held work on a quiet board (concurrent schedule)", () => {
+  const oneItem = async (): Promise<BoardSeed> => ({
+    source: "planner",
+    model: "fake-planner",
+    items: [{ item: "api", objective: "report status from the api", acceptance: ["gate passes"], scopeHint: ["src/api/**"] }],
+  });
+  /** The generic policy, except agent-1 answers its first `waits` edits of an item with a wait. */
+  const waitsFirst = (waits: number) => {
+    const policy = createGenericBoardPolicy();
+    const waited = new Map<string, number>();
+    const inputs: { agent: string; evidence: readonly string[] }[] = [];
+    const transport: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      inputs.push({ agent: input.agent, evidence: [...input.capsule.evidence] });
+      const outcome = await policy(input);
+      const action = outcome.action as { type: string; itemId?: string };
+      if (input.agent === "agent-1" && action.type === "edit" && action.itemId !== undefined && (waited.get(action.itemId) ?? 0) < waits) {
+        waited.set(action.itemId, (waited.get(action.itemId) ?? 0) + 1);
+        return { action: { type: "wait", reason: "reading the files first" } };
+      }
+      return outcome;
+    };
+    return { transport, inputs };
+  };
+
+  it("a holder that waits once after claiming is re-cued at once and edits: no stalled lapse", async () => {
+    const projectDir = await project();
+    const { base } = await direct("change-held-wait");
+    const { transport, inputs } = waitsFirst(1);
+    const result = await runBoard({
+      ...base,
+      projectDir,
+      seed: oneItem,
+      transport,
+      dial: { minConcurrency: 1, maxConcurrency: 1 },
+      schedule: "concurrent",
+      pollMs: 20,
+      budgets: { timeoutMs: 60_000, quiescenceMs: 600 },
+    });
+    expect(inputs.some((i) => i.agent === "agent-1" && i.evidence.some((e) => /^HELD WORK: I hold api with no push: edit it now/.test(e)))).toBe(true);
+    expect(of(result.log, "claim.lapsed")).toEqual([]);
+    expect(of(result.log, "push.announced").filter((m) => m.payload.item === "api")).not.toHaveLength(0);
+    expect(result.stopReason).toBe("all-items-done");
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  });
+
+  it("a holder that waits past its re-cues is nudged by the driver before any lapse, and then edits", async () => {
+    const projectDir = await project();
+    const { base } = await direct("change-held-nudge");
+    // Three waits: two are re-cued at once, the third leaves it idle until the board is quiet.
+    const { transport, inputs } = waitsFirst(3);
+    const events: BoardRunEvent[] = [];
+    const result = await runBoard({
+      ...base,
+      projectDir,
+      seed: oneItem,
+      transport,
+      dial: { minConcurrency: 1, maxConcurrency: 1 },
+      schedule: "concurrent",
+      pollMs: 20,
+      budgets: { timeoutMs: 60_000, quiescenceMs: 600 },
+      onEvent: (e) => events.push(e),
+    });
+    expect(events).toContainEqual({ kind: "held-work-nudged", item: "api", agent: "agent-1" });
+    expect(inputs.some((i) => i.evidence.some((e) => /^HELD WORK: the board went quiet and I hold api/.test(e)))).toBe(true);
+    expect(of(result.log, "claim.lapsed")).toEqual([]);
+    expect(result.stopReason).toBe("all-items-done");
+  });
+
+  it("an edit blocked in the executor past half the quiet period never lapses its claim", async () => {
+    const projectDir = await project();
+    const { base } = await direct("change-held-slow");
+    const stamping = new ModelStampingExecutor();
+    let calls = 0;
+    const slow: ExecutorProvider = {
+      name: "slow",
+      async execute(context) {
+        calls += 1;
+        if (calls === 1) {
+          await new Promise((resolve) => setTimeout(resolve, 900));
+        }
+        return stamping.execute(context);
+      },
+    };
+    const result = await runBoard({
+      ...base,
+      projectDir,
+      seed: oneItem,
+      executor: slow,
+      dial: { minConcurrency: 1, maxConcurrency: 1 },
+      schedule: "concurrent",
+      pollMs: 20,
+      budgets: { timeoutMs: 60_000, quiescenceMs: 600 },
+    });
+    expect(calls).toBeGreaterThan(0);
+    expect(of(result.log, "claim.lapsed")).toEqual([]);
+    expect(result.stopReason).toBe("all-items-done");
+  });
+});
+
 describe("boardRunExitCode (what the CLI exits with)", () => {
   const promoted = { committed: true } as RunBoardResultPromotion;
   type RunBoardResultPromotion = NonNullable<Parameters<typeof boardRunExitCode>[0]["promotion"]>;
@@ -1128,7 +1227,7 @@ describe("acceptance progress per suite (advisory)", () => {
 });
 
 describe("a stronger executor for complex items", () => {
-  it("a large item starts on the strongest configured model, a small one on the base model, and every edit records its model", async () => {
+  it("a large item starts one rung below the strongest configured model, a small one on the base model, and every edit records its model", async () => {
     const projectDir = await project();
     const executor = new ModelStampingExecutor();
     const twoItems = async (): Promise<BoardSeed> => ({
@@ -1140,16 +1239,16 @@ describe("a stronger executor for complex items", () => {
       ],
     });
     const result = await offline({ goal: GOAL, projectDir, seed: twoItems, executor, escalationModels: ["m1", "m2"] });
-    expect(executor.contexts.find((c) => c.workUnitId === "big")!.model).toBe("m2");
+    expect(executor.contexts.find((c) => c.workUnitId === "big")!.model).toBe("m1");
     expect(executor.contexts.find((c) => c.workUnitId === "small")!.model).toBeUndefined();
     expect(result.editModels).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ item: "big", model: "m2", why: "it spans 3 files" }),
+        expect.objectContaining({ item: "big", model: "m1", why: "it spans 3 files" }),
         expect.objectContaining({ item: "small", model: "base" }),
       ]),
     );
-    expect(of(result.log, "push.announced").find((m) => m.payload.item === "big")!.rationale).toMatch(/model: m2, strongest: it spans 3 files/);
-    expect(formatBoardRunSummary(result)).toMatch(/edit models: .*strongest for complex items: big \(it spans 3 files\)/);
+    expect(of(result.log, "push.announced").find((m) => m.payload.item === "big")!.rationale).toMatch(/model: m1, stronger: it spans 3 files/);
+    expect(formatBoardRunSummary(result)).toMatch(/edit models: .*stronger for complex items: big \(it spans 3 files\)/);
   });
 });
 

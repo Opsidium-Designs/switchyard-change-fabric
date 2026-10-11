@@ -6,7 +6,11 @@
  * fetch happens here.
  */
 
-import { describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ALLOW_HEURISTIC_PLANNER_FLAG,
@@ -14,6 +18,7 @@ import {
   plannerFallbackBanner,
   selectAgentTurn,
   selectExecutor,
+  selectPlanner,
   type ExecutorEnv,
 } from "../src/executor-select.ts";
 
@@ -193,5 +198,51 @@ describe("selectAgentTurn", () => {
     expect(selectAgentTurn({ ...env, AI_GATEWAY_MODEL: "m-base" }).model).toBe("m-base");
     expect(selectAgentTurn({ ...env, AI_GATEWAY_MODEL: "m-base", AI_GATEWAY_AGENT_MODEL: "m-agent" }).model).toBe("m-agent");
     expect(JSON.stringify(selectAgentTurn(env))).not.toContain("secret-token");
+  });
+});
+
+describe("per-model completion ceilings from the environment", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+  const gateway = { EXECUTOR: "ai-gateway", CLOUDFLARE_AI_GATEWAY_URL: "https://gw", CLOUDFLARE_AI_GATEWAY_TOKEN: "t" };
+  const capture = (): Record<string, unknown>[] => {
+    const bodies: Record<string, unknown>[] = [];
+    // A stubbed fetch (no network): it records each body and returns an empty plan / edit.
+    vi.stubGlobal("fetch", async (_url: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ units: [], contracts: [], rationale: "" }) }, finish_reason: "stop" }] }), { status: 200 });
+    });
+    return bodies;
+  };
+
+  it("the executor and planner ceilings follow the model family, and the env overrides each family separately", async () => {
+    const bodies = capture();
+    const dir = await mkdtemp(join(tmpdir(), "scf-ceilings-"));
+    try {
+      const edit = (env: ExecutorEnv, model: string) =>
+        selectExecutor(env)
+          .executor.execute({ worktreeDir: dir, workUnitId: "u", objective: "o", paths: ["a.ts"], baselineRef: "HEAD", model })
+          .catch(() => undefined);
+      await edit(gateway, "gpt-5");
+      await edit(gateway, "gpt-4o");
+      await edit({ ...gateway, AI_GATEWAY_EXECUTOR_MAX_TOKENS: "9000", AI_GATEWAY_EXECUTOR_REASONING_MAX_TOKENS: "40000" }, "gpt-5");
+      await edit({ ...gateway, AI_GATEWAY_EXECUTOR_MAX_TOKENS: "9000", AI_GATEWAY_EXECUTOR_REASONING_MAX_TOKENS: "nope" }, "gpt-4.1");
+      const plan = (env: ExecutorEnv, model: string) => selectPlanner(env).plan!({ model, messages: [{ role: "user", content: "x" }] });
+      await plan(gateway, "gpt-5");
+      await plan({ ...gateway, AI_GATEWAY_PLANNER_MAX_TOKENS: "6000", AI_GATEWAY_PLANNER_REASONING_MAX_TOKENS: "24000" }, "gpt-5");
+      await plan({ ...gateway, AI_GATEWAY_PLANNER_MAX_TOKENS: "6000" }, "gpt-4o");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+    expect(bodies.map((b) => [b.model, b.max_completion_tokens, b.reasoning_effort])).toEqual([
+      ["gpt-5", 32768, "low"],
+      ["gpt-4o", 8192, undefined],
+      ["gpt-5", 40000, "low"],
+      ["gpt-4.1", 9000, undefined],
+      ["gpt-5", 16384, "medium"],
+      ["gpt-5", 24000, "medium"],
+      ["gpt-4o", 6000, undefined],
+    ]);
   });
 });

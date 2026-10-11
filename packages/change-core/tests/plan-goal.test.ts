@@ -284,6 +284,32 @@ describe("planGoal: schema-constrained planner over the structural backbone", ()
     );
   });
 
+  it("hands a validation rejection to the next ladder model as one-shot feedback", async () => {
+    const badBase: PlannedShape = {
+      units: [{ id: "ghost", objective: "bad", paths: ["src/resources/ghost.js"], dependsOn: [] }],
+      contracts: [],
+    };
+    const asked: { model: string; messages: readonly { role: string; content: string }[] }[] = [];
+    const result = await planGoal({
+      goal: GOAL,
+      repo: SERVICE_REPO,
+      plan: async (request) => {
+        asked.push({ model: request.model, messages: request.messages });
+        return request.model === "gpt-5" ? GOOD_PLAN : badBase;
+      },
+      baseModel: "gpt-4o-mini",
+      escalationModels: ["gpt-4.1", "gpt-5"],
+    });
+    expect(result.plan.model).toBe("gpt-5");
+    expect(asked.map((a) => a.model)).toEqual(["gpt-4o-mini", "gpt-4.1", "gpt-5"]);
+    const last = (a: (typeof asked)[number]) => a.messages.at(-1)!.content;
+    // The base model saw no feedback; each next model saw the previous rejection only.
+    expect(asked[0]!.messages.some((m) => /REJECTED by the repository check/.test(m.content))).toBe(false);
+    expect(last(asked[1]!)).toMatch(/REJECTED by the repository check: unit ghost owns unknown path src\/resources\/ghost\.js/);
+    expect(last(asked[2]!)).toMatch(/REJECTED by the repository check: unit ghost owns unknown path/);
+    expect(asked[2]!.messages.filter((m) => /REJECTED/.test(m.content))).toHaveLength(1);
+  });
+
   it("falls back to the heuristic when a transport error exhausts the ladder", async () => {
     const throwing: PlanTransport = async () => {
       throw new Error("transport blew up");

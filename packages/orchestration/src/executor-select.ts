@@ -40,6 +40,7 @@ import {
   DEFAULT_AI_GATEWAY_MODEL,
   DEFAULT_WORKERS_AI_MODEL,
   gatewaySlugFromUrl,
+  parseTokenCeiling,
   ScopedNoopExecutor,
   WorkersAiExecutor,
   type AskJev,
@@ -67,6 +68,14 @@ export interface ExecutorEnv {
   readonly AI_GATEWAY_AGENT_MODEL?: string;
   /** The board turn's completion-token ceiling (a positive integer; default by model family). */
   readonly AI_GATEWAY_AGENT_MAX_TOKENS?: string;
+  /** The edit ceiling for a non-reasoning model (a positive integer; default 8192). */
+  readonly AI_GATEWAY_EXECUTOR_MAX_TOKENS?: string;
+  /** The edit ceiling for a reasoning model (a positive integer; default 32768). */
+  readonly AI_GATEWAY_EXECUTOR_REASONING_MAX_TOKENS?: string;
+  /** The plan ceiling for a non-reasoning model (a positive integer; default 4096). */
+  readonly AI_GATEWAY_PLANNER_MAX_TOKENS?: string;
+  /** The plan ceiling for a reasoning model (a positive integer; default 16384). */
+  readonly AI_GATEWAY_PLANNER_REASONING_MAX_TOKENS?: string;
   readonly AI_GATEWAY_ESCALATION_MODEL?: string;
   readonly AI_GATEWAY_ESCALATION_MODELS?: string;
   readonly AI_GATEWAY_MAX_MODEL_RETRIES?: string;
@@ -181,7 +190,16 @@ export function selectExecutor(env: ExecutorEnv = runtimeEnv()): SelectedExecuto
       env.AI_GATEWAY_MAX_MODEL_RETRIES,
       DEFAULT_AI_GATEWAY_MAX_MODEL_RETRIES,
     );
-    const invoke = createAiGatewayRestInvoke({ gatewayUrl, gatewayToken });
+    // The completion ceiling is per model (a reasoning model gets a larger one
+    // plus reasoning_effort); the environment may override either ceiling.
+    const executorMax = parseTokenCeiling(env.AI_GATEWAY_EXECUTOR_MAX_TOKENS);
+    const executorReasoningMax = parseTokenCeiling(env.AI_GATEWAY_EXECUTOR_REASONING_MAX_TOKENS);
+    const invoke = createAiGatewayRestInvoke({
+      gatewayUrl,
+      gatewayToken,
+      ...(executorMax !== undefined ? { maxTokens: executorMax } : {}),
+      ...(executorReasoningMax !== undefined ? { reasoningMaxTokens: executorReasoningMax } : {}),
+    });
     // Reuse the Workers AI executor shape with the gateway transport injected:
     // the prompt building, edit parsing, and bounded same-model retry are
     // identical, and the per-attempt context.model lets the ladder pass the
@@ -346,7 +364,14 @@ export function selectPlanner(env: ExecutorEnv = runtimeEnv()): SelectedPlanner 
     env.AI_GATEWAY_ESCALATION_MODEL,
     DEFAULT_AI_GATEWAY_ESCALATION_MODEL,
   );
-  const invoke = createAiGatewayPlannerInvoke({ gatewayUrl, gatewayToken });
+  const plannerMax = parseTokenCeiling(env.AI_GATEWAY_PLANNER_MAX_TOKENS);
+  const plannerReasoningMax = parseTokenCeiling(env.AI_GATEWAY_PLANNER_REASONING_MAX_TOKENS);
+  const invoke = createAiGatewayPlannerInvoke({
+    gatewayUrl,
+    gatewayToken,
+    ...(plannerMax !== undefined ? { maxTokens: plannerMax } : {}),
+    ...(plannerReasoningMax !== undefined ? { reasoningMaxTokens: plannerReasoningMax } : {}),
+  });
   const plan: PlanTransport = (request) => invoke(request);
   return {
     live: true,
@@ -393,8 +418,7 @@ export function selectAgentTurn(env: ExecutorEnv = runtimeEnv()): SelectedAgentT
   }
   const model =
     (env.AI_GATEWAY_AGENT_MODEL ?? "").trim() || (env.AI_GATEWAY_MODEL ?? "").trim() || DEFAULT_AI_GATEWAY_MODEL;
-  const rawMax = (env.AI_GATEWAY_AGENT_MAX_TOKENS ?? "").trim();
-  const maxTokens = /^[1-9][0-9]{0,6}$/.test(rawMax) ? Number(rawMax) : agentTurnMaxTokens(model);
+  const maxTokens = parseTokenCeiling(env.AI_GATEWAY_AGENT_MAX_TOKENS) ?? agentTurnMaxTokens(model);
   const invoke = createAiGatewayAgentTurnInvoke({ gatewayUrl, gatewayToken, model, maxTokens });
   return {
     live: true,

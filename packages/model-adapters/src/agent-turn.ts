@@ -19,6 +19,7 @@
  */
 
 import { callGatewayJsonSchema } from "./gateway-json-schema.ts";
+import { isReasoningModel } from "./model-budget.ts";
 import { DEFAULT_WORKERS_AI_TIMEOUT_MS, type WorkersAiMessage } from "./workers-ai.ts";
 
 // ---------------------------------------------------------------------------
@@ -293,6 +294,23 @@ function str(raw: Raw, field: string, max: number): string {
   return value.trim();
 }
 
+/** The marker a clamped string ends with (see clampedStr). */
+export const CLAMP_MARKER = " [truncated]";
+
+/**
+ * A required string that is CUT to `max` characters (ending with
+ * CLAMP_MARKER) rather than rejected: for free text the runtime only passes
+ * on, where a long reply still says what to do.
+ */
+function clampedStr(raw: Raw, field: string, max: number): string {
+  const value = raw[field];
+  if (typeof value !== "string" || value.trim() === "") {
+    bad(`${field} must be a non-empty string`);
+  }
+  const text = value.trim();
+  return text.length > max ? `${text.slice(0, max - CLAMP_MARKER.length).trimEnd()}${CLAMP_MARKER}` : text;
+}
+
 function optStr(raw: Raw, field: string, max: number): string | undefined {
   return present(raw, field) ? str(raw, field, max) : undefined;
 }
@@ -559,7 +577,8 @@ export function parseAgentAction(raw: unknown, allowed: readonly AgentActionType
     }
     case "edit":
       only(value, ["type", "itemId", "instruction"], "edit");
-      return { type: "edit", itemId: idOf(value, "itemId"), instruction: str(value, "instruction", L.maxInstruction) };
+      // An over-long instruction is cut (marked), never a refused turn.
+      return { type: "edit", itemId: idOf(value, "itemId"), instruction: clampedStr(value, "instruction", L.maxInstruction) };
     case "propose_done":
       only(value, ["type", "itemId", "rationale"], "propose_done");
       return withRationale({ type: "propose_done", itemId: idOf(value, "itemId") }, value);
@@ -1148,7 +1167,7 @@ export function buildAgentTurnMessages(input: AgentTurnInput): WorkersAiMessage[
     "Rules:",
     "- Claim an open item before working on it. A claim declares the repo paths or globs you will read and write; your write intent must stay inside the item's scopeHint, must not overlap another agent's write intent, and may never touch the board's protected paths (the files that define the gate).",
     "- If your claim is contested, answer with contest_reply: cede, keep, or narrow your write intent to entries within your previous intent that no longer overlap.",
-    "- edit makes the change for an item you hold, inside your write intent only; the runtime commits, pushes, and announces it, and the integrator gates every push.",
+    `- edit makes the change for an item you hold, inside your write intent only; the runtime commits, pushes, and announces it, and the integrator gates every push. Keep edit.instruction to at most ${AGENT_ACTION_LIMITS.maxInstruction} characters (a longer one is cut).`,
     "- propose_done only after your edit for that item was pushed. The item completes when a passing integrated revision merges your push: when claims[].lastPush.integratedIn is set (your push passed) and doneProposed is false, propose_done for that item now.",
     "- FIX REQUEST: claims[].fix on an item you hold means an integrated revision FAILED the gate and implicates YOUR item (digest.failure has the output). The item is not done and you are not waiting for integration, even if you already proposed done: a done proposal never completes a failing item. Edit that item now to make the gate pass, before anything else (or, when claims[].seamCue or claims[].contractCue is set, send that contract). Never answer a fix request with wait.",
     "- When claims[].contractCue says the failing check is in a protected test (part of the contract), read it: if that test encodes the OLD behavior the goal changes (for example it pins a value the goal says must now be computed differently), send message kind contract {target: that exact path, change: modify, itemId} so a human can decide; do not keep re-editing your file to satisfy a check the goal itself changes.",
@@ -1156,7 +1175,7 @@ export function buildAgentTurnMessages(input: AgentTurnInput): WorkersAiMessage[
     "- Tool items the lead seeded (tool-<capability>, open) are claimable work: claim one (write intent tools/<capability>/**) and build_tool. If a tool.gated message addressed to you says your build FAILED, build_tool again: the failing checks are given to the builder.",
     "- Tools are accelerators, NEVER prerequisites: claim your item now; when a tool covering your files is published (board.tools[].versions), use_tool it (the scanner first to find the places, then the codemod with those files as args, itemId = your item); otherwise edit by hand. Never wait for a tool, and never leave open items unclaimed because a tool is not ready. claims[].toolUnavailable lists tools you must not count on.",
     "- Use message for help, questions (address them with `to`), replies (payload.requestId), contract changes, and reviews. payload.need is a SHORT id such as auth-contract or shared-boundary (letters, digits, - _ . :; at most 64 characters): explain the need in rationale, never in need.",
-    "- SPLIT: when an item you hold spans many files or several distinct sub-changes, split it into children (each child's scopeHint inside your write intent; no pushes of yours on it yet). You become its SUB-LEAD: other agents claim the children (leave them to others); when children push (digest.subLead[].children[].lastPush with merged false), pull {itemId: the split item} merges their pushes into your repo and announces ONE push for the item; the item completes when every child is done and that push passes an integrated revision.",
+    "- SPLIT: when an item you hold spans many files or several distinct sub-changes, split it into children (each child's scopeHint inside your write intent; no pushes of yours on it yet). You become its SUB-LEAD: other agents claim the children (leave them to others); when children push (digest.subLead[].children[].lastPush by another agent with merged false, or a SUB-LEAD MERGE DUE cue), pull {itemId: the split item} merges their pushes into your repo and announces ONE push for the item; nothing integrates them until you do. A child you push yourself integrates directly (no pull). The item completes when every child is done and that push passes an integrated revision.",
     "- HELP WITH A FORK: when you hold an item with several files and have pushed part of it, you may message kind help {itemId, need, scope: files inside your write intent} to grant those files to a helper. Do not touch them, and do not propose_done, until you pull: when digest.help.mine shows the helper's delivered commit, pull {itemId, requestId} (or pull {itemId, requestId, decline: true} to close the grant without taking it; a failed pull closes it too). When you are free and digest.help.wanted lists a request, message kind reply {requestId} to take it: the runtime forks the requester's repo (you start from its in-progress state); then edit {itemId: the requester's item} works only on the granted scope in your fork and delivers it (digest.help.granted).",
     "- STRUGGLING: when digest.struggling lists an item of yours (failed edits, turns spent, or a failing revision implicating it) and digest.idleAgents is not empty, consider asking for help: message kind help {itemId, need, scope} grants part of it to a helper who forks your repo; or split it when board.cues.splittable lists it (a split is refused while your own push on the item is not yet integrated, and when the run integrates on Cloudflare; do not retry a refused split). A help grant blocks you only once a helper takes it (its fork offer); until then keep working. You decide; it is a cue, not an order.",
     "- IDLE: when you hold nothing and no item is open, digest.busyOwners lists owners whose items are going badly: offer_help {itemId, toAgent: the owner, why} volunteers (once per item until answered). When digest.volunteers lists a volunteer on your item, answer_volunteer {itemId, volunteer, accept: true, scope: files inside your write intent it takes over} (it forks your repo and delivers; you pull) or accept: false to decline.",
@@ -1211,8 +1230,6 @@ export const DEFAULT_AGENT_TURN_MAX_TOKENS = 2048;
  * content is written (finish_reason "length", an empty reply).
  */
 export const DEFAULT_REASONING_AGENT_TURN_MAX_TOKENS = 16384;
-/** Model ids treated as reasoning models (their reasoning counts against the completion ceiling). */
-const REASONING_MODEL = /(^|[/:])(o\d+(-[a-z]+)?|gpt-5[\w.-]*|deepseek-r1[\w.-]*|qwq[\w.-]*)$|reason|think/i;
 
 /**
  * The completion-token ceiling for a turn on `model`: a per-model override
@@ -1224,7 +1241,7 @@ export function agentTurnMaxTokens(model: string, byModel: Readonly<Record<strin
   if (override !== undefined && Number.isInteger(override) && override > 0) {
     return override;
   }
-  return REASONING_MODEL.test(model) ? DEFAULT_REASONING_AGENT_TURN_MAX_TOKENS : DEFAULT_AGENT_TURN_MAX_TOKENS;
+  return isReasoningModel(model) ? DEFAULT_REASONING_AGENT_TURN_MAX_TOKENS : DEFAULT_AGENT_TURN_MAX_TOKENS;
 }
 
 /** Options for the live AI Gateway turn transport (holds the gateway credential). */

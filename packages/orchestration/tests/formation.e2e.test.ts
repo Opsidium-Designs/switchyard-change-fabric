@@ -20,8 +20,10 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, it } from "vitest";
 
-import { reduceBoard, type BoardMessage } from "@switchyard-change/change-core";
-import type { ExecutorContext } from "@switchyard-change/model-adapters";
+import { awaitingSubLead, reduceBoard, type BoardDigest, type BoardMessage } from "@switchyard-change/change-core";
+import type { AgentTurnTransport, ExecutorContext } from "@switchyard-change/model-adapters";
+
+import { createGenericBoardPolicy } from "../src/board-policy.ts";
 
 import { assertBoardBacked, buildBoardGraph } from "../src/board-graph.ts";
 import { runBoardOffline } from "../src/run-board-offline.ts";
@@ -32,14 +34,15 @@ const reject = async () => "reject" as const;
 const of = <T extends BoardMessage["type"]>(log: readonly BoardMessage[], type: T) =>
   log.filter((m): m is Extract<BoardMessage, { type: T }> => m.type === type);
 
-/** One `make demo-board` run, offline. */
-function demo(goalFile: string, project: string) {
+/** One `make demo-board` run, offline (optionally with another turn transport). */
+function demo(goalFile: string, project: string, transport?: AgentTurnTransport<BoardDigest, BoardMessage>) {
   return runBoardOffline({
     goal: readFileSync(join(ROOT, "examples", "goals", goalFile), "utf8"),
     projectDir: join(ROOT, ...project.split("/")),
     fixtureGate: true,
     replacesDeclaredGate: ["npm", "run", "gate"],
     resolveContract: reject,
+    ...(transport ? { transport } : {}),
   });
 }
 
@@ -126,6 +129,39 @@ describe("formation on the demo-board inputs (offline, deterministic)", () => {
     expect(reduceBoard(log)).toEqual(result.state);
     const graph = buildBoardGraph(log);
     expect(graph.edges.filter((e) => e.label === "merged").map((e) => e.to)).toEqual(expect.arrayContaining([`item:${parent}`]));
+  });
+
+  it("a sub-lead that waits instead of merging its children's pushes is cued to pull: the merge lands and the run never ends with pushes awaiting it", async () => {
+    // The generic policy, except every sub-lead answers its first merge with a wait.
+    const policy = createGenericBoardPolicy();
+    const waited = new Set<string>();
+    const cued: string[] = [];
+    const transport: AgentTurnTransport<BoardDigest, BoardMessage> = async (input) => {
+      if (input.capsule.evidence.some((e) => e.startsWith("SUB-LEAD MERGE DUE: pull {itemId: "))) {
+        cued.push(input.agent);
+      }
+      const outcome = await policy(input);
+      const action = outcome.action as { type: string; itemId?: string; requestId?: string };
+      if (action.type === "pull" && action.requestId === undefined && !waited.has(input.agent)) {
+        waited.add(input.agent);
+        return { action: { type: "wait", reason: "the children may push again; merging later" } };
+      }
+      return outcome;
+    };
+    const result = await demo("service-api-validation-auth.goal.txt", "examples/apps/service-api", transport);
+    const log = result.log;
+    const split = of(log, "item.split")[0]!;
+    expect(split).toBeDefined();
+    expect(waited.has(split.from)).toBe(true);
+    expect(cued).toContain(split.from);
+    // The sub-lead's merge still landed, and the parent completed.
+    expect(of(log, "push.announced").some((m) => m.from === split.from && m.payload.item === split.payload.item && (m.payload.merges ?? []).length > 0)).toBe(true);
+    expect(result.state.items[split.payload.item]).toMatchObject({ status: "done" });
+    expect(awaitingSubLead(result.state)).toEqual([]);
+    expect(result.stopReason === "quiescent" && awaitingSubLead(result.state).length > 0).toBe(false);
+    expect(result.verdict).toBe("verified");
+    expect(result.incompleteItems).toEqual([]);
+    expect(reduceBoard(log)).toEqual(result.state);
   });
 
   it("a struggling owner's cue brings a volunteer: granted a scope, it forks, delivers, and is pulled; bounded", async () => {

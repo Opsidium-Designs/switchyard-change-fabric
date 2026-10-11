@@ -45,6 +45,7 @@ import {
   BOARD_LIMITS,
   boardAttributionTally,
   pendingPushItems,
+  awaitingSubLead,
   promotionRefusal,
   CURRENT_ARBITRATION,
   pendingPushKey,
@@ -263,6 +264,10 @@ export type BoardRunEvent =
   | { readonly kind: "seam-stalled"; readonly item: string; readonly released: boolean; readonly dependents: readonly string[] }
   /** The board went quiet while a leased claim with no stated wait reason made no progress: recorded stalled (it lapsed). */
   | { readonly kind: "claim-stalled"; readonly item: string; readonly agent: string }
+  /** A quiet board with a held claim not moving (no stated wait reason): its holder was nudged to edit it before any lapse. */
+  | { readonly kind: "held-work-nudged"; readonly item: string; readonly agent: string }
+  /** A quiet board with children's pushes awaiting their sub-lead's merge: the sub-lead(s) were nudged to pull. */
+  | { readonly kind: "sub-lead-merge-nudged"; readonly agents: readonly string[]; readonly items: readonly string[] }
   /** A quiet board with open items nobody holds (unclaimed, or a lapsed claim): free workers were offered them. */
   | { readonly kind: "open-items-offered"; readonly items: readonly string[] }
   /** The run reached a cost or time cap (recorded as run.capped). */
@@ -284,6 +289,23 @@ export interface BoardRunEffectiveBudgets extends ScaledBudgets {
   readonly scopeFiles?: number;
   /** The run's cost and time caps (engine-enforced). */
   readonly caps?: { readonly maxCalls?: number; readonly maxSpendUsd?: number; readonly maxWallMs?: number; readonly maxCallsPerItem?: number };
+}
+
+/**
+ * The pushes still awaiting their sub-lead's merge when a run ends quiet, as
+ * a clause for the stop detail ("" when none): a quiet end never claims
+ * nothing was pending while they wait.
+ */
+export function awaitingSubLeadDetail(state: BoardState): string {
+  const awaiting = awaitingSubLead(state);
+  if (awaiting.length === 0) {
+    return "";
+  }
+  const named = awaiting.map((i) => {
+    const parent = state.items[i.parent!];
+    return `${i.id} (pushed by ${i.lastPush!.agent}) for sub-lead ${parent?.subLead ?? "?"} of ${i.parent}`;
+  });
+  return `; ${awaiting.length} push(es) still awaited their sub-lead's merge after its bounded merge cues: ${named.join(", ")}`;
 }
 
 /** One line for a run's effective budgets (the CLI and the summary print the same). */
@@ -572,7 +594,15 @@ export interface RunBoardResult {
   /** The effective budgets (scaled with the plan unless explicit). */
   readonly budgets?: BoardRunEffectiveBudgets;
   /** The model each pushed app edit used (the strongest for complex items). */
-  readonly editModels?: readonly { readonly agent: string; readonly item: string; readonly commit: string; readonly model: string; readonly why?: string }[];
+  readonly editModels?: readonly {
+    readonly agent: string;
+    readonly item: string;
+    readonly commit: string;
+    readonly model: string;
+    readonly why?: string;
+    /** The model that spent its completion budget first; the edit ran one rung down. */
+    readonly budgetFallbackFrom?: string;
+  }[];
   /** Every tool gate the run's bench ran and recorded, in order. */
   readonly toolGates?: readonly ToolGateRecord[];
   /** The tool author's label (when the run set one). */
@@ -2400,13 +2430,40 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     return nudged;
   };
 
+  // Held claims judged on a quiet board: what their holder had done when it
+  // was last judged (its lease progress and its local turns on the item, such
+  // as a failed edit, which never reach the board). A claim lapses only when
+  // a LATER quiet period finds neither moved.
+  const heldJudged = new Map<string, { readonly agent: string; readonly progressSeq: number; readonly activity: number }>();
+  const localActivity = (agent: string, item: string): number =>
+    turns.filter((t) => t.agent === agent && t.action.type !== "wait" && (t.action as { itemId?: unknown }).itemId === item).length;
+  // Children's pushes awaiting their sub-lead's merge: the sub-lead is nudged
+  // to pull (bounded by its merge cues).
+  const nudgeSubLeadMerges = (state: BoardState): boolean => {
+    const awaiting = awaitingSubLead(state);
+    const subLeads = [...new Set(awaiting.map((i) => state.items[i.parent!]?.subLead).filter((a): a is string => a !== undefined))].sort();
+    let nudged = false;
+    for (const worker of workers) {
+      if (subLeads.includes(worker.id) && worker.nudgeSubLeadMerge()) {
+        nudged = true;
+      }
+    }
+    if (nudged) {
+      emit({ kind: "sub-lead-merge-nudged", agents: subLeads, items: awaiting.map((i) => i.id) });
+    }
+    return nudged;
+  };
+
   // A quiet board acts on each waiting item's STATED reason (itemWaitReason),
   // never on a guess: a seam hold that stopped moving is recorded stalled; an
   // open seam item, an unclaimed item, or one whose claim lapsed is offered to
-  // the free workers; a leased claim with NO stated reason whose holder sat
-  // the quiet period out is recorded stalled (it lapses: a quiet board
-  // advances no message count). Waiting for a human, the lead, the gate, or
-  // another item is left alone: someone else acts next.
+  // the free workers; a child's push awaiting its sub-lead's merge nudges the
+  // sub-lead; a leased claim with NO stated reason whose holder sat the quiet
+  // period out is nudged first (its holder is told to edit it now), and only
+  // recorded stalled (it lapses: a quiet board advances no message count) when
+  // a later quiet period finds it still not moving. A holder taking a turn is
+  // never judged. Waiting for a human, the lead, the gate, or another item is
+  // left alone: someone else acts next.
   // One step per quiet period, in this order, so each holder gets a chance to
   // act on what the previous step changed before the next one judges it.
   const actOnStalls = async (): Promise<boolean> => {
@@ -2436,6 +2493,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         return true;
       }
     }
+    if (nudgeSubLeadMerges(state)) {
+      return true;
+    }
     let acted = false;
     if (leasesOn(state)) {
       for (const item of Object.values(state.items)) {
@@ -2452,6 +2512,22 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           itemWaitReason(state, item.id) !== undefined ||
           leaseSuspension(state, item) !== undefined
         ) {
+          continue;
+        }
+        const owner = workers.find((w) => w.id === item.owner);
+        if (owner?.busy || owner?.turnPending) {
+          continue; // taking a turn (an edit in flight), or about to: not stalled
+        }
+        const judged = { agent: item.owner, progressSeq: item.lease.progressSeq, activity: localActivity(item.owner, item.id) };
+        const prior = heldJudged.get(item.id);
+        if (prior === undefined || prior.agent !== judged.agent || prior.progressSeq !== judged.progressSeq || prior.activity !== judged.activity) {
+          // First seen not moving (or it moved since): nudge its holder and
+          // judge it again on a later quiet period, never lapse it now.
+          heldJudged.set(item.id, judged);
+          acted = true;
+          if (owner?.nudgeHeldWork(item.id)) {
+            emit({ kind: "held-work-nudged", item: item.id, agent: item.owner });
+          }
           continue;
         }
         const recorded = await operator.recordEngine("claim.lapsed", { item: item.id });
@@ -2644,8 +2720,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         const integrated = integrator.revisions.length > before;
         const decided = await settleContracts();
         if (!acted && joined === 0 && !integrated && !decided && !(await actOnStalls())) {
-          stopReason = check((await operator.page(0, 1)).state) ?? "quiescent";
-          stopDetail = "no agent had anything to do and no integration was pending";
+          const quietState = (await operator.page(0, 1)).state;
+          stopReason = check(quietState) ?? "quiescent";
+          stopDetail = `no agent had anything to do and no integration was pending${awaitingSubLeadDetail(quietState)}`;
         }
       }
       stopReason ??= check((await operator.page(0, 1)).state) ?? "max-rounds";
@@ -2656,6 +2733,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       const pollMs = options.pollMs ?? 500;
       let lastSeq = -1;
       let quietSince = Date.now();
+      let turnsSeen = 0;
       while (stopReason === undefined) {
         await refreshAgentTokens();
         const state = (await operator.page(0, 1)).state;
@@ -2695,7 +2773,12 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         await settleContracts();
         // Quiescence: every agent idle, nothing integrating or pending, and no
         // board message for the bounded period.
-        const anyBusy = [lead, ...workers].some((a) => a.busy) || integrator.busy || integrator.wants(state);
+        // A turn that did something (not a wait) is activity even when it
+        // never reached the board (a failed edit, a refused action); so is an
+        // agent about to take a turn it was given (a follow-up, a nudge).
+        const acted = turns.slice(turnsSeen).some((t) => t.action.type !== "wait");
+        turnsSeen = turns.length;
+        const anyBusy = [lead, ...workers].some((a) => a.busy || a.turnPending) || integrator.busy || integrator.wants(state) || acted;
         if (state.lastSeq !== lastSeq || anyBusy) {
           lastSeq = state.lastSeq;
           quietSince = Date.now();
@@ -2705,7 +2788,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           quietSince = Date.now();
         } else if (Date.now() - quietSince >= budgets.quiescenceMs) {
           stopReason = "quiescent";
-          stopDetail = `every agent was idle (none taking a turn), nothing was integrating or pending, and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s`;
+          stopDetail =
+            awaitingSubLead(state).length === 0
+              ? `every agent was idle (none taking a turn), nothing was integrating or pending, and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s`
+              : `every agent was idle (none taking a turn), nothing was integrating, and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s${awaitingSubLeadDetail(state)}`;
           break;
         }
         await new Promise((resolve) => setTimeout(resolve, pollMs));
@@ -2778,7 +2864,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     // verified.
     incompleteItems = outstanding(finalState).map((i) => i.id);
     incompleteReasons = incompleteItemReasons(finalState);
-    const ungated = pendingPushItems(finalState);
+    // A child's push still awaiting its sub-lead's merge was never gated either.
+    const ungated = [...pendingPushItems(finalState), ...awaitingSubLead(finalState)];
     if (verdict === "verified" && ungated.length > 0) {
       verdict = "failed";
       // A speculative candidate may have gated and blamed a pending push (its
@@ -3664,7 +3751,17 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
       }
     }
   } else {
-    lines.push("  integrated revision: none (nothing was pushed)");
+    const awaiting = awaitingSubLead(result.state);
+    const pushed = Object.values(result.state.items).some((i) => i.lastPush !== undefined);
+    lines.push(
+      `  integrated revision: none (${
+        awaiting.length > 0
+          ? `nothing was integrated (${awaiting.length} push(es) awaited their sub-lead)`
+          : pushed
+            ? "nothing was integrated"
+            : "nothing was pushed"
+      })`,
+    );
   }
   for (const reason of result.integrationFailures) {
     lines.push(`  integration not recorded: ${reason}`);
@@ -3685,10 +3782,12 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
   if ((result.editModels ?? []).length > 0) {
     const counts = new Map<string, number>();
     for (const e of result.editModels ?? []) counts.set(e.model, (counts.get(e.model) ?? 0) + 1);
-    const strongest = (result.editModels ?? []).filter((e) => e.why !== undefined && e.model !== "base");
+    const stronger = (result.editModels ?? []).filter((e) => e.why !== undefined && e.model !== "base");
+    const fallbacks = (result.editModels ?? []).filter((e) => e.budgetFallbackFrom !== undefined);
     lines.push(
       `  edit models: ${[...counts].map(([m, n]) => `${m} x${n}`).join(", ")}` +
-        (strongest.length > 0 ? `; strongest for complex items: ${[...new Set(strongest.map((e) => `${e.item} (${e.why})`))].join(", ")}` : ""),
+        (stronger.length > 0 ? `; stronger for complex items: ${[...new Set(stronger.map((e) => `${e.item} (${e.why})`))].join(", ")}` : "") +
+        (fallbacks.length > 0 ? `; budget fallbacks: ${fallbacks.map((e) => `${e.item} ${e.budgetFallbackFrom} -> ${e.model}`).join(", ")}` : ""),
     );
   }
   const forks = result.cleanedUp.filter((name) => name.includes("--help-"));
