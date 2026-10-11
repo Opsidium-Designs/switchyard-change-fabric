@@ -49,7 +49,7 @@ describe("the published recorded runs", () => {
   it("are all listed in the index, and every index entry has a file", async () => {
     const index = await loadReplayIndex(fileFetch);
     expect(index.map((r) => `${r.id}.json`).sort()).toEqual([...replayFiles].sort());
-    expect(index.map((r) => r.id)).toEqual(["board-live-reg3", "board-live-sf7", "board-live-sf8"]);
+    expect(index.map((r) => r.id)).toEqual(["board-live-l3", "board-live-reg3", "board-live-sf7", "board-live-sf8"]);
   });
 
   it("fold at every seq with the shared board code, every node backed", async () => {

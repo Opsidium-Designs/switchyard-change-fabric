@@ -2,6 +2,14 @@
   "format": "switchyard-replay/v1",
   "runs": [
     {
+      "id": "board-live-l3",
+      "title": "service-api: 6 items, gate passed on revision 4, verified and promoted",
+      "app": "service-api",
+      "outcome": "verified",
+      "description": "A lead and 3 workers fix a multi-resource API (input validation and auth on every resource) under a one-item claim cap. Failing revisions blame only items whose own tests fail; agents whose work waits on others take the next item. Acceptance climbs 10/20 -> 14/20 -> 18/20 -> 20/20 on revision 4, a speculative round lands one more push on revision 5, and the gated commit is promoted. Recorded verdict: verified.",
+      "messages": 74
+    },
+    {
       "id": "board-live-reg3",
       "title": "service-api: 6 items, gate passed on revision 3, verified",
       "app": "service-api",
