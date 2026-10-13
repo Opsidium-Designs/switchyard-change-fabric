@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { MissionControl } from "./mission-control";
 import { ThemeToggle } from "./theme";
+import { readPreviews } from "./previews.ts";
 import {
   finalVerdict,
   loadReplay,
@@ -163,6 +164,7 @@ export function ReplayApp() {
               busy={false}
               onResolve={() => undefined}
               recorded
+              previews={readPreviews(run.snapshot)}
               {...(startSeq !== null ? { initialSeq: startSeq } : {})}
               {...(initial.tab !== null && run.changeId === initial.run ? { initialTab: initial.tab } : {})}
               onSeqChange={onSeqChange}

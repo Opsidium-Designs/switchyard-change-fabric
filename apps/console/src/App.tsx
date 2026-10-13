@@ -21,6 +21,7 @@ import { MissionControl, type BoardEscalationRecord } from "./mission-control";
 import { ThemeToggle } from "./theme";
 import { boardCapable, TEMPLATES, type ContractPolicy, type LaunchMode, type Template } from "./templates";
 import { postToWorker } from "./worker-post";
+import { readPreviews } from "./previews.ts";
 
 /**
  * Console for the Switchyard Change Fabric: the control plane.
@@ -718,6 +719,7 @@ export function App() {
               escalations={(snapshot?.escalations ?? []) as readonly BoardEscalationRecord[]}
               busy={busy}
               onResolve={resolveBoardEscalation}
+              previews={readPreviews(snapshot)}
             />
           ) : (
             <section className="app-panel">

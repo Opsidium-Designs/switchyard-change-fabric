@@ -24,6 +24,7 @@ import {
   type BoardTicker,
 } from "@switchyard-change/orchestration/board-graph";
 import type { EscalationSnapshot } from "@switchyard-change/orchestration/graph-model";
+import { backedPreviews, previewTitle, type RevisionPreview } from "./previews.ts";
 import { buildProofBundle, formatTestTeeth, type ProofBundle } from "@switchyard-change/orchestration/proof-bundle";
 
 import {
@@ -413,6 +414,25 @@ function GateMarkerButton({
 }
 
 /**
+ * A link to the app running one revision (a Worker version uploaded from that
+ * revision's commit). Opens in a new tab; the gate verdict stays the verdict.
+ */
+export function PreviewLink({ preview, gate, compact = false }: { preview: RevisionPreview; gate: string; compact?: boolean }) {
+  return (
+    <a
+      className={`mc-preview-link${compact ? " is-compact" : ""}`}
+      href={preview.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={previewTitle(preview, gate)}
+      aria-label={`open the app at revision ${preview.n} (${gate})`}
+    >
+      {compact ? "app \u2197" : `open the app at r${preview.n} \u2197`}
+    </a>
+  );
+}
+
+/**
  * The run's chapters (from the full log, so the strip holds still while
  * scrubbing), each ending at the gate marker of the revision that closed it.
  * A chapter's marker appears only once the cursor has reached that revision,
@@ -427,6 +447,7 @@ export function ChapterStrip({
   onHover,
   onSelect,
   onSeek,
+  previews,
 }: {
   chapters: readonly Chapter[];
   k: number;
@@ -435,6 +456,8 @@ export function ChapterStrip({
   onHover: (n: number | null) => void;
   onSelect: (n: number) => void;
   onSeek: (seq: number) => void;
+  /** Backed revision previews by revision number: each adds a link to the running app. */
+  previews?: ReadonlyMap<number, RevisionPreview> | undefined;
 }) {
   const byRev = new Map(markers.map((m) => [m.n, m]));
   return (
@@ -464,7 +487,10 @@ export function ChapterStrip({
                 <span className="mc-chapter-fill" style={{ width: `${Math.round(fill * 100)}%` }} aria-hidden="true" />
               </button>
               {marker ? (
-                <GateMarkerButton marker={marker} focus={focus} onHover={onHover} onSelect={onSelect} />
+                <span className="mc-gate-stack">
+                  <GateMarkerButton marker={marker} focus={focus} onHover={onHover} onSelect={onSelect} />
+                  {previews?.get(marker.n) ? <PreviewLink preview={previews.get(marker.n)!} gate={GATE_WORD[marker.verdict]} compact /> : null}
+                </span>
               ) : null}
             </li>
           );
@@ -486,9 +512,12 @@ const ORIGIN_TYPES = new Set<BoardMessage["type"]>(["goal.posted", "agent.joined
 export function Narrator({
   narration,
   onSelectSeq,
+  preview,
 }: {
   narration: Narration | null;
   onSelectSeq: (seq: number) => void;
+  /** The backed preview of the revision this message integrated, if any. */
+  preview?: { readonly preview: RevisionPreview; readonly gate: string } | undefined;
 }) {
   if (!narration) {
     return (
@@ -515,6 +544,7 @@ export function Narrator({
       ) : !ORIGIN_TYPES.has(narration.type) ? (
         <span className="mc-narr-why muted">no recorded cause</span>
       ) : null}
+      {preview ? <PreviewLink preview={preview.preview} gate={preview.gate} /> : null}
       <button type="button" className="mc-seq-link mc-narr-self" onClick={() => onSelectSeq(narration.seq)} title="open this message in the thread">
         {narration.type}
       </button>
@@ -1979,7 +2009,7 @@ export function Thread({
   );
 }
 
-export function BoardNodeDetail({ node, landed }: { node: BoardGraphNode; landed?: LandedPart | undefined }) {
+export function BoardNodeDetail({ node, landed, preview }: { node: BoardGraphNode; landed?: LandedPart | undefined; preview?: RevisionPreview | undefined }) {
   const d = node.detail;
   const row = (label: string, value: ReactNode) =>
     value === undefined || value === null || value === "" ? null : (
@@ -2037,6 +2067,15 @@ export function BoardNodeDetail({ node, landed }: { node: BoardGraphNode; landed
           <>
             {row("Gate", d.verdictLabel)}
             {row("Commit", <code>{d.commit}</code>)}
+            {row(
+              "Running app",
+              preview ? (
+                <>
+                  <PreviewLink preview={preview} gate={d.verdictLabel} />{" "}
+                  <span className="muted">a Worker version built from this commit{preview.backfilled ? ", uploaded after the run" : ""}; the gate decides, the app is a look</span>
+                </>
+              ) : undefined,
+            )}
             {row("Merged pushes", landed ? `${d.merged.length} (${landed.commits.length} already landed in rev ${landed.rev})` : String(d.merged.length))}
             {row(
               landed ? "Contributors to the failure" : "Contributors",
@@ -2340,6 +2379,8 @@ export interface MissionControlProps {
   readonly recorded?: boolean;
   /** Called with the replay cursor (null at the end of the log), e.g. to keep a shareable URL. */
   readonly onSeqChange?: (seq: number | null) => void;
+  /** Revision previews from the snapshot; only those backed by the log's integrated.rev commit are shown. */
+  readonly previews?: readonly RevisionPreview[];
 }
 
 export function MissionControl({
@@ -2352,6 +2393,7 @@ export function MissionControl({
   initialTab,
   recorded = false,
   onSeqChange,
+  previews,
 }: MissionControlProps) {
   const lastSeq = log.length === 0 ? 0 : log[log.length - 1]!.seq;
   const [cursor, setCursor] = useState<number | "live">(initialSeq ?? "live");
@@ -2371,6 +2413,8 @@ export function MissionControl({
   // Every projection of the log is guarded: a message the fold cannot read refuses the view at
   // that seq (with the replay controls kept), never a blank page.
   const layoutResult = useMemo(() => attempt(() => boardLayout(log)), [log]);
+  // Previews whose commit matches the log's integrated.rev of the same number (no unbacked link).
+  const backed = useMemo(() => backedPreviews(log, previews ?? []), [log, previews]);
   const layout = layoutResult.value;
   // The proof of the final revision at K, from the log alone (works the same in replay).
   const proofResult = useMemo(() => attempt(() => buildProofBundle(boardPrefix(log, k))), [log, k]);
@@ -2517,6 +2561,9 @@ export function MissionControl({
   const landed = selectedNode?.detail.kind === "rev" ? speculativeLanded(log, k, selectedNode.detail.n) : undefined;
 
   const narration = narrateAt(log, k, payloadSummary);
+  const narratedRev = narration?.type === "integrated.rev" ? log.find((m) => m.seq === narration.seq) : undefined;
+  const narratedPreview = narratedRev?.type === "integrated.rev" ? backed.get(narratedRev.payload.n) : undefined;
+  const narratedMarker = narratedPreview ? markers.find((m) => m.n === narratedPreview.n) : undefined;
   const selectSeqInThread = (seq: number) => {
     select({ kind: "seq", seq });
     setTab("thread");
@@ -2526,7 +2573,11 @@ export function MissionControl({
     <section className={`mc${recorded ? " is-recorded" : ""}`} aria-label="Mission control">
       <div className="mc-timeline" aria-label="Timeline">
         <div className="mc-timeline-head">
-          <Narrator narration={narration} onSelectSeq={selectSeqInThread} />
+          <Narrator
+            narration={narration}
+            onSelectSeq={selectSeqInThread}
+            preview={narratedPreview && narratedMarker ? { preview: narratedPreview, gate: GATE_WORD[narratedMarker.verdict] } : undefined}
+          />
           <Ticker ticker={model.ticker} live={live} k={k} lastSeq={lastSeq} recorded={recorded} />
         </div>
         <div className="mc-timeline-story">
@@ -2541,6 +2592,7 @@ export function MissionControl({
               setTab("node");
             }}
             onSeek={seek}
+            previews={backed}
           />
         </div>
         {replayBar}
@@ -2640,7 +2692,7 @@ export function MissionControl({
           />
         ) : tab === "node" ? (
           selectedNode ? (
-            <BoardNodeDetail node={selectedNode} landed={landed} />
+            <BoardNodeDetail node={selectedNode} landed={landed} preview={selectedNode.detail.kind === "rev" ? backed.get(selectedNode.detail.n) : undefined} />
           ) : (
             <p className="muted mc-empty">Select an item, agent, revision, tool, or decision.</p>
           )

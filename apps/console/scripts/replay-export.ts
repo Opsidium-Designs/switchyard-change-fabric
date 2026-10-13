@@ -9,10 +9,14 @@
  * holds, so the console's fold replays them byte for byte) plus a slim,
  * allow-listed slice of the ChangeState snapshot (status, objective, the
  * recorded integration verdict, escalations, the dial). Nothing outside that
- * allow list is published: no deployment URLs, no repo identities.
+ * allow list is published: no production deployment URL, no repo identities.
+ * Revision previews are the one exception, on purpose: each is a public
+ * workers.dev URL of a Worker version built from one revision's commit, kept
+ * only when it is well formed (https, workers.dev, no credentials).
  */
 
 import type { BoardMessage } from "@switchyard-change/orchestration/board-graph";
+import { readPreviews } from "../src/previews.ts";
 
 type FetchFn = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -20,7 +24,7 @@ type FetchFn = (input: string, init?: RequestInit) => Promise<Response>;
 export const REPLAY_FORMAT = "switchyard-replay/v1";
 
 /** The snapshot fields a replay keeps (everything else is dropped before publishing). */
-export const SNAPSHOT_ALLOW = ["id", "objective", "status", "dial", "integration", "planningFailure", "escalations", "board"] as const;
+export const SNAPSHOT_ALLOW = ["id", "objective", "status", "dial", "integration", "planningFailure", "escalations", "board", "previews"] as const;
 
 export interface ReplayFile {
   readonly format: typeof REPLAY_FORMAT;
@@ -241,6 +245,11 @@ export function slimSnapshot(snapshot: unknown): Record<string, unknown> | null 
   const out: Record<string, unknown> = {};
   for (const key of SNAPSHOT_ALLOW) {
     if (source[key] !== undefined) out[key] = source[key];
+  }
+  if (out.previews !== undefined) {
+    const previews = readPreviews(source);
+    if (previews.length > 0) out.previews = previews;
+    else delete out.previews;
   }
   return out;
 }
