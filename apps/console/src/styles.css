@@ -2367,3 +2367,12 @@ body {
 .mc-grade.grade-advisory { color: var(--advisory); border-style: dashed; font-style: italic; }
 .mc-grade-legend { display: flex; flex-direction: column; gap: 0.15rem; font-size: 0.72rem; color: var(--muted); margin: 0.3rem 0 0.6rem; }
 .mc-proof-facts dt { display: flex; align-items: center; gap: 0.35rem; }
+
+/* A folded Board column: the heading and the item names on one line. */
+.mc-column.is-folded summary { cursor: pointer; list-style: none; }
+.mc-column.is-folded summary::-webkit-details-marker { display: none; }
+.mc-column.is-folded summary h3 { display: inline; margin-right: 0.4rem; }
+.mc-column.is-folded summary h3::before { content: "\25B8 "; color: var(--muted); }
+.mc-column.is-folded details[open] summary h3::before { content: "\25BE "; }
+.mc-column-names { display: block; font-size: 0.78rem; color: var(--muted); margin: 0.1rem 0 0.4rem; line-height: 1.35; }
+.mc-column.is-folded details[open] .mc-column-names { display: none; }

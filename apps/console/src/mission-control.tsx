@@ -816,43 +816,83 @@ export function BoardPane({
           {best}
         </p>
       ) : null}
-      {columns.map(([title, ids]) => (
-        <section key={title} className={`mc-column col-${title.toLowerCase()}`}>
+      {columns.map(([title, ids]) => {
+        // A column folds behind its heading (item names on one line) when it is
+        // long and needs no one: the graph already draws every item. Contested
+        // and proposed items always stay open, as does a selected item's column.
+        const attention = title === "CONTESTED" || title === "PROPOSED";
+        const holdsSelection = selection?.kind === "item" && ids.includes(selection.id);
+        const folded = !attention && !holdsSelection && ids.length > COLUMN_OPEN_MAX;
+        const heading = (
           <h3>
             {title} <span className="muted">{ids.length}</span>
           </h3>
-          {title === "CONTESTED"
-            ? cards.map((card) => (
-                <EscalationCard
-                  key={card.key}
-                  card={card}
-                  busy={busy}
-                  onResolve={onResolve}
-                  onSelectSeq={(seq) => onSelect({ kind: "seq", seq })}
-                />
-              ))
-            : null}
-          {ids.length === 0 && !(title === "CONTESTED" && cards.length > 0) ? <p className="muted mc-empty">none</p> : null}
-          <ul className="mc-cards">
-            {ids.map((id) => {
-              const node = byItem.get(id);
-              return node ? (
-                <ItemCard
-                  key={id}
-                  node={node}
-                  label={labels.get(id) ?? id}
-                  selected={selection?.kind === "item" && selection.id === id}
-                  onSelect={() => onSelect({ kind: "item", id })}
-                  onSelectAgent={(agent) => onSelect({ kind: "agent", id: agent })}
-                />
-              ) : null;
-            })}
-          </ul>
-        </section>
-      ))}
+        );
+        return (
+          <section key={title} className={`mc-column col-${title.toLowerCase()}${folded ? " is-folded" : ""}`}>
+            {folded ? (
+              <details>
+                <summary>
+                  {heading}
+                  <span className="mc-column-names">{ids.map((id) => labels.get(id) ?? id).join(", ")}</span>
+                </summary>
+                <ul className="mc-cards">
+                  {ids.map((id) => {
+                    const node = byItem.get(id);
+                    return node ? (
+                      <ItemCard
+                        key={id}
+                        node={node}
+                        label={labels.get(id) ?? id}
+                        selected={false}
+                        onSelect={() => onSelect({ kind: "item", id })}
+                        onSelectAgent={(agent) => onSelect({ kind: "agent", id: agent })}
+                      />
+                    ) : null;
+                  })}
+                </ul>
+              </details>
+            ) : (
+              <>
+                {heading}
+                {title === "CONTESTED"
+                  ? cards.map((card) => (
+                      <EscalationCard
+                        key={card.key}
+                        card={card}
+                        busy={busy}
+                        onResolve={onResolve}
+                        onSelectSeq={(seq) => onSelect({ kind: "seq", seq })}
+                      />
+                    ))
+                  : null}
+                {ids.length === 0 && !(title === "CONTESTED" && cards.length > 0) ? <p className="muted mc-empty">none</p> : null}
+                <ul className="mc-cards">
+                  {ids.map((id) => {
+                    const node = byItem.get(id);
+                    return node ? (
+                      <ItemCard
+                        key={id}
+                        node={node}
+                        label={labels.get(id) ?? id}
+                        selected={selection?.kind === "item" && selection.id === id}
+                        onSelect={() => onSelect({ kind: "item", id })}
+                        onSelectAgent={(agent) => onSelect({ kind: "agent", id: agent })}
+                      />
+                    ) : null;
+                  })}
+                </ul>
+              </>
+            )}
+          </section>
+        );
+      })}
     </div>
   );
 }
+
+/** A Board column with more items than this folds behind its heading. */
+const COLUMN_OPEN_MAX = 3;
 
 // ---------------------------------------------------------------------------
 // Graph
