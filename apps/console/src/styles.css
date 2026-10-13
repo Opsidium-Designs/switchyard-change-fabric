@@ -2130,3 +2130,168 @@ body {
 .mc-jev-type { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-style: normal; font-weight: 600; }
 .mc-jev-outcome { color: var(--text); }
 .mc-jev-seq { margin-left: auto; color: var(--muted); font-style: normal; }
+
+/* --- The timeline panel: narrator, chapters with their gate markers, replay controls --- */
+
+.mc,
+.mc.is-recorded {
+  grid-template-rows: auto minmax(520px, calc(100vh - 150px));
+  grid-template-areas:
+    "timeline timeline timeline"
+    "board graph right";
+}
+
+.mc-timeline {
+  grid-area: timeline;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.45rem 0.7rem 0.3rem;
+}
+
+.mc.is-recorded .mc-timeline { border-color: var(--replay-border); }
+
+.mc-timeline-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.3rem 1rem;
+}
+
+.mc-timeline .mc-ticker {
+  padding: 0;
+  font-size: 0.78rem;
+  gap: 0.2rem 0.7rem;
+  margin-left: auto;
+}
+
+.mc-timeline .mc-replay {
+  padding: 0.3rem 0 0;
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+}
+
+.mc-narrator {
+  flex: 1 1 32rem;
+  min-width: 0;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.2rem 0.5rem;
+  font-size: 1rem;
+  line-height: 1.35;
+}
+
+.mc-step {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  color: var(--muted);
+  min-width: 4.2rem;
+}
+
+.mc-narr-dot {
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  align-self: center;
+  flex: none;
+}
+
+.mc-narr-text { font-weight: 600; flex: 1 1 20rem; }
+.mc-narr-why { font-size: 0.78rem; color: var(--muted); white-space: nowrap; }
+.mc .mc-narr-self { font-size: 0.72rem; }
+
+.mc-timeline-story {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.9rem;
+}
+
+.mc-timeline-story .mc-chapters {
+  flex: 1 1 36rem;
+  min-width: 0;
+  padding: 0;
+  border: none;
+  background: none;
+}
+
+.mc-charts { display: flex; flex-direction: column; gap: 0.5rem; margin: 0 0 0.6rem; }
+.mc-charts .mc-chart-svg { width: 100%; max-width: 196px; }
+
+.mc-chapter-row {
+  list-style: none;
+  display: flex;
+  flex: 1 1 auto;
+  gap: 0.3rem;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.mc-chapter {
+  display: flex;
+  align-items: stretch;
+  gap: 0.15rem;
+  min-width: 6.2rem;
+  flex-basis: 0;
+}
+
+.mc .mc-chapter-btn {
+  position: relative;
+  overflow: hidden;
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 0.2rem 0.45rem;
+  border-radius: 6px;
+  text-align: left;
+  line-height: 1.15;
+}
+
+.mc-chapter-title {
+  position: relative;
+  z-index: 1;
+  font-size: 0.78rem;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.mc-chapter-meta {
+  position: relative;
+  z-index: 1;
+  font-size: 0.66rem;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.mc-chapter-fill {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 3px;
+  background: var(--accent);
+}
+
+.mc-chapter.is-past .mc-chapter-fill { background: var(--muted); opacity: 0.6; }
+.mc-chapter.is-ahead .mc-chapter-btn { opacity: 0.55; border-style: dashed; }
+.mc .mc-chapter.is-current .mc-chapter-btn { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.mc .mc-gate-marker.is-ahead { border: 1px dashed var(--border); color: var(--muted); opacity: 0.6; }
+
+@media (max-width: 1100px) {
+  .mc,
+  .mc.is-recorded {
+    grid-template-rows: auto;
+    grid-template-areas: "timeline" "graph" "board" "right";
+  }
+  .mc-chapter-row { flex-wrap: wrap; }
+}
+.mc-charts .mc-chart figcaption { white-space: normal; }

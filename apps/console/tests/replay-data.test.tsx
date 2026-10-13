@@ -137,7 +137,7 @@ describe("the recorded view", () => {
       createElement(MissionControl, { log: run.messages, escalations: [], busy: false, onResolve: () => undefined, recorded: true, initialSeq: 110 }),
     );
     expect(markup).toContain('class="mc is-recorded"');
-    expect(markup).toContain("recorded run: seq 110/178");
+    expect(markup).toContain("seq 110/178");
     expect(markup).not.toContain("LIVE");
     expect(markup).not.toContain("go live");
     expect(markup).toContain("end: final verdict");

@@ -30,7 +30,7 @@ import {
   smartItemTitles,
   speculativeLanded,
 } from "../src/board-overlay.ts";
-import { BoardNodeDetail, GateStrip, hullHeader, MissionControl } from "../src/mission-control.tsx";
+import { BoardNodeDetail, ChapterStrip, hullHeader, MissionControl } from "../src/mission-control.tsx";
 import { loadReplay } from "../src/replay-data.ts";
 import { nextTheme, readStoredTheme, storeTheme, themeFromSearch, THEME_STORAGE_KEY } from "../src/theme.tsx";
 import { boardLayout } from "@switchyard-change/orchestration/board-graph";
@@ -205,7 +205,7 @@ describe("the gate timeline", () => {
   });
 
   it("shows an empty timeline honestly before any revision", () => {
-    const html = renderToStaticMarkup(createElement(GateStrip, { markers: [], chart: { series: [] }, focus: null, onHover: () => {}, onSelect: () => {} }));
+    const html = renderToStaticMarkup(createElement(ChapterStrip, { chapters: [], k: 0, markers: [], focus: null, onHover: () => {}, onSelect: () => {}, onSeek: () => {} }));
     expect(html).toContain("no integrated revision yet");
   });
 });

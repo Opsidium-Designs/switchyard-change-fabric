@@ -128,9 +128,8 @@ describe("mission control at the live head", () => {
     // Outside the gate timeline (one marker per revision), the ticker, and the thread (where a row IS the integrated.rev message).
     const outsideRevs = markup
       .replace(/<g class="mc-node kind-rev[\s\S]*?<\/g>/g, "")
-      .replace(/<div class="mc-gate"[\s\S]*?<div class="mc-board"/, "")
-      .replace(/<div class="mc-ticker"[\s\S]*?<\/div>/, "")
-      .replace(/<div class="mc-right"[\s\S]*?<div class="mc-replay"/, "");
+      .replace(/<div class="mc-timeline"[\s\S]*?<div class="mc-board"/, "")
+      .replace(/<div class="mc-right"[\s\S]*$/, "");
     expect(outsideRevs).not.toMatch(/GATE (PASS|FAIL)/);
     expect(markup).not.toMatch(/correct/i);
   });

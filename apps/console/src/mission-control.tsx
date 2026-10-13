@@ -43,10 +43,10 @@ import {
   type GateMarker,
   type JevRow,
   type LandedPart,
-  type ProgressChart,
   type SuiteSeries,
 } from "./board-overlay";
 import { IDENTITY_VIEW, shouldZoomOnWheel, zoomAt, type ViewTransform } from "./graph-interactions";
+import { chapters as runChapters, formatDuration, narrateAt, type Chapter, type Narration } from "./narration";
 import { keyMoments, MOMENT_GROUPS, type MomentKind } from "./replay-data";
 
 /**
@@ -343,7 +343,7 @@ export function Ticker({
       {recorded ? null : <span className="mc-goal" title={ticker.goalSeq !== undefined ? `${ticker.goal ?? ""} (seq ${ticker.goalSeq}, goal.posted)` : undefined}>
         {ticker.goal ?? "no goal posted yet"}
       </span>}
-      {rev ? (
+      {recorded ? null : rev ? (
         <span className={`mc-rev-chip ${gateClass}`} title={`(seq ${rev.seq}, integrated.rev)`}>
           rev {rev.n} [{rev.label}]
           {rev.progress ? (
@@ -365,12 +365,7 @@ export function Ticker({
         {ticker.items.open} open, {ticker.items.claimed} claimed, {ticker.items.contested} contested, {ticker.items.done} done{ticker.items.proposed > 0 ? `, ${ticker.items.proposed} awaiting the lead` : ""}
       </span>
       <span className="mc-jev advisory">{ticker.jev.label}</span>
-      {recorded ? (
-        <span className="mc-replaying">
-          recorded run: seq {k}/{lastSeq}
-          {k >= lastSeq ? " (end)" : ""}
-        </span>
-      ) : !live ? (
+      {recorded ? null : !live ? (
         <span className="mc-replaying">
           replay: seq {k}/{lastSeq}
         </span>
@@ -385,60 +380,144 @@ export function Ticker({
 
 const GATE_WORD: Record<GateMarker["verdict"], string> = { pass: "PASS", fail: "FAIL", "no-gate": "NO GATE" };
 
-/**
- * The gate timeline: one marker per integrated revision at K (number, verdict,
- * acceptance count), beside the acceptance-over-revisions charts. Hovering or
- * selecting a marker draws that revision's links in the graph.
- */
-export function GateStrip({
-  markers,
-  chart,
+/** A revision's gate marker: number, verdict, acceptance count. Hover or select it to draw its links. */
+function GateMarkerButton({
+  marker: m,
   focus,
   onHover,
   onSelect,
 }: {
-  markers: readonly GateMarker[];
-  chart: ProgressChart;
+  marker: GateMarker;
   focus: number | null;
   onHover: (n: number | null) => void;
   onSelect: (n: number) => void;
 }) {
   return (
-    <div className="mc-gate" aria-label="Gate timeline">
-      <span className="mc-gate-title" title="Every integrated revision; the gate on the integrated tree decides">
-        GATE
+    <button
+      type="button"
+      className={`mc-gate-marker is-${m.verdict}${m.landed ? " is-landed" : ""}${focus === m.n ? " is-focus" : ""}`}
+      aria-label={`revision ${m.n}: ${m.verdictLabel}${m.count ? `, ${m.count}` : ""}`}
+      title={m.tooltip}
+      onMouseEnter={() => onHover(m.n)}
+      onMouseLeave={() => onHover(null)}
+      onFocus={() => onHover(m.n)}
+      onBlur={() => onHover(null)}
+      onClick={() => onSelect(m.n)}
+    >
+      <span className="mc-gate-n">r{m.n}</span>
+      <span className="mc-gate-verdict">{GATE_WORD[m.verdict]}</span>
+      {m.count ? <span className={`mc-gate-count${m.acceptanceNotRun !== undefined ? " is-gap" : ""}`}>{m.count}</span> : null}
+    </button>
+  );
+}
+
+/**
+ * The run's chapters (from the full log, so the strip holds still while
+ * scrubbing), each ending at the gate marker of the revision that closed it.
+ * A chapter's marker appears only once the cursor has reached that revision,
+ * so the strip never tells the ending early. Clicking a chapter seeks to its
+ * start; hovering or selecting a marker draws that revision's links.
+ */
+export function ChapterStrip({
+  chapters: list,
+  k,
+  markers,
+  focus,
+  onHover,
+  onSelect,
+  onSeek,
+}: {
+  chapters: readonly Chapter[];
+  k: number;
+  markers: readonly GateMarker[];
+  focus: number | null;
+  onHover: (n: number | null) => void;
+  onSelect: (n: number) => void;
+  onSeek: (seq: number) => void;
+}) {
+  const byRev = new Map(markers.map((m) => [m.n, m]));
+  return (
+    <div className="mc-gate mc-chapters" aria-label="Gate timeline">
+      <span className="mc-gate-title" title="The run in chapters; each revision ends at its gate, and the gate on the integrated tree decides">
+        STORY
       </span>
-      {markers.length === 0 ? (
-        <span className="muted mc-gate-empty">no integrated revision yet</span>
-      ) : (
-        <ol className="mc-gate-row">
-          {markers.map((m) => (
-            <li key={m.n}>
+      <ol className="mc-chapter-row">
+        {list.map((c) => {
+          const span = c.endSeq - c.startSeq + 1;
+          const state = k > c.endSeq ? "is-past" : k >= c.startSeq ? "is-current" : "is-ahead";
+          const fill = state === "is-past" ? 1 : state === "is-current" ? (k - c.startSeq + 1) / span : 0;
+          const marker = c.rev ? byRev.get(c.rev.n) : undefined;
+          return (
+            <li key={c.startSeq} className={`mc-chapter kind-${c.kind} ${state}`} style={{ flexGrow: Math.max(1, Math.sqrt(span)) }}>
               <button
                 type="button"
-                className={`mc-gate-marker is-${m.verdict}${m.landed ? " is-landed" : ""}${focus === m.n ? " is-focus" : ""}`}
-                aria-label={`revision ${m.n}: ${m.verdictLabel}${m.count ? `, ${m.count}` : ""}`}
-                title={m.tooltip}
-                onMouseEnter={() => onHover(m.n)}
-                onMouseLeave={() => onHover(null)}
-                onFocus={() => onHover(m.n)}
-                onBlur={() => onHover(null)}
-                onClick={() => onSelect(m.n)}
+                className="mc-chapter-btn"
+                aria-current={state === "is-current" ? "step" : undefined}
+                title={`${c.title}${c.rev ? `, ending at revision ${c.rev.n}` : ""}: seq ${c.startSeq} to ${c.endSeq}${c.durationMs !== undefined ? `, ${formatDuration(c.durationMs)} of the live run` : ""}: jump to its start`}
+                onClick={() => onSeek(c.startSeq)}
               >
-                <span className="mc-gate-n">r{m.n}</span>
-                <span className="mc-gate-verdict">{GATE_WORD[m.verdict]}</span>
-                {m.count ? (
-                  <span className={`mc-gate-count${m.acceptanceNotRun !== undefined ? " is-gap" : ""}`}>{m.count}</span>
-                ) : null}
+                <span className="mc-chapter-title">{c.title}</span>
+                <span className="mc-chapter-meta">
+                  {span} msg{c.durationMs !== undefined ? ` · ${formatDuration(c.durationMs)}` : ""}
+                </span>
+                <span className="mc-chapter-fill" style={{ width: `${Math.round(fill * 100)}%` }} aria-hidden="true" />
               </button>
+              {marker ? (
+                <GateMarkerButton marker={marker} focus={focus} onHover={onHover} onSelect={onSelect} />
+              ) : null}
             </li>
-          ))}
-        </ol>
-      )}
-      {chart.series.map((series) => (
-        <SuiteChart key={series.suite} series={series} landed={chart.landed} focus={focus} />
-      ))}
+          );
+        })}
+      </ol>
+      {markers.length === 0 ? <span className="muted mc-gate-empty">no integrated revision yet</span> : null}
     </div>
+  );
+}
+
+/** Message types that start a thread of their own: no earlier message causes them. */
+const ORIGIN_TYPES = new Set<BoardMessage["type"]>(["goal.posted", "agent.joined", "agent.left", "item.proposed", "item.claimed", "help.requested", "contract.proposed", "token.refreshed"]);
+
+/**
+ * The narrator: one plain sentence for the message at K, with the earlier
+ * messages the log links it to. Read from the recorded log only; a message
+ * with no recorded cause says so instead of guessing one.
+ */
+export function Narrator({
+  narration,
+  onSelectSeq,
+}: {
+  narration: Narration | null;
+  onSelectSeq: (seq: number) => void;
+}) {
+  if (!narration) {
+    return (
+      <p className="mc-narrator" role="status">
+        <span className="muted">Nothing on the board yet.</span>
+      </p>
+    );
+  }
+  const shown = narration.causes.slice(0, 4);
+  return (
+    <p className="mc-narrator" role="status" aria-live="polite">
+      <span className="mc-narr-dot" style={{ background: FAMILY_COLORS[boardMessageFamily(narration.type)] }} aria-hidden="true" />
+      <span className="mc-narr-text">{narration.text}</span>
+      {shown.length > 0 ? (
+        <span className="mc-narr-why">
+          after{" "}
+          {shown.map((seq) => (
+            <button key={seq} type="button" className="mc-seq-link" onClick={() => onSelectSeq(seq)} title="the earlier message the log links this one to">
+              seq {seq}
+            </button>
+          ))}
+          {narration.causes.length > shown.length ? ` +${narration.causes.length - shown.length}` : ""}
+        </span>
+      ) : !ORIGIN_TYPES.has(narration.type) ? (
+        <span className="mc-narr-why muted">no recorded cause</span>
+      ) : null}
+      <button type="button" className="mc-seq-link mc-narr-self" onClick={() => onSelectSeq(narration.seq)} title="open this message in the thread">
+        {narration.type}
+      </button>
+    </p>
   );
 }
 
@@ -701,6 +780,7 @@ export function BoardPane({
   onSelect,
   onResolve,
   log,
+  charts,
 }: {
   model: BoardGraphModel;
   cards: readonly EscalationCardData[];
@@ -710,6 +790,8 @@ export function BoardPane({
   onResolve: (id: string, decision: string) => void | Promise<void>;
   /** The board log: when given, seam and tool items read by their recorded origin. */
   log?: readonly BoardMessage[];
+  /** The acceptance-over-revisions charts, shown above the columns. */
+  charts?: ReactNode;
 }) {
   const byItem = new Map(model.nodes.filter((n) => n.kind === "item").map((n) => [n.label, n]));
   const short = boardShortLabels([...byItem.keys()], { seeds: seedItemIds(model) });
@@ -727,6 +809,7 @@ export function BoardPane({
   return (
     <div className="mc-board" aria-label="Board">
       <h2>BOARD</h2>
+      {charts}
       {best !== undefined ? (
         <p className="muted mc-ratchet" title="the best-scoring failing revision before the first pass: what new pushes are stacked on; it never moves the head or promotes">
           {best}
@@ -2179,6 +2262,15 @@ export function MissionControl({
   const arrows = useMemo(() => (talk ? (attempt(() => communicationArrows(log, k)).value ?? []) : []), [log, k, talk]);
   const chart = useMemo(() => attempt(() => progressChart(log, k)).value ?? { series: [] }, [log, k]);
 
+  const story = useMemo(() => runChapters(log), [log]);
+  const seek = useCallback(
+    (seq: number) => {
+      setPlaying(false);
+      setCursor(seq >= lastSeq ? "live" : seq);
+    },
+    [lastSeq],
+  );
+
   // The replay controls render even when the graph refuses to draw, so a bad seq never strands the viewer.
   const replayBar = (
     <ReplayBar
@@ -2188,10 +2280,7 @@ export function MissionControl({
       playing={playing}
       speed={speed}
       recorded={recorded}
-      onSeek={(seq) => {
-        setPlaying(false);
-        setCursor(seq >= lastSeq ? "live" : seq);
-      }}
+      onSeek={seek}
       onLive={() => {
         setPlaying(false);
         setCursor("live");
@@ -2239,20 +2328,53 @@ export function MissionControl({
   const focusRev = hoverRev ?? selectedRev;
   const landed = selectedNode?.detail.kind === "rev" ? speculativeLanded(log, k, selectedNode.detail.n) : undefined;
 
+  const narration = narrateAt(log, k, payloadSummary);
+  const selectSeqInThread = (seq: number) => {
+    select({ kind: "seq", seq });
+    setTab("thread");
+  };
+
   return (
     <section className={`mc${recorded ? " is-recorded" : ""}`} aria-label="Mission control">
-      <Ticker ticker={model.ticker} live={live} k={k} lastSeq={lastSeq} recorded={recorded} />
-      <GateStrip
-        markers={markers}
-        chart={chart}
-        focus={focusRev}
-        onHover={setHoverRev}
-        onSelect={(n) => {
-          select({ kind: "node", id: `rev:${n}` });
-          setTab("node");
-        }}
+      <div className="mc-timeline" aria-label="Timeline">
+        <div className="mc-timeline-head">
+          <Narrator narration={narration} onSelectSeq={selectSeqInThread} />
+          <Ticker ticker={model.ticker} live={live} k={k} lastSeq={lastSeq} recorded={recorded} />
+        </div>
+        <div className="mc-timeline-story">
+          <ChapterStrip
+            chapters={story}
+            k={k}
+            markers={markers}
+            focus={focusRev}
+            onHover={setHoverRev}
+            onSelect={(n) => {
+              select({ kind: "node", id: `rev:${n}` });
+              setTab("node");
+            }}
+            onSeek={seek}
+          />
+        </div>
+        {replayBar}
+      </div>
+      <BoardPane
+        model={model}
+        cards={cards}
+        selection={selection}
+        busy={busy}
+        onSelect={select}
+        onResolve={onResolve}
+        log={log}
+        charts={
+          chart.series.length > 0 ? (
+            <div className="mc-charts">
+              {chart.series.map((series) => (
+                <SuiteChart key={series.suite} series={series} landed={chart.landed} focus={focusRev} />
+              ))}
+            </div>
+          ) : null
+        }
       />
-      <BoardPane model={model} cards={cards} selection={selection} busy={busy} onSelect={select} onResolve={onResolve} log={log} />
       <div className="mc-graph" aria-label="Graph">
         <div className="mc-graph-controls">
           <strong>GRAPH</strong>
@@ -2339,7 +2461,6 @@ export function MissionControl({
           <ToolsRegistry model={model} />
         )}
       </div>
-      {replayBar}
     </section>
   );
 }
