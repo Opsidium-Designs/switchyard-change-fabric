@@ -41,7 +41,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: export-replay preview-replayreplay-build replay-preview deploy-replay delete-replay jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: export-replay preview-replay replay-build replay-preview deploy-replay delete-replay jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
