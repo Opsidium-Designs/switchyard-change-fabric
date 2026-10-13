@@ -1,7 +1,8 @@
 # The replay page
 
 A static, zero-cost public page that plays back REAL recorded board runs in the
-browser. It is the console's mission control (graph, board, threads, tools tab,
+browser (and one clearly labelled SIMULATED run at scale: see "The simulated
+run at scale" below). It is the console's mission control (graph, board, threads, tools tab,
 progress, scrubber) built in a replay mode: the recorded board log is folded
 with the same `buildBoardGraph(log, k)` the live console uses, so the view at
 seq K is exactly what the board had recorded at K. Nothing runs: no Worker, no
@@ -165,9 +166,70 @@ make delete-replay    # remove it again
 | `board-live-reg3` | verified | service-api: 6 resource items, a codemod built and published, acceptance 10/20, 16/20, then 20/20 on revision 3 |
 | `board-live-sf7` | failed | storefront: contracts, help, handoffs, a scanner and a codemod; a shared Invoice change broke typecheck for revisions 2 to 9; best acceptance 40/129 |
 | `board-live-sf8` | failed | storefront: 7 contract proposals, 4 escalated to a human; acceptance peaked at 35/129; two seam items stalled |
+| `board-sim-100` | verified (SIMULATED) | NOT a live run: 100 scripted agents and a lead on a generated 100-module project; a seeded scanner and codemod, a scanner-found item split three ways under a sub-lead, the fixture gate failing revision 1 and passing revision 2, the gated tree promoted; 853 messages |
 
 Runs recorded before promotions were written to the board (the three above)
 carry no `revision.promoted`, so the page reports the recorded verdict, never
 promotion, and their PROOF tab says not proven (no promotion recorded). A run
 recorded since shows "VERIFIED AND PROMOTED" only from its recorded
 `revision.promoted`.
+
+## The simulated run at scale
+
+`board-sim-100` is the one run on the page that is NOT a live run. It is
+labelled SIMULATED everywhere a viewer meets it: `simulated: true` in the
+replay file and its index entry, a title starting "SIMULATED:", a description
+starting with what that means, a SIMULATED chip on its picker card and in the
+run header (in place of the recorded-run chip), a one-line explanation under
+the header, and a sentence in its verdict panel.
+
+What is real: the board and its reducer (every message is one a board
+accepted; the page checks it with `reduceBoard` like every other run), the
+claims and their arbitration, the lead's seeded scanner and codemod (built,
+gated on their own tests, published, and run), the continuous integrator and
+its merges, the gate step on the exact integrated tree, the fix request and
+the fix loop, item completion derived from a passing revision, and the
+promotion of the gated tree to a local Git branch with its receipt. It runs
+offline (`run-board --offline`) on the concurrent schedule a live run uses,
+with about 100 agents under a dial of 100.
+
+What is NOT real, and what a viewer must not read into it:
+
+- No model took part. Every agent turn is the generic offline policy (the same
+  goal-agnostic stand-in `make demo-board` uses), with free workers spread over
+  the open items (`--spread-claims`: agent-k reads the open items from the
+  k-th, so a wide pool does not all reach for the first one). Every edit is the
+  deterministic noop executor writing a marker into its files: no validation
+  was added to any module.
+- The gate is the offline FIXTURE, not the project's tests (the generated
+  project has none): it fails the first integrated revision, naming one file,
+  and passes once that file is edited again. "Verified" and "PROVEN" on this
+  run therefore mean the engine's mechanics held (the gate step ran on the
+  promoted tree, the promoted commit is the gated one), not that the goal's
+  code change was made.
+- The planner is the heuristic decomposition (one item per module), not a
+  planner model.
+- Times are not real: the offline board stamps one second per message from a
+  fixed start (2026-01-01), so the chapter durations count messages, and no
+  model latency or cost is in them.
+
+The project is generated at run time and never committed:
+`examples/scale/make-scale-project.mjs <dir>` writes 10 domains x 10 route
+modules (`src/<domain>/<module>.ts`) over three shared contract files, with
+the last module of each domain importing the first (so the plan has a little
+dependency order), no dependencies, and no gate script. Regenerate the replay
+with:
+
+```bash
+make demo-board-scale   # SCALE_MAX=100 SCALE_INFLIGHT=16 SCALE_TURNS=8000 SCALE_ID=board-sim-100
+```
+
+It generates the project in a temp directory, runs
+`run-board --offline --fixture-gate --concurrent --spread-claims --board-out <file>`
+(the raw board log and Change snapshot, unscrubbed, kept in the temp
+directory), then `export-replay --from-file <file> --simulated`, which scrubs
+it and refuses anything token-like exactly as for a live export, and writes
+`apps/console/public/replays/board-sim-100.json` and its index entry (the
+description's counts are always read fresh from the new log). The concurrent
+schedule interleaves differently each time, so a regenerated replay is a
+different log, not a byte-identical one. No credentials and no network.

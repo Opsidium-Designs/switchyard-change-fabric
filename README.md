@@ -28,7 +28,9 @@ make demo-board-storefront  # the same board on the larger multi-domain storefro
 
 Real board runs, recorded from the Worker, played back in the browser with the
 same mission control as a live run: no Worker, no launcher, no credentials, no
-model calls. Failed runs are included on purpose.
+model calls. Failed runs are included on purpose. One run, `board-sim-100`, is
+labelled SIMULATED: about 100 scripted agents on the real board engine with the
+offline fixture gate (`make demo-board-scale`), to show coordination at scale.
 
 ```bash
 make replay-preview   # build and serve the replay page on http://127.0.0.1:4180

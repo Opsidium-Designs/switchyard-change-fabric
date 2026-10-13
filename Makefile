@@ -23,6 +23,7 @@
 #   make run-board-cityhall   live board run on the cityhall app at ~30 agents (needs a running Worker and inference)
 #   make cityhall-gate  install the cityhall app's pinned deps and run its gate (fails on the planted gaps)
 #   make cityhall-reference-check  prove cityhall is solvable: baseline gate fails, reference solution passes (offline)
+#   make demo-board-scale  a SIMULATED ~100-agent board run (real engine, scripted agents) published to the replay page
 #   make demo-live   one-command watchable live demo (needs `make dev-all` running)
 #   make clean-live  tear down the real repos a watch run left up
 #   make seed-change seed the demo Change into a running Worker (for the console)
@@ -45,7 +46,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: export-replay preview-replay replay-build replay-preview deploy-replay delete-replay jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-board-cityhall run-board-cityhall cityhall-gate cityhall-reference-check demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: export-replay preview-replay replay-build replay-preview deploy-replay delete-replay jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-board-cityhall run-board-cityhall cityhall-gate cityhall-reference-check demo-board-scale demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -356,6 +357,41 @@ cityhall-gate:
 cityhall-reference-check:
 	cd examples/apps/cityhall && npm ci --no-audit --no-fund
 	node examples/reference/check-cityhall.mjs
+
+# A SIMULATED board run at scale for the replay page: about 100 agents on a
+# generated 100-module project (examples/scale/make-scale-project.mjs writes it
+# into a temp directory; nothing is committed but the replay). The board,
+# claims, contracts, tools, integration, gate step, and promotion are the real
+# engine (the offline run, on the concurrent schedule live runs use); the
+# agents' turns are the generic offline policy spreading free workers over the
+# open items (--spread-claims), their edits the deterministic noop executor,
+# and the gate the offline FIXTURE (fails the first revision, passes once that
+# file is edited again): it shows coordination at scale, not agents fixing code.
+# It writes apps/console/public/replays/$(SCALE_ID).json plus its index entry,
+# labelled SIMULATED in the file, the title, the description, and on the page.
+# The concurrent schedule interleaves differently each run, so a regenerated
+# replay is a different (equally real) log. No credentials, no network.
+SCALE_GOAL = $(CURDIR)/examples/scale/scale.goal.txt
+SCALE_ID ?= board-sim-100
+SCALE_MAX ?= 100
+SCALE_INFLIGHT ?= 16
+SCALE_TURNS ?= 8000
+
+demo-board-scale:
+	@work=$$(mktemp -d "$${TMPDIR:-/tmp}/scf-board-scale-XXXXXX") && \
+	node examples/scale/make-scale-project.mjs "$$work/project" && \
+	echo "Simulated board run ($(SCALE_MAX) agents; the transcript goes to $$work/run.log)..." && \
+	start=$$(date +%s); \
+	npm -w apps/cli run dev -- run-board --offline --fixture-gate --concurrent --spread-claims --decide-contracts $(DECIDE_CONTRACTS) \
+	  --goal-file "$(SCALE_GOAL)" --project "$$work/project" --id $(SCALE_ID) \
+	  --min 1 --max $(SCALE_MAX) --max-inflight $(SCALE_INFLIGHT) --max-turns $(SCALE_TURNS) \
+	  --board-out "$$work/board.json" > "$$work/run.log" 2>&1; status=$$?; \
+	echo "run-board exit $$status after $$(( $$(date +%s) - start )) s"; \
+	sed -n '/^Board run for/,$$p' "$$work/run.log"; \
+	test -f "$$work/board.json" || { echo "no board export written; see $$work/run.log"; exit 1; }; \
+	npm -w apps/console run export-replay -- --from-file "$$work/board.json" --id $(SCALE_ID) --simulated --app scale-project \
+	  --title "$(SCALE_MAX) scripted agents on a 100-module project" \
+	  --description "A generated project of 10 domains x 10 route modules over shared contracts; the real board engine runs the claims, tools, integration, fix loop, and promotion while every agent turn is scripted."
 
 # The watchable live headline run. It uses the seeded audit-logging Change (which
 # has the hardcoded src/audit/events.ts collision), so the human escalation beat

@@ -40,6 +40,15 @@
       "outcome": "failed",
       "description": "The same storefront goal with a lead and 6 workers: 7 contract proposals (6 accepted, 1 rejected by the lead, 4 escalated to a human), help requests, a volunteer, and handoffs. Acceptance peaks at 35/129 on revisions 6 and 7, later revisions fail typecheck, and two seam items stall. No revision passed the gate, so nothing was promoted. Recorded verdict: failed.",
       "messages": 178
+    },
+    {
+      "id": "board-sim-100",
+      "title": "SIMULATED: 100 scripted agents on a 100-module project",
+      "app": "scale-project",
+      "outcome": "verified",
+      "description": "Simulated: the real board engine (offline) with scripted agents (no model chose anything) and the offline fixture gate, not the project's tests. A generated project of 10 domains x 10 route modules over shared contracts; the real board engine runs the claims, tools, integration, fix loop, and promotion while every agent turn is scripted. 101 agent(s), 101 item(s) proposed, 2 integrated revision(s); last revision 2: gate pass; 853 board messages.",
+      "messages": 853,
+      "simulated": true
     }
   ]
 }

@@ -1491,7 +1491,8 @@ Usage:
 
 ```bash
 make demo-board                     # offline: local control, generic policy, noop executor, fixture gate
-switchyard-change run-board --offline [--fixture-gate] [--decide-contracts accept|reject] --goal-file <goal.txt> --project <dir> [--min N] [--max N] [--keep-work-root]
+switchyard-change run-board --offline [--fixture-gate] [--decide-contracts accept|reject] --goal-file <goal.txt> --project <dir> [--min N] [--max N] [--keep-work-root] \
+  [--concurrent] [--spread-claims] [--board-out <file>]   # the simulated run at scale: see docs/REPLAY.md
 switchyard-change run-board "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--max-inflight N] \
   [--id <changeId>] [--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] \
   [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] \
