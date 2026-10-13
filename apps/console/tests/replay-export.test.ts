@@ -13,12 +13,14 @@ import {
   fetchBoardLog,
   findLocalPaths,
   findSecrets,
+  labelSimulated,
   parseDotEnv,
   recordedOutcome,
   ReplayRefused,
   scrubString,
   scrubValue,
   sensitiveEnvValues,
+  SIMULATED_NOTE,
   slimSnapshot,
   upsertIndex,
 } from "../scripts/replay-export.ts";
@@ -132,6 +134,15 @@ describe("buildReplayFile", () => {
     expect(describeReplay(file)).toBe("1 agent(s), 1 item(s) proposed, 1 integrated revision(s); last revision 1: gate fail, acceptance 3/5; 4 board messages.");
   });
 
+  it("marks a simulated run (scripted agents) in the file, and only when asked", () => {
+    const live = buildReplayFile({ changeId: "board-live-x", messages });
+    expect("simulated" in live).toBe(false);
+    const sim = buildReplayFile({ changeId: "board-sim-x", messages }, { simulated: true });
+    expect(sim.simulated).toBe(true);
+    // The label sits before the log, so a reader of the raw file meets it first.
+    expect(Object.keys(sim).slice(0, 3)).toEqual(["format", "changeId", "simulated"]);
+  });
+
   it("refuses to build a file holding a secret, naming where", () => {
     const leaky = [...messages, msg(5, "push.announced", { item: "unit-a", note: "Bearer 0123456789abcdefXYZ" }, "agent-1")];
     let caught: unknown;
@@ -186,5 +197,21 @@ describe("upsertIndex", () => {
     const two = upsertIndex(one, { ...entry, id: "b" });
     const replaced = upsertIndex(two, { ...entry, title: "A2" });
     expect(replaced.runs.map((r) => `${r.id}:${r.title}`)).toEqual(["a:A2", "b:A"]);
+  });
+});
+
+describe("labelSimulated", () => {
+  const entry = { id: "board-sim-x", title: "100 agents", app: "scale-project", outcome: "verified" as const, description: "d.", messages: 3 };
+
+  it("labels a simulated entry's title, description, and flag, once", () => {
+    const labelled = labelSimulated(entry, true);
+    expect(labelled.title).toBe("SIMULATED: 100 agents");
+    expect(labelled.description).toBe(`${SIMULATED_NOTE} d.`);
+    expect(labelled.simulated).toBe(true);
+    expect(labelSimulated(labelled, true)).toEqual(labelled);
+  });
+
+  it("leaves a live entry exactly as it was", () => {
+    expect(labelSimulated(entry, false)).toBe(entry);
   });
 });

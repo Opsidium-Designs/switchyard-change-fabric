@@ -2435,3 +2435,26 @@ body {
 }
 
 .mc .mc-narrator .mc-preview-link { margin-left: 0.4rem; }
+
+/* --- A simulated run (scripted agents on the real engine): labelled everywhere --- */
+
+.replay-sim-chip {
+  font-size: 0.74rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: var(--warn);
+  border: 2px solid var(--warn);
+  border-radius: 4px;
+  padding: 0.08rem 0.55rem;
+  background: rgba(210, 153, 34, 0.14);
+}
+.replay-sim-explain {
+  margin: 0;
+  padding: 0.35rem 0.7rem;
+  border-left: 4px solid var(--warn);
+  background: rgba(210, 153, 34, 0.1);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+.replay-card.is-simulated { border-style: dashed; border-top-style: solid; border-top-color: var(--warn); }
+.replay-card .replay-sim-chip { align-self: flex-start; }

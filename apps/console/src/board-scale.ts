@@ -181,6 +181,8 @@ export function compactCards(itemCount: number): boolean {
 }
 
 const PLANNER_PREFIX = /^(?:unit|item|u)-(?=[A-Za-z0-9])/;
+/** An item a worker proposed: the board names it after its proposer (`agent-1-item-1`). */
+const AGENT_PROPOSED = /^agent-\d+-/;
 /** Source roots a scope directory skips (`src/billing` is the `billing` domain). */
 const SCOPE_ROOTS = new Set(["src", "lib", "app", "apps", "packages"]);
 
@@ -205,6 +207,9 @@ export function scopeDirectory(scope: readonly string[] | undefined): string | u
  * The lane of every top-level item: a split item's lane is its domain (its id,
  * or its prefix); other items join the lane of their domain prefix when two or
  * more items share it, else of their scope directory when shared, else `other`.
+ * A prefix more than half the board shares, over two or more shared scope
+ * directories, is an action verb, not a domain: those items take their
+ * directory's lane.
  */
 export function boardLanes(
   topLevel: readonly string[],
@@ -216,7 +221,10 @@ export function boardLanes(
   const prefixOf = new Map<string, string>();
   const dirOf = new Map<string, string>();
   for (const item of topLevel) {
-    const prefix = domainPrefix(item) ?? (isSplit(item) ? item.replace(PLANNER_PREFIX, "").toLowerCase() : undefined);
+    // An agent-proposed id (`agent-1-item-1`) names who proposed it, not a domain.
+    const prefix = AGENT_PROPOSED.test(item)
+      ? undefined
+      : (domainPrefix(item) ?? (isSplit(item) ? item.replace(PLANNER_PREFIX, "").toLowerCase() : undefined));
     if (prefix !== undefined) {
       prefixOf.set(item, prefix);
       prefixCount.set(prefix, (prefixCount.get(prefix) ?? 0) + 1);
@@ -227,11 +235,26 @@ export function boardLanes(
       dirCount.set(dir, (dirCount.get(dir) ?? 0) + 1);
     }
   }
+  // A prefix most of the board shares (a fanned-out action's verb, `validate-src-...`)
+  // says nothing about where the work is: when its items' scope directories
+  // split it into shared domains, those win.
+  const prefixDirs = new Map<string, Set<string>>();
+  for (const item of topLevel) {
+    const prefix = prefixOf.get(item);
+    const dir = dirOf.get(item);
+    if (prefix !== undefined && dir !== undefined && (dirCount.get(dir) ?? 0) >= 2) {
+      prefixDirs.set(prefix, (prefixDirs.get(prefix) ?? new Set()).add(dir));
+    }
+  }
+  const verbLike = (prefix: string) => (prefixCount.get(prefix) ?? 0) * 2 > topLevel.length && (prefixDirs.get(prefix)?.size ?? 0) >= 2;
   const lanes = new Map<string, string>();
   for (const item of topLevel) {
     const prefix = prefixOf.get(item);
     const dir = dirOf.get(item);
-    if (prefix !== undefined && (isSplit(item) || (prefixCount.get(prefix) ?? 0) >= 2)) lanes.set(item, prefix);
+    if (prefix !== undefined && !isSplit(item) && verbLike(prefix) && dir !== undefined && (dirCount.get(dir) ?? 0) >= 2) lanes.set(item, dir);
+    else if (prefix !== undefined && (isSplit(item) || (prefixCount.get(prefix) ?? 0) >= 2)) lanes.set(item, prefix);
+    // A split agent-proposed item: its scope's domain, else its own id.
+    else if (prefix === undefined && isSplit(item)) lanes.set(item, dir ?? item.toLowerCase());
     else if (dir !== undefined && ((dirCount.get(dir) ?? 0) >= 2 || prefixCount.has(dir))) lanes.set(item, dir);
     else lanes.set(item, "other");
   }
@@ -521,6 +544,16 @@ export function compactHullTitle(item: string, label: string, context: string | 
       const rest = stripped.slice(head.length + 1);
       // Only when the label is the id or a shortening of it: a label read from the item's origin stays.
       return label === item || label === stripped || rest.endsWith(label) || label.endsWith(rest) ? rest : label;
+    }
+  }
+  // The lane's word inside the id (`validate-src-parking-appeals` in lane `parking`),
+  // or leading a shortened label of it (`parking-appeals`): what follows it.
+  if (label === item || label === stripped || stripped.endsWith(label)) {
+    const lower = label.toLowerCase();
+    for (const sep of [".", "-", "_", "/"]) {
+      if (lower.startsWith(`${head}${sep}`) && label.length > head.length + 1) return label.slice(head.length + 1);
+      const at = lower.indexOf(`${sep}${head}${sep}`);
+      if (at >= 0 && at + head.length + 2 < label.length) return label.slice(at + head.length + 2);
     }
   }
   return label;

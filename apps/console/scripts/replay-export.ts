@@ -26,9 +26,19 @@ export const REPLAY_FORMAT = "switchyard-replay/v1";
 /** The snapshot fields a replay keeps (everything else is dropped before publishing). */
 export const SNAPSHOT_ALLOW = ["id", "objective", "status", "dial", "integration", "planningFailure", "escalations", "board", "previews"] as const;
 
+/**
+ * What a SIMULATED replay is, in one line: the board, claims, contracts,
+ * integration, gate, and promotion ran in the real engine (offline), but every
+ * agent turn and edit was scripted (no model). Shown wherever a viewer sees one.
+ */
+export const SIMULATED_NOTE =
+  "Simulated: the real board engine (offline) with scripted agents (no model chose anything) and the offline fixture gate, not the project's tests.";
+
 export interface ReplayFile {
   readonly format: typeof REPLAY_FORMAT;
   readonly changeId: string;
+  /** Set on a simulated run (scripted agents on the real engine); absent on a recorded live run. */
+  readonly simulated?: true;
   readonly messages: readonly BoardMessage[];
   readonly snapshot: Record<string, unknown> | null;
 }
@@ -42,6 +52,8 @@ export interface ReplayIndexEntry {
   readonly outcome: ReplayOutcome;
   readonly description: string;
   readonly messages: number;
+  /** Set on a simulated run (scripted agents on the real engine); absent on a recorded live run. */
+  readonly simulated?: true;
 }
 
 export interface ReplayIndex {
@@ -272,7 +284,7 @@ export class ReplayRefused extends Error {
  */
 export function buildReplayFile(
   raw: { readonly changeId: string; readonly messages: readonly BoardMessage[]; readonly snapshot?: unknown },
-  options: { readonly repoRoot?: string; readonly env?: Record<string, string | undefined> } = {},
+  options: { readonly repoRoot?: string; readonly env?: Record<string, string | undefined>; readonly simulated?: boolean } = {},
 ): ReplayFile {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(raw.changeId)) {
     throw new Error(`refusing an unsafe change id: ${JSON.stringify(raw.changeId)}`);
@@ -284,7 +296,13 @@ export function buildReplayFile(
     if (m.seq !== i + 1) throw new Error(`the board log is not contiguous at index ${i} (seq ${m.seq})`);
   });
   const file: ReplayFile = scrubValue(
-    { format: REPLAY_FORMAT, changeId: raw.changeId, messages: raw.messages, snapshot: slimSnapshot(raw.snapshot ?? null) },
+    {
+      format: REPLAY_FORMAT,
+      changeId: raw.changeId,
+      ...(options.simulated ? { simulated: true as const } : {}),
+      messages: raw.messages,
+      snapshot: slimSnapshot(raw.snapshot ?? null),
+    },
     options.repoRoot,
   );
   const findings = findSecrets(file, options.env ?? {});
@@ -363,6 +381,18 @@ export function describeReplay(file: ReplayFile): string {
     ? `; last revision ${p.n}: gate ${p.gate}${p.progress?.acceptance ? `, acceptance ${p.progress.acceptance.passed}/${p.progress.acceptance.total}` : ""}`
     : "";
   return `${agents.size} agent(s), ${items.size} item(s) proposed, ${revs} integrated revision(s)${lastRev}; ${file.messages.length} board messages.`;
+}
+
+/**
+ * A simulated run's index entry, labelled where a viewer reads it first: the
+ * title starts with "SIMULATED:" and the description carries SIMULATED_NOTE
+ * (neither is added twice), plus `simulated: true`. A live entry is unchanged.
+ */
+export function labelSimulated(entry: ReplayIndexEntry, simulated: boolean): ReplayIndexEntry {
+  if (!simulated) return entry;
+  const title = /^SIMULATED\b/.test(entry.title) ? entry.title : `SIMULATED: ${entry.title}`;
+  const description = entry.description.includes(SIMULATED_NOTE) ? entry.description : `${SIMULATED_NOTE} ${entry.description}`;
+  return { ...entry, title, description, simulated: true };
 }
 
 /** Insert or replace one run in the index (by id), keeping the rest in order. */

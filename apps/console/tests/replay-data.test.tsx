@@ -16,7 +16,7 @@ import { findLocalPaths, findSecrets } from "../scripts/replay-export.ts";
 import { buildProofBundle } from "@switchyard-change/orchestration/proof-bundle";
 
 import { hullHeader, MissionControl, ProofPanel, boardShortLabels, seedItemIds } from "../src/mission-control.tsx";
-import { RECORDED_BANNER, ReplayApp, VerdictPanel } from "../src/ReplayApp.tsx";
+import { RECORDED_BANNER, ReplayApp, RunKindChip, RunPicker, VerdictPanel } from "../src/ReplayApp.tsx";
 import {
   finalVerdict,
   keyMoments,
@@ -25,6 +25,8 @@ import {
   parseReplayParams,
   replayPath,
   replaySearch,
+  SIMULATED_CHIP,
+  SIMULATED_EXPLAIN,
   type ReplayRun,
 } from "../src/replay-data.ts";
 
@@ -49,7 +51,7 @@ describe("the published recorded runs", () => {
   it("are all listed in the index, and every index entry has a file", async () => {
     const index = await loadReplayIndex(fileFetch);
     expect(index.map((r) => `${r.id}.json`).sort()).toEqual([...replayFiles].sort());
-    expect(index.map((r) => r.id)).toEqual(["board-live-sf21", "board-live-l3", "board-live-reg3", "board-live-sf7", "board-live-sf8"]);
+    expect(index.map((r) => r.id)).toEqual(["board-live-sf21", "board-live-l3", "board-live-reg3", "board-live-sf7", "board-live-sf8", "board-sim-100"]);
   });
 
   it("fold at every seq with the shared board code, every node backed", async () => {
@@ -189,6 +191,71 @@ describe("the proof panel (from the log alone, in replay too)", () => {
       const html = renderToStaticMarkup(createElement(ProofPanel, { bundle, onSelectSeq: () => undefined }));
       expect(html).toContain(bundle.status === "proven" ? "PROVEN" : "NOT PROVEN");
       expect(html).not.toMatch(/undefined|NaN/);
+    }
+  });
+});
+
+describe("a simulated run is labelled wherever a viewer sees it", () => {
+  const live = { id: "board-live-x", title: "a live run", app: "storefront", outcome: "verified" as const, description: "real." };
+  const sim = { id: "board-sim-x", title: "SIMULATED: 100 agents", app: "scale-project", outcome: "verified" as const, description: "scripted.", simulated: true };
+
+  it("the picker marks the simulated card with the chip, and qualifies 'real runs'", () => {
+    const html = renderToStaticMarkup(createElement(RunPicker, { runs: [live, sim], error: null, onOpen: () => undefined }));
+    expect(html.match(/replay-sim-chip/g)).toHaveLength(1);
+    expect(html).toContain(SIMULATED_CHIP);
+    expect(html).toContain("replay-card is-verified is-simulated");
+    expect(html).toContain("except the runs marked SIMULATED");
+    // A list of live runs only reads as before.
+    const liveOnly = renderToStaticMarkup(createElement(RunPicker, { runs: [live], error: null, onOpen: () => undefined }));
+    expect(liveOnly).not.toContain("SIMULATED");
+  });
+
+  it("the run header shows the SIMULATED chip instead of the recorded-run chip, with what it means", () => {
+    const simChip = renderToStaticMarkup(createElement(RunKindChip, { simulated: true }));
+    expect(simChip).toContain(SIMULATED_CHIP);
+    expect(simChip).toContain(`title="${SIMULATED_EXPLAIN.replace(/'/g, "&#x27;")}"`);
+    expect(simChip).not.toContain(RECORDED_BANNER);
+    const liveChip = renderToStaticMarkup(createElement(RunKindChip, { simulated: false }));
+    expect(liveChip).toContain(RECORDED_BANNER);
+    expect(liveChip).not.toContain("SIMULATED");
+  });
+
+  it("the verdict of a simulated run says it was the fixture gate and scripted agents", async () => {
+    const verdict = finalVerdict(await load("board-live-reg3"));
+    const simulated = renderToStaticMarkup(createElement(VerdictPanel, { verdict, simulated: true }));
+    expect(simulated).toContain("SIMULATED run: the gate was the offline fixture check");
+    expect(renderToStaticMarkup(createElement(VerdictPanel, { verdict }))).not.toContain("SIMULATED");
+  });
+
+  it("the loader carries the file's simulated flag (and only a literal true)", async () => {
+    const { messages } = await load("board-live-reg3");
+    const body = (simulated: unknown) => async () =>
+      new Response(JSON.stringify({ format: "switchyard-replay/v1", changeId: "x", simulated, messages }), { status: 200 });
+    expect((await loadReplay(body(true), "x")).simulated).toBe(true);
+    expect((await loadReplay(body("yes"), "x")).simulated).toBeUndefined();
+  });
+
+  it("the published simulated run at scale: about 100 agents and 100 items on the real board, the fixture gate named", async () => {
+    const run = await load("board-sim-100");
+    expect(run.simulated).toBe(true);
+    const joined = run.messages.filter((m) => m.type === "agent.joined" && m.from !== "lead").length;
+    expect(joined).toBeGreaterThanOrEqual(90);
+    expect(run.messages.filter((m) => m.type === "item.proposed").length).toBeGreaterThanOrEqual(100);
+    // The board recorded which gate ran: the offline fixture, never the project's tests.
+    expect(JSON.stringify(run.messages[0])).toContain("fixture");
+  });
+
+  it("every published simulated run says so in its file, its title, and its description", async () => {
+    const index = await loadReplayIndex(fileFetch);
+    for (const entry of index) {
+      const file = JSON.parse(readFileSync(new URL(`replays/${entry.id}.json`, PUBLIC), "utf8")) as { simulated?: unknown };
+      expect(file.simulated === true).toBe(entry.simulated === true);
+      if (entry.simulated === true) {
+        expect(entry.title).toMatch(/^SIMULATED: /);
+        expect(entry.description).toContain("Simulated:");
+      } else {
+        expect(entry.id).toMatch(/^board-live-/);
+      }
     }
   });
 });

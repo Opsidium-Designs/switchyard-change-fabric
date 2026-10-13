@@ -25,7 +25,16 @@ export interface ReplayIndexEntry {
   readonly outcome: ReplayOutcome;
   readonly description: string;
   readonly messages?: number;
+  /** A simulated run: the real engine offline with scripted agents (see SIMULATED_CHIP). */
+  readonly simulated?: boolean;
 }
+
+/** The label a simulated run carries everywhere a viewer sees it. */
+export const SIMULATED_CHIP = "SIMULATED: real board engine, scripted agents, fixture gate";
+
+/** What a simulated run is and is not, in one line. */
+export const SIMULATED_EXPLAIN =
+  "The board, claims, contracts, integration, gate step, and promotion ran in the real engine (offline), but no model took part: every agent turn and edit was scripted, and the gate was the offline fixture check (it fails the first revision and passes once that file is edited again), not the app's own tests. Durations are the offline clock (one second per board message). It shows coordination at scale, not agents fixing code.";
 
 /** The recorded integration verdict (the final, authoritative one), as the snapshot holds it. */
 export interface RecordedIntegration {
@@ -46,6 +55,8 @@ export interface ReplaySnapshot {
 
 export interface ReplayRun {
   readonly changeId: string;
+  /** True when the file says it is simulated (scripted agents on the real engine). */
+  readonly simulated?: boolean;
   readonly messages: readonly BoardMessage[];
   readonly snapshot: ReplaySnapshot | null;
 }
@@ -80,7 +91,7 @@ export const REPLAY_INVALID = "failed validation";
 export async function loadReplay(fetchFn: FetchFn, id: string): Promise<ReplayRun> {
   const res = await fetchFn(replayPath(`${id}.json`));
   if (!res.ok) throw new Error(`could not load the recorded run ${id} (${res.status})`);
-  const body = (await res.json()) as { format?: unknown; changeId?: unknown; messages?: unknown; snapshot?: unknown };
+  const body = (await res.json()) as { format?: unknown; changeId?: unknown; simulated?: unknown; messages?: unknown; snapshot?: unknown };
   if (body.format !== REPLAY_FORMAT) throw new Error(`${id} is not a ${REPLAY_FORMAT} file`);
   if (!Array.isArray(body.messages) || body.messages.length === 0) throw new Error(`${id} has no board messages`);
   const messages = body.messages as BoardMessage[];
@@ -96,6 +107,7 @@ export async function loadReplay(fetchFn: FetchFn, id: string): Promise<ReplayRu
   }
   return {
     changeId: typeof body.changeId === "string" ? body.changeId : id,
+    ...(body.simulated === true ? { simulated: true } : {}),
     messages,
     snapshot: body.snapshot !== null && typeof body.snapshot === "object" ? (body.snapshot as ReplaySnapshot) : null,
   };

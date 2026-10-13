@@ -9,6 +9,8 @@ import {
   loadReplayIndex,
   parseReplayParams,
   replaySearch,
+  SIMULATED_CHIP,
+  SIMULATED_EXPLAIN,
   type FinalVerdict,
   type ReplayIndexEntry,
   type ReplayRun,
@@ -99,6 +101,9 @@ export function ReplayApp() {
   );
 
   const entry = runs?.find((r) => r.id === runId) ?? null;
+  // Simulated when either the index or the file says so: never shown as a live run.
+  const simulated = entry?.simulated === true || run?.simulated === true;
+  const anySimulated = (runs ?? []).some((r) => r.simulated === true);
 
   return (
     <main className={`app-shell replay-shell${runId !== null ? " is-wide" : ""}`}>
@@ -123,7 +128,7 @@ export function ReplayApp() {
       {runId === null ? (
         <p className="replay-banner" role="status">
           <strong>{RECORDED_BANNER}</strong> Every node and message below is a recorded board message from a real run; nothing is
-          simulated or re-run.
+          simulated or re-run{anySimulated ? <>, except the runs marked <strong>SIMULATED</strong>: {SIMULATED_EXPLAIN}</> : "."}
         </p>
       ) : null}
 
@@ -138,19 +143,18 @@ export function ReplayApp() {
               </button>
               <h2>{entry?.title ?? runId}</h2>
               {entry ? <span className="replay-app">{entry.app}</span> : null}
-              <span
-                className="replay-recorded-chip"
-                role="status"
-                title="Every node and message below is a recorded board message from a real run; nothing is simulated or re-run."
-              >
-                {RECORDED_BANNER}
-              </span>
+              <RunKindChip simulated={simulated} />
               {run ? <ReadingGuide /> : null}
             </div>
+            {simulated ? <p className="replay-sim-explain">{SIMULATED_EXPLAIN}</p> : null}
             {run ? (
               <>
                 <GoalLine goal={runGoal(run)} />
-                {watching === null ? <VerdictPanel verdict={finalVerdict(run)} /> : <VerdictTeaser verdict={finalVerdict(run)} />}
+                {watching === null ? (
+                  <VerdictPanel verdict={finalVerdict(run)} simulated={simulated} />
+                ) : (
+                  <VerdictTeaser verdict={finalVerdict(run)} simulated={simulated} />
+                )}
               </>
             ) : null}
             {runError ? <p className="error">{runError}</p> : null}
@@ -182,14 +186,38 @@ export function runGoal(run: ReplayRun): string {
   return first?.type === "goal.posted" ? first.payload.objective : (run.snapshot?.objective ?? "");
 }
 
+/** The SIMULATED label: unmistakable, with what it means on hover. */
+export function SimulatedChip() {
+  return (
+    <span className="replay-sim-chip" role="status" title={SIMULATED_EXPLAIN}>
+      {SIMULATED_CHIP}
+    </span>
+  );
+}
+
+/** The run header's label: SIMULATED for scripted agents, else the recorded-run chip. */
+export function RunKindChip({ simulated }: { simulated: boolean }) {
+  if (simulated) return <SimulatedChip />;
+  return (
+    <span
+      className="replay-recorded-chip"
+      role="status"
+      title="Every node and message below is a recorded board message from a real run; nothing is simulated or re-run."
+    >
+      {RECORDED_BANNER}
+    </span>
+  );
+}
+
 /** The final verdict, exactly as the run recorded it (never inferred from the replay position). */
-export function VerdictPanel({ verdict }: { verdict: FinalVerdict }) {
+export function VerdictPanel({ verdict, simulated = false }: { verdict: FinalVerdict; simulated?: boolean }) {
   return (
     <div className={`replay-verdict is-${verdict.kind}`} role="note" aria-label="Final verdict">
       <span className="replay-verdict-word">{verdict.headline}</span>
       <span className="replay-verdict-detail">
         <strong>Final verdict, as recorded at the end of the run.</strong> {verdict.detail}
         {verdict.kind === "verified" || verdict.kind === "failed" ? " The gate on the integrated tree decides; the agents cannot mark their own work done." : ""}
+        {simulated ? " SIMULATED run: the gate was the offline fixture check, not the app's tests, and the agents were scripted, so this verdict shows the engine's mechanics, not a code fix." : ""}
       </span>
     </div>
   );
@@ -213,11 +241,11 @@ function GoalLine({ goal }: { goal: string }) {
  * run is watched as it happened rather than read backwards from its ending.
  * It is the same recorded verdict, never a projection from the cursor.
  */
-export function VerdictTeaser({ verdict }: { verdict: FinalVerdict }) {
+export function VerdictTeaser({ verdict, simulated = false }: { verdict: FinalVerdict; simulated?: boolean }) {
   return (
     <details className={`replay-verdict-teaser is-${verdict.kind}`}>
-      <summary>How this run ended (recorded verdict)</summary>
-      <VerdictPanel verdict={verdict} />
+      <summary>How this run ended (recorded verdict{simulated ? ", simulated run" : ""})</summary>
+      <VerdictPanel verdict={verdict} simulated={simulated} />
     </details>
   );
 }
@@ -252,7 +280,7 @@ function ReadingGuide() {
   );
 }
 
-function RunPicker({
+export function RunPicker({
   runs,
   error,
   onOpen,
@@ -286,15 +314,18 @@ function RunPicker({
     <section className="app-panel replay-picker" aria-label="Recorded runs">
       <h2>Pick a recorded run</h2>
       <p className="muted">
-        Real runs on live infrastructure, exported from the board log. Failures are kept on purpose: an honest failure is a result.
+        Real runs on live infrastructure, exported from the board log
+        {runs.some((r) => r.simulated === true) ? ", except the runs marked SIMULATED (scripted agents on the real engine, offline)" : ""}. Failures
+        are kept on purpose: an honest failure is a result.
       </p>
       <ul className="replay-list">
         {runs.map((r) => (
-          <li key={r.id} className={`replay-card is-${r.outcome}`}>
+          <li key={r.id} className={`replay-card is-${r.outcome}${r.simulated === true ? " is-simulated" : ""}`}>
             <div className="replay-card-head">
               <span className={`replay-outcome is-${r.outcome}`}>{r.outcome}</span>
               <span className="replay-app">{r.app}</span>
             </div>
+            {r.simulated === true ? <SimulatedChip /> : null}
             <h3>{r.title}</h3>
             <p className="replay-card-desc">{r.description}</p>
             <div className="replay-card-foot">

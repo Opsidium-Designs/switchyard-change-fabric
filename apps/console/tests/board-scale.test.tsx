@@ -130,6 +130,31 @@ describe("lane grouping", () => {
     });
   });
 
+  it("a verb prefix most of the board shares yields to the scope directories it spans", () => {
+    const ids = ["parking-appeals", "parking-fees", "permits-fees", "permits-notices"].map((m) => `validate-src-${m}`);
+    const scope = (id: string) => [`src/${id.split("-")[2]}/${id.split("-")[3]}.ts`];
+    const lanes = boardLanes([...ids, "seam-http"], () => false, (id) => (id.startsWith("validate-") ? scope(id) : ["src/contracts/http.ts"]));
+    expect(Object.fromEntries(lanes)).toEqual({
+      "validate-src-parking-appeals": "parking",
+      "validate-src-parking-fees": "parking",
+      "validate-src-permits-fees": "permits",
+      "validate-src-permits-notices": "permits",
+      "seam-http": "other",
+    });
+    // A shared prefix over ONE directory (or a minority of the board) is still the lane.
+    const one = boardLanes(["validate-a", "validate-b"], () => false, () => ["src/billing/x.ts"]);
+    expect([...one.values()]).toEqual(["validate", "validate"]);
+    // An agent-proposed split item takes its scope's domain, not its proposer's name.
+    const proposed = boardLanes(["agent-1-item-1", "agent-2-item-1"], (id) => id === "agent-1-item-1", (id) =>
+      id === "agent-1-item-1" ? ["src/contracts/money.ts", "src/contracts/http.ts"] : ["README.md"],
+    );
+    expect(Object.fromEntries(proposed)).toEqual({ "agent-1-item-1": "contracts", "agent-2-item-1": "other" });
+    // The compact title drops everything up to the lane's word.
+    expect(compactHullTitle("validate-src-parking-appeals", "validate-src-parking-appeals", "parking")).toBe("appeals");
+    expect(compactHullTitle("validate-src-parking-appeals", "parking-appeals", "parking")).toBe("appeals");
+    expect(compactHullTitle("validate-src-parking-appeals", "a label from its origin", "parking")).toBe("a label from its origin");
+  });
+
   it("titles a compact hull by what its lane or parent does not already say; a label from its origin is kept", () => {
     expect(compactHullTitle("permits.fee-calc", "permits.fee-calc", "permits")).toBe("fee-calc");
     expect(compactHullTitle("parking-meter-rates", "meter-rates", "parking")).toBe("meter-rates");
