@@ -2293,6 +2293,117 @@ export function foldSummary(key: string, messages: readonly BoardMessage[]): str
   }
 }
 
+/** The order the thread lists its messages in. */
+export type ThreadOrder = "newest" | "oldest";
+
+export const THREAD_ORDER_KEY = "switchyard.thread.order";
+
+/** The remembered thread order (newest first by default; storage may be blocked). */
+export function readThreadOrder(storage: Pick<Storage, "getItem"> | undefined = threadStorage()): ThreadOrder {
+  try {
+    return storage?.getItem(THREAD_ORDER_KEY) === "oldest" ? "oldest" : "newest";
+  } catch {
+    return "newest";
+  }
+}
+
+/** Remember the thread order (a blocked storage keeps it for this page only). */
+export function storeThreadOrder(order: ThreadOrder, storage: Pick<Storage, "setItem"> | undefined = threadStorage()): void {
+  try {
+    storage?.setItem(THREAD_ORDER_KEY, order);
+  } catch {
+    // Storage blocked: the choice lasts for this page only.
+  }
+}
+
+function threadStorage(): Storage | undefined {
+  try {
+    return typeof window === "undefined" ? undefined : window.localStorage;
+  } catch {
+    return undefined;
+  }
+}
+
+/** One end of a message's direction: who, and the role chip it is drawn with. */
+export interface Party {
+  readonly id: string;
+  readonly role: "agent" | "lead" | "engine" | "human" | "everyone";
+}
+
+/** A message's direction: its sender, its recipients, and whether the recipients were read from the board rather than addressed. */
+export interface MessageDirection {
+  readonly from: Party;
+  readonly to: readonly Party[];
+  /** True when the message named no recipient and the overlay's rule (from the board) names who it concerns. */
+  readonly implied: boolean;
+}
+
+/**
+ * Who sent a message and to whom, from recorded data only: the message's own
+ * `to` when it names one; else, for a coordination message, who the talk
+ * overlay's rule says it concerns (`implied`, from the board before it); else
+ * everyone on the board (a board post is visible to all).
+ */
+export function messageDirection(m: BoardMessage, leads: ReadonlySet<string>, implied?: readonly string[]): MessageDirection {
+  const party = (id: string): Party => ({
+    id,
+    role: id === "engine" ? "engine" : id === "human" ? "human" : leads.has(id) ? "lead" : "agent",
+  });
+  const from = party(m.from);
+  if (m.to && m.to.length > 0) return { from, to: m.to.map(party), implied: false };
+  if (implied && implied.length > 0) return { from, to: implied.map(party), implied: true };
+  return { from, to: [{ id: "everyone", role: "everyone" }], implied: false };
+}
+
+/** The leads of a board log (agent.joined with the lead role). */
+function boardLeads(log: readonly BoardMessage[] | undefined): Set<string> {
+  const out = new Set<string>(["lead"]);
+  for (const m of log ?? []) if (m.type === "agent.joined" && m.payload.role === "lead") out.add(m.from);
+  return out;
+}
+
+/** Per seq, who a coordination message concerns, as the talk overlay reads it (participant ids). */
+function impliedTargets(log: readonly BoardMessage[] | undefined): Map<number, string[]> {
+  const out = new Map<number, string[]>();
+  if (!log || log.length === 0) return out;
+  const last = log[log.length - 1]!.seq;
+  for (const a of communicationArrows(log, last, { window: 0, max: Number.MAX_SAFE_INTEGER })) {
+    if (a.to === null) continue;
+    const id = a.to.replace(/^agent:/, "");
+    out.set(a.seq, [...(out.get(a.seq) ?? []), id]);
+  }
+  return out;
+}
+
+function PartyChip({ party, onSelectAgent }: { party: Party; onSelectAgent: (agent: string) => void }) {
+  const clickable = party.role === "agent" || party.role === "lead";
+  return (
+    <button
+      type="button"
+      className={`mc-party role-${party.role}`}
+      disabled={!clickable}
+      onClick={() => (clickable ? onSelectAgent(party.id) : undefined)}
+      title={party.role === "everyone" ? "posted to the whole board, addressed to no one" : `${party.id} (${party.role})`}
+    >
+      {party.id}
+    </button>
+  );
+}
+
+/** Scroll to a message's card when it is in the list (and flash it); else select it. */
+function jumpToMessage(seq: number, onSelectSeq: (seq: number) => void): void {
+  const el = typeof document === "undefined" ? null : document.getElementById(`mc-msg-${seq}`);
+  if (!el) {
+    onSelectSeq(seq);
+    return;
+  }
+  el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  el.classList.remove("is-flash");
+  // Restart the flash on a repeated click.
+  void el.offsetWidth;
+  el.classList.add("is-flash");
+}
+
 export function Thread({
   messages,
   title,
@@ -2300,7 +2411,10 @@ export function Thread({
   onSelectSeq,
   onSelectAgent,
   log,
+  order,
+  onOrder,
 }: {
+  /** The messages to list, oldest first when `order` is given (the thread then lists them in that order). */
   messages: readonly BoardMessage[];
   title: string;
   selectedSeq: number | null;
@@ -2308,13 +2422,59 @@ export function Thread({
   onSelectAgent: (agent: string) => void;
   /** The board log, for each row's plain sentence and its recorded causes. Without it, rows show the typed summary only. */
   log?: readonly BoardMessage[];
+  /** Newest or oldest first; without it the messages are listed as given and no toggle is shown. */
+  order?: ThreadOrder;
+  onOrder?: (order: ThreadOrder) => void;
 }) {
+  const leads = useMemo(() => boardLeads(log), [log]);
+  const implied = useMemo(() => impliedTargets(log), [log]);
+  const bySeq = useMemo(() => new Map((log ?? messages).map((m) => [m.seq, m])), [log, messages]);
+  const shown = order === undefined ? messages : [...messages].sort((a, b) => (order === "newest" ? b.seq - a.seq : a.seq - b.seq));
+  const inList = new Set(shown.map((m) => m.seq));
   const row = (m: BoardMessage) => {
     const family = boardMessageFamily(m.type);
     const plain = log ? narrateMessage(m, log, payloadSummary).text : undefined;
     const grade = gradeOf(m);
+    const dir = messageDirection(m, leads, implied.get(m.seq));
+    const parent = m.inReplyTo !== undefined ? bySeq.get(m.inReplyTo) : undefined;
     return (
-      <li key={m.seq} className={`mc-msg fam-${family}${selectedSeq === m.seq ? " is-selected" : ""}`}>
+      <li
+        key={m.seq}
+        id={`mc-msg-${m.seq}`}
+        className={`mc-msg fam-${family}${selectedSeq === m.seq ? " is-selected" : ""}${m.inReplyTo !== undefined ? " is-reply" : ""}`}
+      >
+        {m.inReplyTo !== undefined ? (
+          <div className="mc-msg-reply">
+            <span aria-hidden="true">{"↳"}</span> reply to{" "}
+            <button
+              type="button"
+              className="mc-seq-link"
+              onClick={() => jumpToMessage(m.inReplyTo!, onSelectSeq)}
+              title={inList.has(m.inReplyTo) ? "jump to the message it answers (in this list)" : "open the message it answers"}
+            >
+              re seq {m.inReplyTo}
+            </button>
+            {parent ? (
+              <span className="mc-msg-reply-what">
+                {parent.from}&apos;s {parent.type}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
+        <div className="mc-msg-dir" aria-label={`from ${dir.from.id} to ${dir.to.map((p) => p.id).join(", ")}`}>
+          <PartyChip party={dir.from} onSelectAgent={onSelectAgent} />
+          <span className="mc-dir-arrow" aria-hidden="true">
+            {"→"}
+          </span>
+          {dir.to.map((p) => (
+            <PartyChip key={p.id} party={p} onSelectAgent={onSelectAgent} />
+          ))}
+          {dir.implied ? (
+            <span className="mc-dir-note" title="the message named no recipient; this is who it concerns on the board (it was posted to everyone)">
+              concerns
+            </span>
+          ) : null}
+        </div>
         {plain !== undefined ? <div className="mc-msg-plain">{plain}</div> : null}
         <div className="mc-msg-head">
           <button type="button" className="mc-seq-link" onClick={() => onSelectSeq(m.seq)}>
@@ -2331,12 +2491,6 @@ export function Thread({
             {m.type}
           </span>
           {grade ? <GradeBadge grade={grade} /> : null}
-          {m.to && m.to.length > 0 ? <span className="muted">to {m.to.join(", ")}</span> : null}
-          {m.inReplyTo !== undefined ? (
-            <button type="button" className="mc-seq-link" onClick={() => onSelectSeq(m.inReplyTo!)}>
-              re seq {m.inReplyTo}
-            </button>
-          ) : null}
         </div>
         <div className={`mc-msg-body${plain !== undefined ? " is-raw" : ""}`}>{payloadSummary(m)}</div>
         {m.rationale ? (
@@ -2349,12 +2503,23 @@ export function Thread({
   };
   return (
     <div className="mc-thread">
-      <h3>
-        {title} <span className="muted">({messages.length})</span>
-      </h3>
+      <div className="mc-thread-head">
+        <h3>
+          {title} <span className="muted">({messages.length})</span>
+        </h3>
+        {order !== undefined && onOrder ? (
+          <span className="mc-thread-order" role="group" aria-label="Thread order">
+            {(["newest", "oldest"] as const).map((o) => (
+              <button key={o} type="button" className={order === o ? "is-active" : ""} aria-pressed={order === o} onClick={() => onOrder(o)}>
+                {o} first
+              </button>
+            ))}
+          </span>
+        ) : null}
+      </div>
       {messages.length === 0 ? <p className="muted">No messages yet.</p> : null}
       <ol className="mc-thread-list">
-        {foldThread(messages).map((entry) =>
+        {foldThread(shown).map((entry) =>
           entry.kind === "one" ? (
             row(entry.message)
           ) : (
@@ -2805,6 +2970,7 @@ export function MissionControl({
   const [tab, setTab] = useState<RightTab>(initialTab ?? "thread");
   const [talk, setTalk] = useState(true);
   const [hoverRev, setHoverRev] = useState<number | null>(null);
+  const [threadOrder, setThreadOrder] = useState<ThreadOrder>(() => readThreadOrder());
   const live = cursor === "live" || cursor >= lastSeq;
   const k = cursor === "live" ? lastSeq : Math.min(cursor, lastSeq);
   // The seq a selection was made at: a selected revision draws its links only until the cursor moves on.
@@ -2952,9 +3118,10 @@ export function MissionControl({
   }
 
   const cards = escalationCards(model, escalations, live, recorded);
-  const thread = selection ? boardThread(log, k, selection, model.state) : [...boardPrefix(log, k).slice(-40)].reverse();
+  // Oldest first here; the thread lists them in the chosen order.
+  const thread = selection ? boardThread(log, k, selection, model.state) : boardPrefix(log, k).slice(-40);
   const threadTitle = !selection
-    ? "Latest board messages (newest first)"
+    ? `Latest board messages (${threadOrder} first)`
     : selection.kind === "seq"
       ? `Message seq ${selection.seq}`
       : selection.kind === "item"
@@ -3100,6 +3267,11 @@ export function MissionControl({
             onSelectSeq={(seq) => select({ kind: "seq", seq })}
             onSelectAgent={(agent) => select({ kind: "agent", id: agent })}
             log={log}
+            order={threadOrder}
+            onOrder={(next) => {
+              storeThreadOrder(next);
+              setThreadOrder(next);
+            }}
           />
         ) : tab === "node" ? (
           selectedNode ? (

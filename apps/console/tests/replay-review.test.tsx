@@ -14,7 +14,20 @@ import { boardCaptions, buildBoardGraph, type BoardMessage } from "@switchyard-c
 
 import { COMM_KINDS, commKind, communicationArrows, drawnLegend, fixAskState, outstandingFixLinks, revisionAnchor } from "../src/board-overlay.ts";
 import { LANE_HEAD, scaledBoardLayout } from "../src/board-scale.ts";
-import { BoardGraphView, MissionControl, placeCaptions, ReplayBar, scrubThumbCenter, scrubTickX, SCRUB_THUMB_PX } from "../src/mission-control.tsx";
+import {
+  BoardGraphView,
+  messageDirection,
+  MissionControl,
+  placeCaptions,
+  readThreadOrder,
+  ReplayBar,
+  scrubThumbCenter,
+  scrubTickX,
+  SCRUB_THUMB_PX,
+  storeThreadOrder,
+  Thread,
+  THREAD_ORDER_KEY,
+} from "../src/mission-control.tsx";
 
 const PUBLIC = new URL("../public/", import.meta.url);
 
@@ -158,6 +171,67 @@ describe("captions on the graph", () => {
     const free = placeCaptions([{ seq: 1, node: "agent:a", text: "item.claimed" }], points, layout, 1, []);
     expect(free).toHaveLength(1);
     expect(free[0]!.y + free[0]!.h).toBeLessThanOrEqual(150);
+  });
+});
+
+describe("the thread", () => {
+  const sf21 = recorded("board-live-sf21");
+  const sf8 = recorded("board-live-sf8");
+  const leads = new Set(["lead"]);
+  const at = (log: BoardMessage[], seq: number) => log.find((m) => m.seq === seq)!;
+  const line = (d: ReturnType<typeof messageDirection>) => `${d.from.id}(${d.from.role}) -> ${d.to.map((p) => `${p.id}(${p.role})`).join(", ")}${d.implied ? " [implied]" : ""}`;
+
+  it("names the sender and the recipients of every message, from recorded data only", () => {
+    // Addressed: the message's own `to`.
+    expect(line(messageDirection(at(sf8, 108), leads))).toBe("agent-1(agent) -> lead(lead)");
+    // Not addressed: who the overlay's rule says it concerns, marked implied.
+    expect(line(messageDirection(at(sf21, 36), leads, ["lead"]))).toBe("agent-1(agent) -> lead(lead) [implied]");
+    // The engine's fix request is addressed to the owner.
+    expect(line(messageDirection(at(sf21, 33), leads))).toBe("engine(engine) -> agent-1(agent)");
+    // Neither addressed nor concerning anyone in particular: the whole board.
+    expect(line(messageDirection(at(sf21, 34), leads))).toBe("agent-1(agent) -> everyone(everyone)");
+  });
+
+  it("shows the direction first on each card, and a reply under a link to the message it answers", () => {
+    const html = renderToStaticMarkup(
+      createElement(Thread, { messages: sf21.filter((m) => m.seq >= 33 && m.seq <= 38), title: "t", selectedSeq: null, onSelectSeq: () => {}, onSelectAgent: () => {}, log: sf21, order: "oldest", onOrder: () => {} }),
+    );
+    // contract.proposed (36): agent-1 -> lead, read from the board (it named no recipient).
+    expect(html).toMatch(/<li id="mc-msg-36" class="mc-msg[^"]*"><div class="mc-msg-dir" aria-label="from agent-1 to lead"><button type="button" class="mc-party role-agent"[^>]*>agent-1<\/button><span class="mc-dir-arrow" aria-hidden="true">→<\/span><button type="button" class="mc-party role-lead"[^>]*>lead<\/button><span class="mc-dir-note"/);
+    // contract.escalated (37) answers 36: an indented reply that links back to it.
+    expect(html).toMatch(/<li id="mc-msg-37" class="mc-msg fam-contract is-reply"><div class="mc-msg-reply"><span aria-hidden="true">↳<\/span> reply to <button type="button" class="mc-seq-link"[^>]*>re seq 36<\/button><span class="mc-msg-reply-what">agent-1&#x27;s contract.proposed<\/span>/);
+    expect(html).toMatch(/aria-label="from engine to human"/);
+    // The human's answer goes back to the proposer (read from the board); a struggling report is posted to everyone.
+    expect(html).toMatch(/<li id="mc-msg-38"[^>]*><div class="mc-msg-dir" aria-label="from human to agent-1">/);
+    expect(html).toMatch(/<li id="mc-msg-34"[^>]*><div class="mc-msg-dir" aria-label="from agent-1 to everyone">/);
+    // Oldest first, as asked.
+    const order = [...html.matchAll(/<li id="mc-msg-(\d+)"/g)].map((m) => Number(m[1]));
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+  });
+
+  it("lists newest first by default, with a toggle, and remembers the choice (storage may be blocked)", () => {
+    const html = renderToStaticMarkup(createElement(MissionControl, { log: sf21, escalations: [], busy: false, onResolve: () => {}, recorded: true, initialSeq: 60 }));
+    expect(html).toContain("Latest board messages (newest first)");
+    expect(html).toMatch(/<span class="mc-thread-order" role="group" aria-label="Thread order"><button type="button" class="is-active" aria-pressed="true">newest first<\/button><button type="button" class="" aria-pressed="false">oldest first<\/button>/);
+    const ids = [...html.matchAll(/<li id="mc-msg-(\d+)"/g)].map((m) => Number(m[1]));
+    expect(ids[0]).toBe(60);
+    expect(ids).toEqual([...ids].sort((a, b) => b - a));
+    const store = new Map<string, string>();
+    const storage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) };
+    expect(readThreadOrder(storage)).toBe("newest");
+    storeThreadOrder("oldest", storage);
+    expect(store.get(THREAD_ORDER_KEY)).toBe("oldest");
+    expect(readThreadOrder(storage)).toBe("oldest");
+    const blocked = {
+      getItem: () => {
+        throw new Error("blocked");
+      },
+      setItem: () => {
+        throw new Error("blocked");
+      },
+    };
+    expect(readThreadOrder(blocked)).toBe("newest");
+    expect(() => storeThreadOrder("oldest", blocked)).not.toThrow();
   });
 });
 

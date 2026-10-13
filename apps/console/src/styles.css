@@ -1580,6 +1580,39 @@ body {
 .mc .mc-sender.sender-human { border-color: var(--await); color: var(--await); }
 .mc .mc-sender.sender-agent { border-color: var(--blue); color: var(--info); }
 .mc-msg-body { margin-top: 0.15rem; overflow-wrap: anywhere; }
+
+/* The thread: who wrote to whom, first on every card, as role chips. */
+.mc-thread-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 0.3rem 0.6rem; }
+.mc-thread-head h3 { margin: 0 0 0.4rem; }
+.mc-thread-order { display: inline-flex; gap: 0.2rem; }
+.mc .mc-thread-order button { padding: 0.1rem 0.45rem; font-size: 0.72rem; }
+.mc-msg-dir { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem; margin-bottom: 0.15rem; }
+.mc-dir-arrow { font-weight: 800; font-size: 1.15rem; color: var(--text); line-height: 1; }
+.mc-dir-note { font-size: 0.68rem; color: var(--muted); font-style: italic; }
+.mc .mc-party {
+  padding: 0.02rem 0.45rem;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+}
+.mc .mc-party:disabled { opacity: 1; cursor: default; }
+.mc .mc-party.role-agent { border-color: var(--blue); color: var(--info); background: light-dark(#ddf4ff, #0c2240); }
+.mc .mc-party.role-lead { border-color: var(--lead); color: var(--lead); background: light-dark(#e3f6f2, #0d2a26); }
+.mc .mc-party.role-engine { border-color: var(--grey-border); color: var(--muted); background: var(--deep); }
+.mc .mc-party.role-human { border-color: var(--await); color: var(--await-2); background: light-dark(#fff8c5, #2e2405); }
+.mc .mc-party.role-everyone { border-style: dashed; color: var(--muted); font-weight: 600; }
+/* A reply is indented under a line naming the message it answers (click to jump there). */
+.mc-msg.is-reply { margin-left: 0.9rem; }
+.mc-msg-reply { font-size: 0.72rem; color: var(--muted); display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem; }
+.mc-msg-reply-what { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mc-msg.is-flash { animation: mc-msg-flash 1.2s ease-out; }
+@keyframes mc-msg-flash {
+  0%, 30% { outline: 2px solid var(--accent); }
+  100% { outline: 2px solid transparent; }
+}
 .mc-rationale { display: block; margin-top: 0.15rem; color: var(--muted); font-style: italic; }
 .mc-detail .meta { grid-template-columns: 1fr; gap: 0.3rem; }
 .mc-detail dd { overflow-wrap: anywhere; }
