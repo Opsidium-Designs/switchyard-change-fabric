@@ -406,7 +406,8 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
 
   it("only a passing LAST revision is promoted: an earlier pass does not ship a later failure", async () => {
     const projectDir = await project();
-    const result = await offline({ goal: GOAL, projectDir, seed, appGateCommand: ["gate"], verifyCommandRunner: new PassOnceGate() });
+    // After the first pass every revision fails, so one fix attempt per item is enough to show it.
+    const result = await offline({ goal: GOAL, projectDir, seed, appGateCommand: ["gate"], verifyCommandRunner: new PassOnceGate(), budgets: { maxFixAttemptsPerItem: 1 } });
     expect(result.revisions[0]!.gate).toBe("pass");
     expect(result.revision!.gate).toBe("fail");
     expect(result.verdict).toBe("failed");
@@ -424,7 +425,8 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
 
   it("a declared gate that is not wired cannot pass", async () => {
     const projectDir = await project();
-    const result = await offline({ goal: GOAL, projectDir, seed, requireAppGate: true });
+    // Every revision fails here, so one fix attempt per item is enough to show it (fixes are charged once per push).
+    const result = await offline({ goal: GOAL, projectDir, seed, requireAppGate: true, budgets: { maxFixAttemptsPerItem: 1 } });
     expect(result.revisions.length).toBeGreaterThan(0);
     expect(result.revisions.every((r) => r.gate === "fail")).toBe(true);
     expect(result.verdict).toBe("failed");
