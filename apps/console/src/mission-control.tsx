@@ -3588,7 +3588,7 @@ export function BoardLegend({ present, absent }: { present: readonly LegendEntry
         </li>
       ) : null}
       <li>
-        <span className="swatch-hex sw-neutral" aria-hidden="true" /> revision: on the gate timeline; hover one for its links (the latest one's open fix requests are drawn from the top right)
+        <span className="swatch-hex sw-neutral" aria-hidden="true" /> revision: on the gate timeline; hover one for its links. The latest failing one is drawn at the top right with lines to the items it asked to fix, until they push or the next revision lands; a pass shows briefly
       </li>
       <li>
         <svg className="mc-legend-svg" width={26} height={12} viewBox="0 0 26 12" aria-hidden="true">
