@@ -138,9 +138,9 @@ describe("the communication overlay", () => {
     ]);
     // Each arrow carries its kind, read from its message type.
     expect(arrows.map((a) => `${a.seq} ${a.kind}`).reverse()).toEqual([
-      "6 help",
-      "7 help",
-      "8 help",
+      "6 help-offer",
+      "7 help-ask",
+      "8 help-ask",
       "9 contract",
       "10 contract",
       "11 contract",
@@ -150,7 +150,7 @@ describe("the communication overlay", () => {
       "15 conflict",
       "17 proposal",
       "18 proposal",
-      "19 help",
+      "19 help-ask",
     ]);
   });
 
@@ -165,11 +165,11 @@ describe("the communication overlay", () => {
       "contract.accepted": "contract",
       "contract.rejected": "contract",
       "contract.escalated": "contract",
-      "help.requested": "help",
-      "help.volunteered": "help",
-      "help.offered": "help",
-      "help.delivered": "help",
-      "help.declined": "help",
+      "help.requested": "help-ask",
+      "help.volunteered": "help-offer",
+      "help.offered": "help-offer",
+      "help.delivered": "help-offer",
+      "help.declined": "help-ask",
       handoff: "handoff",
       "claim.contested": "conflict",
       "claim.kept": "conflict",
@@ -204,8 +204,8 @@ describe("the communication overlay", () => {
     const help = log.find((m) => m.type === "help.requested")!.seq;
     const html = renderToStaticMarkup(createElement(MissionControl, { log, escalations: [], busy: false, onResolve: () => {}, initialSeq: help + 1 }));
     expect(html).toContain('aria-label="Agent communication overlay"');
-    // A help request is drawn in the help colour, with the help arrowhead (one marker per kind).
-    expect(html).toMatch(/<g class="mc-talk-arrow talk-help[^"]*"[^>]*><path d="M [^"]+" marker-end="url\(#mc-talk-head-help\)"/);
+    // A help request is drawn in the help-ask colour, with the help-ask arrowhead (one marker per kind).
+    expect(html).toMatch(/<g class="mc-talk-arrow talk-help-ask[^"]*"[^>]*><path d="M [^"]+"[^>]* marker-end="url\(#mc-talk-head-help-ask\)"/);
     for (const kind of COMM_KINDS) expect(html).toContain(`<marker id="mc-talk-head-${kind}"`);
     expect(html).toContain(">asks help</text>");
     // Every talk label is drawn clear of every other talk label.
@@ -332,9 +332,9 @@ describe("the on-screen legend", () => {
   it("lists the drawn edge variants and talk kinds with counts, and the rest as not on screen", () => {
     const { present, absent } = drawnLegend(
       [edge("dependency"), edge("dependency"), edge("dependency", { label: "fork" }), edge("contest", { contest: "escalated" }), edge("spawn")],
-      [{ kind: "help" }, { kind: "help" }, { kind: "conflict" }],
+      [{ kind: "help-ask" }, { kind: "help-offer" }, { kind: "help-offer" }, { kind: "conflict" }],
     );
-    expect(present.map((e) => `${e.key} ${e.count}`)).toEqual(["dependency 2", "fork 1", "contest-escalated 1", "talk-help 2", "talk-conflict 1"]);
+    expect(present.map((e) => `${e.key} ${e.count}`)).toEqual(["dependency 2", "fork 1", "contest-escalated 1", "talk-help-ask 1", "talk-help-offer 2", "talk-conflict 1"]);
     expect(absent.map((e) => e.key)).toEqual(["merged", "trigger", "consumed-tool", "contest", "message", "talk-proposal", "talk-contract", "talk-handoff"]);
     expect(absent.find((e) => e.key === "contest")!.hint).toBe("contest: two agents claim the same file");
     expect(absent.find((e) => e.key === "fork")).toBeUndefined();

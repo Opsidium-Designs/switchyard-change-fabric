@@ -45,13 +45,16 @@
   /* The agent-talk overlay: its own teal, apart from every graph edge color. */
   --talk: light-dark(#0a7f86, #39d0d8);
   --talk-bg: light-dark(#e3f6f7, #0f2a2d);
-  /* Agent talk by kind (stroke + label background): proposal teal, contract violet, help blue, handoff amber, conflict red. */
+  /* Agent talk by kind (stroke + label background): proposal teal, contract violet, help asked blue,
+     help offered magenta, handoff amber, conflict red. */
   --talk-proposal: var(--talk);
   --talk-proposal-bg: var(--talk-bg);
   --talk-contract: var(--fam-contract);
   --talk-contract-bg: light-dark(#f3eefe, #241a36);
-  --talk-help: light-dark(#0550ae, #58a6ff);
-  --talk-help-bg: light-dark(#ddf4ff, #0c2240);
+  --talk-help-ask: light-dark(#0550ae, #58a6ff);
+  --talk-help-ask-bg: light-dark(#ddf4ff, #0c2240);
+  --talk-help-offer: light-dark(#a0306e, #f778ba);
+  --talk-help-offer-bg: light-dark(#ffeff7, #3a1029);
   --talk-handoff: light-dark(#8a5a00, #e3b341);
   --talk-handoff-bg: light-dark(#fff8c5, #2e2405);
   --talk-conflict: var(--bad-text);
@@ -2172,7 +2175,8 @@ body {
 
 .talk-proposal { --tk: var(--talk-proposal); --tk-bg: var(--talk-proposal-bg); }
 .talk-contract { --tk: var(--talk-contract); --tk-bg: var(--talk-contract-bg); }
-.talk-help { --tk: var(--talk-help); --tk-bg: var(--talk-help-bg); }
+.talk-help-ask { --tk: var(--talk-help-ask); --tk-bg: var(--talk-help-ask-bg); }
+.talk-help-offer { --tk: var(--talk-help-offer); --tk-bg: var(--talk-help-offer-bg); }
 .talk-handoff { --tk: var(--talk-handoff); --tk-bg: var(--talk-handoff-bg); }
 .talk-conflict { --tk: var(--talk-conflict); --tk-bg: var(--talk-conflict-bg); }
 .mc-talk-arrow, .mc-talk-mark { cursor: pointer; transition: opacity 400ms ease; }

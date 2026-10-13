@@ -1575,6 +1575,12 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
                 <path className={`mc-talk-head talk-${kind}`} d="M 0 0 L 10 5 L 0 10 z" />
               </marker>
             ))}
+            {/* And one start dot per kind at the sender, so the direction reads at both ends. */}
+            {COMM_KINDS.map((kind) => (
+              <marker key={`tail-${kind}`} id={`mc-talk-tail-${kind}`} viewBox="0 0 10 10" refX="5" refY="5" markerWidth="3" markerHeight="3">
+                <circle className={`mc-talk-head talk-${kind}`} cx="5" cy="5" r="4" />
+              </marker>
+            ))}
           </defs>
           <g transform={`translate(${view.tx}, ${view.ty}) scale(${view.k})`}>
             {/* Lanes (a large board): items grouped by sub-lead or domain; drawn only once one of their items exists at K. */}
@@ -1859,7 +1865,7 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
                 }
                 return (
                   <g key={arrow.id} className={`mc-talk-arrow talk-${arrow.kind}${arrow.age === 0 ? " is-new" : ""}`} style={{ opacity }} onClick={() => choose({ kind: "seq", seq: arrow.seq })}>
-                    <path d={curve.d} markerEnd={`url(#mc-talk-head-${arrow.kind})`} />
+                    <path d={curve.d} markerStart={`url(#mc-talk-tail-${arrow.kind})`} markerEnd={`url(#mc-talk-head-${arrow.kind})`} />
                     {pill}
                     <title>{arrow.tooltip}</title>
                   </g>

@@ -12,7 +12,7 @@ import { describe, expect, it } from "vitest";
 
 import { buildBoardGraph, type BoardMessage } from "@switchyard-change/orchestration/board-graph";
 
-import { fixAskState, outstandingFixLinks, revisionAnchor } from "../src/board-overlay.ts";
+import { COMM_KINDS, commKind, drawnLegend, fixAskState, outstandingFixLinks, revisionAnchor } from "../src/board-overlay.ts";
 
 import { MissionControl, ReplayBar, scrubThumbCenter, scrubTickX, SCRUB_THUMB_PX } from "../src/mission-control.tsx";
 
@@ -69,6 +69,46 @@ describe("the scrubber", () => {
     const log = recorded("board-live-reg3");
     const html = renderToStaticMarkup(createElement(MissionControl, { log, escalations: [], busy: false, onResolve: noop, recorded: true, initialSeq: 40 }));
     expect(html).toMatch(/<input type="range" min="0" max="89"[^>]*value="40"/);
+  });
+});
+
+describe("help asks and help offers", () => {
+  it("are two talk kinds, by who is acting: the asker (or the owner answering) and the helper", () => {
+    expect(commKind("help.requested")).toBe("help-ask");
+    expect(commKind("help.declined")).toBe("help-ask");
+    for (const t of ["help.volunteered", "help.offered", "help.delivered"]) expect(commKind(t)).toBe("help-offer");
+    expect(COMM_KINDS).toContain("help-ask");
+    expect(COMM_KINDS).toContain("help-offer");
+    expect(COMM_KINDS).not.toContain("help");
+  });
+
+  it("have two colours in both themes, apart from every other talk colour", () => {
+    const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+    const varOf = (name: string): string => css.match(new RegExp(`--${name}: ([^;]+);`))?.[1]!.trim() ?? "";
+    const resolve = (v: string): string => {
+      const ref = v.match(/^var\(--([a-z-]+)\)$/);
+      return ref ? resolve(varOf(ref[1]!)) : v;
+    };
+    const themes = (kind: string): [string, string] => {
+      const m = resolve(varOf(`talk-${kind}`)).match(/^light-dark\((#[0-9a-f]+), (#[0-9a-f]+)\)$/i);
+      expect(m, kind).not.toBeNull();
+      return [m![1]!.toLowerCase(), m![2]!.toLowerCase()];
+    };
+    for (const theme of [0, 1]) {
+      const colours = COMM_KINDS.map((k) => themes(k)[theme]);
+      expect(new Set(colours).size, `theme ${theme}: ${colours.join(", ")}`).toBe(COMM_KINDS.length);
+    }
+    expect(css).toContain(".talk-help-ask {");
+    expect(css).toContain(".talk-help-offer {");
+  });
+
+  it("are listed apart in the legend, and each arrow has its head at the target and a dot at the sender", () => {
+    const { present } = drawnLegend([], [{ kind: "help-ask" }, { kind: "help-offer" }]);
+    expect(present.map((e) => `${e.key}: ${e.label}`)).toEqual(["talk-help-ask: help asked", "talk-help-offer: help offered"]);
+    const sf21 = recorded("board-live-sf21");
+    const html = renderToStaticMarkup(createElement(MissionControl, { log: sf21, escalations: [], busy: false, onResolve: () => {}, recorded: true, initialSeq: 98 }));
+    expect(html).toMatch(/<g class="mc-talk-arrow talk-help-offer[^"]*"[^>]*><path d="[^"]+" marker-start="url\(#mc-talk-tail-help-offer\)" marker-end="url\(#mc-talk-head-help-offer\)"/);
+    expect(html).toContain('<marker id="mc-talk-tail-help-ask"');
   });
 });
 

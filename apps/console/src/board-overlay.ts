@@ -48,13 +48,15 @@ export interface CommArrow {
 }
 
 /** The kinds of agent talk, each drawn in its own colour. */
-export const COMM_KINDS = ["proposal", "contract", "help", "handoff", "conflict"] as const;
+/** Help is split by direction: an ASK (a request, or the owner answering a volunteer) and an OFFER (volunteering, offering, delivering). */
+export const COMM_KINDS = ["proposal", "contract", "help-ask", "help-offer", "handoff", "conflict"] as const;
 export type CommKind = (typeof COMM_KINDS)[number];
 
 /**
  * The kind of a talk arrow, from its message type alone: a proposal (items,
- * tools, and their acceptance or re-plan), a contract exchange, help, a
- * handoff, or a conflict (a contested or overlapping claim, a predicted
+ * tools, and their acceptance or re-plan), a contract exchange, a help ask
+ * (a request, a scoped grant, or the owner declining a volunteer), a help
+ * offer (volunteering, offering, or delivering help), a handoff, or a conflict (a contested or overlapping claim, a predicted
  * clash). Null for a message type the overlay never draws.
  */
 export function commKind(type: string): CommKind | null {
@@ -71,11 +73,12 @@ export function commKind(type: string): CommKind | null {
     case "contract.escalated":
       return "contract";
     case "help.requested":
+    case "help.declined":
+      return "help-ask";
     case "help.volunteered":
     case "help.offered":
     case "help.delivered":
-    case "help.declined":
-      return "help";
+      return "help-offer";
     case "handoff":
       return "handoff";
     case "claim.contested":
@@ -519,7 +522,7 @@ export function edgeVariant(edge: BoardGraphEdge): EdgeVariant | null {
   }
 }
 
-/** A legend key: an edge variant, or a talk kind (`talk-help`, ...). */
+/** A legend key: an edge variant, or a talk kind (`talk-help-ask`, ...). */
 export type LegendKey = EdgeVariant | `talk-${CommKind}`;
 
 export interface LegendEntry {
@@ -553,7 +556,8 @@ const LEGEND_TEXT: Readonly<Record<LegendKey, { readonly label: string; readonly
   message: { label: "message: an addressed message (messages toggle: as they land, or all)", name: "message", hint: "message: turn messages on (as they land, or all)" },
   "talk-proposal": { label: "proposal", name: "talk: proposal", hint: "talk: an item or tool proposed, accepted, rejected, or re-planned (talk on)" },
   "talk-contract": { label: "contract", name: "talk: contract", hint: "talk: a contract proposed, decided, or escalated (talk on)" },
-  "talk-help": { label: "help", name: "talk: help", hint: "talk: help asked, volunteered, offered, delivered, or declined (talk on)" },
+  "talk-help-ask": { label: "help asked", name: "talk: help asked", hint: "talk: help asked or granted, or a volunteer declined by the owner (talk on)" },
+  "talk-help-offer": { label: "help offered", name: "talk: help offered", hint: "talk: help volunteered, offered, or delivered (talk on)" },
   "talk-handoff": { label: "handoff", name: "talk: handoff", hint: "talk: an item handed to another agent (talk on)" },
   "talk-conflict": { label: "conflict", name: "talk: conflict", hint: "talk: a claim contested, kept, ceded, narrowed, overlapping, or a predicted clash (talk on)" },
 };
