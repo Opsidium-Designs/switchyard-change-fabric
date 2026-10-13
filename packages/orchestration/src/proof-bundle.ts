@@ -60,6 +60,11 @@ export interface ProofBundle {
   };
   /** The recorded promotion and whether its gated commit is the revision's. */
   readonly promotion?: { readonly rev: number; readonly gatedCommit: string; readonly commit: string; readonly branch: string; readonly seq?: number; readonly matchesGated: boolean };
+  /**
+   * The promotion receipt (a git note on the promoted commit), as the run
+   * reports it: written or not, and why not. A record, never part of the proof.
+   */
+  readonly receipt?: ProofReceipt;
   readonly gate: { readonly command?: readonly string[]; readonly verdict: "pass" | "fail" | "none"; readonly gated: boolean };
   readonly inventory: {
     readonly baseline: { readonly status: "recorded" | "unavailable"; readonly count?: number; readonly format?: string } | null;
@@ -123,6 +128,14 @@ export interface ProofCandidate {
   readonly developer?: ProofCount;
 }
 
+/** What happened to the promotion receipt note (the run reports it; a record only). */
+export interface ProofReceipt {
+  readonly ref: string;
+  readonly commit: string;
+  readonly written: boolean;
+  readonly reason?: string;
+}
+
 /** Options: what the log alone cannot carry (the run's own id, a promotion the board refused to record). */
 export interface ProofBundleOptions {
   readonly changeId?: string;
@@ -130,6 +143,8 @@ export interface ProofBundleOptions {
   readonly gateCommand?: readonly string[];
   /** A promotion the run reports but the board does not hold (it is checked the same way, never trusted). */
   readonly promotion?: { readonly rev?: number; readonly gatedCommit: string; readonly commit: string; readonly branch: string };
+  /** The promotion receipt note's outcome, as the run reports it. */
+  readonly receipt?: ProofReceipt;
 }
 
 function of<K extends BoardMessage["type"]>(log: readonly BoardMessage[], type: K): Extract<BoardMessage, { readonly type: K }>[] {
@@ -374,6 +389,7 @@ export function buildProofBundle(log: readonly BoardMessage[], options: ProofBun
         }
       : {}),
     ...(promotion ? { promotion } : {}),
+    ...(options.receipt ? { receipt: { ...options.receipt } } : {}),
     gate: {
       ...((state.gateCommand ?? options.gateCommand) !== undefined ? { command: [...(state.gateCommand ?? options.gateCommand)!] } : {}),
       verdict: last === undefined ? "none" : last.payload.gate,
@@ -442,6 +458,13 @@ export function formatProofSummary(bundle: ProofBundle): string[] {
   ];
   if (bundle.promotion) {
     lines.push(`  promoted: ${bundle.promotion.branch} ${bundle.promotion.commit.slice(0, 12)} from gated ${bundle.promotion.gatedCommit.slice(0, 12)} (${bundle.promotion.matchesGated ? "the gated tree" : "NOT the gated tree"})`);
+  }
+  if (bundle.receipt) {
+    lines.push(
+      bundle.receipt.written
+        ? `  receipt: git note on ${bundle.receipt.commit.slice(0, 12)} under ${bundle.receipt.ref}`
+        : `  receipt: NOT written (${bundle.receipt.reason ?? "no reason recorded"})`,
+    );
   }
   lines.push(`  gate: ${bundle.gate.command?.join(" ") ?? "(no command recorded)"} -> ${bundle.gate.verdict}${bundle.gate.gated ? "" : " (no gate ran)"}`);
   if (bundle.progress.length > 0) {

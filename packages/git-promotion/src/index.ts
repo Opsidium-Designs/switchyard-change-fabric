@@ -7,6 +7,8 @@
  *                     target, and result schema
  *   - LocalGitDeliveryProvider: the guaranteed baseline delivery path, creating
  *                     a real branch and commit in a local source repository
+ *   - notes:          the promotion receipt, a git note on the promoted commit
+ *                     under refs/notes/switchyard (never moves a branch)
  *   - cleanup:        the simple "expire the per-WorkUnit workspaces after
  *                     promotion" lifecycle policy, driven through the portable
  *                     WorkspaceProvider contract
@@ -28,6 +30,9 @@ export type {
 
 export type { LocalGitDeliveryOptions } from "./local-git.ts";
 export { LocalGitDeliveryProvider, defaultBranch } from "./local-git.ts";
+
+export type { PromotionReceiptRecord, WritePromotionNoteInput } from "./notes.ts";
+export { RECEIPT_NOTES_REF, writePromotionNote } from "./notes.ts";
 
 export type {
   ChangeWorkspaces,

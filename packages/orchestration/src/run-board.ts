@@ -98,7 +98,7 @@ import type { AgentTurnTransport, AskJev, ExecutorProvider } from "@switchyard-c
 import { jevErrorReason, ScopedNoopExecutor } from "@switchyard-change/model-adapters";
 import { runGit } from "@switchyard-change/artifact-workspace/git-transport";
 import { authenticatedRemote, type GitIdentity } from "@switchyard-change/local-runner";
-import { defaultBranch, type PromotionResult } from "@switchyard-change/git-promotion";
+import { defaultBranch, RECEIPT_NOTES_REF, writePromotionNote, type PromotionReceiptRecord, type PromotionResult } from "@switchyard-change/git-promotion";
 import {
   advanceIntegrationBranch,
   isIntegrationAborted,
@@ -129,6 +129,7 @@ import { DEFAULT_SPECULATE, formatCandidates, integrateSpeculativeRound, MAX_SPE
 import { integrateRatchetRound, type RatchetIsolation, type RatchetRoundResult } from "./ratchet-integration.ts";
 import { TokenRefresher } from "./token-refresh.ts";
 import { buildProofBundle, type ProofBundle } from "./proof-bundle.ts";
+import { buildPromotionReceipt } from "./promotion-receipt.ts";
 import { meteredExecutor, meteredJev, meteredToolAuthor, meteredTransport, RunMeter, type RunCapReached, type RunCaps } from "./run-meter.ts";
 import { RateLimitBackoff, rateLimitedExecutor, rateLimitedTransport, type RateLimitBackoffEvent, type RateLimitBackoffOptions } from "./rate-limit-backoff.ts";
 import { scanRepoSnapshot } from "./scan-repo.ts";
@@ -293,6 +294,8 @@ export type BoardRunEvent =
   | ({ readonly kind: "rate-limited" } & RateLimitBackoffEvent)
   /** The run promoted, but the board refused to record the promotion (the proof bundle says not proven). */
   | { readonly kind: "promotion-unrecorded"; readonly reason: string }
+  /** The promotion receipt (a git note on the promoted commit): written, or not and why (the promotion stands either way). */
+  | { readonly kind: "receipt"; readonly receipt: PromotionReceiptRecord }
   /** An agent's repo (or fork) token was replaced before it expired (recorded as token.refreshed; never the token). */
   | { readonly kind: "token-refreshed"; readonly agent: string; readonly tokenKind: "repo-write" | "help-fork"; readonly request?: string }
   | { readonly kind: "token-refresh-failed"; readonly reason: string }
@@ -744,6 +747,8 @@ export interface RunBoardResult {
   /** The last revision's evidence. */
   readonly evidence?: EvidenceSummary;
   readonly promotion?: PromotionResult;
+  /** The promotion receipt (a git note on the promoted commit under refs/notes/switchyard): written, or not and why. */
+  readonly receipt?: PromotionReceiptRecord;
   readonly sourceRepoDir?: string;
   readonly deployment?: { readonly url: string; readonly app: string };
   readonly workRoot: string;
@@ -3368,6 +3373,29 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   let evidence: EvidenceSummary | undefined;
   // A promotion the board refused to record (the proof bundle checks it the same way).
   let promotionUnrecorded: { rev: number; gatedCommit: string; commit: string; branch: string } | undefined;
+  // The promotion receipt note's outcome (reported, never swallowed).
+  let receipt: PromotionReceiptRecord | undefined;
+  const writeReceipt = async (commit: string): Promise<PromotionReceiptRecord> => {
+    const notWritten = (reason: string): PromotionReceiptRecord => ({ ref: RECEIPT_NOTES_REF, commit, written: false, reason });
+    if (promotionUnrecorded) {
+      return notWritten("the promotion was not recorded on the board, so there are no recorded facts to write a receipt from");
+    }
+    if (sourceRepoDir === undefined) {
+      return notWritten("the promoted repository is unknown");
+    }
+    try {
+      const sofar = await operator.log();
+      const bundle = buildProofBundle(sofar.messages, { changeId, ...(options.appGateCommand ? { gateCommand: options.appGateCommand } : {}) });
+      const built = buildPromotionReceipt(bundle, { at: new Date().toISOString() });
+      if (built === undefined || bundle.promotion?.commit !== commit) {
+        return notWritten("the board's recorded promotion is not this commit's");
+      }
+      const written = await writePromotionNote({ repoDir: sourceRepoDir, commit, message: scrub(built.text), identity, workRoot });
+      return written.reason !== undefined ? { ...written, reason: scrub(written.reason) } : written;
+    } catch (error) {
+      return notWritten(scrub(`the receipt could not be built: ${error instanceof Error ? error.message : String(error)}`));
+    }
+  };
   try {
     // 4. The last integration: anything still pending is integrated once more,
     // so the final verdict is the gate of the revision that includes it.
@@ -3514,6 +3542,12 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           promotionUnrecorded = { rev: last.n, gatedCommit, commit: promotion.commit, branch: promotion.branch };
           emit({ kind: "promotion-unrecorded", reason: scrub(recorded && !recorded.ok ? `${recorded.code}: ${recorded.error}` : "the board was unreachable") });
         }
+        // The receipt: a git note on the promoted commit, under its own notes
+        // ref (the commit and the branch are never touched). Built only from
+        // the board's recorded facts, so an unrecorded promotion gets none. A
+        // failure here never fails the promotion; it is reported instead.
+        receipt = await writeReceipt(promotion.commit);
+        emit({ kind: "receipt", receipt });
       }
       // A promotion the board did not record has no backing revision.promoted:
       // nothing is deployed from it (the proof bundle reports it unproven too).
@@ -3563,6 +3597,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     changeId,
     ...(options.appGateCommand ? { gateCommand: options.appGateCommand } : {}),
     ...(promotionUnrecorded ? { promotion: promotionUnrecorded } : {}),
+    ...(receipt ? { receipt } : {}),
   });
   return {
     changeId,
@@ -3593,6 +3628,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     ...(options.gateLabel !== undefined ? { gateLabel: options.gateLabel } : {}),
     ...(evidence ? { evidence } : {}),
     ...(promotion ? { promotion } : {}),
+    ...(receipt ? { receipt } : {}),
     ...(sourceRepoDir ? { sourceRepoDir } : {}),
     ...(deployment ? { deployment } : {}),
     workRoot,
@@ -4432,6 +4468,13 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
     );
   } else {
     lines.push("  not promoted: nothing was integrated");
+  }
+  if (result.receipt) {
+    lines.push(
+      result.receipt.written
+        ? `  receipt: git note on ${result.receipt.commit.slice(0, 12)} under ${result.receipt.ref} (read it: git notes --ref=switchyard show ${result.receipt.commit.slice(0, 12)})`
+        : `  receipt: NOT written (${result.receipt.reason ?? "no reason recorded"}); the promotion stands`,
+    );
   }
   if (result.deployment) {
     lines.push(`  redeployed: ${result.deployment.url}`);

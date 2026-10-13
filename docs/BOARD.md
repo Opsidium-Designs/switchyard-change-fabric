@@ -917,6 +917,31 @@ is distributed changes: items are proposed and claimed, never assigned.
   board refused after its blamed failure was recorded returns the failure's
   evidence, never the unrecorded candidate's. A worker's proposal awaiting the lead keeps the
   phase open (`all-items-done` waits for the lead's decision).
+- Promotion receipt: once the board records `revision.promoted`, the run
+  attaches a git note to the promoted commit under its own notes ref,
+  `refs/notes/switchyard` (`writePromotionNote`, git-promotion; text from
+  `buildPromotionReceipt`, a pure function of the proof bundle). It holds only
+  recorded facts: the change id, the goal (clipped to 280 characters), the
+  revision and its gated commit, the gate command and verdict ("no gate ran"
+  for an unverified pass), the acceptance/developer counts parsed from the gate
+  output (labeled advisory), the items integrated with their agents, the
+  pushes merged, the accepted contract changes (contract, target, decided by),
+  the branch, the proof status, and the ISO time; then a JSON block after the
+  line `--- switchyard receipt v1 json ---` (`parsePromotionReceipt` reads it
+  back). A note lives on its own ref, so it never changes the promoted commit,
+  the branch, or HEAD. Writing it never fails the promotion, and it is never
+  silent: the outcome is `receipt {ref, commit, written, reason?}` on the run
+  result, the `receipt` event, the summary (`receipt: ...`), and the proof
+  bundle (a record, never part of the proof). A promotion the board did not
+  record gets no note (`written: false`, no recorded facts to state). Read it
+  in the promoted repo (the printed `repo:` path) with
+  `git log --notes=switchyard` or `git notes --ref=switchyard show <commit>`.
+  Promotion lands in that local repo and pushes nowhere (with the local or
+  the cloud integrator alike: both promote locally), so there is no push for
+  the note to ride on. Notes do not travel with a plain fetch or push; carry
+  them explicitly, for example
+  `git fetch <repo> refs/notes/switchyard:refs/notes/switchyard` or
+  `git push <remote> refs/notes/switchyard`.
 - Work roots: the CLI's offline commands (`run`, `run-goal`, `run-board
   --offline`) remove their whole scratch work root when they finish
   (`work root removed: <path>`); a live run (`run-live`, `run-board`) and

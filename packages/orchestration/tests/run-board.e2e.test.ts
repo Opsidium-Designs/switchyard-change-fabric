@@ -32,6 +32,7 @@ import type { CommandOutcome, CommandRunner, DependencyInstaller } from "@switch
 
 import { createGenericBoardPolicy } from "../src/board-policy.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
+import { parsePromotionReceipt } from "../src/promotion-receipt.ts";
 import { FirstAttemptFailingGate, runBoardOffline } from "../src/run-board-offline.ts";
 import { boardRunExitCode, formatBoardRunSummary, formatBoardTranscript, runBoard, type BoardRunEvent, type BoardSeed, type RunBoardOptions } from "../src/run-board.ts";
 
@@ -223,6 +224,28 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     expect(await treeOf(result.sourceRepoDir!, result.promotion!.commit)).toBe(
       await treeOf(join(result.workRoot, "integration-artifacts", "change-board-offline--integration.git"), result.revision!.commit),
     );
+    // The receipt: a git note on the promoted commit under refs/notes/switchyard,
+    // holding the recorded facts; the branch head is still the promoted commit.
+    expect(result.receipt).toEqual({ ref: "refs/notes/switchyard", commit: result.promotion!.commit, written: true });
+    expect(events.find((e) => e.kind === "receipt")).toMatchObject({ receipt: { written: true } });
+    expect(result.proof!.receipt).toEqual(result.receipt);
+    expect(summary).toContain(`receipt: git note on ${result.promotion!.commit.slice(0, 12)} under refs/notes/switchyard`);
+    const note = (await git("git", ["-C", result.sourceRepoDir!, "notes", "--ref=switchyard", "show", result.promotion!.commit])).stdout;
+    expect(note).toContain(`Switchyard receipt: change change-board-offline, revision ${result.revision!.n}`);
+    expect(note).toContain(`Gated commit: ${result.revision!.commit} (revision ${result.revision!.n})`);
+    expect(note).toContain("no gate ran (unverified: nothing was checked)");
+    expect(note).toContain("Promoted to: switchyard/change-board-offline (the gated tree)");
+    const facts = parsePromotionReceipt(note)!;
+    expect(facts).toMatchObject({
+      changeId: "change-board-offline",
+      revision: { n: result.revision!.n, gatedCommit: result.revision!.commit },
+      promoted: { commit: result.promotion!.commit, branch: "switchyard/change-board-offline", matchesGated: true },
+      gate: { gated: false },
+      pushesMerged: of(log, "push.announced").length,
+    });
+    expect(facts.integrated.map((i) => i.item).sort()).toEqual(result.proof!.contributions.items.filter((i) => i.pushes > 0).map((i) => i.item).sort());
+    expect(Number.isNaN(Date.parse(facts.at))).toBe(false);
+    expect((await git("git", ["-C", result.sourceRepoDir!, "rev-parse", `refs/heads/${result.promotion!.branch}`])).stdout.trim()).toBe(result.promotion!.commit);
 
     expect(reduceBoard(log)).toEqual(result.state);
   });
@@ -2253,6 +2276,12 @@ describe("runBoard never promotes or redeploys a candidate the board did not rec
     expect(events.find((e) => e.kind === "deploy-skipped")).toMatchObject({ reason: expect.stringMatching(/not recorded on the board/) });
     expect(result.proof?.status).toBe("not-proven");
     expect(result.proof!.reasons.join("\n")).toMatch(/promotion reported by the run but not recorded on the board/);
+    // No recorded facts, no receipt: reported, and the promoted branch stands.
+    expect(result.receipt).toMatchObject({ ref: "refs/notes/switchyard", commit: result.promotion!.commit, written: false, reason: expect.stringMatching(/not recorded on the board/) });
+    expect(result.proof!.receipt).toEqual(result.receipt);
+    expect(formatBoardRunSummary(result)).toMatch(/receipt: NOT written \(the promotion was not recorded on the board[^\n]*\); the promotion stands/);
+    await expect(git("git", ["-C", result.sourceRepoDir!, "rev-parse", "--verify", "-q", "refs/notes/switchyard"])).rejects.toThrow();
+    expect((await git("git", ["-C", result.sourceRepoDir!, "rev-parse", `refs/heads/${result.promotion!.branch}`])).stdout.trim()).toBe(result.promotion!.commit);
   }, 120_000);
 });
 
