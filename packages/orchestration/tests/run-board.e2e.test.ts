@@ -697,7 +697,12 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
       reason: "item-budget",
       detail: expect.stringMatching(/spent more than 1 turns on item wiring; exhausted 3 item\(s\) \(core, api, wiring\), at most 3/),
     });
-    expect(result.stopReason).toBe("all-agents-stopped");
+    // Open work remains, so ONE replacement joins (a new id; the join bound is
+    // twice the dial's max): it is held to the same per-item budget and the
+    // board goes quiet (its claim contests the stopped holder's wide claim).
+    expect(of(result.log, "agent.joined").map((m) => m.from)).toEqual(["lead", "agent-1", "agent-2"]);
+    expect(of(result.log, "agent.joined").find((m) => m.from === "agent-2")!.rationale).toMatch(/^replacing 1 stopped agent\(s\): \d+ open item\(s\) outnumber the 0 agent\(s\) in flight/);
+    expect(result.stopReason).toBe("quiescent");
     expect(types(result.log)).not.toContain("push.announced");
     expect(result.revision).toBeUndefined();
     expect(result.verdict).toBe("failed");

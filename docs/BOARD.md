@@ -764,14 +764,17 @@ is distributed changes: items are proposed and claimed, never assigned.
   run pinned to arbitration revision 1 keeps the fixed 8, so its recorded
   logs replay unchanged),
   without an explicit `--max` the dial's max is min(items, 6)
-  (at least the dial's min), without an explicit `--max-turns` the
+  (at least the dial's min; an explicit `--max` is used as given, up to 128),
+  without an explicit `--max-turns` the
   run-wide turn budget is min(800, max(200, 25 per planned item + 10 per file
   in the planned scopes)), and without an explicit `--claim-cap` the claim cap
   is 1 (2 when planned items are at least three times the dial's max). An
   explicit claim cap (the goal rule or `--claim-cap`) is never overwritten. The
   effective values are printed (`budgets: ...`), with a `warning:` when the
   plan is empty (it can never end all-items-done) or the scaled turn budget is
-  capped at 800 below what the plan asks (pass `--max-turns`).
+  capped at 800 below what the plan asks (the warning names the exact
+  `--max-turns N` the plan asks for; `--max-turns` takes any positive integer,
+  for example 3000).
 - No claim hoarding (`goal.posted.rules.maxActiveClaims`): an agent may hold
   at most that many UNFINISHED change items; a further claim, or a handoff to
   an agent at its cap, is refused (`CLAIM_CAP`) and the digest says so
@@ -892,7 +895,8 @@ is distributed changes: items are proposed and claimed, never assigned.
 - `packages/orchestration/src/run-board.ts`: the driver. It creates the Change
   (planning-first), derives the protected set, posts `goal.posted` (with it) as
   the human, starts the lead, recruits workers under the min/max dial (another
-  joins while open items outnumber the workers in flight, up to max), and
+  joins while open items outnumber the workers in flight, up to max; a worker
+  that stopped is replaced, see "Wide pools" below), and
   integrates CONTINUOUSLY while the agents work (below). The agent phase ends
   when every item is completed, or every outstanding item's fix budget is spent
   (`fix-budget`), or the run budget, a cost or time cap (`capped`), persistent
@@ -1488,7 +1492,7 @@ Usage:
 ```bash
 make demo-board                     # offline: local control, generic policy, noop executor, fixture gate
 switchyard-change run-board --offline [--fixture-gate] [--decide-contracts accept|reject] --goal-file <goal.txt> --project <dir> [--min N] [--max N] [--keep-work-root]
-switchyard-change run-board "<goal>" --project <dir> --worker <url> [--min N] [--max N] \
+switchyard-change run-board "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--max-inflight N] \
   [--id <changeId>] [--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] \
   [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] \
   [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] \
@@ -1497,10 +1501,49 @@ switchyard-change run-board "<goal>" --project <dir> --worker <url> [--min N] [-
 
 Flags are `--flag value` (two arguments): an inline `--flag=value` and a known
 flag with no value are refused with a clear error. The dial is integers
-`1 <= --min <= --max <= 16` (without `--max` the default 3 is raised to
-`--min`); `--token-ttl` is an integer from 60 to 3600 seconds; every numeric
+`1 <= --min <= --max <= 128` (without `--max` the default 3 is raised to
+`--min`); `--max-inflight` is an integer from 1 to 64; `--token-ttl` is an integer from 60 to 3600 seconds; every numeric
 flag must be a plain decimal number (never coerced: `NaN`, `Infinity`, `1e3`,
 and `0x10` are refused).
+
+### Wide pools: agents, model calls, and replacements
+
+The dial counts AGENTS, not model calls. An agent spends most of its time
+outside a model call (reading the board, running its repo operations, waiting
+for a revision), so a pool of 30 agents needs far fewer calls in flight than
+30, and each local CLI call is a process of its own while each gateway call
+counts against the provider's rate limit. `--max-inflight N` (1 to 64;
+default min(the dial's max, 8)) bounds the model calls a run has in flight at
+once: agent turns, edits, the planner, tool authoring, and typed decisions all
+share it. A call beyond it waits for a slot in arrival order (first in, first
+out), so no agent is starved; the queue wait is outside each call's own
+timeout. A call made on a path that already holds a slot runs on that slot,
+so nesting never deadlocks, and a slot is released on a return, a throw, or an
+abort (a turn still queued when the agent phase ends is answered `wait`
+without calling the model). The shared rate-limit backoff (see "Rate limits")
+composes with it: a paused agent asks for no slot. The budgets line prints the
+limit, and the summary prints the peak in flight and the calls that queued and
+for how long (`model calls in flight: at most N at once, peak P; Q of C
+call(s) queued for a slot, W s queued in total`; also `inflight` on the run's
+result).
+
+Worker replacement: the pool counts ACTIVE workers (not stopped). When a
+worker stops (it exhausted its per-item budget on three items, or a step
+failed), another joins in its place while open work (open items, plus help
+requests granting a scope) outnumbers the active workers, with a new id that
+continues the sequence (`agent-31`, `agent-32`, ...; an id is never reused). A
+replacement never joins a board with nothing open. Joins over the whole run
+(the first pool and every replacement) are bounded by twice the dial's max and
+by what the board admits beside the lead. The run ends `all-agents-stopped`
+only when every worker stopped and no replacement may join.
+
+Limits for wide pools: a board admits 256 agents over its life (the lead, the
+workers, and their replacements); an integrated revision may merge up to 256
+pushes; a board holds 20000 messages (512 kept in reserve for engine batches).
+The scaled claim lease is 40 messages per agent of the dial's max, so the
+scaled deadline (8 leases) is capped at what a board can hold (19338 messages)
+for a dial above about 60. These are admission and size bounds only: they
+never change how a recorded log folds, so recorded replays fold as before.
 
 `--speculate K` (1 to 8; default 3 with the local integrator) sets speculative
 batch gating (see "Speculative batch gating" below); `--speculate 1` integrates
@@ -2319,7 +2362,8 @@ recorded state only.
   seam's importers forever); tool items too (builds and tool gates renew them);
   a split item is not (its children are). Defaults (`scaledBudgets`): a lease
   of max(150, 40 per agent of the dial's max) board messages and a deadline of
-  8 leases; `--lease-messages` and `--deadline-messages` override them.
+  8 leases (at most 19338 messages, what a board can hold); `--lease-messages`
+  and `--deadline-messages` override them.
 
 ### Excluded pushes (`push.excluded`)
 

@@ -50,7 +50,10 @@ to start with the reason.
 | `CLI_JEV` | `off` | `gateway` keeps the advisory Jev layer on the AI Gateway (needs its credentials) |
 
 Models are Claude Code aliases (`sonnet`, `opus`, `haiku`) or full model ids.
-The concurrency dial is unchanged. The run header names the path, for example:
+The concurrency dial is unchanged. Each call is a process of its own, so a
+board run bounds how many run at once with `--max-inflight N` (default
+min(the dial's max, 8)); agents beyond it queue for a slot (see "Wide pools"
+in BOARD.md). The run header names the path, for example:
 
 ```
 inference: local claude CLI on this machine's own login (executor sonnet -> opus; planner sonnet; agent turns sonnet; tools opus, sonnet); Jev off

@@ -1,7 +1,8 @@
 /**
  * Flag validation at the real CLI entrypoint: an inline `--flag=value` (which
  * the CLI would otherwise ignore without a word) and a known flag with no
- * value are refused clearly; the dial is integers 1 <= min <= max <= 16; the
+ * value are refused clearly; the dial is integers 1 <= min <= max <= 128;
+ * `--max-inflight` is an integer from 1 to 64; the
  * numeric caps and prices are never coerced (NaN, a bad price, a duplicate);
  * `--token-ttl` is an integer from 60 to 3600 s; and `--max-spend-usd` is
  * refused unless every model the run calls has a `--price`. Spawns the actual
@@ -35,6 +36,7 @@ const STRIPPED = [
   "AI_GATEWAY_PLANNER_MODEL",
   "AI_GATEWAY_PLANNER_ESCALATION_MODELS",
   "AGENT_TURN_MODEL",
+  "SWITCHYARD_INFERENCE",
 ];
 
 let liveEnvFile: string;
@@ -95,18 +97,33 @@ describe("CLI flag validation", () => {
     expect(swallowed.stderr).toContain("--max-calls needs a value");
   });
 
-  it("the dial is integers 1 <= min <= max <= 16", async () => {
+  it("the dial is integers 1 <= min <= max <= 128", async () => {
     for (const [args, message] of [
       [["--min", "4", "--max", "2"], "--min (4) must not exceed --max (2)"],
-      [["--max", "17"], "--max must be an integer from 1 to 16"],
-      [["--min", "0"], "--min must be an integer from 1 to 16"],
-      [["--min", "abc"], "--min must be an integer from 1 to 16"],
-      [["--max", "2.5"], "--max must be an integer from 1 to 16"],
+      [["--max", "129"], "--max must be an integer from 1 to 128"],
+      [["--min", "0"], "--min must be an integer from 1 to 128"],
+      [["--min", "abc"], "--min must be an integer from 1 to 128"],
+      [["--max", "2.5"], "--max must be an integer from 1 to 128"],
     ] as const) {
       const { code, stderr } = await runCli(offline(...args));
       expect(code).toBe(1);
       expect(stderr).toContain(message);
     }
+  });
+
+  it("--max-inflight is an integer from 1 to 64", async () => {
+    for (const value of ["0", "65", "abc", "2.5"]) {
+      const { code, stderr } = await runCli(offline("--max-inflight", value));
+      expect(code).toBe(1);
+      expect(stderr).toContain(`--max-inflight must be an integer from 1 to 64 (got "${value}")`);
+    }
+  });
+
+  it("accepts a 128-agent dial, a 64-call in-flight limit, and a large --max-turns (the live run then stops for want of a turn model, not a flag)", async () => {
+    const { code, stderr } = await runCli(live("--min", "1", "--max", "128", "--max-inflight", "64", "--max-turns", "3000"));
+    expect(code).toBe(1);
+    expect(stderr).not.toMatch(/--max(-inflight|-turns)? must be/);
+    expect(stderr).toContain("a live board run needs a live turn model");
   });
 
   it("numeric caps and prices are never coerced: NaN, a bad price, and a duplicate price are refused", async () => {

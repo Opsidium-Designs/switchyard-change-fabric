@@ -571,6 +571,33 @@ describe("board transitions: invalid moves are rejected with a clear error and c
     board.reject(msg("a", "help.offered", { request: "x" }, { inReplyTo: 999 }), /names no recorded message/, "UNKNOWN_REF");
   });
 
+  it("admits a wide pool over a run (replacements included) up to maxAgents, then refuses with LIMIT", () => {
+    expect(BOARD_LIMITS.maxAgents).toBe(256);
+    const board = seeded();
+    // seeded() joined a, b, c, and the lead.
+    for (let i = 4; i < BOARD_LIMITS.maxAgents; i += 1) {
+      board.post(msg(`w${i}`, "agent.joined"));
+    }
+    expect(Object.keys(board.state.agents)).toHaveLength(BOARD_LIMITS.maxAgents);
+    board.reject(msg("one-too-many", "agent.joined"), /admits at most 256 agents/, "LIMIT");
+  });
+
+  it("an integrated revision may merge more pushes than an intent has entries (a wide pool lands in one revision)", () => {
+    const board = seeded();
+    const agents = Array.from({ length: 100 }, (_, i) => `w${i}`);
+    for (const [i, agent] of agents.entries()) {
+      board.post(msg(agent, "agent.joined"));
+      board.post(msg("lead", "item.proposed", { item: `p${i}`, objective: `p${i} ok`, acceptance: ["it works"], scopeHint: [`src/p${i}.ts`] }));
+      board.post(claim(agent, `p${i}`, [`src/p${i}.ts`]));
+      board.post(push(agent, `p${i}`, `c${i}`, [`src/p${i}.ts`]));
+    }
+    const merged = agents.map((_, i) => `c${i}`);
+    expect(merged.length).toBeGreaterThan(BOARD_LIMITS.maxIntentEntries);
+    const appended = board.post(rev("fail", merged, "r-wide"));
+    expect(appended[0]).toMatchObject({ type: "integrated.rev", payload: { merged } });
+    board.reject(rev("pass", Array.from({ length: BOARD_LIMITS.maxRevisionPushes + 1 }, (_, i) => `x${i}`), "r-over"), /at most 256 ids/, "BAD_PAYLOAD");
+  });
+
   it("a full board refuses further messages with LIMIT (409)", () => {
     const board = seeded();
     board.state = { ...board.state, lastSeq: BOARD_LIMITS.maxMessages - 10 };

@@ -69,6 +69,8 @@ import {
   formatCandidates,
   DEFAULT_SPECULATE,
   MAX_SPECULATE,
+  MAX_INFLIGHT,
+  validMaxInflight,
   formatBoardTranscript,
   formatBudgetsLine,
   formatProofSummary,
@@ -952,7 +954,7 @@ const commands: Command[] = [
     summary:
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
-      `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--id <changeId>] ` +
+      `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--max-inflight N] [--id <changeId>] ` +
       `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--deploy-app <app dir> [--deploy-app-name <worker>] [--preview-revisions]] [--rate-limit-window-ms N] [--inference gateway|claude-cli|codex-cli] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
@@ -965,6 +967,7 @@ const commands: Command[] = [
         return 1;
       }
       const dial = dialFromArgs(args);
+      const maxInflight = maxInflightFromArgs(args);
       const intFlag = (flag: string): number | undefined => {
         const raw = optionValue(args, flag);
         if (raw === undefined) {
@@ -1139,6 +1142,7 @@ const commands: Command[] = [
           dial,
           // No explicit --max: the dial's max scales with the plan size.
           ...(optionValue(args, "--max") === undefined ? { scaleDial: true } : {}),
+          ...(maxInflight !== undefined ? { maxInflight } : {}),
           budgets,
           caps,
           // The fixture replaces the declared gate entirely (offline only).
@@ -1284,6 +1288,8 @@ const commands: Command[] = [
         dial,
         // No explicit --max: the dial's max scales with the plan size.
         ...(optionValue(args, "--max") === undefined ? { scaleDial: true } : {}),
+        // Model calls in flight at once (default min(dial max, 8)): agents beyond it queue for a slot.
+        ...(maxInflight !== undefined ? { maxInflight } : {}),
         transport: turn.transport,
         executor: selected.executor,
         ...(selected.escalationModels.length > 0 ? { escalationModels: selected.escalationModels } : {}),
@@ -1747,8 +1753,8 @@ function integerValue(raw: string): number {
 /** The agents' repo token lifetime bounds (seconds), as the Worker enforces them. */
 const MIN_TOKEN_TTL_SECONDS = 60;
 const MAX_TOKEN_TTL_SECONDS = 3600;
-/** The concurrency dial's upper bound. */
-const MAX_DIAL = 16;
+/** The concurrency dial's upper bound (agents in the pool; model calls in flight are bounded separately by --max-inflight). */
+const MAX_DIAL = 128;
 
 /**
  * Resolve the --gate / --no-gate toggle for the per-app gate. Returns true when
@@ -2017,6 +2023,23 @@ function dialFromArgs(args: readonly string[]): ConcurrencyDial {
     throw new Error(`--min (${min}) must not exceed --max (${max})`);
   }
   return { minConcurrency: min, maxConcurrency: max };
+}
+
+/**
+ * Parse --max-inflight: the most model calls a board run has in flight at once
+ * (an integer from 1 to MAX_INFLIGHT). Undefined when absent: the run defaults
+ * it to min(the dial's max, 8).
+ */
+function maxInflightFromArgs(args: readonly string[]): number | undefined {
+  const raw = optionValue(args, "--max-inflight");
+  if (raw === undefined) {
+    return undefined;
+  }
+  const value = integerValue(raw);
+  if (!validMaxInflight(value)) {
+    throw new Error(`--max-inflight must be an integer from 1 to ${MAX_INFLIGHT} (got ${JSON.stringify(raw)})`);
+  }
+  return value;
 }
 
 /** True when `value` is the argument consumed by a preceding --flag. */
