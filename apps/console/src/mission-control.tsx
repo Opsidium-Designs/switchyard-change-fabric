@@ -31,7 +31,8 @@ import {
   COMM_WINDOW,
   commCurve,
   drawnLegend,
-  outstandingFixLinks,
+  fixAskState,
+  revisionAnchor,
   placeLabel,
   talkLabelCandidates,
   type EdgeVariant,
@@ -60,6 +61,8 @@ import {
   benchCounts,
   benchLine,
   COMPACT_DOT_R,
+  COMPACT_DOT_Y,
+  COMPACT_NESTED_DOT_Y,
   COMPACT_HULL_H,
   COMPACT_NESTED_H,
   COMPACT_MAX_AGENTS,
@@ -784,12 +787,15 @@ function ItemCard({
   selected,
   onSelect,
   onSelectAgent,
+  fixAsk,
 }: {
   node: BoardGraphNode;
   label: string;
   selected: boolean;
   onSelect: () => void;
   onSelectAgent: (agent: string) => void;
+  /** The item's fix request: the current failing state ("open") or history ("superseded"); none when answered. */
+  fixAsk?: { readonly n: number; readonly state: "open" | "superseded" } | undefined;
 }) {
   if (node.detail.kind !== "item") {
     return null;
@@ -815,7 +821,15 @@ function ItemCard({
             {agentShortLabel(d.claimant)} waits
           </button>
         ) : null}
-        {d.fixRequested !== undefined ? <span className="mc-tag is-fix">fix asked (rev {d.fixRequested})</span> : null}
+        {fixAsk?.state === "open" ? (
+          <span className="mc-tag is-fix" title="the latest revision failed and asked this item for a fix; it clears when the owner pushes">
+            fix asked (rev {fixAsk.n})
+          </span>
+        ) : fixAsk?.state === "superseded" ? (
+          <span className="mc-tag is-history" title="history: an earlier failing revision asked for a fix; a later revision was integrated and did not ask again">
+            asked at rev {fixAsk.n}
+          </span>
+        ) : null}
         {d.fixExhausted ? <span className="mc-tag is-fix">fix budget spent</span> : null}
         {d.doneProposed && d.completed === undefined ? <span className="mc-tag">done proposed, unverified</span> : null}
         {d.status === "split" ? <span className="mc-tag">split</span> : null}
@@ -875,6 +889,7 @@ export function BoardPane({
   charts?: ReactNode;
 }) {
   const byItem = new Map(model.nodes.filter((n) => n.kind === "item").map((n) => [n.label, n]));
+  const fixAsks = log ? fixAskState(model, log) : new Map<string, { n: number; state: "open" | "superseded" }>();
   // A large board's cards are compact (one line each; the objective shows on the selected card).
   const compactList = compactCards(byItem.size);
   const short = boardShortLabels([...byItem.keys()], { seeds: seedItemIds(model) });
@@ -931,6 +946,7 @@ export function BoardPane({
                         selected={false}
                         onSelect={() => onSelect({ kind: "item", id })}
                         onSelectAgent={(agent) => onSelect({ kind: "agent", id: agent })}
+                        fixAsk={fixAsks.get(id)}
                       />
                     ) : null;
                   })}
@@ -962,6 +978,7 @@ export function BoardPane({
                         selected={selection?.kind === "item" && selection.id === id}
                         onSelect={() => onSelect({ kind: "item", id })}
                         onSelectAgent={(agent) => onSelect({ kind: "agent", id: agent })}
+                        fixAsk={fixAsks.get(id)}
                       />
                     ) : null;
                   })}
@@ -1240,9 +1257,11 @@ const FIT_PAD = 16;
 /** Text never renders below its CSS size; it grows by at most this much when the drawing is scaled down. */
 const MAX_TEXT_BOOST = 1.8;
 /** Where a focused revision is drawn: above the hulls, at the right of the drawing. */
-const REV_ANCHOR_Y = 122;
+const REV_ANCHOR_Y = 150;
 /** The line over the latest revision while its open fix requests are drawn (its red hexagon says it failed). */
 const FIX_ASKED_LABEL = "FAIL: fix asked";
+/** The line over a newly passing latest revision (shown a few seqs, fading). */
+const PASSED_LABEL = "PASS";
 
 /** The text boost that keeps labels at their minimum on-screen size at a given drawing scale. */
 export function textBoost(drawingScale: number): number {
@@ -1339,8 +1358,10 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
   // The revision drawn now (only while focused), at its anchor above the hulls.
   const focusNode = focusRev !== null ? model.nodes.find((n) => n.id === `rev:${focusRev}`) : undefined;
   // With no revision focused, the latest revision's open fix requests are drawn from it (each line backed by its fix.requested).
-  const fixAsked = focusNode ? null : outstandingFixLinks(model, log);
-  const shownRev = focusNode ?? fixAsked?.rev;
+  const anchor = focusNode ? null : revisionAnchor(model, log);
+  const fixAsked = anchor?.mode === "fix-asked" ? anchor : null;
+  const shownRev = focusNode ?? anchor?.rev;
+  const anchorLabel = anchor?.mode === "passed" ? PASSED_LABEL : FIX_ASKED_LABEL;
   const revAnchor = { x: extent.width - 34, y: REV_ANCHOR_Y };
   const points = new Map<string, BoardPoint>();
   for (const node of model.nodes) {
@@ -1359,6 +1380,8 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
       points.set(node.id, p);
     }
   }
+  // Only the latest failing revision's open requests read as "fix" on a hull (an older request is history).
+  const fixAsks = fixAskState(model, log);
   const itemLabels = smartItemTitles(
     boardPrefix(log, model.k),
     boardShortLabels(
@@ -1434,7 +1457,7 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
     if (collapsed.has(node.detail.item)) {
       const w = `${node.detail.agents.length} agents`.length * 15 * boost * CHAR_EM;
       const cx = compact ? rect.x + 12 + w / 2 : rect.x + rect.w / 2;
-      const by = compact ? rect.y + (rect.parent !== undefined ? 50 : 54) + 5 : rect.y + rect.h / 2 + 12;
+      const by = compact ? rect.y + (rect.parent !== undefined ? COMPACT_NESTED_DOT_Y : COMPACT_DOT_Y) + 5 : rect.y + rect.h / 2 + 12;
       occupied.push(textBox(cx, by, w, 15 * boost));
     }
   }
@@ -1461,7 +1484,7 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
       const w = shownRev.detail.verdictLabel.length * 13 * boost * CHAR_EM;
       occupied.push({ x: revAnchor.x - 26 - w, y: revAnchor.y - 20, w, h: 40 });
     } else {
-      const w = FIX_ASKED_LABEL.length * 13 * boost * CHAR_EM;
+      const w = anchorLabel.length * 13 * boost * CHAR_EM;
       occupied.push(textBox(revAnchor.x + 18 - w / 2, revAnchor.y - 26, w, 13 * boost));
     }
   }
@@ -1586,7 +1609,7 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
                   const rect = layout.items.get(d.item);
                   if (!rect) return null;
                   const isSel = selected === node.id;
-                  const statusText = `${node.status}${d.fixRequested !== undefined ? ` / fix ${d.fixAttempts}` : ""}`;
+                  const statusText = `${node.status}${fixAsks.get(d.item)?.state === "open" ? ` / fix ${d.fixAttempts}` : ""}`;
                   const title = itemLabels.get(d.item) ?? d.item;
                   const header = hullHeader({ title: compact ? compactHullTitle(d.item, title, rect.parent ?? laneOfItem.get(d.item)) : title, status: statusText, width: rect.w, boost });
                   // The done check and the struggling mark sit at the bottom of the hull; a compact hull keeps them in its own band (above any nested child).
@@ -1654,7 +1677,7 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
                         <text
                           className="mc-hull-count"
                           x={compact ? rect.x + 12 : rect.x + rect.w / 2}
-                          y={compact ? rect.y + (rect.parent !== undefined ? 50 : 54) + 5 : rect.y + rect.h / 2 + 12}
+                          y={compact ? rect.y + (rect.parent !== undefined ? COMPACT_NESTED_DOT_Y : COMPACT_DOT_Y) + 5 : rect.y + rect.h / 2 + 12}
                           textAnchor={compact ? "start" : "middle"}
                         >
                           {d.agents.length} agents
@@ -1695,8 +1718,9 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
             {/* The focused revision's own edges (merged items, fix asked), else the latest revision's open fix requests, to the top of each hull. */}
             {shownRev && shownRev.detail.kind === "rev" ? (
               <g
-                className={`mc-rev-focus status-${shownRev.status}${focusNode ? "" : " is-fix-asked"}`}
-                aria-label={focusNode ? `revision ${shownRev.detail.n} links` : `revision ${shownRev.detail.n} open fix requests`}
+                className={`mc-rev-focus status-${shownRev.status}${focusNode ? "" : anchor?.mode === "passed" ? " is-passed" : " is-fix-asked"}`}
+                aria-label={focusNode ? `revision ${shownRev.detail.n} links` : anchor?.mode === "passed" ? `revision ${shownRev.detail.n} passed` : `revision ${shownRev.detail.n} open fix requests`}
+                {...(anchor?.mode === "passed" ? { style: { opacity: anchor.opacity } } : {})}
               >
                 {shownRevLinks.map((edge) => {
                   const item = (edge.from.startsWith("item:") ? edge.from : edge.to).slice("item:".length);
@@ -1717,7 +1741,7 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
                   </text>
                   {/* Focused: the verdict to its left. Fix requests only: a short line above it, clear of the goal's label. */}
                   <text className="mc-node-sub" textAnchor="end" x={focusNode ? -26 : 18} y={focusNode ? 5 : -26}>
-                    {focusNode ? shownRev.detail.verdictLabel : FIX_ASKED_LABEL}
+                    {focusNode ? shownRev.detail.verdictLabel : anchorLabel}
                   </text>
                   <title>{shownRev.tooltip}</title>
                 </g>
@@ -2553,6 +2577,36 @@ export const REPLAY_SPEEDS = [1, 4, 16] as const;
 /** Milliseconds per message at 1x. */
 const REPLAY_BASE_MS = 2000;
 
+/**
+ * The scrubber thumb's width in CSS px (styles.css sets it as `--mc-thumb` and
+ * styles the thumb to exactly this width in every engine), so the tick row can
+ * be inset by half a thumb on each side and line up with the thumb's centre.
+ */
+export const SCRUB_THUMB_PX = 14;
+
+/**
+ * Where the centre of a range input's thumb sits for `value`, in px from the
+ * input's left edge: the thumb travels the track minus its own width, so its
+ * centre runs from half a thumb at `min` to the width minus half a thumb at `max`.
+ */
+export function scrubThumbCenter(value: number, min: number, max: number, widthPx: number, thumbPx = SCRUB_THUMB_PX): number {
+  const span = max - min;
+  const frac = span > 0 ? Math.min(1, Math.max(0, (value - min) / span)) : 0;
+  return thumbPx / 2 + frac * Math.max(0, widthPx - thumbPx);
+}
+
+/**
+ * Where the tick (pip) of message `seq` sits, in px from the scrubber's left
+ * edge: the tick row is an SVG whose viewBox runs `min..max` with the tick
+ * drawn AT x = seq, inset by half a thumb on each side (styles.css), so it
+ * lands exactly under the thumb's centre at that seq.
+ */
+export function scrubTickX(seq: number, min: number, max: number, widthPx: number, thumbPx = SCRUB_THUMB_PX): number {
+  const inner = Math.max(0, widthPx - thumbPx);
+  const span = max - min;
+  return thumbPx / 2 + (span > 0 ? ((seq - min) / span) * inner : 0);
+}
+
 export function ReplayBar({
   log,
   k,
@@ -2585,7 +2639,8 @@ export function ReplayBar({
     for (const m of log) {
       const f = boardMessageFamily(m.type);
       const list = paths.get(f) ?? [];
-      list.push(`M${m.seq - 0.5} 0v10`);
+      // AT the seq (never seq - 0.5): the range below puts its thumb's centre at value/max of the inset row.
+      list.push(`M${m.seq} 0v10`);
       paths.set(f, list);
     }
     return [...paths.entries()];
@@ -2609,7 +2664,8 @@ export function ReplayBar({
           </button>
         ))}
       </span>
-      <div className="mc-scrub">
+      <div className="mc-scrub" style={{ ["--mc-thumb" as string]: `${SCRUB_THUMB_PX}px` }}>
+        {/* viewBox 0..lastSeq matches the range's min..max; the row is inset half a thumb each side (styles.css). */}
         <svg className="mc-ticks" viewBox={`0 0 ${Math.max(1, lastSeq)} 10`} preserveAspectRatio="none" aria-hidden="true">
           {ticks.map(([family, d]) => (
             <path key={family} d={d.join("")} style={{ stroke: FAMILY_COLORS[family] }} strokeWidth={Math.max(0.4, lastSeq / 600)} />
@@ -2733,6 +2789,14 @@ export function MissionControl({
   const [hoverRev, setHoverRev] = useState<number | null>(null);
   const live = cursor === "live" || cursor >= lastSeq;
   const k = cursor === "live" ? lastSeq : Math.min(cursor, lastSeq);
+  // The seq a selection was made at: a selected revision draws its links only until the cursor moves on.
+  const kRef = useRef(k);
+  kRef.current = k;
+  const [selectedAt, setSelectedAt] = useState<number | null>(initialSelection ? k : null);
+  // A hovered gate marker can be re-rendered away under the pointer (no mouseleave): moving the cursor ends the hover.
+  useEffect(() => {
+    setHoverRev(null);
+  }, [k]);
   useEffect(() => {
     onSeqChange?.(live ? null : k);
   }, [k, live, onSeqChange]);
@@ -2814,6 +2878,7 @@ export function MissionControl({
 
   const select = useCallback((next: BoardSelection) => {
     setSelection(next);
+    setSelectedAt(kRef.current);
     setTab((t) => (t === "tools" ? "thread" : t));
   }, []);
 
@@ -2884,7 +2949,9 @@ export function MissionControl({
   const selectedSeq = selection?.kind === "seq" ? selection.seq : null;
   const markers = gateTimeline(model, log);
   const selectedRev = selectedId?.startsWith("rev:") ? Number(selectedId.slice(4)) : null;
-  const focusRev = hoverRev ?? selectedRev;
+  // A selected revision is focused (its node and links drawn) only at the seq it was selected at:
+  // once the cursor moves on, the anchor goes back to the latest revision's open fix requests.
+  const focusRev = hoverRev ?? (selectedAt === k ? selectedRev : null);
   const landed = selectedNode?.detail.kind === "rev" ? speculativeLanded(log, k, selectedNode.detail.n) : undefined;
 
   const narration = narrateAt(log, k, payloadSummary);

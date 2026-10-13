@@ -1354,6 +1354,7 @@ body {
 }
 
 .mc-tag.is-fix { border-color: var(--bad-strong); color: var(--bad-text); }
+.mc-tag.is-history { border-style: dashed; border-color: var(--grey-border); color: var(--muted); font-style: italic; }
 
 .mc-done {
   display: inline-block;
@@ -1606,8 +1607,61 @@ body {
   min-width: 10rem;
 }
 
-.mc-ticks { width: 100%; height: 10px; }
-.mc-scrub input { width: 100%; margin: 0; }
+/* The tick row spans exactly the thumb centre's travel: the range thumb is
+   styled to --mc-thumb wide in every engine, and the row is inset half a thumb
+   on each side, so the pip of seq k sits under the thumb's centre at k. */
+.mc-scrub { --mc-thumb: 14px; }
+.mc-ticks {
+  display: block;
+  width: calc(100% - var(--mc-thumb));
+  margin: 0 calc(var(--mc-thumb) / 2);
+  height: 10px;
+  overflow: visible;
+}
+.mc-scrub input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  display: block;
+  width: 100%;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+}
+.mc-scrub input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+}
+.mc-scrub input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border);
+}
+.mc-scrub input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  box-sizing: border-box;
+  width: var(--mc-thumb);
+  height: var(--mc-thumb);
+  margin-top: calc((4px - var(--mc-thumb)) / 2);
+  border-radius: 50%;
+  border: 2px solid var(--panel);
+  background: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.mc-scrub input[type="range"]::-moz-range-thumb {
+  box-sizing: border-box;
+  width: var(--mc-thumb);
+  height: var(--mc-thumb);
+  border-radius: 50%;
+  border: 2px solid var(--panel);
+  background: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.mc-scrub input[type="range"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .mc-seq { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; color: var(--muted); }
 .mc .mc-live-pill { border-radius: 999px; }
 .mc .mc-live-pill.is-live { background: var(--bad-strong); border-color: var(--bad-strong); color: #fff; font-weight: 700; }
@@ -2107,6 +2161,7 @@ body {
 /* --- A focused revision's links in the graph (hovered on the timeline, or selected) --- */
 
 .mc-rev-focus .mc-edge path { fill: none; stroke-width: 2.2; cursor: pointer; }
+.mc-rev-focus.is-passed { transition: opacity 400ms ease; }
 .mc-rev-focus .mc-edge.kind-dependency path { stroke: var(--muted); }
 .mc-rev-focus.status-pass .mc-edge.kind-dependency path { stroke: var(--ok); }
 .mc-rev-focus.status-fail .mc-edge.kind-dependency path { stroke: var(--bad); }

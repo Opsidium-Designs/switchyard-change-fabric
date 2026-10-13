@@ -418,14 +418,81 @@ export function outstandingFixLinks(
   }
   if (!latest || latest.detail.kind !== "rev") return null;
   if (latest.detail.gated && latest.detail.gate === "pass") return null;
-  const pushes = boardPrefix(log, model.k).filter((m) => m.type === "push.announced");
+  const answers = boardPrefix(log, model.k).filter((m) => FIX_ANSWER_TYPES.has(m.type));
   const edges = model.edges.filter((e) => {
     if (e.kind !== "trigger" || e.from !== latest!.id || e.type !== "fix.requested" || !e.to.startsWith("item:")) return false;
     const item = e.to.slice("item:".length);
     const asked = e.seqs[0]!;
-    return !pushes.some((m) => m.seq > asked && m.type === "push.announced" && m.payload.item === item);
+    return !answers.some((m) => m.seq > asked && fixAnswerItem(m) === item);
   });
   return edges.length > 0 ? { rev: latest, edges } : null;
+}
+
+/**
+ * The messages that end a fix request for their item: the owner's push (the
+ * fix itself), the item completed, its fix budget spent, the item reopened for
+ * someone else, or the claim lapsing. A later revision ends every request of
+ * the one before it (outstandingFixLinks only reads the latest revision).
+ */
+const FIX_ANSWER_TYPES = new Set<BoardMessage["type"]>(["push.announced", "item.completed", "fix.exhausted", "item.reopened", "claim.lapsed"]);
+
+function fixAnswerItem(m: BoardMessage): string | undefined {
+  return FIX_ANSWER_TYPES.has(m.type) ? (m.payload as { readonly item?: string }).item : undefined;
+}
+
+/** How many seqs a newly passing revision stays drawn at the anchor (fading) before it leaves. */
+export const PASS_SHOW_SEQS = 4;
+
+/**
+ * What the revision anchor (top right of the graph) draws with no revision
+ * focused: the latest revision's open fix requests while it is failing (red,
+ * "FAIL: fix asked"), gone as soon as every request is answered or a later
+ * revision is integrated; a passing latest revision shows for PASS_SHOW_SEQS
+ * seqs after it lands, fading, with no lines; otherwise nothing. Pure.
+ */
+export function revisionAnchor(
+  model: BoardGraphModel,
+  log: readonly BoardMessage[],
+):
+  | { readonly mode: "fix-asked"; readonly rev: BoardGraphModel["nodes"][number]; readonly edges: readonly BoardGraphEdge[]; readonly opacity: 1 }
+  | { readonly mode: "passed"; readonly rev: BoardGraphModel["nodes"][number]; readonly edges: readonly BoardGraphEdge[]; readonly opacity: number }
+  | null {
+  const open = outstandingFixLinks(model, log);
+  if (open) return { mode: "fix-asked", rev: open.rev, edges: open.edges, opacity: 1 };
+  let latest: BoardGraphModel["nodes"][number] | undefined;
+  for (const node of model.nodes) {
+    if (node.detail.kind !== "rev") continue;
+    if (!latest || (latest.detail.kind === "rev" && node.detail.n > latest.detail.n)) latest = node;
+  }
+  if (!latest || latest.detail.kind !== "rev" || !latest.detail.gated || latest.detail.gate !== "pass") return null;
+  const age = model.k - latest.seqs[0]!;
+  if (age < 0 || age >= PASS_SHOW_SEQS) return null;
+  return { mode: "passed", rev: latest, edges: [], opacity: Number((1 - age / PASS_SHOW_SEQS).toFixed(2)) };
+}
+
+/**
+ * Whether an item's "fix asked (rev N)" request is the CURRENT failing state
+ * or history: "open" while it is one of the latest revision's open requests
+ * (the same rule as the anchor's lines), "superseded" when the board still
+ * holds an unanswered request from an earlier failing revision (a later
+ * revision was integrated and did not ask the item again), null otherwise
+ * (none asked, answered, or the latest revision passed).
+ */
+export function fixAskState(model: BoardGraphModel, log: readonly BoardMessage[]): Map<string, { readonly n: number; readonly state: "open" | "superseded" }> {
+  const out = new Map<string, { n: number; state: "open" | "superseded" }>();
+  const open = outstandingFixLinks(model, log);
+  const openItems = new Set((open?.edges ?? []).map((e) => e.to.slice("item:".length)));
+  let latest: { n: number; pass: boolean } | undefined;
+  for (const node of model.nodes) {
+    if (node.detail.kind === "rev" && (!latest || node.detail.n > latest.n)) latest = { n: node.detail.n, pass: node.detail.gated && node.detail.gate === "pass" };
+  }
+  for (const node of model.nodes) {
+    if (node.detail.kind !== "item" || node.detail.fixRequested === undefined) continue;
+    const n = node.detail.fixRequested;
+    if (openItems.has(node.detail.item)) out.set(node.detail.item, { n, state: "open" });
+    else if (latest && !latest.pass && latest.n > n) out.set(node.detail.item, { n, state: "superseded" });
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
