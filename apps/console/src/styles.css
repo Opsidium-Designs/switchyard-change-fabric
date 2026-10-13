@@ -600,7 +600,7 @@ body {
    styling exactly, so the legend reads the same as the graph. */
 .ln-tool { border-top-color: var(--orange); border-top-style: solid; }
 
-/* --- Dial control --- */
+/* --- Run mode control --- */
 
 .dial-row {
   display: flex;
@@ -615,54 +615,15 @@ body {
   font-size: 0.85rem;
 }
 
-.dial-row input[type="range"] {
-  width: 9rem;
-}
-
-.dial-value {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  min-width: 1.2rem;
-  text-align: center;
-}
-
-/* The "locked for this run" indicator shown beside the disabled sliders while a
-   run is active, so it is obvious the dial is read-only for the run's lifetime. */
-.dial-locked {
-  font-size: 0.7rem;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+/* The run's actual agent count in the run panel (read from the board or the
+   graph, never a configured dial). */
+.run-agents {
+  font-size: 0.75rem;
   padding: 0.12rem 0.5rem;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: rgba(139, 148, 158, 0.15);
   color: var(--muted);
-}
-
-.dial-row input[type="range"]:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-
-.dial-row button {
-  padding: 0.4rem 0.85rem;
-  background: var(--accent);
-  color: var(--ink-on);
-  border: 1px solid var(--accent);
-  border-radius: 6px;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.dial-row button.secondary {
-  background: transparent;
-  color: var(--text);
-  border-color: var(--border);
-  font-weight: 500;
-}
-
-.dial-row button:disabled {
-  opacity: 0.5;
-  cursor: default;
 }
 
 /* --- Node detail --- */

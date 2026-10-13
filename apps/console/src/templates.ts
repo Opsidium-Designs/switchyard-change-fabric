@@ -44,8 +44,13 @@ export interface Template {
    * before/after. Shown once, on the gallery card.
    */
   readonly problemItSolves: string;
-  /** A human-readable hint at how many agents the run recruits. */
-  readonly agentCountHint: string;
+  /**
+   * How many agents a run of this template recruits, per launch mode: the
+   * template's own settings, passed to the CLI as `--min`/`--max`. The console
+   * has no dial: a launch always uses these. On the board the counts are the
+   * workers (the lead is extra).
+   */
+  readonly agents: { readonly [mode in LaunchMode]: AgentCounts };
   /**
    * Whether this template hits the evidence-unsettleable fork and PAUSES for a
    * human answer in the console. An escalating template waits on a real pending
@@ -81,19 +86,24 @@ export interface Template {
    */
   readonly boardGoalFile?: string;
   /**
-   * Board-run options for a template larger than the default launch: a higher
-   * dial ceiling, a suggested dial, and the run-board budget flags it needs
-   * (`--max-inflight`, `--max-turns`, `--timeout-ms`). Absent means the defaults.
+   * Board-run budget options for a template larger than the default launch:
+   * the run-board flags it needs (`--max-inflight`, `--max-turns`,
+   * `--timeout-ms`). Absent means the CLI's defaults.
    */
   readonly boardOptions?: BoardRunOptions;
 }
 
-/** The run-board options a template may carry (see Template.boardOptions). */
+/**
+ * A template's agent counts for one launch mode: `min` agents to start with
+ * and at most `max` at once (the CLI's `--min`/`--max`).
+ */
+export interface AgentCounts {
+  readonly min: number;
+  readonly max: number;
+}
+
+/** The run-board budget options a template may carry (see Template.boardOptions). */
 export interface BoardRunOptions {
-  /** The highest dial max the launcher accepts for a board run (default DEFAULT_DIAL_LIMIT). */
-  readonly dialLimit?: number;
-  /** The dial the template is meant to run at (shown on its card; one click sets it). */
-  readonly suggestedDial?: { readonly min: number; readonly max: number };
   /** `--max-inflight`: the most model calls in flight at once. */
   readonly maxInflight?: number;
   /** `--max-turns`: the run's total turn budget. */
@@ -101,9 +111,6 @@ export interface BoardRunOptions {
   /** `--timeout-ms`: the agent-phase time limit. */
   readonly timeoutMs?: number;
 }
-
-/** The dial ceiling for a launch with no template-specific limit (the console sliders' default range). */
-export const DEFAULT_DIAL_LIMIT = 8;
 
 /**
  * The shipped templates. ONE is the simple intro (the audit-logging change);
@@ -123,8 +130,15 @@ export const DEFAULT_DIAL_LIMIT = 8;
  *     rounding (a human contract decision). run-live has no contract route, so
  *     there the pinned test is restored and the gate stays failing, honestly.
  *   - cityhall: the largest app, 32 modules across 8 city departments, shaped
- *     for about 30 agents on the board. Its board options carry the dial and
- *     budget flags the Makefile's run-board-cityhall target uses.
+ *     for about 30 agents on the board. Its agent counts and board options
+ *     match the Makefile's run-board-cityhall target.
+ *
+ * Each template's agent counts come from the runs it was built and recorded
+ * with: audit-logging has three units; service-api has six resources (one
+ * agent each on run-live) and its recorded board runs used a lead and 3
+ * workers; storefront's board runs used a lead and 6 workers; cityhall uses
+ * the Makefile's CH_MIN/CH_MAX on the board and the console's former run-live
+ * ceiling of 8 on run-live.
  */
 export const TEMPLATES: readonly Template[] = [
   {
@@ -135,7 +149,7 @@ export const TEMPLATES: readonly Template[] = [
       "Adds audit logging to a small TypeScript project with three agents (model, api, tests).",
     problemItSolves:
       "api and tests both declare src/audit/events.ts. The lease plan keeps it single-writer (one unit owns it, the other yields it at integration), but who should own a shared file is a call evidence cannot settle, so the run escalates and waits for your answer. The unit you choose owns the path: its version is the one integrated and shipped (an answer that names neither unit falls back to the first-declared owner, and the evidence records why). The project's gate (npm run gate) passes only once each organization's audit log is readable at /orgs/:orgId/audit/events without exposing another organization's events.",
-    agentCountHint: "about 3 agents",
+    agents: { live: { min: 1, max: 3 }, board: { min: 1, max: 3 } },
     escalates: true,
     source: { kind: "change", changeFile: "examples/changes/audit-logging.change.yaml" },
     projectDir: "examples/demo-project",
@@ -149,7 +163,7 @@ export const TEMPLATES: readonly Template[] = [
       "service-api: one Cloudflare Worker serving users, orders, products, auth, search, and notifications, each its own module over frozen requireAuth and json/problem contracts.",
     problemItSolves:
       "No resource validates input or calls requireAuth. Before: an unauthenticated POST returns 201. After: it returns 401, and an invalid body returns 400. If you Deployed the app first, the verified fix redeploys to the same URL. Its home page is a tester that runs all 18 checks: about 6 of 18 pass before the fix, 18 of 18 after.",
-    agentCountHint: "about 6 agents, one per resource",
+    agents: { live: { min: 1, max: 6 }, board: { min: 1, max: 3 } },
     escalates: false,
     source: { kind: "goal", goalFile: "examples/goals/service-api-validation-auth.goal.txt" },
     projectDir: "examples/apps/service-api",
@@ -163,7 +177,7 @@ export const TEMPLATES: readonly Template[] = [
       "storefront: one Cloudflare Worker in TypeScript with a catalog (products, categories, search), orders (cart, checkout, history), and billing (invoices, payments, tax, refunds) over shared money, http, and auth contracts, with a lockfile, so the run installs dependencies before its gate.",
     problemItSolves:
       "Money is floating-point dollars, so a $19.99 price reads back as 1998 cents and tax is truncated; refunds and payments are uncapped; writes and customer data need no token; inputs and page sizes are unchecked. The gate (typecheck, the existing tests, and an acceptance suite) passes only when all of it is fixed. The fix repeats one change across many handlers, splits billing into several sub-changes, changes the shared money contract, and contradicts one existing test that pins the old tax rounding: changing that test is a contract change you decide (on the board). Its home page is a tester: about 1 of 16 checks correct before the fix, 16 of 16 after.",
-    agentCountHint: "about 4 to 8 agents",
+    agents: { live: { min: 1, max: 6 }, board: { min: 1, max: 6 } },
     escalates: false,
     source: { kind: "goal", goalFile: "examples/goals/storefront-correct-and-safe.goal.txt" },
     projectDir: "examples/apps/storefront",
@@ -177,17 +191,16 @@ export const TEMPLATES: readonly Template[] = [
       "cityhall: one Cloudflare Worker in TypeScript with 32 modules across 8 city departments (utilities, parking, housing, licensing, parks, records, transit, permits) over shared money, time, validation, auth, and http contracts, with a lockfile, so the run installs dependencies before its gate.",
     problemItSolves:
       "Every module carries its own planted bugs: fees and shares off by a cent, business-day deadlines counted wrong (the start date counted, city holidays ignored), writes that need no token or staff role, other residents' records visible, and list endpoints that accept any page size. Two existing developer tests pin the old behavior, so changing them is a contract change you decide (on the board). The gate (typecheck, the developer tests, and a 237-test acceptance suite) passes only when all of it is fixed: 106 of 237 acceptance tests pass before the fix, 237 of 237 after. Its home page is a tester: about 1 of 46 checks correct before the fix, 46 of 46 after.",
-    agentCountHint: "about 8 to 30 agents",
+    agents: { live: { min: 1, max: 8 }, board: { min: 8, max: 30 } },
     escalates: false,
     source: { kind: "goal", goalFile: "examples/goals/cityhall-services-correct.goal.txt" },
     projectDir: "examples/apps/cityhall",
     app: "cityhall",
-    // The Makefile's run-board-cityhall defaults (CH_MIN, CH_MAX, CH_INFLIGHT,
-    // CH_TURNS, CH_TIMEOUT_MS): a ~36-item plan asks for ~1300 turns, and the
-    // first 30-agent run needed close to the 30-minute default limit.
+    // The Makefile's run-board-cityhall defaults (CH_INFLIGHT, CH_TURNS,
+    // CH_TIMEOUT_MS; CH_MIN/CH_MAX are the board agent counts above): a
+    // ~36-item plan asks for ~1300 turns, and the first 30-agent run needed
+    // close to the 30-minute default limit.
     boardOptions: {
-      dialLimit: 30,
-      suggestedDial: { min: 8, max: 30 },
       maxInflight: 8,
       maxTurns: 1400,
       timeoutMs: 4_500_000,
@@ -214,9 +227,20 @@ export function boardGoalFileOf(template: Template): string | undefined {
   return template.source.kind === "goal" ? template.source.goalFile : template.boardGoalFile;
 }
 
-/** The highest dial max a launch of this template in this mode accepts. */
-export function dialLimitOf(template: Template, mode: LaunchMode): number {
-  return mode === "board" ? (template.boardOptions?.dialLimit ?? DEFAULT_DIAL_LIMIT) : DEFAULT_DIAL_LIMIT;
+/** The agent counts a launch of this template in this mode uses. */
+export function agentCountsOf(template: Template, mode: LaunchMode): AgentCounts {
+  return template.agents[mode];
+}
+
+/**
+ * The read-only line a template card shows for its agent counts in a mode,
+ * e.g. "Runs with up to 30 agents (8 to start)". On the board the lead is
+ * extra, so it is named.
+ */
+export function agentCountLine(template: Template, mode: LaunchMode): string {
+  const { min, max } = agentCountsOf(template, mode);
+  const who = mode === "board" ? `a lead and up to ${max} agents` : `up to ${max} agents`;
+  return `Runs with ${who} (${min} to start)`;
 }
 
 /** The apps the templates name: the only apps the launcher deploys or removes. */

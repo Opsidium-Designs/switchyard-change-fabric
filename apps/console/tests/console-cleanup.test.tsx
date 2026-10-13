@@ -235,7 +235,6 @@ describe("cost and run-exit display", () => {
         template: null,
         launchStatus: { status: "exited", exitCode: 1, log },
         redeployed: false,
-        dial: { min: 1, max: 3 },
         busy: false,
         onTearDown: () => {},
       }),
@@ -256,7 +255,6 @@ describe("cost and run-exit display", () => {
         template,
         launchStatus: { status: "exited", exitCode: 1, log: ["starting", "Error: worker unreachable"] },
         redeployed: false,
-        dial: { min: 1, max: 3 },
         busy: false,
         onTearDown: () => {},
       }),
@@ -266,7 +264,7 @@ describe("cost and run-exit display", () => {
     expect(markup).toContain(template.name);
     expect(markup).not.toContain(template.whatItDoes);
     expect(markup).not.toContain("What this does");
-    expect(markup).toContain("min 1 / max 3 (locked)");
+    expect(markup).not.toContain("(locked)");
   });
 });
 
@@ -294,7 +292,10 @@ describe("template copy and initial layout", () => {
     for (const t of TEMPLATES) {
       expect(markup.split(t.whatItDoes).length - 1).toBe(1);
     }
-    expect(markup).toContain('aria-label="Concurrency dial"');
+    expect(markup).not.toContain('aria-label="Concurrency dial"');
+    for (const t of TEMPLATES) {
+      expect(markup).toContain(`Runs with up to ${t.agents.live.max} agents (${t.agents.live.min} to start)`);
+    }
   });
 });
 

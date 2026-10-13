@@ -61,10 +61,9 @@ import type { Connect, Plugin } from "vite";
 import { loadDotEnvFile, withoutCredentials } from "@switchyard-change/orchestration/credentials";
 
 import {
+  agentCountsOf,
   boardCapable,
   boardGoalFileOf,
-  DEFAULT_DIAL_LIMIT,
-  dialLimitOf,
   TEMPLATES,
   templateApps,
   templateById,
@@ -87,8 +86,6 @@ interface LaunchedRun {
   readonly child: ChildProcess;
   status: "running" | "exited";
   exitCode: number | null;
-  /** The concurrency dial this run was launched with (its locked launch config). */
-  readonly dial: LaunchDial;
   /** run-live, or agents on the board (run-board). */
   readonly mode: LaunchMode;
   /** The last lines of CLI output, kept small for an honest status read. */
@@ -129,46 +126,17 @@ function freshChangeId(template: Template): string {
 }
 
 /**
- * The concurrency dial captured for a launch. The human sets min/max in the
- * console BEFORE launching, and that choice becomes this run's launch config:
- * it is passed straight through to the run-live CLI as --min/--max, so the
- * launched run uses it from the first wave. It is NOT changed mid-run (the
- * console locks the dial once a run is active), so a run keeps the dial it was
- * launched with.
+ * Push the template's own agent counts for a mode as --min/--max. The console
+ * has no dial: a launch always runs with the counts the template declares, and
+ * nothing in the request body can change them.
  */
-export interface LaunchDial {
-  readonly min: number;
-  readonly max: number;
+function pushAgentCounts(args: string[], template: Template, mode: LaunchMode): void {
+  const { min, max } = agentCountsOf(template, mode);
+  args.push("--min", String(min), "--max", String(max));
 }
 
-/** The dial defaults, matching the CLI's own dialFromArgs defaults. */
-const DEFAULT_DIAL: LaunchDial = { min: 1, max: 3 };
-
-/**
- * Read and clamp a numeric dial bound from the launch body. A missing or
- * non-finite value falls back to the default; the value is clamped to 0..limit
- * (the sliders' 0..8 by default, or a template's own board dial limit), so a
- * browser-supplied body can never drive the dial out of range.
- */
-function dialBound(value: unknown, fallback: number, limit: number): number {
-  const n = typeof value === "number" ? value : Number(value);
-  if (!Number.isFinite(n)) {
-    return fallback;
-  }
-  return Math.max(0, Math.min(limit, Math.round(n)));
-}
-
-/** Resolve the launch dial from the request body, clamped to `limit` and defaulted. Exported for tests. */
-export function dialFromBody(body: Record<string, unknown>, limit: number = DEFAULT_DIAL_LIMIT): LaunchDial {
-  const min = dialBound(body.min, DEFAULT_DIAL.min, limit);
-  const max = dialBound(body.max, DEFAULT_DIAL.max, limit);
-  // Keep the dial coherent: max is never below min, min is never below one.
-  const safeMin = Math.max(1, min);
-  return { min: safeMin, max: Math.max(safeMin, max) };
-}
-
-/** Build the run-live CLI args for a template, a generated unique id, and a dial. */
-export function runLiveArgs(template: Template, changeId: string, dial: LaunchDial): string[] {
+/** Build the run-live CLI args for a template and a generated unique id. */
+export function runLiveArgs(template: Template, changeId: string): string[] {
   const args = ["-w", "apps/cli", "run", "dev", "--", "run-live"];
   if (template.source.kind === "change") {
     args.push("--change", resolve(REPO_ROOT, template.source.changeFile));
@@ -177,11 +145,8 @@ export function runLiveArgs(template: Template, changeId: string, dial: LaunchDi
   }
   args.push("--project", resolve(REPO_ROOT, template.projectDir));
   args.push("--worker", WORKER_URL);
-  // The dial the human set BEFORE launching is this run's launch config. The
-  // run-live CLI already reads --min/--max (dialFromArgs), so passing them here
-  // means the launched run recruits under exactly the dial that was chosen; the
-  // console then locks the dial read-only for the life of the run.
-  args.push("--min", String(dial.min), "--max", String(dial.max));
+  // The template's own run-live agent counts (the CLI reads --min/--max).
+  pushAgentCounts(args, template, "live");
   // A dynamic-branching template carries a discovery marker: pass it so a
   // completing unit discovers follow-up work carrying that marker in the target
   // repo, growing the live WorkGraph. The marker is a generic repo fact, not a
@@ -252,8 +217,32 @@ export function launchOptionsFromBody(
 }
 
 /**
+ * Resolve a launch request body to a fixed template and validated options.
+ * Only `templateId`, `mode`, and `decideContracts` are read: any `min`/`max`
+ * in the body is ignored, because a launch always runs with the template's own
+ * agent counts. Exported for tests.
+ */
+export function launchRequestFromBody(
+  body: Record<string, unknown>,
+):
+  | { readonly ok: true; readonly template: Template; readonly options: LaunchOptions }
+  | { readonly ok: false; readonly error: string } {
+  const templateId = typeof body.templateId === "string" ? body.templateId : "";
+  const template = templateById(templateId);
+  if (!template) {
+    return { ok: false, error: `unknown template: ${templateId || "(none)"}` };
+  }
+  const chosen = launchOptionsFromBody(body, template);
+  if (!chosen.ok) {
+    return { ok: false, error: chosen.error };
+  }
+  return { ok: true, template, options: chosen.options };
+}
+
+/**
  * Build the run-board CLI args for a goal template: the same goal, project,
- * dial, app, and gate as its run-live launch, plus the template's own board
+ * app, and gate as its run-live launch, the template's own board agent counts,
+ * plus the template's own board
  * budget flags (`--max-inflight`, `--max-turns`, `--timeout-ms`) when it
  * declares them. When the template's app is currently deployed (a manual
  * Deploy left its Worker live), `--preview-revisions` uploads each integrated
@@ -266,7 +255,6 @@ export function launchOptionsFromBody(
 export function runBoardArgs(
   template: Template,
   changeId: string,
-  dial: LaunchDial,
   policy: ContractPolicy,
   appDeployed = false,
 ): string[] {
@@ -278,7 +266,7 @@ export function runBoardArgs(
   args.push("--goal-file", resolve(REPO_ROOT, goalFile));
   args.push("--project", resolve(REPO_ROOT, template.projectDir));
   args.push("--worker", WORKER_URL);
-  args.push("--min", String(dial.min), "--max", String(dial.max));
+  pushAgentCounts(args, template, "board");
   const options = template.boardOptions;
   if (options?.maxInflight !== undefined) {
     args.push("--max-inflight", String(options.maxInflight));
@@ -315,13 +303,12 @@ export function runBoardArgs(
 export function launchArgs(
   template: Template,
   changeId: string,
-  dial: LaunchDial,
   options: LaunchOptions,
   appDeployed = false,
 ): string[] {
   return options.mode === "board"
-    ? runBoardArgs(template, changeId, dial, options.contractPolicy, appDeployed)
-    : runLiveArgs(template, changeId, dial);
+    ? runBoardArgs(template, changeId, options.contractPolicy, appDeployed)
+    : runLiveArgs(template, changeId);
 }
 
 /** Read a small JSON body from a Connect request. */
@@ -352,7 +339,7 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 /** The header every /api/worker proxy response carries (see src/worker-post.ts). */
 export const WORKER_PROXY_MARKER = "x-switchyard-proxy";
 
-/** The largest request body the Worker proxy relays (a resolve/dial body is tiny). */
+/** The largest request body the Worker proxy relays (a resolve body is tiny). */
 const MAX_PROXY_BODY_BYTES = 1_000_000;
 
 /** The outcome of one proxied Worker POST, ready to write to the response. */
@@ -599,14 +586,14 @@ export async function teardownAppRequest(body: Record<string, unknown>, spawnFn:
   return { status: 502, body: { app, ok: false, error: `could not remove ${app}`, output: result.output } };
 }
 
-/** Spawn a launch child for a template under a chosen dial and track it. */
-async function launch(template: Template, dial: LaunchDial, options: LaunchOptions): Promise<LaunchedRun> {
+/** Spawn a launch child for a template (with its own agent counts) and track it. */
+async function launch(template: Template, options: LaunchOptions): Promise<LaunchedRun> {
   const changeId = freshChangeId(template);
   // A deployed app (a live marker) gets revision previews on a board run.
   const appDeployed = template.app
     ? (await readDeployedUrls(REPO_ROOT, [template.app]))[template.app] !== undefined
     : false;
-  const args = launchArgs(template, changeId, dial, options, appDeployed);
+  const args = launchArgs(template, changeId, options, appDeployed);
   // The spawned CLI reads .env into memory itself: no credential is forwarded
   // through its environment (code it runs could read a parent's environ).
   const child = spawn("npm", args, cliSpawnOptions());
@@ -616,7 +603,6 @@ async function launch(template: Template, dial: LaunchDial, options: LaunchOptio
     child,
     status: "running",
     exitCode: null,
-    dial,
     mode: options.mode,
     log: [],
   };
@@ -664,27 +650,17 @@ export function launcherPlugin(): Plugin {
           return;
         }
         void readJson(req).then((body) => {
-          const templateId = typeof body.templateId === "string" ? body.templateId : "";
-          const template = templateById(templateId);
-          if (!template) {
-            sendJson(res, 400, { error: `unknown template: ${templateId || "(none)"}` });
+          const resolved = launchRequestFromBody(body);
+          if (!resolved.ok) {
+            sendJson(res, 400, { error: resolved.error });
             return;
           }
-          const chosen = launchOptionsFromBody(body, template);
-          if (!chosen.ok) {
-            sendJson(res, 400, { error: chosen.error });
-            return;
-          }
-          // The dial the human set before launching is captured as this run's
-          // launch config and passed through to the CLI as --min/--max, clamped
-          // to this template's limit for the chosen mode.
-          const dial = dialFromBody(body, dialLimitOf(template, chosen.options.mode));
-          return launch(template, dial, chosen.options).then((run) =>
+          const { template, options } = resolved;
+          return launch(template, options).then((run) =>
             sendJson(res, 201, {
               changeId: run.changeId,
               templateId: run.templateId,
               escalates: template.escalates,
-              dial: run.dial,
               mode: run.mode,
             }),
           );
@@ -752,7 +728,6 @@ export function launcherPlugin(): Plugin {
           templateId: run.templateId,
           status: run.status,
           exitCode: run.exitCode,
-          dial: run.dial,
           mode: run.mode,
           log: run.log,
         });
