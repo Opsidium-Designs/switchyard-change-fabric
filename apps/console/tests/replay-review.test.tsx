@@ -12,10 +12,11 @@ import { describe, expect, it } from "vitest";
 
 import { boardCaptions, buildBoardGraph, type BoardMessage } from "@switchyard-change/orchestration/board-graph";
 
-import { COMM_KINDS, commKind, communicationArrows, drawnLegend, fixAskState, outstandingFixLinks, revisionAnchor } from "../src/board-overlay.ts";
+import { COMM_KINDS, commKind, communicationArrows, drawnLegend, fixAskState, outstandingFixLinks, progressChart, revisionAnchor } from "../src/board-overlay.ts";
 import { LANE_HEAD, scaledBoardLayout } from "../src/board-scale.ts";
 import {
   BoardGraphView,
+  labelledPoints,
   messageDirection,
   MissionControl,
   placeCaptions,
@@ -24,6 +25,8 @@ import {
   scrubThumbCenter,
   scrubTickX,
   SCRUB_THUMB_PX,
+  SUITE_INFO,
+  suiteHeadline,
   storeThreadOrder,
   Thread,
   THREAD_ORDER_KEY,
@@ -232,6 +235,43 @@ describe("the thread", () => {
     };
     expect(readThreadOrder(blocked)).toBe("newest");
     expect(() => storeThreadOrder("oldest", blocked)).not.toThrow();
+  });
+});
+
+describe("the Board's test charts", () => {
+  const html = (id: string, seq?: number) =>
+    renderToStaticMarkup(createElement(MissionControl, { log: recorded(id), escalations: [], busy: false, onResolve: () => {}, recorded: true, ...(seq !== undefined ? { initialSeq: seq } : {}) }));
+
+  it("say what each suite is and where it stands, in plain words", () => {
+    const sf21 = html("board-live-sf21", 60);
+    expect(sf21).toContain('<span class="mc-chart-name">Acceptance tests</span> <span class="mc-chart-explain">(the gate&#x27;s own test suite; the run must pass all of them)</span>');
+    expect(sf21).toContain('<span class="mc-chart-name">Developer tests</span> <span class="mc-chart-explain">(the app&#x27;s existing tests, which agents may only change with a human&#x27;s approval)</span>');
+    expect(sf21).toMatch(/<span class="mc-chart-headline">\d+ of \d+ passing at revision 2<\/span>/);
+    expect(sf21).toContain("How many tests pass at each revision");
+    expect(sf21).toContain("only the gate decides pass or fail");
+    expect(sf21).not.toMatch(/ACCEPTANCE|DEVELOPER/);
+  });
+
+  it("label every revision on the axis and its count over its point (r1 10/20, r2 16/20, r3 20/20)", () => {
+    const reg3 = html("board-live-reg3");
+    const chart = reg3.match(/<figure class="mc-chart suite-acceptance".*?<\/figure>/)![0];
+    expect(chart).toContain('<span class="mc-chart-headline">20 of 20 passing at revision 3</span>');
+    const counts = [...chart.matchAll(/<text class="mc-chart-count"[^>]*>([^<]+)<\/text>/g)].map((m) => m[1]);
+    const revs = [...chart.matchAll(/<text class="mc-chart-axis"[^>]*>(r\d+)<\/text>/g)].map((m) => m[1]);
+    expect(revs).toEqual(["r1", "r2", "r3"]);
+    expect(counts).toEqual(["10/20", "16/20", "20/20"]);
+    // The y axis runs 0 to the most tests recorded.
+    expect(chart).toMatch(/<text class="mc-chart-axis"[^>]*>20<\/text><text class="mc-chart-axis"[^>]*>0<\/text>/);
+  });
+
+  it("a revision with no count reads as a gap, never a zero, and a long run labels only its first, best, and last counts", () => {
+    const sf8 = progressChart(recorded("board-live-sf8"), Number.POSITIVE_INFINITY).series.find((s) => s.suite === "acceptance")!;
+    expect(suiteHeadline({ ...sf8, points: [sf8.points.find((p) => p.gap !== undefined)!] })).toMatch(/^revision \d+: acceptance did not run: /);
+    expect(suiteHeadline(sf8)).toMatch(/^revision 9: acceptance did not run: [^;]+; last counted 35 of 129 at revision 7$/);
+    const many = { ...sf8, points: Array.from({ length: 12 }, (_, i) => ({ n: i + 1, seq: i + 1, passed: i === 5 ? 18 : 3, total: 20, verdict: "fail" as const })) };
+    expect([...labelledPoints(many, null)].sort((a, b) => a - b)).toEqual([1, 6, 12]);
+    expect([...labelledPoints(many, 9)].sort((a, b) => a - b)).toEqual([1, 6, 9, 12]);
+    expect(SUITE_INFO.acceptance.name).toBe("Acceptance tests");
   });
 });
 

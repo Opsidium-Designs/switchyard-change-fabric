@@ -2176,10 +2176,15 @@ body {
 
 .mc-chart { margin: 0; display: flex; flex-direction: column; gap: 0.05rem; }
 .mc-chart figcaption { font-size: 0.72rem; white-space: nowrap; }
-.mc-chart-name { font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; color: var(--muted); font-size: 0.66rem; }
+.mc-chart-name { font-weight: 800; color: var(--text); font-size: 0.78rem; }
 .mc-chart-story { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .mc-chart-note { color: var(--advisory); font-style: italic; font-size: 0.66rem; }
-.mc-chart-svg { display: block; width: 196px; height: 52px; overflow: visible; }
+.mc-chart-svg { display: block; width: 260px; height: 96px; overflow: visible; }
+.mc-chart-explain { color: var(--muted); font-size: 0.68rem; }
+.mc-chart-headline { display: block; font-weight: 700; font-size: 0.8rem; color: var(--text); }
+.mc-chart-axis { fill: var(--muted); font-size: 8.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mc-chart-count { fill: var(--text); font-size: 8.5px; font-weight: 700; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mc-charts-note { margin: 0; font-size: 0.72rem; color: var(--muted); }
 .mc-chart-total { stroke: var(--muted); stroke-dasharray: 3 3; stroke-width: 1; }
 .mc-chart-base { stroke: var(--border); stroke-width: 1; }
 .mc-chart-focus { stroke: var(--accent); stroke-width: 1; opacity: 0.6; }
@@ -2360,7 +2365,7 @@ body {
 }
 
 .mc-charts { display: flex; flex-direction: column; gap: 0.5rem; margin: 0 0 0.6rem; }
-.mc-charts .mc-chart-svg { width: 100%; max-width: 196px; }
+.mc-charts .mc-chart-svg { width: 100%; max-width: 260px; height: auto; }
 
 .mc-chapter-row {
   list-style: none;

@@ -605,20 +605,53 @@ export function Narrator({
   );
 }
 
-const CHART_W = 196;
-const CHART_H = 52;
+const CHART_W = 260;
+const CHART_H = 96;
+
+/** What each suite is, in plain words (the Board pane's chart headings). */
+export const SUITE_INFO: Readonly<Record<SuiteSeries["suite"], { readonly name: string; readonly explain: string }>> = {
+  acceptance: { name: "Acceptance tests", explain: "the gate's own test suite; the run must pass all of them" },
+  developer: { name: "Developer tests", explain: "the app's existing tests, which agents may only change with a human's approval" },
+  tests: { name: "All tests", explain: "every test the gate ran" },
+};
+
+/** The headline of a suite at the cursor: `16 of 20 passing at revision 2`, or why the latest revision has no count. */
+export function suiteHeadline(series: SuiteSeries): string {
+  const last = series.points[series.points.length - 1];
+  if (!last) return "no revision yet";
+  if (last.passed === undefined) {
+    const counted = [...series.points].reverse().find((p) => p.passed !== undefined);
+    return `revision ${last.n}: ${last.gap ?? "no count recorded"}${counted ? `; last counted ${counted.passed} of ${counted.total} at revision ${counted.n}` : ""}`;
+  }
+  return `${last.passed} of ${last.total} passing at revision ${last.n}`;
+}
+
+/** Which points carry their count as text: all of them for a short run, else the first, the best, the last, and the focused one. */
+export function labelledPoints(series: SuiteSeries, focus: number | null, max = 8): Set<number> {
+  const pts = series.points;
+  if (pts.length <= max) return new Set(pts.map((p) => p.n));
+  const counted = pts.filter((p) => p.passed !== undefined);
+  const best = counted.reduce<ChartPointLike | undefined>((b, p) => (!b || p.passed! > b.passed! ? p : b), undefined);
+  return new Set([pts[0]!.n, pts[pts.length - 1]!.n, ...(best ? [best.n] : []), ...(focus !== null ? [focus] : [])]);
+}
+
+type ChartPointLike = SuiteSeries["points"][number];
 
 /**
- * One suite's count over revisions: a step line through the recorded counts,
- * a dashed line at the largest recorded total, a hollow gap marker where the
- * suite did not run (never a zero), the landed revision ringed, and
- * speculative candidates as small diamonds. Every mark cites its seq.
+ * One suite: how many of its tests pass at each revision. The heading says
+ * what the suite is and where it stands now; the chart is a step line through
+ * the recorded counts with each revision labelled on the x axis (`r1`, `r2`,
+ * ...) and its count over its point (`10/20`), the y axis from 0 to the most
+ * tests recorded, a hollow gap marker where the suite did not run (never a
+ * zero), the passing revision ringed, and speculative candidates as small
+ * diamonds. Every mark cites its seq. The counts are advisory: only the gate
+ * decides pass or fail.
  */
 export function SuiteChart({ series, landed, focus = null }: { series: SuiteSeries; landed?: number | undefined; focus?: number | null }) {
-  const pad = { l: 6, r: 8, t: 6, b: 8 };
+  const pad = { l: 30, r: 18, t: 16, b: 18 };
   const n = series.points.length;
   const step = n > 1 ? (CHART_W - pad.l - pad.r) / (n - 1) : 0;
-  const xOf = (i: number) => (n > 1 ? pad.l + i * step : CHART_W / 2);
+  const xOf = (i: number) => (n > 1 ? pad.l + i * step : (pad.l + CHART_W - pad.r) / 2);
   const indexOf = new Map(series.points.map((p, i) => [p.n, i]));
   const total = Math.max(1, series.total);
   const yOf = (v: number) => pad.t + (1 - v / total) * (CHART_H - pad.t - pad.b);
@@ -636,21 +669,31 @@ export function SuiteChart({ series, landed, focus = null }: { series: SuiteSeri
     open = true;
   });
   const story = seriesStory(series);
+  const info = SUITE_INFO[series.suite];
+  const headline = suiteHeadline(series);
+  const labelled = labelledPoints(series, focus);
+  const xLabelEvery = Math.max(1, Math.ceil(n / 10));
   return (
     <figure className={`mc-chart suite-${series.suite}`} aria-label={`${series.suite} over revisions`}>
       <figcaption>
-        <span className="mc-chart-name">{series.suite}</span> <span className="mc-chart-story">{story}</span>
-        <span className="mc-chart-note" title="Counts are advisory, parsed from the gate's output; the gate alone decides">
-          {" "}advisory
-        </span>
+        <span className="mc-chart-name">{info.name}</span> <span className="mc-chart-explain">({info.explain})</span>
+        <span className="mc-chart-headline">{headline}</span>
       </figcaption>
-      <svg className="mc-chart-svg" viewBox={`0 0 ${CHART_W} ${CHART_H}`} role="img" aria-label={`${series.suite}: ${story}`}>
+      <svg className="mc-chart-svg" viewBox={`0 0 ${CHART_W} ${CHART_H}`} role="img" aria-label={`${info.name}: how many pass at each revision: ${story}`}>
+        <title>{`${info.name} passing at each revision: ${story}`}</title>
         <line className="mc-chart-total" x1={pad.l} x2={CHART_W - pad.r} y1={yOf(total)} y2={yOf(total)}>
-          <title>{`all ${series.total} checks of the ${series.suite} suite (the most recorded)`}</title>
+          <title>{`all ${series.total} tests of the ${series.suite} suite (the most recorded)`}</title>
         </line>
         <line className="mc-chart-base" x1={pad.l} x2={CHART_W - pad.r} y1={yOf(0)} y2={yOf(0)} />
+        {/* The y axis: 0 to the most tests recorded. */}
+        <text className="mc-chart-axis" x={pad.l - 4} y={yOf(total) + 3} textAnchor="end">
+          {series.total}
+        </text>
+        <text className="mc-chart-axis" x={pad.l - 4} y={yOf(0) + 3} textAnchor="end">
+          0
+        </text>
         {focus !== null && indexOf.has(focus) ? (
-          <line className="mc-chart-focus" x1={xOf(indexOf.get(focus)!)} x2={xOf(indexOf.get(focus)!)} y1={pad.t - 4} y2={CHART_H - 2} />
+          <line className="mc-chart-focus" x1={xOf(indexOf.get(focus)!)} x2={xOf(indexOf.get(focus)!)} y1={pad.t - 4} y2={CHART_H - pad.b + 2} />
         ) : null}
         {d ? <path className="mc-chart-line" d={d.trim()} /> : null}
         {series.candidates.map((c) => {
@@ -681,6 +724,26 @@ export function SuiteChart({ series, landed, focus = null }: { series: SuiteSeri
             </circle>
           ),
         )}
+        {/* Per point: its count over it, its revision under the axis. */}
+        {series.points.map((p, i) => (
+          <g key={`l${p.seq}`} className="mc-chart-labels">
+            {labelled.has(p.n) ? (
+              <text
+                className="mc-chart-count"
+                x={xOf(i)}
+                y={p.passed === undefined ? yOf(0) - 9 : yOf(p.passed) - 6}
+                textAnchor={n > 1 && i === 0 ? "start" : n > 1 && i === n - 1 ? "end" : "middle"}
+              >
+                {p.passed === undefined ? "--" : `${p.passed}/${p.total}`}
+              </text>
+            ) : null}
+            {i % xLabelEvery === 0 || i === n - 1 ? (
+              <text className="mc-chart-axis" x={xOf(i)} y={CHART_H - 4} textAnchor="middle">
+                r{p.n}
+              </text>
+            ) : null}
+          </g>
+        ))}
       </svg>
     </figure>
   );
@@ -3187,6 +3250,10 @@ export function MissionControl({
         charts={
           chart.series.length > 0 ? (
             <div className="mc-charts">
+              <p className="mc-charts-note">
+                How many tests pass at each revision (r1, r2, ...). <span className="advisory">Advisory</span>: the counts are read from the gate&apos;s
+                output; only the gate decides pass or fail.
+              </p>
               {chart.series.map((series) => (
                 <SuiteChart key={series.suite} series={series} landed={chart.landed} focus={focusRev} />
               ))}

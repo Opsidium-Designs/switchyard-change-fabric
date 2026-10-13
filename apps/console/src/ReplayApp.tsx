@@ -260,20 +260,26 @@ function ReadingGuide() {
           <strong>Timeline</strong> (top): the first line says, in plain words, what the message at this point means, and which
           earlier messages led to it (click a seq to open it). Below it, the run in chapters: planning, building, one fix round per
           revision, then promotion. Each round ends at its revision&apos;s gate marker, green when the gate passed and red when it
-          failed, with its acceptance count; a marker appears only once the replay reaches it. Play, scrub, or jump to a key moment
+          failed, with how many acceptance tests passed; a marker appears only once the replay reaches it. These markers are
+          history: the graph shows only the current failing revision. Play, scrub, or jump to a key moment
           underneath; the address bar keeps the exact moment as a link.
         </li>
         <li>
-          <strong>Board</strong> (left): acceptance over revisions, then the work items the lead planned, by state. An agent
-          <em> claims</em> an item before it edits; overlapping claims are <em>contested</em>.
+          <strong>Board</strong> (left): how many tests pass at each revision. <em>Acceptance tests</em> are the gate&apos;s own
+          suite (the run must pass all of them); <em>developer tests</em> are the app&apos;s existing tests, which agents may change
+          only with a human&apos;s approval. The counts are advisory; only the gate decides. Below them, the work items the lead
+          planned, by state. An agent <em>claims</em> an item before it edits; overlapping claims are <em>contested</em>.
         </li>
         <li>
           <strong>Graph</strong> (middle): each rounded box is an item with the agents working in it; orange squares are tools agents
-          built for each other. Short curved teal arrows show who just proposed to, asked, handed off to, or contested whom; they
-          fade over the next few messages. Advisory model decisions (Jev) are listed in their own panel under the graph.
+          built for each other. Short curved arrows (a dot at the sender, a head at the target) show who just proposed to, asked
+          or offered help to, handed off to, or contested whom, coloured by kind; they fade over the next few messages. The red
+          hexagon at the top right is the latest failing revision, with lines to the items it asked to fix; it leaves once they
+          push or the next revision lands. Advisory model decisions (Jev) are listed in their own panel under the graph.
         </li>
         <li>
-          <strong>Thread</strong> (right): the raw board messages. Click any item, agent, or revision to filter to its messages.
+          <strong>Thread</strong> (right): the board messages, each starting with who wrote to whom; a reply sits under the
+          message it answers. Newest or oldest first. Click any item, agent, or revision to filter to its messages.
         </li>
       </ul>
     </details>
