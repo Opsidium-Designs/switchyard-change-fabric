@@ -206,3 +206,5 @@ export {
   sandboxContainment,
   userProcesses,
 } from "./integrate-run.ts";
+export type { AssessTestTeethInput, CheckReleasedTestTeethInput, TestTeethRecord, TestTeethRun, TestTeethStatus } from "./test-teeth.ts";
+export { assessTestTeeth, checkReleasedTestTeeth, isTestFile, TEETH_RUNNER_UNKNOWN, testFileCommand } from "./test-teeth.ts";

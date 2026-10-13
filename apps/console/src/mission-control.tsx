@@ -24,7 +24,7 @@ import {
   type BoardTicker,
 } from "@switchyard-change/orchestration/board-graph";
 import type { EscalationSnapshot } from "@switchyard-change/orchestration/graph-model";
-import { buildProofBundle, type ProofBundle } from "@switchyard-change/orchestration/proof-bundle";
+import { buildProofBundle, formatTestTeeth, type ProofBundle } from "@switchyard-change/orchestration/proof-bundle";
 
 import {
   COMM_WINDOW,
@@ -1782,6 +1782,14 @@ export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSel
           contracts <GradeBadge grade="decided" />
         </dt>
         <dd>{bundle.contracts.length > 0 ? bundle.contracts.map((c) => `${c.contract} ${c.status}${c.decidedBy ? ` by ${c.decidedBy}` : ""}`).join("; ") : "none"}</dd>
+        {bundle.teeth && bundle.teeth.length > 0 ? (
+          <>
+            <dt>
+              test teeth <GradeBadge grade="advisory" />
+            </dt>
+            <dd>{bundle.teeth.map((t) => formatTestTeeth(t).replace(/^test teeth: /, "")).join("; ")}</dd>
+          </>
+        ) : null}
         <dt>
           tools <GradeBadge grade="checked" />
         </dt>

@@ -393,6 +393,26 @@ need no acceptance from the lead.
    project's pre-existing developer TEST FILES (and configs no gate step
    reads), stays contract-changeable with a human's approval. The run summary and the CLI
    print both classes.
+   TEST TEETH (advisory): a released test that also passes on the untouched
+   baseline proves nothing about the fix. So after the verdict, the
+   promotion, and the deploy are settled, when the final revision passed a
+   gate that ran, the run takes each released developer test file
+   (`*.test.*` / `*.spec.*`) that revision changed and runs it ALONE through
+   the gate's own command runner (its install, allowlisted environment,
+   timeout, and abort signal): once on the revision's tree, and once on the
+   project baseline (the integration branch's head before any revision) with
+   the NEW test file swapped in. `teeth`: it fails on the baseline and passes
+   on the revision (good); `no-teeth`: it passes on the baseline too;
+   `could-not-check` with the reason: the runner is unknown (only vitest, read
+   from `package.json`, is run today: `npx --no vitest run <file>`), the
+   install failed, the command crashed, timed out, or was aborted, the runner
+   found no test file, or the test fails on the revision when run alone. It
+   never changes a verdict, a promotion, a deploy, or the proof status: the
+   records ride on the run's proof bundle (`teeth`, see below), the CLI
+   summary prints one line each, and the console's PROOF tab shows them as an
+   advisory row when the bundle carries them. They are not on the board log,
+   so a console that builds the proof from the log alone (live or replay)
+   does not show them yet.
 1. A claim whose write intent overlaps no other agent's live claim is granted.
    An agent's own claims never contest each other (it is one writer).
 2. An overlapping write intent opens a contest naming the earliest-granted
@@ -2463,7 +2483,9 @@ reports but the board did not record is listed and checked, but is never
 proof ("promotion reported by the run but not recorded on the board"). With speculative
 batch gating it also lists the candidates of the round that landed the final
 revision and the landed one (whose commit must be the revision's and the
-promoted gated commit, else NOT-PROVEN). The CLI prints a
+promoted gated commit, else NOT-PROVEN). It also lists the run's TEST TEETH
+records (`teeth`, advisory, reported by the run rather than read from the
+log; see the test-contract rules above): never part of the proof. The CLI prints a
 summary and writes the JSON to `--proof-out`, or `proof-bundle.json` in a kept
 work root (a live run's, or `--keep-work-root`); the console's PROOF tab
 renders it from the log alone, so a recorded run shows it too.

@@ -115,6 +115,8 @@ import {
   type DependencyInstallOutcome,
   inventoryAfterContracts,
   recordBaselineInventory,
+  checkReleasedTestTeeth,
+  type TestTeethRecord,
   GATED_REF_PREFIX,
   matchesGlob,
   labelGateProgress,
@@ -3396,6 +3398,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       return notWritten(scrub(`the receipt could not be built: ${error instanceof Error ? error.message : String(error)}`));
     }
   };
+  // Test teeth of the final passing revision's released developer tests (advisory).
+  let teeth: TestTeethRecord[] | undefined;
   try {
     // 4. The last integration: anything still pending is integrated once more,
     // so the final verdict is the gate of the revision that includes it.
@@ -3581,6 +3585,39 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       emit({ kind: "promotion-skipped", reason: "nothing was integrated: not promoting (no delivery branch was created)" });
     }
 
+    // ADVISORY test teeth, run AFTER the verdict, the promotion, and the deploy
+    // are settled (it can change none of them): each contract-released
+    // developer test the final passing revision changed is run alone on the
+    // baseline (new test swapped in) and on the revision. Anything that goes
+    // wrong is recorded as could-not-check; nothing here throws past this block.
+    const released = releasedTargets(finalState).filter((t) => !(finalState.immutable ?? []).includes(t));
+    if (last && last.gate === "pass" && last.gated && gateRunner && baselineCommit !== undefined && released.length > 0) {
+      const teethToken = cloudWorkspace
+        ? await integrationRepoToken({ fetchFn: rawFetch, base, changeId, scope: "read", ttlSeconds: 600 }).catch(() => undefined)
+        : undefined;
+      if (teethToken) {
+        secrets.add(teethToken.token);
+      }
+      try {
+        teeth = (
+          await checkReleasedTestTeeth({
+            remote: authenticatedRemote(integration.integrationRef.gitUrl, teethToken?.token ?? integration.integrationToken),
+            baselineCommit,
+            revisionCommit: last.commit,
+            rev: last.n,
+            released,
+            runner: gateRunner,
+            workRoot: worktreeRoot,
+            ...(options.signal ? { signal: options.signal } : {}),
+          })
+        ).map((t) => (t.reason !== undefined ? { ...t, reason: scrub(t.reason) } : t));
+      } catch (error) {
+        teeth = [{ path: released.join(", "), rev: last.n, status: "could-not-check", baseline: "not-run", revision: "not-run", reason: scrub(String(error)).slice(0, 300) }];
+      } finally {
+        await teethToken?.revoke().catch(() => undefined);
+      }
+    }
+
     // Agents that hold nothing leave the board (the log records the end of the formation).
     for (const agent of [...workers, lead]) {
       await agent.leave("the run is over").catch(() => undefined);
@@ -3598,6 +3635,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     ...(options.appGateCommand ? { gateCommand: options.appGateCommand } : {}),
     ...(promotionUnrecorded ? { promotion: promotionUnrecorded } : {}),
     ...(receipt ? { receipt } : {}),
+    ...(teeth !== undefined ? { teeth } : {}),
   });
   return {
     changeId,

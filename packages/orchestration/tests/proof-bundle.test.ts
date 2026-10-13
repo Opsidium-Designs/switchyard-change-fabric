@@ -9,7 +9,7 @@ import { describe, expect, it } from "vitest";
 
 import { appendBoardMessage, appendDecisionRecorded, appendEngineRecord, appendIntegratedRev, emptyBoard, type BoardMessage, type BoardState } from "@switchyard-change/change-core";
 
-import { buildProofBundle, formatProofSummary } from "../src/proof-bundle.ts";
+import { buildProofBundle, formatProofSummary, formatTestTeeth } from "../src/proof-bundle.ts";
 import { speculativeLog } from "./board-graph-fixture.ts";
 
 const AT = "2026-01-01T00:00:00.000Z";
@@ -133,6 +133,28 @@ describe("the proof bundle (pure, from the log)", () => {
     const upToFailure = run.messages.slice(0, run.messages.findIndex((m) => m.type === "integrated.rev" && m.payload.gate === "fail") + 1);
     expect(buildProofBundle(upToFailure)).toMatchObject({ status: "not-proven", reasons: ["the last revision (1) failed its gate"] });
     expect(buildProofBundle([])).toMatchObject({ status: "not-proven", reasons: ["no integrated revision was recorded"] });
+  });
+
+  it("lists the run's test-teeth records as advisory: they never change the status or the reasons", () => {
+    const messages = verifiedRun().messages;
+    const plain = buildProofBundle(messages);
+    expect(plain.teeth).toBeUndefined();
+    const records = [
+      { path: "tests/a.test.ts", rev: 2, status: "teeth" as const, baseline: "fail" as const, revision: "pass" as const },
+      { path: "tests/b.test.ts", rev: 2, status: "no-teeth" as const, baseline: "pass" as const, revision: "pass" as const },
+      { path: "tests/c.test.ts", rev: 2, status: "could-not-check" as const, baseline: "not-run" as const, revision: "not-run" as const, reason: "runner unknown" },
+    ];
+    const withTeeth = buildProofBundle(messages, { teeth: records });
+    expect(withTeeth.teeth).toEqual(records);
+    expect({ ...withTeeth, teeth: undefined }).toEqual({ ...plain, teeth: undefined });
+    expect(records.map(formatTestTeeth)).toEqual([
+      "test teeth: tests/a.test.ts fails on baseline (good), passes on rev 2",
+      "test teeth: tests/b.test.ts passes on baseline too (no teeth: it does not show the fix), passes on rev 2",
+      "test teeth: tests/c.test.ts could not check: runner unknown",
+    ]);
+    // A failing run stays not proven with the same reasons, whatever the teeth say.
+    const failing = messages.slice(0, messages.findIndex((m) => m.type === "integrated.rev" && m.payload.gate === "fail") + 1);
+    expect(buildProofBundle(failing, { teeth: records }).reasons).toEqual(buildProofBundle(failing).reasons);
   });
 });
 

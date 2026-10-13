@@ -316,6 +316,22 @@ describe("honesty labels", () => {
     expect(proof).not.toMatch(/undefined|NaN/);
   });
 
+  it("shows the run's test-teeth records in the proof as an advisory row, and no row without them", () => {
+    const spec = speculativeLog();
+    const plain = renderToStaticMarkup(createElement(ProofPanel, { bundle: buildProofBundle(spec), onSelectSeq: () => undefined }));
+    expect(plain).not.toContain("test teeth");
+    const bundle = buildProofBundle(spec, {
+      teeth: [
+        { path: "tests/billing/tax.test.ts", rev: 6, status: "teeth", baseline: "fail", revision: "pass" },
+        { path: "tests/x.test.ts", rev: 6, status: "could-not-check", baseline: "not-run", revision: "not-run", reason: "runner unknown" },
+      ],
+    });
+    expect(bundle.status).toBe("proven");
+    const proof = renderToStaticMarkup(createElement(ProofPanel, { bundle, onSelectSeq: () => undefined }));
+    expect(proof).toMatch(/<dt>test teeth <span class="mc-grade grade-advisory"/);
+    expect(proof).toContain("tests/billing/tax.test.ts fails on baseline (good), passes on rev 6; tests/x.test.ts could not check: runner unknown");
+  });
+
   it("describes a resolved attribution as where the pick landed, advisory", () => {
     const model = buildBoardGraph(log);
     const jev = model.nodes.find((n) => n.kind === "jev" && n.label === "attribution")!;

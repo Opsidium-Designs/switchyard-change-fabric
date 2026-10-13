@@ -288,8 +288,8 @@ export {
   rateLimitedExecutor,
   rateLimitedTransport,
 } from "./rate-limit-backoff.ts";
-export type { ProofBundle, ProofBundleOptions, ProofCandidate, ProofCount, ProofReceipt } from "./proof-bundle.ts";
-export { buildProofBundle, formatProofSpeculation, formatProofSummary } from "./proof-bundle.ts";
+export type { ProofBundle, ProofBundleOptions, ProofCandidate, ProofCount, ProofReceipt, ProofTestTeeth } from "./proof-bundle.ts";
+export { buildProofBundle, formatProofSpeculation, formatProofSummary, formatTestTeeth } from "./proof-bundle.ts";
 export type { PromotionReceipt, PromotionReceiptFacts } from "./promotion-receipt.ts";
 export { buildPromotionReceipt, parsePromotionReceipt, RECEIPT_JSON_MARKER } from "./promotion-receipt.ts";
 export type { RefreshableToken, TokenRefresherOptions } from "./token-refresh.ts";

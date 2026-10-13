@@ -29,6 +29,13 @@
  * the pushes recorded as regressors (the stack scored strictly better without
  * them): a record of what was stacked and who was told, never part of the proof (the ratchet never moves the head,
  * promotes, or changes a verdict).
+ *
+ * TEST TEETH (advisory, from the run, not the log): when the final passing
+ * revision changed a contract-released developer test, the run ran that file
+ * alone on the baseline tree (new test swapped in) and on the revision, and
+ * reports whether it fails on the baseline (it has teeth). The bundle lists
+ * what the run reports (`options.teeth`); it is never part of the proof and
+ * never changes the status.
  */
 
 import { describeProgressScore, foldBoard, isChangeItem, progressHeadline, ratchetHistory, type BoardMessage, type BoardRevProgress } from "@switchyard-change/change-core";
@@ -111,6 +118,41 @@ export interface ProofBundle {
     readonly history: readonly { readonly n: number; readonly seq: number; readonly commit: string; readonly line: string }[];
     readonly regressions: readonly { readonly seq: number; readonly item: string; readonly agent: string; readonly commit: string; readonly rev: number; readonly ratchet: number; readonly from: string; readonly to: string; readonly candidate: string }[];
   };
+  /**
+   * Test teeth (absent when the run checked none): the released developer
+   * tests the final revision changed, each run alone on the baseline and the
+   * revision. ADVISORY, reported by the run: never part of the proof.
+   */
+  readonly teeth?: readonly ProofTestTeeth[];
+}
+
+/**
+ * One released developer test the final revision changed, run alone on the
+ * baseline (with the new test swapped in) and on the revision: ADVISORY.
+ * teeth: it fails on the baseline and passes on the revision (it catches what
+ * it targets); no-teeth: it passes on the baseline too; could-not-check: the
+ * check did not run cleanly (`reason` says why).
+ */
+export interface ProofTestTeeth {
+  readonly path: string;
+  readonly rev: number;
+  readonly status: "teeth" | "no-teeth" | "could-not-check";
+  readonly baseline: "pass" | "fail" | "not-run";
+  readonly revision: "pass" | "fail" | "not-run";
+  readonly command?: readonly string[];
+  readonly reason?: string;
+}
+
+/** One readable line for a test-teeth record (the CLI summary and the console Proof tab). */
+export function formatTestTeeth(record: ProofTestTeeth): string {
+  switch (record.status) {
+    case "teeth":
+      return `test teeth: ${record.path} fails on baseline (good), passes on rev ${record.rev}`;
+    case "no-teeth":
+      return `test teeth: ${record.path} passes on baseline too (no teeth: it does not show the fix), passes on rev ${record.rev}`;
+    default:
+      return `test teeth: ${record.path} could not check: ${record.reason ?? "no reason recorded"}`;
+  }
 }
 
 /** One speculative candidate as the proof lists it (each backed by its candidate.gated seq). */
@@ -145,6 +187,8 @@ export interface ProofBundleOptions {
   readonly promotion?: { readonly rev?: number; readonly gatedCommit: string; readonly commit: string; readonly branch: string };
   /** The promotion receipt note's outcome, as the run reports it. */
   readonly receipt?: ProofReceipt;
+  /** The run's test-teeth records (advisory: listed, never part of the proof or the status). */
+  readonly teeth?: readonly ProofTestTeeth[];
 }
 
 function of<K extends BoardMessage["type"]>(log: readonly BoardMessage[], type: K): Extract<BoardMessage, { readonly type: K }>[] {
@@ -434,6 +478,7 @@ export function buildProofBundle(log: readonly BoardMessage[], options: ProofBun
     incompleteItems: changeItems.filter((i) => i.status !== "done").map((i) => i.id),
     ...(speculation ? { speculation } : {}),
     ...(history.length > 0 || regressions.length > 0 ? { ratchet: { history, regressions } } : {}),
+    ...(options.teeth !== undefined && options.teeth.length > 0 ? { teeth: options.teeth.map((t) => ({ ...t, ...(t.command ? { command: [...t.command] } : {}) })) } : {}),
   };
 }
 
@@ -480,6 +525,9 @@ export function formatProofSummary(bundle: ProofBundle): string[] {
           ? `; regressions: ${bundle.ratchet.regressions.map((r) => `${r.item} (${r.agent}, ${r.commit.slice(0, 10)}) rev ${r.rev} ${r.to} with it, ${r.from} without it`).join("; ")}`
           : ""),
     );
+  }
+  for (const t of bundle.teeth ?? []) {
+    lines.push(`  ${formatTestTeeth(t)} (advisory, not a verdict)`);
   }
   lines.push(
     `  merged: ${bundle.contributions.pushesMerged} push(es) from ${bundle.contributions.agents.join(", ") || "nobody"}; ${bundle.contributions.items.filter((i) => i.status === "done").length} of ${bundle.contributions.items.length} item(s) done`,
