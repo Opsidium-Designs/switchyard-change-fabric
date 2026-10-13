@@ -954,7 +954,7 @@ const commands: Command[] = [
     summary:
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
-      `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--max-inflight N] [--id <changeId>] ` +
+      `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate] [--spread-claims] [--concurrent] [--board-out <file>]] [--worker <url>] [--min N] [--max N] [--max-inflight N] [--id <changeId>] ` +
       `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--deploy-app <app dir> [--deploy-app-name <worker>] [--preview-revisions]] [--rate-limit-window-ms N] [--inference gateway|claude-cli|codex-cli] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
@@ -1117,12 +1117,23 @@ const commands: Command[] = [
         // noop executor can never satisfy a real gate), and says so everywhere;
         // a live run always uses the project's declared gate.
         const fixtureGate = hasFlag(args, "--fixture-gate");
+        // A scripted run at scale: free workers spread over the open items (offline policy only).
+        const spreadClaims = hasFlag(args, "--spread-claims");
+        const boardOut = optionValue(args, "--board-out");
+        // Every agent in its own loop, as on a live run: the real board, but no longer byte-identical.
+        const concurrent = hasFlag(args, "--concurrent");
         const declaredGate = fixtureGate && (appGateCommand || gateWiring.requireAppGate) ? (appGateCommand ?? ["npm", "run", "gate"]) : undefined;
         // Installed before the header is printed: once the header is out, SIGINT/SIGTERM interrupt the run.
         const stop = interruptOnSignals();
-        console.log("Offline board run (no network, deterministic)");
+        console.log(
+          concurrent
+            ? "Offline board run (no network; concurrent schedule: agents interleave differently run to run)"
+            : "Offline board run (no network, deterministic)",
+        );
         console.log("  planner: heuristic decomposition (offline stub)");
-        console.log("  agent turns: generic deterministic policy (offline stand-in for the turn model)");
+        console.log(
+          `  agent turns: generic deterministic policy (offline stand-in for the turn model)${spreadClaims ? "; free workers spread over the open items (--spread-claims)" : ""}`,
+        );
         console.log("  executor: scoped deterministic noop; workspaces: local fallback repos");
         console.log(`  agent-built tools: ${OFFLINE_TOOL_AUTHOR_LABEL}; tool gates and tool runs isolated like gate commands`);
         console.log(
@@ -1151,11 +1162,22 @@ const commands: Command[] = [
           ...(fixtureGate ? { fixtureGate: true } : {}),
           ...(declaredGate ? { replacesDeclaredGate: declaredGate } : {}),
           ...(speculate !== undefined ? { speculate } : {}),
+          ...(spreadClaims ? { spreadClaims: true } : {}),
+          ...(concurrent ? { schedule: "concurrent" as const, pollMs: 50 } : {}),
         }).finally(stop.dispose);
         console.log("Board transcript:");
         console.log(redactSecrets(formatBoardTranscript(result.log)));
         console.log("");
         console.log(redactSecrets(formatBoardRunSummary(result)));
+        if (boardOut !== undefined) {
+          // The raw board export (the shape `export-replay --from-file` reads):
+          // NOT scrubbed, so it stays local; the replay exporter scrubs it and
+          // refuses anything token-like before anything is published.
+          const path = resolve(boardOut);
+          await mkdir(dirname(path), { recursive: true });
+          await writeFile(path, `${JSON.stringify({ changeId: result.changeId, messages: result.log, snapshot: result.snapshot })}\n`);
+          console.log(`  board export (raw, local only; publish it with export-replay --from-file): ${path}`);
+        }
         // The offline demo's scratch work root is removed unless asked to keep it: the
         // proof bundle is written there only when it is kept, else only with --proof-out.
         await writeProofBundle(result, optionValue(args, "--proof-out"), hasFlag(args, KEEP_WORK_ROOT_FLAG));
@@ -1169,6 +1191,18 @@ const commands: Command[] = [
       // offline policy is never a silent live substitute.
       if (hasFlag(args, "--fixture-gate")) {
         console.error("Error: --fixture-gate is offline only; a live board run always uses the project's declared gate");
+        return 1;
+      }
+      if (hasFlag(args, "--concurrent")) {
+        console.error("Error: --concurrent is for the offline run (a live run is already concurrent; --lockstep steps it)");
+        return 1;
+      }
+      if (hasFlag(args, "--spread-claims")) {
+        console.error("Error: --spread-claims scripts the offline policy only; on a live run the turn model chooses its items");
+        return 1;
+      }
+      if (optionValue(args, "--board-out") !== undefined) {
+        console.error("Error: --board-out is offline only; export a live run from the Worker with make export-replay ID=<changeId>");
         return 1;
       }
       const turn = selectAgentTurn();

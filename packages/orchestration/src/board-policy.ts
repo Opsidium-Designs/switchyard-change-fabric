@@ -96,6 +96,8 @@ import type {
 } from "@switchyard-change/model-adapters";
 import { matchesGlob } from "@switchyard-change/verification";
 
+import { nameSome, toolInputsWithin } from "./tool-proposal.ts";
+
 type Input = AgentTurnInput<BoardDigest, BoardMessage>;
 
 /** The write intent the agent asked for in its latest claim of `item`. */
@@ -189,6 +191,32 @@ type BoardToolFact = BoardTools[number];
 /** The latest published version of a tool, if any. */
 function latest(tool: BoardToolFact): BoardToolFact["versions"][number] | undefined {
   return tool.versions.at(-1);
+}
+
+/** The last tool-need detections, by their exact inputs (bounded). */
+const toolNeedCache = new Map<string, ReturnType<typeof detectBoardToolNeed>>();
+const TOOL_NEED_CACHE_SIZE = 32;
+
+/**
+ * `detectBoardToolNeed`, memoized on its exact inputs: a pure function, so the
+ * answer is the same; on a wide plan (100 items) one detection costs most of a
+ * second and every free agent asks it on every turn while the board is unchanged.
+ */
+function cachedToolNeed(
+  items: Parameters<typeof detectBoardToolNeed>[0],
+  files: Parameters<typeof detectBoardToolNeed>[1],
+  protectedPaths: readonly string[],
+): ReturnType<typeof detectBoardToolNeed> {
+  const key = JSON.stringify([items, files, protectedPaths]);
+  if (toolNeedCache.has(key)) {
+    return toolNeedCache.get(key);
+  }
+  const need = detectBoardToolNeed(items, files, { protected: protectedPaths });
+  if (toolNeedCache.size >= TOOL_NEED_CACHE_SIZE) {
+    toolNeedCache.delete(toolNeedCache.keys().next().value!);
+  }
+  toolNeedCache.set(key, need);
+  return need;
 }
 
 /** True when a tool's declared inputs cover `file` (no inputs: the whole repo). */
@@ -462,16 +490,16 @@ function toolAction(input: Input, stage: "held" | "free"): AgentAction | undefin
 
   // A repeated mechanical change across the planned items: propose a tool for it (one per agent).
   if (!decisions.some((h) => h.action.type === "propose_tool")) {
-    const need = detectBoardToolNeed(
+    const need = cachedToolNeed(
       items
         .filter((i) => i.planned === true)
         .map((i) => ({ item: i.item, scopeHint: i.scopeHint, status: i.status, objective: i.objective, ...(i.tool !== undefined || i.fromTool !== undefined ? { tool: true } : {}) })),
       input.repo.files,
-      { protected: d.protected },
+      d.protected,
     );
     if (need) {
       const has = (capability: string) => tools.some((t) => t.capability === capability);
-      const why = `${need.items.length} items (${need.items.join(", ")}) apply the same "${need.editKind}" change across ${need.files.length} files`;
+      const why = `${need.items.length} items (${nameSome(need.items)}) apply the same "${need.editKind}" change across ${need.files.length} files`;
       if (!has(need.scanner)) {
         return {
           type: "propose_tool",
@@ -489,7 +517,7 @@ function toolAction(input: Input, stage: "held" | "free"): AgentAction | undefin
           capability: need.codemod,
           kind: "codemod",
           why: `${why}: one codemod applies it the same way everywhere instead of hand edits`,
-          inputs: [...need.scope],
+          inputs: toolInputsWithin(need.scope),
           outputs: ["edits"],
         };
       }
@@ -612,6 +640,27 @@ function replanAction(input: Input): AgentAction | undefined {
 export interface GenericBoardPolicyOptions {
   /** Prefer open items whose scope overlaps no other holder's (default true). */
   readonly preferNonOverlapping?: boolean;
+  /**
+   * Spread free workers over the open items (offline scripted runs at scale
+   * only; default off): worker `agent-k` reads the claimable items starting at
+   * index k (mod their count), so a wide pool does not all reach for the first
+   * open item. Deterministic; the seam-first and non-overlapping ordering still
+   * applies on top. Never used by a live run: there the turn model chooses.
+   */
+  readonly spreadClaims?: boolean;
+}
+
+/** `agent-k` -> k (0 for the lead or any other id): the spread offset. */
+function agentOffset(agent: string): number {
+  const m = /^agent-(\d+)$/.exec(agent);
+  return m ? Number(m[1]) : 0;
+}
+
+/** The items rotated to start at `offset` (mod their count). */
+export function rotateFrom<T>(items: readonly T[], offset: number): T[] {
+  if (items.length === 0) return [];
+  const at = ((offset % items.length) + items.length) % items.length;
+  return [...items.slice(at), ...items.slice(0, at)];
 }
 
 function decide(input: Input, options: GenericBoardPolicyOptions = {}): AgentAction {
@@ -1035,7 +1084,7 @@ function decide(input: Input, options: GenericBoardPolicyOptions = {}): AgentAct
     const openSeamItems = new Set((d.openSeams ?? []).map((o) => o.item));
     // An item whose claim of mine lapsed goes to another agent first.
     const lapsedMine = (i: (typeof d.openItems)[number]) => i.wait?.reason.kind === "lease-lapsed" && i.wait.reason.agent === me;
-    const claimable = d.openItems
+    const claimable = (options.spreadClaims ? rotateFrom(d.openItems, agentOffset(me)) : d.openItems)
       .filter((i) => i.scopeHint.length > 0 && !otherTools.has(i.item) && !mine(i) && (i.waitsFor ?? []).length === 0 && !lapsedMine(i))
       .filter((i) => d.claimCap === undefined || openSeamItems.has(i.item))
       // Seam items first; then items whose scope overlaps no other holder's (fewer collisions).

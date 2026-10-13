@@ -123,6 +123,23 @@ export interface RunBoardOfflineOptions {
   readonly capsClock?: () => number;
   /** Defaults to the generic policy. */
   readonly transport?: AgentTurnTransport<BoardDigest, BoardMessage>;
+  /**
+   * With the default generic policy: spread free workers over the open items
+   * (see GenericBoardPolicyOptions.spreadClaims), for a scripted run at scale.
+   * Ignored when a transport is given.
+   */
+  readonly spreadClaims?: boolean;
+  /** The limit on model calls in flight (see RunBoardOptions.maxInflight). */
+  readonly maxInflight?: number;
+  /**
+   * The schedule (default lockstep: a byte-identical log run to run). A
+   * concurrent offline run steps every agent in its own loop, as a live run
+   * does, so the log interleaves differently each time: still the real board
+   * and integrator, no longer deterministic.
+   */
+  readonly schedule?: "lockstep" | "concurrent";
+  /** The concurrent schedule's board poll interval, in ms (see RunBoardOptions.pollMs). */
+  readonly pollMs?: number;
   /** Defaults to the heuristic decomposition of the goal. */
   readonly seed?: (goal: string) => Promise<BoardSeed>;
   /** Defaults to the scoped deterministic executor. */
@@ -184,8 +201,14 @@ export interface RunBoardOfflineOptions {
   readonly previewRevision?: RunBoardOptions["previewRevision"];
 }
 
+/** An offline run's result, with the Change snapshot the offline control served at the end. */
+export interface RunBoardOfflineResult extends RunBoardResult {
+  /** The Change state projection (as GET /changes/:id serves it) after the run; null when it had none. */
+  readonly snapshot: unknown;
+}
+
 /** Run a board offline and deterministically. */
-export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<RunBoardResult> {
+export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<RunBoardOfflineResult> {
   const workRoot = options.workRoot ?? (await mkdtemp(join(tmpdir(), "scf-board-offline-")));
   const epoch = Date.parse(OFFLINE_BOARD_EPOCH);
   let tick = 0;
@@ -208,12 +231,14 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       fetchFn: control.fetch as unknown as typeof fetch,
       dial: options.dial ?? { minConcurrency: 1, maxConcurrency: 3 },
       ...(options.scaleDial ? { scaleDial: true } : {}),
-      transport: options.transport ?? createGenericBoardPolicy(),
+      transport: options.transport ?? createGenericBoardPolicy(options.spreadClaims ? { spreadClaims: true } : {}),
+      ...(options.maxInflight !== undefined ? { maxInflight: options.maxInflight } : {}),
       seed:
         options.seed ??
         (async (goal) => boardSeedFromChange((await decomposeGoal({ goal, projectDir: options.projectDir })).change)),
       ...(options.executor ? { executor: options.executor } : {}),
-      schedule: "lockstep",
+      schedule: options.schedule ?? "lockstep",
+      ...(options.pollMs !== undefined ? { pollMs: options.pollMs } : {}),
       ...(options.speculate !== undefined ? { speculate: options.speculate } : {}),
       // Candidates in order, one at a time: a deterministic log.
       candidateConcurrency: 1,
@@ -261,8 +286,17 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       ...(options.deployAppName ? { deployAppName: options.deployAppName } : {}),
       ...(options.previewRevision ? { previewRevision: options.previewRevision } : {}),
     });
+    // The Change's state projection (what the Worker serves as GET /changes/:id):
+    // what a replay export keeps a slim slice of. A run that never created its
+    // Change (an early refusal) has none.
+    let snapshot: unknown = null;
+    try {
+      snapshot = control.state(result.changeId);
+    } catch {
+      snapshot = null;
+    }
     // The whole scratch directory: the offline control's repos and the run's work root.
-    return { ...result, scratchRoot: workRoot };
+    return { ...result, scratchRoot: workRoot, snapshot };
   } finally {
     if (pinDates) {
       for (const [key, value] of [

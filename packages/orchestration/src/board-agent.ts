@@ -73,6 +73,7 @@ import { ToolUseError, type ToolAuthor, type ToolBench } from "./board-tools.ts"
 import type { RefreshableToken } from "./token-refresh.ts";
 import type { RunCapReached, RunMeter } from "./run-meter.ts";
 import type { RateLimitBackoff } from "./rate-limit-backoff.ts";
+import { nameSome, toolInputsWithin } from "./tool-proposal.ts";
 
 import { redactSecrets } from "./redact.ts";
 import {
@@ -1381,10 +1382,11 @@ export class BoardAgent {
       }
     }
     if (need) {
-      const why = `${need.items.length} planned items (${need.items.join(", ")}) repeat the same "${need.editKind}" change across ${need.files.length} files`;
+      // A wide plan's item list and scope are folded to fit the board's payload limits.
+      const why = `${need.items.length} planned items (${nameSome(need.items)}) repeat the same "${need.editKind}" change across ${need.files.length} files`;
       const tools: Extract<AgentAction, { type: "propose_tool" }>[] = [
         { type: "propose_tool", capability: need.scanner, kind: "scanner", why: `${why}: a scanner finds every place in the repository that needs it, including any the plan missed`, inputs: [], outputs: ["findings"] },
-        { type: "propose_tool", capability: need.codemod, kind: "codemod", why: `${why}: one codemod applies it the same way everywhere instead of hand edits`, inputs: [...need.scope], outputs: ["edits"] },
+        { type: "propose_tool", capability: need.codemod, kind: "codemod", why: `${why}: one codemod applies it the same way everywhere instead of hand edits`, inputs: toolInputsWithin(need.scope), outputs: ["edits"] },
       ];
       for (const action of tools) {
         const outcome = await client.post({

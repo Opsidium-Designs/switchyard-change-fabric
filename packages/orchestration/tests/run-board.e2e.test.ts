@@ -2400,3 +2400,32 @@ describe("a developer test a human released reaches the agent (live regression s
     expect(result.promotion?.committed).not.toBe(true);
   }, 120_000);
 });
+
+describe("the offline run's export (the simulated replay's source)", () => {
+  it("returns the Change snapshot the offline control serves, with the recorded integration verdict", async () => {
+    const projectDir = await project();
+    const result = await offline({ goal: GOAL, projectDir, seed, fixtureGate: true });
+    const snapshot = result.snapshot as { id?: string; integration?: { verdict?: string } } | null;
+    expect(snapshot?.id).toBe(result.changeId);
+    expect(snapshot?.integration?.verdict).toBe(result.verdict);
+  });
+
+  it("runs on the concurrent schedule too: the real board and integrator, every item done, the log folding to its state", async () => {
+    const projectDir = await project();
+    const result = await offline({
+      goal: GOAL,
+      projectDir,
+      seed,
+      fixtureGate: true,
+      schedule: "concurrent",
+      pollMs: 20,
+      spreadClaims: true,
+      dial: { minConcurrency: 1, maxConcurrency: 4 },
+      maxInflight: 2,
+    });
+    expect(result.stopReason).toBe("all-items-done");
+    expect(result.verdict).toBe("verified");
+    expect(result.budgets).toMatchObject({ maxInflight: 2 });
+    expect(reduceBoard(result.log)).toEqual(result.state);
+  }, 60_000);
+});

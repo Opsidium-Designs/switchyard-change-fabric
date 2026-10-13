@@ -316,7 +316,7 @@ export type { ProtectedPaths } from "./protected-paths.ts";
 export { deriveProtectedPaths, isRunnerConfig, isTestShaped, RUNNER_CONFIG_FILES, stepPrograms } from "./protected-paths.ts";
 export { promoteVerifiedIntegration, redeployIfPreviouslyDeployed } from "./run-live.ts";
 export type { LocalChangeControlOptions } from "./local-control.ts";
-export type { RunBoardOfflineOptions } from "./run-board-offline.ts";
+export type { RunBoardOfflineOptions, RunBoardOfflineResult } from "./run-board-offline.ts";
 export { FirstAttemptFailingGate, OFFLINE_BOARD_EPOCH, OFFLINE_GATE_FIXTURE_COMMAND, OFFLINE_TOOL_AUTHOR_LABEL, offlineFixtureGateLabel, runBoardOffline } from "./run-board-offline.ts";
 
 export { ChildProcessCommandRunner } from "@switchyard-change/verification";

@@ -4,10 +4,11 @@
  */
 import { describe, expect, it } from "vitest";
 
-import type { BoardDigest, BoardMessage } from "@switchyard-change/change-core";
+import { BOARD_LIMITS, entryWithin, type BoardDigest, type BoardMessage } from "@switchyard-change/change-core";
 import type { AgentTurnInput } from "@switchyard-change/model-adapters";
 
-import { coveredByOutstanding, createGenericBoardPolicy, duplicateOf } from "../src/board-policy.ts";
+import { coveredByOutstanding, createGenericBoardPolicy, duplicateOf, rotateFrom } from "../src/board-policy.ts";
+import { nameSome, toolInputsWithin } from "../src/tool-proposal.ts";
 
 const existing = [
   { item: "u-users-validate-auth", objective: "Add input validation to the users resource handlers", scopeHint: ["src/users/**"] },
@@ -378,5 +379,76 @@ describe("overlap preference in the generic policy", () => {
     ];
     const free = { ...base, digest: { ...base.digest, openItems } as unknown as BoardDigest };
     expect((await policy(free)).action).toMatchObject({ type: "claim", itemId: "three" });
+  });
+});
+
+describe("spread claims (the offline scripted policy at scale)", () => {
+  const openItems = ["a", "b", "c", "d", "e"].map((item) => ({ item, objective: item, acceptance: [], scopeHint: [`src/${item}.ts`] }));
+  const free = (agent: string) => {
+    const base = input(agent, "worker", {});
+    return { ...base, digest: { ...base.digest, openItems } as unknown as BoardDigest };
+  };
+
+  it("rotates a list from an offset, wrapping (and an empty list stays empty)", () => {
+    expect(rotateFrom([1, 2, 3], 1)).toEqual([2, 3, 1]);
+    expect(rotateFrom([1, 2, 3], 7)).toEqual([2, 3, 1]);
+    expect(rotateFrom([], 4)).toEqual([]);
+  });
+
+  it("off by default: every free worker reaches for the first open item", async () => {
+    for (const agent of ["agent-1", "agent-2", "agent-3"]) {
+      expect((await policy(free(agent))).action).toMatchObject({ type: "claim", itemId: "a" });
+    }
+  });
+
+  it("on: agent-k starts at the k-th open item, so a wide pool spreads deterministically", async () => {
+    const spread = createGenericBoardPolicy({ spreadClaims: true });
+    const picks: string[] = [];
+    for (const agent of ["agent-1", "agent-2", "agent-3", "agent-4", "agent-5", "agent-6"]) {
+      picks.push(((await spread(free(agent))).action as { itemId: string }).itemId);
+    }
+    expect(picks).toEqual(["b", "c", "d", "e", "a", "b"]);
+    // Deterministic: the same input picks the same item.
+    expect((await spread(free("agent-3"))).action).toMatchObject({ itemId: "d" });
+  });
+
+  it("on: the seam-first order still wins over the rotation", async () => {
+    const spread = createGenericBoardPolicy({ spreadClaims: true });
+    const base = free("agent-2");
+    const withSeam = {
+      ...base,
+      digest: { ...base.digest, openItems: [...openItems, { ...openItems[0]!, item: "seam", seam: true }] } as unknown as BoardDigest,
+    };
+    expect((await spread(withSeam)).action).toMatchObject({ type: "claim", itemId: "seam" });
+  });
+});
+
+describe("tool proposals on a wide plan stay within the board's limits", () => {
+  it("a rationale names a few items, then how many more", () => {
+    expect(nameSome(["a", "b"])).toBe("a, b");
+    expect(nameSome(Array.from({ length: 100 }, (_, i) => `i${i}`), 3)).toBe("i0, i1, i2, and 97 more");
+  });
+
+  it("a codemod's inputs fold into directory globs only when the scope is too wide, still covering every file", () => {
+    const few = ["src/a/x.ts", "src/b/y.ts"];
+    expect(toolInputsWithin(few)).toEqual(few);
+    const wide = Array.from({ length: 100 }, (_, i) => `src/d${i % 10}/m${i}.ts`);
+    const folded = toolInputsWithin(wide);
+    expect(folded).toEqual(Array.from({ length: 10 }, (_, i) => `src/d${i}/**`));
+    expect(wide.every((f) => folded.some((g) => entryWithin(f, g)))).toBe(true);
+    // Too many directories too: one level up.
+    expect(toolInputsWithin(wide, 5)).toEqual(["src/**"]);
+    expect(toolInputsWithin(["a.ts", "b.ts"], 1)).toEqual(["**"]);
+  });
+
+  it("a free worker's tool proposal over 100 planned files is one the board accepts", async () => {
+    const files = Array.from({ length: 100 }, (_, i) => `src/d${i % 10}/m${i}.ts`);
+    const items = files.map((f, i) => ({ item: `validate-src-d${i % 10}-m${i}`, objective: `Add input validation in ${f}`, scopeHint: [f], status: "open", planned: true }));
+    const base = input("agent-1", "worker", { items } as unknown as Partial<Input["board"]>);
+    const turn = { ...base, repo: { files, excerpts: [] } } as unknown as Input;
+    const first = (await policy(turn)).action as unknown as { type: string; why: string; inputs: string[] };
+    expect(first.type).toBe("propose_tool");
+    expect(first.why.length).toBeLessThanOrEqual(BOARD_LIMITS.maxRationale);
+    expect(first.inputs.length).toBeLessThanOrEqual(BOARD_LIMITS.maxIntentEntries);
   });
 });
