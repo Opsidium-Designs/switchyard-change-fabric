@@ -52,6 +52,23 @@ make replay-preview   # build, then serve on http://127.0.0.1:4180 (REPLAY_PORT=
   never styled like a verdict.
 - A seam item reads `seam: <file>` (its contract's recorded target) and a tool
   item `tool: <capability>`; the full id stays in the tooltip and the detail.
+- A large board (more than 24 items or 16 workers; the board admits up to 100
+  agents) is drawn at scale (`apps/console/src/board-scale.ts`): items are
+  grouped into lanes (a sub-lead's split item with its children nested inside,
+  else the items sharing a domain prefix such as `parking-`, else a scope
+  directory), each lane captioned with its done count at the current seq;
+  hulls are compact (titles drop what the lane or parent already says, at most
+  4 agent dots, then a count); and free agents (idle or left) are one bench
+  chip with counts, not a dot each. The drawing fits the pane by default.
+  A folded Board column of more than 12 items names 6, then a count, and the
+  cards are compact; the ticker stays one line, with active/total agents and, when there
+  are sub-leads, the active agents under each. Positions still come from the
+  full log, so nothing moves while scrubbing; a small board keeps the layout it
+  always had. `apps/console/tests/fixtures/large-board.ts` builds synthetic
+  30- and 100-agent board logs through the board API for the tests;
+  `tests/fixtures/write-large-replay.ts <dir>` writes them as replay files into
+  a built `dist-replay/replays` for local screenshots only (they are never
+  added to `public/replays` or the index).
 - Theme: light and dark, following the system until chosen with the toggle in
   the header (remembered in localStorage); `&theme=light` or `&theme=dark`
   forces one for a link or a screenshot.

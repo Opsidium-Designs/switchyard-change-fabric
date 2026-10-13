@@ -1209,8 +1209,15 @@ body {
 .mc-rev-chip.is-fail { border-color: var(--bad-strong); color: var(--bad-text); }
 .mc-rev-chip.is-nogate { border-color: var(--warn); color: var(--warn); border-style: dashed; }
 .mc-rebasing { color: var(--warn); }
-.mc-agents, .mc-items { color: var(--muted); }
+.mc-agents, .mc-items, .mc-teams { color: var(--muted); }
 .mc-replaying { color: var(--violet); font-weight: 600; }
+
+/* The ticker stays one line at any board size: long parts are cut (their title holds the full text). */
+.mc-ticker { flex-wrap: nowrap; white-space: nowrap; min-width: 0; max-width: 100%; overflow: hidden; }
+.mc-ticker > span { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.mc-ticker > .mc-agents, .mc-ticker > .mc-rev-chip, .mc-ticker > .mc-replaying { flex-shrink: 0; }
+.mc-ticker > .mc-goal { flex: 1 1 18rem; }
+.mc-ticker > .mc-teams { flex: 0 3 auto; }
 
 /* Board pane */
 .mc-board {
@@ -1501,6 +1508,15 @@ body {
 .mc-node.kind-human.status-awaiting .shape { fill: var(--await); }
 .mc-node-label { fill: var(--text); font-size: calc(13px * var(--mc-t, 1)); pointer-events: none; }
 .mc-node-label.is-center { font-weight: 700; }
+.mc-node-label.is-compact { font-size: calc(11px * var(--mc-t, 1)); }
+
+/* A large board: lanes group the items (by sub-lead or domain), and free agents are one bench chip. */
+.mc-lane rect { fill: rgba(139, 148, 158, 0.035); stroke: var(--border); stroke-dasharray: 5 4; pointer-events: none; }
+.mc-lane-title { fill: var(--text); font-size: calc(13px * var(--mc-t, 1)); font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mc-lane-detail { fill: var(--muted); font-size: calc(11px * var(--mc-t, 1)); }
+.mc-bench-chip rect { fill: rgba(139, 148, 158, 0.1); stroke: var(--border); stroke-width: 1.5; cursor: pointer; }
+.mc-bench-chip.is-selected rect { stroke: var(--accent); stroke-width: 2.5; }
+.mc-bench-chip text { fill: var(--text); font-size: calc(13px * var(--mc-t, 1)); pointer-events: none; }
 .mc-node-sub { fill: var(--muted); font-size: calc(13px * var(--mc-t, 1)); font-weight: 600; pointer-events: none; }
 .mc-node-chip { font-size: calc(12px * var(--mc-t, 1)); pointer-events: none; }
 .mc-node.kind-rev.status-pass .mc-node-sub { fill: var(--ok); }
@@ -1611,6 +1627,13 @@ body {
   overflow: hidden;
   max-width: 34rem;
 }
+
+/* A large board (over 24 items): compact cards, one title line each; a selected card shows its objective. */
+.mc-cards.is-compact { gap: 0.2rem; }
+.mc-cards.is-compact .mc-card { padding: 0.15rem 0.4rem; }
+.mc-cards.is-compact .mc-card-title { font-size: 0.76rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mc-cards.is-compact .mc-card:not(.is-selected) .mc-card-objective { display: none; }
+.mc-cards.is-compact .mc-card-wait { -webkit-line-clamp: 1; font-size: 0.72rem; }
 
 /* Long item objectives read as three lines on a card; a selected card shows all. */
 .mc-card:not(.is-selected) .mc-card-objective {
@@ -2229,6 +2252,8 @@ body {
   margin: 0;
   padding: 0;
   min-width: 0;
+  /* A run with many revisions scrolls its chapters sideways instead of spilling out of the panel. */
+  overflow-x: auto;
 }
 
 .mc-chapter {

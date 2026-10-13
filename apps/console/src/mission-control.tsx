@@ -4,7 +4,6 @@ import {
   aggregateMessageEdges,
   boardCaptions,
   boardJumpTargets,
-  boardLayout,
   boardMessageFamily,
   boardNodePoint,
   boardThread,
@@ -47,6 +46,26 @@ import {
   type SuiteSeries,
 } from "./board-overlay";
 import { IDENTITY_VIEW, shouldZoomOnWheel, zoomAt, type ViewTransform } from "./graph-interactions";
+import {
+  BENCH_CHIP_H,
+  benchCounts,
+  benchLine,
+  COMPACT_DOT_R,
+  COMPACT_HULL_H,
+  COMPACT_NESTED_H,
+  COMPACT_MAX_AGENTS,
+  compactCards,
+  compactHullTitle,
+  laneCaption,
+  LANE_HEAD,
+  onBenchChip,
+  scaledBoardLayout,
+  scaledNodePoint,
+  shortList,
+  subLeadTeams,
+  type ScaledBoardLayout,
+  type SubLeadTeam,
+} from "./board-scale";
 import { chapters as runChapters, formatDuration, narrateAt, narrateMessage, type Chapter, type Narration } from "./narration";
 import { GRADE_INFO, gradeOf, type EvidenceGrade } from "./evidence";
 import { keyMoments, MOMENT_GROUPS, type MomentKind } from "./replay-data";
@@ -55,7 +74,8 @@ import { keyMoments, MOMENT_GROUPS, type MomentKind } from "./replay-data";
  * Mission control: the console view for a BOARD run (agents that form around
  * a goal). Everything on screen is a projection of the board log the console
  * holds: `buildBoardGraph(log, K)` for the graph, the board columns, the
- * ticker, and the threads, and `boardLayout(log)` (from the FULL log) for
+ * ticker, and the threads, and `scaledBoardLayout(log)` (from the FULL log: the
+ * orchestration `boardLayout` for a small board, lanes for a large one) for
  * positions, so the replay scrubber at seq K shows exactly what the board had
  * recorded at K, and nothing moves while scrubbing unless its state changed.
  *
@@ -330,14 +350,19 @@ export function Ticker({
   k,
   lastSeq,
   recorded = false,
+  teams = [],
 }: {
   ticker: BoardTicker;
   live: boolean;
   k: number;
   lastSeq: number;
   recorded?: boolean;
+  /** The sub-leads at K and their active agents (a compact breakdown beside the agent count). */
+  teams?: readonly SubLeadTeam[];
 }) {
   const rev = ticker.rev;
+  const teamLabel = (t: SubLeadTeam) => `${t.items.map((i) => agentShortLabel(i, 14)).join("+")} ${t.active}`;
+  const shownTeams = teams.slice(0, TICKER_MAX_TEAMS);
   const gateClass = !rev ? "" : !rev.gated ? "is-nogate" : rev.gate === "pass" ? "is-pass" : "is-fail";
   return (
     <div className="mc-ticker" aria-label="Ticker">
@@ -360,10 +385,19 @@ export function Ticker({
         <span className="mc-rev-chip">no integrated revision yet</span>
       )}
       {ticker.rebasing.length > 0 ? <span className="mc-rebasing">rebasing: {ticker.rebasing.join(", ")}</span> : null}
-      <span className="mc-agents">
+      <span className="mc-agents" title={`${ticker.agents.active} active of ${ticker.agents.joined} joined`}>
         {ticker.agents.active}/{ticker.agents.joined} agents
       </span>
-      <span className="mc-items">
+      {teams.length > 0 ? (
+        <span
+          className="mc-teams"
+          title={`active agents per sub-lead: ${teams.map((t) => `${t.agent} leads ${t.items.join(", ")} (${t.active} active)`).join("; ")}`}
+        >
+          sub-leads: {shownTeams.map(teamLabel).join(" · ")}
+          {teams.length > shownTeams.length ? ` · +${teams.length - shownTeams.length}` : ""}
+        </span>
+      ) : null}
+      <span className="mc-items" title="items on the board at this seq">
         {ticker.items.open} open, {ticker.items.claimed} claimed, {ticker.items.contested} contested, {ticker.items.done} done{ticker.items.proposed > 0 ? `, ${ticker.items.proposed} awaiting the lead` : ""}
       </span>
       <span className="mc-jev advisory">{ticker.jev.label}</span>
@@ -379,6 +413,9 @@ export function Ticker({
 // ---------------------------------------------------------------------------
 // Gate timeline and progress
 // ---------------------------------------------------------------------------
+
+/** The ticker names at most this many sub-leads, then a count. */
+const TICKER_MAX_TEAMS = 4;
 
 const GATE_WORD: Record<GateMarker["verdict"], string> = { pass: "PASS", fail: "FAIL", "no-gate": "NO GATE" };
 
@@ -825,6 +862,8 @@ export function BoardPane({
   charts?: ReactNode;
 }) {
   const byItem = new Map(model.nodes.filter((n) => n.kind === "item").map((n) => [n.label, n]));
+  // A large board's cards are compact (one line each; the objective shows on the selected card).
+  const compactList = compactCards(byItem.size);
   const short = boardShortLabels([...byItem.keys()], { seeds: seedItemIds(model) });
   const labels = log ? smartItemTitles(boardPrefix(log, model.k), short) : short;
   const columns: [string, readonly string[]][] = [
@@ -864,9 +903,11 @@ export function BoardPane({
               <details>
                 <summary>
                   {heading}
-                  <span className="mc-column-names">{ids.map((id) => labels.get(id) ?? id).join(", ")}</span>
+                  <span className="mc-column-names" title={ids.length > FOLDED_NAMES_MAX ? ids.map((id) => labels.get(id) ?? id).join(", ") : undefined}>
+                    {shortList(ids.map((id) => labels.get(id) ?? id), ids.length > FOLDED_NAMES_MAX ? FOLDED_NAMES_SHORT : FOLDED_NAMES_MAX)}
+                  </span>
                 </summary>
-                <ul className="mc-cards">
+                <ul className={`mc-cards${compactList ? " is-compact" : ""}`}>
                   {ids.map((id) => {
                     const node = byItem.get(id);
                     return node ? (
@@ -897,7 +938,7 @@ export function BoardPane({
                     ))
                   : null}
                 {ids.length === 0 && !(title === "CONTESTED" && cards.length > 0) ? <p className="muted mc-empty">none</p> : null}
-                <ul className="mc-cards">
+                <ul className={`mc-cards${compactList ? " is-compact" : ""}`}>
                   {ids.map((id) => {
                     const node = byItem.get(id);
                     return node ? (
@@ -923,6 +964,9 @@ export function BoardPane({
 
 /** A Board column with more items than this folds behind its heading. */
 const COLUMN_OPEN_MAX = 3;
+/** A folded column names all its items up to this many; a longer one names the first FOLDED_NAMES_SHORT, then a count. */
+const FOLDED_NAMES_MAX = 12;
+const FOLDED_NAMES_SHORT = 6;
 
 // ---------------------------------------------------------------------------
 // Graph
@@ -1162,7 +1206,8 @@ export function placeCaptions(
 
 export interface BoardGraphViewProps {
   readonly model: BoardGraphModel;
-  readonly layout: BoardLayout;
+  /** The orchestration layout, or the console's scaled layout of a large board (lanes, compact hulls, bench chip). */
+  readonly layout: BoardLayout | ScaledBoardLayout;
   readonly selection: BoardSelection | null;
   readonly log: readonly BoardMessage[];
   readonly messageMode: MessageMode;
@@ -1199,14 +1244,18 @@ export function textBoost(drawingScale: number): number {
  * curved arrows over the graph, derived from recorded messages, styled apart
  * from every graph edge.
  */
-export function BoardGraphView({ model, layout, selection, log, messageMode, recentSeqs, captions, onSelect, arrows = [], focusRev = null }: BoardGraphViewProps) {
+export function BoardGraphView({ model, layout: given, selection, log, messageMode, recentSeqs, captions, onSelect, arrows = [], focusRev = null }: BoardGraphViewProps) {
+  const layout: ScaledBoardLayout = "compact" in given ? given : { ...given, compact: false, lanes: [] };
+  const compact = layout.compact;
   const selected = selectedNodeId(selection, log);
   const stageRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [view, setView] = useState<ViewTransform>(IDENTITY_VIEW);
   const [stage, setStage] = useState<{ w: number; h: number } | null>(null);
   const drag = useRef<{ x: number; y: number; tx: number; ty: number; moved: boolean } | null>(null);
-  const extent = drawingExtent(layout);
+  const baseExtent = drawingExtent(layout);
+  // A scaled layout also holds its lanes and bench chip: the drawing spans its whole size.
+  const extent = compact ? { width: Math.max(baseExtent.width, layout.width), height: Math.max(baseExtent.height, layout.height) } : baseExtent;
   const vbW = extent.width + 2 * FIT_PAD;
   const vbH = extent.height + 2 * FIT_PAD;
 
@@ -1253,13 +1302,25 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
     onSelect(next);
   };
 
-  // Collapse a hull past HULL_MAX_AGENTS unless it is selected or contested.
+  // Collapse a hull past HULL_MAX_AGENTS (COMPACT_MAX_AGENTS on a large board) unless it is selected or contested.
+  const maxAgents = compact ? COMPACT_MAX_AGENTS : HULL_MAX_AGENTS;
   const collapsed = new Set<string>();
   for (const node of model.nodes) {
-    if (node.detail.kind === "item" && node.detail.agents.length > HULL_MAX_AGENTS && selected !== node.id && !node.detail.contested) {
+    if (node.detail.kind === "item" && node.detail.agents.length > maxAgents && selected !== node.id && !node.detail.contested) {
       collapsed.add(node.detail.item);
     }
   }
+  // A large board's free agents are one chip with counts, not a dot each.
+  const bench = compact ? benchCounts(model) : { idle: [], left: [] };
+  const benchSelected = compact && selection?.kind === "agent" && (bench.idle.includes(selection.id) || bench.left.includes(selection.id));
+  // The chip grows with its line at the current text boost (it never cuts the counts).
+  const benchW = layout.benchChip
+    ? Math.max(layout.benchChip.w, Math.ceil(benchLine(bench.idle.length, bench.left.length).length * 13 * boost * CHAR_EM) + 36)
+    : 0;
+  // A large board's hull titles drop what their lane or parent hull already says.
+  const laneOfItem = new Map<string, string>(layout.lanes.flatMap((lane) => lane.items.map((item): [string, string] => [item, lane.key])));
+  const itemAgents = new Map<string, readonly string[]>();
+  for (const node of model.nodes) if (node.detail.kind === "item") itemAgents.set(node.detail.item, node.detail.agents);
   // The revision drawn now (only while focused), at its anchor above the hulls.
   const focusNode = focusRev !== null ? model.nodes.find((n) => n.id === `rev:${focusRev}`) : undefined;
   const revAnchor = { x: extent.width - 34, y: REV_ANCHOR_Y };
@@ -1270,7 +1331,7 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
       continue;
     }
     if (node.kind === "jev") continue;
-    const p = boardNodePoint(layout, node);
+    const p = compact ? scaledNodePoint(layout, node, model) : boardNodePoint(layout, node);
     if (!p) continue;
     if (node.detail.kind === "agent" && node.detail.hull !== undefined && collapsed.has(node.detail.hull)) {
       // A collapsed hull bundles its agents' edges at the hull center.
@@ -1295,6 +1356,11 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
     if (e.kind === "message") return false;
     if (onRevOrJev(e.from) || onRevOrJev(e.to)) return false;
     if (e.kind !== "dependency") return true;
+    // A large board draws a split item's children INSIDE its hull: the nesting is the link (split, merged), so the line is hidden.
+    if (compact && e.from.startsWith("item:") && e.to.startsWith("item:")) {
+      const [a, b] = [e.from.slice(5), e.to.slice(5)];
+      if (layout.items.get(a)?.parent === b || layout.items.get(b)?.parent === a) return false;
+    }
     const related = selected !== null && (e.from === selected || e.to === selected);
     if (e.from === "goal") return related;
     return true;
@@ -1365,8 +1431,30 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
           </marker>
         </defs>
         <g transform={`translate(${view.tx}, ${view.ty}) scale(${view.k})`}>
+          {/* Lanes (a large board): items grouped by sub-lead or domain; drawn only once one of their items exists at K. */}
+          {layout.lanes.length > 0 ? (
+            <g className="mc-lanes">
+              {layout.lanes.map((lane) => {
+                const caption = laneCaption(lane, model);
+                if (!caption) return null;
+                const titleText = ellipsizeToWidth(caption.title, lane.w * 0.45, 13 * boost);
+                return (
+                  <g key={lane.key} className="mc-lane">
+                    <rect x={lane.x} y={lane.y} width={lane.w} height={lane.h} rx={12} />
+                    <text className="mc-lane-title" x={lane.x + 10} y={lane.y + LANE_HEAD - 8}>
+                      {titleText}
+                    </text>
+                    <text className="mc-lane-detail" x={lane.x + lane.w - 10} y={lane.y + LANE_HEAD - 8} textAnchor="end">
+                      {ellipsizeToWidth(caption.detail, lane.w - 30 - titleText.length * 13 * boost * 0.62, 11 * boost)}
+                    </text>
+                    <title>{`${caption.title}: ${caption.detail}${caption.subLeads.length > 0 ? `, sub-lead ${caption.subLeads.join(", ")}` : ""} (${lane.items.length} top-level item(s))`}</title>
+                  </g>
+                );
+              })}
+            </g>
+          ) : null}
           {/* Item hulls. */}
-          <g className="mc-hulls">
+          <g className={`mc-hulls${compact ? " is-compact" : ""}`}>
             {model.nodes
               .filter((n) => n.kind === "item")
               .map((node) => {
@@ -1376,7 +1464,10 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                 if (!rect) return null;
                 const isSel = selected === node.id;
                 const statusText = `${node.status}${d.fixRequested !== undefined ? ` / fix ${d.fixAttempts}` : ""}`;
-                const header = hullHeader({ title: itemLabels.get(d.item) ?? d.item, status: statusText, width: rect.w, boost });
+                const title = itemLabels.get(d.item) ?? d.item;
+                const header = hullHeader({ title: compact ? compactHullTitle(d.item, title, rect.parent ?? laneOfItem.get(d.item)) : title, status: statusText, width: rect.w, boost });
+                // The done check and the struggling mark sit at the bottom of the hull; a compact hull keeps them in its own band (above any nested child).
+                const markBottom = compact ? rect.y + (rect.parent !== undefined ? COMPACT_NESTED_H : COMPACT_HULL_H) : rect.y + rect.h;
                 const inFocus = focusNode?.detail.kind === "rev" ? revLinks.some((e) => e.from === node.id || e.to === node.id) : false;
                 return (
                   <g
@@ -1406,31 +1497,43 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                       </>
                     ) : null}
                     {d.completed !== undefined ? (
-                      <circle className="mc-check is-filled" cx={rect.x + rect.w - 22} cy={rect.y + rect.h - 22} r={11} />
+                      <circle className="mc-check is-filled" cx={rect.x + rect.w - 22} cy={markBottom - 22} r={11} />
                     ) : d.doneProposed ? (
-                      <circle className="mc-check is-hollow" cx={rect.x + rect.w - 22} cy={rect.y + rect.h - 22} r={11} />
+                      <circle className="mc-check is-hollow" cx={rect.x + rect.w - 22} cy={markBottom - 22} r={11} />
                     ) : null}
                     {d.completed !== undefined || d.doneProposed ? (
-                      <text className="mc-check-mark" x={rect.x + rect.w - 22} y={rect.y + rect.h - 17} textAnchor="middle">
+                      <text className="mc-check-mark" x={rect.x + rect.w - 22} y={markBottom - 17} textAnchor="middle">
                         {"✓"}
                       </text>
                     ) : null}
                     {d.struggling !== undefined ? (
+                      // A compact hull's dot row runs along its left: the mark sits left of the done check instead.
                       <g className="mc-struggling">
-                        <circle cx={rect.x + 18} cy={rect.y + rect.h - 20} r={10} />
-                        <text x={rect.x + 18} y={rect.y + rect.h - 15} textAnchor="middle">
+                        <circle cx={compact ? rect.x + rect.w - 48 : rect.x + 18} cy={markBottom - 20} r={10} />
+                        <text x={compact ? rect.x + rect.w - 48 : rect.x + 18} y={markBottom - 15} textAnchor="middle">
                           !
                         </text>
                         <title>{`struggling (${d.struggling.reason}, ${d.struggling.turnsSpent} turn(s)): idle agents may volunteer (seq ${d.struggling.seq}, item.struggling)`}</title>
                       </g>
                     ) : null}
-                    {d.volunteers !== undefined && d.volunteers.length > 0 ? (
-                      <text className="mc-volunteers" x={rect.x + 34} y={rect.y + rect.h - 15}>
-                        {d.volunteers.map((v) => `${v.agent}${v.answer ? ` (${v.answer})` : " offered"}`).join(", ")}
-                      </text>
+                    {d.volunteers !== undefined && d.volunteers.length > 0 && !(compact && collapsed.has(d.item)) ? (
+                      // One line inside the hull (a long list is cut), the full list in the title.
+                      <g className="mc-volunteers-line">
+                        <text className="mc-volunteers" x={compact ? rect.x + 12 : rect.x + 34} y={rect.y + rect.h - (compact ? 6 : 15)}>
+                          {compact
+                            ? ellipsizeToWidth(`${d.volunteers.length} offer${d.volunteers.length === 1 ? "" : "s"}`, rect.w - 70, 11 * boost)
+                            : ellipsizeToWidth(d.volunteers.map((v) => `${v.agent}${v.answer ? ` (${v.answer})` : " offered"}`).join(", "), rect.w - 34 - 40, 11 * boost)}
+                        </text>
+                        <title>{`volunteers: ${d.volunteers.map((v) => `${v.agent}${v.answer ? ` (${v.answer})` : " offered"}`).join(", ")}`}</title>
+                      </g>
                     ) : null}
                     {collapsed.has(d.item) ? (
-                      <text className="mc-hull-count" x={rect.x + rect.w / 2} y={rect.y + rect.h / 2 + 12} textAnchor="middle">
+                      <text
+                        className="mc-hull-count"
+                        x={compact ? rect.x + 12 : rect.x + rect.w / 2}
+                        y={compact ? rect.y + (rect.parent !== undefined ? 50 : 54) + 5 : rect.y + rect.h / 2 + 12}
+                        textAnchor={compact ? "start" : "middle"}
+                      >
                         {d.agents.length} agents
                       </text>
                     ) : null}
@@ -1454,7 +1557,8 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                   onClick={() => selectEdge(edge)}
                 >
                   <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} />
-                  {edge.label ? (
+                  {/* A large board nests a split item's children inside it: the "merged" tag would only repeat that. */}
+                  {edge.label && !(compact && edge.label === "merged") ? (
                     <text className="mc-edge-tag" x={(a.x + b.x) / 2} y={(a.y + b.y) / 2 - 4} textAnchor="middle">
                       {edge.label}
                     </text>
@@ -1531,7 +1635,20 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                 if (node.detail.kind === "agent" && node.detail.hull !== undefined && collapsed.has(node.detail.hull)) {
                   return null;
                 }
+                // A large board's free agents are counted on the bench chip, not drawn one by one.
+                if (onBenchChip(layout, node)) return null;
                 const isSel = selected === node.id;
+                const inHull = compact && node.detail.kind === "agent" && node.kind !== "lead" && node.detail.hull !== undefined ? layout.items.get(node.detail.hull) : undefined;
+                // In a compact hull only the first dot (or the sub-lead) is labelled, to its right, cut to the hull.
+                const hullAgents = inHull && node.detail.kind === "agent" ? itemAgents.get(node.detail.hull!) ?? [] : [];
+                const compactLabel =
+                  inHull && node.detail.kind === "agent" && (hullAgents[0] === node.detail.agent || node.detail.subLeadOf?.includes(node.detail.hull!))
+                    ? ellipsizeToWidth(
+                        `${agentShortLabel(node.label)}${node.detail.subLeadOf?.includes(node.detail.hull!) ? " (sub-lead)" : hullAgents.length > 1 ? ` +${hullAgents.length - 1}` : ""}`,
+                        inHull.x + inHull.w - p.x - 14 - 60 - (hullAgents.length - 1) * 24,
+                        11 * boost,
+                      )
+                    : null;
                 return (
                   <g
                     key={node.id}
@@ -1544,12 +1661,47 @@ export function BoardGraphView({ model, layout, selection, log, messageMode, rec
                       choose(node.detail.kind === "agent" ? { kind: "agent", id: node.detail.agent } : { kind: "node", id: node.id })
                     }
                   >
-                    <NodeShape node={node} />
-                    <NodeLabel node={node} boost={boost} />
+                    {inHull ? (
+                      <>
+                        <circle className="shape" r={COMPACT_DOT_R} />
+                        {compactLabel ? (
+                          <text className="mc-node-label is-compact" textAnchor="start" x={COMPACT_DOT_R + 4 + (node.detail.kind === "agent" && !node.detail.subLeadOf?.includes(node.detail.hull!) ? (hullAgents.length - 1) * 24 : 0)} y={4}>
+                            {compactLabel}
+                          </text>
+                        ) : null}
+                      </>
+                    ) : (
+                      <>
+                        <NodeShape node={node} />
+                        <NodeLabel node={node} boost={boost} />
+                      </>
+                    )}
                     <title>{node.tooltip}</title>
                   </g>
                 );
               })}
+            {layout.benchChip && bench.idle.length + bench.left.length > 0 ? (
+              <g
+                className={`mc-bench-chip${benchSelected ? " is-selected" : ""}`}
+                role="button"
+                tabIndex={0}
+                aria-label={`bench: ${bench.idle.length} idle, ${bench.left.length} left`}
+                onClick={() => {
+                  const first = bench.idle[0] ?? bench.left[0];
+                  if (first !== undefined) choose({ kind: "agent", id: first });
+                }}
+              >
+                <rect x={layout.benchChip.x} y={layout.benchChip.y} width={benchW} height={BENCH_CHIP_H} rx={BENCH_CHIP_H / 2} />
+                <text x={layout.benchChip.x + 16} y={layout.benchChip.y + BENCH_CHIP_H / 2 + 5}>
+                  {ellipsizeToWidth(
+                    benchLine(bench.idle.length, bench.left.length),
+                    benchW - 32,
+                    13 * boost,
+                  )}
+                </text>
+                <title>{`Agents holding no item at seq ${model.k}. Idle: ${shortList(bench.idle, 12) || "none"}. Left the board: ${shortList(bench.left, 12) || "none"}.`}</title>
+              </g>
+            ) : null}
           </g>
 
           {/* The communication overlay: who addressed whom in the last few seqs (an annotation, not a graph edge). */}
@@ -2412,7 +2564,7 @@ export function MissionControl({
 
   // Every projection of the log is guarded: a message the fold cannot read refuses the view at
   // that seq (with the replay controls kept), never a blank page.
-  const layoutResult = useMemo(() => attempt(() => boardLayout(log)), [log]);
+  const layoutResult = useMemo(() => attempt(() => scaledBoardLayout(log)), [log]);
   // Previews whose commit matches the log's integrated.rev of the same number (no unbacked link).
   const backed = useMemo(() => backedPreviews(log, previews ?? []), [log, previews]);
   const layout = layoutResult.value;
@@ -2578,7 +2730,7 @@ export function MissionControl({
             onSelectSeq={selectSeqInThread}
             preview={narratedPreview && narratedMarker ? { preview: narratedPreview, gate: GATE_WORD[narratedMarker.verdict] } : undefined}
           />
-          <Ticker ticker={model.ticker} live={live} k={k} lastSeq={lastSeq} recorded={recorded} />
+          <Ticker ticker={model.ticker} live={live} k={k} lastSeq={lastSeq} recorded={recorded} teams={subLeadTeams(model)} />
         </div>
         <div className="mc-timeline-story">
           <ChapterStrip
