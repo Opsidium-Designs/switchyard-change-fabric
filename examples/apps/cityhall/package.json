@@ -1,0 +1,19 @@
+{
+  "name": "switchyard-change-fabric-cityhall",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A city-services Worker API (permits, parking, utilities, licensing, records, transit, parks, housing) of 32 small route modules over shared money, time, validate, auth, and http contracts, with planted gaps in every module and in three shared seams.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "gate": "npm run typecheck && vitest run && vitest run --config gate/vitest.config.ts"
+  },
+  "devDependencies": {
+    "typescript": "5.7.2",
+    "vitest": "2.1.8"
+  }
+}

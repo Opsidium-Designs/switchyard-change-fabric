@@ -1,0 +1,11 @@
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "switchyard-change-fabric-cityhall",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-09-23",
+  "workers_dev": true,
+  "preview_urls": true,
+  "observability": {
+    "enabled": true
+  }
+}
