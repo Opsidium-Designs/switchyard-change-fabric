@@ -181,6 +181,15 @@ export function formatCost(detail: {
 }
 
 /**
+ * The change id named by ?watch= (a run started from the CLI, followed
+ * read-only), or null when absent or not a well-formed change id.
+ */
+export function watchedChangeId(search: string): string | null {
+  const id = new URLSearchParams(search).get("watch");
+  return id !== null && /^change-[a-z0-9-]{1,64}$/.test(id) ? id : null;
+}
+
+/**
  * Whether a Change is a BOARD run: launched as one, or its snapshot reports a
  * board with messages (a run-live Change's board stays empty).
  */
@@ -193,9 +202,10 @@ export function isBoardRun(runMode: LaunchMode | null, snapshot: unknown): boole
 }
 
 export function App() {
-  // No change-id box and no ?change= reliance: the console follows the UNIQUE id
-  // the launcher hands back when a template is launched. Null means no run yet.
-  const [changeId, setChangeId] = useState<string | null>(null);
+  // No change-id box: the console follows the UNIQUE id the launcher hands back
+  // when a template is launched. Null means no run yet. A run started from the
+  // CLI can be followed read-only with ?watch=<change id>.
+  const [changeId, setChangeId] = useState<string | null>(() => watchedChangeId(typeof window === "undefined" ? "" : window.location.search));
   const [activeTemplate, setActiveTemplate] = useState<Template | null>(null);
   const [templates, setTemplates] = useState<readonly Template[]>(TEMPLATES);
   const [snapshot, setSnapshot] = useState<ChangeStateSnapshot | null>(null);
@@ -222,7 +232,7 @@ export function App() {
   const [deployedUrls, setDeployedUrls] = useState<Record<string, string>>({});
   // The template gallery collapses to a one-line strip while a run is active so
   // the graph sits near the top of the page.
-  const [galleryOpen, setGalleryOpen] = useState(true);
+  const [galleryOpen, setGalleryOpen] = useState(() => watchedChangeId(typeof window === "undefined" ? "" : window.location.search) === null);
   // The launch mode for the NEXT launch (run-live, or agents on the board) and,
   // for a board run, who answers contract decisions. The active run's mode is
   // kept separately so the view follows what was actually launched.
