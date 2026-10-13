@@ -12,6 +12,8 @@
 import { reduceBoard } from "@switchyard-change/orchestration/board-graph";
 import type { BoardMessage } from "@switchyard-change/orchestration/board-graph";
 
+import { isPreviewUrl } from "./previews.ts";
+
 type FetchFn = (input: string, init?: RequestInit) => Promise<Response>;
 
 export const REPLAY_FORMAT = "switchyard-replay/v1";
@@ -27,6 +29,83 @@ export interface ReplayIndexEntry {
   readonly messages?: number;
   /** A simulated run: the real engine offline with scripted agents (see SIMULATED_CHIP). */
   readonly simulated?: boolean;
+  /** The app to try: the original and (for a passing run) the fixed code (see readShowcaseApps). */
+  readonly apps?: ShowcaseApps;
+}
+
+// ---------------------------------------------------------------------------
+// "Try the app": the original and the run-fixed code, live
+// ---------------------------------------------------------------------------
+
+/** The original (broken) app, as the repo holds it. */
+export interface ShowcaseBefore {
+  readonly url: string;
+  /** The repo commit the original was uploaded from, or "original". */
+  readonly commit: string;
+}
+
+/** The app as this run fixed it: the exact promoted commit of its passing revision. */
+export interface ShowcaseAfter {
+  readonly url: string;
+  readonly commit: string;
+  /** The run this fixed code belongs to (always the entry's own id). */
+  readonly run: string;
+  /** The passing revision's number, when recorded. */
+  readonly rev?: number;
+}
+
+export interface ShowcaseApps {
+  readonly before?: ShowcaseBefore;
+  readonly after?: ShowcaseAfter;
+}
+
+const COMMIT_ID = /^[0-9a-f]{7,64}$/i;
+
+/**
+ * The well-formed `apps` of an index entry, or undefined. Each link must be an
+ * https workers.dev URL with no credentials (the same rule as revision
+ * previews); `after` must name this run and a commit id, so a fixed link is
+ * never shown on a run it does not belong to. A malformed half is dropped.
+ */
+export function readShowcaseApps(raw: unknown, runId: string): ShowcaseApps | undefined {
+  if (raw === null || typeof raw !== "object") return undefined;
+  const r = raw as { before?: unknown; after?: unknown };
+  const b = r.before as { url?: unknown; commit?: unknown } | null | undefined;
+  const before =
+    b !== null && typeof b === "object" && isPreviewUrl(b.url) && typeof b.commit === "string" && (b.commit === "original" || COMMIT_ID.test(b.commit))
+      ? { url: b.url, commit: b.commit }
+      : undefined;
+  const a = r.after as { url?: unknown; commit?: unknown; run?: unknown; rev?: unknown } | null | undefined;
+  const after =
+    a !== null && typeof a === "object" && isPreviewUrl(a.url) && typeof a.commit === "string" && COMMIT_ID.test(a.commit) && a.run === runId
+      ? { url: a.url, commit: a.commit, run: runId, ...(typeof a.rev === "number" && Number.isInteger(a.rev) && a.rev > 0 ? { rev: a.rev } : {}) }
+      : undefined;
+  if (before === undefined && after === undefined) return undefined;
+  return { ...(before ? { before } : {}), ...(after ? { after } : {}) };
+}
+
+/** What to try on each example app's home page (from the app's README), and where to land. */
+export const SHOWCASE_HINTS: Readonly<Record<string, { readonly text: string; readonly hash?: string }>> = {
+  storefront: {
+    text: "Each link opens the store with its health checks running: about 1 of 16 pass on the original and 16 of 16 after a correct fix. Also try an overpayment or an over-refund in the payments panel.",
+    hash: "#run-checks",
+  },
+  "service-api": {
+    text: "Press Run all checks on the home page: 6 of 18 checks are secure on the original and 18 of 18 after a correct fix.",
+  },
+  cityhall: {
+    text: "The home page runs 46 checks on load: about 1 of 46 pass on the original and 46 of 46 after a correct fix.",
+  },
+};
+
+/** The note every showcase carries: what the original is, and that no real data is held. */
+export const SHOWCASE_NOTE =
+  "The original is deliberately broken (for example no auth on writes, wrong money math), but it holds only demo data, in memory per isolate.";
+
+/** A showcase link with the app's landing hash (the stored URL is already validated). */
+export function showcaseHref(url: string, app: string): string {
+  const hash = SHOWCASE_HINTS[app]?.hash;
+  return hash !== undefined ? `${url.replace(/#.*$/, "")}${hash}` : url;
 }
 
 /** The label a simulated run carries everywhere a viewer sees it. */
@@ -72,10 +151,17 @@ export async function loadReplayIndex(fetchFn: FetchFn): Promise<ReplayIndexEntr
   if (!res.ok) throw new Error(`could not load the replay index (${res.status})`);
   const body = (await res.json()) as { runs?: unknown };
   if (!Array.isArray(body.runs)) throw new Error("the replay index has no runs");
-  return body.runs.filter(
-    (r): r is ReplayIndexEntry =>
-      r !== null && typeof r === "object" && typeof (r as ReplayIndexEntry).id === "string" && typeof (r as ReplayIndexEntry).title === "string",
-  );
+  return body.runs
+    .filter(
+      (r): r is ReplayIndexEntry =>
+        r !== null && typeof r === "object" && typeof (r as ReplayIndexEntry).id === "string" && typeof (r as ReplayIndexEntry).title === "string",
+    )
+    .map((r) => {
+      // Only well-formed app links are kept (see readShowcaseApps).
+      const { apps: raw, ...rest } = r as ReplayIndexEntry & { apps?: unknown };
+      const apps = readShowcaseApps(raw, r.id);
+      return apps !== undefined ? { ...rest, apps } : rest;
+    });
 }
 
 /** The prefix of the error a recorded run that the board reducer refuses fails with. */

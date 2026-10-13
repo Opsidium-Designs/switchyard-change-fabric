@@ -21,7 +21,7 @@ export interface RevisionPreview {
 }
 
 /** A preview URL must be an https workers.dev URL with no credentials in it. */
-function isPreviewUrl(value: unknown): value is string {
+export function isPreviewUrl(value: unknown): value is string {
   if (typeof value !== "string") return false;
   try {
     const u = new URL(value);

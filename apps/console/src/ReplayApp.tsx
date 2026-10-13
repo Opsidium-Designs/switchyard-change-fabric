@@ -9,6 +9,9 @@ import {
   loadReplayIndex,
   parseReplayParams,
   replaySearch,
+  SHOWCASE_HINTS,
+  SHOWCASE_NOTE,
+  showcaseHref,
   SIMULATED_CHIP,
   SIMULATED_EXPLAIN,
   type FinalVerdict,
@@ -157,6 +160,7 @@ export function ReplayApp() {
                 )}
               </>
             ) : null}
+            {entry ? <TryTheApp entry={entry} /> : null}
             {runError ? <p className="error">{runError}</p> : null}
             {!run && !runError ? <p className="muted">Loading the recorded board log...</p> : null}
           </section>
@@ -286,6 +290,58 @@ function ReadingGuide() {
   );
 }
 
+/**
+ * "Try the app": the example app live in two versions, the ORIGINAL (broken)
+ * code and the code this run FIXED (the exact promoted commit of its passing
+ * revision), each a Worker version opened in a new tab. Shown only when the
+ * index records validated links for this run; a failed run may have only the
+ * original. `compact` is the run picker card's small form.
+ */
+export function TryTheApp({ entry, compact = false }: { entry: ReplayIndexEntry; compact?: boolean }) {
+  const before = entry.apps?.before;
+  const after = entry.apps?.after?.run === entry.id ? entry.apps.after : undefined;
+  if (before === undefined && after === undefined) return null;
+  const revText = after?.rev !== undefined ? ` (revision ${after.rev})` : "";
+  const beforeTitle = `The original ${entry.app} code${before && before.commit !== "original" ? ` (repo commit ${before.commit.slice(0, 10)})` : ""}, running live. Opens in a new tab.`;
+  const afterTitle = after
+    ? `The ${entry.app} code this run promoted${revText} (commit ${after.commit.slice(0, 10)}), running live. Opens in a new tab. The app is only a look; the gate decided the verdict.`
+    : "";
+  const link = (url: string, className: string, title: string, label: string) => (
+    <a className={className} href={showcaseHref(url, entry.app)} target="_blank" rel="noopener noreferrer" title={title}>
+      {label} ↗
+    </a>
+  );
+  if (compact) {
+    return (
+      <p className="replay-card-try">
+        <span>Try the app:</span>
+        {before ? link(before.url, "is-before", beforeTitle, "original") : null}
+        {after ? link(after.url, "is-after", afterTitle, `fixed${revText}`) : null}
+      </p>
+    );
+  }
+  const hint = SHOWCASE_HINTS[entry.app]?.text;
+  return (
+    <div className="replay-try" role="group" aria-label="Try the app">
+      <span className="replay-label">Try the app</span>
+      <span className="replay-try-links">
+        {before ? link(before.url, "replay-try-link is-before", beforeTitle, "Original (before the run)") : null}
+        {after ? (
+          link(after.url, "replay-try-link is-after", afterTitle, `Fixed by this run${revText}`)
+        ) : (
+          <span className="replay-try-none">
+            {entry.outcome === "verified" ? "No fixed version is published for this run." : "No fixed version: this run promoted nothing."}
+          </span>
+        )}
+      </span>
+      <p className="replay-try-hint">
+        {hint !== undefined ? `${hint} ` : ""}
+        {SHOWCASE_NOTE}
+      </p>
+    </div>
+  );
+}
+
 export function RunPicker({
   runs,
   error,
@@ -334,6 +390,7 @@ export function RunPicker({
             {r.simulated === true ? <SimulatedChip /> : null}
             <h3>{r.title}</h3>
             <p className="replay-card-desc">{r.description}</p>
+            <TryTheApp entry={r} compact />
             <div className="replay-card-foot">
               {r.messages !== undefined ? <span className="muted">{r.messages} board messages</span> : <span />}
               <a

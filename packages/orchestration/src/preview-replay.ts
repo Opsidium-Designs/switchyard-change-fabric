@@ -90,7 +90,16 @@ export async function commitExists(repoDir: string, commit: string): Promise<boo
 
 /** The Worker `name` declared in a wrangler.jsonc / wrangler.json text (comments allowed). */
 export function wranglerConfigName(text: string): string | undefined {
-  // Drop comments outside strings, then read the top-level "name".
+  const parsed = parseWranglerConfig(text);
+  return typeof parsed?.name === "string" ? parsed.name : undefined;
+}
+
+/**
+ * A wrangler.jsonc / wrangler.json text parsed as an object (comments outside
+ * strings and trailing commas allowed), or undefined when it is not one.
+ */
+export function parseWranglerConfig(text: string): Record<string, unknown> | undefined {
+  // Drop comments outside strings, then parse.
   let out = "";
   let inString = false;
   for (let i = 0; i < text.length; i += 1) {
@@ -124,8 +133,8 @@ export function wranglerConfigName(text: string): string | undefined {
     }
   }
   try {
-    const parsed = JSON.parse(out.replace(/,(\s*[}\]])/g, "$1")) as { name?: unknown };
-    return typeof parsed.name === "string" ? parsed.name : undefined;
+    const parsed: unknown = JSON.parse(out.replace(/,(\s*[}\]])/g, "$1"));
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined;
   } catch {
     return undefined;
   }

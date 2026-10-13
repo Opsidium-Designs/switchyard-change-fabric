@@ -36,6 +36,9 @@
 #   make replay-preview  serve the replay build locally (REPLAY_PORT, default 4180)
 #   make deploy-replay   deploy the replay page as Workers static assets (a REAL deploy: confirm first)
 #   make delete-replay   delete that deployed replay page
+#   make showcase APP=<app> FIXED=<git dir or bundle>[@ref] RUN=<replay id> [DRY_RUN=1]  publish the original and run-fixed app for the replay page's "Try the app" (a REAL deploy unless DRY_RUN)
+#   make showcase APP=<app> BEFORE_ONLY=1 [RUN='<id> ...'] [DRY_RUN=1]  publish only the original (a run with no fixed code)
+#   make showcase-down APP=<app>  delete that showcase Worker (switchyard-showcase-<app>; infra-down leaves it)
 #   make infra-up      spin the hosted Cloudflare infra up (deploy + queue + subscription), idempotent
 #   make infra-status  read-only: what is live right now (am I paying for anything?)
 #   make infra-down    spin the hosted Cloudflare infra down (delete worker + queue + subscription + repos), idempotent
@@ -46,7 +49,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: export-replay preview-replay replay-build replay-preview deploy-replay delete-replay jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-board-cityhall run-board-cityhall cityhall-gate cityhall-reference-check demo-board-scale demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: export-replay preview-replay replay-build replay-preview deploy-replay delete-replay showcase showcase-down jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-board-cityhall run-board-cityhall cityhall-gate cityhall-reference-check demo-board-scale demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -576,6 +579,44 @@ deploy-replay: replay-build
 delete-replay:
 	set -a; [ -f .env ] && . ./.env; set +a; \
 	name=$$(sed -nE 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' apps/console/wrangler.replay.jsonc | head -1); \
+	echo "Deleting Worker $$name ..."; \
+	curl -sS -X DELETE \
+	  "https://api.cloudflare.com/client/v4/accounts/$$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$$name?force=true" \
+	  -H "Authorization: Bearer $$CLOUDFLARE_API_TOKEN" | \
+	  grep -qE '"success"[[:space:]]*:[[:space:]]*true|does not exist' \
+	  && echo "Teardown complete: $$name is not deployed." \
+	  || { echo "Teardown may have failed; check the account."; exit 1; }
+
+# --- "Try the app" on the replay page: the original vs. the run-fixed code ---
+
+# Publish an example app in two versions on ONE Worker, switchyard-showcase-<APP>
+# (deliberately outside the switchyard-change-fabric-* names `make infra-down`
+# deletes, so the public demo survives an infra teardown). The production deploy
+# and the `before` preview alias serve examples/apps/<APP> at the repo's HEAD
+# commit (the original, deliberately broken code); the `after-<run>-r<n>` alias
+# serves FIXED=<git dir or bundle>[@ref], which must provably be the passing
+# revision of RUN=<replay id> (the gated tree, else the promoted commit the
+# replay records), or nothing is uploaded. The links are written into
+# apps/console/public/replays/index.json; rebuild and redeploy the replay page
+# to publish them. BEFORE_ONLY=1 publishes the original alone (RUN may then
+# list several ids, space separated, e.g. a failed run). A REAL deploy on the
+# account in .env (the CLI reads CLOUDFLARE_* into memory and passes them only
+# to wrangler): confirm first. DRY_RUN=1 prints the exact commands and touches
+# nothing. Remove it with `make showcase-down APP=<app>`. See docs/REPLAY.md.
+FIXED ?=
+RUN ?=
+showcase:
+	@test "$(origin APP)" != "file" && test -n "$(RUN)$(BEFORE_ONLY)" && { test -n "$(FIXED)" || test -n "$(BEFORE_ONLY)"; } || { echo "usage: make showcase APP=<app> FIXED=<git dir or bundle>[@ref] RUN=<replay id> [DRY_RUN=1]  |  make showcase APP=<app> BEFORE_ONLY=1 [RUN='<id> ...'] [DRY_RUN=1]"; exit 2; }
+	npm -w apps/cli run dev -- showcase-app --app "$(APP)" $(if $(FIXED),--fixed "$(abspath $(FIXED))",) $(foreach r,$(RUN),--run "$(r)") $(if $(BEFORE_ONLY),--before-only,) $(if $(DRY_RUN),--dry-run,)
+
+# Delete an app's showcase Worker (both versions and its production URL) over
+# the Cloudflare REST API, like delete-app. Idempotent: already gone is success.
+# The replay index keeps its links until you remove the `apps` field (or
+# re-export the run); they then lead nowhere.
+showcase-down:
+	@test "$(origin APP)" != "file" || { echo "usage: make showcase-down APP=<app>"; exit 2; }
+	set -a; [ -f .env ] && . ./.env; set +a; \
+	name="switchyard-showcase-$(APP)"; \
 	echo "Deleting Worker $$name ..."; \
 	curl -sS -X DELETE \
 	  "https://api.cloudflare.com/client/v4/accounts/$$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$$name?force=true" \
