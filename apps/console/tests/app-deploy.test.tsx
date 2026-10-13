@@ -2,7 +2,7 @@
  * Deploying and removing the example apps from the console, offline (no
  * browser, no network, no wrangler: every spawned CLI is a fake child):
  *   - the cityhall template and the run-board args it launches with (the
- *     Makefile's CH_* dial and budget flags, previews only when deployed);
+ *     Makefile's CH_* agent counts and budget flags, previews only when deployed);
  *   - the launcher's deploy-app / teardown-app endpoints: only template apps,
  *     the exact CLI commands, no credential in the spawned environment, and
  *     the CLI's own error on a failure;
@@ -22,7 +22,6 @@ import type { BoardMessage } from "@switchyard-change/orchestration/board-graph"
 import {
   deployAppArgs,
   deployAppRequest,
-  dialFromBody,
   knownAppFromBody,
   launchArgs,
   runBoardArgs,
@@ -40,7 +39,7 @@ import {
   tearDownConfirmText,
 } from "../src/App.tsx";
 import { latestPassingPreview, type RevisionPreview } from "../src/previews.ts";
-import { boardCapable, DEFAULT_DIAL_LIMIT, dialLimitOf, TEMPLATES, templateApps, templateById } from "../src/templates.ts";
+import { boardCapable, TEMPLATES, templateApps, templateById } from "../src/templates.ts";
 
 /** A fake `spawn`: records each call, then emits the given output and exit code. */
 function fakeSpawn(result: { code: number | null; stdout?: string; stderr?: string; error?: string }) {
@@ -72,7 +71,7 @@ describe("the cityhall template", () => {
     expect(cityhall.projectDir).toBe("examples/apps/cityhall");
     expect(cityhall.source).toEqual({ kind: "goal", goalFile: "examples/goals/cityhall-services-correct.goal.txt" });
     expect(boardCapable(cityhall)).toBe(true);
-    expect(cityhall.agentCountHint).toBe("about 8 to 30 agents");
+    expect(cityhall.agents.board).toEqual({ min: 8, max: 30 });
     expect(cityhall.whatItDoes).toContain("32 modules across 8 city departments");
     for (const dept of ["utilities", "parking", "housing", "licensing", "parks", "records", "transit", "permits"]) {
       expect(cityhall.whatItDoes).toContain(dept);
@@ -83,9 +82,7 @@ describe("the cityhall template", () => {
   });
 
   it("launches run-board with the Makefile's CH_* budget flags and the app's stable worker", () => {
-    const dial = dialFromBody({ min: 8, max: 30 }, dialLimitOf(cityhall, "board"));
-    expect(dial).toEqual({ min: 8, max: 30 });
-    const args = runBoardArgs(cityhall, "console-cityhall-x", dial, "console");
+    const args = runBoardArgs(cityhall, "console-cityhall-x", "console");
     const flag = (name: string) => args[args.indexOf(name) + 1];
     expect(args.slice(0, 6)).toEqual(["-w", "apps/cli", "run", "dev", "--", "run-board"]);
     expect(flag("--goal-file")).toMatch(/examples\/goals\/cityhall-services-correct\.goal\.txt$/);
@@ -101,17 +98,8 @@ describe("the cityhall template", () => {
     expect(args).not.toContain("--preview-revisions");
   });
 
-  it("clamps the dial to the template's limit for the mode, and the default limit elsewhere", () => {
-    expect(dialFromBody({ min: 8, max: 99 }, dialLimitOf(cityhall, "board"))).toEqual({ min: 8, max: 30 });
-    expect(dialFromBody({ min: 8, max: 30 }, dialLimitOf(cityhall, "live"))).toEqual({ min: 8, max: 8 });
-    const storefront = templateById("storefront")!;
-    expect(dialLimitOf(storefront, "board")).toBe(DEFAULT_DIAL_LIMIT);
-    expect(dialFromBody({ min: 2, max: 30 }, dialLimitOf(storefront, "board"))).toEqual({ min: 2, max: 8 });
-    expect(dialFromBody({ min: 2, max: 30 })).toEqual({ min: 2, max: 8 });
-  });
-
   it("passes no budget flags for a template without board options", () => {
-    const args = runBoardArgs(templateById("storefront")!, "x", { min: 1, max: 3 }, "console");
+    const args = runBoardArgs(templateById("storefront")!, "x", "console");
     expect(args).not.toContain("--max-inflight");
     expect(args).not.toContain("--max-turns");
     expect(args).not.toContain("--timeout-ms");
@@ -119,22 +107,20 @@ describe("the cityhall template", () => {
 });
 
 describe("revision previews on a launch", () => {
-  const dial = { min: 1, max: 3 };
-
   it("adds --preview-revisions to a board run only when the app is deployed, keeping --decide-contracts last", () => {
     for (const t of TEMPLATES.filter((x) => x.app)) {
-      const deployed = launchArgs(t, "x", dial, { mode: "board", contractPolicy: "accept" }, true);
+      const deployed = launchArgs(t, "x", { mode: "board", contractPolicy: "accept" }, true);
       expect(deployed, t.id).toContain("--preview-revisions");
       expect(deployed.indexOf("--preview-revisions")).toBeGreaterThan(deployed.indexOf("--deploy-app-name"));
       expect(deployed.slice(-2)).toEqual(["--decide-contracts", "accept"]);
-      expect(launchArgs(t, "x", dial, { mode: "board", contractPolicy: "console" }, false)).not.toContain("--preview-revisions");
+      expect(launchArgs(t, "x", { mode: "board", contractPolicy: "console" }, false)).not.toContain("--preview-revisions");
     }
   });
 
   it("never adds previews to a non-app template or to run-live (which keeps its redeploy in place)", () => {
     const audit = templateById("audit-logging")!;
-    expect(launchArgs(audit, "x", dial, { mode: "board", contractPolicy: "console" }, true)).not.toContain("--preview-revisions");
-    const live = launchArgs(templateById("service-api")!, "x", dial, { mode: "live", contractPolicy: "console" }, true);
+    expect(launchArgs(audit, "x", { mode: "board", contractPolicy: "console" }, true)).not.toContain("--preview-revisions");
+    const live = launchArgs(templateById("service-api")!, "x", { mode: "live", contractPolicy: "console" }, true);
     expect(live[5]).toBe("run-live");
     expect(live).not.toContain("--preview-revisions");
     expect(live[live.indexOf("--deploy-app-name") + 1]).toBe("switchyard-change-fabric-service-api");
@@ -282,7 +268,6 @@ describe("the run's Tear down (repos)", () => {
     changeId: "console-cityhall-x",
     template: templateById("cityhall")!,
     redeployed: false,
-    dial: { min: 8, max: 30 },
     busy: false,
     onTearDown: () => {},
   };
@@ -369,7 +354,6 @@ describe("the fixed app link", () => {
         template: templateById("cityhall")!,
         launchStatus: { status: "exited", exitCode: 0, log: [] },
         redeployed: false,
-        dial: { min: 8, max: 30 },
         busy: false,
         onTearDown: () => {},
         fixedApp: preview(4, c("d")),

@@ -20,9 +20,8 @@ import { GraphView, changeHasPassed } from "./graph-view";
 import { MissionControl, type BoardEscalationRecord } from "./mission-control";
 import { ThemeToggle } from "./theme";
 import {
+  agentCountLine,
   boardCapable,
-  DEFAULT_DIAL_LIMIT,
-  dialLimitOf,
   TEMPLATES,
   type ContractPolicy,
   type LaunchMode,
@@ -283,8 +282,6 @@ export function App() {
   // 404 is no longer the launch race and is handled as a real error.
   const hasAppearedRef = useRef(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [min, setMin] = useState(1);
-  const [max, setMax] = useState(3);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [launchStatus, setLaunchStatus] = useState<LaunchStatus | null>(null);
@@ -513,36 +510,14 @@ export function App() {
     }
   }, [snapshot]);
 
-  // Keep the dial inputs in sync with the real dial the state reports, so the
-  // control shows the config actually in force (not a local guess).
-  const reportedDial = snapshot?.dial;
-  const lastDialKey = useRef<string>("");
-  useEffect(() => {
-    if (!reportedDial) {
-      return;
-    }
-    const key = `${reportedDial.minConcurrency}/${reportedDial.maxConcurrency}`;
-    if (key !== lastDialKey.current) {
-      lastDialKey.current = key;
-      setMin(reportedDial.minConcurrency);
-      setMax(reportedDial.maxConcurrency);
-    }
-  }, [reportedDial]);
-
-  // The sliders' ceiling for the next launch: the default, or on the board the
-  // largest template dial limit (the launcher clamps each launch to its own
-  // template's limit). Switching back to a smaller ceiling clamps the dial.
-  const dialLimit = useMemo(
-    () => Math.max(DEFAULT_DIAL_LIMIT, ...templates.map((t) => dialLimitOf(t, launchMode))),
-    [templates, launchMode],
+  // The run's actual agents: on the board, the agents that joined and those
+  // still active (from the recorded board log); on run-live, the units an agent
+  // was recruited for and those running (from the graph). Never a configured
+  // dial: a board run does not write the snapshot's dial.
+  const runAgents = useMemo(
+    () => (boardMode ? boardAgentCount(boardLog) : model ? liveAgentCount(model) : null),
+    [boardMode, boardLog, model],
   );
-  useEffect(() => {
-    if (changeId) {
-      return;
-    }
-    setMin((value) => Math.min(value, dialLimit));
-    setMax((value) => Math.min(value, dialLimit));
-  }, [dialLimit, changeId]);
 
   // A verified run that redeployed the app in place: its stable URL now serves
   // the fix, so the gallery stops calling it the original code.
@@ -586,11 +561,6 @@ export function App() {
     }
   }, []);
 
-  // The dial is set BEFORE a run and locked during it: there is no mid-run
-  // re-POST that changes concurrency live. The chosen min/max is captured as the
-  // launched run's config (passed through POST /api/launch), and while a run is
-  // active the control is read-only, showing the in-force dial reported by state.
-
   // Launch a template: ask the launcher to start a real live run with a FRESH
   // UNIQUE Change id, then follow exactly that id. The browser is the launcher,
   // so there is no CLI step for the demo.
@@ -603,8 +573,6 @@ export function App() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           templateId: template.id,
-          min,
-          max,
           ...(launchMode === "board" ? { mode: "board", decideContracts: contractPolicy } : {}),
         }),
       });
@@ -614,14 +582,9 @@ export function App() {
         setBusy(false);
         return;
       }
-      const body = (await res.json()) as { changeId: string; mode?: LaunchMode; dial?: { min: number; max: number } };
+      const body = (await res.json()) as { changeId: string; mode?: LaunchMode };
       // Follow the unique id the launcher generated. Reset the view for the run.
       setRunMode(body.mode ?? launchMode);
-      // The dial the launcher actually used (clamped to this template's limit).
-      if (body.dial) {
-        setMin(body.dial.min);
-        setMax(body.dial.max);
-      }
       setWatchOnly(false);
       setLauncherKnowsRun(true);
       resetBoard();
@@ -651,7 +614,7 @@ export function App() {
       setNotice("cannot reach the launcher. Is `make dev-all` running?");
     }
     setBusy(false);
-  }, [min, max, launchMode, contractPolicy, resetBoard]);
+  }, [launchMode, contractPolicy, resetBoard]);
 
   // Manual Deploy (BEFORE a fix): deploy an app template's app in its CURRENT
   // (broken) state to its STABLE workers.dev URL, so the watcher sees the break
@@ -850,21 +813,8 @@ export function App() {
         onLaunch={launchTemplate}
         onDeploy={deployApp}
         onRemove={removeApp}
-        onSuggestDial={(dial) => {
-          setMin(dial.min);
-          setMax(dial.max);
-        }}
-        dialLocked={Boolean(changeId)}
         launchMode={launchMode}
       >
-        <DialControl
-          min={min}
-          max={max}
-          limit={dialLimit}
-          locked={Boolean(changeId)}
-          onMin={setMin}
-          onMax={setMax}
-        />
         <RunModeControl
           mode={launchMode}
           policy={contractPolicy}
@@ -885,11 +835,7 @@ export function App() {
               (activeTemplate?.app ? deployedUrls[activeTemplate.app] : undefined)
             }
             redeployed={Boolean(snapshot?.deployment?.url)}
-            dial={
-              reportedDial
-                ? { min: reportedDial.minConcurrency, max: reportedDial.maxConcurrency }
-                : { min, max }
-            }
+            agents={runAgents}
             busy={busy}
             onTearDown={() => void cleanupRun()}
             watchOnly={watchOnly}
@@ -984,7 +930,8 @@ export function App() {
  * one-line description, what it does, what it solves, an agent count hint, and
  * whether it pauses for a human). While a run is active it collapses to a
  * one-line strip so the graph stays near the top; the strip can be expanded.
- * The dial (the launch config) is rendered inside it as `children`.
+ * The run mode control is rendered inside it as `children`. Each card shows
+ * the template's own agent counts for the chosen mode, read-only.
  */
 function TemplateGallery({
   templates,
@@ -999,8 +946,6 @@ function TemplateGallery({
   onLaunch,
   onDeploy,
   onRemove,
-  onSuggestDial,
-  dialLocked = false,
   launchMode = "live",
   children,
 }: {
@@ -1017,8 +962,6 @@ function TemplateGallery({
   onLaunch: (template: Template) => void | Promise<void>;
   onDeploy: (template: Template) => void | Promise<void>;
   onRemove: (template: Template) => void | Promise<void>;
-  onSuggestDial?: (dial: { min: number; max: number }) => void;
-  dialLocked?: boolean;
   launchMode?: LaunchMode;
   children?: ReactNode;
 }) {
@@ -1057,7 +1000,6 @@ function TemplateGallery({
           const op = template.app ? appOps[template.app] : undefined;
           const opInFlight = op?.kind === "deploying" || op?.kind === "removing";
           const canLaunch = launchMode === "live" || boardCapable(template);
-          const suggested = template.boardOptions?.suggestedDial;
           return (
             <li
               key={template.id}
@@ -1076,23 +1018,7 @@ function TemplateGallery({
                 <dt>What this run solves</dt>
                 <dd>{template.problemItSolves}</dd>
               </dl>
-              <p className="muted template-count">
-                {template.agentCountHint}
-                {suggested && launchMode === "board" && onSuggestDial ? (
-                  <>
-                    {" "}
-                    <button
-                      type="button"
-                      className="secondary"
-                      disabled={dialLocked}
-                      onClick={() => onSuggestDial(suggested)}
-                      title={`Set the dial to min ${suggested.min} / max ${suggested.max} for this template's board run`}
-                    >
-                      Use dial {suggested.min} to {suggested.max}
-                    </button>
-                  </>
-                ) : null}
-              </p>
+              <p className="muted template-count">{agentCountLine(template, canLaunch ? launchMode : "live")}</p>
               {template.app ? (
                 <AppDeployControl
                   app={template.app}
@@ -1257,65 +1183,41 @@ export function RunModeControl({
   );
 }
 
+/** A run's actual agents: how many joined (or were recruited) and how many are active now. */
+export interface RunAgents {
+  readonly joined: number;
+  readonly active: number;
+}
+
 /**
- * The concurrency dial: the real min/max recruitment config, set BEFORE a run
- * (passed through POST /api/launch) and locked while one is active (there is no
- * mid-run re-POST). The run panel shows the in-force dial during a run.
+ * The agents a board run actually has, from its recorded log: every agent that
+ * posted agent.joined, and those of them that have not posted agent.left.
+ * Exported for tests.
  */
-function DialControl({
-  min,
-  max,
-  limit = DEFAULT_DIAL_LIMIT,
-  locked,
-  onMin,
-  onMax,
-}: {
-  min: number;
-  max: number;
-  limit?: number;
-  locked: boolean;
-  onMin: (value: number) => void;
-  onMax: (value: number) => void;
-}) {
-  return (
-    <div className="dial-panel" aria-label="Concurrency dial">
-      <div className="dial-row">
-        <strong>Concurrency</strong>
-        <label htmlFor="dial-min">min</label>
-        <input
-          id="dial-min"
-          type="range"
-          min={0}
-          max={limit}
-          value={min}
-          disabled={locked}
-          onChange={(event) => onMin(Number(event.target.value))}
-        />
-        <span className="dial-value">{min}</span>
-        <label htmlFor="dial-max">max</label>
-        <input
-          id="dial-max"
-          type="range"
-          min={1}
-          max={limit}
-          value={max}
-          disabled={locked}
-          onChange={(event) => onMax(Number(event.target.value))}
-        />
-        <span className="dial-value">{max}</span>
-        {locked ? (
-          <span className="dial-locked">locked for this run</span>
-        ) : (
-          <span className="muted">agents running at once, for the next launch</span>
-        )}
-      </div>
-    </div>
-  );
+export function boardAgentCount(log: readonly BoardMessage[]): RunAgents {
+  const joined = new Set<string>();
+  const left = new Set<string>();
+  for (const message of log) {
+    if (message.type === "agent.joined") joined.add(message.from);
+    else if (message.type === "agent.left") left.add(message.from);
+  }
+  let active = 0;
+  for (const agent of joined) if (!left.has(agent)) active += 1;
+  return { joined: joined.size, active };
+}
+
+/**
+ * The agents a run-live run actually has, from its graph: every unit an agent
+ * was recruited for (a real repo exists), and those running now. Exported for tests.
+ */
+export function liveAgentCount(model: WorkGraphModel): RunAgents {
+  const agents = model.nodes.filter((node) => node.kind === "agent");
+  return { joined: agents.length, active: agents.filter((node) => node.status === "running").length };
 }
 
 /**
  * The run status panel: only the template name, the run state, the live URL
- * (when the app was deployed), the in-force dial, and Tear down. On a non-zero
+ * (when the app was deployed), the run's actual agent count, and Tear down. On a non-zero
  * exit it shows the tail of the launcher's redacted run log so the reason is
  * visible. Exported for tests.
  */
@@ -1325,7 +1227,7 @@ export function RunStatus({
   launchStatus,
   liveUrl,
   redeployed,
-  dial,
+  agents = null,
   busy,
   onTearDown,
   watchOnly = false,
@@ -1337,7 +1239,8 @@ export function RunStatus({
   launchStatus: LaunchStatus | null;
   liveUrl?: string;
   redeployed: boolean;
-  dial: { min: number; max: number };
+  /** The run's actual agents (joined and active), or null before any are known. */
+  agents?: RunAgents | null;
   busy: boolean;
   onTearDown: () => void;
   /** A run followed read-only (?watch=): not launched here, so no Tear down at all. */
@@ -1362,9 +1265,11 @@ export function RunStatus({
         <strong>{template?.name ?? "Live run"}</strong>
         <span className={`run-state${failed ? " is-failed" : ""}`}>{state}</span>
         <code className="muted">{changeId}</code>
-        <span className="dial-locked">
-          dial min {dial.min} / max {dial.max} (locked)
-        </span>
+        {agents ? (
+          <span className="run-agents" title={`${agents.active} active of ${agents.joined} joined`}>
+            {agents.joined === 0 ? "no agents yet" : `${agents.joined} agents joined, ${agents.active} active`}
+          </span>
+        ) : null}
         {watchOnly ? null : (
           <button
             type="button"

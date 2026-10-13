@@ -400,10 +400,9 @@ describe("board polling", () => {
 describe("launching a board run", () => {
   const serviceApi = templateById("service-api")!;
   const auditLogging = templateById("audit-logging")!;
-  const dial = { min: 1, max: 3 };
 
   it("runs run-board with the same template's goal, project, and gate", () => {
-    const args = runBoardArgs(serviceApi, "console-x", dial, "console");
+    const args = runBoardArgs(serviceApi, "console-x", "console");
     expect(args.slice(0, 6)).toEqual(["-w", "apps/cli", "run", "dev", "--", "run-board"]);
     expect(args.join(" ")).toContain("examples/goals/service-api-validation-auth.goal.txt");
     expect(args.join(" ")).toContain("--project");
@@ -413,13 +412,13 @@ describe("launching a board run", () => {
   });
 
   it("runs audit-logging on the board from its goal file and project, while run-live keeps its Change spec", () => {
-    const board = runBoardArgs(auditLogging, "x", dial, "console").join(" ");
+    const board = runBoardArgs(auditLogging, "x", "console").join(" ");
     expect(board).toContain("run-board");
     expect(board).toContain("examples/goals/audit-logging.goal.txt");
     expect(board).toContain("examples/demo-project");
     expect(board).toContain("--gate");
     expect(board).not.toContain("audit-logging.change.yaml");
-    const live = launchArgs(auditLogging, "x", dial, { mode: "live", contractPolicy: "console" }).join(" ");
+    const live = launchArgs(auditLogging, "x", { mode: "live", contractPolicy: "console" }).join(" ");
     expect(live).toContain("run-live");
     expect(live).toContain("examples/changes/audit-logging.change.yaml");
   });
@@ -427,7 +426,7 @@ describe("launching a board run", () => {
   it("runs the storefront app on the board from its goal, project, gate, and app, like any real-app template", () => {
     const storefront = templateById("storefront")!;
     expect(storefront.app).toBe("storefront");
-    const args = runBoardArgs(storefront, "x", dial, "console");
+    const args = runBoardArgs(storefront, "x", "console");
     const line = args.join(" ");
     expect(line).toContain("run-board");
     expect(line).toContain("examples/goals/storefront-correct-and-safe.goal.txt");
@@ -437,8 +436,8 @@ describe("launching a board run", () => {
   });
 
   it("passes --decide-contracts only for an automatic policy", () => {
-    expect(runBoardArgs(serviceApi, "x", dial, "accept").slice(-2)).toEqual(["--decide-contracts", "accept"]);
-    expect(runBoardArgs(serviceApi, "x", dial, "reject").slice(-2)).toEqual(["--decide-contracts", "reject"]);
+    expect(runBoardArgs(serviceApi, "x", "accept").slice(-2)).toEqual(["--decide-contracts", "accept"]);
+    expect(runBoardArgs(serviceApi, "x", "reject").slice(-2)).toEqual(["--decide-contracts", "reject"]);
   });
 
   it("validates the launch body: a board launch needs a goal template; unknown values are refused", () => {
@@ -456,7 +455,7 @@ describe("launching a board run", () => {
   });
 
   it("keeps run-live launches unchanged", () => {
-    const args = launchArgs(serviceApi, "x", dial, { mode: "live", contractPolicy: "console" });
+    const args = launchArgs(serviceApi, "x", { mode: "live", contractPolicy: "console" });
     expect(args[5]).toBe("run-live");
   });
 
