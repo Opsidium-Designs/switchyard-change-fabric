@@ -46,7 +46,7 @@ import {
   type SuiteSeries,
 } from "./board-overlay";
 import { IDENTITY_VIEW, shouldZoomOnWheel, zoomAt, type ViewTransform } from "./graph-interactions";
-import { chapters as runChapters, formatDuration, narrateAt, type Chapter, type Narration } from "./narration";
+import { chapters as runChapters, formatDuration, narrateAt, narrateMessage, type Chapter, type Narration } from "./narration";
 import { keyMoments, MOMENT_GROUPS, type MomentKind } from "./replay-data";
 
 /**
@@ -1735,19 +1735,127 @@ export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSel
   );
 }
 
+/** The fold group a routine message belongs to; consecutive runs of one group fold into a single row. */
+function foldKey(m: BoardMessage): string | null {
+  switch (m.type) {
+    case "agent.left":
+      return "left";
+    case "agent.joined":
+      return (m.payload as { role?: string }).role === "lead" ? null : "joined";
+    case "item.claimed":
+    case "claim.granted":
+      return "claim";
+    case "item.proposed":
+      return "proposed";
+    case "token.refreshed":
+      return "token";
+    default:
+      return null;
+  }
+}
+
+/** Fewer than this many routine messages in a row stay unfolded. */
+const FOLD_MIN = 3;
+
+export type ThreadEntry = { readonly kind: "one"; readonly message: BoardMessage } | { readonly kind: "fold"; readonly key: string; readonly messages: readonly BoardMessage[] };
+
+/** The thread's rows: routine messages in a row (claims, joins, departures, proposals) fold into one. */
+export function foldThread(messages: readonly BoardMessage[]): ThreadEntry[] {
+  const out: ThreadEntry[] = [];
+  let i = 0;
+  while (i < messages.length) {
+    const key = foldKey(messages[i]!);
+    let j = i + 1;
+    if (key !== null) {
+      while (j < messages.length && foldKey(messages[j]!) === key) j += 1;
+    }
+    if (key !== null && j - i >= FOLD_MIN) {
+      out.push({ kind: "fold", key, messages: messages.slice(i, j) });
+    } else {
+      for (let x = i; x < j; x += 1) out.push({ kind: "one", message: messages[x]! });
+    }
+    i = j;
+  }
+  return out;
+}
+
+function names(list: readonly string[], max = 4): string {
+  const unique = [...new Set(list)];
+  return unique.length > max ? `${unique.slice(0, max).join(", ")} and ${unique.length - max} more` : unique.join(", ");
+}
+
+/** The one sentence a folded run of routine messages reads as. */
+export function foldSummary(key: string, messages: readonly BoardMessage[]): string {
+  const field = (m: BoardMessage, k: string) => String((m.payload as Record<string, unknown>)[k] ?? "");
+  switch (key) {
+    case "left":
+      return `${messages.length} agents leave the board (${names(messages.map((m) => m.from))}).`;
+    case "joined":
+      return `${messages.length} agents join the board (${names(messages.map((m) => m.from))}).`;
+    case "claim": {
+      const grants = messages.filter((m) => m.type === "claim.granted");
+      return grants.length > 0
+        ? `${grants.length} claim${grants.length === 1 ? "" : "s"} granted: ${names(grants.map((m) => `${field(m, "item")} to ${field(m, "agent")}`), 3)}.`
+        : `${messages.length} claim requests (${names(messages.map((m) => field(m, "item")))}).`;
+    }
+    case "proposed":
+      return `${messages[0]!.from === "lead" ? "The lead" : names(messages.map((m) => m.from))} proposes ${messages.length} items: ${names(messages.map((m) => field(m, "item")), 6)}.`;
+    case "token":
+      return `${messages.length} tokens refreshed (never shown).`;
+    default:
+      return `${messages.length} messages.`;
+  }
+}
+
 export function Thread({
   messages,
   title,
   selectedSeq,
   onSelectSeq,
   onSelectAgent,
+  log,
 }: {
   messages: readonly BoardMessage[];
   title: string;
   selectedSeq: number | null;
   onSelectSeq: (seq: number) => void;
   onSelectAgent: (agent: string) => void;
+  /** The board log, for each row's plain sentence and its recorded causes. Without it, rows show the typed summary only. */
+  log?: readonly BoardMessage[];
 }) {
+  const row = (m: BoardMessage) => {
+    const family = boardMessageFamily(m.type);
+    const plain = log ? narrateMessage(m, log, payloadSummary).text : undefined;
+    return (
+      <li key={m.seq} className={`mc-msg fam-${family}${selectedSeq === m.seq ? " is-selected" : ""}`}>
+        {plain !== undefined ? <div className="mc-msg-plain">{plain}</div> : null}
+        <div className="mc-msg-head">
+          <button type="button" className="mc-seq-link" onClick={() => onSelectSeq(m.seq)}>
+            seq {m.seq}
+          </button>
+          <button
+            type="button"
+            className={`mc-sender sender-${m.from === "engine" ? "engine" : m.from === "human" ? "human" : "agent"}`}
+            onClick={() => (m.from !== "engine" && m.from !== "human" ? onSelectAgent(m.from) : undefined)}
+          >
+            {m.from}
+          </button>
+          <span className="mc-type" style={{ color: FAMILY_COLORS[family] }}>
+            {m.type}
+          </span>
+          {family === "decision" ? <span className="mc-chip-advisory">advisory</span> : null}
+          {m.to && m.to.length > 0 ? <span className="muted">to {m.to.join(", ")}</span> : null}
+          {m.inReplyTo !== undefined ? (
+            <button type="button" className="mc-seq-link" onClick={() => onSelectSeq(m.inReplyTo!)}>
+              re seq {m.inReplyTo}
+            </button>
+          ) : null}
+        </div>
+        <div className={`mc-msg-body${plain !== undefined ? " is-raw" : ""}`}>{payloadSummary(m)}</div>
+        {m.rationale ? <q className="mc-rationale">{m.rationale}</q> : null}
+      </li>
+    );
+  };
   return (
     <div className="mc-thread">
       <h3>
@@ -1755,37 +1863,23 @@ export function Thread({
       </h3>
       {messages.length === 0 ? <p className="muted">No messages yet.</p> : null}
       <ol className="mc-thread-list">
-        {messages.map((m) => {
-          const family = boardMessageFamily(m.type);
-          return (
-            <li key={m.seq} className={`mc-msg fam-${family}${selectedSeq === m.seq ? " is-selected" : ""}`}>
-              <div className="mc-msg-head">
-                <button type="button" className="mc-seq-link" onClick={() => onSelectSeq(m.seq)}>
-                  seq {m.seq}
-                </button>
-                <button
-                  type="button"
-                  className={`mc-sender sender-${m.from === "engine" ? "engine" : m.from === "human" ? "human" : "agent"}`}
-                  onClick={() => (m.from !== "engine" && m.from !== "human" ? onSelectAgent(m.from) : undefined)}
-                >
-                  {m.from}
-                </button>
-                <span className="mc-type" style={{ color: FAMILY_COLORS[family] }}>
-                  {m.type}
-                </span>
-                {family === "decision" ? <span className="mc-chip-advisory">advisory</span> : null}
-                {m.to && m.to.length > 0 ? <span className="muted">to {m.to.join(", ")}</span> : null}
-                {m.inReplyTo !== undefined ? (
-                  <button type="button" className="mc-seq-link" onClick={() => onSelectSeq(m.inReplyTo!)}>
-                    re seq {m.inReplyTo}
-                  </button>
-                ) : null}
-              </div>
-              <div className="mc-msg-body">{payloadSummary(m)}</div>
-              {m.rationale ? <q className="mc-rationale">{m.rationale}</q> : null}
+        {foldThread(messages).map((entry) =>
+          entry.kind === "one" ? (
+            row(entry.message)
+          ) : (
+            <li key={`fold-${entry.messages[0]!.seq}`} className="mc-fold">
+              <details open={selectedSeq !== null && entry.messages.some((m) => m.seq === selectedSeq)}>
+                <summary>
+                  <span className="mc-fold-text">{foldSummary(entry.key, entry.messages)}</span>
+                  <span className="mc-fold-range">
+                    seq {Math.min(...entry.messages.map((m) => m.seq))} to {Math.max(...entry.messages.map((m) => m.seq))}, {entry.messages.length} messages
+                  </span>
+                </summary>
+                <ol className="mc-thread-list">{entry.messages.map(row)}</ol>
+              </details>
             </li>
-          );
-        })}
+          ),
+        )}
       </ol>
     </div>
   );
@@ -2448,6 +2542,7 @@ export function MissionControl({
             selectedSeq={selectedSeq}
             onSelectSeq={(seq) => select({ kind: "seq", seq })}
             onSelectAgent={(agent) => select({ kind: "agent", id: agent })}
+            log={log}
           />
         ) : tab === "node" ? (
           selectedNode ? (

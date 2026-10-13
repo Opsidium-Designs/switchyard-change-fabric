@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import type { BoardMessage } from "@switchyard-change/orchestration/board-graph";
 
-import { payloadSummary } from "../src/mission-control.tsx";
+import { foldSummary, foldThread, payloadSummary } from "../src/mission-control.tsx";
 import { chapters, formatDuration, narrateAt, narrateMessage, revOutcome } from "../src/narration.ts";
 
 const REPLAYS = new URL("../public/replays/", import.meta.url);
@@ -97,5 +97,25 @@ describe("chapters", () => {
     expect(formatDuration(42_000)).toBe("42 s");
     expect(formatDuration(12 * 60_000)).toBe("12 min");
     expect(formatDuration(65 * 60_000)).toBe("1 h 05 min");
+  });
+});
+
+describe("the folded thread", () => {
+  it("folds sf21's seven departures into one row and keeps every message inside it", () => {
+    const log = recorded("board-live-sf21");
+    const newestFirst = [...log].reverse();
+    const entries = foldThread(newestFirst);
+    const kept = entries.flatMap((e) => (e.kind === "one" ? [e.message] : e.messages));
+    expect(kept.map((m) => m.seq)).toEqual(newestFirst.map((m) => m.seq));
+    const left = entries.find((e) => e.kind === "fold" && e.key === "left");
+    expect(left?.kind === "fold" ? foldSummary(left.key, left.messages) : "").toMatch(/^7 agents leave the board/);
+  });
+
+  it("leaves short runs and non-routine messages unfolded", () => {
+    const log = recorded("board-live-sf21");
+    const revs = log.filter((m) => m.type === "integrated.rev");
+    expect(foldThread(revs).every((e) => e.kind === "one")).toBe(true);
+    const twoClaims = log.filter((m) => m.type === "claim.granted").slice(0, 2);
+    expect(foldThread(twoClaims).every((e) => e.kind === "one")).toBe(true);
   });
 });

@@ -2323,3 +2323,25 @@ body {
 .replay-goal .replay-goal-text:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .replay-verdict-teaser > summary { cursor: pointer; font-size: 0.85rem; color: var(--accent); }
 .replay-verdict-teaser[open] > summary { margin-bottom: 0.4rem; }
+
+/* --- The thread: a plain sentence over the exact protocol line; routine runs fold --- */
+
+.mc-msg-plain { font-size: 0.88rem; font-weight: 600; line-height: 1.3; margin-bottom: 0.15rem; }
+.mc-msg-body.is-raw {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+.mc-msg-plain + .mc-msg-head { font-size: 0.72rem; opacity: 0.85; }
+.mc-fold { list-style: none; margin-bottom: 0.4rem; }
+.mc-fold > details {
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 0.3rem 0.5rem;
+  background: var(--bg);
+}
+.mc-fold summary { cursor: pointer; display: flex; flex-direction: column; gap: 0.1rem; }
+.mc-fold-text { font-size: 0.85rem; font-weight: 600; }
+.mc-fold-range { font-size: 0.7rem; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mc-fold details[open] > summary { margin-bottom: 0.35rem; }
+.mc-fold .mc-thread-list { padding: 0; }
