@@ -176,6 +176,9 @@ egress (`make dev-containers` locally, Docker required). See
 [docs/BOARD.md](./docs/BOARD.md) and the "Integration on Cloudflare" section of
 [docs/LIVE-DEPLOY.md](./docs/LIVE-DEPLOY.md).
 
+The failures we actually hit in live runs, and the mechanism and test that now
+stop each one, are in [docs/FAILURE-MODES.md](./docs/FAILURE-MODES.md).
+
 ### What the graph shows
 
 Nodes are the goal, the planner (kickoff and each re-plan), work units and
