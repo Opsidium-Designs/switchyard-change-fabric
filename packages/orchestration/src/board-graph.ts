@@ -1603,9 +1603,11 @@ export interface BoardLayout {
 }
 
 export const HULL_W = 250;
-export const HULL_H = 180;
-const HULL_GAP = 30;
-const TOP_BAND = 160;
+export const HULL_H = 196;
+/** The gap between hulls (rows and columns): room for talk labels and captions between them. */
+const HULL_GAP = 48;
+/** The band above the first row of hulls: the goal, the lead, the human, their labels, and the revision anchor. */
+const TOP_BAND = 200;
 /** The title bar at the top of a hull (captions avoid it). */
 export const HULL_TITLE_H = 32;
 const MARGIN = 24;
@@ -1756,7 +1758,7 @@ export function hullAgentPoint(hull: BoardHullRect, slot: number, agent: string)
   const nested = (hull.depth ?? 0) > 0;
   return {
     x: hull.x + (perRow === 1 ? hull.w / 2 : 30 + (i % perRow) * step) + stableJitter(`${agent}:x`, 5),
-    y: hull.y + (nested ? 62 : 80) + Math.floor(i / perRow) * (nested ? 40 : 56) + stableJitter(`${agent}:y`, 4),
+    y: hull.y + (nested ? 66 : 90) + Math.floor(i / perRow) * (nested ? 40 : 56) + stableJitter(`${agent}:y`, 4),
   };
 }
 

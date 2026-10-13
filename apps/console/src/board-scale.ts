@@ -36,25 +36,25 @@ export const LARGE_WORKERS = 16;
 
 /** Compact hull sizes (a top-level hull, a nested child hull) and gaps. */
 export const COMPACT_HULL_W = 190;
-export const COMPACT_HULL_H = 84;
-export const COMPACT_NESTED_H = 70;
+export const COMPACT_HULL_H = 92;
+export const COMPACT_NESTED_H = 74;
 /** Where the dot row sits below a compact hull's top (below its title bar). */
-export const COMPACT_DOT_Y = 54;
-export const COMPACT_NESTED_DOT_Y = 50;
+export const COMPACT_DOT_Y = 60;
+export const COMPACT_NESTED_DOT_Y = 54;
 /** The dot step and radius of an agent drawn inside a compact hull. */
 export const COMPACT_DOT_STEP = 24;
 export const COMPACT_DOT_R = 9;
 /** A compact hull draws at most this many agent dots, else a count. */
 export const COMPACT_MAX_AGENTS = 4;
-const GAP = 12;
+const GAP = 20;
 const NESTED_GAP = 8;
 /** A lane's own header row and padding. */
 export const LANE_HEAD = 26;
 const LANE_PAD = 10;
-const LANE_GAP = 22;
+const LANE_GAP = 32;
 /** Items per lane row (a split item spans the whole row). */
 const LANE_COLS = 2;
-const TOP_BAND = 132;
+const TOP_BAND = 172;
 const MARGIN = 24;
 /** The bench chip (every free agent, as counts). */
 export const BENCH_CHIP_W = 380;
