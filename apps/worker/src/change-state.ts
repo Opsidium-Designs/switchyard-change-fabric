@@ -1,6 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 
 import {
+  mergeRevisionPreview,
+  type RevisionPreview,
   appendBoardMessage,
   appendDecisionRecorded,
   appendSeamStalled,
@@ -607,6 +609,12 @@ export interface ChangeStateView {
    */
   readonly deployment?: DeploymentRecord;
   /**
+   * Revision previews: each integrated revision's app (failing ones included)
+   * uploaded as a Worker version under a preview alias, sorted by n, one per
+   * revision. Advisory and visual only; absent when none was recorded.
+   */
+  readonly previews?: readonly RevisionPreview[];
+  /**
    * The CHANGE-LEVEL mechanical verify attempts recorded for this Change: each
    * is one real run of the per-app gate against the integrated change after a
    * wave, keyed by round. They back the graph's `verify` nodes, so a verify node
@@ -1071,6 +1079,8 @@ export class ChangeState extends DurableObject<Env> {
     // The live deployment of the fixed app (recorded at the end of a real-app
     // run after verification passed). Null until the run deploys one.
     await this.ctx.storage.put("deployment", null);
+    // Revision previews (advisory Worker versions per integrated revision).
+    await this.ctx.storage.put("previews", [] as RevisionPreview[]);
     // Round-N agent instances, keyed by `${unitId}#${round}`: a retry round's
     // re-fanned unit running as a BRAND NEW agent with its OWN recorded Artifact
     // repo and a real status lifecycle, exactly like a kickoff lease. Empty until
@@ -2211,6 +2221,17 @@ export class ChangeState extends DurableObject<Env> {
     return stored;
   }
 
+  /**
+   * Record a revision preview (validated by the route): one per revision (a
+   * later write for the same n replaces), sorted by n, capped. Advisory: it
+   * backs no verdict and gates nothing.
+   */
+  async recordPreview(preview: RevisionPreview): Promise<RevisionPreview> {
+    const previews = mergeRevisionPreview(await this.loadPreviews(), preview);
+    await this.ctx.storage.put("previews", previews);
+    return preview;
+  }
+
   /** The recorded live deployment for this run, if any. */
   async getDeployment(): Promise<DeploymentRecord | null> {
     return this.loadDeployment();
@@ -2850,6 +2871,7 @@ export class ChangeState extends DurableObject<Env> {
     const activity = await this.loadActivity();
     const detail = await this.loadDetail();
     const deployment = await this.loadDeployment();
+    const previews = await this.loadPreviews();
     const verifyAttempts = await this.loadVerifyAttempts();
     const retryAttempts = await this.loadRetryAttempts();
     const roundAgents = await this.loadRoundAgents();
@@ -2922,6 +2944,7 @@ export class ChangeState extends DurableObject<Env> {
       escalations,
       failed: Object.values(failed).sort((a, b) => (a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0)),
       ...(deployment ? { deployment } : {}),
+      ...(previews.length > 0 ? { previews } : {}),
       verifyAttempts,
       retryAttempts,
       rePlans: retryAttempts.filter((a) => a.refanSource === "re-plan").length,
@@ -3031,6 +3054,10 @@ export class ChangeState extends DurableObject<Env> {
 
   private async loadDetail(): Promise<Record<string, UnitDetail>> {
     return (await this.ctx.storage.get<Record<string, UnitDetail>>("detail")) ?? {};
+  }
+
+  private async loadPreviews(): Promise<RevisionPreview[]> {
+    return (await this.ctx.storage.get<RevisionPreview[]>("previews")) ?? [];
   }
 
   private async loadDeployment(): Promise<DeploymentRecord | null> {

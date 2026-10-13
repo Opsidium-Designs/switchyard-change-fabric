@@ -8,6 +8,7 @@ import {
   boardErrorStatus,
   parseBoardJoinWorkspace,
   parseChangeSpec,
+  parseRevisionPreview,
   type BoardErrorCode,
 } from "@switchyard-change/change-core";
 import { ARTIFACT_REPO_NAME_MAX, boundedRepoName } from "@switchyard-change/change-core/repo-name";
@@ -519,6 +520,31 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
     }
     const deployment = await stub.recordDeployment({ url: body.url, app: body.app });
     return json({ deployment }, 201);
+  }
+
+  // Record a REVISION PREVIEW: an integrated revision's app uploaded as a
+  // Worker version under a preview alias (never a production deploy). Advisory
+  // and visual only: failing revisions get previews too, and nothing here backs
+  // or changes a verdict. One per revision (a later write replaces), sorted.
+  const previewsMatch = url.pathname.match(/^\/changes\/([^/]+)\/previews$/);
+  if (request.method === "POST" && previewsMatch) {
+    const changeId = decodeURIComponent(previewsMatch[1] ?? "");
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ error: `no such Change: ${changeId}` }, 404);
+    }
+    let body: unknown;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ error: "invalid preview body" }, 400);
+    }
+    const parsed = parseRevisionPreview(body, () => new Date().toISOString());
+    if (!parsed.ok) {
+      return json({ error: parsed.error }, 400);
+    }
+    const preview = await stub.recordPreview(parsed.preview);
+    return json({ preview }, 201);
   }
 
   // Mark a "planning" placeholder as FAILED before its plan was attached (the
