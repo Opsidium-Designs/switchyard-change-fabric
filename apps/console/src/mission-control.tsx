@@ -1914,7 +1914,7 @@ export function ToolsRegistry({ model }: { model: BoardGraphModel }) {
 
 export const REPLAY_SPEEDS = [1, 4, 16] as const;
 /** Milliseconds per message at 1x. */
-const REPLAY_BASE_MS = 600;
+const REPLAY_BASE_MS = 2000;
 
 export function ReplayBar({
   log,

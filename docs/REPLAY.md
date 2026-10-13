@@ -20,7 +20,7 @@ make replay-preview   # build, then serve on http://127.0.0.1:4180 (REPLAY_PORT=
 - `?run=<id>` opens a run at its end (the final state), `?run=<id>&seq=<n>` at
   seq n, `&tab=tools` (or `thread`, `node`, `proof`) opens a right pane tab. The address
   bar follows the scrubber, so a link opens the moment being watched.
-- Play from the start, change speed (1x, 4x, 16x), scrub, or jump to a key
+- Play from the start, change speed (1x is 2 s per message; 4x, 16x), scrub, or jump to a key
   moment: claims, contests, contract changes, help and handoffs, tool
   publications, gate passes and failures, promotions, completions, spent fix
   budgets, stalled seams, lapsed claims, re-plans, and caps. Every key moment
