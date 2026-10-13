@@ -10,11 +10,11 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { buildBoardGraph, type BoardMessage } from "@switchyard-change/orchestration/board-graph";
+import { boardCaptions, buildBoardGraph, type BoardMessage } from "@switchyard-change/orchestration/board-graph";
 
-import { COMM_KINDS, commKind, drawnLegend, fixAskState, outstandingFixLinks, revisionAnchor } from "../src/board-overlay.ts";
-
-import { MissionControl, ReplayBar, scrubThumbCenter, scrubTickX, SCRUB_THUMB_PX } from "../src/mission-control.tsx";
+import { COMM_KINDS, commKind, communicationArrows, drawnLegend, fixAskState, outstandingFixLinks, revisionAnchor } from "../src/board-overlay.ts";
+import { LANE_HEAD, scaledBoardLayout } from "../src/board-scale.ts";
+import { BoardGraphView, MissionControl, placeCaptions, ReplayBar, scrubThumbCenter, scrubTickX, SCRUB_THUMB_PX } from "../src/mission-control.tsx";
 
 const PUBLIC = new URL("../public/", import.meta.url);
 
@@ -69,6 +69,95 @@ describe("the scrubber", () => {
     const log = recorded("board-live-reg3");
     const html = renderToStaticMarkup(createElement(MissionControl, { log, escalations: [], busy: false, onResolve: noop, recorded: true, initialSeq: 40 }));
     expect(html).toMatch(/<input type="range" min="0" max="89"[^>]*value="40"/);
+  });
+});
+
+describe("captions on the graph", () => {
+  type R = { x: number; y: number; w: number; h: number; what: string };
+  const hit = (a: R, b: R) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+  const num = "(-?[\\d.e-]+)";
+  const attrs = `x="${num}" y="${num}" width="${num}" height="${num}"`;
+  const rect = (m: RegExpMatchArray, what: string): R => ({ x: Number(m[1]), y: Number(m[2]), w: Number(m[3]), h: Number(m[4]), what });
+  const CHAR_EM = 0.62;
+
+  /** Every box a caption must keep clear of, read back from the rendered SVG (an independent check of the placement). */
+  function drawnBoxes(html: string): R[] {
+    const boxes: R[] = [];
+    for (const m of html.matchAll(new RegExp(`<rect class="mc-hull-bar" ${attrs}`, "g"))) boxes.push(rect(m, "hull title"));
+    for (const m of html.matchAll(new RegExp(`<g class="mc-lane"><rect ${attrs}`, "g"))) boxes.push({ ...rect(m, "lane head"), h: LANE_HEAD });
+    for (const m of html.matchAll(new RegExp(`<g class="mc-bench-chip[^>]*><rect ${attrs}`, "g"))) boxes.push(rect(m, "bench chip"));
+    for (const m of html.matchAll(new RegExp(`<g class="mc-talk-(?:arrow|mark)[^>]*>(?:<path[^>]*></path>)?<rect ${attrs}`, "g"))) boxes.push(rect(m, "talk pill"));
+    // Node shapes and their labels (goal, lead, human, agents, tools, the revision anchor and its line).
+    const groups = html.matchAll(/<g class="mc-node kind-([a-z]+)[^"]*" style="transform:translate\((-?[\d.]+)px, (-?[\d.]+)px\)"[^>]*>(.*?)<title>/g);
+    for (const g of groups) {
+      const [kind, px, py, inner] = [g[1]!, Number(g[2]), Number(g[3]), g[4]!];
+      const r = kind === "goal" ? 30 : kind === "lead" ? 24 : kind === "human" ? 19 : kind === "rev" ? 18 : 17;
+      if (!inner.startsWith('<circle class="shape" r="9"')) boxes.push({ x: px - r, y: py - r, w: 2 * r, h: 2 * r, what: `${kind} shape` });
+      for (const t of inner.matchAll(/<text class="mc-node-(?:label|sub)[^"]*" text-anchor="(start|middle|end)"(?: x="(-?[\d.]+)")? y="(-?[\d.]+)">([^<]*)/g)) {
+        const font = 13;
+        const w = t[4]!.length * font * CHAR_EM;
+        const ax = px + Number(t[2] ?? 0);
+        const x = t[1] === "middle" ? ax - w / 2 : t[1] === "end" ? ax - w : ax;
+        boxes.push({ x, y: py + Number(t[3]) - font * 0.85, w, h: font * 1.1, what: `${kind} label "${t[4]}"` });
+      }
+    }
+    return boxes;
+  }
+
+  it("never cover a node, a label, a hull title, a lane head, the bench chip, the revision anchor, or a talk pill, on the recorded runs", () => {
+    let asked = 0;
+    let placed = 0;
+    const seen = new Set<string>();
+    for (const id of [...RUNS, "board-sim-100"]) {
+      const log = recorded(id);
+      const last = log[log.length - 1]!.seq;
+      const layout = scaledBoardLayout(log);
+      const step = Math.max(1, Math.floor(last / 14));
+      for (let k = 6; k <= last; k += step) {
+        const model = buildBoardGraph(log, k);
+        const captions = boardCaptions(log, k - 3, k, new Set(model.nodes.map((n) => n.id)), 3);
+        asked += captions.length;
+        const html = renderToStaticMarkup(
+          createElement(BoardGraphView, {
+            model,
+            layout,
+            selection: null,
+            log,
+            messageMode: "live",
+            recentSeqs: new Set<number>(),
+            captions,
+            onSelect: () => {},
+            arrows: communicationArrows(log, k),
+          }),
+        );
+        const caps = [...html.matchAll(new RegExp(`<g class="mc-caption"><rect ${attrs}`, "g"))].map((m) => rect(m, "caption"));
+        placed += caps.length;
+        const others = drawnBoxes(html);
+        for (const o of others) seen.add(o.what.replace(/ ".*$/, ""));
+        for (const [i, c] of caps.entries()) {
+          for (const o of [...others, ...caps.slice(i + 1)]) {
+            expect(hit(c, o), `${id} seq ${k}: a caption ${JSON.stringify(c)} covers the ${o.what} ${JSON.stringify(o)}`).toBe(false);
+          }
+        }
+      }
+    }
+    // The check really reads every kind of box back from the drawing.
+    for (const what of ["hull title", "lane head", "bench chip", "talk pill", "goal shape", "goal label", "lead shape", "lead label", "human label", "agent label", "rev shape", "rev label", "tool label"]) {
+      expect(seen, what).toContain(what);
+    }
+    expect(asked).toBeGreaterThan(40);
+    // With the roomier layout most captions find a free spot; the rest are left off (the thread still has them).
+    expect(placed / asked).toBeGreaterThan(0.8);
+  });
+
+  it("drop a caption with no free spot instead of covering text", () => {
+    const layout = { width: 400, height: 300, items: new Map() } as unknown as Parameters<typeof placeCaptions>[2];
+    const points = new Map([["agent:a", { x: 200, y: 150 }]]);
+    const everything = [{ x: -1000, y: -1000, w: 3000, h: 3000 }];
+    expect(placeCaptions([{ seq: 1, node: "agent:a", text: "item.claimed" }], points, layout, 1, everything)).toEqual([]);
+    const free = placeCaptions([{ seq: 1, node: "agent:a", text: "item.claimed" }], points, layout, 1, []);
+    expect(free).toHaveLength(1);
+    expect(free[0]!.y + free[0]!.h).toBeLessThanOrEqual(150);
   });
 });
 

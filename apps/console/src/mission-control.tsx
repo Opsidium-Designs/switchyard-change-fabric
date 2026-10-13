@@ -1198,22 +1198,24 @@ interface Box {
   readonly h: number;
 }
 
-function overlaps(a: Box, b: Box): boolean {
-  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
-}
-
 /**
- * Place at most three captions above their senders: each starts just above its
- * node and moves up past any hull title bar or caption already placed (simple
- * vertical stacking), and stays inside the drawing horizontally.
+ * Place at most three captions near their senders with the same collision
+ * avoidance as the talk labels (placeLabel): each takes the first free spot
+ * among a stack of spots above its sender, then above and to either side, then
+ * below, clear of every hull title bar, every `occupied` box (node shapes and
+ * labels, lane heads, the goal and lead labels, the bench chip, the revision
+ * anchor and its line, ...), and the captions already placed, inside the
+ * drawing. A caption with no free spot is dropped (the thread still has it).
  */
 export function placeCaptions(
   captions: readonly { readonly seq: number; readonly node: string; readonly text: string }[],
   points: ReadonlyMap<string, BoardPoint>,
   layout: BoardLayout,
   scale = 1,
+  occupied: readonly Box[] = [],
+  bounds: Box = { x: 0, y: 0, w: layout.width, h: Number.POSITIVE_INFINITY },
 ): PlacedCaption[] {
-  const bars: Box[] = [...layout.items.values()].map((r) => ({ x: r.x, y: r.y, w: r.w, h: HULL_TITLE_H }));
+  const taken: Box[] = [...[...layout.items.values()].map((r) => ({ x: r.x, y: r.y, w: r.w, h: HULL_TITLE_H })), ...occupied];
   const placed: PlacedCaption[] = [];
   const h = 22 * scale;
   for (const caption of captions.slice(0, 3)) {
@@ -1221,15 +1223,17 @@ export function placeCaptions(
     if (!p) continue;
     const text = clip(caption.text, 44);
     const w = Math.max(60, text.length * 7 * scale + 18);
-    const x = Math.min(Math.max(p.x, w / 2 + 4), layout.width - w / 2 - 4);
-    let y = p.y - 26 * scale - h;
-    for (let step = 0; step < 12; step += 1) {
-      const box = { x: x - w / 2, y, w, h };
-      const hit = [...bars, ...placed.map((c) => ({ x: c.x - c.w / 2, y: c.y, w: c.w, h: c.h }))].find((b) => overlaps(box, b));
-      if (!hit) break;
-      y = hit.y - h - 4;
-    }
-    placed.push({ seq: caption.seq, text, x, y: Math.max(2, y), w, h });
+    const x = Math.min(Math.max(p.x, bounds.x + w / 2 + 4), bounds.x + bounds.w - w / 2 - 4);
+    const above = (i: number) => p.y - 26 * scale - h / 2 - i * (h + 4);
+    const candidates = [
+      ...[0, 1, 2, 3, 4, 5].map((i) => ({ x, y: above(i) })),
+      ...[0, 1, 2].flatMap((i) => [-1, 1].map((side) => ({ x: p.x + side * (w / 2 + 24), y: above(i) }))),
+      ...[0, 1, 2].map((i) => ({ x, y: p.y + 34 * scale + h / 2 + i * (h + 4) })),
+    ];
+    const box = placeLabel({ w, h }, candidates, taken, { bounds, gap: 3 });
+    if (!box) continue;
+    taken.push(box);
+    placed.push({ seq: caption.seq, text, x: box.x + box.w / 2, y: box.y, w, h });
   }
   return placed;
 }
@@ -1417,7 +1421,6 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
         : model.edges.filter((e) => e.kind === "message" && recentSeqs.has(e.seqs[e.seqs.length - 1]!))
   ).filter((e) => !onRevOrJev(e.from) && !onRevOrJev(e.to));
   const selectEdge = (edge: BoardGraphEdge) => choose({ kind: "seq", seq: edge.seqs[edge.seqs.length - 1]! });
-  const placedCaptions = placeCaptions(captions, points, { ...layout, width: extent.width }, boost);
   const transformed = view.k !== 1 || view.tx !== 0 || view.ty !== 0;
 
   // The nodes drawn one by one (not in a collapsed hull, not on the bench chip), with a compact hull's short label.
@@ -1451,6 +1454,13 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
     const rect = layout.items.get(node.detail.item);
     if (!rect) continue;
     occupied.push({ x: rect.x, y: rect.y, w: rect.w, h: HULL_TITLE_H });
+    // The done check and the struggling mark at the bottom of the hull (as drawn below).
+    const markBottom = compact ? rect.y + (rect.parent !== undefined ? COMPACT_NESTED_H : COMPACT_HULL_H) : rect.y + rect.h;
+    if (node.detail.completed !== undefined || node.detail.doneProposed) occupied.push({ x: rect.x + rect.w - 33, y: markBottom - 33, w: 22, h: 22 });
+    if (node.detail.struggling !== undefined) {
+      const sx = compact ? rect.x + rect.w - 48 : rect.x + 18;
+      occupied.push({ x: sx - 10, y: markBottom - 30, w: 20, h: 20 });
+    }
     if (node.detail.volunteers !== undefined && node.detail.volunteers.length > 0) {
       occupied.push({ x: rect.x + (compact ? 12 : 34), y: rect.y + rect.h - (compact ? 6 : 15) - 11 * boost, w: Math.max(0, rect.w - (compact ? 70 : 74)), h: 14 * boost });
     }
@@ -1488,12 +1498,14 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
       occupied.push(textBox(revAnchor.x + 18 - w / 2, revAnchor.y - 26, w, 13 * boost));
     }
   }
-  for (const c of placedCaptions) occupied.push({ x: c.x - c.w / 2, y: c.y, w: c.w, h: c.h });
   if (layout.benchChip && bench.idle.length + bench.left.length > 0) {
     occupied.push({ x: layout.benchChip.x, y: layout.benchChip.y, w: benchW, h: BENCH_CHIP_H });
   }
-  // Talk labels, newest arrow first: each takes the first free spot along its curve (or above its sender), else none.
+  // Captions first (the newest messages), clear of everything above; then the talk labels keep clear of the captions.
   const talkBounds = { x: -FIT_PAD, y: -FIT_PAD, w: vbW, h: vbH };
+  const placedCaptions = placeCaptions(captions, points, { ...layout, width: extent.width }, boost, occupied, talkBounds);
+  for (const c of placedCaptions) occupied.push({ x: c.x - c.w / 2, y: c.y, w: c.w, h: c.h });
+  // Talk labels, newest arrow first: each takes the first free spot along its curve (or above its sender), else none.
   const talkDrawn = arrows.flatMap((arrow): TalkDrawn[] => {
     const a = points.get(arrow.from);
     if (!a) return [];
@@ -1873,12 +1885,12 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
               })}
             </g>
 
-            {/* Captions above the senders of newly landed messages (at most three, stacked clear of hull titles). */}
+            {/* Captions near the senders of newly landed messages (at most three, each on a free spot, else left off). */}
             <g className="mc-captions">
               {placedCaptions.map((c) => (
-                <g key={c.seq} className="mc-caption" style={{ transform: `translate(${c.x}px, ${c.y}px)` }}>
-                  <rect x={-c.w / 2} y={0} width={c.w} height={c.h} rx={6} />
-                  <text textAnchor="middle" y={c.h * 0.7}>
+                <g key={c.seq} className="mc-caption">
+                  <rect x={c.x - c.w / 2} y={c.y} width={c.w} height={c.h} rx={6} />
+                  <text textAnchor="middle" x={c.x} y={c.y + c.h * 0.7}>
                     {c.text}
                   </text>
                 </g>
