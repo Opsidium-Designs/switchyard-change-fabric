@@ -171,6 +171,8 @@ export type {
   BoardCandidatePush,
   BoardClashHead,
   EngineRecordType,
+  BoardEngineClose,
+  BoardItemCompletion,
 } from "./board.ts";
 export {
   appendBoardMessage,
@@ -271,6 +273,8 @@ export {
   integratedHead,
   leaseLapse,
   leaseSuspension,
+  engineCloseRefusal,
+  engineClosableItems,
   seamContractFacts,
   verifyBoard,
   withContractTriage,

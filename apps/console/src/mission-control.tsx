@@ -249,7 +249,11 @@ export function payloadSummary(message: BoardMessage): string {
     case "done.proposed":
       return `${message.payload.item} (a proposal: done only on a passing revision)`;
     case "item.completed":
-      return message.payload.via === "tool" ? `${message.payload.item}: its tool was published (v${message.payload.version})` : `${message.payload.item} at rev ${message.payload.n}`;
+      return message.payload.via === "tool"
+        ? `${message.payload.item}: its tool was published (v${message.payload.version})`
+        : message.payload.closedBy === "engine"
+          ? `${message.payload.item} at rev ${message.payload.n}, closed by the engine (push #${message.payload.pushSeq} passed; the owner did not propose done)`
+          : `${message.payload.item} at rev ${message.payload.n}`;
     case "contract.proposed":
     case "contract.escalated":
       return `${message.payload.contract}: ${message.payload.kind} ${message.payload.target}`;
@@ -2206,7 +2210,9 @@ export function BoardNodeDetail({ node, landed, preview }: { node: BoardGraphNod
             {row(
               "Done",
               d.completed !== undefined
-                ? `completed at rev ${d.completed.n} (${d.completed.via})`
+                ? d.completed.closedBy === "engine"
+                  ? `completed at rev ${d.completed.n}: closed by the engine (its push #${d.completed.pushSeq ?? "?"} passed; the owner did not propose done)`
+                  : `completed at rev ${d.completed.n} (${d.completed.via})`
                 : d.doneProposed
                   ? "proposed only: not done until a passing revision merges the owner's latest push"
                   : undefined,

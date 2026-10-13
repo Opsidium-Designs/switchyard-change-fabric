@@ -86,6 +86,8 @@ import {
   itemWaitReason,
   leasesOn,
   leaseSuspension,
+  engineClosableItems,
+  type BoardEngineClose,
   deriveCohesionBlueprint,
   type BoardMessage,
   type BoardRules,
@@ -257,6 +259,14 @@ export interface BoardRunBudgets {
    * (default 90 s). Bounded: after it, the owner works on, and edits by hand.
    */
   readonly toolHoldMs?: number;
+  /**
+   * The close-out window, in ms (default 2 minutes): when the agent phase would
+   * end (timeout, quiescence, the lockstep round cap) while owners whose latest
+   * push the latest passing revision merged have not proposed done, those
+   * owners are cued and given this long (every other worker held back) to
+   * propose done before the phase ends. Lockstep: one round of their turns.
+   */
+  readonly closeOutMs?: number;
 }
 
 /** A progress event of a board run. */
@@ -289,6 +299,20 @@ export type BoardRunEvent =
   | { readonly kind: "claim-stalled"; readonly item: string; readonly agent: string }
   /** A quiet board with a held claim not moving (no stated wait reason): its holder was nudged to edit it before any lapse. */
   | { readonly kind: "held-work-nudged"; readonly item: string; readonly agent: string }
+  /**
+   * The agent phase was ending (`reason`) while owners whose latest push a
+   * passing revision merged had not proposed done: they were cued for a
+   * bounded close-out turn before it ends (every other worker held back).
+   */
+  | { readonly kind: "close-out-cued"; readonly reason: BoardStopReason; readonly agents: readonly string[]; readonly items: readonly string[]; readonly windowMs: number }
+  /** The close-out window ended: the cued items still not proposed done. */
+  | { readonly kind: "close-out-ended"; readonly proposed: readonly string[]; readonly pending: readonly string[] }
+  /**
+   * After the agent phase, the engine closed items whose owners did not
+   * propose done, each backed by the owner's latest push (`pushSeq`) that the
+   * passing revision `n` merged (recorded as item.completed closedBy engine at `seq`).
+   */
+  | { readonly kind: "engine-closed"; readonly closes: readonly (BoardEngineClose & { readonly seq: number })[] }
   /** A quiet board with children's pushes awaiting their sub-lead's merge: the sub-lead(s) were nudged to pull. */
   | { readonly kind: "sub-lead-merge-nudged"; readonly agents: readonly string[]; readonly items: readonly string[] }
   /** A quiet board with open items nobody holds (unclaimed, or a lapsed claim): free workers were offered them. */
@@ -489,6 +513,14 @@ export type BoardStopReason =
   | "all-agents-stopped"
   /** The operator stopped the run (options.signal, for example SIGINT): no new turns, no new integration; cleanup still runs. */
   | "interrupted";
+
+/**
+ * The stop reasons that first give owners whose latest push a passing revision
+ * merged a bounded close-out turn to propose done (see BoardRunBudgets.closeOutMs).
+ * Every other reason (an interrupt, a cap, the turn budget, a rate limit, no
+ * agent left) ends the phase at once.
+ */
+const CLOSE_OUT_REASONS: ReadonlySet<BoardStopReason> = new Set<BoardStopReason>(["timeout", "quiescent", "max-rounds", "fix-budget"]);
 
 /** An integration recorded as a board revision. */
 export interface BoardRevision {
@@ -767,7 +799,8 @@ export interface RunBoardResult {
   /**
    * Why each incomplete item did not complete, stated from board state (for
    * example "item X: its push passed in rev N but its owner did not propose
-   * done"). The engine never completes an item on an owner's behalf.
+   * done"). Items the engine closed (item.completed closedBy engine) are not
+   * here: they are completed, and the summary names them.
    */
   readonly incompleteReasons?: readonly string[];
   /** Workers' proposals the lead rejected (with its rationale) or never decided: not counted. */
@@ -2111,8 +2144,10 @@ function outstanding(state: BoardState): BoardItem[] {
 
 /**
  * Why each outstanding item is not completed, stated from board state alone.
- * The engine never completes an item on an owner's behalf: an item whose push
- * passed but whose owner never proposed done stays incomplete, and this says so.
+ * Only an engine close (after the run's last gated pass, backed by the owner's
+ * latest push in it) completes an item on its owner's behalf; an item whose
+ * push passed but whose owner never proposed done and the engine could not
+ * close stays incomplete, and this says so.
  */
 export function incompleteItemReasons(state: BoardState): string[] {
   return outstanding(state).map((i) => {
@@ -2187,6 +2222,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     maxFixAttemptsPerItem: options.budgets?.maxFixAttemptsPerItem ?? 3,
     quiescenceMs: options.budgets?.quiescenceMs ?? 2 * 60 * 1000,
     toolHoldMs: options.budgets?.toolHoldMs ?? 90 * 1000,
+    closeOutMs: options.budgets?.closeOutMs ?? 2 * 60 * 1000,
   };
   const ttl = options.workspaceTtlSeconds ?? 1800;
   const refreshTokens = options.refreshTokens !== false;
@@ -3094,6 +3130,47 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     await operator.recordEngine("run.capped", { kind: cap.kind, limit: cap.limit, used: cap.used, ...(cap.item !== undefined ? { item: cap.item } : {}) }).catch(() => undefined);
   };
 
+  // CLOSE-OUT: the agent phase can end (its timeout, quiescence, the round cap)
+  // right after a passing revision, before owners whose latest push it merged
+  // took the turn that proposes done (for example queued behind other agents
+  // for a model slot). Those owners are cued once per item and given a bounded
+  // window (every other worker held back) before the phase ends. A hard stop
+  // (an interrupt, a cap, the turn budget, a rate limit) is never extended.
+  let closeOut:
+    | { readonly reason: BoardStopReason; readonly detail?: string; readonly agents: ReadonlySet<string>; readonly items: readonly string[]; readonly until: number }
+    | undefined;
+  const cueCloseOut = (reason: BoardStopReason, state: BoardState): { readonly agents: ReadonlySet<string>; readonly items: readonly string[] } | undefined => {
+    if (!CLOSE_OUT_REASONS.has(reason) || budgets.closeOutMs <= 0 || interrupted()) {
+      return undefined;
+    }
+    const targets = engineClosableItems(state);
+    const agents = new Set<string>();
+    const items: string[] = [];
+    for (const owner of new Set(targets.map((t) => t.owner))) {
+      const worker = workers.find((w) => w.id === owner && !w.stopped);
+      const mine = targets.filter((t) => t.owner === owner).map((t) => t.item);
+      if (worker?.cueCloseOut(mine)) {
+        agents.add(owner);
+        items.push(...mine);
+      }
+    }
+    if (agents.size === 0) {
+      return undefined;
+    }
+    emit({ kind: "close-out-cued", reason, agents: [...agents], items, windowMs: budgets.closeOutMs });
+    return { agents, items };
+  };
+  /** The close-out ended: which cued items were proposed done, in words for the stop detail. */
+  const endCloseOut = (items: readonly string[], state: BoardState): string => {
+    const proposed = items.filter((i) => state.items[i]?.status === "done" || state.items[i]?.doneProposed === true);
+    const pending = items.filter((i) => !proposed.includes(i));
+    emit({ kind: "close-out-ended", proposed, pending });
+    return (
+      `close-out after the passing revision: cued the owner(s) of ${items.length} item(s), ${proposed.length} proposed done` +
+      (pending.length > 0 ? `, ${pending.length} did not (${pending.join(", ")})` : "")
+    );
+  };
+
   const lead = makeAgent("lead", "lead");
   // An operator interrupt (options.signal) stops every agent loop at once and
   // ends the agent phase with stop reason "interrupted"; the ending still runs.
@@ -3351,6 +3428,27 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         }
       }
       stopReason ??= check((await operator.page(0, 1)).state) ?? "max-rounds";
+      // Close-out: one round of turns for the cued owners only, before the phase ends.
+      const cued = cueCloseOut(stopReason, (await operator.page(0, 1)).state);
+      if (cued !== undefined) {
+        for (const worker of workers) {
+          if (interrupted() || rateLimit.quotaExhausted || runBudget.exhausted || meter.reached() !== undefined) {
+            break;
+          }
+          if (cued.agents.has(worker.id) && !worker.stopped) {
+            await worker.step();
+          }
+        }
+        reportStops();
+        const after = (await operator.page(0, 1)).state;
+        const closing = endCloseOut(cued.items, after);
+        if (check(after) === "all-items-done") {
+          stopReason = "all-items-done";
+          stopDetail = closing;
+        } else {
+          stopDetail = stopDetail !== undefined ? `${stopDetail}; ${closing}` : closing;
+        }
+      }
     } else {
       loops.push(lead.run({ signal: controller.signal }));
       let latestState: BoardState | undefined;
@@ -3359,12 +3457,47 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       let lastSeq = -1;
       let quietSince = Date.now();
       let turnsSeen = 0;
+      // The poll wait ends early on an interrupt.
+      const pollWait = (): Promise<void> =>
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(done, pollMs);
+          function done(): void {
+            clearTimeout(timer);
+            controller.signal.removeEventListener("abort", done);
+            resolve();
+          }
+          controller.signal.addEventListener("abort", done, { once: true });
+        });
       while (stopReason === undefined) {
         await refreshAgentTokens();
         const state = (await operator.page(0, 1)).state;
-        stopReason = check(state);
-        if (stopReason) {
-          break;
+        const reason = check(state);
+        if (closeOut !== undefined) {
+          // The close-out window: it ends when every cued item was proposed
+          // done, at its bound, or at once on a hard stop (an interrupt, a cap,
+          // every item done); nothing new is recruited or integrated meanwhile.
+          const settled = closeOut.items.every((i) => state.items[i]?.status === "done" || state.items[i]?.doneProposed === true);
+          const hard = reason !== undefined && !CLOSE_OUT_REASONS.has(reason);
+          if (hard || settled || Date.now() >= closeOut.until) {
+            const closing = endCloseOut(closeOut.items, state);
+            stopReason = hard ? reason : closeOut.reason;
+            // A hard stop keeps its own detail (an interrupt's grace, a cap's use), filled in below.
+            stopDetail = hard ? (reason === "all-items-done" ? closing : undefined) : closeOut.detail === undefined ? closing : `${closeOut.detail}; ${closing}`;
+            break;
+          }
+          reportStops();
+          await pollWait();
+          continue;
+        }
+        if (reason !== undefined) {
+          const cued = cueCloseOut(reason, state);
+          if (cued === undefined) {
+            stopReason = reason;
+            break;
+          }
+          closeOut = { reason, ...cued, until: Date.now() + budgets.closeOutMs };
+          await pollWait();
+          continue;
         }
         latestState = state;
         const before = workers.length;
@@ -3373,6 +3506,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           // Tool builders first: an owner whose unpushed work a codemod being
           // built covers waits (bounded by toolHoldMs from when it was first held).
           const hold = async () => {
+            // During a close-out window only the cued owners take turns.
+            if (closeOut !== undefined) {
+              return !closeOut.agents.has(worker.id);
+            }
             // Judged on the board as it is NOW, not the driver's last poll: a
             // poll that lags (a loaded machine) must not let an owner that just
             // claimed a covered item past the hold. Read only while a codemod
@@ -3414,24 +3551,20 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           // items are offered, stalled claims lapse) before quiescence could.
           quietSince = Date.now();
         } else if (Date.now() - quietSince >= budgets.quiescenceMs) {
-          stopReason = "quiescent";
-          stopDetail =
+          const detail =
             (awaitingSubLead(state).length === 0
               ? `every agent was idle (none taking a turn), nothing was integrating or pending, and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s`
               : `every agent was idle (none taking a turn), nothing was integrating, and no board message arrived for ${Math.round(budgets.quiescenceMs / 1000)} s${awaitingSubLeadDetail(state)}`) +
             undecidedDetail(state);
-          break;
-        }
-        // The poll wait ends early on an interrupt.
-        await new Promise<void>((resolve) => {
-          const timer = setTimeout(done, pollMs);
-          function done(): void {
-            clearTimeout(timer);
-            controller.signal.removeEventListener("abort", done);
-            resolve();
+          const cued = cueCloseOut("quiescent", state);
+          if (cued === undefined) {
+            stopReason = "quiescent";
+            stopDetail = detail;
+            break;
           }
-          controller.signal.addEventListener("abort", done, { once: true });
-        });
+          closeOut = { reason: "quiescent", detail, ...cued, until: Date.now() + budgets.closeOutMs };
+        }
+        await pollWait();
       }
     }
   } catch (error) {
@@ -3477,6 +3610,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   if (stopReason === "capped" && cap !== undefined) {
     stopDetail ??= `the ${cap.kind} cap was reached (${cap.used} of ${cap.limit}): no new turns; the in-flight work was integrated`;
     await recordCap(cap);
+  }
+  if (stopReason === "timeout") {
+    const limit = `the agent phase reached its wall-clock limit (${Math.round(budgets.timeoutMs / 1000)} s; --timeout-ms raises it)`;
+    stopDetail = stopDetail !== undefined ? `${limit}; ${stopDetail}` : limit;
   }
   if (stopReason === "rate-limited") {
     stopDetail ??= rateLimit.stopDetail();
@@ -3550,6 +3687,27 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     }
     if (integrator.revisions.length === 0) {
       emit({ kind: "nothing-to-integrate" });
+    }
+
+    // The engine closes what is left only on recorded state: after a GATED
+    // pass that is the board's latest revision, each held item whose owner
+    // did not propose done but whose latest push a passing revision merged
+    // (no fix, regression, exclusion, contract, contest, or help outstanding;
+    // the board checks each) is recorded item.completed closedBy engine,
+    // citing the push.announced seq. Anything else stays not completed.
+    const lastGated = integrator.revisions.at(-1);
+    if (!integrationCutShort && lastGated?.gate === "pass" && lastGated.gated) {
+      const closes: (BoardEngineClose & { readonly seq: number })[] = [];
+      for (const close of engineClosableItems((await operator.page(0, 1)).state)) {
+        const recorded = await operator.recordEngine("item.completed", { item: close.item, n: close.n, pushSeq: close.pushSeq }).catch(() => undefined);
+        const message = recorded?.ok ? recorded.appended.find((m) => m.type === "item.completed" && m.payload.item === close.item) : undefined;
+        if (message !== undefined) {
+          closes.push({ ...close, seq: message.seq });
+        }
+      }
+      if (closes.length > 0) {
+        emit({ kind: "engine-closed", closes });
+      }
     }
 
     // 5. The authoritative verdict is the LAST revision's gate; only that
@@ -4289,7 +4447,11 @@ function payloadSummary(m: BoardMessage): string {
     case "rebase.needed":
       return `${String(p.agent)} onto rev ${String(p.n)}`;
     case "item.completed":
-      return p.via === "tool" ? `${String(p.item)} via its own tool gate (published v${String(p.version)})` : `${String(p.item)} via rev ${String(p.n)}`;
+      return p.via === "tool"
+        ? `${String(p.item)} via its own tool gate (published v${String(p.version)})`
+        : p.closedBy === "engine"
+          ? `${String(p.item)} via rev ${String(p.n)}, closed by the engine (its push #${String(p.pushSeq)} passed; the owner did not propose done)`
+          : `${String(p.item)} via rev ${String(p.n)}`;
     case "handoff":
       return `${String(p.item)} -> ${String(p.to)}`;
     default:
@@ -4489,6 +4651,30 @@ function formatWaitMs(ms: number): string {
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`;
 }
 
+/**
+ * The items the engine closed (item.completed closedBy engine), one line per
+ * revision: "closed by the engine (push passed in rev N, owner did not propose
+ * done): item (owner X, push #seq), ...". From board state alone.
+ */
+export function engineClosedLines(state: BoardState): string[] {
+  const byRev = new Map<number, BoardItem[]>();
+  for (const item of Object.values(state.items)) {
+    if (item.status === "done" && item.completed?.closedBy === "engine" && item.completed.n !== undefined) {
+      byRev.set(item.completed.n, [...(byRev.get(item.completed.n) ?? []), item]);
+    }
+  }
+  return [...byRev.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(
+      ([n, items]) =>
+        `closed by the engine (push passed in rev ${n}, owner did not propose done): ` +
+        items
+          .sort((a, b) => a.proposedSeq - b.proposedSeq)
+          .map((i) => `${i.id} (owner ${i.owner ?? "?"}, push #${i.completed!.pushSeq ?? "?"})`)
+          .join(", "),
+    );
+}
+
 export function formatBoardRunSummary(result: RunBoardResult): string {
   // Only accepted items count: a worker's proposal the lead rejected (or never
   // decided) is not part of the Change.
@@ -4665,6 +4851,9 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
   }
   for (const id of proposals.undecided) {
     lines.push(`    proposal undecided (the lead never accepted or rejected it): ${id}`);
+  }
+  for (const line of engineClosedLines(result.state)) {
+    lines.push(`    ${line}`);
   }
   for (const reason of result.incompleteReasons ?? []) {
     lines.push(`    not completed: ${reason}`);

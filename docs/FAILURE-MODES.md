@@ -208,6 +208,40 @@ directories are removed before the run exits.
   already-aborted signal runs nothing and reports aborted`
   (`packages/verification/tests/command.test.ts`)
 
+### 14. A fixed run ends partial because owners never proposed done (prevented)
+
+**Seen:** in a live 30-agent run on 2026-10-13, revision 8 passed the full
+gate (237/237) and was promoted, but the run ended `verified (partial: 6
+item(s) not completed ...)` and the CLI exited 1. The pass landed about 80
+seconds before the 30-minute agent-phase wall clock (`--timeout-ms`, not set,
+so the default), and those 6 owners were still queued for one of the 8
+in-flight model slots when the timeout ended the phase. Each item's push had
+passed; only the done proposal was missing.
+
+**Now:** when the phase would end (its timeout, quiescence, the round cap)
+while owners whose latest push a passing revision merged have not proposed
+done, those owners get one close-out cue and a bounded window (2 minutes by
+default; every other worker is held back). After the last gated pass, any such
+item still open is closed by the engine: a recorded `item.completed` with
+`closedBy: engine` that cites the owner's `push.announced` seq. The board
+refuses it unless that push was merged by a passing revision, the board's
+latest revision passed, and nothing is outstanding on the item (a fix request,
+a regression, an exclusion, a pending contract, a contest, a help grant). The
+summary names each one (`closed by the engine (push passed in rev N, owner did
+not propose done): ...`). An item with no such push stays not completed, and
+the result stays partial.
+
+- Code: `engineCloseRefusal` (`packages/change-core/src/board.ts`); the
+  close-out window and the engine close (`packages/orchestration/src/run-board.ts`)
+- Tests: `an owner that never proposes done gets a close-out cue; the engine
+  then closes its item on its recorded push: verified, exit 0`; `an owner that
+  answers the close-out cue proposes done itself: no engine close, every item
+  done`; `an item no passing revision merged a push of stays not completed: the
+  engine closes only the backed item, and the verdict stays partial (exit 1)`;
+  `a timeout right after a pass cues the owner who has not proposed done, holds
+  the others, and the owner closes its item` (`run-board-close-out.e2e.test.ts`);
+  the `engine close` tests (`packages/change-core/tests/board.test.ts`)
+
 ## What is still open
 
 - A changed developer test is approved by a human. When the final revision

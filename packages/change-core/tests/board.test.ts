@@ -21,6 +21,8 @@ import {
   ENGINE_RECORD_TYPES,
   leaseLapse,
   leaseSuspension,
+  engineCloseRefusal,
+  engineClosableItems,
   itemWaitReason,
   describeWaitReason,
   replanEligible,
@@ -4332,5 +4334,74 @@ describe("push.regressed (arbitration revision 5: the pre-pass progress ratchet)
     const board = regressedBoard();
     board.post(msg("engine", "integrated.rev", { commit: "r3", gate: "pass", merged: ["c-one", "c-two-2", "c-three"] }));
     board.reject(regressed(), /the pre-pass ratchet is over/, "INVALID_STATE");
+  });
+});
+
+describe("engine close: an item whose owner did not propose done, backed by its latest push in the latest passing revision", () => {
+  const close = (item: string, n: number, pushSeq: number) => msg("engine", "item.completed", { item, n, pushSeq });
+
+  it("records item.completed closedBy engine citing the push seq, addressed to the owner; replay accepts it and never a forged one", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a.ts"]));
+    const pushed = board.post(push("a", "one", "c1", ["src/a.ts"]))[0]!;
+    board.post(rev("pass", ["c1"], "r1"));
+    expect(board.state.items.one!.status).toBe("claimed");
+    expect(engineClosableItems(board.state)).toEqual([{ item: "one", owner: "a", n: 1, pushSeq: pushed.seq, commit: "c1" }]);
+    board.reject(
+      msg("engine", "item.completed", { item: "one", n: 1, pushSeq: pushed.seq, via: "integrated" }),
+      /an engine close record is \{item, n, pushSeq\}/,
+      "BAD_PAYLOAD",
+    );
+    board.reject(close("one", 1, pushed.seq + 1), /latest push is seq \d+, merged by passing rev 1: an engine close cites exactly those/, "INVALID_STATE");
+    const appended = board.post(close("one", 1, pushed.seq));
+    expect(appended[0]).toMatchObject({
+      from: "engine",
+      type: "item.completed",
+      to: ["a"],
+      payload: { item: "one", n: 1, via: "integrated", closedBy: "engine", pushSeq: pushed.seq },
+    });
+    expect(board.state.items.one).toMatchObject({ status: "done", completed: { n: 1, via: "integrated", closedBy: "engine", pushSeq: pushed.seq, seq: appended[0]!.seq } });
+    expect(engineClosableItems(board.state)).toEqual([]);
+    board.reject(close("one", 1, pushed.seq), /already done/, "INVALID_STATE");
+    expect(reduceBoard(board.log)).toEqual(board.state);
+    // A derived-looking completion in its place is not something arbitration produced.
+    const forged = board.log.map((m) => (m.type === "item.completed" ? ({ ...m, payload: { item: "one", n: 1, via: "integrated" } } as BoardMessage) : m));
+    expect(() => reduceBoard(forged)).toThrow(/was not produced by arbitration/);
+  });
+
+  it("refuses an item whose latest push no passing revision merged, one never pushed, and any close after a failing latest revision", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a.ts"]));
+    board.post(push("a", "one", "c1", ["src/a.ts"]));
+    board.post(rev("pass", ["c1"], "r1"));
+    // A newer push after the pass: its latest push was not merged by a passing revision.
+    const newer = board.post(push("a", "one", "c1b", ["src/a.ts"]))[0]!;
+    board.reject(close("one", 1, newer.seq), /no passing revision merged its latest push/, "INVALID_STATE");
+    // Claimed, never pushed.
+    board.post(claim("b", "two", ["src/b.ts"]));
+    board.reject(close("two", 1, 1), /its owner never pushed for it/, "INVALID_STATE");
+    // A failing latest revision: nothing is closed, even an item an earlier pass merged.
+    board.post(claim("c", "three", ["src/c.ts"]));
+    const three = board.post(push("c", "three", "c3", ["src/c.ts"]))[0]!;
+    board.post(rev("pass", ["c3"], "r2"));
+    expect(engineClosableItems(board.state).map((c) => c.item)).toEqual(["three"]);
+    board.post(rev("fail", ["c1b"], "r3"));
+    board.reject(close("three", 2, three.seq), /the board's latest revision \(3\) did not pass/, "INVALID_STATE");
+    expect(engineClosableItems(board.state)).toEqual([]);
+  });
+
+  it("refuses while a contract for the item waits for a decision, a fix is outstanding, or its push regressed", () => {
+    const board = seeded();
+    board.post(claim("a", "one", ["src/a.ts"]));
+    const pushed = board.post(push("a", "one", "c1", ["src/a.ts"]))[0]!;
+    board.post(rev("pass", ["c1"], "r1"));
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "src/api.ts", kind: "add", item: "one" }));
+    board.reject(close("one", 1, pushed.seq), /a contract for it waits for a decision/, "INVALID_STATE");
+    board.post(msg("lead", "contract.rejected", { contract: "k1" }));
+    expect(engineCloseRefusal(board.state, board.state.items.one!)).toBeUndefined();
+    const item = board.state.items.one!;
+    expect(engineCloseRefusal(board.state, { ...item, fixRequested: 2 })).toMatch(/a fix is outstanding/);
+    expect(engineCloseRefusal(board.state, { ...item, lastPush: { ...item.lastPush!, regressed: { seq: 1 } as never } })).toMatch(/regressed, excluded, or unverified/);
+    expect(engineCloseRefusal(board.state, { ...item, doneProposed: true })).toBe("its owner proposed done");
   });
 });

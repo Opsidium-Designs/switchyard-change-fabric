@@ -1414,6 +1414,20 @@ const commands: Command[] = [
             case "agents-done":
               console.log(`Agent phase ended: ${event.reason}${event.detail ? ` (${event.detail})` : ""}.`);
               break;
+            case "close-out-cued":
+              console.log(
+                `  close-out: the agent phase is ending (${event.reason}); cued ${event.agents.join(", ")} to propose done on ${event.items.join(", ")} ` +
+                  `(their latest push passed), up to ${Math.round(event.windowMs / 1000)} s with every other worker held`,
+              );
+              break;
+            case "close-out-ended":
+              console.log(`  close-out ended: ${event.proposed.length} proposed done${event.pending.length > 0 ? `; not proposed: ${event.pending.join(", ")}` : ""}`);
+              break;
+            case "engine-closed":
+              for (const c of event.closes) {
+                console.log(`  closed by the engine: ${c.item} (owner ${c.owner} did not propose done; its push #${c.pushSeq} passed in rev ${c.n}; recorded at #${c.seq})`);
+              }
+              break;
             case "integrated": {
               const r = event.revision;
               console.log(
