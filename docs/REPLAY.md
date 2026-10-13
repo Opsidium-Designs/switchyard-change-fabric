@@ -162,6 +162,64 @@ compact JSON). `DRY_RUN=1` prints the plan and writes nothing.
 - The console shows a preview link only when its commit is the commit the log
   recorded for that revision; anything else is ignored.
 
+## Try the apps
+
+A run can carry two live links, shown under its verdict ("Try the app") and,
+smaller, on its card in the run list: **Original (before the run)** and
+**Fixed by this run (revision N)**, each opening in a new tab. Each app's home
+page checks itself, so the two are easy to compare: storefront's health checks
+(about 1 of 16 pass on the original, 16 of 16 after a correct fix), service-api's
+"Run all checks" (6 of 18 secure, then 18 of 18), cityhall's self-test (about 1
+of 46, then 46 of 46).
+
+Both versions live on ONE Worker per app, `switchyard-showcase-<app>`:
+
+- the production deploy and the `before` preview alias serve
+  `examples/apps/<app>` at the repo's HEAD commit (the original code);
+- the `after-<run tag>-r<n>` alias serves the fixed code of that run (the alias
+  names the run, so two runs of one app never share a fixed link).
+
+```bash
+# a passing run: the fixed code is a git dir or bundle (optionally @ref; HEAD by default)
+make showcase APP=storefront FIXED=$HOME/path/to/storefront--board-live-sf21.bundle RUN=board-live-sf21 DRY_RUN=1
+# a run with no fixed code (a failed run): the original only, on one or more runs
+make showcase APP=storefront BEFORE_ONLY=1 RUN="board-live-sf7 board-live-sf8" DRY_RUN=1
+# remove an app's showcase Worker (both versions and its production URL)
+make showcase-down APP=storefront
+```
+
+- **Honesty.** The fixed link is the exact code the gate passed. The command
+  reads the run's replay and refuses, before anything is uploaded, unless the
+  run's verdict is verified with a gated passing revision and the fixed commit
+  either has the same tree as that revision's gated commit (when the source
+  holds it) or is the promoted commit the replay records for that revision
+  (`revision.promoted`). A source that proves neither is refused with the
+  reason; pass the run's integration repo instead, or publish the original only.
+- **Nothing in the repo changes.** Each source is exported into a temporary
+  directory and given its own `wrangler.jsonc` (the showcase Worker's name, the
+  app's own `main` and `compatibility_date`, `workers_dev` and `preview_urls`
+  on); wrangler runs there. The apps have no runtime dependencies, so nothing
+  is installed. Local `.wrangler` state in a source is never uploaded.
+- **Recording.** After a real run, the links are written into the run's entry
+  in `apps/console/public/replays/index.json` as `apps: { before: { url,
+  commit }, after: { url, commit, run, rev } }` (`before.commit` is the repo
+  commit the original came from; `after.commit` the fixed commit). A
+  before-only run keeps an `after` already recorded. Rebuild and redeploy the
+  page (`make deploy-replay`) to publish them. The page shows a link only when
+  it is an https `workers.dev` URL with no credentials, and a fixed link only on
+  the run it names. Re-exporting a run rewrites its entry without `apps`:
+  run `make showcase` again after a re-export.
+- **What a viewer reaches.** The originals are deliberately broken (no auth on
+  writes, wrong money math), but they hold no real data: every app keeps demo
+  records in memory, per isolate. The checks a viewer runs write demo records
+  into that memory only.
+- **Lifetime and cost.** The Worker is named outside the
+  `switchyard-change-fabric-*` resources, so `make infra-down` leaves it up on
+  purpose (the public demo survives an infra teardown); remove it with
+  `make showcase-down APP=<app>`. Credentials come from `.env`, read into
+  memory by the CLI and passed only to wrangler; they are never printed.
+  `DRY_RUN=1` prints the exact commands and config and touches nothing.
+
 ## Deploy it
 
 `apps/console/wrangler.replay.jsonc` serves `dist-replay/` as Workers static

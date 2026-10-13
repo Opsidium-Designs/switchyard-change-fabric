@@ -112,6 +112,8 @@ import {
 } from "@switchyard-change/orchestration";
 import { DEFAULT_JEV_MODEL, describeRetryAfter, DiscoveringExecutor, isQuotaExhaustedError, parseInferenceMode, probeCli } from "@switchyard-change/model-adapters";
 
+import { showcaseAppCommand } from "./showcase-app.ts";
+
 const CLI_NAME = "switchyard-change";
 const VERSION = "0.0.0";
 
@@ -1706,6 +1708,8 @@ const commands: Command[] = [
       return 0;
     },
   },
+  // The replay page's "Try the app" links (see showcase-app.ts).
+  showcaseAppCommand({ cliName: CLI_NAME, repoRoot, wranglerCommand, wranglerEnv, optionValue, optionValues, hasFlag }),
 ];
 
 const commandMap = new Map(commands.map((c) => [c.name, c]));
@@ -2253,7 +2257,7 @@ async function preflightInference(): Promise<boolean> {
 }
 
 /** The commands that read `.env`: they talk to the live Worker, Cloudflare, or the AI Gateway. */
-const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "tool-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "teardown-app", "cleanup-live", "preview-replay"]);
+const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "tool-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "teardown-app", "cleanup-live", "preview-replay", "showcase-app"]);
 
 /**
  * Load the repo's `.env` (or SCF_ENV_FILE) into memory, never into this

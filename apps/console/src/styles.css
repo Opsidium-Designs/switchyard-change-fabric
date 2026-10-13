@@ -2623,3 +2623,31 @@ body {
 }
 .replay-card.is-simulated { border-style: dashed; border-top-style: solid; border-top-color: var(--warn); }
 .replay-card .replay-sim-chip { align-self: flex-start; }
+
+/* "Try the app": the original and the run-fixed code, live, each in a new tab. */
+.replay-try {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 0.6rem;
+  font-size: 0.88rem;
+}
+.replay-try-links { display: inline-flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.replay-try-link {
+  display: inline-block;
+  padding: 0.2rem 0.65rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 600;
+  text-decoration: none;
+}
+.replay-try-link:hover, .replay-try-link:focus-visible { border-color: var(--accent); color: var(--accent); }
+.replay-try-link.is-before { border-left: 3px solid var(--bad-strong); }
+.replay-try-link.is-after { border-left: 3px solid var(--ok-strong); }
+.replay-try-none { color: var(--muted); font-size: 0.84rem; }
+.replay-try-hint { flex-basis: 100%; margin: 0; color: var(--muted); font-size: 0.82rem; line-height: 1.45; }
+.replay-card-try { margin: 0; font-size: 0.8rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: baseline; }
+.replay-card-try a { color: var(--accent); text-decoration: none; }
+.replay-card-try a:hover, .replay-card-try a:focus-visible { text-decoration: underline; }

@@ -116,7 +116,10 @@ the Queue, and the Artifacts `repo.pushed` subscription (real, billable,
 idempotent). `make infra-status` is read-only ("am I paying for anything?").
 `make infra-down` removes it all, including leftover repos. See
 [`docs/EVENT-SUBSCRIPTION.md`](docs/EVENT-SUBSCRIPTION.md) and
-[`docs/LIVE-DEPLOY.md`](docs/LIVE-DEPLOY.md).
+[`docs/LIVE-DEPLOY.md`](docs/LIVE-DEPLOY.md). The replay page's "Try the app"
+Workers (`switchyard-showcase-<app>`, from `make showcase`) are deliberately
+outside that teardown; remove one with `make showcase-down APP=<app>` (see
+[`docs/REPLAY.md`](docs/REPLAY.md)).
 
 ## How it works
 
