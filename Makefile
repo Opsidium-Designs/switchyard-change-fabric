@@ -19,6 +19,10 @@
 #   make demo-board-storefront  the board on the multi-domain storefront app (offline, deterministic)
 #   make run-board-storefront   live board run on the storefront app (needs a running Worker and the AI Gateway)
 #   make storefront-gate  install the storefront app's pinned deps and run its gate (fails on the planted gaps)
+#   make demo-board-cityhall  the board on the 32-module cityhall app (offline, deterministic)
+#   make run-board-cityhall   live board run on the cityhall app at ~30 agents (needs a running Worker and inference)
+#   make cityhall-gate  install the cityhall app's pinned deps and run its gate (fails on the planted gaps)
+#   make cityhall-reference-check  prove cityhall is solvable: baseline gate fails, reference solution passes (offline)
 #   make demo-live   one-command watchable live demo (needs `make dev-all` running)
 #   make clean-live  tear down the real repos a watch run left up
 #   make seed-change seed the demo Change into a running Worker (for the console)
@@ -41,7 +45,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: export-replay preview-replay replay-build replay-preview deploy-replay delete-replay jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: export-replay preview-replay replay-build replay-preview deploy-replay delete-replay jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-board-cityhall run-board-cityhall cityhall-gate cityhall-reference-check demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -310,6 +314,46 @@ run-board-storefront:
 
 storefront-gate:
 	cd examples/apps/storefront && npm ci --no-audit --no-fund && npm run gate
+
+# The THIRD example app, built for coordination at scale: a city-services API of
+# eight departments x four route modules (32 modules, one file each) over shared
+# money, time, validate, auth, and http contracts. Every module has its own
+# independent planted gaps (about 30 to 40 parallel items with disjoint write
+# sets), three shared seams several modules wait on (a missing money split, a
+# wrong business-day count, unbounded pagination), a few cross-department
+# dependencies, and two developer tests that pin the old behavior (a human
+# decides those contract changes). See examples/apps/cityhall/README.md. The
+# acceptance gate has 237 tests, so each revision's progress shows as a count.
+#
+# demo-board-cityhall runs it offline and deterministically with the generic
+# fixture gate (coordination only, not a real fix; no credentials). The live run
+# needs a running Worker (`make dev`) and live inference; it runs at about 30
+# agents (CH_MIN/CH_MAX/CH_INFLIGHT turn the dial; DECIDE=accept|reject answers
+# the test contract changes from the CLI, unset waits for the console).
+# cityhall-gate runs the app's own gate locally (it FAILS on the baseline; that
+# is the point), and cityhall-reference-check proves it is solvable by running
+# the gate on the baseline (must fail) and on the reference solution kept
+# outside the app in examples/reference/ (must pass). Both are offline.
+CITYHALL_GOAL = $(CURDIR)/examples/goals/cityhall-services-correct.goal.txt
+CITYHALL_PROJECT = $(CURDIR)/examples/apps/cityhall
+CH_MIN ?= 8
+CH_MAX ?= 30
+CH_INFLIGHT ?= 8
+
+demo-board-cityhall:
+	npm -w apps/cli run dev -- run-board --offline --fixture-gate --decide-contracts $(DECIDE_CONTRACTS) --goal-file "$(CITYHALL_GOAL)" --project "$(CITYHALL_PROJECT)" \
+	  --min $(MIN) --max $(MAX)
+
+run-board-cityhall:
+	npm -w apps/cli run dev -- run-board --goal-file "$(CITYHALL_GOAL)" --project "$(CITYHALL_PROJECT)" --worker "$(WORKER)" \
+	  --min $(CH_MIN) --max $(CH_MAX) --max-inflight $(CH_INFLIGHT) $(if $(INTEGRATOR),--integrator $(INTEGRATOR),) $(if $(DECIDE),--decide-contracts $(DECIDE),)
+
+cityhall-gate:
+	cd examples/apps/cityhall && npm ci --no-audit --no-fund && npm run gate
+
+cityhall-reference-check:
+	cd examples/apps/cityhall && npm ci --no-audit --no-fund
+	node examples/reference/check-cityhall.mjs
 
 # The watchable live headline run. It uses the seeded audit-logging Change (which
 # has the hardcoded src/audit/events.ts collision), so the human escalation beat
