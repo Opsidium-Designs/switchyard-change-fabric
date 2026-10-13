@@ -19,9 +19,17 @@ import { pullBoard, resolveEscalation } from "./board-data";
 import { GraphView, changeHasPassed } from "./graph-view";
 import { MissionControl, type BoardEscalationRecord } from "./mission-control";
 import { ThemeToggle } from "./theme";
-import { boardCapable, TEMPLATES, type ContractPolicy, type LaunchMode, type Template } from "./templates";
+import {
+  boardCapable,
+  DEFAULT_DIAL_LIMIT,
+  dialLimitOf,
+  TEMPLATES,
+  type ContractPolicy,
+  type LaunchMode,
+  type Template,
+} from "./templates";
 import { postToWorker } from "./worker-post";
-import { readPreviews } from "./previews.ts";
+import { latestPassingPreview, readPreviews, type RevisionPreview } from "./previews.ts";
 
 /**
  * Console for the Switchyard Change Fabric: the control plane.
@@ -92,7 +100,7 @@ export function openBoardFeed(
 }
 
 /** The launcher-side status of a launched run (from GET /api/runs/:id). */
-interface LaunchStatus {
+export interface LaunchStatus {
   readonly status: "running" | "exited";
   readonly exitCode: number | null;
   readonly log: readonly string[];
@@ -201,6 +209,62 @@ export function isBoardRun(runMode: LaunchMode | null, snapshot: unknown): boole
   return typeof board?.messages === "number" && board.messages > 0;
 }
 
+/**
+ * A per-app deploy/remove operation in flight or failed. "Deployed" is not an
+ * op: it is the presence of the app's URL (from a Deploy or the launcher's
+ * markers), so a reload still knows it.
+ */
+export type AppOp =
+  | { readonly kind: "deploying" }
+  | { readonly kind: "removing" }
+  | { readonly kind: "failed"; readonly action: "deploy" | "remove"; readonly error: string };
+
+/**
+ * The lines of a failed deploy/remove CLI worth showing: its own failure lines
+ * (`Deploy failed: ...`, `Remove failed: ...`, any `Error`), never npm's
+ * boilerplate; with none, the last few lines of its output.
+ */
+export function cliErrorLines(output: readonly string[], max = 4): string[] {
+  const own = output.filter((line) => !NPM_BOILERPLATE.test(line)).map((line) => line.trim());
+  const failures = own.filter((line) => /\bfailed\b|\berror\b/i.test(line));
+  return (failures.length > 0 ? failures : own).slice(-max);
+}
+
+/** The question a human answers before an app's deployed Worker is deleted. */
+export function removeAppConfirmText(app: string, url: string): string {
+  return (
+    `Remove the deployed ${app} app at ${url}?\n\n` +
+    `This deletes its Cloudflare Worker (and the revision previews uploaded as versions of it). ` +
+    `No run's repos are touched; you can Deploy it again later.`
+  );
+}
+
+/** The question a human answers before a run's real Artifact repos are torn down. */
+export function tearDownConfirmText(changeId: string): string {
+  return (
+    `Tear down the real Artifact repos of run ${changeId}?\n\n` +
+    `This deletes (archives) every repo the run created; it cannot be undone from here. ` +
+    `A deployed app stays deployed (use Remove app for that).`
+  );
+}
+
+/**
+ * Why the run's Tear down is not allowed right now, or null when it is: a run
+ * the launcher reports as still running is using those repos. A run whose
+ * status has not arrived yet is treated as running, unless the launcher does
+ * not know the run at all (it was restarted), when tearing down is the only way
+ * left to clean up from here.
+ */
+export function tearDownBlockedReason(launchStatus: LaunchStatus | null, launcherKnowsRun: boolean): string | null {
+  if (launchStatus?.status === "running") {
+    return "The run is still running and using these repos: tear down after it exits.";
+  }
+  if (launchStatus === null && launcherKnowsRun) {
+    return "Waiting for the launcher to report the run's status.";
+  }
+  return null;
+}
+
 export function App() {
   // No change-id box: the console follows the UNIQUE id the launcher hands back
   // when a template is launched. Null means no run yet. A run started from the
@@ -230,6 +294,17 @@ export function App() {
   // place to the SAME URL), to teardown. This is the pre-run break the watcher
   // sees before launching a fix.
   const [deployedUrls, setDeployedUrls] = useState<Record<string, string>>({});
+  // Per-app deploy/remove operations in flight or failed (app name -> op).
+  const [appOps, setAppOps] = useState<Record<string, AppOp>>({});
+  // Apps a verified run of THIS session redeployed in place: their stable URL
+  // now serves the fix, not the original code.
+  const [redeployedApps, setRedeployedApps] = useState<Record<string, true>>({});
+  // A run followed read-only with ?watch= was not launched here: this console
+  // never tears its repos down.
+  const [watchOnly, setWatchOnly] = useState(() => watchedChangeId(typeof window === "undefined" ? "" : window.location.search) !== null);
+  // Whether the launcher knows the followed run (false after a 404, e.g. the
+  // dev server restarted): then its status will never arrive.
+  const [launcherKnowsRun, setLauncherKnowsRun] = useState(true);
   // The template gallery collapses to a one-line strip while a run is active so
   // the graph sits near the top of the page.
   const [galleryOpen, setGalleryOpen] = useState(() => watchedChangeId(typeof window === "undefined" ? "" : window.location.search) === null);
@@ -335,9 +410,15 @@ export function App() {
     let cancelled = false;
     const pull = () => {
       void fetch(`/api/runs/${encodeURIComponent(changeId)}`)
-        .then((res) => (res.ok ? res.json() : null))
+        .then((res) => {
+          if (!cancelled && res.status === 404) {
+            setLauncherKnowsRun(false);
+          }
+          return res.ok ? res.json() : null;
+        })
         .then((body: LaunchStatus | null) => {
           if (!cancelled && body) {
+            setLauncherKnowsRun(true);
             setLaunchStatus(body);
           }
         })
@@ -448,6 +529,38 @@ export function App() {
     }
   }, [reportedDial]);
 
+  // The sliders' ceiling for the next launch: the default, or on the board the
+  // largest template dial limit (the launcher clamps each launch to its own
+  // template's limit). Switching back to a smaller ceiling clamps the dial.
+  const dialLimit = useMemo(
+    () => Math.max(DEFAULT_DIAL_LIMIT, ...templates.map((t) => dialLimitOf(t, launchMode))),
+    [templates, launchMode],
+  );
+  useEffect(() => {
+    if (changeId) {
+      return;
+    }
+    setMin((value) => Math.min(value, dialLimit));
+    setMax((value) => Math.min(value, dialLimit));
+  }, [dialLimit, changeId]);
+
+  // A verified run that redeployed the app in place: its stable URL now serves
+  // the fix, so the gallery stops calling it the original code.
+  const redeployedUrl = snapshot?.deployment?.url;
+  const activeApp = activeTemplate?.app;
+  useEffect(() => {
+    if (redeployedUrl && activeApp) {
+      setRedeployedApps((prev) => (prev[activeApp] ? prev : { ...prev, [activeApp]: true }));
+    }
+  }, [redeployedUrl, activeApp]);
+
+  // The fixed app: the latest passing revision's backed preview (board runs with
+  // previews on). Only a preview whose commit matches the log is ever linked.
+  const fixedPreview = useMemo(
+    () => (boardMode ? latestPassingPreview(boardLog, readPreviews(snapshot)) : undefined),
+    [boardMode, boardLog, snapshot],
+  );
+
   const selectedNode: GraphNode | null = useMemo(() => {
     if (!model || !selectedId) {
       return null;
@@ -501,9 +614,16 @@ export function App() {
         setBusy(false);
         return;
       }
-      const body = (await res.json()) as { changeId: string; mode?: LaunchMode };
+      const body = (await res.json()) as { changeId: string; mode?: LaunchMode; dial?: { min: number; max: number } };
       // Follow the unique id the launcher generated. Reset the view for the run.
       setRunMode(body.mode ?? launchMode);
+      // The dial the launcher actually used (clamped to this template's limit).
+      if (body.dial) {
+        setMin(body.dial.min);
+        setMax(body.dial.max);
+      }
+      setWatchOnly(false);
+      setLauncherKnowsRun(true);
       resetBoard();
       setSnapshot(null);
       setSelectedId(null);
@@ -538,48 +658,121 @@ export function App() {
   // first. The URL is surfaced persistently and the fix later redeploys in place
   // to the SAME URL. This never launches a run; it is purely the deploy hop.
   const deployApp = useCallback(async (template: Template) => {
-    if (!template.app) {
+    const app = template.app;
+    if (!app) {
       return;
     }
-    setBusy(true);
     setNotice(null);
+    setAppOps((prev) => ({ ...prev, [app]: { kind: "deploying" } }));
+    let op: AppOp | null = null;
     try {
       const res = await fetch("/api/deploy-app", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ templateId: template.id, app: template.app }),
+        body: JSON.stringify({ templateId: template.id, app }),
       });
-      const body = (await res.json().catch(() => ({}))) as { url?: string; error?: string };
+      const body = (await res.json().catch(() => ({}))) as { url?: string; error?: string; output?: string[] };
       if (res.ok && body.url) {
-        setDeployedUrls((prev) => ({ ...prev, [template.app as string]: body.url as string }));
+        const url = body.url;
+        setDeployedUrls((prev) => ({ ...prev, [app]: url }));
+        setRedeployedApps((prev) => {
+          const next = { ...prev };
+          delete next[app];
+          return next;
+        });
         setNotice(
-          `deployed ${template.name} in its current (broken) state to ${body.url}. ` +
-            `Open it to see the break, then launch the fix to redeploy in place to the same URL.`,
+          `deployed ${template.name} in its original (broken) state to ${url}. ` +
+            `Open it to see the break, then launch the fix.`,
         );
       } else {
-        setNotice(body.error ?? `could not deploy ${template.name} (${res.status}).`);
+        const lines = cliErrorLines(body.output ?? []);
+        op = { kind: "failed", action: "deploy", error: [body.error ?? `deploy failed (${res.status})`, ...lines].join("\n") };
       }
     } catch {
-      setNotice("cannot reach the launcher to deploy. Is `make dev-all` running?");
+      op = { kind: "failed", action: "deploy", error: "cannot reach the launcher to deploy. Is `make dev-all` running?" };
     }
-    setBusy(false);
+    setAppOps((prev) => {
+      const next = { ...prev };
+      if (op) {
+        next[app] = op;
+      } else {
+        delete next[app];
+      }
+      return next;
+    });
   }, []);
+
+  // Remove a deployed app: delete its stable Worker (and the previews that are
+  // versions of it) and clear its marker, after the human confirms. No run's
+  // repos are touched.
+  const removeApp = useCallback(async (template: Template) => {
+    const app = template.app;
+    const url = app ? deployedUrls[app] : undefined;
+    if (!app || !url) {
+      return;
+    }
+    if (typeof window !== "undefined" && !window.confirm(removeAppConfirmText(app, url))) {
+      return;
+    }
+    setNotice(null);
+    setAppOps((prev) => ({ ...prev, [app]: { kind: "removing" } }));
+    let op: AppOp | null = null;
+    try {
+      const res = await fetch("/api/teardown-app", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ templateId: template.id, app }),
+      });
+      const body = (await res.json().catch(() => ({}))) as { ok?: boolean; error?: string; output?: string[] };
+      if (res.ok && body.ok) {
+        setDeployedUrls((prev) => {
+          const next = { ...prev };
+          delete next[app];
+          return next;
+        });
+        setRedeployedApps((prev) => {
+          const next = { ...prev };
+          delete next[app];
+          return next;
+        });
+        setNotice(`removed ${template.name}: ${url} is no longer deployed.`);
+      } else {
+        const lines = cliErrorLines(body.output ?? []);
+        op = { kind: "failed", action: "remove", error: [body.error ?? `remove failed (${res.status})`, ...lines].join("\n") };
+      }
+    } catch {
+      op = { kind: "failed", action: "remove", error: "cannot reach the launcher to remove the app. Is `make dev-all` running?" };
+    }
+    setAppOps((prev) => {
+      const next = { ...prev };
+      if (op) {
+        next[app] = op;
+      } else {
+        delete next[app];
+      }
+      return next;
+    });
+  }, [deployedUrls]);
 
   // Per-run cleanup: tear down THIS run's real Artifact repos (scoped to its
   // unique id), so clicking through templates repeatedly never leaves billable
   // repos. A new run uses a fresh unique id, so it never collides with a prior
-  // run even before cleanup.
+  // run even before cleanup. It deletes real repos, so the human confirms
+  // first, and it is refused while the launched run is still running. A
+  // deployed app is NOT removed here (Remove app does that).
   const cleanupRun = useCallback(async () => {
-    if (!changeId) {
+    if (!changeId || watchOnly || tearDownBlockedReason(launchStatus, launcherKnowsRun) !== null) {
+      return;
+    }
+    if (typeof window !== "undefined" && !window.confirm(tearDownConfirmText(changeId))) {
       return;
     }
     setBusy(true);
     try {
-      const teardownApp = activeTemplate?.app;
       const res = await fetch("/api/cleanup", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ changeId, ...(teardownApp ? { app: teardownApp } : {}) }),
+        body: JSON.stringify({ changeId }),
       });
       const body = (await res.json().catch(() => ({}))) as {
         ok?: boolean;
@@ -596,13 +789,6 @@ export function App() {
         setRunMode(null);
         resetBoard();
         setGalleryOpen(true);
-        if (teardownApp) {
-          setDeployedUrls((prev) => {
-            const next = { ...prev };
-            delete next[teardownApp];
-            return next;
-          });
-        }
       } else {
         setNotice(body.error ?? `cleanup did not complete for ${changeId}.`);
       }
@@ -610,7 +796,7 @@ export function App() {
       setNotice("cannot reach the launcher to clean up. Is `make dev-all` running?");
     }
     setBusy(false);
-  }, [changeId, activeTemplate, resetBoard]);
+  }, [changeId, watchOnly, launchStatus, launcherKnowsRun, resetBoard]);
 
   // Answer a board escalation (a contest or a protected contract) through the
   // existing resolve route, proxied by the launcher when it can.
@@ -652,15 +838,29 @@ export function App() {
         activeId={activeTemplate?.id ?? null}
         busy={busy}
         deployedUrls={deployedUrls}
+        appOps={appOps}
+        redeployedApps={redeployedApps}
+        appInUse={
+          activeTemplate?.app && !watchOnly && tearDownBlockedReason(launchStatus, launcherKnowsRun) !== null
+            ? activeTemplate.app
+            : null
+        }
         collapsed={Boolean(changeId) && !galleryOpen}
         onToggle={() => setGalleryOpen((open) => !open)}
         onLaunch={launchTemplate}
         onDeploy={deployApp}
+        onRemove={removeApp}
+        onSuggestDial={(dial) => {
+          setMin(dial.min);
+          setMax(dial.max);
+        }}
+        dialLocked={Boolean(changeId)}
         launchMode={launchMode}
       >
         <DialControl
           min={min}
           max={max}
+          limit={dialLimit}
           locked={Boolean(changeId)}
           onMin={setMin}
           onMax={setMax}
@@ -692,6 +892,9 @@ export function App() {
             }
             busy={busy}
             onTearDown={() => void cleanupRun()}
+            watchOnly={watchOnly}
+            tearDownBlocked={tearDownBlockedReason(launchStatus, launcherKnowsRun)}
+            fixedApp={fixedPreview}
           />
         ) : (
           <p className="muted">Pick a template above to launch a live run.</p>
@@ -788,10 +991,16 @@ function TemplateGallery({
   activeId,
   busy,
   deployedUrls,
+  appOps = {},
+  redeployedApps = {},
+  appInUse = null,
   collapsed,
   onToggle,
   onLaunch,
   onDeploy,
+  onRemove,
+  onSuggestDial,
+  dialLocked = false,
   launchMode = "live",
   children,
 }: {
@@ -799,10 +1008,17 @@ function TemplateGallery({
   activeId: string | null;
   busy: boolean;
   deployedUrls: Record<string, string>;
+  appOps?: Record<string, AppOp>;
+  redeployedApps?: Record<string, true>;
+  /** The app of a launched run still running (its Worker must not be removed under it). */
+  appInUse?: string | null;
   collapsed: boolean;
   onToggle: () => void;
   onLaunch: (template: Template) => void | Promise<void>;
   onDeploy: (template: Template) => void | Promise<void>;
+  onRemove: (template: Template) => void | Promise<void>;
+  onSuggestDial?: (dial: { min: number; max: number }) => void;
+  dialLocked?: boolean;
   launchMode?: LaunchMode;
   children?: ReactNode;
 }) {
@@ -830,14 +1046,18 @@ function TemplateGallery({
         ) : null}
       </div>
       <p className="muted">
-        Launch a live run from here. For an app, Deploy first to see it broken; a
-        verified fix then redeploys to the same URL.
+        Launch a live run from here. For an app, Deploy first to see its original
+        code broken at a live URL; a board run then gives every revision its own
+        preview link, and a verified fix redeploys to the same URL.
       </p>
       {children}
       <ul className="template-list">
         {templates.map((template) => {
           const deployedUrl = template.app ? deployedUrls[template.app] : undefined;
+          const op = template.app ? appOps[template.app] : undefined;
+          const opInFlight = op?.kind === "deploying" || op?.kind === "removing";
           const canLaunch = launchMode === "live" || boardCapable(template);
+          const suggested = template.boardOptions?.suggestedDial;
           return (
             <li
               key={template.id}
@@ -856,27 +1076,41 @@ function TemplateGallery({
                 <dt>What this run solves</dt>
                 <dd>{template.problemItSolves}</dd>
               </dl>
-              <p className="muted template-count">{template.agentCountHint}</p>
-              {deployedUrl ? (
-                <p className="deploy-proof template-deployed">
-                  Deployed:{" "}
-                  <a href={deployedUrl} target="_blank" rel="noreferrer">
-                    {deployedUrl}
-                  </a>
-                </p>
+              <p className="muted template-count">
+                {template.agentCountHint}
+                {suggested && launchMode === "board" && onSuggestDial ? (
+                  <>
+                    {" "}
+                    <button
+                      type="button"
+                      className="secondary"
+                      disabled={dialLocked}
+                      onClick={() => onSuggestDial(suggested)}
+                      title={`Set the dial to min ${suggested.min} / max ${suggested.max} for this template's board run`}
+                    >
+                      Use dial {suggested.min} to {suggested.max}
+                    </button>
+                  </>
+                ) : null}
+              </p>
+              {template.app ? (
+                <AppDeployControl
+                  app={template.app}
+                  url={deployedUrl}
+                  op={op}
+                  redeployed={Boolean(redeployedApps[template.app])}
+                  inUse={appInUse === template.app}
+                  onDeploy={() => void onDeploy(template)}
+                  onRemove={() => void onRemove(template)}
+                />
               ) : null}
               <div className="template-actions">
-                {template.app ? (
-                  <button
-                    type="button"
-                    className="secondary"
-                    onClick={() => void onDeploy(template)}
-                    disabled={busy}
-                  >
-                    {deployedUrl ? "Redeploy current state" : "Deploy app (see it broken)"}
-                  </button>
-                ) : null}
-                <button type="button" onClick={() => void onLaunch(template)} disabled={busy || !canLaunch}>
+                <button
+                  type="button"
+                  onClick={() => void onLaunch(template)}
+                  disabled={busy || !canLaunch || opInFlight}
+                  title={opInFlight ? "Wait for the app's deploy or remove to finish" : undefined}
+                >
                   {launchMode === "board" ? `Launch ${template.name} on the board` : `Launch ${template.name}`}
                 </button>
                 {!canLaunch ? (
@@ -888,6 +1122,92 @@ function TemplateGallery({
         })}
       </ul>
     </section>
+  );
+}
+
+/**
+ * One app's live deployment control on its template card: Deploy when it is not
+ * deployed, and when it is, the URL as a link, what that URL serves (the
+ * ORIGINAL code, before any fix, unless a verified run of this session
+ * redeployed it in place), and Remove app. The status reads deploying,
+ * deployed, removing, or failed with the CLI's own error. Exported for tests.
+ */
+export function AppDeployControl({
+  app,
+  url,
+  op,
+  redeployed = false,
+  inUse = false,
+  onDeploy,
+  onRemove,
+}: {
+  app: string;
+  url: string | undefined;
+  op: AppOp | undefined;
+  redeployed?: boolean;
+  inUse?: boolean;
+  onDeploy: () => void;
+  onRemove: () => void;
+}) {
+  const status =
+    op?.kind === "deploying"
+      ? "deploying..."
+      : op?.kind === "removing"
+        ? "removing..."
+        : op?.kind === "failed"
+          ? `${op.action === "deploy" ? "deploy" : "remove"} failed`
+          : url
+            ? "deployed"
+            : "not deployed";
+  const inFlight = op?.kind === "deploying" || op?.kind === "removing";
+  return (
+    <div className="app-deploy" aria-label={`Deployment of ${app}`}>
+      <p className={`app-deploy-status${op?.kind === "failed" ? " is-failed" : ""}`}>
+        <strong>App {app}:</strong> <span className="app-deploy-state">{status}</span>
+      </p>
+      {url ? (
+        <p className="deploy-proof template-deployed">
+          {redeployed
+            ? "Deployed (the fix, redeployed in place by the verified run): "
+            : "Deployed (the ORIGINAL code, before any fix: open it to see it broken): "}
+          <a href={url} target="_blank" rel="noreferrer">
+            {url}
+          </a>
+        </p>
+      ) : null}
+      {op?.kind === "failed" ? (
+        <pre className="detail-pre app-deploy-error" role="alert">
+          {op.error}
+        </pre>
+      ) : null}
+      <div className="template-actions">
+        {url ? (
+          <button
+            type="button"
+            className="secondary"
+            onClick={onRemove}
+            disabled={inFlight || inUse}
+            title={
+              inUse
+                ? "A launched run of this app is still running; remove the app after it exits."
+                : `Delete the deployed ${app} Worker at ${url}`
+            }
+          >
+            Remove app
+          </button>
+        ) : (
+          <button
+            type="button"
+            className="secondary"
+            onClick={onDeploy}
+            disabled={inFlight}
+            title={`Deploy the original ${app} code (before any fix) to its stable workers.dev URL`}
+          >
+            Deploy app (see it broken)
+          </button>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -945,12 +1265,14 @@ export function RunModeControl({
 function DialControl({
   min,
   max,
+  limit = DEFAULT_DIAL_LIMIT,
   locked,
   onMin,
   onMax,
 }: {
   min: number;
   max: number;
+  limit?: number;
   locked: boolean;
   onMin: (value: number) => void;
   onMax: (value: number) => void;
@@ -964,7 +1286,7 @@ function DialControl({
           id="dial-min"
           type="range"
           min={0}
-          max={8}
+          max={limit}
           value={min}
           disabled={locked}
           onChange={(event) => onMin(Number(event.target.value))}
@@ -975,7 +1297,7 @@ function DialControl({
           id="dial-max"
           type="range"
           min={1}
-          max={8}
+          max={limit}
           value={max}
           disabled={locked}
           onChange={(event) => onMax(Number(event.target.value))}
@@ -1006,6 +1328,9 @@ export function RunStatus({
   dial,
   busy,
   onTearDown,
+  watchOnly = false,
+  tearDownBlocked = null,
+  fixedApp,
 }: {
   changeId: string;
   template: Template | null;
@@ -1015,6 +1340,12 @@ export function RunStatus({
   dial: { min: number; max: number };
   busy: boolean;
   onTearDown: () => void;
+  /** A run followed read-only (?watch=): not launched here, so no Tear down at all. */
+  watchOnly?: boolean;
+  /** Why Tear down is refused right now (the run is still running), or null. */
+  tearDownBlocked?: string | null;
+  /** The latest passing revision's backed preview: the fixed app to open. */
+  fixedApp?: RevisionPreview | undefined;
 }) {
   const failed =
     launchStatus !== null && launchStatus.status === "exited" && launchStatus.exitCode !== 0;
@@ -1034,10 +1365,28 @@ export function RunStatus({
         <span className="dial-locked">
           dial min {dial.min} / max {dial.max} (locked)
         </span>
-        <button type="button" className="secondary" onClick={onTearDown} disabled={busy}>
-          Tear down (repos{template?.app ? " + deployed app" : ""})
-        </button>
+        {watchOnly ? null : (
+          <button
+            type="button"
+            className="secondary"
+            onClick={onTearDown}
+            disabled={busy || tearDownBlocked !== null}
+            title={tearDownBlocked ?? "Delete the real Artifact repos this run created (asks first)"}
+          >
+            Tear down (repos)
+          </button>
+        )}
       </div>
+      {fixedApp ? (
+        <p className="deploy-proof fixed-app">
+          <strong>
+            <a href={fixedApp.url} target="_blank" rel="noreferrer">
+              Open the fixed app
+            </a>
+          </strong>{" "}
+          (revision {fixedApp.n}, the latest whose gate passed; a preview of commit {fixedApp.commit.slice(0, 10)}, the gate decides)
+        </p>
+      ) : null}
       {liveUrl ? (
         <p className="deploy-proof">
           {redeployed ? "Live URL (fix redeployed): " : "Live URL (deployed before the fix): "}

@@ -111,7 +111,9 @@ deploy hop above:
 
 1. **Deploy (see it broken).** The per-app "Deploy app" button deploys the app in
    its CURRENT (broken) state to its STABLE live URL and surfaces that clickable
-   URL. The stable worker name is derived from the app
+   URL, labelled as the original code before any fix. The card shows the status
+   (deploying, deployed, removing, or failed with the CLI's own error). The
+   stable worker name is derived from the app
    (`switchyard-change-fabric-<app>`), not a per-run id, so the URL is fixed.
 2. **Launch the fix.** Launching the template starts a run. The run NEVER deploys
    fresh. Only a `verified` integration verdict is promoted to Git (a
@@ -121,17 +123,37 @@ deploy hop above:
    directory), so the SAME URL now serves the fixed app. A failed or cannot-pass
    verdict is neither promoted nor redeployed. If no Deploy happened first, the
    run deploys nothing: a verified fix is still promoted to Git, and the console
-   simply shows no live URL.
-3. **Tear down.** The "Tear down" control deletes the run's real Artifact repos
-   and, when the app was deployed, the app's stable deployed Worker, so nothing
-   leaks.
+   simply shows no live URL. A board run launched while the app is deployed also
+   gets `--preview-revisions`: every integrated revision is uploaded as a Worker
+   VERSION under a preview alias (never a production deploy), and the run panel
+   links the latest revision whose gate passed as "Open the fixed app" (only a
+   preview whose commit matches the board log's revision is ever linked).
+3. **Tear down (repos).** Once the run has exited, the "Tear down (repos)"
+   control (it asks first) deletes the run's real Artifact repos. It is disabled
+   while the run is still running and hidden for a run followed read-only with
+   `?watch=<id>`. It leaves the deployed app alone.
+4. **Remove app.** The card's "Remove app" control (it asks first, naming the app
+   and URL) deletes the app's stable Worker, and with it the revision previews
+   that are versions of it, and clears its marker. No run's repos are touched.
+   It is disabled while a launched run of that app is still running.
 
 Under the hood a manual Deploy records a small, gitignored per-app marker under
 `.deployments/<app>.json` holding only the public URL (never a secret). The run
 reads it to decide whether to redeploy in place, and teardown clears it. The
-`switchyard-change deploy-app --app <name>` and
-`switchyard-change cleanup-live --change-id <id> --app <name>` commands are the
-CLI equivalents the console launcher calls.
+console launcher calls these CLI commands (from the repo root, with no
+credential in their environment; the CLI reads `.env` itself):
+
+| Console control | Spawned command |
+|-----------------|-----------------|
+| Deploy app | `npm -w apps/cli run dev -- deploy-app --app <app> --worker <worker url>` |
+| Remove app | `npm -w apps/cli run dev -- teardown-app --app <app>` |
+| Tear down (repos) | `npm -w apps/cli run dev -- cleanup-live --change-id <id> --worker <worker url>` |
+
+`teardown-app` runs `wrangler delete` in `examples/apps/<app>` and fails (keeping
+the marker) on any error other than the Worker already being gone; if a scoped
+token cannot run `wrangler delete`, `make delete-app APP=<app>` deletes it over
+the REST API instead. `cleanup-live --app <app>` still tears an app down
+together with a run's repos from the CLI.
 
 ## Protecting the control-plane Worker (API token, fail-closed)
 

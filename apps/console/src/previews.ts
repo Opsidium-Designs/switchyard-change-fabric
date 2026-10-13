@@ -66,6 +66,26 @@ export function backedPreviews(log: readonly BoardMessage[], previews: readonly 
   return out;
 }
 
+/**
+ * The preview of the LATEST revision whose gate passed (a gate actually ran:
+ * an ungated "pass" checked nothing), and only when that preview is backed by
+ * the log's commit for it. This is the fixed app a human can open; undefined
+ * when no passing revision has a backed preview.
+ */
+export function latestPassingPreview(
+  log: readonly BoardMessage[],
+  previews: readonly RevisionPreview[],
+): RevisionPreview | undefined {
+  const backed = backedPreviews(log, previews);
+  let best: RevisionPreview | undefined;
+  for (const m of log) {
+    if (m.type !== "integrated.rev" || m.payload.gate !== "pass" || m.payload.gated === false) continue;
+    const p = backed.get(m.payload.n);
+    if (p !== undefined && (best === undefined || p.n > best.n)) best = p;
+  }
+  return best;
+}
+
 /** How a preview link describes itself (hover text). */
 export function previewTitle(p: RevisionPreview, gate: string): string {
   return `The app running revision ${p.n} (commit ${p.commit.slice(0, 10)}), a Worker version uploaded from that exact commit${p.backfilled ? " after the run" : ""}. Its gate said ${gate}; the preview is only a look, the gate decides.`;

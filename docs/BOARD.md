@@ -1045,7 +1045,7 @@ is distributed changes: items are proposed and claimed, never assigned.
   (`/proc/<pid>/environ`), so a gate or tool child could read its parent's. No
   Makefile target exports `.env` into the CLI any more: the live commands
   (`run-live`, `run-board` without `--offline`, `recruit-live`, `doctor`,
-  `jev-smoke`, `tool-smoke`, `deploy-app`, `cleanup-live`, `preview-replay`, `env-check`) read `.env` (or
+  `jev-smoke`, `tool-smoke`, `deploy-app`, `teardown-app`, `cleanup-live`, `preview-replay`, `env-check`) read `.env` (or
   `SCF_ENV_FILE`) themselves into memory, and the offline commands never read
   it (`packages/orchestration/src/credentials.ts`,
   a small parser, no dependency), and the code that needs a credential reads it

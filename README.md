@@ -89,9 +89,21 @@ static assets). See [docs/REPLAY.md](./docs/REPLAY.md).
      accept or reject that test change (rejecting it leaves the gate failing,
      honestly). Its home page is a tester: about 1 of 16 checks correct before,
      16 of 16 after. See its [README](examples/apps/storefront/README.md).
+   - **Make city hall services correct (board, about 30 agents):** the largest
+     app, `examples/apps/cityhall` (32 modules across 8 city departments over
+     shared money, time, validation, auth, and http contracts). Run it with
+     agents on the board; **Use dial 8 to 30** sets the dial, and the launch
+     passes the same budget flags as `make run-board-cityhall`. Its gate runs a
+     237-test acceptance suite. See its [README](examples/apps/cityhall/README.md).
 
-   Each launch gets a fresh unique Change id. **Tear down** deletes that run's
-   Artifact repos (and the deployed app, if any).
+   Every app card has **Deploy app (see it broken)**, which deploys the ORIGINAL
+   code to the app's stable `workers.dev` URL, and, once deployed, **Remove app**
+   (asks first), which deletes that Worker without touching any run's repos.
+   When the app is deployed, a board run uploads every integrated revision as a
+   preview, and the run panel links the latest passing one as **Open the fixed
+   app**. Each launch gets a fresh unique Change id. **Tear down (repos)** (asks
+   first; available once the run has exited) deletes that run's Artifact repos;
+   it is hidden for a run followed read-only with `?watch=<id>`.
 
 CLI equivalents: `make run-live-service` (the service-api fix),
 `make run-board-storefront` (the storefront on the board; `DECIDE=accept|reject`

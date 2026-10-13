@@ -1615,6 +1615,33 @@ const commands: Command[] = [
     },
   },
   {
+    name: "teardown-app",
+    summary: "Delete an example app's STABLE deployed Worker and clear its deployment marker (no run's repos are touched).",
+    usage: `${CLI_NAME} teardown-app --app <name>`,
+    async run(args) {
+      // The counterpart of deploy-app: delete examples/apps/<app>'s stable
+      // Worker (its revision previews are versions of it, so they go too) and
+      // clear the per-app marker. Unlike cleanup-live it touches no Artifact
+      // repo. The delete is strict: a failure other than "already gone" keeps
+      // the marker and exits non-zero, so a live Worker is never reported gone.
+      const app = optionValue(args, "--app");
+      if (!app || !/^[A-Za-z0-9._-]+$/.test(app) || app.startsWith(".")) {
+        console.error(`Usage: ${CLI_NAME} teardown-app --app <name>`);
+        return 1;
+      }
+      const appDir = resolve(repoRoot(), "examples/apps", app);
+      try {
+        await wranglerDelete(appDir, { strict: true });
+        await clearAppDeployment(repoRoot(), app);
+        console.log(`Removed ${app}: its stable worker ${stableAppWorkerName(app)} is deleted and its deployment marker cleared`);
+        return 0;
+      } catch (error) {
+        console.error(`Remove failed: ${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      }
+    },
+  },
+  {
     name: "cleanup-live",
     summary: "Tear down the real Artifact repos a watch-mode run left in place.",
     usage: `${CLI_NAME} cleanup-live --change-id <id> [--app <name>] [--worker <url>]`,
@@ -2226,7 +2253,7 @@ async function preflightInference(): Promise<boolean> {
 }
 
 /** The commands that read `.env`: they talk to the live Worker, Cloudflare, or the AI Gateway. */
-const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "tool-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "cleanup-live", "preview-replay"]);
+const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "tool-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "teardown-app", "cleanup-live", "preview-replay"]);
 
 /**
  * Load the repo's `.env` (or SCF_ENV_FILE) into memory, never into this
@@ -2283,10 +2310,13 @@ async function wranglerCommand(
 
 /**
  * Tear a deployed example app down with `wrangler delete` in the app directory,
- * so a real-app run never leaves a billable Worker behind. Best-effort: a worker
- * already gone is not an error.
+ * so a real-app run never leaves a billable Worker behind. Best-effort by
+ * default: a worker already gone is not an error, and neither is any other
+ * failure. With `strict` (the standalone teardown-app command), a failure other
+ * than "the Worker does not exist" throws with wrangler's own (redacted) text,
+ * so the caller never clears the deployment marker of a Worker still live.
  */
-async function wranglerDelete(appDir: string): Promise<void> {
+async function wranglerDelete(appDir: string, options: { readonly strict?: boolean } = {}): Promise<void> {
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const run = promisify(execFile);
@@ -2294,8 +2324,18 @@ async function wranglerDelete(appDir: string): Promise<void> {
     cwd: appDir,
     env: wranglerEnv(),
     maxBuffer: 4 * 1024 * 1024,
-  }).catch(() => {
+  }).catch((error: unknown) => {
     /* best-effort teardown; the Makefile delete-app is the authoritative path */
+    if (!options.strict) {
+      return;
+    }
+    const detail = error as { message?: string; stdout?: string; stderr?: string };
+    const text = `${detail.stderr ?? ""}\n${detail.stdout ?? ""}\n${detail.message ?? String(error)}`;
+    if (/does not exist|not found|\b10007\b/i.test(text)) {
+      return;
+    }
+    const lines = text.split(/\r?\n/).map((line) => line.trim()).filter((line) => line !== "");
+    throw new Error(redactSecrets(lines.slice(-6).join(" | ") || "wrangler delete failed"));
   });
 }
 async function main(argv: string[]): Promise<number> {

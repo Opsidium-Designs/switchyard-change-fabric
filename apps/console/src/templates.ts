@@ -80,7 +80,30 @@ export interface Template {
    * template uses its own goal file and needs none.
    */
   readonly boardGoalFile?: string;
+  /**
+   * Board-run options for a template larger than the default launch: a higher
+   * dial ceiling, a suggested dial, and the run-board budget flags it needs
+   * (`--max-inflight`, `--max-turns`, `--timeout-ms`). Absent means the defaults.
+   */
+  readonly boardOptions?: BoardRunOptions;
 }
+
+/** The run-board options a template may carry (see Template.boardOptions). */
+export interface BoardRunOptions {
+  /** The highest dial max the launcher accepts for a board run (default DEFAULT_DIAL_LIMIT). */
+  readonly dialLimit?: number;
+  /** The dial the template is meant to run at (shown on its card; one click sets it). */
+  readonly suggestedDial?: { readonly min: number; readonly max: number };
+  /** `--max-inflight`: the most model calls in flight at once. */
+  readonly maxInflight?: number;
+  /** `--max-turns`: the run's total turn budget. */
+  readonly maxTurns?: number;
+  /** `--timeout-ms`: the agent-phase time limit. */
+  readonly timeoutMs?: number;
+}
+
+/** The dial ceiling for a launch with no template-specific limit (the console sliders' default range). */
+export const DEFAULT_DIAL_LIMIT = 8;
 
 /**
  * The shipped templates. ONE is the simple intro (the audit-logging change);
@@ -99,6 +122,9 @@ export interface Template {
  *     contract that must change, and one existing test pinning the old tax
  *     rounding (a human contract decision). run-live has no contract route, so
  *     there the pinned test is restored and the gate stays failing, honestly.
+ *   - cityhall: the largest app, 32 modules across 8 city departments, shaped
+ *     for about 30 agents on the board. Its board options carry the dial and
+ *     budget flags the Makefile's run-board-cityhall target uses.
  */
 export const TEMPLATES: readonly Template[] = [
   {
@@ -143,6 +169,30 @@ export const TEMPLATES: readonly Template[] = [
     projectDir: "examples/apps/storefront",
     app: "storefront",
   },
+  {
+    id: "cityhall",
+    name: "Make city hall services correct (board, about 30 agents)",
+    description: "A city-services API with 32 modules across 8 departments, each with its own planted bugs; built for agents on the board.",
+    whatItDoes:
+      "cityhall: one Cloudflare Worker in TypeScript with 32 modules across 8 city departments (utilities, parking, housing, licensing, parks, records, transit, permits) over shared money, time, validation, auth, and http contracts, with a lockfile, so the run installs dependencies before its gate.",
+    problemItSolves:
+      "Every module carries its own planted bugs: fees and shares off by a cent, business-day deadlines counted wrong (the start date counted, city holidays ignored), writes that need no token or staff role, other residents' records visible, and list endpoints that accept any page size. Two existing developer tests pin the old behavior, so changing them is a contract change you decide (on the board). The gate (typecheck, the developer tests, and a 237-test acceptance suite) passes only when all of it is fixed: 106 of 237 acceptance tests pass before the fix, 237 of 237 after. Its home page is a tester: about 1 of 46 checks correct before the fix, 46 of 46 after.",
+    agentCountHint: "about 8 to 30 agents",
+    escalates: false,
+    source: { kind: "goal", goalFile: "examples/goals/cityhall-services-correct.goal.txt" },
+    projectDir: "examples/apps/cityhall",
+    app: "cityhall",
+    // The Makefile's run-board-cityhall defaults (CH_MIN, CH_MAX, CH_INFLIGHT,
+    // CH_TURNS, CH_TIMEOUT_MS): a ~36-item plan asks for ~1300 turns, and the
+    // first 30-agent run needed close to the 30-minute default limit.
+    boardOptions: {
+      dialLimit: 30,
+      suggestedDial: { min: 8, max: 30 },
+      maxInflight: 8,
+      maxTurns: 1400,
+      timeoutMs: 4_500_000,
+    },
+  },
 ];
 
 /** Look up a template by id. */
@@ -162,6 +212,16 @@ export function boardCapable(template: Template): boolean {
 /** The goal file a board run of this template posts, or undefined when it has none. */
 export function boardGoalFileOf(template: Template): string | undefined {
   return template.source.kind === "goal" ? template.source.goalFile : template.boardGoalFile;
+}
+
+/** The highest dial max a launch of this template in this mode accepts. */
+export function dialLimitOf(template: Template, mode: LaunchMode): number {
+  return mode === "board" ? (template.boardOptions?.dialLimit ?? DEFAULT_DIAL_LIMIT) : DEFAULT_DIAL_LIMIT;
+}
+
+/** The apps the templates name: the only apps the launcher deploys or removes. */
+export function templateApps(templates: readonly Template[] = TEMPLATES): string[] {
+  return [...new Set(templates.flatMap((t) => (t.app ? [t.app] : [])))];
 }
 
 /** How a launch runs: the existing run-live driver, or agents on the board. */

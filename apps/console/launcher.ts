@@ -19,9 +19,12 @@
  *   GET  /api/deployments         the app URLs already deployed (read from the
  *                                  gitignored .deployments/<app>.json markers),
  *                                  so a console reload remembers a prior Deploy
+ *   POST /api/teardown-app {templateId|app}  delete that template app's STABLE
+ *                                  deployed Worker and clear its marker (the
+ *                                  `teardown-app` CLI); no run's repos are touched
  *   POST /api/cleanup {changeId, app?}  tear down that run's real Artifact repos
- *                                  and (when app is given) the app's stable
- *                                  deployed Worker
+ *                                  and (when a template app is given) the app's
+ *                                  stable deployed Worker
  *   POST /api/worker/changes/...  the console's MUTATION proxy to the Worker: it
  *                                  forwards the POST to the same Worker path and,
  *                                  when SWITCHYARD_API_TOKEN is set in this dev
@@ -47,7 +50,7 @@
  * header of a proxied Worker POST and never logs or returns to the browser.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import type { ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
@@ -57,7 +60,18 @@ import type { Connect, Plugin } from "vite";
 
 import { loadDotEnvFile, withoutCredentials } from "@switchyard-change/orchestration/credentials";
 
-import { boardCapable, boardGoalFileOf, TEMPLATES, templateById, type ContractPolicy, type LaunchMode, type Template } from "./src/templates";
+import {
+  boardCapable,
+  boardGoalFileOf,
+  DEFAULT_DIAL_LIMIT,
+  dialLimitOf,
+  TEMPLATES,
+  templateApps,
+  templateById,
+  type ContractPolicy,
+  type LaunchMode,
+  type Template,
+} from "./src/templates";
 
 /** The repo root, two levels up from apps/console. */
 const CONSOLE_DIR = dirname(fileURLToPath(import.meta.url));
@@ -132,22 +146,22 @@ const DEFAULT_DIAL: LaunchDial = { min: 1, max: 3 };
 
 /**
  * Read and clamp a numeric dial bound from the launch body. A missing or
- * non-finite value falls back to the default; the value is clamped to the same
- * 0..8 range the console sliders expose, so a browser-supplied body can never
- * drive the dial out of range.
+ * non-finite value falls back to the default; the value is clamped to 0..limit
+ * (the sliders' 0..8 by default, or a template's own board dial limit), so a
+ * browser-supplied body can never drive the dial out of range.
  */
-function dialBound(value: unknown, fallback: number): number {
+function dialBound(value: unknown, fallback: number, limit: number): number {
   const n = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(n)) {
     return fallback;
   }
-  return Math.max(0, Math.min(8, Math.round(n)));
+  return Math.max(0, Math.min(limit, Math.round(n)));
 }
 
-/** Resolve the launch dial from the request body, clamped and defaulted. */
-function dialFromBody(body: Record<string, unknown>): LaunchDial {
-  const min = dialBound(body.min, DEFAULT_DIAL.min);
-  const max = dialBound(body.max, DEFAULT_DIAL.max);
+/** Resolve the launch dial from the request body, clamped to `limit` and defaulted. Exported for tests. */
+export function dialFromBody(body: Record<string, unknown>, limit: number = DEFAULT_DIAL_LIMIT): LaunchDial {
+  const min = dialBound(body.min, DEFAULT_DIAL.min, limit);
+  const max = dialBound(body.max, DEFAULT_DIAL.max, limit);
   // Keep the dial coherent: max is never below min, min is never below one.
   const safeMin = Math.max(1, min);
   return { min: safeMin, max: Math.max(safeMin, max) };
@@ -239,11 +253,23 @@ export function launchOptionsFromBody(
 
 /**
  * Build the run-board CLI args for a goal template: the same goal, project,
- * dial, app, and gate as its run-live launch. `--decide-contracts` is passed
- * ONLY for an automatic policy; otherwise each contract decision waits for the
- * human's answer in the console.
+ * dial, app, and gate as its run-live launch, plus the template's own board
+ * budget flags (`--max-inflight`, `--max-turns`, `--timeout-ms`) when it
+ * declares them. When the template's app is currently deployed (a manual
+ * Deploy left its Worker live), `--preview-revisions` uploads each integrated
+ * revision as a Worker VERSION under a preview alias (never a production
+ * deploy), so every revision gets a link and the passing one is the fixed app;
+ * a preview needs that Worker to exist, so it is not passed otherwise.
+ * `--decide-contracts` is passed ONLY for an automatic policy (and stays last);
+ * otherwise each contract decision waits for the human's answer in the console.
  */
-export function runBoardArgs(template: Template, changeId: string, dial: LaunchDial, policy: ContractPolicy): string[] {
+export function runBoardArgs(
+  template: Template,
+  changeId: string,
+  dial: LaunchDial,
+  policy: ContractPolicy,
+  appDeployed = false,
+): string[] {
   const goalFile = boardGoalFileOf(template);
   if (goalFile === undefined) {
     throw new Error(`${template.id} has no goal to post on the board`);
@@ -253,9 +279,22 @@ export function runBoardArgs(template: Template, changeId: string, dial: LaunchD
   args.push("--project", resolve(REPO_ROOT, template.projectDir));
   args.push("--worker", WORKER_URL);
   args.push("--min", String(dial.min), "--max", String(dial.max));
+  const options = template.boardOptions;
+  if (options?.maxInflight !== undefined) {
+    args.push("--max-inflight", String(options.maxInflight));
+  }
+  if (options?.maxTurns !== undefined) {
+    args.push("--max-turns", String(options.maxTurns));
+  }
+  if (options?.timeoutMs !== undefined) {
+    args.push("--timeout-ms", String(options.timeoutMs));
+  }
   if (template.app) {
     args.push("--deploy-app", resolve(REPO_ROOT, "examples/apps", template.app));
     args.push("--deploy-app-name", `switchyard-change-fabric-${template.app}`);
+    if (appDeployed) {
+      args.push("--preview-revisions");
+    }
   }
   // A board run is always held to the project's declared gate: both board
   // templates' projects declare one. A project without one then reads "gate
@@ -268,10 +307,20 @@ export function runBoardArgs(template: Template, changeId: string, dial: LaunchD
   return args;
 }
 
-/** The CLI args for a launch, by mode. Exported for tests. */
-export function launchArgs(template: Template, changeId: string, dial: LaunchDial, options: LaunchOptions): string[] {
+/**
+ * The CLI args for a launch, by mode. `appDeployed` (the template's app has a
+ * live deployment marker) turns on revision previews for a board run; run-live
+ * has no preview route and keeps its redeploy-in-place behavior. Exported for tests.
+ */
+export function launchArgs(
+  template: Template,
+  changeId: string,
+  dial: LaunchDial,
+  options: LaunchOptions,
+  appDeployed = false,
+): string[] {
   return options.mode === "board"
-    ? runBoardArgs(template, changeId, dial, options.contractPolicy)
+    ? runBoardArgs(template, changeId, dial, options.contractPolicy, appDeployed)
     : runLiveArgs(template, changeId, dial);
 }
 
@@ -429,18 +478,138 @@ export async function readDeployedUrls(
   return out;
 }
 
-/** Spawn a run-live child for a template under a chosen dial and track it. */
-function launch(template: Template, dial: LaunchDial, options: LaunchOptions): LaunchedRun {
-  const changeId = freshChangeId(template);
-  const args = launchArgs(template, changeId, dial, options);
-  // The spawned CLI reads .env into memory itself: no credential is forwarded
-  // through its environment (code it runs could read a parent's environ).
-  const child = spawn("npm", args, {
+/** The spawn the launcher uses; injectable so tests run with a fake child process. */
+export type SpawnFn = (command: string, args: readonly string[], options: SpawnOptions) => ChildProcess;
+
+/** The options every spawned CLI gets: the repo root and NO credential in its environment. */
+function cliSpawnOptions(): SpawnOptions {
+  return {
     cwd: REPO_ROOT,
     // Never pass a credential through a spawned run's environment: the CLI reads .env into memory itself.
     env: withoutCredentials(process.env),
     stdio: ["ignore", "pipe", "pipe"],
+  };
+}
+
+/** The outcome of one short-lived CLI command: its exit code and its (redacted) non-empty output lines. */
+export interface CliResult {
+  readonly code: number | null;
+  readonly output: string[];
+}
+
+/** Run one short CLI command (`npm <args>`) to completion and collect its output. */
+export function runCli(spawnFn: SpawnFn, args: readonly string[]): Promise<CliResult> {
+  return new Promise((resolveResult) => {
+    const out: string[] = [];
+    let child: ChildProcess;
+    try {
+      child = spawnFn("npm", args, cliSpawnOptions());
+    } catch (error) {
+      resolveResult({ code: null, output: [redactSecrets(error instanceof Error ? error.message : String(error))] });
+      return;
+    }
+    const lines = () =>
+      out
+        .join("")
+        .split(/\r?\n/)
+        .filter((line) => line.trim() !== "")
+        .map(redactSecrets);
+    let settled = false;
+    const settle = (code: number | null) => {
+      if (!settled) {
+        settled = true;
+        resolveResult({ code, output: lines() });
+      }
+    };
+    child.stdout?.on("data", (d: Buffer) => out.push(d.toString("utf8")));
+    child.stderr?.on("data", (d: Buffer) => out.push(d.toString("utf8")));
+    child.on("error", (error: Error) => {
+      out.push(`\n${error.message}\n`);
+      settle(null);
+    });
+    child.on("exit", (code) => settle(code));
   });
+}
+
+/**
+ * Resolve the app a deploy/teardown body names, ONLY when it belongs to a
+ * template: a known `templateId` with an app, else an `app` that some template
+ * names. Anything else (an unknown app, a path, a non-string) is undefined.
+ */
+export function knownAppFromBody(body: Record<string, unknown>, templates: readonly Template[] = TEMPLATES): string | undefined {
+  const templateId = typeof body.templateId === "string" ? body.templateId : "";
+  if (templateId !== "") {
+    return templates.find((t) => t.id === templateId)?.app;
+  }
+  const app = typeof body.app === "string" ? body.app : "";
+  return app !== "" && templateApps(templates).includes(app) ? app : undefined;
+}
+
+/** The `deploy-app` CLI args: deploy the app's CURRENT code to its stable Worker. */
+export function deployAppArgs(app: string): string[] {
+  return ["-w", "apps/cli", "run", "dev", "--", "deploy-app", "--app", app, "--worker", WORKER_URL];
+}
+
+/** The `teardown-app` CLI args: delete the app's stable Worker and clear its marker (no repos touched). */
+export function teardownAppArgs(app: string): string[] {
+  return ["-w", "apps/cli", "run", "dev", "--", "teardown-app", "--app", app];
+}
+
+/** A launcher endpoint's answer: an HTTP status and a JSON body. */
+export interface EndpointResult {
+  readonly status: number;
+  readonly body: Record<string, unknown>;
+}
+
+/**
+ * POST /api/deploy-app: deploy a template's app in its CURRENT (broken) state to
+ * its STABLE workers.dev URL and return that URL, or the CLI's error.
+ */
+export async function deployAppRequest(body: Record<string, unknown>, spawnFn: SpawnFn = spawn): Promise<EndpointResult> {
+  const app = knownAppFromBody(body);
+  if (app === undefined) {
+    const named = typeof body.templateId === "string" && body.templateId !== "" ? body.templateId : body.app;
+    return { status: 400, body: { error: `unknown or non-app template/app: ${typeof named === "string" && named !== "" ? named : "(none)"}` } };
+  }
+  const result = await runCli(spawnFn, deployAppArgs(app));
+  const match = result.output.join("\n").match(/https:\/\/[^\s]+\.workers\.dev[^\s]*/);
+  if (result.code === 0 && match) {
+    return { status: 201, body: { app, url: match[0] } };
+  }
+  return {
+    status: 502,
+    body: { app, error: "deploy did not complete (is the app deployable and the account authenticated?)", output: result.output },
+  };
+}
+
+/**
+ * POST /api/teardown-app: delete a template's app's stable Worker and clear its
+ * marker through the `teardown-app` CLI. No run's repos are touched.
+ */
+export async function teardownAppRequest(body: Record<string, unknown>, spawnFn: SpawnFn = spawn): Promise<EndpointResult> {
+  const app = knownAppFromBody(body);
+  if (app === undefined) {
+    const named = typeof body.templateId === "string" && body.templateId !== "" ? body.templateId : body.app;
+    return { status: 400, body: { error: `unknown app: ${typeof named === "string" && named !== "" ? named : "(none)"}` } };
+  }
+  const result = await runCli(spawnFn, teardownAppArgs(app));
+  if (result.code === 0) {
+    return { status: 200, body: { app, ok: true, output: result.output } };
+  }
+  return { status: 502, body: { app, ok: false, error: `could not remove ${app}`, output: result.output } };
+}
+
+/** Spawn a launch child for a template under a chosen dial and track it. */
+async function launch(template: Template, dial: LaunchDial, options: LaunchOptions): Promise<LaunchedRun> {
+  const changeId = freshChangeId(template);
+  // A deployed app (a live marker) gets revision previews on a board run.
+  const appDeployed = template.app
+    ? (await readDeployedUrls(REPO_ROOT, [template.app]))[template.app] !== undefined
+    : false;
+  const args = launchArgs(template, changeId, dial, options, appDeployed);
+  // The spawned CLI reads .env into memory itself: no credential is forwarded
+  // through its environment (code it runs could read a parent's environ).
+  const child = spawn("npm", args, cliSpawnOptions());
   const run: LaunchedRun = {
     changeId,
     templateId: template.id,
@@ -484,8 +653,7 @@ export function launcherPlugin(): Plugin {
           next();
           return;
         }
-        const apps = TEMPLATES.flatMap((t) => (t.app ? [t.app] : []));
-        void readDeployedUrls(REPO_ROOT, apps).then((deployments) =>
+        void readDeployedUrls(REPO_ROOT, templateApps()).then((deployments) =>
           sendJson(res, 200, { deployments }),
         );
       });
@@ -502,22 +670,28 @@ export function launcherPlugin(): Plugin {
             sendJson(res, 400, { error: `unknown template: ${templateId || "(none)"}` });
             return;
           }
-          // The dial the human set before launching is captured as this run's
-          // launch config and passed through to the run-live CLI as --min/--max.
-          const dial = dialFromBody(body);
           const chosen = launchOptionsFromBody(body, template);
           if (!chosen.ok) {
             sendJson(res, 400, { error: chosen.error });
             return;
           }
-          const run = launch(template, dial, chosen.options);
-          sendJson(res, 201, {
-            changeId: run.changeId,
-            templateId: run.templateId,
-            escalates: template.escalates,
-            dial: run.dial,
-            mode: run.mode,
-          });
+          // The dial the human set before launching is captured as this run's
+          // launch config and passed through to the CLI as --min/--max, clamped
+          // to this template's limit for the chosen mode.
+          const dial = dialFromBody(body, dialLimitOf(template, chosen.options.mode));
+          return launch(template, dial, chosen.options).then((run) =>
+            sendJson(res, 201, {
+              changeId: run.changeId,
+              templateId: run.templateId,
+              escalates: template.escalates,
+              dial: run.dial,
+              mode: run.mode,
+            }),
+          );
+        }).catch(() => {
+          if (!res.headersSent) {
+            sendJson(res, 500, { error: "launch failed" });
+          }
         });
       });
 
@@ -533,40 +707,33 @@ export function launcherPlugin(): Plugin {
         // the human launches later redeploys the fixed code IN PLACE to the same
         // URL. Resolves the app only from a fixed template id or an app that
         // belongs to a template, never a browser-supplied path.
-        void readJson(req).then((body) => {
-          const templateId = typeof body.templateId === "string" ? body.templateId : "";
-          const appFromBody = typeof body.app === "string" ? body.app : "";
-          const template = templateId !== "" ? templateById(templateId) : undefined;
-          const app = template?.app ?? (appFromBody !== "" ? appFromBody : "");
-          const known = TEMPLATES.some((t) => t.app === app);
-          if (app === "" || !known) {
-            sendJson(res, 400, { error: `unknown or non-app template/app: ${templateId || appFromBody || "(none)"}` });
-            return;
-          }
-          const child = spawn(
-            "npm",
-            ["-w", "apps/cli", "run", "dev", "--", "deploy-app", "--app", app, "--worker", WORKER_URL],
-            { cwd: REPO_ROOT, // Never pass a credential through a spawned run's environment: the CLI reads .env into memory itself.
-    env: withoutCredentials(process.env), stdio: ["ignore", "pipe", "pipe"] },
-          );
-          const out: string[] = [];
-          child.stdout?.on("data", (d: Buffer) => out.push(d.toString("utf8")));
-          child.stderr?.on("data", (d: Buffer) => out.push(d.toString("utf8")));
-          child.on("exit", (code) => {
-            const text = out.join("");
-            const match = text.match(/https:\/\/[^\s]+\.workers\.dev[^\s]*/);
-            const url = match ? match[0] : undefined;
-            if (code === 0 && url) {
-              sendJson(res, 201, { app, url });
-            } else {
-              sendJson(res, 502, {
-                app,
-                error: "deploy did not complete (is the app deployable and the account authenticated?)",
-                output: text.split(/\r?\n/).filter((line) => line.trim() !== ""),
-              });
+        void readJson(req)
+          .then((body) => deployAppRequest(body))
+          .then((result) => sendJson(res, result.status, result.body))
+          .catch(() => {
+            if (!res.headersSent) {
+              sendJson(res, 500, { error: "deploy failed" });
             }
           });
-        });
+      });
+
+      server.middlewares.use("/api/teardown-app", (req, res, next) => {
+        if (req.method !== "POST") {
+          next();
+          return;
+        }
+        // Remove a template's deployed app: delete its STABLE Worker (its
+        // revision previews are versions of it, so they go too) and clear its
+        // marker through the `teardown-app` CLI. No run's repos are touched; the
+        // app must belong to a template, never a browser-supplied path.
+        void readJson(req)
+          .then((body) => teardownAppRequest(body))
+          .then((result) => sendJson(res, result.status, result.body))
+          .catch(() => {
+            if (!res.headersSent) {
+              sendJson(res, 500, { error: "teardown failed" });
+            }
+          });
       });
 
       server.middlewares.use("/api/runs", (req, res, next) => {
@@ -638,10 +805,14 @@ export function launcherPlugin(): Plugin {
           }
           // Tear down this run's real Artifact repos through the existing
           // cleanup-live CLI, scoped to that run's unique id. When the body names
-          // an app (the active template's app), tear its STABLE deployed Worker
-          // down too and clear its per-app marker, so a manual Deploy never leaks
-          // even when the run itself never redeployed.
+          // an app it must be a template's app; its STABLE deployed Worker is
+          // then torn down too (the console no longer sends one: it removes a
+          // deployed app separately, through /api/teardown-app).
           const app = typeof body.app === "string" ? body.app : "";
+          if (app !== "" && !templateApps().includes(app)) {
+            sendJson(res, 400, { error: `unknown app: ${app}` });
+            return;
+          }
           const cleanupArgs = [
             "-w",
             "apps/cli",
@@ -657,22 +828,17 @@ export function launcherPlugin(): Plugin {
           if (app !== "") {
             cleanupArgs.push("--app", app);
           }
-          const child = spawn("npm", cleanupArgs, {
-            cwd: REPO_ROOT,
-            // Never pass a credential through a spawned run's environment: the CLI reads .env into memory itself.
-    env: withoutCredentials(process.env),
-            stdio: ["ignore", "pipe", "pipe"],
-          });
-          const out: string[] = [];
-          child.stdout?.on("data", (d: Buffer) => out.push(d.toString("utf8")));
-          child.stderr?.on("data", (d: Buffer) => out.push(d.toString("utf8")));
-          child.on("exit", (code) => {
-            sendJson(res, code === 0 ? 200 : 502, {
+          return runCli(spawn, cleanupArgs).then((result) =>
+            sendJson(res, result.code === 0 ? 200 : 502, {
               changeId,
-              ok: code === 0,
-              output: out.join("").split(/\r?\n/).filter((line) => line.trim() !== ""),
-            });
-          });
+              ok: result.code === 0,
+              output: result.output,
+            }),
+          );
+        }).catch(() => {
+          if (!res.headersSent) {
+            sendJson(res, 500, { error: "cleanup failed" });
+          }
         });
       });
     },

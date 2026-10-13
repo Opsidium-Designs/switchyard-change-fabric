@@ -1030,6 +1030,38 @@ body {
   font-size: 0.82rem;
 }
 
+/* The per-card app deployment control: status, URL, and Deploy / Remove app. */
+.app-deploy {
+  width: 100%;
+  margin-top: 0.3rem;
+}
+
+.app-deploy-status {
+  margin: 0.2rem 0;
+  font-size: 0.85rem;
+}
+
+.app-deploy-state {
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 0.78rem;
+  color: var(--accent);
+}
+
+.app-deploy-status.is-failed .app-deploy-state {
+  color: var(--bad-text);
+}
+
+.app-deploy-error {
+  margin: 0.25rem 0;
+  white-space: pre-wrap;
+}
+
+/* The latest passing revision's preview: the fixed app, next to the run state. */
+.fixed-app {
+  font-size: 1rem;
+}
+
 /* --- Run status row --- */
 
 .run-status {
