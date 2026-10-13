@@ -210,9 +210,12 @@ directories are removed before the run exits.
 
 ## What is still open
 
-- A changed developer test is checked against the goal by a human, but nothing
-  yet proves that the new test fails on the old code. That check is being
-  added as advisory evidence.
+- A changed developer test is approved by a human. When the final revision
+  passes, each released test it changed is run alone on the baseline code and
+  on the revision, and the proof bundle records whether it fails on the
+  baseline ("teeth"). This is advisory and never changes a verdict. It lives on
+  the proof bundle, not the board log, so the replay page does not show it yet,
+  and it has only been exercised offline.
 - A model can still write a weak test that passes for the wrong reason. The
   immutable acceptance gate is what protects the verdict; developer tests are
   the agents' own scaffolding.
