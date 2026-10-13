@@ -176,7 +176,13 @@ export function narrateMessage(message: BoardMessage, log: readonly BoardMessage
         text = `${item} is done: its tool passed its own gate and was published.`;
       } else {
         cite(revSeq(index, message.seq, str(p, "n")));
-        text = `${item} is done: revision ${str(p, "n")} passed with its change in it.`;
+        if (str(p, "closedBy") === "engine") {
+          const pushSeq = Number(p.pushSeq);
+          if (Number.isInteger(pushSeq)) cite(pushSeq);
+          text = `${item} is done, closed by the engine: its owner never proposed done, but its latest push passed in revision ${str(p, "n")}.`;
+        } else {
+          text = `${item} is done: revision ${str(p, "n")} passed with its change in it.`;
+        }
       }
       break;
     case "contract.proposed":

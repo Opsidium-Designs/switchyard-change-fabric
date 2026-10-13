@@ -137,7 +137,15 @@ export interface ItemNodeDetail {
   readonly volunteers?: readonly { readonly agent: string; readonly seq: number; readonly answer?: "accepted" | "declined" }[];
   /** The owner proposed done: a hollow check until a passing revision completes it. */
   readonly doneProposed: boolean;
-  readonly completed?: { readonly n?: number; readonly via: "integrated" | "children" | "tool"; readonly version?: string };
+  readonly completed?: {
+    readonly n?: number;
+    readonly via: "integrated" | "children" | "tool";
+    readonly version?: string;
+    /** Closed by the engine: the owner did not propose done; its latest push (`pushSeq`) passed in rev `n` (recorded at `seq`). */
+    readonly closedBy?: "engine";
+    readonly pushSeq?: number;
+    readonly seq?: number;
+  };
   readonly fixAttempts: number;
   readonly fixRequested?: number;
   readonly fixExhausted: boolean;
@@ -709,6 +717,8 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
     const seqs = new Set<number>([origin.seq]);
     if (item.grantedSeq !== undefined) seqs.add(item.grantedSeq);
     if (item.lastPush) seqs.add(item.lastPush.seq);
+    // An engine close is backed by its recorded item.completed (and the push it cites, above).
+    if (item.completed?.closedBy === "engine" && item.completed.seq !== undefined) seqs.add(item.completed.seq);
     const struggle =
       item.struggling && item.struggling.owner === item.owner && item.status === "claimed" && !(item.lastPush && item.lastPush.agent === item.owner && item.lastPush.seq > item.struggling.seq)
         ? item.struggling
@@ -723,7 +733,9 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
       item.status === "done"
         ? item.completed?.via === "tool"
           ? `, done: its tool passed its own gate and was published (v${item.completed.version ?? "?"})`
-          : `, done at rev ${item.completed?.n ?? "?"}`
+          : item.completed?.closedBy === "engine"
+            ? `, done at rev ${item.completed.n ?? "?"}: closed by the engine (its push #${item.completed.pushSeq ?? "?"} passed in rev ${item.completed.n ?? "?"}; the owner did not propose done)`
+            : `, done at rev ${item.completed?.n ?? "?"}`
         : item.doneProposed
           ? ", done proposed (not yet on a passing revision)"
           : item.status === "proposed"

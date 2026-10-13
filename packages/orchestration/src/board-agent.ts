@@ -247,8 +247,9 @@ const MAX_TURN_REFERENCES = 2;
 const MAX_PENDING_MESSAGES = 200;
 /**
  * How many times a passed push is cued for propose_done if the agent ignores
- * it. The last cue says plainly that the item cannot complete otherwise: the
- * engine never proposes done on an agent's behalf.
+ * it. The last cue says so plainly: nobody proposes done on an agent's behalf
+ * (only at the end of the agent phase may the engine close an item, and only
+ * one its owner's latest push in the latest passing revision backs).
  */
 export const MAX_DONE_CUES = 5;
 /** How many times a free agent that waited is told to claim the open items. */
@@ -626,6 +627,10 @@ export class BoardAgent {
   private readonly heldWorkNudges = new Map<string, number>();
   /** Set by the driver: held items to edit (or hand off) on the next step. */
   private readonly heldWorkNudge = new Set<string>();
+  /** Items the driver already cued for close-out (one close-out cue per item). */
+  private readonly closeOutCued = new Set<string>();
+  /** Set by the driver as the agent phase ends: passed items to propose done on the next step. */
+  private readonly closeOutNudge = new Set<string>();
   /** Sub-lead: merge cues per set of children's pushes awaiting its pull (bounded by MAX_MERGE_CUES). */
   private readonly mergeCues = new Map<string, number>();
   /** Sub-lead: the children's pushes awaiting its pull as last seen ("" when none). */
@@ -706,7 +711,7 @@ export class BoardAgent {
    * judges a held claim stalled while its holder is about to act.
    */
   get turnPending(): boolean {
-    return !this.stop && !this.heldBack && (this.followUp || this.heldWorkNudge.size > 0 || this.mergeNudge || this.offerNudge || this.openSeamNudge || this.contractNudge);
+    return !this.stop && !this.heldBack && (this.followUp || this.heldWorkNudge.size > 0 || this.closeOutNudge.size > 0 || this.mergeNudge || this.offerNudge || this.openSeamNudge || this.contractNudge);
   }
 
   /** The agent's workspace (its own repo), once joined. */
@@ -1024,6 +1029,19 @@ export class BoardAgent {
     if (heldCue) {
       this.evidence.push(heldWorkCue(digest, heldNudged));
     }
+    // CLOSE-OUT: the agent phase is ending after a passing revision merged this
+    // owner's latest push for an item it has not proposed done (one cue per item).
+    const closing = passed.filter((c) => this.closeOutNudge.has(c.item));
+    this.closeOutNudge.clear();
+    const closeOutCue = closing.length > 0;
+    if (closeOutCue) {
+      this.evidence.push(
+        bounded(
+          `CLOSE-OUT (the agent phase is ending): a passing revision merged my latest push for ${closing.map((c) => `${c.item} (rev ${c.lastPush!.integratedIn})`).join(", ")} and I have not proposed done. Return propose_done for it now.`,
+          800,
+        ),
+      );
+    }
     // SUB-LEAD: children's pushes (by other agents) wait for this agent to
     // merge them; nothing integrates them until it pulls. Cued when the set
     // appears and when the driver nudges, bounded per set.
@@ -1067,6 +1085,7 @@ export class BoardAgent {
         openSeamCue ||
         offerCue ||
         heldCue ||
+        closeOutCue ||
         mergeCue ||
         questionCue ||
         (freeKey !== undefined && freeKey !== this.lastFreeKey)
@@ -1084,7 +1103,7 @@ export class BoardAgent {
       const which = passed.map((c) => `${c.item} (rev ${c.lastPush!.integratedIn})`).join(", ");
       this.evidence.push(
         cues + 1 >= MAX_DONE_CUES
-          ? `FINAL CUE: a passing revision merged my push for ${which}. The item cannot complete unless I return propose_done for it now; nobody proposes done on my behalf, and without it the run ends partial.`
+          ? `FINAL CUE: a passing revision merged my push for ${which}. Return propose_done for it now; nobody proposes done on my behalf.`
           : `a passing revision merged my push for ${which}: propose done`,
       );
     }
@@ -1139,6 +1158,25 @@ export class BoardAgent {
     }
     this.heldWorkNudges.set(item, count + 1);
     this.heldWorkNudge.add(item);
+    return true;
+  }
+
+  /**
+   * The driver's CLOSE-OUT cue as the agent phase ends after a passing
+   * revision: a passing revision merged this owner's latest push for each of
+   * `items` and it has not proposed done; its next step takes a turn told to
+   * propose done now. One close-out cue per item; returns false when every
+   * item was already cued (or it cannot act).
+   */
+  cueCloseOut(items: readonly string[]): boolean {
+    const fresh = items.filter((item) => !this.closeOutCued.has(item));
+    if (this.role !== "worker" || this.stop || fresh.length === 0) {
+      return false;
+    }
+    for (const item of fresh) {
+      this.closeOutCued.add(item);
+      this.closeOutNudge.add(item);
+    }
     return true;
   }
 

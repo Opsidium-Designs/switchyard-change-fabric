@@ -940,12 +940,20 @@ export interface BoardPayloads {
    * Engine: an item completed. `via: integrated` and `children` cite the passing
    * revision `n`; `via: tool` completes a tool item when its tool passed its own
    * gate and was published (`version`), which no integrated revision decides.
+   * `closedBy: engine` (via integrated) is RECORDED by the operator at the end
+   * of the agent phase, never derived: the owner did not propose done, but its
+   * latest push (`pushSeq`, its push.announced) was merged by the passing
+   * revision `n`, the board's latest revision, with no fix request,
+   * regression, exclusion, pending contract, contest, or taken help grant
+   * outstanding on the item.
    */
   "item.completed": {
     readonly item: string;
     readonly n?: number;
     readonly via: "integrated" | "children" | "tool";
     readonly version?: string;
+    readonly closedBy?: "engine";
+    readonly pushSeq?: number;
   };
   /** Engine: a failing revision implicated this item; its owner is asked (`to`) for fix `attempt`. */
   "fix.requested": { readonly item: string; readonly n: number; readonly attempt: number };
@@ -1247,6 +1255,20 @@ export function isChangeItem(item: Pick<BoardItem, "status" | "tool">): boolean 
   return isAcceptedItem(item) && item.tool === undefined;
 }
 
+/**
+ * How an item completed. An engine close (`closedBy: engine`) also cites the
+ * owner's latest push (`pushSeq`) the passing revision `n` merged, and the seq
+ * of the recorded item.completed (`seq`).
+ */
+export interface BoardItemCompletion {
+  readonly n?: number;
+  readonly via: "integrated" | "children" | "tool";
+  readonly version?: string;
+  readonly closedBy?: "engine";
+  readonly pushSeq?: number;
+  readonly seq?: number;
+}
+
 /** The latest push announced for an item, and the revision that merged it. */
 export interface BoardItemPush {
   readonly seq: number;
@@ -1304,7 +1326,7 @@ export interface BoardItem {
   claimant?: { readonly agent: string; intent: BoardIntent; contest: string };
   doneProposed: boolean;
   lastPush?: BoardItemPush;
-  completed?: { readonly n?: number; readonly via: "integrated" | "children" | "tool"; readonly version?: string };
+  completed?: BoardItemCompletion;
   /** Fix requests failing revisions sent for this item so far. */
   fixAttempts?: number;
   /** The failing revision whose fix request is still unanswered (cleared by the owner's next push). */
@@ -2563,6 +2585,13 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
       if (raw.version !== undefined) {
         fail("BAD_PAYLOAD", "version belongs to a tool item's completion");
       }
+      if (raw.closedBy !== undefined || raw.pushSeq !== undefined) {
+        // An engine close: via integrated, citing the owner's latest push.
+        if (via !== "integrated" || raw.closedBy !== "engine") {
+          fail("BAD_PAYLOAD", "an engine close is {item, n, via: integrated, closedBy: engine, pushSeq}");
+        }
+        return { item: id(raw, "item"), n: positiveInt(raw, "n"), via, closedBy: "engine", pushSeq: positiveInt(raw, "pushSeq") };
+      }
       return { item: id(raw, "item"), n: positiveInt(raw, "n"), via };
     }
     case "fix.requested":
@@ -3474,6 +3503,72 @@ function anchorClock(state: BoardState, seq: number, tick: number | undefined): 
 /** The tick to stamp on an anchor the message being applied sets (revision 2 only). */
 function tickStamp(state: BoardState): { tick?: number } {
   return arbitrationV2(state) ? { tick: state.ticks ?? 0 } : {};
+}
+
+/**
+ * Why the engine may NOT close `item` on its owner's behalf (an engine close
+ * records item.completed with `closedBy: engine`), or undefined when it may:
+ * a held change item whose owner's LATEST push was merged by a passing
+ * revision while the board's latest revision is a passing one, with no fix
+ * request, regression, exclusion, unverified merge, pending contract, open
+ * contest, or taken help grant outstanding. Only an owner who did not propose
+ * done is closed this way (a done proposal completes on the pass itself). Pure.
+ */
+export function engineCloseRefusal(state: BoardState, item: BoardItem): string | undefined {
+  if (!isChangeItem(item)) {
+    return "it is not an accepted change item";
+  }
+  if (item.status !== "claimed" || item.owner === undefined) {
+    return `it is ${item.status}, not held by an owner`;
+  }
+  if (item.doneProposed) {
+    return "its owner proposed done";
+  }
+  const push = item.lastPush;
+  if (push === undefined || push.agent !== item.owner) {
+    return "its owner never pushed for it";
+  }
+  if (push.integratedIn === undefined || !state.passingRevs.includes(push.integratedIn)) {
+    return "no passing revision merged its latest push";
+  }
+  if (state.integrated == null || state.lastRevN !== state.integrated.n) {
+    return `the board's latest revision (${state.lastRevN}) did not pass`;
+  }
+  if (item.fixRequested !== undefined) {
+    return `a fix is outstanding (requested by rev ${item.fixRequested})`;
+  }
+  if (push.regressed !== undefined || push.excluded !== undefined || push.unverifiedIn !== undefined) {
+    return "its latest push was regressed, excluded, or unverified";
+  }
+  if (Object.values(state.contracts).some((c) => c.status === "proposed" && c.item === item.id)) {
+    return "a contract for it waits for a decision";
+  }
+  if (pendingContestOn(state, item.id) !== undefined) {
+    return "a contest on it is open";
+  }
+  if (takenHelpGrants(state, item.id).length > 0) {
+    return "a helper holds a grant on it";
+  }
+  return undefined;
+}
+
+/** An item the engine may close on its owner's behalf, with what backs the close. */
+export interface BoardEngineClose {
+  readonly item: string;
+  readonly owner: string;
+  /** The passing revision that merged the owner's latest push. */
+  readonly n: number;
+  /** The seq of the owner's latest push.announced. */
+  readonly pushSeq: number;
+  readonly commit: string;
+}
+
+/** Every item the engine may close now (see engineCloseRefusal), in proposal order. Pure. */
+export function engineClosableItems(state: BoardState): BoardEngineClose[] {
+  return Object.values(state.items)
+    .filter((i) => engineCloseRefusal(state, i) === undefined)
+    .sort((a, b) => a.proposedSeq - b.proposedSeq)
+    .map((i) => ({ item: i.id, owner: i.owner!, n: i.lastPush!.integratedIn!, pushSeq: i.lastPush!.seq, commit: i.lastPush!.commit }));
 }
 
 /**
@@ -5139,7 +5234,18 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       if (!state.passingRevs.includes(draft.payload.n!)) {
         fail("INVALID_STATE", `item.completed must cite a passing integrated revision (rev ${draft.payload.n} did not pass)`);
       }
-      if (draft.payload.via === "integrated") {
+      if (draft.payload.closedBy === "engine") {
+        const refused = engineCloseRefusal(state, item);
+        if (refused !== undefined) {
+          fail("INVALID_STATE", `item ${item.id} cannot be closed by the engine: ${refused}`);
+        }
+        if (item.lastPush!.integratedIn !== draft.payload.n || item.lastPush!.seq !== draft.payload.pushSeq) {
+          fail(
+            "INVALID_STATE",
+            `item ${item.id}'s latest push is seq ${item.lastPush!.seq}, merged by passing rev ${item.lastPush!.integratedIn}: an engine close cites exactly those`,
+          );
+        }
+      } else if (draft.payload.via === "integrated") {
         if (item.status !== "claimed" || !item.doneProposed) {
           fail("INVALID_STATE", `item ${item.id} has no done proposal from its owner`);
         }
@@ -5958,7 +6064,9 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       item.completed =
         message.payload.via === "tool"
           ? { via: "tool", version: message.payload.version! }
-          : { n: message.payload.n!, via: message.payload.via };
+          : message.payload.closedBy === "engine"
+            ? { n: message.payload.n!, via: message.payload.via, closedBy: "engine", pushSeq: message.payload.pushSeq!, seq: message.seq }
+            : { n: message.payload.n!, via: message.payload.via };
       delete item.intent;
       delete item.fixRequested;
       delete item.struggling;
@@ -6480,6 +6588,22 @@ function arbitrateInPlace(work: BoardState, incoming: BoardMessage): BoardDraft[
     case "done.proposed":
       completeIfReady(incoming.payload.item);
       break;
+    case "item.completed": {
+      // Only a RECORDED completion arrives here (an engine close): its scope
+      // stops being a live claim, and a split parent it finishes completes.
+      const item = work.items[incoming.payload.item];
+      if (incoming.payload.closedBy === "engine" && item !== undefined) {
+        const n = incoming.payload.n!;
+        resolveWaitersOn(item.id);
+        completeSplitUpward(item.parent, n);
+        for (const replaced of item.replaces ?? []) {
+          if (replaced !== item.parent) {
+            completeSplitUpward(replaced, n);
+          }
+        }
+      }
+      break;
+    }
     case "tool.gated": {
       // Only a build that passed its OWN gate enters the registry, as the next
       // version of its capability; the tool item completes with it.
@@ -6823,6 +6947,8 @@ const RECORDED_ENGINE_TYPES: ReadonlySet<BoardMessageType> = new Set([
   "candidate.gated",
   "push.excluded",
   "push.regressed",
+  // Only an engine close (closedBy: engine) is recorded; every other completion is derived.
+  "item.completed",
 ]);
 
 /**
@@ -6844,7 +6970,9 @@ export function reduceBoard(messages: readonly BoardMessage[]): BoardState {
     }
     if (
       incoming.from === BOARD_ENGINE &&
-      (!RECORDED_ENGINE_TYPES.has(incoming.type) || (incoming.type === "claim.lapsed" && incoming.payload.reason !== "stalled"))
+      (!RECORDED_ENGINE_TYPES.has(incoming.type) ||
+        (incoming.type === "claim.lapsed" && incoming.payload.reason !== "stalled") ||
+        (incoming.type === "item.completed" && incoming.payload.closedBy !== "engine"))
     ) {
       fail("LOG_MISMATCH", `engine ${incoming.type} at seq ${incoming.seq} was not produced by arbitration`);
     }
@@ -7130,6 +7258,7 @@ export const ENGINE_RECORD_TYPES = [
   "candidate.gated",
   "push.excluded",
   "push.regressed",
+  "item.completed",
 ] as const;
 export type EngineRecordType = (typeof ENGINE_RECORD_TYPES)[number];
 
@@ -7161,6 +7290,11 @@ export type EngineRecordType = (typeof ENGINE_RECORD_TYPES)[number];
  *     the holder's push made its stack worse (the same stack without it,
  *     a gated tree, scored strictly better); addressed to the holder, it is
  *     not stacked again until the holder pushes again.
+ *   - item.completed {item, n, pushSeq}: at the end of the agent phase, the
+ *     engine closes an item whose owner did not propose done, backed by the
+ *     owner's latest push (`pushSeq`) that the passing revision `n` merged
+ *     (see engineCloseRefusal); recorded `closedBy: engine` and addressed to
+ *     the owner.
  * Refused (nothing appended) when the record does not match the board.
  */
 export function appendEngineRecord(state: BoardState, input: unknown, at: string): BoardAppendResult {
@@ -7194,6 +7328,18 @@ export function appendEngineRecord(state: BoardState, input: unknown, at: string
           payload: { item: item.id, agent: owner, reason: "stalled", lastProgressSeq: item.lease.progressSeq, ...(commit !== undefined ? { commit } : {}) },
           ...(activeAgent(state, owner) ? { to: [owner] } : {}),
         },
+        at,
+      );
+    }
+    case "item.completed": {
+      if (Object.keys(raw).some((k) => !["item", "n", "pushSeq"].includes(k))) {
+        fail("BAD_PAYLOAD", "an engine close record is {item, n, pushSeq}");
+      }
+      const payload = parsePayload("item.completed", { ...raw, via: "integrated", closedBy: "engine" }) as BoardPayloads["item.completed"];
+      const owner = state.items[payload.item]?.owner;
+      return appendChecked(
+        state,
+        { from: BOARD_ENGINE, type: "item.completed", payload, ...(owner !== undefined && activeAgent(state, owner) ? { to: [owner] } : {}) },
         at,
       );
     }

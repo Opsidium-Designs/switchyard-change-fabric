@@ -305,7 +305,7 @@ export function keyMoments(log: readonly BoardMessage[]): KeyMoment[] {
         break;
       }
       case "item.completed":
-        push("done", `${field(m, "item")} completed`);
+        push("done", `${field(m, "item")} completed${field(m, "closedBy") === "engine" ? " (closed by the engine: its push passed, the owner did not propose done)" : ""}`);
         break;
       case "revision.promoted":
         push("gate-pass", `revision ${field(m, "rev")} promoted to ${field(m, "branch")}`);

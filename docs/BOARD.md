@@ -83,7 +83,7 @@ Who sent a message is established by the route, never by the message body.
 | `POST /changes/:id/board` | agent token | `{type, payload, rationale?, inReplyTo?, to?}` appended as that agent; `201 {appended, escalations}`. |
 | `POST /changes/:id/board/human` | bearer | A human message. |
 | `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected or seam `contract` (kept on the contract as `triage` for whoever decides it). It changes only the decision counts and that advisory line, never arbitration or the verdict. |
-| `POST /changes/:id/board/record` | bearer | `{type, payload}`: an engine fact only the operator side observes, validated against the board before it is appended (`appendEngineRecord`): `claim.lapsed {item}` (a leased claim recorded `stalled` on a quiet board), `clash.predicted`, `trunk.moved`, `token.refreshed`, `revision.promoted`, `run.capped`, `candidate.gated`, `push.excluded {item, agent, commit, reason}` (addressed to the holder). See "Stalls, re-plans, clashes, proofs, and caps". |
+| `POST /changes/:id/board/record` | bearer | `{type, payload}`: an engine fact only the operator side observes, validated against the board before it is appended (`appendEngineRecord`): `claim.lapsed {item}` (a leased claim recorded `stalled` on a quiet board), `clash.predicted`, `trunk.moved`, `token.refreshed`, `revision.promoted`, `run.capped`, `candidate.gated`, `push.excluded {item, agent, commit, reason}` (addressed to the holder), `item.completed {item, n, pushSeq}` (an engine close after the last gated pass, recorded `closedBy: engine` and addressed to the owner). See "Stalls, re-plans, clashes, proofs, and caps". |
 | `POST /changes/:id/board/agent-token` | bearer | `{agent, ttlSeconds?, help?}` (60 to 3600): a REFRESHED, short-lived WRITE token for a joined agent's own repo (with `help`, the granted helper's fork), for runs longer than one token lifetime. `201 {workspaceName, tokenId, token, tokenExpiresAt}`, returned once; the old token is revoked through the read-token revoke route. Same checks as the read-token route. With `help`, a write token also requires the helper still joined (a read token does not). |
 | `POST /changes/:id/board/seam-stalled` | bearer | `{item}`: the board went quiet while this seam item held dependents; the engine appends `seam.stalled {item, released}` (the hold ends; with no push of its owner's the item is released). Refused unless the item holds a dependent. |
 | `POST /changes/:id/integration/revision` | bearer | An integration result `{commit, gate, merged, failing?}`; appends `integrated.rev` and what it triggers (completions and `rebase.needed` on a pass, `fix.requested` / `fix.exhausted` on a fail). |
@@ -1312,12 +1312,25 @@ is distributed changes: items are proposed and claimed, never assigned.
   completed: ...; the Change is not complete)` and the CLI exits non-zero. An
   owner whose push a passing revision merged is woken for a turn so it can
   propose done, and cued again at its next opportunities if it ignores the cue
-  (up to 5 times, the last one stating plainly that the item cannot complete
-  otherwise; a turn it was taking anyway does not use one up). The engine never
-  proposes done on an owner's behalf: an item whose push passed but whose owner
-  never proposed done stays incomplete, and the summary says exactly that
-  (`not completed: item X: its push passed in rev N but its owner did not
-  propose done`), with a reason line for every other incomplete item too. A failing
+  (up to 5 times, the last one stating it plainly; a turn it was taking anyway
+  does not use one up). Nobody proposes done on an owner's behalf. CLOSE-OUT:
+  when the agent phase would end (its timeout, quiescence, the lockstep round
+  cap, the fix budget) while such owners have not proposed done, each gets one
+  close-out cue and a bounded window (`closeOutMs`, default 2 minutes; every
+  other worker is held back; lockstep: one round of their turns) before the
+  phase ends; a hard stop (an interrupt, a cap, the turn budget, a rate limit)
+  is never extended. ENGINE CLOSE: after the run's last revision passed a gate,
+  the engine records `item.completed` with `closedBy: engine` and `pushSeq`
+  (the owner's `push.announced` seq) for each held item whose owner's latest
+  push a passing revision merged, through the engine-record route. The board
+  refuses it (`engineCloseRefusal`) unless the board's latest revision passed
+  and no fix request, regression, exclusion, unverified merge, pending
+  contract, open contest, or taken help grant is outstanding on the item;
+  replay accepts only that recorded form. The summary names each
+  (`closed by the engine (push passed in rev N, owner did not propose done):
+  X (owner A, push #S)`), and the item's graph node cites the close and the
+  push. Anything else stays incomplete and the summary says why (`not
+  completed: item X: ...`), so the result stays partial. A failing
   revision's reason is shown as its first full line(s), at most 300 characters
   (`failure:` in the summary and the CLI), and the full bounded evidence stays
   on the board. The
