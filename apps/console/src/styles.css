@@ -2345,3 +2345,25 @@ body {
 .mc-fold-range { font-size: 0.7rem; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .mc-fold details[open] > summary { margin-bottom: 0.35rem; }
 .mc-fold .mc-thread-list { padding: 0; }
+
+/* --- Evidence grades --- */
+
+.mc-grade {
+  display: inline-block;
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 0 0.35rem;
+  border-radius: 4px;
+  border: 1px solid currentColor;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.mc-grade.grade-checked { color: var(--ok); }
+.mc-grade.grade-decided { color: var(--await); }
+.mc-grade.grade-recorded { color: var(--muted); border-style: dotted; }
+.mc-grade.grade-claimed { color: var(--violet); border-style: dashed; }
+.mc-grade.grade-advisory { color: var(--advisory); border-style: dashed; font-style: italic; }
+.mc-grade-legend { display: flex; flex-direction: column; gap: 0.15rem; font-size: 0.72rem; color: var(--muted); margin: 0.3rem 0 0.6rem; }
+.mc-proof-facts dt { display: flex; align-items: center; gap: 0.35rem; }

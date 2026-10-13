@@ -47,6 +47,7 @@ import {
 } from "./board-overlay";
 import { IDENTITY_VIEW, shouldZoomOnWheel, zoomAt, type ViewTransform } from "./graph-interactions";
 import { chapters as runChapters, formatDuration, narrateAt, narrateMessage, type Chapter, type Narration } from "./narration";
+import { GRADE_INFO, gradeOf, type EvidenceGrade } from "./evidence";
 import { keyMoments, MOMENT_GROUPS, type MomentKind } from "./replay-data";
 
 /**
@@ -1642,6 +1643,13 @@ export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSel
         {bundle.status === "proven" ? "PROVEN" : "NOT PROVEN"}
         {bundle.revision ? ` for revision ${bundle.revision.n} (${bundle.revision.commit.slice(0, 12)})` : ""} {seq(bundle.revision?.seq)}
       </p>
+      <p className="mc-grade-legend">
+        {(Object.keys(GRADE_INFO) as EvidenceGrade[]).map((g) => (
+          <span key={g}>
+            <GradeBadge grade={g} /> {GRADE_INFO[g].meaning}
+          </span>
+        ))}
+      </p>
       {bundle.reasons.length > 0 ? (
         <ul className="mc-proof-reasons">
           {bundle.reasons.map((r) => (
@@ -1650,12 +1658,16 @@ export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSel
         </ul>
       ) : null}
       <dl className="mc-proof-facts">
-        <dt>gate</dt>
+        <dt>
+          gate <GradeBadge grade="checked" />
+        </dt>
         <dd>
           {bundle.gate.command?.join(" ") ?? "no command recorded"}: {bundle.gate.verdict}
           {bundle.gate.gated ? "" : " (no gate ran)"}
         </dd>
-        <dt>promoted</dt>
+        <dt>
+          promoted <GradeBadge grade="checked" />
+        </dt>
         <dd>
           {bundle.promotion ? (
             <>
@@ -1668,7 +1680,9 @@ export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSel
         </dd>
         {bundle.revision?.applied ? (
           <>
-            <dt>applied</dt>
+            <dt>
+          applied <GradeBadge grade="checked" />
+        </dt>
             <dd>
               {bundle.revision.applied.map((u, i) => (
                 <span key={u.agent}>
@@ -1680,14 +1694,18 @@ export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSel
             </dd>
           </>
         ) : null}
-        <dt>tests</dt>
+        <dt>
+          tests <GradeBadge grade="advisory" />
+        </dt>
         <dd>
           baseline {bundle.inventory.baseline?.count ?? "unknown"}; final{" "}
           {bundle.inventory.final
             ? `executed ${bundle.inventory.final.executed}${bundle.inventory.final.acceptance ? `, acceptance ${bundle.inventory.final.acceptance.passed}/${bundle.inventory.final.acceptance.total}` : ""}${bundle.inventory.final.developer ? `, developer ${bundle.inventory.final.developer.passed}/${bundle.inventory.final.developer.total}` : ""}`
             : "no count"}
         </dd>
-        <dt>progress</dt>
+        <dt>
+          progress <GradeBadge grade="advisory" />
+        </dt>
         <dd>
           {bundle.progress.length > 0
             ? bundle.progress.map((p, i) => (
@@ -1699,7 +1717,9 @@ export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSel
         </dd>
         {bundle.speculation ? (
           <>
-            <dt>speculation</dt>
+            <dt>
+          speculation <GradeBadge grade="checked" />
+        </dt>
             <dd>
               round {bundle.speculation.round}:{" "}
               {bundle.speculation.candidates.map((c, i) => (
@@ -1711,20 +1731,32 @@ export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSel
             </dd>
           </>
         ) : null}
-        <dt>merged</dt>
+        <dt>
+          merged <GradeBadge grade="recorded" />
+        </dt>
         <dd>
           {bundle.contributions.pushesMerged} push(es) from {bundle.contributions.agents.join(", ") || "nobody"};{" "}
           {bundle.contributions.items.filter((i) => i.status === "done").length} of {bundle.contributions.items.length} item(s) done
         </dd>
-        <dt>contracts</dt>
+        <dt>
+          contracts <GradeBadge grade="decided" />
+        </dt>
         <dd>{bundle.contracts.length > 0 ? bundle.contracts.map((c) => `${c.contract} ${c.status}${c.decidedBy ? ` by ${c.decidedBy}` : ""}`).join("; ") : "none"}</dd>
-        <dt>tools</dt>
+        <dt>
+          tools <GradeBadge grade="checked" />
+        </dt>
         <dd>{bundle.tools.length > 0 ? bundle.tools.map((t) => `${t.capability} v${t.version} (${t.uses} use(s))`).join("; ") : "none"}</dd>
-        <dt>decisions</dt>
+        <dt>
+          decisions <GradeBadge grade="advisory" />
+        </dt>
         <dd>{bundle.decisions.length > 0 ? `${bundle.decisions.length} advisory (never part of the proof)` : "none"}</dd>
-        <dt>human</dt>
+        <dt>
+          human <GradeBadge grade="decided" />
+        </dt>
         <dd>{bundle.human.length > 0 ? bundle.human.map((h) => `${h.ref}: ${h.decision}`).join("; ") : "none"}</dd>
-        <dt>stalls</dt>
+        <dt>
+          stalls <GradeBadge grade="recorded" />
+        </dt>
         <dd>
           {bundle.lapses.length} lapse(s), {bundle.replans.length} re-plan(s), {bundle.escalations.length} escalation(s), {bundle.clashes.length} clash prediction(s)
           {bundle.caps.length > 0 ? `, caps reached: ${bundle.caps.map((c) => c.kind).join(", ")}` : ""}
@@ -1732,6 +1764,15 @@ export function ProofPanel({ bundle, onSelectSeq }: { bundle: ProofBundle; onSel
       </dl>
       {bundle.incompleteItems.length > 0 ? <p className="muted">not completed: {bundle.incompleteItems.join(", ")}</p> : null}
     </div>
+  );
+}
+
+/** A small evidence-grade badge: how much the statement beside it is worth. */
+export function GradeBadge({ grade }: { grade: EvidenceGrade }) {
+  return (
+    <span className={`mc-grade grade-${grade}`} title={`${GRADE_INFO[grade].label}: ${GRADE_INFO[grade].meaning}`}>
+      {GRADE_INFO[grade].label}
+    </span>
   );
 }
 
@@ -1826,6 +1867,7 @@ export function Thread({
   const row = (m: BoardMessage) => {
     const family = boardMessageFamily(m.type);
     const plain = log ? narrateMessage(m, log, payloadSummary).text : undefined;
+    const grade = gradeOf(m);
     return (
       <li key={m.seq} className={`mc-msg fam-${family}${selectedSeq === m.seq ? " is-selected" : ""}`}>
         {plain !== undefined ? <div className="mc-msg-plain">{plain}</div> : null}
@@ -1843,7 +1885,7 @@ export function Thread({
           <span className="mc-type" style={{ color: FAMILY_COLORS[family] }}>
             {m.type}
           </span>
-          {family === "decision" ? <span className="mc-chip-advisory">advisory</span> : null}
+          {grade ? <GradeBadge grade={grade} /> : null}
           {m.to && m.to.length > 0 ? <span className="muted">to {m.to.join(", ")}</span> : null}
           {m.inReplyTo !== undefined ? (
             <button type="button" className="mc-seq-link" onClick={() => onSelectSeq(m.inReplyTo!)}>
@@ -1852,7 +1894,11 @@ export function Thread({
           ) : null}
         </div>
         <div className={`mc-msg-body${plain !== undefined ? " is-raw" : ""}`}>{payloadSummary(m)}</div>
-        {m.rationale ? <q className="mc-rationale">{m.rationale}</q> : null}
+        {m.rationale ? (
+          <q className="mc-rationale" title={m.from === "engine" ? "the engine's note" : `${m.from}'s own words: claimed, never counted`}>
+            {m.rationale}
+          </q>
+        ) : null}
       </li>
     );
   };

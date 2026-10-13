@@ -310,7 +310,7 @@ describe("honesty labels", () => {
     expect(bundle.status).toBe("proven");
     expect(bundle.speculation?.landed).toMatchObject({ commit: "cand111", rev: 3, matchesRevision: true, matchesPromoted: true });
     const proof = renderToStaticMarkup(createElement(ProofPanel, { bundle, onSelectSeq: () => undefined }));
-    expect(proof).toContain("<dt>speculation</dt>");
+    expect(proof).toMatch(/<dt>speculation <span class="mc-grade grade-checked"/);
     expect(proof).toMatch(/C1 pass \(landed, the gated commit\)/);
     expect(proof).toMatch(/C2 fail \(blamed\)/);
     expect(proof).not.toMatch(/undefined|NaN/);
@@ -332,7 +332,7 @@ describe("honesty labels", () => {
     );
     expect(markup).toContain(`seq ${messages[0]!.seq}`);
     expect(markup).toContain(`re seq ${messages[0]!.seq}`);
-    expect(markup).toContain("<q class=\"mc-rationale\">need the auth contract before I guard users</q>");
+    expect(markup).toMatch(/<q class="mc-rationale" title="[^"]*claimed, never counted">need the auth contract before I guard users<\/q>/);
     expect(markup).toContain('class="mc-sender sender-agent"');
   });
 });
