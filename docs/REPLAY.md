@@ -39,15 +39,28 @@ make replay-preview   # build, then serve on http://127.0.0.1:4180 (REPLAY_PORT=
   the passing revision ringed, speculative candidates as small diamonds, and a
   hollow gap marker (never a zero) where a suite did not run. Revisions are not
   drawn in the graph: hovering or selecting a marker draws that revision with
-  its links to the items it merged and asked to fix.
+  its links to the items it merged and asked to fix. With no revision focused,
+  the latest revision's still-open fix requests are drawn from it at the top
+  right (`outstandingFixLinks`): one trigger line per recorded `fix.requested`,
+  until that item pushes again or a later revision lands; none once a
+  revision passes.
 - Agent coordination is an overlay on the graph (toggle: `talk on/off`):
-  short curved teal arrows labelled with a verb (proposes, accepts, asks help,
+  short curved arrows labelled with a verb (proposes, accepts, asks help,
   volunteers, hands off, contests, clash, re-plans, ...) from the acting
   participant to the one it addressed or concerned, for the messages of the
-  last 10 seqs, fading as they age. It is derived from the recorded messages at
-  the current seq (`communicationArrows` in `apps/console/src/board-overlay.ts`),
-  every arrow cites its seq, and it is not a graph edge: the edge kinds are
-  unchanged.
+  last 10 seqs, fading as they age. Each arrow is coloured by its kind
+  (`commKind`): proposal teal, contract violet, help blue, handoff amber,
+  conflict red, with a matching arrowhead. A label takes the first free spot
+  along its curve (`placeLabel`), clear of node labels, hull and lane titles,
+  captions, the bench chip, and newer talk labels; when none is free the arrow
+  is drawn without its label (the tooltip keeps the verb). It is derived from
+  the recorded messages at the current seq (`communicationArrows` in
+  `apps/console/src/board-overlay.ts`), every arrow cites its seq, and it is
+  not a graph edge: the edge kinds are unchanged.
+- The graph legend lists what is drawn now (`drawnLegend`): each edge style
+  and talk kind on screen with its count, then one "Not on screen now" line
+  (hover a name for when it appears). The item-card marks (done, done
+  proposed, struggling) are always listed.
 - Advisory decisions (Jev) are listed in a collapsible panel under the graph:
   type, answer, confidence, and the mechanical outcome once resolved; grey,
   never styled like a verdict.

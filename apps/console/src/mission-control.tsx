@@ -27,8 +27,16 @@ import { backedPreviews, previewTitle, type RevisionPreview } from "./previews.t
 import { buildProofBundle, formatTestTeeth, type ProofBundle } from "@switchyard-change/orchestration/proof-bundle";
 
 import {
+  COMM_KINDS,
   COMM_WINDOW,
   commCurve,
+  drawnLegend,
+  outstandingFixLinks,
+  placeLabel,
+  talkLabelCandidates,
+  type EdgeVariant,
+  type LegendEntry,
+  type LegendKey,
   commOpacity,
   communicationArrows,
   gateTimeline,
@@ -40,6 +48,7 @@ import {
   speculativeLanded,
   drawingExtent,
   type CommArrow,
+  type CommCurve,
   type GateMarker,
   type JevRow,
   type LandedPart,
@@ -1228,6 +1237,8 @@ const FIT_PAD = 16;
 const MAX_TEXT_BOOST = 1.8;
 /** Where a focused revision is drawn: above the hulls, at the right of the drawing. */
 const REV_ANCHOR_Y = 122;
+/** The line over the latest revision while its open fix requests are drawn (its red hexagon says it failed). */
+const FIX_ASKED_LABEL = "FAIL: fix asked";
 
 /** The text boost that keeps labels at their minimum on-screen size at a given drawing scale. */
 export function textBoost(drawingScale: number): number {
@@ -1323,11 +1334,14 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
   for (const node of model.nodes) if (node.detail.kind === "item") itemAgents.set(node.detail.item, node.detail.agents);
   // The revision drawn now (only while focused), at its anchor above the hulls.
   const focusNode = focusRev !== null ? model.nodes.find((n) => n.id === `rev:${focusRev}`) : undefined;
+  // With no revision focused, the latest revision's open fix requests are drawn from it (each line backed by its fix.requested).
+  const fixAsked = focusNode ? null : outstandingFixLinks(model, log);
+  const shownRev = focusNode ?? fixAsked?.rev;
   const revAnchor = { x: extent.width - 34, y: REV_ANCHOR_Y };
   const points = new Map<string, BoardPoint>();
   for (const node of model.nodes) {
     if (node.kind === "rev") {
-      if (node === focusNode) points.set(node.id, revAnchor);
+      if (node === shownRev) points.set(node.id, revAnchor);
       continue;
     }
     if (node.kind === "jev") continue;
@@ -1366,6 +1380,8 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
     return true;
   });
   const revLinks = focusNode && focusNode.detail.kind === "rev" ? revisionLinks(model, focusNode.detail.n) : [];
+  // The revision lines drawn now: the focused revision's links, else the latest revision's open fix requests.
+  const shownRevLinks = focusNode ? revLinks : (fixAsked?.edges ?? []);
   const messages = (
     messageMode === "off"
       ? []
@@ -1376,387 +1392,540 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
   const selectEdge = (edge: BoardGraphEdge) => choose({ kind: "seq", seq: edge.seqs[edge.seqs.length - 1]! });
   const placedCaptions = placeCaptions(captions, points, { ...layout, width: extent.width }, boost);
   const transformed = view.k !== 1 || view.tx !== 0 || view.ty !== 0;
-  // Overlay marks on one sender stack upward, so two marks never sit on each other.
-  const markSlots = new Map<string, number>();
+
+  // The nodes drawn one by one (not in a collapsed hull, not on the bench chip), with a compact hull's short label.
+  const drawnNodes = model.nodes
+    .filter((n) => n.kind !== "item" && n.kind !== "rev" && n.kind !== "jev")
+    .flatMap((node): DrawnNode[] => {
+      const p = points.get(node.id);
+      if (!p) return [];
+      if (node.detail.kind === "agent" && node.detail.hull !== undefined && collapsed.has(node.detail.hull)) return [];
+      // A large board's free agents are counted on the bench chip, not drawn one by one.
+      if (onBenchChip(layout, node)) return [];
+      const inHull = compact && node.detail.kind === "agent" && node.kind !== "lead" && node.detail.hull !== undefined ? layout.items.get(node.detail.hull) : undefined;
+      // In a compact hull only the first dot (or the sub-lead) is labelled, to its right, cut to the hull.
+      const hullAgents = inHull && node.detail.kind === "agent" ? itemAgents.get(node.detail.hull!) ?? [] : [];
+      const compactLabel =
+        inHull && node.detail.kind === "agent" && (hullAgents[0] === node.detail.agent || node.detail.subLeadOf?.includes(node.detail.hull!))
+          ? ellipsizeToWidth(
+              `${agentShortLabel(node.label)}${node.detail.subLeadOf?.includes(node.detail.hull!) ? " (sub-lead)" : hullAgents.length > 1 ? ` +${hullAgents.length - 1}` : ""}`,
+              inHull.x + inHull.w - p.x - 14 - 60 - (hullAgents.length - 1) * 24,
+              11 * boost,
+            )
+          : null;
+      const compactX = COMPACT_DOT_R + 4 + (node.detail.kind === "agent" && !node.detail.subLeadOf?.includes(node.detail.hull!) ? (hullAgents.length - 1) * 24 : 0);
+      return [{ node, p, inHull: inHull !== undefined, compactLabel, compactX }];
+    });
+
+  // Everything a talk label must not cover: node shapes and labels, hull and lane titles, hull text, edge tags, captions, the bench chip.
+  const occupied: Box[] = drawnNodes.flatMap((d) => nodeBoxes(d, boost));
+  for (const node of model.nodes) {
+    if (node.detail.kind !== "item") continue;
+    const rect = layout.items.get(node.detail.item);
+    if (!rect) continue;
+    occupied.push({ x: rect.x, y: rect.y, w: rect.w, h: HULL_TITLE_H });
+    if (node.detail.volunteers !== undefined && node.detail.volunteers.length > 0) {
+      occupied.push({ x: rect.x + (compact ? 12 : 34), y: rect.y + rect.h - (compact ? 6 : 15) - 11 * boost, w: Math.max(0, rect.w - (compact ? 70 : 74)), h: 14 * boost });
+    }
+    if (collapsed.has(node.detail.item)) {
+      const w = `${node.detail.agents.length} agents`.length * 15 * boost * CHAR_EM;
+      const cx = compact ? rect.x + 12 + w / 2 : rect.x + rect.w / 2;
+      const by = compact ? rect.y + (rect.parent !== undefined ? 50 : 54) + 5 : rect.y + rect.h / 2 + 12;
+      occupied.push(textBox(cx, by, w, 15 * boost));
+    }
+  }
+  for (const lane of layout.lanes) {
+    if (laneCaption(lane, model)) occupied.push({ x: lane.x, y: lane.y, w: lane.w, h: LANE_HEAD });
+  }
+  for (const edge of persistent) {
+    const a = points.get(edge.from);
+    const b = points.get(edge.to);
+    if (!a || !b || !edge.label || (compact && edge.label === "merged")) continue;
+    occupied.push(textBox((a.x + b.x) / 2, (a.y + b.y) / 2 - 4, edge.label.length * 11 * boost * CHAR_EM, 11 * boost));
+  }
+  if (messageMode === "all") {
+    for (const edge of messages) {
+      const a = points.get(edge.from);
+      const b = points.get(edge.to);
+      if (!a || !b || edge.count <= 1) continue;
+      occupied.push(textBox((a.x + b.x) / 2, (a.y + b.y) / 2 - 4, `x${edge.count}`.length * 12 * boost * CHAR_EM, 12 * boost));
+    }
+  }
+  if (shownRev && shownRev.detail.kind === "rev") {
+    occupied.push({ x: revAnchor.x - 20, y: revAnchor.y - 20, w: 40, h: 40 });
+    if (focusNode) {
+      const w = shownRev.detail.verdictLabel.length * 13 * boost * CHAR_EM;
+      occupied.push({ x: revAnchor.x - 26 - w, y: revAnchor.y - 20, w, h: 40 });
+    } else {
+      const w = FIX_ASKED_LABEL.length * 13 * boost * CHAR_EM;
+      occupied.push(textBox(revAnchor.x + 18 - w / 2, revAnchor.y - 26, w, 13 * boost));
+    }
+  }
+  for (const c of placedCaptions) occupied.push({ x: c.x - c.w / 2, y: c.y, w: c.w, h: c.h });
+  if (layout.benchChip && bench.idle.length + bench.left.length > 0) {
+    occupied.push({ x: layout.benchChip.x, y: layout.benchChip.y, w: benchW, h: BENCH_CHIP_H });
+  }
+  // Talk labels, newest arrow first: each takes the first free spot along its curve (or above its sender), else none.
+  const talkBounds = { x: -FIT_PAD, y: -FIT_PAD, w: vbW, h: vbH };
+  const talkDrawn = arrows.flatMap((arrow): TalkDrawn[] => {
+    const a = points.get(arrow.from);
+    if (!a) return [];
+    const b = arrow.to !== null ? points.get(arrow.to) : undefined;
+    const size = { w: arrow.verb.length * 7.2 * boost + 12, h: 17 * boost };
+    const isMark = !b || (Math.abs(a.x - b.x) < 1 && Math.abs(a.y - b.y) < 1);
+    const curve = isMark ? null : commCurve(a, b!);
+    const candidates = curve
+      ? talkLabelCandidates(curve, size.h)
+      : [0, 1, 2, 3].map((slot) => ({ x: a.x, y: a.y - 30 - size.h / 2 - slot * (size.h + 3) })).concat(
+          [-1, 1].map((side) => ({ x: a.x + side * (size.w / 2 + 24), y: a.y - 30 - size.h / 2 })),
+        );
+    const label = placeLabel(size, candidates, occupied, { bounds: talkBounds });
+    if (label) occupied.push(label);
+    return [{ arrow, from: a, curve, label }];
+  });
+  // The legend lists what is drawn now, from the same arrays the drawing renders.
+  const itemOfLink = (e: BoardGraphEdge) => (e.from.startsWith("item:") ? e.from : e.to).slice("item:".length);
+  const legend = drawnLegend(
+    [
+      ...persistent.filter((e) => points.has(e.from) && points.has(e.to)),
+      ...(shownRev ? shownRevLinks.filter((e) => layout.items.has(itemOfLink(e))) : []),
+      ...messages.filter((e) => points.has(e.from) && points.has(e.to)),
+    ],
+    talkDrawn.map((t) => t.arrow),
+  );
 
   return (
-    <div className="mc-graph-stage" ref={stageRef}>
-      <div className="mc-zoom">
-        <button type="button" onClick={() => zoomBy(1.25)} title="Zoom in">
-          +
-        </button>
-        <button type="button" onClick={() => zoomBy(0.8)} title="Zoom out">
-          -
-        </button>
-        <button type="button" onClick={() => setView(IDENTITY_VIEW)} disabled={!transformed} title="Fit the graph to the pane">
-          Fit
-        </button>
-        <span className="muted">alt + scroll to zoom, drag to pan</span>
-      </div>
-      <svg
-        ref={svgRef}
-        className="mc-graph-svg"
-        viewBox={`${-FIT_PAD} ${-FIT_PAD} ${vbW} ${vbH}`}
-        role="img"
-        aria-label="Board graph"
-        preserveAspectRatio="xMidYMin meet"
-        style={{ ["--mc-t" as string]: boost.toFixed(3) }}
-        onMouseDown={(event) => {
-          if (event.button !== 0) return;
-          drag.current = { x: event.clientX, y: event.clientY, tx: view.tx, ty: view.ty, moved: false };
-        }}
-        onMouseMove={(event) => {
-          const d = drag.current;
-          if (!d) return;
-          const dx = event.clientX - d.x;
-          const dy = event.clientY - d.y;
-          if (!d.moved && Math.hypot(dx, dy) < 4) return;
-          d.moved = true;
-          const { unit } = toSvg(event.clientX, event.clientY);
-          setView((prev) => ({ ...prev, tx: d.tx + dx * unit, ty: d.ty + dy * unit }));
-        }}
-        onMouseUp={() => {
-          // Let the click that ends a drag see `moved`, then clear it.
-          setTimeout(() => {
+    <>
+      <div className="mc-graph-stage" ref={stageRef}>
+        <div className="mc-zoom">
+          <button type="button" onClick={() => zoomBy(1.25)} title="Zoom in">
+            +
+          </button>
+          <button type="button" onClick={() => zoomBy(0.8)} title="Zoom out">
+            -
+          </button>
+          <button type="button" onClick={() => setView(IDENTITY_VIEW)} disabled={!transformed} title="Fit the graph to the pane">
+            Fit
+          </button>
+          <span className="muted">alt + scroll to zoom, drag to pan</span>
+        </div>
+        <svg
+          ref={svgRef}
+          className="mc-graph-svg"
+          viewBox={`${-FIT_PAD} ${-FIT_PAD} ${vbW} ${vbH}`}
+          role="img"
+          aria-label="Board graph"
+          preserveAspectRatio="xMidYMin meet"
+          style={{ ["--mc-t" as string]: boost.toFixed(3) }}
+          onMouseDown={(event) => {
+            if (event.button !== 0) return;
+            drag.current = { x: event.clientX, y: event.clientY, tx: view.tx, ty: view.ty, moved: false };
+          }}
+          onMouseMove={(event) => {
+            const d = drag.current;
+            if (!d) return;
+            const dx = event.clientX - d.x;
+            const dy = event.clientY - d.y;
+            if (!d.moved && Math.hypot(dx, dy) < 4) return;
+            d.moved = true;
+            const { unit } = toSvg(event.clientX, event.clientY);
+            setView((prev) => ({ ...prev, tx: d.tx + dx * unit, ty: d.ty + dy * unit }));
+          }}
+          onMouseUp={() => {
+            // Let the click that ends a drag see `moved`, then clear it.
+            setTimeout(() => {
+              drag.current = null;
+            }, 0);
+          }}
+          onMouseLeave={() => {
             drag.current = null;
-          }, 0);
-        }}
-        onMouseLeave={() => {
-          drag.current = null;
-        }}
-      >
-        <defs>
-          <marker id="mc-talk-head" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-            <path className="mc-talk-head" d="M 0 0 L 10 5 L 0 10 z" />
-          </marker>
-        </defs>
-        <g transform={`translate(${view.tx}, ${view.ty}) scale(${view.k})`}>
-          {/* Lanes (a large board): items grouped by sub-lead or domain; drawn only once one of their items exists at K. */}
-          {layout.lanes.length > 0 ? (
-            <g className="mc-lanes">
-              {layout.lanes.map((lane) => {
-                const caption = laneCaption(lane, model);
-                if (!caption) return null;
-                const titleText = ellipsizeToWidth(caption.title, lane.w * 0.45, 13 * boost);
-                return (
-                  <g key={lane.key} className="mc-lane">
-                    <rect x={lane.x} y={lane.y} width={lane.w} height={lane.h} rx={12} />
-                    <text className="mc-lane-title" x={lane.x + 10} y={lane.y + LANE_HEAD - 8}>
-                      {titleText}
-                    </text>
-                    <text className="mc-lane-detail" x={lane.x + lane.w - 10} y={lane.y + LANE_HEAD - 8} textAnchor="end">
-                      {ellipsizeToWidth(caption.detail, lane.w - 30 - titleText.length * 13 * boost * 0.62, 11 * boost)}
-                    </text>
-                    <title>{`${caption.title}: ${caption.detail}${caption.subLeads.length > 0 ? `, sub-lead ${caption.subLeads.join(", ")}` : ""} (${lane.items.length} top-level item(s))`}</title>
-                  </g>
-                );
-              })}
+          }}
+        >
+          <defs>
+            {/* One arrowhead per talk kind, so each head matches its arrow's colour. */}
+            {COMM_KINDS.map((kind) => (
+              <marker key={kind} id={`mc-talk-head-${kind}`} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path className={`mc-talk-head talk-${kind}`} d="M 0 0 L 10 5 L 0 10 z" />
+              </marker>
+            ))}
+          </defs>
+          <g transform={`translate(${view.tx}, ${view.ty}) scale(${view.k})`}>
+            {/* Lanes (a large board): items grouped by sub-lead or domain; drawn only once one of their items exists at K. */}
+            {layout.lanes.length > 0 ? (
+              <g className="mc-lanes">
+                {layout.lanes.map((lane) => {
+                  const caption = laneCaption(lane, model);
+                  if (!caption) return null;
+                  const titleText = ellipsizeToWidth(caption.title, lane.w * 0.45, 13 * boost);
+                  return (
+                    <g key={lane.key} className="mc-lane">
+                      <rect x={lane.x} y={lane.y} width={lane.w} height={lane.h} rx={12} />
+                      <text className="mc-lane-title" x={lane.x + 10} y={lane.y + LANE_HEAD - 8}>
+                        {titleText}
+                      </text>
+                      <text className="mc-lane-detail" x={lane.x + lane.w - 10} y={lane.y + LANE_HEAD - 8} textAnchor="end">
+                        {ellipsizeToWidth(caption.detail, lane.w - 30 - titleText.length * 13 * boost * 0.62, 11 * boost)}
+                      </text>
+                      <title>{`${caption.title}: ${caption.detail}${caption.subLeads.length > 0 ? `, sub-lead ${caption.subLeads.join(", ")}` : ""} (${lane.items.length} top-level item(s))`}</title>
+                    </g>
+                  );
+                })}
+              </g>
+            ) : null}
+            {/* Item hulls. */}
+            <g className={`mc-hulls${compact ? " is-compact" : ""}`}>
+              {model.nodes
+                .filter((n) => n.kind === "item")
+                .map((node) => {
+                  if (node.detail.kind !== "item") return null;
+                  const d = node.detail;
+                  const rect = layout.items.get(d.item);
+                  if (!rect) return null;
+                  const isSel = selected === node.id;
+                  const statusText = `${node.status}${d.fixRequested !== undefined ? ` / fix ${d.fixAttempts}` : ""}`;
+                  const title = itemLabels.get(d.item) ?? d.item;
+                  const header = hullHeader({ title: compact ? compactHullTitle(d.item, title, rect.parent ?? laneOfItem.get(d.item)) : title, status: statusText, width: rect.w, boost });
+                  // The done check and the struggling mark sit at the bottom of the hull; a compact hull keeps them in its own band (above any nested child).
+                  const markBottom = compact ? rect.y + (rect.parent !== undefined ? COMPACT_NESTED_H : COMPACT_HULL_H) : rect.y + rect.h;
+                  const inFocus = focusNode?.detail.kind === "rev" ? revLinks.some((e) => e.from === node.id || e.to === node.id) : false;
+                  return (
+                    <g
+                      key={node.id}
+                      className={`mc-hull status-${node.status}${isSel ? " is-selected" : ""}${rect.parent !== undefined ? " is-nested" : ""}${inFocus ? " is-rev-focus" : ""}`}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`item ${d.item} (${node.status})`}
+                      onClick={() => choose({ kind: "item", id: d.item })}
+                    >
+                      <rect x={rect.x} y={rect.y} width={rect.w} height={rect.h} rx={16} />
+                      <rect className="mc-hull-bar" x={rect.x} y={rect.y} width={rect.w} height={HULL_TITLE_H} rx={16} />
+                      <text
+                        className="mc-hull-title"
+                        x={rect.x + 14}
+                        y={rect.y + 22}
+                        {...(header.scale !== undefined ? { style: { fontSize: `calc(15px * var(--mc-t, 1) * ${header.scale})` } } : {})}
+                      >
+                        {header.title}
+                      </text>
+                      {header.badge.w > 0 ? (
+                        <>
+                          <rect className="mc-hull-badge" x={rect.x + header.badge.x} y={rect.y + 7} width={header.badge.w} height={HULL_TITLE_H - 14} rx={9} />
+                          <text className="mc-hull-status" x={rect.x + header.badge.x + header.badge.w / 2} y={rect.y + 21} textAnchor="middle">
+                            {header.status}
+                          </text>
+                        </>
+                      ) : null}
+                      {d.completed !== undefined ? (
+                        <circle className="mc-check is-filled" cx={rect.x + rect.w - 22} cy={markBottom - 22} r={11} />
+                      ) : d.doneProposed ? (
+                        <circle className="mc-check is-hollow" cx={rect.x + rect.w - 22} cy={markBottom - 22} r={11} />
+                      ) : null}
+                      {d.completed !== undefined || d.doneProposed ? (
+                        <text className="mc-check-mark" x={rect.x + rect.w - 22} y={markBottom - 17} textAnchor="middle">
+                          {"✓"}
+                        </text>
+                      ) : null}
+                      {d.struggling !== undefined ? (
+                        // A compact hull's dot row runs along its left: the mark sits left of the done check instead.
+                        <g className="mc-struggling">
+                          <circle cx={compact ? rect.x + rect.w - 48 : rect.x + 18} cy={markBottom - 20} r={10} />
+                          <text x={compact ? rect.x + rect.w - 48 : rect.x + 18} y={markBottom - 15} textAnchor="middle">
+                            !
+                          </text>
+                          <title>{`struggling (${d.struggling.reason}, ${d.struggling.turnsSpent} turn(s)): idle agents may volunteer (seq ${d.struggling.seq}, item.struggling)`}</title>
+                        </g>
+                      ) : null}
+                      {d.volunteers !== undefined && d.volunteers.length > 0 && !(compact && collapsed.has(d.item)) ? (
+                        // One line inside the hull (a long list is cut), the full list in the title.
+                        <g className="mc-volunteers-line">
+                          <text className="mc-volunteers" x={compact ? rect.x + 12 : rect.x + 34} y={rect.y + rect.h - (compact ? 6 : 15)}>
+                            {compact
+                              ? ellipsizeToWidth(`${d.volunteers.length} offer${d.volunteers.length === 1 ? "" : "s"}`, rect.w - 70, 11 * boost)
+                              : ellipsizeToWidth(d.volunteers.map((v) => `${v.agent}${v.answer ? ` (${v.answer})` : " offered"}`).join(", "), rect.w - 34 - 40, 11 * boost)}
+                          </text>
+                          <title>{`volunteers: ${d.volunteers.map((v) => `${v.agent}${v.answer ? ` (${v.answer})` : " offered"}`).join(", ")}`}</title>
+                        </g>
+                      ) : null}
+                      {collapsed.has(d.item) ? (
+                        <text
+                          className="mc-hull-count"
+                          x={compact ? rect.x + 12 : rect.x + rect.w / 2}
+                          y={compact ? rect.y + (rect.parent !== undefined ? 50 : 54) + 5 : rect.y + rect.h / 2 + 12}
+                          textAnchor={compact ? "start" : "middle"}
+                        >
+                          {d.agents.length} agents
+                        </text>
+                      ) : null}
+                      <title>{node.tooltip}</title>
+                    </g>
+                  );
+                })}
             </g>
-          ) : null}
-          {/* Item hulls. */}
-          <g className={`mc-hulls${compact ? " is-compact" : ""}`}>
-            {model.nodes
-              .filter((n) => n.kind === "item")
-              .map((node) => {
-                if (node.detail.kind !== "item") return null;
-                const d = node.detail;
-                const rect = layout.items.get(d.item);
-                if (!rect) return null;
-                const isSel = selected === node.id;
-                const statusText = `${node.status}${d.fixRequested !== undefined ? ` / fix ${d.fixAttempts}` : ""}`;
-                const title = itemLabels.get(d.item) ?? d.item;
-                const header = hullHeader({ title: compact ? compactHullTitle(d.item, title, rect.parent ?? laneOfItem.get(d.item)) : title, status: statusText, width: rect.w, boost });
-                // The done check and the struggling mark sit at the bottom of the hull; a compact hull keeps them in its own band (above any nested child).
-                const markBottom = compact ? rect.y + (rect.parent !== undefined ? COMPACT_NESTED_H : COMPACT_HULL_H) : rect.y + rect.h;
-                const inFocus = focusNode?.detail.kind === "rev" ? revLinks.some((e) => e.from === node.id || e.to === node.id) : false;
+
+            {/* Persistent edges: dependency, trigger, consumed-tool, contest. */}
+            <g className="mc-edges">
+              {persistent.map((edge) => {
+                const a = points.get(edge.from);
+                const b = points.get(edge.to);
+                if (!a || !b) return null;
+                const related = selected !== null && (edge.from === selected || edge.to === selected);
                 return (
                   <g
-                    key={node.id}
-                    className={`mc-hull status-${node.status}${isSel ? " is-selected" : ""}${rect.parent !== undefined ? " is-nested" : ""}${inFocus ? " is-rev-focus" : ""}`}
-                    role="button"
-                    tabIndex={0}
-                    aria-label={`item ${d.item} (${node.status})`}
-                    onClick={() => choose({ kind: "item", id: d.item })}
+                    key={edge.id}
+                    className={`mc-edge kind-${edge.kind}${edge.contest ? ` contest-${edge.contest}` : ""}${edge.label ? ` label-${edge.label}` : ""}${related ? " is-related" : ""}`}
+                    onClick={() => selectEdge(edge)}
                   >
-                    <rect x={rect.x} y={rect.y} width={rect.w} height={rect.h} rx={16} />
-                    <rect className="mc-hull-bar" x={rect.x} y={rect.y} width={rect.w} height={HULL_TITLE_H} rx={16} />
-                    <text
-                      className="mc-hull-title"
-                      x={rect.x + 14}
-                      y={rect.y + 22}
-                      {...(header.scale !== undefined ? { style: { fontSize: `calc(15px * var(--mc-t, 1) * ${header.scale})` } } : {})}
-                    >
-                      {header.title}
-                    </text>
-                    {header.badge.w > 0 ? (
-                      <>
-                        <rect className="mc-hull-badge" x={rect.x + header.badge.x} y={rect.y + 7} width={header.badge.w} height={HULL_TITLE_H - 14} rx={9} />
-                        <text className="mc-hull-status" x={rect.x + header.badge.x + header.badge.w / 2} y={rect.y + 21} textAnchor="middle">
-                          {header.status}
-                        </text>
-                      </>
-                    ) : null}
-                    {d.completed !== undefined ? (
-                      <circle className="mc-check is-filled" cx={rect.x + rect.w - 22} cy={markBottom - 22} r={11} />
-                    ) : d.doneProposed ? (
-                      <circle className="mc-check is-hollow" cx={rect.x + rect.w - 22} cy={markBottom - 22} r={11} />
-                    ) : null}
-                    {d.completed !== undefined || d.doneProposed ? (
-                      <text className="mc-check-mark" x={rect.x + rect.w - 22} y={markBottom - 17} textAnchor="middle">
-                        {"✓"}
+                    <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} />
+                    {/* A large board nests a split item's children inside it: the "merged" tag would only repeat that. */}
+                    {edge.label && !(compact && edge.label === "merged") ? (
+                      <text className="mc-edge-tag" x={(a.x + b.x) / 2} y={(a.y + b.y) / 2 - 4} textAnchor="middle">
+                        {edge.label}
                       </text>
                     ) : null}
-                    {d.struggling !== undefined ? (
-                      // A compact hull's dot row runs along its left: the mark sits left of the done check instead.
-                      <g className="mc-struggling">
-                        <circle cx={compact ? rect.x + rect.w - 48 : rect.x + 18} cy={markBottom - 20} r={10} />
-                        <text x={compact ? rect.x + rect.w - 48 : rect.x + 18} y={markBottom - 15} textAnchor="middle">
-                          !
-                        </text>
-                        <title>{`struggling (${d.struggling.reason}, ${d.struggling.turnsSpent} turn(s)): idle agents may volunteer (seq ${d.struggling.seq}, item.struggling)`}</title>
-                      </g>
-                    ) : null}
-                    {d.volunteers !== undefined && d.volunteers.length > 0 && !(compact && collapsed.has(d.item)) ? (
-                      // One line inside the hull (a long list is cut), the full list in the title.
-                      <g className="mc-volunteers-line">
-                        <text className="mc-volunteers" x={compact ? rect.x + 12 : rect.x + 34} y={rect.y + rect.h - (compact ? 6 : 15)}>
-                          {compact
-                            ? ellipsizeToWidth(`${d.volunteers.length} offer${d.volunteers.length === 1 ? "" : "s"}`, rect.w - 70, 11 * boost)
-                            : ellipsizeToWidth(d.volunteers.map((v) => `${v.agent}${v.answer ? ` (${v.answer})` : " offered"}`).join(", "), rect.w - 34 - 40, 11 * boost)}
-                        </text>
-                        <title>{`volunteers: ${d.volunteers.map((v) => `${v.agent}${v.answer ? ` (${v.answer})` : " offered"}`).join(", ")}`}</title>
-                      </g>
-                    ) : null}
-                    {collapsed.has(d.item) ? (
-                      <text
-                        className="mc-hull-count"
-                        x={compact ? rect.x + 12 : rect.x + rect.w / 2}
-                        y={compact ? rect.y + (rect.parent !== undefined ? 50 : 54) + 5 : rect.y + rect.h / 2 + 12}
-                        textAnchor={compact ? "start" : "middle"}
-                      >
-                        {d.agents.length} agents
-                      </text>
-                    ) : null}
-                    <title>{node.tooltip}</title>
-                  </g>
-                );
-              })}
-          </g>
-
-          {/* Persistent edges: dependency, trigger, consumed-tool, contest. */}
-          <g className="mc-edges">
-            {persistent.map((edge) => {
-              const a = points.get(edge.from);
-              const b = points.get(edge.to);
-              if (!a || !b) return null;
-              const related = selected !== null && (edge.from === selected || edge.to === selected);
-              return (
-                <g
-                  key={edge.id}
-                  className={`mc-edge kind-${edge.kind}${edge.contest ? ` contest-${edge.contest}` : ""}${edge.label ? ` label-${edge.label}` : ""}${related ? " is-related" : ""}`}
-                  onClick={() => selectEdge(edge)}
-                >
-                  <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} />
-                  {/* A large board nests a split item's children inside it: the "merged" tag would only repeat that. */}
-                  {edge.label && !(compact && edge.label === "merged") ? (
-                    <text className="mc-edge-tag" x={(a.x + b.x) / 2} y={(a.y + b.y) / 2 - 4} textAnchor="middle">
-                      {edge.label}
-                    </text>
-                  ) : null}
-                  <title>{edge.tooltip}</title>
-                </g>
-              );
-            })}
-          </g>
-
-          {/* The focused revision's own edges (merged items, fix asked), to the top of each hull. */}
-          {focusNode && focusNode.detail.kind === "rev" ? (
-            <g className={`mc-rev-focus status-${focusNode.status}`} aria-label={`revision ${focusNode.detail.n} links`}>
-              {revLinks.map((edge) => {
-                const item = (edge.from.startsWith("item:") ? edge.from : edge.to).slice("item:".length);
-                const rect = layout.items.get(item);
-                if (!rect) return null;
-                const curve = commCurve(revAnchor, { x: rect.x + rect.w / 2, y: rect.y }, 0.12, 22);
-                return (
-                  <g key={edge.id} className={`mc-edge kind-${edge.kind} is-related`} onClick={() => selectEdge(edge)}>
-                    <path d={curve.d} />
                     <title>{edge.tooltip}</title>
                   </g>
                 );
               })}
-              <g className={`mc-node kind-rev status-${focusNode.status}`} style={{ transform: `translate(${revAnchor.x}px, ${revAnchor.y}px)` }} onClick={() => choose({ kind: "node", id: focusNode.id })}>
-                <polygon className="shape" points={hexagon(18)} />
-                <text className="mc-node-label is-center" textAnchor="middle" y={5}>
-                  {focusNode.detail.n}
-                </text>
-                <text className="mc-node-sub" textAnchor="end" x={-26} y={5}>
-                  {focusNode.detail.verdictLabel}
-                </text>
-                <title>{focusNode.tooltip}</title>
-              </g>
             </g>
-          ) : null}
 
-          {/* Message edges: transient (a dot travels and fades), all (aggregated), or off. */}
-          <g className="mc-messages">
-            {messages.map((edge) => {
-              const a = points.get(edge.from);
-              const b = points.get(edge.to);
-              if (!a || !b) return null;
-              return (
-                <g
-                  key={edge.id}
-                  className={`mc-edge kind-message${messageMode === "live" ? " is-transient" : ""}`}
-                  onClick={() => selectEdge(edge)}
-                >
-                  <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} />
-                  {messageMode === "live" ? (
-                    <circle className="mc-msg-dot" r={6}>
-                      <animateMotion dur="1.4s" fill="freeze" path={`M ${a.x} ${a.y} L ${b.x} ${b.y}`} />
-                    </circle>
-                  ) : edge.count > 1 ? (
-                    <text className="mc-edge-label" x={(a.x + b.x) / 2} y={(a.y + b.y) / 2 - 4} textAnchor="middle">
-                      x{edge.count}
-                    </text>
-                  ) : null}
-                  <title>{edge.tooltip}</title>
+            {/* The focused revision's own edges (merged items, fix asked), else the latest revision's open fix requests, to the top of each hull. */}
+            {shownRev && shownRev.detail.kind === "rev" ? (
+              <g
+                className={`mc-rev-focus status-${shownRev.status}${focusNode ? "" : " is-fix-asked"}`}
+                aria-label={focusNode ? `revision ${shownRev.detail.n} links` : `revision ${shownRev.detail.n} open fix requests`}
+              >
+                {shownRevLinks.map((edge) => {
+                  const item = (edge.from.startsWith("item:") ? edge.from : edge.to).slice("item:".length);
+                  const rect = layout.items.get(item);
+                  if (!rect) return null;
+                  const curve = commCurve(revAnchor, { x: rect.x + rect.w / 2, y: rect.y }, 0.12, 22);
+                  return (
+                    <g key={edge.id} className={`mc-edge kind-${edge.kind} is-related`} onClick={() => selectEdge(edge)}>
+                      <path d={curve.d} />
+                      <title>{edge.tooltip}</title>
+                    </g>
+                  );
+                })}
+                <g className={`mc-node kind-rev status-${shownRev.status}`} style={{ transform: `translate(${revAnchor.x}px, ${revAnchor.y}px)` }} onClick={() => choose({ kind: "node", id: shownRev.id })}>
+                  <polygon className="shape" points={hexagon(18)} />
+                  <text className="mc-node-label is-center" textAnchor="middle" y={5}>
+                    {shownRev.detail.n}
+                  </text>
+                  {/* Focused: the verdict to its left. Fix requests only: a short line above it, clear of the goal's label. */}
+                  <text className="mc-node-sub" textAnchor="end" x={focusNode ? -26 : 18} y={focusNode ? 5 : -26}>
+                    {focusNode ? shownRev.detail.verdictLabel : FIX_ASKED_LABEL}
+                  </text>
+                  <title>{shownRev.tooltip}</title>
                 </g>
-              );
-            })}
-          </g>
+              </g>
+            ) : null}
 
-          {/* Nodes (agents tween between hulls via a CSS transform transition). Revisions and decisions live outside the drawing. */}
-          <g className="mc-nodes">
-            {model.nodes
-              .filter((n) => n.kind !== "item" && n.kind !== "rev" && n.kind !== "jev")
-              .map((node) => {
-                const p = points.get(node.id);
-                if (!p) return null;
-                if (node.detail.kind === "agent" && node.detail.hull !== undefined && collapsed.has(node.detail.hull)) {
-                  return null;
-                }
-                // A large board's free agents are counted on the bench chip, not drawn one by one.
-                if (onBenchChip(layout, node)) return null;
-                const isSel = selected === node.id;
-                const inHull = compact && node.detail.kind === "agent" && node.kind !== "lead" && node.detail.hull !== undefined ? layout.items.get(node.detail.hull) : undefined;
-                // In a compact hull only the first dot (or the sub-lead) is labelled, to its right, cut to the hull.
-                const hullAgents = inHull && node.detail.kind === "agent" ? itemAgents.get(node.detail.hull!) ?? [] : [];
-                const compactLabel =
-                  inHull && node.detail.kind === "agent" && (hullAgents[0] === node.detail.agent || node.detail.subLeadOf?.includes(node.detail.hull!))
-                    ? ellipsizeToWidth(
-                        `${agentShortLabel(node.label)}${node.detail.subLeadOf?.includes(node.detail.hull!) ? " (sub-lead)" : hullAgents.length > 1 ? ` +${hullAgents.length - 1}` : ""}`,
-                        inHull.x + inHull.w - p.x - 14 - 60 - (hullAgents.length - 1) * 24,
-                        11 * boost,
-                      )
-                    : null;
+            {/* Message edges: transient (a dot travels and fades), all (aggregated), or off. */}
+            <g className="mc-messages">
+              {messages.map((edge) => {
+                const a = points.get(edge.from);
+                const b = points.get(edge.to);
+                if (!a || !b) return null;
                 return (
                   <g
-                    key={node.id}
-                    className={`mc-node kind-${node.kind} status-${node.status}${isSel ? " is-selected" : ""}${node.detail.kind === "agent" && node.detail.subLeadOf !== undefined && node.detail.hull !== undefined && node.detail.subLeadOf.includes(node.detail.hull) ? " is-sub-lead" : ""}`}
-                    style={{ transform: `translate(${p.x}px, ${p.y}px)` }}
-                    role="button"
-                    tabIndex={0}
-                    aria-label={`${node.kind} ${node.label} (${node.status})`}
-                    onClick={() =>
-                      choose(node.detail.kind === "agent" ? { kind: "agent", id: node.detail.agent } : { kind: "node", id: node.id })
-                    }
+                    key={edge.id}
+                    className={`mc-edge kind-message${messageMode === "live" ? " is-transient" : ""}`}
+                    onClick={() => selectEdge(edge)}
                   >
-                    {inHull ? (
-                      <>
-                        <circle className="shape" r={COMPACT_DOT_R} />
-                        {compactLabel ? (
-                          <text className="mc-node-label is-compact" textAnchor="start" x={COMPACT_DOT_R + 4 + (node.detail.kind === "agent" && !node.detail.subLeadOf?.includes(node.detail.hull!) ? (hullAgents.length - 1) * 24 : 0)} y={4}>
-                            {compactLabel}
-                          </text>
-                        ) : null}
-                      </>
-                    ) : (
-                      <>
-                        <NodeShape node={node} />
-                        <NodeLabel node={node} boost={boost} />
-                      </>
-                    )}
-                    <title>{node.tooltip}</title>
+                    <line x1={a.x} y1={a.y} x2={b.x} y2={b.y} />
+                    {messageMode === "live" ? (
+                      <circle className="mc-msg-dot" r={6}>
+                        <animateMotion dur="1.4s" fill="freeze" path={`M ${a.x} ${a.y} L ${b.x} ${b.y}`} />
+                      </circle>
+                    ) : edge.count > 1 ? (
+                      <text className="mc-edge-label" x={(a.x + b.x) / 2} y={(a.y + b.y) / 2 - 4} textAnchor="middle">
+                        x{edge.count}
+                      </text>
+                    ) : null}
+                    <title>{edge.tooltip}</title>
                   </g>
                 );
               })}
-            {layout.benchChip && bench.idle.length + bench.left.length > 0 ? (
-              <g
-                className={`mc-bench-chip${benchSelected ? " is-selected" : ""}`}
-                role="button"
-                tabIndex={0}
-                aria-label={`bench: ${bench.idle.length} idle, ${bench.left.length} left`}
-                onClick={() => {
-                  const first = bench.idle[0] ?? bench.left[0];
-                  if (first !== undefined) choose({ kind: "agent", id: first });
-                }}
-              >
-                <rect x={layout.benchChip.x} y={layout.benchChip.y} width={benchW} height={BENCH_CHIP_H} rx={BENCH_CHIP_H / 2} />
-                <text x={layout.benchChip.x + 16} y={layout.benchChip.y + BENCH_CHIP_H / 2 + 5}>
-                  {ellipsizeToWidth(
-                    benchLine(bench.idle.length, bench.left.length),
-                    benchW - 32,
-                    13 * boost,
-                  )}
-                </text>
-                <title>{`Agents holding no item at seq ${model.k}. Idle: ${shortList(bench.idle, 12) || "none"}. Left the board: ${shortList(bench.left, 12) || "none"}.`}</title>
-              </g>
-            ) : null}
-          </g>
+            </g>
 
-          {/* The communication overlay: who addressed whom in the last few seqs (an annotation, not a graph edge). */}
-          <g className="mc-talk" aria-label="Agent communication overlay">
-            {arrows.map((arrow) => {
-              const a = points.get(arrow.from);
-              if (!a) return null;
-              const b = arrow.to !== null ? points.get(arrow.to) : undefined;
-              const opacity = commOpacity(arrow.age, COMM_WINDOW);
-              const labelW = arrow.verb.length * 7.2 * boost + 12;
-              const labelH = 17 * boost;
-              if (!b || (Math.abs(a.x - b.x) < 1 && Math.abs(a.y - b.y) < 1)) {
-                // No drawn target: a mark above the sender, stacked when it has several.
-                const slot = markSlots.get(arrow.from) ?? 0;
-                markSlots.set(arrow.from, slot + 1);
-                const y = a.y - 30 - labelH - slot * (labelH + 3);
-                return (
-                  <g key={arrow.id} className="mc-talk-mark" style={{ opacity }} onClick={() => choose({ kind: "seq", seq: arrow.seq })}>
-                    <rect x={a.x - labelW / 2} y={y} width={labelW} height={labelH} rx={labelH / 2} />
-                    <text x={a.x} y={y + labelH * 0.72} textAnchor="middle">
+            {/* Nodes (agents tween between hulls via a CSS transform transition). Revisions and decisions live outside the drawing. */}
+            <g className="mc-nodes">
+              {drawnNodes.map(({ node, p, inHull, compactLabel, compactX }) => {
+                  const isSel = selected === node.id;
+                  return (
+                    <g
+                      key={node.id}
+                      className={`mc-node kind-${node.kind} status-${node.status}${isSel ? " is-selected" : ""}${node.detail.kind === "agent" && node.detail.subLeadOf !== undefined && node.detail.hull !== undefined && node.detail.subLeadOf.includes(node.detail.hull) ? " is-sub-lead" : ""}`}
+                      style={{ transform: `translate(${p.x}px, ${p.y}px)` }}
+                      role="button"
+                      tabIndex={0}
+                      aria-label={`${node.kind} ${node.label} (${node.status})`}
+                      onClick={() =>
+                        choose(node.detail.kind === "agent" ? { kind: "agent", id: node.detail.agent } : { kind: "node", id: node.id })
+                      }
+                    >
+                      {inHull ? (
+                        <>
+                          <circle className="shape" r={COMPACT_DOT_R} />
+                          {compactLabel ? (
+                            <text className="mc-node-label is-compact" textAnchor="start" x={compactX} y={4}>
+                              {compactLabel}
+                            </text>
+                          ) : null}
+                        </>
+                      ) : (
+                        <>
+                          <NodeShape node={node} />
+                          <NodeLabel node={node} boost={boost} />
+                        </>
+                      )}
+                      <title>{node.tooltip}</title>
+                    </g>
+                  );
+                })}
+              {layout.benchChip && bench.idle.length + bench.left.length > 0 ? (
+                <g
+                  className={`mc-bench-chip${benchSelected ? " is-selected" : ""}`}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`bench: ${bench.idle.length} idle, ${bench.left.length} left`}
+                  onClick={() => {
+                    const first = bench.idle[0] ?? bench.left[0];
+                    if (first !== undefined) choose({ kind: "agent", id: first });
+                  }}
+                >
+                  <rect x={layout.benchChip.x} y={layout.benchChip.y} width={benchW} height={BENCH_CHIP_H} rx={BENCH_CHIP_H / 2} />
+                  <text x={layout.benchChip.x + 16} y={layout.benchChip.y + BENCH_CHIP_H / 2 + 5}>
+                    {ellipsizeToWidth(
+                      benchLine(bench.idle.length, bench.left.length),
+                      benchW - 32,
+                      13 * boost,
+                    )}
+                  </text>
+                  <title>{`Agents holding no item at seq ${model.k}. Idle: ${shortList(bench.idle, 12) || "none"}. Left the board: ${shortList(bench.left, 12) || "none"}.`}</title>
+                </g>
+              ) : null}
+            </g>
+
+            {/* The communication overlay: who addressed whom in the last few seqs (an annotation, not a graph edge). */}
+            <g className="mc-talk" aria-label="Agent communication overlay">
+              {talkDrawn.map(({ arrow, from, curve, label }) => {
+                const opacity = commOpacity(arrow.age, COMM_WINDOW);
+                // A label with no free spot is left off (the tooltip still carries the verb).
+                const pill = label ? (
+                  <>
+                    <rect x={label.x} y={label.y} width={label.w} height={label.h} rx={label.h / 2} />
+                    <text x={label.x + label.w / 2} y={label.y + label.h * 0.72} textAnchor="middle">
                       {arrow.verb}
                     </text>
+                  </>
+                ) : null;
+                if (!curve) {
+                  // No drawn target: a mark above the sender (a small dot when no label fits).
+                  return (
+                    <g key={arrow.id} className={`mc-talk-mark talk-${arrow.kind}`} style={{ opacity }} onClick={() => choose({ kind: "seq", seq: arrow.seq })}>
+                      {pill ?? <circle cx={from.x} cy={from.y - 26} r={4 * boost} />}
+                      <title>{arrow.tooltip}</title>
+                    </g>
+                  );
+                }
+                return (
+                  <g key={arrow.id} className={`mc-talk-arrow talk-${arrow.kind}${arrow.age === 0 ? " is-new" : ""}`} style={{ opacity }} onClick={() => choose({ kind: "seq", seq: arrow.seq })}>
+                    <path d={curve.d} markerEnd={`url(#mc-talk-head-${arrow.kind})`} />
+                    {pill}
                     <title>{arrow.tooltip}</title>
                   </g>
                 );
-              }
-              const curve = commCurve(a, b);
-              return (
-                <g key={arrow.id} className={`mc-talk-arrow${arrow.age === 0 ? " is-new" : ""}`} style={{ opacity }} onClick={() => choose({ kind: "seq", seq: arrow.seq })}>
-                  <path d={curve.d} markerEnd="url(#mc-talk-head)" />
-                  <rect x={curve.mid.x - labelW / 2} y={curve.mid.y - labelH / 2} width={labelW} height={labelH} rx={labelH / 2} />
-                  <text x={curve.mid.x} y={curve.mid.y + labelH * 0.22} textAnchor="middle">
-                    {arrow.verb}
-                  </text>
-                  <title>{arrow.tooltip}</title>
-                </g>
-              );
-            })}
-          </g>
+              })}
+            </g>
 
-          {/* Captions above the senders of newly landed messages (at most three, stacked clear of hull titles). */}
-          <g className="mc-captions">
-            {placedCaptions.map((c) => (
-              <g key={c.seq} className="mc-caption" style={{ transform: `translate(${c.x}px, ${c.y}px)` }}>
-                <rect x={-c.w / 2} y={0} width={c.w} height={c.h} rx={6} />
-                <text textAnchor="middle" y={c.h * 0.7}>
-                  {c.text}
-                </text>
-              </g>
-            ))}
+            {/* Captions above the senders of newly landed messages (at most three, stacked clear of hull titles). */}
+            <g className="mc-captions">
+              {placedCaptions.map((c) => (
+                <g key={c.seq} className="mc-caption" style={{ transform: `translate(${c.x}px, ${c.y}px)` }}>
+                  <rect x={-c.w / 2} y={0} width={c.w} height={c.h} rx={6} />
+                  <text textAnchor="middle" y={c.h * 0.7}>
+                    {c.text}
+                  </text>
+                </g>
+              ))}
+            </g>
           </g>
-        </g>
-      </svg>
-    </div>
+        </svg>
+      </div>
+      <BoardLegend present={legend.present} absent={legend.absent} />
+    </>
   );
+}
+
+/** A node drawn one by one, where it sits, and (in a compact hull) its short label and that label's x offset. */
+interface DrawnNode {
+  readonly node: BoardGraphNode;
+  readonly p: BoardPoint;
+  readonly inHull: boolean;
+  readonly compactLabel: string | null;
+  readonly compactX: number;
+}
+
+/** One talk arrow (or mark) as drawn: its curve (null for a mark) and its placed label (null when no spot was free). */
+interface TalkDrawn {
+  readonly arrow: CommArrow;
+  readonly from: BoardPoint;
+  readonly curve: CommCurve | null;
+  readonly label: Box | null;
+}
+
+/** The box of one line of text: centered on cx, with its baseline at by, at a font size of fontPx. */
+function textBox(cx: number, by: number, w: number, fontPx: number): Box {
+  return { x: cx - w / 2, y: by - fontPx * 0.85, w, h: fontPx * 1.1 };
+}
+
+/** The radius each node shape is drawn at (NodeShape). */
+function shapeRadius(node: BoardGraphNode): number {
+  switch (node.kind) {
+    case "goal":
+      return 30;
+    case "lead":
+      return 24;
+    case "human":
+      return 19;
+    default:
+      return 17;
+  }
+}
+
+/**
+ * The boxes a drawn node covers: its shape and its label text, mirroring
+ * NodeShape, NodeLabel, and the compact-hull label, so a talk label can keep
+ * clear of them.
+ */
+function nodeBoxes(d: DrawnNode, boost: number): Box[] {
+  const { node, p } = d;
+  if (d.inHull) {
+    const boxes: Box[] = [{ x: p.x - COMPACT_DOT_R, y: p.y - COMPACT_DOT_R, w: 2 * COMPACT_DOT_R, h: 2 * COMPACT_DOT_R }];
+    if (d.compactLabel) {
+      const w = d.compactLabel.length * 11 * boost * CHAR_EM;
+      boxes.push(textBox(p.x + d.compactX + w / 2, p.y + 4, w, 11 * boost));
+    }
+    return boxes;
+  }
+  const r = shapeRadius(node);
+  const boxes: Box[] = [{ x: p.x - r, y: p.y - r, w: 2 * r, h: 2 * r }];
+  const font = 13 * boost;
+  const below = (rr: number) => p.y + rr + 15 * boost;
+  const line = (text: string, by: number) => boxes.push(textBox(p.x, by, text.length * font * CHAR_EM, font));
+  const det = node.detail;
+  if (det.kind === "tool") {
+    line(ellipsizeToWidth(det.capability, 180, font), below(17));
+    if (det.uses > 0) line(` used x${det.uses}`, below(17) + font * 1.2);
+  } else if (det.kind === "goal") {
+    line(clip(det.objective, 44), below(30));
+  } else if (det.kind === "human") {
+    line(det.pending.length > 0 ? `human: ${det.pending.length} waiting` : "human", p.y - (19 + 8));
+  } else if (det.kind !== "rev" && det.kind !== "jev") {
+    line(agentShortLabel(node.label), node.kind === "lead" ? p.y - (24 + 6) : below(17));
+  }
+  return boxes;
 }
 
 function NodeShape({ node }: { node: BoardGraphNode }) {
@@ -2815,7 +2984,6 @@ export function MissionControl({
           arrows={arrows}
           focusRev={focusRev}
         />
-        <BoardLegend />
         <JevPanel
           rows={jevRows(model)}
           selected={selectedId}
@@ -2871,16 +3039,121 @@ function boardPrefix(log: readonly BoardMessage[], k: number): readonly BoardMes
   return log.filter((m) => m.seq <= k);
 }
 
-function BoardLegend() {
+/** The graph classes each edge variant is drawn with, so its legend swatch matches the drawing exactly. */
+const EDGE_SWATCH_CLASS: Readonly<Record<EdgeVariant, string>> = {
+  dependency: "mc-edge kind-dependency",
+  fork: "mc-edge kind-dependency label-fork",
+  merged: "mc-edge kind-dependency label-merged",
+  trigger: "mc-edge kind-trigger",
+  "consumed-tool": "mc-edge kind-consumed-tool",
+  contest: "mc-edge kind-contest contest-open",
+  "contest-escalated": "mc-edge kind-contest contest-escalated",
+  message: "mc-edge kind-message",
+};
+
+/** A legend swatch: a short line (or talk curve) drawn with the real graph classes. */
+function LegendSwatch({ entryKey }: { entryKey: LegendKey }) {
+  return (
+    <svg className="mc-legend-svg" width={26} height={12} viewBox="0 0 26 12" aria-hidden="true">
+      {entryKey.startsWith("talk-") ? (
+        <g className={`mc-talk-arrow ${entryKey}`}>
+          <path d="M 2 10 Q 13 0 24 10" />
+        </g>
+      ) : (
+        <g className={EDGE_SWATCH_CLASS[entryKey as EdgeVariant]}>
+          <line x1={1} y1={6} x2={25} y2={6} />
+        </g>
+      )}
+    </svg>
+  );
+}
+
+/** A card-mark swatch (the hull's done check or struggling mark), drawn with the real hull classes. */
+function MarkSwatch({ mark }: { mark: "done" | "proposed" | "struggling" }) {
+  return (
+    <svg className="mc-legend-svg" width={20} height={20} viewBox="0 0 20 20" aria-hidden="true">
+      {mark === "struggling" ? (
+        <g className="mc-struggling">
+          <circle cx={10} cy={10} r={8.5} />
+          <text x={10} y={14.5} textAnchor="middle">
+            !
+          </text>
+        </g>
+      ) : (
+        <>
+          <circle className={`mc-check ${mark === "done" ? "is-filled" : "is-hollow"}`} cx={10} cy={10} r={8.5} />
+          <text className="mc-check-mark" x={10} y={14.5} textAnchor="middle">
+            {"✓"}
+          </text>
+        </>
+      )}
+    </svg>
+  );
+}
+
+/**
+ * The graph legend for what is drawn NOW: each edge variant and talk kind on
+ * screen with its count, then one line naming those not on screen (hover one
+ * for when it appears). The card marks and the revision note are always listed.
+ */
+export function BoardLegend({ present, absent }: { present: readonly LegendEntry[]; absent: readonly LegendEntry[] }) {
+  const edges = present.filter((e) => !e.key.startsWith("talk-"));
+  const talk = present.filter((e) => e.key.startsWith("talk-"));
   return (
     <ul className="legend mc-legend" aria-label="Board legend">
-      <li><span className="line ln-dependency" /> dependency</li>
-      <li><span className="line ln-trigger" /> trigger (fix asked, escalation)</li>
-      <li><span className="line ln-tool" /> consumed tool</li>
-      <li><span className="line ln-contest" /> contest (until resolved)</li>
-      <li><span className="line ln-message" /> message</li>
-      <li><span className="line ln-talk" /> agent talk (overlay from recorded messages, not a graph edge)</li>
-      <li><span className="swatch-hex sw-neutral" aria-hidden="true" /> revision: on the gate timeline; hover one for its links</li>
+      {edges.map((e) => (
+        <li key={e.key} data-legend={e.key}>
+          <LegendSwatch entryKey={e.key} /> {e.label} <span className="mc-legend-count">x{e.count}</span>
+        </li>
+      ))}
+      {talk.length > 0 ? (
+        <li className="mc-legend-talk">
+          agent talk (overlay from recorded messages, not a graph edge):
+          {talk.map((e) => (
+            <span key={e.key} data-legend={e.key}>
+              <LegendSwatch entryKey={e.key} /> {e.label} <span className="mc-legend-count">x{e.count}</span>
+            </span>
+          ))}
+        </li>
+      ) : null}
+      <li>
+        <span className="swatch-hex sw-neutral" aria-hidden="true" /> revision: on the gate timeline; hover one for its links (the latest one's open fix requests are drawn from the top right)
+      </li>
+      <li>
+        <svg className="mc-legend-svg" width={26} height={12} viewBox="0 0 26 12" aria-hidden="true">
+          <g className="mc-rev-focus status-pass">
+            <g className="mc-edge kind-dependency">
+              <path d="M 1 3 L 25 3" />
+            </g>
+          </g>
+          <g className="mc-rev-focus status-fail">
+            <g className="mc-edge kind-dependency">
+              <path d="M 1 9 L 25 9" />
+            </g>
+          </g>
+        </svg>{" "}
+        focused revision: its merged-item links turn green (pass) or red (fail)
+      </li>
+      <li data-legend="mark-done">
+        <MarkSwatch mark="done" /> done: completed on a passing revision
+      </li>
+      <li data-legend="mark-proposed">
+        <MarkSwatch mark="proposed" /> done proposed, not yet confirmed by a passing revision
+      </li>
+      <li data-legend="mark-struggling">
+        <MarkSwatch mark="struggling" /> struggling: a failing revision blamed its push, repeated failed edits, or half its turns spent with no push; idle agents may volunteer (hover a card's mark for the reason)
+      </li>
+      {absent.length > 0 ? (
+        <li className="mc-legend-absent">
+          Not on screen now:{" "}
+          {absent.map((e, i) => (
+            <span key={e.key} data-legend-absent={e.key} title={e.hint}>
+              {e.name}
+              {i < absent.length - 1 ? ", " : ""}
+            </span>
+          ))}
+        </li>
+      ) : null}
     </ul>
   );
 }

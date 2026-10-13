@@ -12,15 +12,24 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 
-import { buildBoardGraph, BOARD_GRAPH_EDGE_KINDS, type BoardMessage } from "@switchyard-change/orchestration/board-graph";
+import { buildBoardGraph, BOARD_GRAPH_EDGE_KINDS, type BoardGraphEdge, type BoardMessage } from "@switchyard-change/orchestration/board-graph";
 
 import { missionControlLog, speculativeLog } from "../../../packages/orchestration/tests/board-graph-fixture.ts";
 import {
+  COMM_KINDS,
   COMM_MAX,
   COMM_WINDOW,
   commCurve,
+  commKind,
   commOpacity,
   communicationArrows,
+  drawnLegend,
+  EDGE_VARIANTS,
+  edgeVariant,
+  outstandingFixLinks,
+  placeLabel,
+  rectsOverlap,
+  talkLabelCandidates,
   drawingExtent,
   gateTimeline,
   jevRows,
@@ -127,6 +136,53 @@ describe("the communication overlay", () => {
       "18 agent:lead re-plans null",
       "19 agent:a2 declines agent:a1",
     ]);
+    // Each arrow carries its kind, read from its message type.
+    expect(arrows.map((a) => `${a.seq} ${a.kind}`).reverse()).toEqual([
+      "6 help",
+      "7 help",
+      "8 help",
+      "9 contract",
+      "10 contract",
+      "11 contract",
+      "12 contract",
+      "13 handoff",
+      "14 conflict",
+      "15 conflict",
+      "17 proposal",
+      "18 proposal",
+      "19 help",
+    ]);
+  });
+
+  it("maps every drawn message type to one kind, and every other type to none", () => {
+    const kinds: Record<string, string> = {
+      "item.proposed": "proposal",
+      "tool.proposed": "proposal",
+      "item.accepted": "proposal",
+      "item.rejected": "proposal",
+      "item.replanned": "proposal",
+      "contract.proposed": "contract",
+      "contract.accepted": "contract",
+      "contract.rejected": "contract",
+      "contract.escalated": "contract",
+      "help.requested": "help",
+      "help.volunteered": "help",
+      "help.offered": "help",
+      "help.delivered": "help",
+      "help.declined": "help",
+      handoff: "handoff",
+      "claim.contested": "conflict",
+      "claim.kept": "conflict",
+      "claim.ceded": "conflict",
+      "claim.narrowed": "conflict",
+      "claim.overlap": "conflict",
+      "clash.predicted": "conflict",
+    };
+    for (const [type, kind] of Object.entries(kinds)) expect(commKind(type)).toBe(kind);
+    expect(new Set(Object.values(kinds))).toEqual(new Set(COMM_KINDS));
+    for (const type of ["goal.posted", "agent.joined", "claim.granted", "claim.lapsed", "integrated.rev", "nope"]) expect(commKind(type)).toBeNull();
+    // Every arrow in the fixture run has the kind of its message.
+    for (const a of communicationArrows(log, lastSeq, { window: 0, max: 100 })) expect(a.kind).toBe(commKind(a.type));
   });
 
   it("finds the coordination in a recorded run (sf8 at seq 110: a contract proposal to the lead, escalated to a human)", () => {
@@ -148,13 +204,172 @@ describe("the communication overlay", () => {
     const help = log.find((m) => m.type === "help.requested")!.seq;
     const html = renderToStaticMarkup(createElement(MissionControl, { log, escalations: [], busy: false, onResolve: () => {}, initialSeq: help + 1 }));
     expect(html).toContain('aria-label="Agent communication overlay"');
-    expect(html).toMatch(/<g class="mc-talk-arrow[^"]*"[^>]*><path d="M [^"]+" marker-end="url\(#mc-talk-head\)"/);
+    // A help request is drawn in the help colour, with the help arrowhead (one marker per kind).
+    expect(html).toMatch(/<g class="mc-talk-arrow talk-help[^"]*"[^>]*><path d="M [^"]+" marker-end="url\(#mc-talk-head-help\)"/);
+    for (const kind of COMM_KINDS) expect(html).toContain(`<marker id="mc-talk-head-${kind}"`);
     expect(html).toContain(">asks help</text>");
+    // Every talk label is drawn clear of every other talk label.
+    const pills = [...html.matchAll(/<g class="mc-talk-(?:arrow|mark)[^>]*>(?:<path[^>]*><\/path>)?<rect x="([-\d.e]+)" y="([-\d.e]+)" width="([\d.e]+)" height="([\d.e]+)"/g)].map((m) => ({
+      x: Number(m[1]),
+      y: Number(m[2]),
+      w: Number(m[3]),
+      h: Number(m[4]),
+    }));
+    expect(pills.length).toBeGreaterThan(0);
+    for (let i = 0; i < pills.length; i += 1) for (let j = i + 1; j < pills.length; j += 1) expect(rectsOverlap(pills[i]!, pills[j]!)).toBe(false);
     expect(html).toContain("talk on");
     for (const [, kind] of html.matchAll(/class="mc-edge kind-([a-z-]+)/g)) {
       expect(BOARD_GRAPH_EDGE_KINDS).toContain(kind);
     }
     expect(html).toContain("agent talk (overlay from recorded messages, not a graph edge)");
+  });
+});
+
+describe("talk label placement", () => {
+  const size = { w: 40, h: 16 };
+  const curve = commCurve({ x: 0, y: 0 }, { x: 200, y: 0 });
+  const candidates = talkLabelCandidates(curve, size.h);
+
+  it("prefers the curve's midpoint, then other points along it, then beside it", () => {
+    expect(candidates).toHaveLength(25);
+    expect(candidates[0]!.x).toBeCloseTo(curve.mid.x, 0);
+    expect(candidates[0]!.y).toBeCloseTo(curve.mid.y, 0);
+    // t = 0.4 lies before the midpoint, t = 0.6 after it.
+    expect(candidates[1]!.x).toBeLessThan(candidates[0]!.x);
+    expect(candidates[2]!.x).toBeGreaterThan(candidates[0]!.x);
+    // The nudged points sit one label height off the curve, on either side.
+    expect(Math.hypot(candidates[5]!.x - candidates[0]!.x, candidates[5]!.y - candidates[0]!.y)).toBeCloseTo(size.h, 0);
+    expect(Math.hypot(candidates[6]!.x - candidates[0]!.x, candidates[6]!.y - candidates[0]!.y)).toBeCloseTo(size.h, 0);
+    // Then twice as far, last.
+    expect(Math.hypot(candidates[15]!.x - candidates[0]!.x, candidates[15]!.y - candidates[0]!.y)).toBeCloseTo(2 * size.h, 0);
+  });
+
+  it("takes the first free spot", () => {
+    const box = placeLabel(size, candidates, []);
+    expect(box).not.toBeNull();
+    expect(box!.x + box!.w / 2).toBeCloseTo(candidates[0]!.x);
+    expect(box!.y + box!.h / 2).toBeCloseTo(candidates[0]!.y);
+    expect(box!.w).toBe(size.w);
+  });
+
+  it("moves off a spot that another label or text already covers", () => {
+    const c0 = candidates[0]!;
+    const taken = { x: c0.x - 10, y: c0.y - 5, w: 20, h: 10 };
+    const box = placeLabel(size, candidates, [taken]);
+    expect(box).not.toBeNull();
+    expect(rectsOverlap(box!, taken)).toBe(false);
+    // Placing a second label with the first one occupied keeps the two apart.
+    const second = placeLabel(size, candidates, [taken, box!]);
+    expect(second).not.toBeNull();
+    expect(rectsOverlap(second!, box!)).toBe(false);
+  });
+
+  it("stays inside the bounds it is given", () => {
+    const bounds = { x: candidates[1]!.x - 25, y: -1000, w: 2000, h: 2000 };
+    const box = placeLabel(size, candidates, [], { bounds });
+    expect(box!.x).toBeGreaterThanOrEqual(bounds.x);
+  });
+
+  it("returns null when every spot is boxed in", () => {
+    expect(placeLabel(size, candidates, [{ x: -500, y: -500, w: 1000, h: 1000 }])).toBeNull();
+    expect(placeLabel(size, [], [])).toBeNull();
+  });
+
+  it("is deterministic", () => {
+    const occupied = [{ x: 80, y: -60, w: 40, h: 30 }, { x: 60, y: -40, w: 30, h: 30 }];
+    expect(placeLabel(size, candidates, occupied)).toEqual(placeLabel(size, talkLabelCandidates(commCurve({ x: 0, y: 0 }, { x: 200, y: 0 }), size.h), occupied));
+  });
+});
+
+describe("the latest revision's open fix requests", () => {
+  const reg3 = recorded("board-live-reg3");
+  const bySeq = new Map(reg3.map((m) => [m.seq, m]));
+  const at = (k: number) => outstandingFixLinks(buildBoardGraph(reg3, k), reg3);
+  const items = (k: number) => at(k)?.edges.map((e) => e.to.slice("item:".length)).sort() ?? null;
+
+  it("are the latest failing revision's fix.requested edges, until the item pushes again or a revision passes", () => {
+    // reg3: rev 1 fails (seq 26) and asks auth for a fix (27); auth pushes at 36.
+    expect(at(26)).toBeNull();
+    expect(at(27)!.rev.id).toBe("rev:1");
+    expect(items(35)).toEqual(["unit-auth-resource"]);
+    expect(at(36)).toBeNull();
+    // rev 2 fails (47) and asks four items (48-51); notifications pushes at 55, users at 56; rev 3 passes at 57.
+    expect(at(51)!.rev.id).toBe("rev:2");
+    expect(items(51)).toEqual(["unit-auth-resource", "unit-notifications-resource", "unit-orders-resource", "unit-users-resource"]);
+    expect(items(55)).toEqual(["unit-auth-resource", "unit-orders-resource", "unit-users-resource"]);
+    expect(items(56)).toEqual(["unit-auth-resource", "unit-orders-resource"]);
+    expect(at(57)).toBeNull();
+    expect(at(reg3[reg3.length - 1]!.seq)).toBeNull();
+  });
+
+  it("are each backed by its fix.requested message", () => {
+    for (const e of at(51)!.edges) {
+      const m = bySeq.get(e.seqs[0]!)!;
+      expect(m.type).toBe("fix.requested");
+      expect(e).toMatchObject({ kind: "trigger", from: "rev:2", to: `item:${(m.payload as { item: string }).item}` });
+      expect(e.tooltip).toContain(`(seq ${m.seq}, fix.requested)`);
+    }
+  });
+
+  it("are drawn from the revision at the top right with no revision focused, and counted in the legend", () => {
+    const html = renderToStaticMarkup(createElement(MissionControl, { log: reg3, escalations: [], busy: false, onResolve: () => {}, initialSeq: 51 }));
+    const group = html.match(/<g class="mc-rev-focus status-fail is-fix-asked" aria-label="revision 2 open fix requests">.*?<g class="mc-node kind-rev/)?.[0] ?? "";
+    expect(group).not.toBe("");
+    const lines = [...group.matchAll(/<g class="mc-edge kind-trigger is-related"><path d="[^"]+"><\/path><title>([^<]+)<\/title>/g)].map((m) => m[1]);
+    expect(lines).toHaveLength(4);
+    for (const t of lines) expect(t).toMatch(/^rev 2 asks for fix attempt \d on unit-[a-z]+-resource \(seq (48|49|50|51), fix.requested\)$/);
+    expect(html).toContain(">FAIL: fix asked</text>");
+    expect(html).toMatch(/<li data-legend="trigger">.*?<span class="mc-legend-count">x4<\/span>/);
+    // Once rev 3 passes, nothing is drawn.
+    const after = renderToStaticMarkup(createElement(MissionControl, { log: reg3, escalations: [], busy: false, onResolve: () => {}, initialSeq: 57 }));
+    expect(after).not.toMatch(/aria-label="revision \d+ open fix requests"/);
+  });
+});
+
+describe("the on-screen legend", () => {
+  const edge = (kind: string, extra: Record<string, unknown> = {}) => ({ id: `${kind}${JSON.stringify(extra)}`, kind, from: "a", to: "b", seqs: [1], type: "x", count: 1, tooltip: "t", ...extra }) as unknown as BoardGraphEdge;
+
+  it("lists the drawn edge variants and talk kinds with counts, and the rest as not on screen", () => {
+    const { present, absent } = drawnLegend(
+      [edge("dependency"), edge("dependency"), edge("dependency", { label: "fork" }), edge("contest", { contest: "escalated" }), edge("spawn")],
+      [{ kind: "help" }, { kind: "help" }, { kind: "conflict" }],
+    );
+    expect(present.map((e) => `${e.key} ${e.count}`)).toEqual(["dependency 2", "fork 1", "contest-escalated 1", "talk-help 2", "talk-conflict 1"]);
+    expect(absent.map((e) => e.key)).toEqual(["merged", "trigger", "consumed-tool", "contest", "message", "talk-proposal", "talk-contract", "talk-handoff"]);
+    expect(absent.find((e) => e.key === "contest")!.hint).toBe("contest: two agents claim the same file");
+    expect(absent.find((e) => e.key === "fork")).toBeUndefined();
+    expect(edgeVariant(edge("dependency", { label: "merged" }))).toBe("merged");
+    expect(edgeVariant(edge("contest", { contest: "open" }))).toBe("contest");
+    // Nothing drawn: every entry is absent, and the text never uses an em dash.
+    const none = drawnLegend([], []);
+    expect(none.present).toEqual([]);
+    expect(none.absent).toHaveLength(EDGE_VARIANTS.length + COMM_KINDS.length);
+    for (const e of none.absent) expect(`${e.label}${e.name}${e.hint}`).not.toContain(String.fromCharCode(0x2014));
+  });
+
+  it("renders what is drawn now, the card marks always, and one line for what is not on screen", () => {
+    const escalated = log.find((m) => m.type === "claim.escalated")!.seq;
+    const html = renderToStaticMarkup(createElement(MissionControl, { log, escalations: [], busy: false, onResolve: () => {}, initialSeq: escalated }));
+    const legendHtml = html.slice(html.indexOf('aria-label="Board legend"'));
+    expect(legendHtml).toContain('<li data-legend="contest-escalated">');
+    expect(legendHtml).toContain('<g class="mc-edge kind-contest contest-escalated">');
+    // Every variant and talk kind is listed exactly once: drawn, or not on screen.
+    for (const key of [...EDGE_VARIANTS, ...COMM_KINDS.map((k) => `talk-${k}`)]) {
+      const shown = legendHtml.split(`data-legend="${key}"`).length - 1;
+      const missing = legendHtml.split(`data-legend-absent="${key}"`).length - 1;
+      expect(shown + missing, key).toBe(1);
+    }
+    expect(legendHtml).toContain("Not on screen now:");
+    expect(legendHtml).toMatch(/data-legend-absent="[a-z-]+" title="[^"]+"/);
+    // The card marks, drawn with the hull's own classes.
+    expect(legendHtml).toMatch(/<li data-legend="mark-done"><svg[^>]*><circle class="mc-check is-filled"[^>]*><\/circle><text class="mc-check-mark"/);
+    expect(legendHtml).toContain("done: completed on a passing revision");
+    expect(legendHtml).toMatch(/<li data-legend="mark-proposed"><svg[^>]*><circle class="mc-check is-hollow"/);
+    expect(legendHtml).toContain("done proposed, not yet confirmed by a passing revision");
+    expect(legendHtml).toMatch(/<li data-legend="mark-struggling"><svg[^>]*><g class="mc-struggling"><circle/);
+    expect(legendHtml).toContain("struggling: a failing revision blamed its push");
+    expect(legendHtml).toContain("focused revision: its merged-item links turn green (pass) or red (fail)");
+    expect(legendHtml).not.toContain("spawn");
   });
 });
 
@@ -194,11 +409,12 @@ describe("the gate timeline", () => {
     expect(html).toContain('aria-label="Gate timeline"');
     expect(html).toContain('aria-label="revision 1: GATE FAIL"');
     expect(html).not.toContain('class="mc-node kind-rev');
-    expect(html).not.toContain("mc-rev-focus");
+    // No revision group in the graph (the legend's swatch reuses the class, outside the graph).
+    expect(html).not.toMatch(/<g class="mc-rev-focus[^"]*" aria-label=/);
     const focused = renderToStaticMarkup(
       createElement(MissionControl, { log, escalations: [], busy: false, onResolve: () => {}, initialSelection: { kind: "node", id: "rev:1" } }),
     );
-    expect(focused).toContain('class="mc-rev-focus status-fail"');
+    expect(focused).toContain('class="mc-rev-focus status-fail" aria-label="revision 1 links"');
     expect(focused).toContain('class="mc-node kind-rev status-fail"');
     expect(focused).toMatch(/mc-gate-marker is-fail is-focus/);
     expect(focused).toMatch(/class="mc-hull [^"]*is-rev-focus/);
