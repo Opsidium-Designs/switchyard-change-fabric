@@ -588,3 +588,28 @@ describe("Worker tool routes (agents build tools for each other)", () => {
     expect((await h.json("POST", `/changes/${ID}/tools/token/revoke`, { tokenId: first.body.tokenId })).status).toBe(200);
   });
 });
+
+describe("the live board feed", () => {
+  it("nudges every watcher with the new last seq after an append, and nothing on a refused post", async () => {
+    const h = await created();
+    const frames: string[] = [];
+    const watcher = { send: (frame: string) => frames.push(frame) };
+    const broken = {
+      send: () => {
+        throw new Error("closing");
+      },
+    };
+    (h.state(ID) as unknown as { ctx: Record<string, unknown> }).ctx.getWebSockets = (tag?: string) => (tag === "board" ? [broken, watcher] : []);
+    expect((await h.json("POST", `/changes/${ID}/board/human`, { type: "goal.posted", payload: { objective: "o" } })).status).toBe(201);
+    expect(frames.map((f) => JSON.parse(f))).toEqual([{ type: "board.seq", lastSeq: 1 }]);
+    // A refused post appends nothing, so it nudges no one.
+    expect((await h.json("POST", `/changes/${ID}/board/human`, { type: "goal.posted", payload: { objective: "again" } })).status).not.toBe(201);
+    expect(frames).toHaveLength(1);
+  });
+
+  it("answers a plain GET with 426 and an unknown Change with 404", async () => {
+    const h = await created();
+    expect((await h.json("GET", `/changes/${ID}/board/live`)).status).toBe(426);
+    expect((await h.json("GET", "/changes/nope/board/live", undefined, { Upgrade: "websocket" })).status).toBe(404);
+  });
+});

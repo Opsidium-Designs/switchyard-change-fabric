@@ -909,6 +909,15 @@ export interface RaiseEscalationInput {
  * here; the runner later reports completion with a cost event, which advances
  * dependents to runnable.
  */
+/** The tag the live board feed's sockets carry. */
+const BOARD_LIVE_TAG = "board";
+
+/** A frame on the live board feed. */
+export interface BoardLiveFrame {
+  readonly type: "board.seq";
+  readonly lastSeq: number;
+}
+
 export class ChangeState extends DurableObject<Env> {
   /** Create (or replace) the Change held by this object from spec YAML text. */
   async createFromSpec(specYaml: string): Promise<CreateResult> {
@@ -1136,7 +1145,7 @@ export class ChangeState extends DurableObject<Env> {
       readonly escalations?: (list: Escalation[]) => Escalation[];
     } = {},
   ): Promise<{ readonly appended: readonly BoardMessage[]; readonly escalations: readonly Escalation[] }> {
-    return this.ctx.storage.transaction(async (txn) => {
+    const done = await this.ctx.storage.transaction(async (txn) => {
       const state = (await txn.get<BoardState>("boardState")) ?? emptyBoard();
       let tokens = (await txn.get<Record<string, string>>("boardTokens")) ?? {};
       const result = make(state, tokens);
@@ -1164,6 +1173,75 @@ export class ChangeState extends DurableObject<Env> {
       }
       return { appended: result.appended, escalations: applied.raised };
     });
+    const last = done.appended.at(-1)?.seq;
+    if (last !== undefined) {
+      this.announceBoardSeq(last);
+    }
+    return done;
+  }
+
+  // -------------------------------------------------------------------------
+  // The live board feed (WebSocket Hibernation)
+  // -------------------------------------------------------------------------
+
+  /** The sockets watching this board (none in an environment without WebSocket Hibernation). */
+  private boardSockets(): WebSocket[] {
+    const ctx = this.ctx as unknown as { getWebSockets?: (tag?: string) => WebSocket[] };
+    return typeof ctx.getWebSockets === "function" ? ctx.getWebSockets(BOARD_LIVE_TAG) : [];
+  }
+
+  /**
+   * Tell every watcher the board's new last seq, after an append committed. A
+   * nudge only: the watcher reads the messages through the same paged board
+   * route as a poll, so the log has one read path. A socket that cannot take
+   * the nudge is skipped (the watcher's slow poll still catches up).
+   */
+  private announceBoardSeq(lastSeq: number): void {
+    const frame = JSON.stringify({ type: "board.seq", lastSeq } satisfies BoardLiveFrame);
+    for (const socket of this.boardSockets()) {
+      try {
+        socket.send(frame);
+      } catch {
+        /* a closing socket; its watcher falls back to polling */
+      }
+    }
+  }
+
+  /**
+   * Accept a watcher of the live board feed: a hibernatable WebSocket that is
+   * sent the current last seq at once, then one `board.seq` frame after every
+   * append. Read-only, like the board's GET route; it carries no message
+   * content and accepts no commands.
+   */
+  override async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response(JSON.stringify({ code: "BAD_PAYLOAD", error: "expected a WebSocket upgrade" }), {
+        status: 426,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    this.ctx.acceptWebSocket(server, [BOARD_LIVE_TAG]);
+    const lastSeq = (await this.ctx.storage.get<number>("boardSeq")) ?? 0;
+    server.send(JSON.stringify({ type: "board.seq", lastSeq } satisfies BoardLiveFrame));
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** A watcher's only message is a keepalive ping; anything else is ignored. */
+  override async webSocketMessage(socket: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (message === "ping") {
+      socket.send(JSON.stringify({ type: "pong" }));
+    }
+  }
+
+  override async webSocketClose(socket: WebSocket, code: number): Promise<void> {
+    try {
+      socket.close(code === 1005 ? 1000 : code, "closing");
+    } catch {
+      /* already closed */
+    }
   }
 
   /** Run a board operation, turning a board rejection into a coded failure. */

@@ -55,6 +55,40 @@ import { postToWorker } from "./worker-post";
 const WORKER_BASE: string =
   (import.meta.env.VITE_WORKER_URL as string | undefined) ?? "http://127.0.0.1:8787";
 const POLL_MS = 1200;
+/** While the live board feed is open, a poll still runs this often, in case a nudge was lost. */
+const PUSH_HEARTBEAT_MS = 6000;
+
+/**
+ * Watch the Worker's live board feed (`GET /changes/:id/board/live`, a
+ * WebSocket): `onSeq` is called with the board's last seq on connect and after
+ * every append. Returns null where WebSocket is unavailable; a closed or
+ * failed socket simply leaves the caller on its poll.
+ */
+export function openBoardFeed(
+  workerBase: string,
+  changeId: string,
+  onSeq: (lastSeq: number) => void,
+): { isOpen(): boolean; close(): void } | null {
+  if (typeof WebSocket === "undefined") return null;
+  let socket: WebSocket;
+  try {
+    socket = new WebSocket(`${workerBase.replace(/^http/, "ws")}/changes/${encodeURIComponent(changeId)}/board/live`);
+  } catch {
+    return null;
+  }
+  socket.onmessage = (event) => {
+    try {
+      const frame = JSON.parse(String(event.data)) as { type?: string; lastSeq?: unknown };
+      if (frame.type === "board.seq" && typeof frame.lastSeq === "number") onSeq(frame.lastSeq);
+    } catch {
+      /* not a board frame */
+    }
+  };
+  return {
+    isOpen: () => socket.readyState === WebSocket.OPEN,
+    close: () => socket.close(),
+  };
+}
 
 /** The launcher-side status of a launched run (from GET /api/runs/:id). */
 interface LaunchStatus {
@@ -337,11 +371,27 @@ export function App() {
         boardPullInFlight.current = false;
       }
     };
-    void pull();
-    const timer = setInterval(() => void pull(), POLL_MS);
+    // Push first: the Worker's live board feed nudges with the new last seq after
+    // every append, and the console pulls at once. Polling stays as the
+    // fallback, slowed to a heartbeat while the socket is open.
+    let lastPull = 0;
+    const pullNow = () => {
+      lastPull = Date.now();
+      void pull();
+    };
+    const socket = openBoardFeed(WORKER_BASE, changeId, (lastSeq) => {
+      const have = boardLogRef.current.at(-1)?.seq ?? 0;
+      if (lastSeq > have) pullNow();
+    });
+    pullNow();
+    const timer = setInterval(() => {
+      if (socket?.isOpen() && Date.now() - lastPull < PUSH_HEARTBEAT_MS) return;
+      pullNow();
+    }, POLL_MS);
     return () => {
       cancelled = true;
       clearInterval(timer);
+      socket?.close();
     };
   }, [changeId, boardMode]);
 

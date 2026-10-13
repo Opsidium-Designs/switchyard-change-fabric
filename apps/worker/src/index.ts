@@ -1191,6 +1191,22 @@ export async function handleRequest(request: Request, env: EnvWithProvisioner): 
   //   POST /changes/:id/tools/used           (bearer) the operator records a run of a pinned tool version
   //   POST /changes/:id/board/record         (bearer) {type, payload} the operator records an engine fact (a stalled claim, ...)
   // The engine's own messages are never accepted from any route.
+  // The live board feed (open, read-only, like the board GET): a WebSocket the
+  // ChangeState object nudges with the new last seq after every append.
+  //   GET /changes/:id/board/live  (Upgrade: websocket)
+  const liveMatch = url.pathname.match(/^\/changes\/([^/]+)\/board\/live$/);
+  if (request.method === "GET" && liveMatch) {
+    const changeId = decodeURIComponent(liveMatch[1] ?? "");
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return json({ code: "BAD_PAYLOAD", error: "the live board feed is a WebSocket: send Upgrade: websocket" }, 426);
+    }
+    const stub = changeStateStub(env, changeId);
+    if (!(await stub.isInitialized())) {
+      return json({ code: "UNKNOWN_REF", error: `no such Change: ${changeId}` }, 404);
+    }
+    return stub.fetch(request);
+  }
+
   const boardRoute = url.pathname.match(
     /^\/changes\/([^/]+)\/(board|board\/join|board\/human|board\/verify|board\/decision|board\/seam-stalled|board\/record|integration\/revision|tools\/gate|tools\/used)$/,
   );
