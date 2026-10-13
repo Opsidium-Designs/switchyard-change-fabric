@@ -13,8 +13,11 @@
  *   2. the lead joins; its first turn is the planner, whose units become
  *      `item.proposed` messages (scoped away from protected paths);
  *   3. workers join under the min/max dial (another joins while open items
- *      outnumber the workers in flight, up to max), each with its own repo, and
- *      take turns: claim, contest, narrow, ask, edit, push, propose done;
+ *      outnumber the workers in flight, up to max; a worker that stopped is
+ *      replaced while open work remains, within a bounded number of joins),
+ *      each with its own repo, and take turns: claim, contest, narrow, ask,
+ *      edit, push, propose done. Their model calls share one in-flight limit
+ *      (`maxInflight`): agents beyond it queue for a slot in arrival order;
  *   4. CONTINUOUS INTEGRATION: whenever announced pushes are pending, the
  *      integrator builds the next integrated revision from the latest passing
  *      revision plus every pending push (each pinned to its announced commit),
@@ -134,6 +137,7 @@ import { buildProofBundle, type ProofBundle } from "./proof-bundle.ts";
 import { buildPromotionReceipt } from "./promotion-receipt.ts";
 import { meteredExecutor, meteredJev, meteredToolAuthor, meteredTransport, RunMeter, type RunCapReached, type RunCaps } from "./run-meter.ts";
 import { RateLimitBackoff, rateLimitedExecutor, rateLimitedTransport, type RateLimitBackoffEvent, type RateLimitBackoffOptions } from "./rate-limit-backoff.ts";
+import { defaultMaxInflight, InflightLimiter, limitedCall, limitedExecutor, limitedToolAuthor, limitedTransport, MAX_INFLIGHT, validMaxInflight, type InflightStats } from "./inflight-limiter.ts";
 import { scanRepoSnapshot } from "./scan-repo.ts";
 import { BoardAgent, listRepoFiles, resolveIntentFiles, RunTurnBudget, type AgentStop, type AgentTurnRecord, type BoardSeedItem } from "./board-agent.ts";
 import {
@@ -314,6 +318,9 @@ export type BoardRunEvent =
 export interface BoardRunEffectiveBudgets extends ScaledBudgets {
   readonly items: number;
   readonly scopeFiles?: number;
+  /** The most model calls in flight at once, and whether it was explicit (else min(dial max, 8)). */
+  readonly maxInflight?: number;
+  readonly inflightExplicit?: boolean;
   /** The run's cost and time caps (engine-enforced). */
   readonly caps?: { readonly maxCalls?: number; readonly maxSpendUsd?: number; readonly maxWallMs?: number; readonly maxCallsPerItem?: number };
 }
@@ -453,7 +460,10 @@ export function formatBudgetsLine(b: BoardRunEffectiveBudgets): string {
     `${b.maxRunTurns} run turn(s) (${scaled(b.runTurnsScaled, `scaled with ${b.items} planned item(s) and ${b.scopeFiles ?? 0} scope file(s)`)}), ` +
     `claim cap ${b.maxActiveClaims} unfinished item(s) per agent (${scaled(b.activeClaimsScaled, "scaled")}), ` +
     `claim lease ${b.claimLeaseMessages} board message(s) without progress (${scaled(b.leaseScaled, `scaled with dial max ${b.dialMax}`)}), ` +
-    `claim deadline ${b.claimDeadlineMessages} message(s) (${scaled(b.deadlineScaled, "8 leases")}; the lead may extend it)` +
+    `claim deadline ${b.claimDeadlineMessages} message(s) (${scaled(b.deadlineScaled, "8 leases, within the board's message cap")}; the lead may extend it)` +
+    (b.maxInflight !== undefined
+      ? `, model calls in flight at most ${b.maxInflight} at once (${b.inflightExplicit ? "explicit" : `min(dial max ${b.dialMax}, 8)`}; more agents queue for a slot)`
+      : "") +
     (b.caps
       ? `; caps: ${b.caps.maxCalls !== undefined ? `${b.caps.maxCalls} model call(s)` : "no call cap"}, ${b.caps.maxSpendUsd !== undefined ? `${b.caps.maxSpendUsd} USD estimated spend` : "no spend cap"}, ` +
         `${b.caps.maxWallMs !== undefined ? `${Math.round(b.caps.maxWallMs / 1000)} s wall clock` : "no wall-clock cap"}, ${b.caps.maxCallsPerItem !== undefined ? `${b.caps.maxCallsPerItem} call(s) per item` : "no per-item cap"}`
@@ -705,6 +715,13 @@ export interface RunBoardOptions {
    * jitter source. The run's own event sink is added.
    */
   readonly rateLimit?: Omit<RateLimitBackoffOptions, "onBackoff">;
+  /**
+   * The most model calls the run has in flight at once (agent turns, edits,
+   * the planner, tool authoring, typed decisions), an integer from 1 to
+   * MAX_INFLIGHT. Default: min(the effective dial max, 8). Agents are not
+   * model calls: a call beyond the limit waits for a slot in arrival order.
+   */
+  readonly maxInflight?: number;
   readonly onEvent?: (event: BoardRunEvent) => void;
 }
 
@@ -794,6 +811,8 @@ export interface RunBoardResult {
   readonly speculation?: { readonly speculate: number; readonly rounds: readonly (readonly CandidateOutcome[])[] };
   /** Every pre-pass ratchet leave-one-out round (arbitration revision 5), in order: what the stack without each candidate scored. */
   readonly ratchet?: { readonly rounds: readonly (readonly RatchetIsolation[])[] };
+  /** The in-flight model-call limit and what it observed: the peak in flight, and the calls that queued for a slot and for how long. */
+  readonly inflight?: InflightStats;
   /** Model calls and estimated spend the run's meter counted (unpriced calls are counted, never free). */
   readonly usage?: {
     readonly calls: number;
@@ -2198,6 +2217,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     );
   }
   const speculate = options.speculate ?? (options.integrator === "cloud" ? 1 : DEFAULT_SPECULATE);
+  if (options.maxInflight !== undefined && !validMaxInflight(options.maxInflight)) {
+    throw new Error(`maxInflight must be an integer from 1 to ${MAX_INFLIGHT}`);
+  }
   const readTtl = options.readTokenTtlSeconds ?? 600;
   // Cost and time caps: every model call is metered (plan-scaled defaults are set once planned).
   const meter = new RunMeter(options.caps ?? {}, options.capsClock ?? Date.now);
@@ -2205,13 +2227,21 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   // spends no turn budget, and past the window ends the run "rate-limited"; a
   // 429 saying the provider account has no credits ends it "quota-exhausted" at once.
   const rateLimit = new RateLimitBackoff({ ...options.rateLimit, onBackoff: (event) => emit({ kind: "rate-limited", ...event }) });
-  const executor = meteredExecutor(rateLimitedExecutor(options.executor ?? new ScopedNoopExecutor(), rateLimit), meter);
-  const transport = meteredTransport(rateLimitedTransport(options.transport, rateLimit), meter);
+  // The agent phase's stop: every agent loop ends on it (and a turn still
+  // queued for a model-call slot is answered wait without calling the model).
+  const controller = new AbortController();
+  // One in-flight bound for every model call of the run (outermost, so a
+  // queued call is neither metered nor rate-limit noted until it runs). Set
+  // from the plan-scaled dial once planned, unless explicit.
+  const limiter = new InflightLimiter(options.maxInflight ?? defaultMaxInflight(options.dial.maxConcurrency));
+  const executor = limitedExecutor(meteredExecutor(rateLimitedExecutor(options.executor ?? new ScopedNoopExecutor(), rateLimit), meter), limiter, controller.signal);
+  const transport = limitedTransport(meteredTransport(rateLimitedTransport(options.transport, rateLimit), meter), limiter, controller.signal);
   // Typed decisions are model calls too: every ask (the integrator's
   // attribution, speculative candidates' included, the contract triage, the
   // fix-confidence check) is counted, and refused past a run cap (advisory:
   // the refusal is recorded as a decision error, the mechanical result stands).
-  const jev = options.jev ? meteredJev(options.jev, meter, options.jevModel) : undefined;
+  // No stop signal: the integrator's attribution still runs after the agent phase.
+  const jev = options.jev ? limitedCall(meteredJev(options.jev, meter, options.jevModel), limiter) : undefined;
   const workRoot = options.workRoot ?? (await mkdtemp(join(tmpdir(), "scf-board-")));
   await mkdir(workRoot, { recursive: true });
   const worktreeRoot = join(workRoot, "worktrees");
@@ -2323,7 +2353,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   // dial, scale with the plan size (explicit values always win).
   let planned: BoardSeed;
   try {
-    planned = await options.seed(objective);
+    // The planner (and any plan review it asks) holds one slot.
+    planned = await limiter.run(() => options.seed(objective));
     // The planner's decomposition is a model call too (usage unknown here: counted unpriced).
     meter.count(planned.model !== undefined ? { model: planned.model } : {});
     // So is each plan-review decision the planner pass asked inside the seed
@@ -2386,7 +2417,11 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     ...(meter.caps.maxSpendUsd !== undefined ? { maxSpendUsd: meter.caps.maxSpendUsd } : {}),
   };
   const dial: ConcurrencyDial = { minConcurrency: options.dial.minConcurrency, maxConcurrency: effective.dialMax };
-  emit({ kind: "budgets", items: planned.items.length, scopeFiles, ...effective, caps: capsLine });
+  if (options.maxInflight === undefined) {
+    limiter.setLimit(defaultMaxInflight(dial.maxConcurrency));
+  }
+  const inflightLine = { maxInflight: limiter.limit, inflightExplicit: options.maxInflight !== undefined };
+  emit({ kind: "budgets", items: planned.items.length, scopeFiles, ...effective, caps: capsLine, ...inflightLine });
   const goal = await operator.postAsHuman({
     type: "goal.posted",
     payload: {
@@ -2606,7 +2641,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   });
   // A separate tool author's model calls are metered (and refused past a run
   // cap); the default author edits through the already metered executor.
-  const toolAuthor = options.toolAuthor ? meteredToolAuthor(options.toolAuthor, meter) : executorToolAuthor(executor);
+  const toolAuthor = options.toolAuthor ? limitedToolAuthor(meteredToolAuthor(options.toolAuthor, meter), limiter, controller.signal) : executorToolAuthor(executor);
   const makeAgent = (id: string, role: "worker" | "lead") =>
     new BoardAgent({
       id,
@@ -3060,7 +3095,6 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   };
 
   const lead = makeAgent("lead", "lead");
-  const controller = new AbortController();
   // An operator interrupt (options.signal) stops every agent loop at once and
   // ends the agent phase with stop reason "interrupted"; the ending still runs.
   const interrupted = (): boolean => options.signal?.aborted === true;
@@ -3167,16 +3201,30 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     }
 
     // 3. Recruit under the dial and let the agents work; integrate as pushes land.
+    // Joins over the whole run are bounded (replacements included), and never
+    // past what the board admits (the lead is one of its agents).
+    const joinCap = maxWorkerJoins(dial.maxConcurrency);
+    const inFlight = () => workers.filter((w) => !w.stopped).length;
+    // Open items, plus help requests that grant a scope nobody has taken yet
+    // (a helper recruited for one forks the requester's repo).
+    const openWork = (state: BoardState): number =>
+      Object.values(state.items).filter((i) => i.status === "open").length +
+      Object.values(state.help).filter((h) => h.scope !== undefined && h.grant === undefined && helpGrantLive(state, h)).length;
+    const wantsWorker = (open: number): boolean => wantsAnotherWorker({ joined: workers.length, active: inFlight(), open, dial, joinCap });
     const recruit = async (state: BoardState): Promise<number> => {
       let joined = 0;
-      const inFlight = () => workers.filter((w) => !w.stopped).length;
-      // Open items, plus help requests that grant a scope nobody has taken yet
-      // (a helper recruited for one forks the requester's repo).
-      const helpWanted = Object.values(state.help).filter((h) => h.scope !== undefined && h.grant === undefined && helpGrantLive(state, h)).length;
-      const open = Object.values(state.items).filter((i) => i.status === "open").length + helpWanted;
-      while (workers.length < dial.maxConcurrency && (inFlight() < dial.minConcurrency || open > inFlight())) {
+      const open = openWork(state);
+      while (wantsWorker(open)) {
+        // Ids only grow (agent-1, agent-2, ...): a replacement never reuses a stopped agent's id.
+        const replacing = workers.length >= dial.maxConcurrency;
         const worker = makeAgent(`agent-${workers.length + 1}`, "worker");
-        await worker.join(open > 0 ? `${open} open item(s) outnumber the ${inFlight()} agent(s) in flight` : "the dial's minimum");
+        await worker.join(
+          replacing
+            ? `replacing ${workers.length - inFlight()} stopped agent(s): ${open} open item(s) outnumber the ${inFlight()} agent(s) in flight`
+            : open > 0
+              ? `${open} open item(s) outnumber the ${inFlight()} agent(s) in flight`
+              : "the dial's minimum",
+        );
         workers.push(worker);
         joined += 1;
         if (worker.joinedWorkspace) {
@@ -3252,7 +3300,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       if (Date.now() - started > budgets.timeoutMs) {
         return "timeout";
       }
-      if (workers.length > 0 && workers.every((w) => w.stopped)) {
+      // Every worker stopped and no replacement may join (nothing open, or the join bound reached).
+      if (workers.length > 0 && workers.every((w) => w.stopped) && !wantsWorker(openWork(state))) {
         return "all-agents-stopped";
       }
       return undefined;
@@ -3767,7 +3816,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     ...(speculate > 1 ? { speculation: { speculate, rounds: integrator instanceof ContinuousBoardIntegrator ? [...integrator.rounds] : [] } } : {}),
     ...(integrator instanceof ContinuousBoardIntegrator && integrator.isolations.length > 0 ? { ratchet: { rounds: [...integrator.isolations] } } : {}),
     editModels: workers.flatMap((w) => w.editModels.map((e) => ({ agent: w.id, ...e }))),
-    budgets: { items: planned.items.length, scopeFiles, ...effective, caps: capsLine },
+    budgets: { items: planned.items.length, scopeFiles, ...effective, caps: capsLine, ...inflightLine },
+    inflight: limiter.stats(),
     ...(options.toolAuthorLabel !== undefined ? { toolAuthorLabel: options.toolAuthorLabel } : {}),
     proof,
   };
@@ -3903,7 +3953,9 @@ export function scaledBudgets(input: {
   const activeClaims = input.explicitActiveClaims ?? (input.items >= 3 * Math.max(1, dialMax) ? 2 : 1);
   // Generous: more agents post more messages between one holder's turns.
   const lease = input.explicitLease ?? Math.max(MIN_SCALED_LEASE_MESSAGES, LEASE_MESSAGES_PER_AGENT * Math.max(1, dialMax));
-  const deadline = input.explicitDeadline ?? DEADLINE_LEASES * lease;
+  // Within the board's message cap: a deadline past what a board can ever
+  // hold would never fire (a wide dial's 8 leases exceed it).
+  const deadline = input.explicitDeadline ?? Math.max(lease, Math.min(DEADLINE_LEASES * lease, MAX_SCALED_DEADLINE_MESSAGES));
   const warnings: string[] = [];
   if (input.items === 0) {
     warnings.push("the plan has no items: nothing can be claimed or completed, so the run never ends all-items-done (it ends when the board goes quiet)");
@@ -3911,7 +3963,7 @@ export function scaledBudgets(input: {
   const wanted = RUN_TURNS_PER_ITEM * input.items + RUN_TURNS_PER_SCOPE_FILE * (input.scopeFiles ?? 0);
   if (input.explicitRunTurns === undefined && wanted > MAX_SCALED_RUN_TURNS) {
     warnings.push(
-      `the plan-scaled run-turn budget is capped at ${MAX_SCALED_RUN_TURNS} (the plan's size asks for ${wanted}${input.items > MAX_SCALED_RUN_TURNS ? `, and it has more items (${input.items}) than turns` : ""}): pass an explicit run-turn budget (--max-turns) to raise it`,
+      `the plan-scaled run-turn budget is capped at ${MAX_SCALED_RUN_TURNS} (the plan's size asks for ${wanted}${input.items > MAX_SCALED_RUN_TURNS ? `, and it has more items (${input.items}) than turns` : ""}): pass an explicit run-turn budget (--max-turns ${wanted}) to give the plan every turn it asks for`,
     );
   }
   return {
@@ -3944,6 +3996,8 @@ export const MIN_SCALED_LEASE_MESSAGES = 150;
 export const LEASE_MESSAGES_PER_AGENT = 40;
 /** The scaled claim deadline, in leases. */
 export const DEADLINE_LEASES = 8;
+/** The longest scaled claim deadline: what a board holds, less its batch reserve and a margin of one smallest lease. */
+export const MAX_SCALED_DEADLINE_MESSAGES = BOARD_LIMITS.maxMessages - BOARD_LIMITS.batchReserve - MIN_SCALED_LEASE_MESSAGES;
 
 /** Run-wide turns per file in the planned scopes (added to the per-item turns). */
 export const RUN_TURNS_PER_SCOPE_FILE = 10;
@@ -3958,6 +4012,43 @@ export const ITEM_TURNS_BASE = 4;
 export const ITEM_TURNS_PER_FIX = 2;
 /** The most turns a plan-scaled run budget grants (an explicit --max-turns may go higher). */
 export const MAX_SCALED_RUN_TURNS = 800;
+
+/** Worker joins a run may make per slot of the dial's max (the first pool, then replacements for stopped workers). */
+export const WORKER_JOINS_PER_SLOT = 2;
+
+/**
+ * The most worker joins over a whole run: WORKER_JOINS_PER_SLOT per slot of
+ * the dial's max, and never more than the board admits beside the lead.
+ */
+export function maxWorkerJoins(dialMax: number): number {
+  return Math.max(0, Math.min(BOARD_LIMITS.maxAgents - 1, WORKER_JOINS_PER_SLOT * Math.max(1, dialMax)));
+}
+
+/**
+ * Whether the pool takes another worker now. Within the run's join bound and
+ * the dial's max of ACTIVE (not stopped) workers, one joins while open work
+ * outnumbers the active workers, or while fewer than the dial's min are
+ * active. Before the pool first fills that is the dial as before; after it
+ * (a replacement for a worker that stopped), only while there is open work to
+ * claim: a replacement never joins a board with nothing open. Pure.
+ */
+export function wantsAnotherWorker(input: {
+  readonly joined: number;
+  readonly active: number;
+  readonly open: number;
+  readonly dial: ConcurrencyDial;
+  readonly joinCap: number;
+}): boolean {
+  const { joined, active, open, dial, joinCap } = input;
+  if (joined >= joinCap || active >= dial.maxConcurrency) {
+    return false;
+  }
+  const firstPool = joined < dial.maxConcurrency;
+  if (open > active) {
+    return true;
+  }
+  return active < dial.minConcurrency && (firstPool || open > 0);
+}
 
 /**
  * The lockstep order of the workers in a round: agents building a tool that is
@@ -4393,6 +4484,11 @@ export function formatFormation(log: readonly BoardMessage[], state: BoardState)
   return lines.length > 0 ? ["  formation:", ...lines] : [];
 }
 
+/** A queued-wait total in words ("1.5 s", "120 ms"). */
+function formatWaitMs(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms)} ms`;
+}
+
 export function formatBoardRunSummary(result: RunBoardResult): string {
   // Only accepted items count: a worker's proposal the lead rejected (or never
   // decided) is not part of the Change.
@@ -4426,6 +4522,12 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
             ((result.usage.rateLimitedCalls ?? 0) > 0 ? `; ${result.usage.rateLimitedCalls} rate-limited call attempt(s) (HTTP 429: not billed, no turn budget spent)` : "") +
             (result.usage.capped.length > 0 ? `; caps reached: ${result.usage.capped.map((c) => `${c.kind}${c.item ? ` (${c.item})` : ""} ${c.used} of ${c.limit}`).join(", ")}` : ""),
           ...(result.usage.warnings ?? []).map((w) => `  meter warning: ${w}`),
+        ]
+      : []),
+    ...(result.inflight
+      ? [
+          `  model calls in flight: at most ${result.inflight.max} at once, peak ${result.inflight.peak}; ` +
+            `${result.inflight.queuedCalls} of ${result.inflight.calls} call(s) queued for a slot, ${formatWaitMs(result.inflight.queuedWaitMs)} queued in total`,
         ]
       : []),
     ...(result.gateLabel !== undefined ? [`  gate: ${result.gateLabel}`] : []),

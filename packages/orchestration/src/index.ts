@@ -272,11 +272,27 @@ export {
   formatToolRegistry,
   formatBoardTranscript,
   integrateBoardRevision,
+  maxWorkerJoins,
   pendingPushKey,
   quietBoardActions,
   runBoard,
   undecidedContractLines,
+  wantsAnotherWorker,
+  WORKER_JOINS_PER_SLOT,
 } from "./run-board.ts";
+export type { InflightStats } from "./inflight-limiter.ts";
+export {
+  DEFAULT_MAX_INFLIGHT,
+  defaultMaxInflight,
+  InflightAbortedError,
+  InflightLimiter,
+  limitedCall,
+  limitedExecutor,
+  limitedToolAuthor,
+  limitedTransport,
+  MAX_INFLIGHT,
+  validMaxInflight,
+} from "./inflight-limiter.ts";
 export type { ModelPrice, RunCapReached, RunCaps } from "./run-meter.ts";
 export { meteredExecutor, meteredJev, meteredToolAuthor, meteredTransport, parsePrice, parsePrices, RunMeter, validateSpendCap } from "./run-meter.ts";
 export type { RateLimitBackoffEvent, RateLimitBackoffOptions, RateLimitNote } from "./rate-limit-backoff.ts";

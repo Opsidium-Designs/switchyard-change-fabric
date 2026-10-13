@@ -203,9 +203,20 @@ export const BOARD_LIMITS = {
   maxMessages: 20000,
   batchReserve: 512,
   maxItems: 1000,
-  maxAgents: 100,
+  /**
+   * Agents that may join one board over its whole life (the lead, every
+   * worker, and every replacement for a worker that stopped). An admission
+   * bound only: it never changes how a recorded log folds.
+   */
+  maxAgents: 256,
   maxChildren: 32,
   maxIntentEntries: 64,
+  /**
+   * Pushes one integrated revision may merge, and items its failing evidence
+   * may name (a wide pool's pushes can all land in one revision). A bound on
+   * what a message may carry only: it never changes how a recorded log folds.
+   */
+  maxRevisionPushes: 256,
   maxEntryLength: MAX_INTENT_ENTRY_LENGTH,
   maxPaths: 256,
   maxShortList: 32,
@@ -2026,8 +2037,8 @@ function failingEvidence(value: unknown): BoardFailingEvidence {
   if (typeof output !== "string" || output.length > BOARD_LIMITS.maxFailingOutput) {
     fail("BAD_PAYLOAD", `failing.output must be a string of at most ${BOARD_LIMITS.maxFailingOutput} characters`);
   }
-  const outstanding = value.outstanding === undefined ? undefined : idList(value, "outstanding", { max: BOARD_LIMITS.maxIntentEntries });
-  return { output, items: idList(value, "items", { max: BOARD_LIMITS.maxIntentEntries }), ...(outstanding !== undefined ? { outstanding } : {}) };
+  const outstanding = value.outstanding === undefined ? undefined : idList(value, "outstanding", { max: BOARD_LIMITS.maxRevisionPushes });
+  return { output, items: idList(value, "items", { max: BOARD_LIMITS.maxRevisionPushes }), ...(outstanding !== undefined ? { outstanding } : {}) };
 }
 
 /** Validate a goal's test inventory: a status, and bounded format, count, and names. */
@@ -2508,7 +2519,7 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         n: positiveInt(raw, "n"),
         commit: id(raw, "commit"),
         gate: oneOf(raw, "gate", ["pass", "fail"] as const),
-        merged: idList(raw, "merged", { max: L.maxIntentEntries }),
+        merged: idList(raw, "merged", { max: L.maxRevisionPushes }),
         paths: pathList(raw, "paths", { max: L.maxPaths * L.maxIntentEntries }),
         contributors: idList(raw, "contributors", { max: L.maxAgents }),
         ...(failing !== undefined ? { failing } : {}),
@@ -6954,7 +6965,7 @@ export function appendIntegratedRev(state: BoardState, input: unknown, at: strin
   const parsed: IntegratedRevInput = {
     commit: id(input, "commit"),
     gate: oneOf(input, "gate", ["pass", "fail"] as const),
-    merged: idList(input, "merged", { max: BOARD_LIMITS.maxIntentEntries }),
+    merged: idList(input, "merged", { max: BOARD_LIMITS.maxRevisionPushes }),
     ...(failing !== undefined ? { failing } : {}),
     ...(ungatedFlag(input) ? { gated: false as const } : {}),
     ...(input.unverified !== undefined ? { unverified: unverifiedMerges(input.unverified) } : {}),
