@@ -144,6 +144,8 @@ export interface VerifyAndIntegrateOptions {
   readonly integrationBaseCommit?: string;
   /** See IntegrateOptions.deferBranchPush. */
   readonly deferIntegrationPush?: boolean;
+  /** See IntegrateOptions.keepFailedGatedCommit. */
+  readonly keepFailedGatedCommit?: boolean;
   /** See IntegrateOptions.testInventory. */
   readonly testInventory?: TestInventory;
   readonly workRoot?: string;
@@ -304,6 +306,7 @@ export class ChangeVerification {
       ...(options.onProtectedChange ? { onProtectedChange: options.onProtectedChange } : {}),
       ...(options.integrationBaseCommit ? { baseCommit: options.integrationBaseCommit } : {}),
       ...(options.deferIntegrationPush ? { deferBranchPush: true } : {}),
+      ...(options.keepFailedGatedCommit ? { keepFailedGatedCommit: true } : {}),
       ...(options.testInventory ? { testInventory: options.testInventory } : {}),
       workRoot,
       identity: options.identity,

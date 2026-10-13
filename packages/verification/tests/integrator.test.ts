@@ -374,6 +374,37 @@ describe("Integrator", () => {
     expect(built.commit).toBe(result.commit);
   });
 
+  it("keeps a failed gated commit on its candidate ref only when asked (never the branch), for an advisory preview", async () => {
+    const refsAt = async (gitUrl: string) =>
+      (await run("git", ["-C", fileURLToPath(gitUrl), "for-each-ref", "--format=%(refname) %(objectname)"])).stdout.trim().split("\n");
+    for (const keep of [false, true]) {
+      const unitDir = join(root, `unit-${keep}`);
+      const baseline = await unitThatDeletes(unitDir);
+      const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, `artifacts-${keep}`) });
+      const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+      const integrator = new Integrator(provider, {
+        commandRunner: new FakeCommandRunner([{ match: "gate", outcome: { code: 1, stdout: "", stderr: "gate failed" } }]),
+      });
+      const result = await integrator.integrate({
+        integrationRef: ref,
+        integrationToken: token,
+        verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+        excludedUnits: [],
+        integrationGateCommand: ["npm", "run", "gate"],
+        requiresIntegrationGate: true,
+        deferBranchPush: true,
+        ...(keep ? { keepFailedGatedCommit: true } : {}),
+        workRoot: root,
+      });
+      expect(result.verdict).toBe("failed");
+      expect(result.commit).toMatch(/^[0-9a-f]{40}$/);
+      const refs = await refsAt(ref.gitUrl);
+      // The branch never moves on a failed gate, kept or not.
+      expect(refs).toContain(`refs/heads/main ${baseline}`);
+      expect(refs.includes(`refs/switchyard/gated/${result.commit} ${result.commit}`)).toBe(keep);
+    }
+  });
+
   it("restores protected JSON keys only, keeps released paths, and in restore mode keeps the gate's verdict", async () => {
     const unitDir = join(root, "unit");
     await mkdir(join(unitDir, "tests"), { recursive: true });

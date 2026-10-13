@@ -174,6 +174,14 @@ export interface IntegrateOptions {
    */
   readonly deferBranchPush?: boolean;
   /**
+   * With `deferBranchPush`: also push a FAILED verdict's gated commit to its
+   * candidate ref (`gatedRef(commit)`), so the exact tree the gate failed on
+   * can be read back for an advisory revision preview. Never the branch: the
+   * verdict, the branch, and promotion are unchanged, and a failure of this
+   * push is ignored. Off by default.
+   */
+  readonly keepFailedGatedCommit?: boolean;
+  /**
    * The BASELINE gate run's executed-test inventory. When given, the gate fails
    * unless this run executed at least those tests (by name where the runner
    * prints names, and never fewer by count), so code under test that exits
@@ -477,6 +485,12 @@ export class Integrator {
         } else {
           promotion = await compareAndSwapBranch(trusted, remote, integrationRef.defaultBranch, commit, expectedBase === "" ? null : expectedBase);
         }
+      } else if (committed && commit !== "" && options.deferBranchPush && options.keepFailedGatedCommit) {
+        // Kept for an advisory preview only: the failed tree goes to its own
+        // candidate ref (never the branch), from the trusted repo like a pass.
+        // Best-effort: it can change nothing about the verdict.
+        const remote = authenticated(integrationRef.gitUrl, options.integrationToken);
+        await safeGit(trusted, ["push", "-q", remote, `${commit}:${gatedRef(commit)}`]).catch(() => undefined);
       }
 
       return {
