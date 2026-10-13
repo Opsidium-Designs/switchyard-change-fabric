@@ -365,3 +365,24 @@ export {
 } from "./credentials.ts";
 export type { CandidateOutcome, SpeculativeRoundOptions, SpeculativeRoundResult } from "./speculative-integration.ts";
 export { DEFAULT_SPECULATE, formatCandidates, integrateSpeculativeRound, MAX_SPECULATE } from "./speculative-integration.ts";
+export type { PreviewUploader, RevisionPreview, RevisionPreviewEvent, RevisionPreviewer, RevisionPreviewerOptions } from "./revision-preview.ts";
+export {
+  appPathInProject,
+  checkoutIntegratedCommit,
+  createRevisionPreviewer,
+  isWorkersDevUrl,
+  MAX_PREVIEW_ALIAS,
+  parsePreviewAliasUrl,
+  previewAlias,
+} from "./revision-preview.ts";
+export type { PreviewReplayFile, PreviewReplayStep } from "./preview-replay.ts";
+export {
+  commitExists,
+  locateAppInTree,
+  MAX_PREVIEWS,
+  parsePreviewReplay,
+  previewReplayPlan,
+  serializePreviewReplay,
+  withBackfilledPreviews,
+  wranglerConfigName,
+} from "./preview-replay.ts";

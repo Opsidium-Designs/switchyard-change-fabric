@@ -177,6 +177,11 @@ export interface RunBoardOfflineOptions {
   readonly interruptGraceMs?: number;
   /** The shared rate-limit backoff's window and bounds (see RunBoardOptions.rateLimit). */
   readonly rateLimit?: RunBoardOptions["rateLimit"];
+  /** The app directory and its Worker name (see RunBoardOptions.deployAppDir): what revision previews upload. */
+  readonly deployAppDir?: string;
+  readonly deployAppName?: string;
+  /** Revision previews with an injected uploader (see RunBoardOptions.previewRevision; offline runs pass a fake). */
+  readonly previewRevision?: RunBoardOptions["previewRevision"];
 }
 
 /** Run a board offline and deterministically. */
@@ -252,6 +257,9 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       ...(options.signal ? { signal: options.signal } : {}),
       ...(options.interruptGraceMs !== undefined ? { interruptGraceMs: options.interruptGraceMs } : {}),
       ...(options.rateLimit ? { rateLimit: options.rateLimit } : {}),
+      ...(options.deployAppDir ? { deployAppDir: options.deployAppDir } : {}),
+      ...(options.deployAppName ? { deployAppName: options.deployAppName } : {}),
+      ...(options.previewRevision ? { previewRevision: options.previewRevision } : {}),
     });
     // The whole scratch directory: the offline control's repos and the run's work root.
     return { ...result, scratchRoot: workRoot };
