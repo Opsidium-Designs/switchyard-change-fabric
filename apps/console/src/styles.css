@@ -1385,6 +1385,14 @@ body {
 .mc-escalation p { margin: 0 0 0.35rem; }
 .mc-escalation-head { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
 .mc-escalation-head strong { color: var(--await); }
+/* Why it waits on a human: short labelled lines, each citing its message. */
+.mc-escalation-why { margin: 0.2rem 0 0.45rem; font-size: 0.8rem; }
+.mc-escalation-why dt { color: var(--muted); font-weight: 700; font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; margin-top: 0.3rem; }
+.mc-escalation-why dd { margin: 0.05rem 0 0; overflow-wrap: anywhere; }
+.mc-escalation-why .mc-rationale + .mc-rationale { margin-top: 0.25rem; }
+.mc-escalation-why .mc-rationale { margin-top: 0; }
+.mc-escalation-fail { color: var(--bad-text); font-size: 0.75rem; }
+.mc-escalation-sides { margin: 0; padding-left: 1rem; }
 .mc-escalation-options { display: flex; gap: 0.4rem; flex-wrap: wrap; }
 
 .mc .mc-escalation-options button {

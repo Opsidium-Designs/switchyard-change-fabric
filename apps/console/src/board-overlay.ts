@@ -967,3 +967,153 @@ export function drawingExtent(layout: ExtentLayout): { readonly width: number; r
   }
   return { width: Math.ceil(maxX + 24), height: Math.ceil(maxY + 12) };
 }
+
+// ---------------------------------------------------------------------------
+// Why an escalation was raised (for the "awaiting a human" card)
+// ---------------------------------------------------------------------------
+
+/** A line of recorded evidence with the message that backs it. */
+export interface CitedLine {
+  readonly text: string;
+  readonly seq: number;
+  readonly type: BoardMessage["type"];
+}
+
+/** The advisory triage of an escalated contract (Jev), never a verdict. */
+export interface EscalationAdvice {
+  readonly answer: string;
+  readonly confidence?: number;
+  /** Confident enough to be used (still advisory). */
+  readonly confident: boolean;
+  readonly seq: number;
+}
+
+export type EscalationContext =
+  | {
+      readonly kind: "contract";
+      readonly contract: string;
+      readonly item: string;
+      readonly target: string;
+      readonly change: "add" | "modify" | "remove";
+      /** The agent that asked, and its proposal. */
+      readonly requester: string;
+      readonly proposalSeq?: number;
+      /** The agent's own words: what to change (the proposal's description) and why (its rationale). */
+      readonly description?: string;
+      readonly rationale?: string;
+      /** The latest recorded gate failure for the item before the escalation. */
+      readonly failure?: CitedLine;
+      readonly advice?: EscalationAdvice;
+      readonly accepting: string;
+      readonly rejecting: string;
+    }
+  | {
+      readonly kind: "contest";
+      readonly contest: string;
+      readonly item: string;
+      readonly ownerItem?: string;
+      readonly claimant: string;
+      readonly owner: string;
+      readonly overlap: readonly string[];
+      readonly turns?: number;
+      readonly reason?: string;
+      /** Each side's own words in the contest, in order (claimed, never counted). */
+      readonly sides: readonly { readonly agent: string; readonly role: "claimant" | "owner"; readonly words: string; readonly seq: number; readonly type: BoardMessage["type"] }[];
+      readonly keepOwner: string;
+      readonly keepClaimant: string;
+    };
+
+/** The first line of a gate output that says what failed (skipping npm's `>` banner lines). */
+function failureLine(output: string): string {
+  const lines = output.split("\n").map((l) => l.trim()).filter((l) => l.length > 0 && !l.startsWith(">"));
+  const line = lines[0] ?? "";
+  return line.length > 200 ? `${line.slice(0, 197)}...` : line;
+}
+
+/**
+ * Why the escalation at `seq` was raised, from the board log up to K only:
+ * for a contract, the requesting agent and item, the agent's own reason (its
+ * proposal's description and rationale), the latest gate failure recorded for
+ * the item before it (an integrated.rev that implicated the item, or the
+ * owner's item.struggling report), the advisory triage if any, and what each
+ * answer does; for a contest, who claims what, the overlapping paths, and
+ * each side's own words. Undefined when the log has no such escalation.
+ */
+export function escalationContext(log: readonly BoardMessage[], k: number, seq: number): EscalationContext | undefined {
+  const messages = boardPrefix(log, k);
+  const esc = messages.find((m) => m.seq === seq);
+  if (!esc) return undefined;
+  if (esc.type === "contract.escalated") {
+    const p = esc.payload;
+    const proposal = [...messages].reverse().find((m) => m.seq <= esc.seq && m.type === "contract.proposed" && m.payload.contract === p.contract);
+    const requester = proposal?.from ?? "an agent";
+    let failure: CitedLine | undefined;
+    for (const m of messages) {
+      if (m.seq > esc.seq) break;
+      if (m.type === "integrated.rev" && m.payload.failing && m.payload.failing.items.includes(p.item)) {
+        failure = { text: `rev ${m.payload.n} failed: ${failureLine(m.payload.failing.output)}`, seq: m.seq, type: m.type };
+      } else if (m.type === "item.struggling" && m.payload.item === p.item && m.payload.lastFailure !== undefined) {
+        failure = { text: m.payload.lastFailure, seq: m.seq, type: m.type };
+      }
+    }
+    const triage = [...messages]
+      .reverse()
+      .find((m) => m.type === "decision.recorded" && m.payload.juncture === "contract-triage" && m.payload.contract === p.contract);
+    const advice: EscalationAdvice | undefined =
+      triage?.type === "decision.recorded" && triage.payload.answer !== undefined
+        ? {
+            answer: triage.payload.answer,
+            ...(triage.payload.confidence !== undefined ? { confidence: triage.payload.confidence } : {}),
+            confident: triage.payload.accepted === true,
+            seq: triage.seq,
+          }
+        : undefined;
+    const description = proposal?.type === "contract.proposed" ? proposal.payload.description : undefined;
+    const verb = p.kind === "add" ? "add" : p.kind === "remove" ? "remove" : "change";
+    return {
+      kind: "contract",
+      contract: p.contract,
+      item: p.item,
+      target: p.target,
+      change: p.kind,
+      requester,
+      ...(proposal ? { proposalSeq: proposal.seq } : {}),
+      ...(description !== undefined ? { description } : {}),
+      ...(proposal?.rationale ? { rationale: proposal.rationale } : {}),
+      ...(failure ? { failure } : {}),
+      ...(advice ? { advice } : {}),
+      accepting: `${requester} may ${verb} ${p.target} for ${p.item} only; every other item still cannot write it, and the gate still decides.`,
+      rejecting: `${p.target} stays as it is; ${requester} must make the gate pass without touching it.`,
+    };
+  }
+  if (esc.type === "claim.escalated") {
+    const p = esc.payload;
+    const contested = messages.find((m) => m.type === "claim.contested" && m.payload.contest === p.contest);
+    const ownerItem = contested?.type === "claim.contested" ? contested.payload.ownerItem : undefined;
+    const sides: { agent: string; role: "claimant" | "owner"; words: string; seq: number; type: BoardMessage["type"] }[] = [];
+    for (const m of messages) {
+      if (m.seq > esc.seq) break;
+      const about =
+        (m.type === "claim.contested" || m.type === "claim.kept" || m.type === "claim.ceded" || m.type === "claim.narrowed") && m.payload.contest === p.contest;
+      const claim = m.type === "item.claimed" && m.from === p.claimant && m.payload.item === p.item;
+      if (!(about || claim) || !m.rationale) continue;
+      const agent = m.type === "claim.contested" ? m.payload.claimant : m.from;
+      sides.push({ agent, role: agent === p.owner ? "owner" : "claimant", words: m.rationale, seq: m.seq, type: m.type });
+    }
+    return {
+      kind: "contest",
+      contest: p.contest,
+      item: p.item,
+      ...(ownerItem !== undefined ? { ownerItem } : {}),
+      claimant: p.claimant,
+      owner: p.owner,
+      overlap: p.overlap,
+      turns: p.turns,
+      reason: p.reason === "turns" ? `the agents did not settle it in ${p.turns} turn(s)` : "neither agent acted for too long",
+      sides,
+      keepOwner: `${p.owner} keeps ${p.overlap.join(", ")}${ownerItem !== undefined ? ` for ${ownerItem}` : ""}; ${p.claimant} must work around it.`,
+      keepClaimant: `${p.claimant} gets ${p.overlap.join(", ")} for ${p.item}; ${p.owner} gives it up.`,
+    };
+  }
+  return undefined;
+}

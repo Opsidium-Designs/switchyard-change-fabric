@@ -31,8 +31,10 @@ import {
   COMM_WINDOW,
   commCurve,
   drawnLegend,
+  escalationContext,
   fixAskState,
   revisionAnchor,
+  type EscalationContext,
   placeLabel,
   talkLabelCandidates,
   type EdgeVariant,
@@ -121,6 +123,8 @@ export interface EscalationCardData {
   readonly note?: string;
   /** A recorded run: the options are shown as text, never as buttons. */
   readonly recorded?: boolean;
+  /** Why it was raised, from the recorded board messages (the agent's reason, the failing gate line, each side's words). */
+  readonly context?: EscalationContext;
 }
 
 const TRIAGE_SPLIT = "\nAdvisory triage";
@@ -135,8 +139,14 @@ export function escalationCards(
   records: readonly BoardEscalationRecord[],
   live: boolean,
   recorded = false,
+  /** The board log: when given, each card carries why it was raised (read up to the model's K). */
+  log?: readonly BoardMessage[],
 ): EscalationCardData[] {
   const out: EscalationCardData[] = [];
+  const why = (seq: number | undefined) => {
+    const context = log && seq !== undefined ? escalationContext(log, model.k, seq) : undefined;
+    return context ? { context } : {};
+  };
   const matched = new Set<string>();
   if (live && !recorded) {
     for (const record of records) {
@@ -157,6 +167,7 @@ export function escalationCards(
         options: record.options && record.options.length > 0 ? record.options : ["proceed"],
         ...(recommendation !== undefined ? { recommendation } : {}),
         ...(fromLog ? { seq: fromLog.seq, type: fromLog.kind === "contest" ? "claim.escalated" : "contract.escalated" } : {}),
+        ...why(fromLog?.seq),
       });
     }
   }
@@ -173,6 +184,7 @@ export function escalationCards(
       seq: e.seq,
       type: e.kind === "contest" ? "claim.escalated" : "contract.escalated",
       ...(recorded ? { recorded: true } : {}),
+      ...why(e.seq),
       note: recorded
         ? "recorded run: this was decided (or left waiting) during the live run, not here"
         : live
@@ -813,10 +825,17 @@ export function EscalationCard({
         ) : null}
       </p>
       <p className="mc-escalation-question">{card.question}</p>
+      {card.context ? <EscalationWhy context={card.context} onSelectSeq={onSelectSeq} showAdvice={card.recommendation === undefined} /> : null}
       {card.recommendation !== undefined ? (
         <p className="mc-recommendation">
           <span className="advisory">Jev recommends {card.recommendation}</span>{" "}
-          <span className="mc-chip-advisory">advisory: you decide</span>
+          <span className="mc-chip-advisory">{card.recorded ? "advisory: a human decides" : "advisory: you decide"}</span>
+          {card.context?.kind === "contract" && card.context.advice ? (
+            <>
+              {" "}
+              <SeqCite seq={card.context.advice.seq} type="decision.recorded" onSelectSeq={onSelectSeq} />
+            </>
+          ) : null}
         </p>
       ) : null}
       {card.recorded ? (
@@ -841,6 +860,128 @@ export function EscalationCard({
       )}
       {card.note ? <p className="muted mc-escalation-note">{card.note}</p> : null}
     </div>
+  );
+}
+
+/** A seq link inside an escalation card (opens the message in the thread). */
+function SeqCite({ seq, type, onSelectSeq }: { seq: number; type: string; onSelectSeq?: ((seq: number) => void) | undefined }) {
+  return (
+    <button type="button" className="mc-seq-link" onClick={() => onSelectSeq?.(seq)} title="open this message in the thread">
+      seq {seq}, {type}
+    </button>
+  );
+}
+
+/**
+ * Why an escalation waits on a human, from recorded messages only: who asks
+ * and for which item, in the agent's own words, the failing gate line that led
+ * to it, what each answer does, and the advisory triage (never a verdict).
+ */
+export function EscalationWhy({
+  context: c,
+  onSelectSeq,
+  showAdvice = true,
+}: {
+  context: EscalationContext;
+  onSelectSeq?: ((seq: number) => void) | undefined;
+  showAdvice?: boolean;
+}) {
+  if (c.kind === "contract") {
+    return (
+      <dl className="mc-escalation-why">
+        <dt>Who asks</dt>
+        <dd>
+          <strong>{c.requester}</strong>, for item <strong>{c.item}</strong>: {c.change} <code>{c.target}</code>
+          {c.proposalSeq !== undefined ? (
+            <>
+              {" "}
+              <SeqCite seq={c.proposalSeq} type="contract.proposed" onSelectSeq={onSelectSeq} />
+            </>
+          ) : null}
+        </dd>
+        {c.description !== undefined || c.rationale !== undefined ? (
+          <>
+            <dt>Its reason</dt>
+            <dd>
+              {c.description !== undefined ? (
+                <q className="mc-rationale" title={`${c.requester}'s own words: claimed, never counted`}>
+                  {c.description}
+                </q>
+              ) : null}
+              {c.rationale !== undefined && c.rationale !== c.description ? (
+                <q className="mc-rationale" title={`${c.requester}'s own words: claimed, never counted`}>
+                  {c.rationale}
+                </q>
+              ) : null}
+            </dd>
+          </>
+        ) : null}
+        {c.failure ? (
+          <>
+            <dt>The failure behind it</dt>
+            <dd>
+              <code className="mc-escalation-fail">{c.failure.text}</code> <SeqCite seq={c.failure.seq} type={c.failure.type} onSelectSeq={onSelectSeq} />
+            </dd>
+          </>
+        ) : null}
+        <dt>Accept</dt>
+        <dd>{c.accepting}</dd>
+        <dt>Reject</dt>
+        <dd>{c.rejecting}</dd>
+        {showAdvice && c.advice ? (
+          <>
+            <dt>Jev</dt>
+            <dd className="advisory">
+              recommends {c.advice.answer}
+              {c.advice.confidence !== undefined ? ` (${c.advice.confidence.toFixed(2)}${c.advice.confident ? "" : ", not confident"})` : ""}{" "}
+              <span className="mc-chip-advisory">advisory: the human decides here, and only the gate decides the run</span>{" "}
+              <SeqCite seq={c.advice.seq} type="decision.recorded" onSelectSeq={onSelectSeq} />
+            </dd>
+          </>
+        ) : null}
+      </dl>
+    );
+  }
+  return (
+    <dl className="mc-escalation-why">
+      <dt>Who</dt>
+      <dd>
+        <strong>{c.claimant}</strong> (for {c.item}) wants what <strong>{c.owner}</strong>
+        {c.ownerItem !== undefined ? ` (for ${c.ownerItem})` : ""} holds
+      </dd>
+      <dt>Overlap</dt>
+      <dd>
+        <code>{c.overlap.join(", ")}</code>
+      </dd>
+      {c.reason !== undefined ? (
+        <>
+          <dt>Why a human</dt>
+          <dd>{c.reason}</dd>
+        </>
+      ) : null}
+      {c.sides.length > 0 ? (
+        <>
+          <dt>Each side</dt>
+          <dd>
+            <ul className="mc-escalation-sides">
+              {c.sides.map((side) => (
+                <li key={side.seq}>
+                  <strong>{side.agent}</strong> <span className="muted">({side.role})</span>:{" "}
+                  <q className="mc-rationale" title={`${side.agent}'s own words: claimed, never counted`}>
+                    {side.words}
+                  </q>{" "}
+                  <SeqCite seq={side.seq} type={side.type} onSelectSeq={onSelectSeq} />
+                </li>
+              ))}
+            </ul>
+          </dd>
+        </>
+      ) : null}
+      <dt>If {c.owner} keeps it</dt>
+      <dd>{c.keepOwner}</dd>
+      <dt>If {c.claimant} gets it</dt>
+      <dd>{c.keepClaimant}</dd>
+    </dl>
   );
 }
 
@@ -3180,7 +3321,7 @@ export function MissionControl({
     );
   }
 
-  const cards = escalationCards(model, escalations, live, recorded);
+  const cards = escalationCards(model, escalations, live, recorded, log);
   // Oldest first here; the thread lists them in the chosen order.
   const thread = selection ? boardThread(log, k, selection, model.state) : boardPrefix(log, k).slice(-40);
   const threadTitle = !selection

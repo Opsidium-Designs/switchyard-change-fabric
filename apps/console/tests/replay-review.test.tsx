@@ -12,10 +12,13 @@ import { describe, expect, it } from "vitest";
 
 import { boardCaptions, buildBoardGraph, type BoardMessage } from "@switchyard-change/orchestration/board-graph";
 
-import { COMM_KINDS, commKind, communicationArrows, drawnLegend, fixAskState, outstandingFixLinks, progressChart, revisionAnchor } from "../src/board-overlay.ts";
+import { COMM_KINDS, commKind, communicationArrows, drawnLegend, escalationContext, fixAskState, outstandingFixLinks, progressChart, revisionAnchor } from "../src/board-overlay.ts";
+import { missionControlLog } from "../../../packages/orchestration/tests/board-graph-fixture.ts";
 import { LANE_HEAD, scaledBoardLayout } from "../src/board-scale.ts";
 import {
   BoardGraphView,
+  EscalationCard,
+  escalationCards,
   labelledPoints,
   messageDirection,
   MissionControl,
@@ -272,6 +275,79 @@ describe("the Board's test charts", () => {
     expect([...labelledPoints(many, null)].sort((a, b) => a - b)).toEqual([1, 6, 12]);
     expect([...labelledPoints(many, 9)].sort((a, b) => a - b)).toEqual([1, 6, 9, 12]);
     expect(SUITE_INFO.acceptance.name).toBe("Acceptance tests");
+  });
+});
+
+describe("an escalation card says why a human is asked", () => {
+  it("sf8: the agent, its item, its own reason, the failing gate line, what accept and reject do, the advisory triage, with seq links", () => {
+    const sf8 = recorded("board-live-sf8");
+    const c = escalationContext(sf8, 110, 109)!;
+    expect(c).toMatchObject({
+      kind: "contract",
+      requester: "agent-1",
+      item: "unit-catalog-categories",
+      target: "tests/catalog.test.ts",
+      change: "modify",
+      proposalSeq: 108,
+      failure: { text: "AssertionError: expected 1072 to be 1073 // Object.is equality", seq: 107, type: "item.struggling" },
+      advice: { answer: "reject", confidence: 0.98, confident: true, seq: 110 },
+    });
+    if (c.kind !== "contract") throw new Error("contract");
+    expect(c.description).toMatch(/^Adjust rounding logic/);
+    expect(c.accepting).toBe("agent-1 may change tests/catalog.test.ts for unit-catalog-categories only; every other item still cannot write it, and the gate still decides.");
+    expect(c.rejecting).toBe("tests/catalog.test.ts stays as it is; agent-1 must make the gate pass without touching it.");
+    // Read only up to K: before the triage is recorded there is no advice.
+    expect(escalationContext(sf8, 109, 109)).not.toHaveProperty("advice");
+
+    const html = renderToStaticMarkup(createElement(MissionControl, { log: sf8, escalations: [], busy: false, onResolve: () => {}, recorded: true, initialSeq: 110 }));
+    const card = html.match(/<div class="mc-escalation".*?<\/div>/)![0];
+    expect(card).toContain("Awaiting a human");
+    expect(card).toContain("<dt>Who asks</dt><dd><strong>agent-1</strong>, for item <strong>unit-catalog-categories</strong>: modify <code>tests/catalog.test.ts</code>");
+    expect(card).toContain("seq 108, contract.proposed");
+    expect(card).toMatch(/<dt>Its reason<\/dt><dd><q class="mc-rationale"[^>]*>Adjust rounding logic/);
+    expect(card).toContain('<dt>The failure behind it</dt><dd><code class="mc-escalation-fail">AssertionError: expected 1072 to be 1073 // Object.is equality</code>');
+    expect(card).toContain("seq 107, item.struggling");
+    expect(card).toContain("<dt>Accept</dt><dd>agent-1 may change tests/catalog.test.ts for unit-catalog-categories only");
+    expect(card).toContain("<dt>Reject</dt><dd>tests/catalog.test.ts stays as it is");
+    // The advisory triage is shown once, labelled advisory.
+    expect(card).toMatch(/Jev recommends reject/);
+    expect(card).toContain("seq 110, decision.recorded");
+    expect(card).toContain("advisory: a human decides");
+    expect(card).toContain("advisory");
+  });
+
+  it("sf21: the agent's own words about the truncating test, before any triage", () => {
+    const sf21 = recorded("board-live-sf21");
+    const c = escalationContext(sf21, 37, 37)!;
+    expect(c).toMatchObject({ kind: "contract", requester: "agent-1", item: "tax", target: "tests/billing/tax.test.ts", proposalSeq: 36 });
+    if (c.kind !== "contract") throw new Error("contract");
+    expect(c.description).toContain("The goal says tax rounds to the nearest cent, so it must be 73");
+    expect(c.rationale).toBe("The failing assertion encodes the old truncating behavior that the goal changes (round to nearest cent).");
+    expect(c.failure).toEqual({ text: "AssertionError: expected 73 to be 72 // Object.is equality", seq: 34, type: "item.struggling" });
+    expect(c).not.toHaveProperty("advice");
+    const html = renderToStaticMarkup(createElement(MissionControl, { log: sf21, escalations: [], busy: false, onResolve: () => {}, recorded: true, initialSeq: 37 }));
+    expect(html).toContain("The failing assertion encodes the old truncating behavior");
+    // Once the human decided (seq 38), the card is gone.
+    const after = renderToStaticMarkup(createElement(MissionControl, { log: sf21, escalations: [], busy: false, onResolve: () => {}, recorded: true, initialSeq: 38 }));
+    expect(after).not.toContain("Awaiting a human");
+  });
+
+  it("a contest: who, which paths overlap, and each side's own words", () => {
+    const log = missionControlLog();
+    const esc = log.find((m) => m.type === "claim.escalated")!;
+    const c = escalationContext(log, esc.seq, esc.seq)!;
+    expect(c.kind).toBe("contest");
+    if (c.kind !== "contest") throw new Error("contest");
+    expect(c.overlap.length).toBeGreaterThan(0);
+    expect(c.sides.length).toBeGreaterThan(0);
+    expect(c.sides.every((s) => s.seq < esc.seq && s.words.length > 0)).toBe(true);
+    expect(new Set(c.sides.map((s) => s.role))).toEqual(new Set(["owner", "claimant"]));
+    const card = escalationCards(buildBoardGraph(log, esc.seq), [], false, true, log).find((x) => x.kind === "contest")!;
+    const html = renderToStaticMarkup(createElement(EscalationCard, { card, busy: false, onResolve: () => {} }));
+    expect(html).toContain("<dt>Overlap</dt>");
+    expect(html).toContain("<dt>Each side</dt>");
+    expect(html).toContain(`If ${c.owner} keeps it`);
+    expect(html).toContain(`If ${c.claimant} gets it`);
   });
 });
 
