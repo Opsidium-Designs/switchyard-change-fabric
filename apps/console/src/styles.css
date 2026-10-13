@@ -51,8 +51,8 @@
   --talk-proposal-bg: var(--talk-bg);
   --talk-contract: var(--fam-contract);
   --talk-contract-bg: light-dark(#f3eefe, #241a36);
-  --talk-help-ask: light-dark(#0550ae, #58a6ff);
-  --talk-help-ask-bg: light-dark(#ddf4ff, #0c2240);
+  --talk-help-ask: light-dark(#c4450a, #ff8f45);
+  --talk-help-ask-bg: light-dark(#fff1e5, #3a1c08);
   --talk-help-offer: light-dark(#a0306e, #f778ba);
   --talk-help-offer-bg: light-dark(#ffeff7, #3a1029);
   --talk-handoff: light-dark(#8a5a00, #e3b341);
@@ -1548,8 +1548,10 @@ body {
 .mc-node-sub.advisory, .mc-node-chip.advisory { fill: var(--advisory); font-style: italic; }
 
 .mc-caption { animation: mc-fade 3s ease-out forwards; pointer-events: none; }
-.mc-caption rect { fill: var(--surface-2); stroke: var(--info); }
-.mc-caption text { fill: var(--text); font-size: calc(12px * var(--mc-t, 1)); }
+.mc-caption rect { fill: var(--surface-2); stroke: var(--text); stroke-opacity: 0.45; }
+.mc-caption text { fill: var(--text); font-size: calc(10.5px * var(--mc-t, 1)); }
+.mc-caption-leader { stroke: var(--text); stroke-opacity: 0.55; stroke-width: 1.2; stroke-dasharray: 2 2; }
+.mc-caption-dot { fill: var(--text); fill-opacity: 0.7; }
 
 .mc-legend { margin-top: 0.4rem; }
 .ln-contest { border-top-color: var(--bad); border-top-width: 3px; }

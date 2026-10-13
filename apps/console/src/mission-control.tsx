@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import {
   aggregateMessageEdges,
@@ -1393,6 +1393,16 @@ export interface PlacedCaption {
   readonly y: number;
   readonly w: number;
   readonly h: number;
+  /** The sender's point: a leader line runs from the caption to it. */
+  readonly sx: number;
+  readonly sy: number;
+}
+
+/** A caption's short text: who sent it and the message type (the rationale is in the thread). */
+export function captionText(node: string, text: string): string {
+  const who = node.replace(/^agent:/, "");
+  const type = text.split(":")[0]!.trim();
+  return clip(`${who}: ${type}`, 30);
 }
 
 interface Box {
@@ -1421,12 +1431,20 @@ export function placeCaptions(
 ): PlacedCaption[] {
   const taken: Box[] = [...[...layout.items.values()].map((r) => ({ x: r.x, y: r.y, w: r.w, h: HULL_TITLE_H })), ...occupied];
   const placed: PlacedCaption[] = [];
-  const h = 22 * scale;
-  for (const caption of captions.slice(0, 3)) {
+  const h = 17 * scale;
+  // One caption per sender: its newest message, with "+N" for the others that landed with it (a lead posting
+  // several items would otherwise stack identical pills on itself).
+  const perSender = new Map<string, { caption: (typeof captions)[number]; more: number }>();
+  for (const caption of captions) {
+    const seen = perSender.get(caption.node);
+    if (seen) seen.more += 1;
+    else perSender.set(caption.node, { caption, more: 0 });
+  }
+  for (const { caption, more } of [...perSender.values()].slice(0, 3)) {
     const p = points.get(caption.node);
     if (!p) continue;
-    const text = clip(caption.text, 44);
-    const w = Math.max(60, text.length * 7 * scale + 18);
+    const text = `${captionText(caption.node, caption.text)}${more > 0 ? ` +${more}` : ""}`;
+    const w = Math.max(50, text.length * 6 * scale + 14);
     const x = Math.min(Math.max(p.x, bounds.x + w / 2 + 4), bounds.x + bounds.w - w / 2 - 4);
     const above = (i: number) => p.y - 26 * scale - h / 2 - i * (h + 4);
     const candidates = [
@@ -1437,7 +1455,7 @@ export function placeCaptions(
     const box = placeLabel({ w, h }, candidates, taken, { bounds, gap: 3 });
     if (!box) continue;
     taken.push(box);
-    placed.push({ seq: caption.seq, text, x: box.x + box.w / 2, y: box.y, w, h });
+    placed.push({ seq: caption.seq, text, x: box.x + box.w / 2, y: box.y, w, h, sx: p.x, sy: p.y });
   }
   return placed;
 }
@@ -2093,7 +2111,16 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
             <g className="mc-captions">
               {placedCaptions.map((c) => (
                 <g key={c.seq} className="mc-caption">
-                  <rect x={c.x - c.w / 2} y={c.y} width={c.w} height={c.h} rx={6} />
+                  {/* A leader from the caption's nearest edge to its sender, so it is clear who said it. */}
+                  <line
+                    className="mc-caption-leader"
+                    x1={Math.min(Math.max(c.sx, c.x - c.w / 2), c.x + c.w / 2)}
+                    y1={c.sy < c.y ? c.y : c.sy > c.y + c.h ? c.y + c.h : c.y + c.h / 2}
+                    x2={c.sx}
+                    y2={c.sy}
+                  />
+                  <circle className="mc-caption-dot" cx={c.sx} cy={c.sy} r={3.5} />
+                  <rect x={c.x - c.w / 2} y={c.y} width={c.w} height={c.h} rx={c.h / 2} />
                   <text textAnchor="middle" x={c.x} y={c.y + c.h * 0.7}>
                     {c.text}
                   </text>
@@ -2169,7 +2196,7 @@ function nodeBoxes(d: DrawnNode, boost: number): Box[] {
     line(ellipsizeToWidth(det.capability, 180, font), below(17));
     if (det.uses > 0) line(` used x${det.uses}`, below(17) + font * 1.2);
   } else if (det.kind === "goal") {
-    line(clip(det.objective, 44), below(30));
+    line("goal", p.y - (30 + 6));
   } else if (det.kind === "human") {
     line(det.pending.length > 0 ? `human: ${det.pending.length} waiting` : "human", p.y - (19 + 8));
   } else if (det.kind !== "rev" && det.kind !== "jev") {
@@ -2240,8 +2267,10 @@ function NodeLabel({ node, boost = 1 }: { node: BoardGraphNode; boost?: number }
   }
   if (d.kind === "goal") {
     return (
-      <text className="mc-node-label" textAnchor="middle" y={below(30)}>
-        {clip(d.objective, 44)}
+      // Named like the other nodes; the objective is one click away (the node detail) and on hover.
+      <text className="mc-node-label" textAnchor="middle" y={-(30 + 6)}>
+        goal
+        <title>{d.objective}</title>
       </text>
     );
   }
@@ -2502,12 +2531,12 @@ export type ThreadOrder = "newest" | "oldest";
 
 export const THREAD_ORDER_KEY = "switchyard.thread.order";
 
-/** The remembered thread order (newest first by default; storage may be blocked). */
+/** The remembered thread order (oldest first, newest at the bottom like a chat, by default; storage may be blocked). */
 export function readThreadOrder(storage: Pick<Storage, "getItem"> | undefined = threadStorage()): ThreadOrder {
   try {
-    return storage?.getItem(THREAD_ORDER_KEY) === "oldest" ? "oldest" : "newest";
+    return storage?.getItem(THREAD_ORDER_KEY) === "newest" ? "newest" : "oldest";
   } catch {
-    return "newest";
+    return "oldest";
   }
 }
 
@@ -2635,6 +2664,23 @@ export function Thread({
   const bySeq = useMemo(() => new Map((log ?? messages).map((m) => [m.seq, m])), [log, messages]);
   const shown = order === undefined ? messages : [...messages].sort((a, b) => (order === "newest" ? b.seq - a.seq : a.seq - b.seq));
   const inList = new Set(shown.map((m) => m.seq));
+  // Oldest first reads like a chat: keep the newest message in view at the bottom of the pane as messages land
+  // (unless the reader has scrolled up), and jump to the newest end when the order is switched.
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const newestSeq = messages.reduce((max, m) => Math.max(max, m.seq), 0);
+  const lastOrder = useRef(order);
+  useLayoutEffect(() => {
+    const pane = rootRef.current?.closest(".mc-right") as HTMLElement | null | undefined;
+    if (!pane || order === undefined) return;
+    const switched = lastOrder.current !== order;
+    lastOrder.current = order;
+    if (order === "newest") {
+      if (switched) pane.scrollTop = 0;
+      return;
+    }
+    const nearBottom = pane.scrollHeight - pane.scrollTop - pane.clientHeight < 240;
+    if (switched || nearBottom) pane.scrollTop = pane.scrollHeight;
+  }, [order, newestSeq]);
   const row = (m: BoardMessage) => {
     const family = boardMessageFamily(m.type);
     const plain = log ? narrateMessage(m, log, payloadSummary).text : undefined;
@@ -2706,7 +2752,7 @@ export function Thread({
     );
   };
   return (
-    <div className="mc-thread">
+    <div className="mc-thread" ref={rootRef}>
       <div className="mc-thread-head">
         <h3>
           {title} <span className="muted">({messages.length})</span>
@@ -3245,7 +3291,7 @@ export function MissionControl({
     for (const [seq, at] of arrivals.current) {
       if (now - at <= CAPTION_MS && seq <= k) from = Math.min(from, seq - 1);
     }
-    return boardCaptions(log, from, k, new Set(model.nodes.map((n) => n.id)), 3);
+    return boardCaptions(log, from, k, new Set(model.nodes.map((n) => n.id)), 12);
   }, [log, k, now, model]);
 
   // Replay playback.

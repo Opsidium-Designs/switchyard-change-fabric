@@ -583,10 +583,11 @@ describe("captions", () => {
     { seq: 27, node: "agent:ag-3", text: "a fourth is never shown" },
   ];
 
-  it("places at most three, above their senders, clear of hull title bars and of each other", () => {
+  it("places one per sender (its newest, +N for the rest), above the sender, clear of hull title bars and of each other", () => {
     for (const scale of [1, 1.5]) {
       const placed = placeCaptions(captions, points, layout, scale);
-      expect(placed.map((c) => c.seq)).toEqual([31, 30, 28]);
+      expect(placed.map((c) => c.seq)).toEqual([31, 30]);
+      expect(placed.map((c) => c.text)).toEqual(["ag-5: claim.kept +1", "ag-3: claim.kept +1"]);
       const boxes = placed.map((c) => ({ x: c.x - c.w / 2, y: c.y, w: c.w, h: c.h }));
       const bars = [...layout.items.values()].map((r) => ({ x: r.x, y: r.y, w: r.w, h: HULL_TITLE_H }));
       const hit = (a: (typeof boxes)[0], b: (typeof boxes)[0]) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;

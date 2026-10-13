@@ -149,7 +149,7 @@ describe("captions on the graph", () => {
             arrows: communicationArrows(log, k),
           }),
         );
-        const caps = [...html.matchAll(new RegExp(`<g class="mc-caption"><rect ${attrs}`, "g"))].map((m) => rect(m, "caption"));
+        const caps = [...html.matchAll(new RegExp(`<g class="mc-caption">(?:<line[^>]*>(?:</line>)?)?(?:<circle[^>]*>(?:</circle>)?)?<rect ${attrs}`, "g"))].map((m) => rect(m, "caption"));
         placed += caps.length;
         const others = drawnBoxes(html);
         for (const o of others) seen.add(o.what.replace(/ ".*$/, ""));
@@ -215,19 +215,19 @@ describe("the thread", () => {
     expect(order).toEqual([...order].sort((a, b) => a - b));
   });
 
-  it("lists newest first by default, with a toggle, and remembers the choice (storage may be blocked)", () => {
+  it("lists oldest first (newest at the bottom) by default, with a toggle, and remembers the choice (storage may be blocked)", () => {
     const html = renderToStaticMarkup(createElement(MissionControl, { log: sf21, escalations: [], busy: false, onResolve: () => {}, recorded: true, initialSeq: 60 }));
-    expect(html).toContain("Latest board messages (newest first)");
-    expect(html).toMatch(/<span class="mc-thread-order" role="group" aria-label="Thread order"><button type="button" class="is-active" aria-pressed="true">newest first<\/button><button type="button" class="" aria-pressed="false">oldest first<\/button>/);
+    expect(html).toContain("Latest board messages (oldest first)");
+    expect(html).toMatch(/<span class="mc-thread-order" role="group" aria-label="Thread order"><button type="button" class="" aria-pressed="false">newest first<\/button><button type="button" class="is-active" aria-pressed="true">oldest first<\/button>/);
     const ids = [...html.matchAll(/<li id="mc-msg-(\d+)"/g)].map((m) => Number(m[1]));
-    expect(ids[0]).toBe(60);
-    expect(ids).toEqual([...ids].sort((a, b) => b - a));
+    expect(ids.at(-1)).toBe(60);
+    expect(ids).toEqual([...ids].sort((a, b) => a - b));
     const store = new Map<string, string>();
     const storage = { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) };
-    expect(readThreadOrder(storage)).toBe("newest");
-    storeThreadOrder("oldest", storage);
-    expect(store.get(THREAD_ORDER_KEY)).toBe("oldest");
     expect(readThreadOrder(storage)).toBe("oldest");
+    storeThreadOrder("newest", storage);
+    expect(store.get(THREAD_ORDER_KEY)).toBe("newest");
+    expect(readThreadOrder(storage)).toBe("newest");
     const blocked = {
       getItem: () => {
         throw new Error("blocked");
@@ -236,8 +236,8 @@ describe("the thread", () => {
         throw new Error("blocked");
       },
     };
-    expect(readThreadOrder(blocked)).toBe("newest");
-    expect(() => storeThreadOrder("oldest", blocked)).not.toThrow();
+    expect(readThreadOrder(blocked)).toBe("oldest");
+    expect(() => storeThreadOrder("newest", blocked)).not.toThrow();
   });
 });
 
