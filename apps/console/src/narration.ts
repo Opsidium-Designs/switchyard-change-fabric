@@ -224,7 +224,7 @@ export function narrateMessage(message: BoardMessage, log: readonly BoardMessage
     default:
       text = `${from}: ${fallback(message)}`;
   }
-  return { seq: message.seq, type: message.type, text, causes };
+  return { seq: message.seq, type: message.type, text: text.charAt(0).toUpperCase() + text.slice(1), causes };
 }
 
 /** The narration for the message at seq K (the last message at or before K), or null before the first. */

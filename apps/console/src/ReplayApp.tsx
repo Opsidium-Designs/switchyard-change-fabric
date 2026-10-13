@@ -38,6 +38,8 @@ export function ReplayApp() {
   const [startSeq, setStartSeq] = useState<number | null>(initial.seq);
   const [run, setRun] = useState<ReplayRun | null>(null);
   const [runError, setRunError] = useState<string | null>(null);
+  // Where the replay cursor is: null at the end of the log (the final state).
+  const [watching, setWatching] = useState<number | null>(initial.seq);
 
   useEffect(() => {
     let cancelled = false;
@@ -87,6 +89,7 @@ export function ReplayApp() {
   // Keep the URL on the moment being watched, so it can be shared.
   const onSeqChange = useCallback(
     (seq: number | null) => {
+      setWatching(seq);
       if (runId === null) return;
       const next = `${window.location.pathname}${replaySearch(runId, seq)}`;
       if (`${window.location.pathname}${window.location.search}` !== next) window.history.replaceState(null, "", next);
@@ -116,10 +119,12 @@ export function ReplayApp() {
         <ThemeToggle />
       </header>
 
-      <p className="replay-banner" role="status">
-        <strong>{RECORDED_BANNER}</strong> Every node and message below is a recorded board message from a real run; nothing is
-        simulated or re-run.
-      </p>
+      {runId === null ? (
+        <p className="replay-banner" role="status">
+          <strong>{RECORDED_BANNER}</strong> Every node and message below is a recorded board message from a real run; nothing is
+          simulated or re-run.
+        </p>
+      ) : null}
 
       {runId === null ? (
         <RunPicker runs={runs} error={indexError} onOpen={open} />
@@ -132,14 +137,19 @@ export function ReplayApp() {
               </button>
               <h2>{entry?.title ?? runId}</h2>
               {entry ? <span className="replay-app">{entry.app}</span> : null}
+              <span
+                className="replay-recorded-chip"
+                role="status"
+                title="Every node and message below is a recorded board message from a real run; nothing is simulated or re-run."
+              >
+                {RECORDED_BANNER}
+              </span>
+              {run ? <ReadingGuide /> : null}
             </div>
             {run ? (
               <>
-                <p className="replay-goal">
-                  <span className="replay-label">Goal</span> {runGoal(run)}
-                </p>
-                <VerdictPanel verdict={finalVerdict(run)} />
-                <ReadingGuide />
+                <GoalLine goal={runGoal(run)} />
+                {watching === null ? <VerdictPanel verdict={finalVerdict(run)} /> : <VerdictTeaser verdict={finalVerdict(run)} />}
               </>
             ) : null}
             {runError ? <p className="error">{runError}</p> : null}
@@ -183,6 +193,33 @@ export function VerdictPanel({ verdict }: { verdict: FinalVerdict }) {
   );
 }
 
+/** The goal on one line; click to read all of it. */
+function GoalLine({ goal }: { goal: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <p className={`replay-goal${open ? " is-open" : ""}`}>
+      <span className="replay-label">Goal</span>{" "}
+      <button type="button" className="replay-goal-text" aria-expanded={open} onClick={() => setOpen((o) => !o)} title={open ? "show less" : "show the whole goal"}>
+        {goal}
+      </button>
+    </p>
+  );
+}
+
+/**
+ * Before the end of the replay, the final verdict waits behind a click, so the
+ * run is watched as it happened rather than read backwards from its ending.
+ * It is the same recorded verdict, never a projection from the cursor.
+ */
+export function VerdictTeaser({ verdict }: { verdict: FinalVerdict }) {
+  return (
+    <details className={`replay-verdict-teaser is-${verdict.kind}`}>
+      <summary>How this run ended (recorded verdict)</summary>
+      <VerdictPanel verdict={verdict} />
+    </details>
+  );
+}
+
 /** A short legend of how to read mission control, for a first-time viewer. */
 function ReadingGuide() {
   return (
@@ -190,13 +227,15 @@ function ReadingGuide() {
       <summary>How to read this</summary>
       <ul>
         <li>
-          <strong>Board</strong> (left): the work items the lead planned, by state. An agent <em>claims</em> an item before it edits;
-          overlapping claims are <em>contested</em>.
+          <strong>Timeline</strong> (top): the first line says, in plain words, what the message at this point means, and which
+          earlier messages led to it (click a seq to open it). Below it, the run in chapters: planning, building, one fix round per
+          revision, then promotion. Each round ends at its revision&apos;s gate marker, green when the gate passed and red when it
+          failed, with its acceptance count; a marker appears only once the replay reaches it. Play, scrub, or jump to a key moment
+          underneath; the address bar keeps the exact moment as a link.
         </li>
         <li>
-          <strong>Gate</strong> (under the ticker): one marker per integrated revision, green when the gate passed and red when it
-          failed, with its acceptance count, beside a small chart of acceptance over revisions. Hover a marker to see which items
-          that revision merged.
+          <strong>Board</strong> (left): acceptance over revisions, then the work items the lead planned, by state. An agent
+          <em> claims</em> an item before it edits; overlapping claims are <em>contested</em>.
         </li>
         <li>
           <strong>Graph</strong> (middle): each rounded box is an item with the agents working in it; orange squares are tools agents
@@ -205,10 +244,6 @@ function ReadingGuide() {
         </li>
         <li>
           <strong>Thread</strong> (right): the raw board messages. Click any item, agent, or revision to filter to its messages.
-        </li>
-        <li>
-          <strong>Replay</strong> (bottom): play, scrub, or jump to a key moment (claims, contract changes, gate results). The link
-          in the address bar opens this exact moment.
         </li>
       </ul>
     </details>

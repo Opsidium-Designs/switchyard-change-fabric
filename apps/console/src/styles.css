@@ -2295,3 +2295,31 @@ body {
   .mc-chapter-row { flex-wrap: wrap; }
 }
 .mc-charts .mc-chart figcaption { white-space: normal; }
+
+/* --- The compact run header (replay page) --- */
+
+.replay-shell.is-wide .replay-run-head { gap: 0.35rem; padding: 0.55rem 0.9rem; }
+.replay-recorded-chip {
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--violet);
+  border: 1px solid var(--replay-border);
+  border-radius: 999px;
+  padding: 0.1rem 0.6rem;
+}
+.replay-run-title .replay-guide { margin-left: auto; }
+.replay-run-title .replay-guide[open] { flex-basis: 100%; order: 10; margin-left: 0; }
+.replay-goal { margin: 0; display: flex; gap: 0.4rem; align-items: baseline; min-width: 0; }
+.replay-goal .replay-goal-text {
+  all: unset;
+  cursor: pointer;
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.replay-goal.is-open .replay-goal-text { white-space: normal; }
+.replay-goal .replay-goal-text:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.replay-verdict-teaser > summary { cursor: pointer; font-size: 0.85rem; color: var(--accent); }
+.replay-verdict-teaser[open] > summary { margin-bottom: 0.4rem; }
