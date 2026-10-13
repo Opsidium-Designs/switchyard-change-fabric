@@ -45,6 +45,17 @@
   /* The agent-talk overlay: its own teal, apart from every graph edge color. */
   --talk: light-dark(#0a7f86, #39d0d8);
   --talk-bg: light-dark(#e3f6f7, #0f2a2d);
+  /* Agent talk by kind (stroke + label background): proposal teal, contract violet, help blue, handoff amber, conflict red. */
+  --talk-proposal: var(--talk);
+  --talk-proposal-bg: var(--talk-bg);
+  --talk-contract: var(--fam-contract);
+  --talk-contract-bg: light-dark(#f3eefe, #241a36);
+  --talk-help: light-dark(#0550ae, #58a6ff);
+  --talk-help-bg: light-dark(#ddf4ff, #0c2240);
+  --talk-handoff: light-dark(#8a5a00, #e3b341);
+  --talk-handoff-bg: light-dark(#fff8c5, #2e2405);
+  --talk-conflict: var(--bad-text);
+  --talk-conflict-bg: light-dark(#ffebe9, #3a1517);
   /* Message families (ticks and type chips). */
   --fam-goal: var(--accent);
   --fam-item: var(--muted);
@@ -2102,15 +2113,30 @@ body {
 .mc-rev-focus .mc-edge.kind-trigger path { stroke: var(--trigger); stroke-dasharray: 6 4; }
 .mc-hull.is-rev-focus > rect:first-of-type { stroke: var(--accent); stroke-width: 2.4; }
 
-/* --- The agent-talk overlay: curved teal arrows with a verb (an annotation, not a graph edge) --- */
+/* --- The agent-talk overlay: curved arrows with a verb, coloured by kind (an annotation, not a graph edge) --- */
 
+.talk-proposal { --tk: var(--talk-proposal); --tk-bg: var(--talk-proposal-bg); }
+.talk-contract { --tk: var(--talk-contract); --tk-bg: var(--talk-contract-bg); }
+.talk-help { --tk: var(--talk-help); --tk-bg: var(--talk-help-bg); }
+.talk-handoff { --tk: var(--talk-handoff); --tk-bg: var(--talk-handoff-bg); }
+.talk-conflict { --tk: var(--talk-conflict); --tk-bg: var(--talk-conflict-bg); }
 .mc-talk-arrow, .mc-talk-mark { cursor: pointer; transition: opacity 400ms ease; }
-.mc-talk-arrow path { fill: none; stroke: var(--talk); stroke-width: 2.4; stroke-linecap: round; }
+.mc-talk-arrow path { fill: none; stroke: var(--tk, var(--talk)); stroke-width: 2.4; stroke-linecap: round; }
 .mc-talk-arrow.is-new path { stroke-width: 3.2; }
-.mc-talk-head { fill: var(--talk); }
-.mc-talk-arrow rect, .mc-talk-mark rect { fill: var(--talk-bg); stroke: var(--talk); stroke-width: 1; }
-.mc-talk-arrow text, .mc-talk-mark text { fill: var(--talk); font-size: calc(11.5px * var(--mc-t, 1)); font-weight: 700; pointer-events: none; }
-.ln-talk { border-top-color: var(--talk); border-top-width: 3px; border-radius: 3px; }
+/* One marker per kind: its head takes the kind's colour from its own class. */
+.mc-talk-head { fill: var(--tk, var(--talk)); }
+.mc-talk-arrow rect, .mc-talk-mark rect { fill: var(--tk-bg, var(--talk-bg)); stroke: var(--tk, var(--talk)); stroke-width: 1; }
+.mc-talk-mark circle { fill: var(--tk, var(--talk)); }
+.mc-talk-arrow text, .mc-talk-mark text { fill: var(--tk, var(--talk)); font-size: calc(11.5px * var(--mc-t, 1)); font-weight: 700; pointer-events: none; }
+.ln-talk { border-top-color: var(--tk, var(--talk)); border-top-width: 3px; border-radius: 3px; }
+.mc-legend-talk { flex-wrap: wrap; }
+.mc-legend-talk > span { display: inline-flex; align-items: center; gap: 0.3rem; }
+/* Legend swatches are drawn with the graph's own classes; they are pictures, not controls. */
+.mc-legend-svg { flex: none; overflow: visible; pointer-events: none; }
+.mc-legend-svg * { cursor: default; }
+.mc-legend-count { color: var(--muted); font-variant-numeric: tabular-nums; }
+.mc-legend-absent { flex-wrap: wrap; gap: 0.25rem; }
+.mc-legend-absent > span { text-decoration: underline dotted; cursor: help; }
 
 /* --- Advisory decisions (Jev): grey and italic, never a verdict --- */
 

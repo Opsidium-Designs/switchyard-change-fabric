@@ -39,10 +39,55 @@ export interface CommArrow {
   readonly to: string | null;
   /** A 1-3 word verb (`proposes`, `asks help`, `hands off`, ...). */
   readonly verb: string;
+  /** What kind of exchange it is (its colour on the overlay), from the message type. */
+  readonly kind: CommKind;
   /** How many seqs ago it landed (0 = the message at the cursor). */
   readonly age: number;
   /** Hover text: who, what, to whom, and the backing message. */
   readonly tooltip: string;
+}
+
+/** The kinds of agent talk, each drawn in its own colour. */
+export const COMM_KINDS = ["proposal", "contract", "help", "handoff", "conflict"] as const;
+export type CommKind = (typeof COMM_KINDS)[number];
+
+/**
+ * The kind of a talk arrow, from its message type alone: a proposal (items,
+ * tools, and their acceptance or re-plan), a contract exchange, help, a
+ * handoff, or a conflict (a contested or overlapping claim, a predicted
+ * clash). Null for a message type the overlay never draws.
+ */
+export function commKind(type: string): CommKind | null {
+  switch (type) {
+    case "item.proposed":
+    case "tool.proposed":
+    case "item.accepted":
+    case "item.rejected":
+    case "item.replanned":
+      return "proposal";
+    case "contract.proposed":
+    case "contract.accepted":
+    case "contract.rejected":
+    case "contract.escalated":
+      return "contract";
+    case "help.requested":
+    case "help.volunteered":
+    case "help.offered":
+    case "help.delivered":
+    case "help.declined":
+      return "help";
+    case "handoff":
+      return "handoff";
+    case "claim.contested":
+    case "claim.kept":
+    case "claim.ceded":
+    case "claim.narrowed":
+    case "claim.overlap":
+    case "clash.predicted":
+      return "conflict";
+    default:
+      return null;
+  }
 }
 
 /** How many seqs an arrow stays on screen after its message lands. */
@@ -104,10 +149,12 @@ export function communicationArrows(
   for (const m of messages) {
     const add = (fromNode: string, toNodes: readonly string[] | null, verb: string) => {
       if (m.seq <= from) return;
+      const kind = commKind(m.type);
+      if (kind === null) return;
       const targets = toNodes === null ? [] : [...new Set(toNodes)].filter((t) => t !== fromNode);
       const age = k - m.seq;
       if (targets.length === 0) {
-        out.push({ id: `comm:${m.seq}`, seq: m.seq, type: m.type, from: fromNode, to: null, verb, age, tooltip: `${agentId(fromNode)} ${verb} (seq ${m.seq}, ${m.type})` });
+        out.push({ id: `comm:${m.seq}`, seq: m.seq, type: m.type, from: fromNode, to: null, verb, kind, age, tooltip: `${agentId(fromNode)} ${verb} (seq ${m.seq}, ${m.type})` });
         return;
       }
       for (const to of targets) {
@@ -118,6 +165,7 @@ export function communicationArrows(
           from: fromNode,
           to,
           verb,
+          kind,
           age,
           tooltip: `${agentId(fromNode)} ${verb} -> ${agentId(to)} (seq ${m.seq}, ${m.type})`,
         });
@@ -243,7 +291,7 @@ export function commCurve(
   b: { readonly x: number; readonly y: number },
   bend = 0.22,
   inset = 20,
-): { readonly d: string; readonly mid: { readonly x: number; readonly y: number } } {
+): CommCurve {
   const dx = b.x - a.x;
   const dy = b.y - a.y;
   const len = Math.hypot(dx, dy) || 1;
@@ -260,7 +308,207 @@ export function commCurve(
   return {
     d: `M ${r(sx)} ${r(sy)} Q ${r(cx)} ${r(cy)} ${r(ex)} ${r(ey)}`,
     mid: { x: r(0.25 * sx + 0.5 * cx + 0.25 * ex), y: r(0.25 * sy + 0.5 * cy + 0.25 * ey) },
+    start: { x: sx, y: sy },
+    control: { x: cx, y: cy },
+    end: { x: ex, y: ey },
   };
+}
+
+interface XY {
+  readonly x: number;
+  readonly y: number;
+}
+
+/** A drawn talk curve: its path, its midpoint, and the quadratic's three points. */
+export interface CommCurve {
+  readonly d: string;
+  readonly mid: XY;
+  readonly start: XY;
+  readonly control: XY;
+  readonly end: XY;
+}
+
+/** An axis-aligned box in layout units (x, y is its top-left corner). */
+export interface LabelRect {
+  readonly x: number;
+  readonly y: number;
+  readonly w: number;
+  readonly h: number;
+}
+
+/** Where along a talk curve its label may go, in order of preference. */
+export const TALK_LABEL_TS = [0.5, 0.4, 0.6, 0.3, 0.7] as const;
+
+/**
+ * Candidate label centers along a talk curve, in order of preference: on the
+ * curve at each t of TALK_LABEL_TS first, then the same points nudged `offset`
+ * to either side of the curve (along its normal there), then twice as far.
+ */
+export function talkLabelCandidates(curve: CommCurve, offset: number): XY[] {
+  const { start: s, control: c, end: e } = curve;
+  const on: XY[] = [];
+  const off: XY[] = [];
+  const far: XY[] = [];
+  for (const t of TALK_LABEL_TS) {
+    const u = 1 - t;
+    const p = { x: u * u * s.x + 2 * u * t * c.x + t * t * e.x, y: u * u * s.y + 2 * u * t * c.y + t * t * e.y };
+    on.push(p);
+    // The quadratic's tangent at t, and its unit normal.
+    const tx = 2 * u * (c.x - s.x) + 2 * t * (e.x - c.x);
+    const ty = 2 * u * (c.y - s.y) + 2 * t * (e.y - c.y);
+    const len = Math.hypot(tx, ty) || 1;
+    const nx = -ty / len;
+    const ny = tx / len;
+    off.push({ x: p.x + nx * offset, y: p.y + ny * offset }, { x: p.x - nx * offset, y: p.y - ny * offset });
+    far.push({ x: p.x + 2 * nx * offset, y: p.y + 2 * ny * offset }, { x: p.x - 2 * nx * offset, y: p.y - 2 * ny * offset });
+  }
+  const r = (n: number) => Number(n.toFixed(1));
+  return [...on, ...off, ...far].map((q) => ({ x: r(q.x), y: r(q.y) }));
+}
+
+/** True when two boxes share any area (touching edges do not overlap). */
+export function rectsOverlap(a: LabelRect, b: LabelRect): boolean {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+/**
+ * Place a label of `size` at the first candidate center whose box, grown by
+ * `gap` on every side, hits none of the `occupied` boxes and lies inside
+ * `bounds` (when given). Null when every candidate is taken: the caller then
+ * draws no label. Pure: the same inputs always give the same spot.
+ */
+export function placeLabel(
+  size: { readonly w: number; readonly h: number },
+  candidates: readonly XY[],
+  occupied: readonly LabelRect[],
+  options: { readonly bounds?: LabelRect; readonly gap?: number } = {},
+): LabelRect | null {
+  const gap = options.gap ?? 2;
+  const b = options.bounds;
+  for (const c of candidates) {
+    const box = { x: c.x - size.w / 2, y: c.y - size.h / 2, w: size.w, h: size.h };
+    if (b && (box.x < b.x || box.y < b.y || box.x + box.w > b.x + b.w || box.y + box.h > b.y + b.h)) continue;
+    const padded = { x: box.x - gap, y: box.y - gap, w: box.w + 2 * gap, h: box.h + 2 * gap };
+    if (occupied.some((o) => rectsOverlap(padded, o))) continue;
+    return box;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Open fix requests of the latest revision
+// ---------------------------------------------------------------------------
+
+/**
+ * The "fix asked" lines drawn without a revision focused: the recorded
+ * rev -> item trigger edges (each backed by its fix.requested message) of the
+ * LATEST integrated revision at K, keeping only the requests still open. A
+ * push for the item after the request answers it; a later revision replaces
+ * the whole set (it is then the latest); a passing latest revision draws
+ * none. Null when nothing is open. Pure: read from the model and the log.
+ */
+export function outstandingFixLinks(
+  model: BoardGraphModel,
+  log: readonly BoardMessage[],
+): { readonly rev: BoardGraphModel["nodes"][number]; readonly edges: readonly BoardGraphEdge[] } | null {
+  let latest: BoardGraphModel["nodes"][number] | undefined;
+  for (const node of model.nodes) {
+    if (node.detail.kind !== "rev") continue;
+    if (!latest || (latest.detail.kind === "rev" && node.detail.n > latest.detail.n)) latest = node;
+  }
+  if (!latest || latest.detail.kind !== "rev") return null;
+  if (latest.detail.gated && latest.detail.gate === "pass") return null;
+  const pushes = boardPrefix(log, model.k).filter((m) => m.type === "push.announced");
+  const edges = model.edges.filter((e) => {
+    if (e.kind !== "trigger" || e.from !== latest!.id || e.type !== "fix.requested" || !e.to.startsWith("item:")) return false;
+    const item = e.to.slice("item:".length);
+    const asked = e.seqs[0]!;
+    return !pushes.some((m) => m.seq > asked && m.type === "push.announced" && m.payload.item === item);
+  });
+  return edges.length > 0 ? { rev: latest, edges } : null;
+}
+
+// ---------------------------------------------------------------------------
+// The on-screen legend
+// ---------------------------------------------------------------------------
+
+/** How a drawn line looks: a graph edge kind, split by its style (fork, merged, escalated contest). */
+export type EdgeVariant = "dependency" | "fork" | "merged" | "trigger" | "consumed-tool" | "contest" | "contest-escalated" | "message";
+export const EDGE_VARIANTS: readonly EdgeVariant[] = ["dependency", "fork", "merged", "trigger", "consumed-tool", "contest", "contest-escalated", "message"];
+
+/** The style variant a graph edge is drawn in (null for `spawn`, which the board graph never emits). */
+export function edgeVariant(edge: BoardGraphEdge): EdgeVariant | null {
+  switch (edge.kind) {
+    case "dependency":
+      return edge.label === "fork" ? "fork" : edge.label === "merged" ? "merged" : "dependency";
+    case "contest":
+      return edge.contest === "escalated" ? "contest-escalated" : "contest";
+    case "trigger":
+    case "consumed-tool":
+    case "message":
+      return edge.kind;
+    default:
+      return null;
+  }
+}
+
+/** A legend key: an edge variant, or a talk kind (`talk-help`, ...). */
+export type LegendKey = EdgeVariant | `talk-${CommKind}`;
+
+export interface LegendEntry {
+  readonly key: LegendKey;
+  /** What the line means, shown beside its swatch when it is on screen. */
+  readonly label: string;
+  /** Its short name in the "not on screen now" line. */
+  readonly name: string;
+  /** When it appears (the hover title of an absent entry). */
+  readonly hint: string;
+  /** How many are drawn now. */
+  readonly count: number;
+}
+
+const LEGEND_TEXT: Readonly<Record<LegendKey, { readonly label: string; readonly name: string; readonly hint: string }>> = {
+  dependency: {
+    label: "dependency: goal or parent item -> item (proposed, split); item -> the revision that merged it; revision -> next revision",
+    name: "dependency",
+    hint: "goal links: select an item; revision links: hover a revision on the gate timeline",
+  },
+  fork: { label: "fork: a helper forked the requester's repo to help", name: "fork", hint: "fork: a helper copies a requester's repo" },
+  merged: { label: "merged: a sub-lead merged a child item's push into its split item", name: "merged", hint: "merged: a sub-lead merges a child item (a large board nests children inside their parent instead)" },
+  trigger: {
+    label: "trigger: fix asked by a failing revision, an item waiting on a human, a tool's build published, a tool's findings filed as an item",
+    name: "trigger",
+    hint: "fix asked: open fix requests of the latest failing revision; also escalations to a human and tools",
+  },
+  "consumed-tool": { label: "consumed tool: an agent used a published tool", name: "consumed tool", hint: "consumed tool: an agent uses a published tool" },
+  contest: { label: "contest: two agents claim the same file (until resolved)", name: "contest", hint: "contest: two agents claim the same file" },
+  "contest-escalated": { label: "escalated contest: waiting on a human (pulsing)", name: "escalated contest", hint: "escalated contest: a contest handed to a human" },
+  message: { label: "message: an addressed message (messages toggle: as they land, or all)", name: "message", hint: "message: turn messages on (as they land, or all)" },
+  "talk-proposal": { label: "proposal", name: "talk: proposal", hint: "talk: an item or tool proposed, accepted, rejected, or re-planned (talk on)" },
+  "talk-contract": { label: "contract", name: "talk: contract", hint: "talk: a contract proposed, decided, or escalated (talk on)" },
+  "talk-help": { label: "help", name: "talk: help", hint: "talk: help asked, volunteered, offered, delivered, or declined (talk on)" },
+  "talk-handoff": { label: "handoff", name: "talk: handoff", hint: "talk: an item handed to another agent (talk on)" },
+  "talk-conflict": { label: "conflict", name: "talk: conflict", hint: "talk: a claim contested, kept, ceded, narrowed, overlapping, or a predicted clash (talk on)" },
+};
+
+/**
+ * The legend for what is drawn now: one entry per edge variant and talk kind
+ * on screen (with its count), and the ones not on screen (with when they
+ * appear). Pure: a function of the drawn edges and talk arrows only.
+ */
+export function drawnLegend(
+  edges: readonly BoardGraphEdge[],
+  arrows: readonly Pick<CommArrow, "kind">[],
+): { readonly present: readonly LegendEntry[]; readonly absent: readonly LegendEntry[] } {
+  const counts = new Map<LegendKey, number>();
+  for (const e of edges) {
+    const v = edgeVariant(e);
+    if (v !== null) counts.set(v, (counts.get(v) ?? 0) + 1);
+  }
+  for (const a of arrows) counts.set(`talk-${a.kind}`, (counts.get(`talk-${a.kind}`) ?? 0) + 1);
+  const keys: LegendKey[] = [...EDGE_VARIANTS, ...COMM_KINDS.map((k): LegendKey => `talk-${k}`)];
+  const entries = keys.map((key): LegendEntry => ({ key, ...LEGEND_TEXT[key], count: counts.get(key) ?? 0 }));
+  return { present: entries.filter((e) => e.count > 0), absent: entries.filter((e) => e.count === 0) };
 }
 
 // ---------------------------------------------------------------------------

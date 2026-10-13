@@ -30,6 +30,7 @@ import {
   domainPrefix,
   isLargeBoard,
   laneCaption,
+  LANE_HEAD,
   scaledBoardLayout,
   scaledNodePoint,
   scopeDirectory,
@@ -260,6 +261,30 @@ describe("mission control at scale", () => {
         expect(dots).toBeLessThan(model.nodes.filter((n) => n.kind === "agent").length - idle.length - left.length + 1);
       }
     }
+  });
+
+  it("keeps every talk label clear of hull titles, lane heads, the bench chip, and the other talk labels", () => {
+    type R = { x: number; y: number; w: number; h: number };
+    const rect = (m: RegExpMatchArray): R => ({ x: Number(m[1]), y: Number(m[2]), w: Number(m[3]), h: Number(m[4]) });
+    const hit = (a: R, b: R) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+    const num = "(-?[\\d.e-]+)";
+    const attrs = `x="${num}" y="${num}" width="${num}" height="${num}"`;
+    let pillsSeen = 0;
+    for (const log of [log30, log100]) {
+      const n = last(log);
+      for (let k = 20; k <= n; k += Math.max(1, Math.floor(n / 40))) {
+        const html = render(log, { initialSeq: k });
+        const pills = [...html.matchAll(new RegExp(`<g class="mc-talk-(?:arrow|mark)[^>]*>(?:<path[^>]*></path>)?<rect ${attrs}`, "g"))].map(rect);
+        const bars = [...html.matchAll(new RegExp(`<rect class="mc-hull-bar" ${attrs}`, "g"))].map(rect);
+        const lanes = [...html.matchAll(new RegExp(`<g class="mc-lane"><rect ${attrs}`, "g"))].map((m) => ({ ...rect(m), h: LANE_HEAD }));
+        const chip = [...html.matchAll(new RegExp(`<g class="mc-bench-chip[^>]*><rect ${attrs}`, "g"))].map(rect);
+        pillsSeen += pills.length;
+        for (const [i, p] of pills.entries()) {
+          for (const o of [...bars, ...lanes, ...chip, ...pills.slice(i + 1)]) expect(hit(p, o), `seq ${k}: a talk label overlaps ${JSON.stringify(o)}`).toBe(false);
+        }
+      }
+    }
+    expect(pillsSeen).toBeGreaterThan(0);
   });
 
   it("draws the bench chip with its counts and never a hundred bench dots at the end of the run", () => {
