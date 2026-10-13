@@ -124,7 +124,12 @@ compact JSON). `DRY_RUN=1` prints the plan and writes nothing.
 - Previews are advisory and visual: they change nothing about the recorded run.
   Their URLs are public `workers.dev` URLs and go away with the Worker
   (`make delete-app APP=<app>`, or `wrangler delete`).
-- Re-exporting a run writes a fresh snapshot: backfill after the export.
+- Re-exporting a run writes a fresh snapshot from the Worker. A live run's
+  recorded previews are kept (only well-formed https `workers.dev` URLs; the
+  production deployment record is still dropped), but backfilled ones exist
+  only in the file: backfill again after a re-export.
+- The console shows a preview link only when its commit is the commit the log
+  recorded for that revision; anything else is ignored.
 
 ## Deploy it
 
