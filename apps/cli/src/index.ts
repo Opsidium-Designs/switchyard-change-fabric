@@ -16,7 +16,8 @@
  *   promote <change.yaml>  run a Change and promote the result into local Git
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -97,6 +98,15 @@ import {
   runJevSmoke,
   runToolSmoke,
   formatToolSmokeBuild,
+  checkoutIntegratedCommit,
+  commitExists,
+  locateAppInTree,
+  parsePreviewAliasUrl,
+  parsePreviewReplay,
+  previewReplayPlan,
+  serializePreviewReplay,
+  withBackfilledPreviews,
+  type RevisionPreview,
 } from "@switchyard-change/orchestration";
 import { DEFAULT_JEV_MODEL, describeRetryAfter, DiscoveringExecutor, isQuotaExhaustedError, parseInferenceMode, probeCli } from "@switchyard-change/model-adapters";
 
@@ -943,7 +953,7 @@ const commands: Command[] = [
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
       `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate]] [--worker <url>] [--min N] [--max N] [--id <changeId>] ` +
-      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--rate-limit-window-ms N] [--inference gateway|claude-cli|codex-cli] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--deploy-app <app dir> [--deploy-app-name <worker>] [--preview-revisions]] [--rate-limit-window-ms N] [--inference gateway|claude-cli|codex-cli] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const goal = await resolveGoal(args);
@@ -1013,6 +1023,18 @@ const commands: Command[] = [
       const integratorFlag = optionValue(args, "--integrator") ?? "local";
       if (integratorFlag !== "local" && integratorFlag !== "cloud") {
         console.error("Error: --integrator must be local or cloud");
+        return 1;
+      }
+      // Revision previews (opt-in, advisory): each integrated revision's app is
+      // uploaded as a Worker VERSION under a preview alias (never a production
+      // deploy). They need the app being deployed (--deploy-app) and a live run.
+      const previewRevisions = hasFlag(args, "--preview-revisions");
+      if (previewRevisions && hasFlag(args, "--offline")) {
+        console.error("Error: --preview-revisions uploads Worker versions to Cloudflare; the offline board run never does");
+        return 1;
+      }
+      if (previewRevisions && optionValue(args, "--deploy-app") === undefined) {
+        console.error("Error: --preview-revisions needs --deploy-app <app dir> (the app whose Worker the previews are versions of)");
         return 1;
       }
       if (integratorFlag === "cloud" && hasFlag(args, "--offline")) {
@@ -1240,6 +1262,11 @@ const commands: Command[] = [
               (speculate ?? DEFAULT_SPECULATE) > 1 ? `up to ${speculate ?? DEFAULT_SPECULATE} prefix candidates per round` : "off"
             })`,
       );
+      if (previewRevisions) {
+        console.log(
+          `  revision previews: ON (each integrated revision, failing ones included, is uploaded as a version of ${deployAppName} under a preview alias; never a production deploy; advisory)`,
+        );
+      }
       console.log(
         prePushTypecheck
           ? "  pre-push typecheck: ON (an edit whose changed files gain type errors is refused before it is pushed)"
@@ -1296,10 +1323,19 @@ const commands: Command[] = [
         ...(deployAppBase
           ? { appAlreadyDeployed: async () => (await readAppDeployment(repoRoot(), deployAppBase))?.url }
           : {}),
+        ...(previewRevisions && deployAppDir
+          ? { previewRevision: async ({ appDir, alias }: { readonly appDir: string; readonly alias: string }) => ({ url: await wranglerVersionsUpload(appDir, alias) }) }
+          : {}),
         onEvent: (event) => {
           switch (event.kind) {
             case "change-created":
               console.log(`Change ${event.changeId} created.`);
+              break;
+            case "revision-previewed":
+              console.log(`  preview r${event.n}: ${event.url}${event.unrecorded !== undefined ? ` (not recorded on the Worker: ${redactSecrets(event.unrecorded)})` : ""}`);
+              break;
+            case "revision-preview-skipped":
+              console.log(redactSecrets(`  no preview for revision ${event.n}: ${event.reason}`));
               break;
             case "budgets":
               console.log(`  ${formatBudgetsLine(event)}`);
@@ -1401,6 +1437,98 @@ const commands: Command[] = [
       );
       // Non-zero unless a gate ran and passed, every item completed, and it was promoted (130 when interrupted).
       return interruptedExitCode(result, boardRunExitCode(result, { requirePromotion: true }));
+    },
+  },
+  {
+    name: "preview-replay",
+    summary: "Backfill revision previews for a recorded run: upload each integrated revision's app as a Worker version under a preview alias.",
+    usage: `${CLI_NAME} preview-replay --replay <replay.json> --repo <integration git dir> --app <app name under examples/apps> [--dry-run]`,
+    async run(args) {
+      // ADVISORY backfill: every recorded integrated revision (failing ones
+      // included) whose commit is still in the run's integration repo is
+      // uploaded as a Worker VERSION of the app's stable worker under a preview
+      // alias (never a production deploy), and the results are written into
+      // the replay's snapshot marked backfilled. --dry-run plans only.
+      const replayPath = optionValue(args, "--replay");
+      const repo = optionValue(args, "--repo");
+      const app = optionValue(args, "--app");
+      const dryRun = hasFlag(args, "--dry-run");
+      if (!replayPath || !repo || !app) {
+        console.error(`Usage: ${CLI_NAME} preview-replay --replay <replay.json> --repo <integration git dir> --app <app name> [--dry-run]`);
+        return 1;
+      }
+      if (!/^[a-z0-9][a-z0-9-]*$/.test(app)) {
+        console.error("Error: --app must be an app directory name under examples/apps (lowercase letters, digits, dashes)");
+        return 1;
+      }
+      const worker = stableAppWorkerName(app);
+      let replay;
+      try {
+        replay = parsePreviewReplay(await readFile(resolve(replayPath), "utf8"));
+      } catch (error) {
+        console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+        return 1;
+      }
+      const plan = previewReplayPlan(replay, worker);
+      console.log(`Preview backfill for ${replay.changeId}: ${plan.length} integrated revision(s), worker ${worker}${dryRun ? " (dry run: nothing is uploaded or written)" : ""}`);
+      if (plan.length === 0) {
+        console.log("  nothing to preview: the replay records no integrated revision");
+        return 0;
+      }
+      const repoDir = resolve(repo);
+      const done: RevisionPreview[] = [];
+      let failed = 0;
+      for (const step of plan) {
+        const label = `  r${step.n} ${step.commit.slice(0, 12)} alias ${step.alias}`;
+        if (!(await commitExists(repoDir, step.commit))) {
+          console.log(`${label}: SKIP, the commit is not in ${repoDir} (a failing revision's tree is kept only by runs with revision previews on)`);
+          failed += 1;
+          continue;
+        }
+        let appRel: string;
+        try {
+          appRel = await locateAppInTree(repoDir, step.commit, worker);
+        } catch (error) {
+          console.log(`${label}: SKIP, ${error instanceof Error ? error.message : String(error)}`);
+          failed += 1;
+          continue;
+        }
+        const where = appRel === "" ? "the tree root" : appRel;
+        if (dryRun) {
+          console.log(`${label}: would upload the app at ${where} as a version of ${worker}`);
+          continue;
+        }
+        const tmp = await mkdtemp(join(tmpdir(), "scf-preview-replay-"));
+        try {
+          const tree = join(tmp, "tree");
+          await checkoutIntegratedCommit({ remote: repoDir, commit: step.commit, targetDir: tree });
+          const url = await wranglerVersionsUpload(appRel === "" ? tree : join(tree, appRel), step.alias);
+          done.push({ n: step.n, commit: step.commit, url, alias: step.alias, at: new Date().toISOString(), backfilled: true });
+          console.log(`${label}: ${url}`);
+        } catch (error) {
+          failed += 1;
+          console.log(
+            redactSecrets(
+              `${label}: upload FAILED, nothing written for this revision: ${error instanceof Error ? error.message : String(error)}\n` +
+                `    (if the Worker ${worker} does not exist yet, deploy the baseline once first: make deploy-app APP=${app}, or wrangler deploy in examples/apps/${app})`,
+            ),
+          );
+        } finally {
+          await rm(tmp, { recursive: true, force: true });
+        }
+      }
+      if (dryRun) {
+        console.log(`Dry run: ${plan.length - failed} of ${plan.length} revision(s) would be uploaded; nothing was written.`);
+        return 0;
+      }
+      if (done.length > 0) {
+        await writeFile(resolve(replayPath), serializePreviewReplay(withBackfilledPreviews(replay, done)));
+        console.log(`Wrote ${done.length} backfilled preview(s) into ${replayPath} (snapshot.previews).`);
+        console.log("  Preview URLs are public workers.dev URLs; they go away with the Worker (wrangler delete).");
+      } else {
+        console.log("No preview was uploaded; the replay file is unchanged.");
+      }
+      return failed > 0 ? 1 : 0;
     },
   },
   {
@@ -1932,6 +2060,35 @@ async function wranglerDeploy(appDir: string): Promise<string> {
   return match[0];
 }
 
+/**
+ * Upload an app directory as a Worker VERSION under a preview alias (`wrangler
+ * versions upload --preview-alias`): never deployed to the Worker's production
+ * URL. Returns the alias URL wrangler prints. Used for the advisory revision
+ * previews; offline runs and tests inject a fake uploader, so `make check`
+ * never calls the network. A failure (for example a Worker that does not exist
+ * yet) throws with wrangler's own error text.
+ */
+async function wranglerVersionsUpload(appDir: string, alias: string): Promise<string> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const run = promisify(execFile);
+  const [cmd, cmdArgs] = await wranglerCommand(["versions", "upload", "--preview-alias", alias, "--message", `switchyard revision preview ${alias}`]);
+  let text: string;
+  try {
+    const { stdout, stderr } = await run(cmd, cmdArgs, { cwd: appDir, env: wranglerEnv(), maxBuffer: 4 * 1024 * 1024 });
+    text = `${stdout}\n${stderr}`;
+  } catch (error) {
+    const out = error as { stdout?: string; stderr?: string; message?: string };
+    const detail = `${out.stderr ?? ""}\n${out.stdout ?? ""}`.trim() || out.message || String(error);
+    throw new Error(`wrangler versions upload failed: ${detail.split("\n").slice(-12).join("\n")}`);
+  }
+  const url = parsePreviewAliasUrl(text, alias);
+  if (url === undefined) {
+    throw new Error(`wrangler versions upload did not print a preview alias URL for ${alias}`);
+  }
+  return url;
+}
+
 /** wrangler's environment: ours plus exactly the Cloudflare credentials it needs. */
 function wranglerEnv(): NodeJS.ProcessEnv {
   const env = runtimeEnv();
@@ -1998,7 +2155,7 @@ async function preflightInference(): Promise<boolean> {
 }
 
 /** The commands that read `.env`: they talk to the live Worker, Cloudflare, or the AI Gateway. */
-const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "tool-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "cleanup-live"]);
+const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "tool-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "cleanup-live", "preview-replay"]);
 
 /**
  * Load the repo's `.env` (or SCF_ENV_FILE) into memory, never into this

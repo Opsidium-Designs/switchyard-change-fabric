@@ -1041,7 +1041,7 @@ is distributed changes: items are proposed and claimed, never assigned.
   (`/proc/<pid>/environ`), so a gate or tool child could read its parent's. No
   Makefile target exports `.env` into the CLI any more: the live commands
   (`run-live`, `run-board` without `--offline`, `recruit-live`, `doctor`,
-  `jev-smoke`, `tool-smoke`, `deploy-app`, `cleanup-live`, `env-check`) read `.env` (or
+  `jev-smoke`, `tool-smoke`, `deploy-app`, `cleanup-live`, `preview-replay`, `env-check`) read `.env` (or
   `SCF_ENV_FILE`) themselves into memory, and the offline commands never read
   it (`packages/orchestration/src/credentials.ts`,
   a small parser, no dependency), and the code that needs a credential reads it
@@ -2489,6 +2489,50 @@ log; see the test-contract rules above): never part of the proof. The CLI prints
 summary and writes the JSON to `--proof-out`, or `proof-bundle.json` in a kept
 work root (a live run's, or `--keep-work-root`); the console's PROOF tab
 renders it from the log alone, so a recorded run shows it too.
+
+### Revision previews (`--preview-revisions`)
+
+A revision preview is the running app at exactly one integrated revision. With
+`--preview-revisions` (live `run-board` only, off by default, and only together
+with `--deploy-app <app dir>`), every recorded `integrated.rev` is uploaded as a
+Cloudflare Worker VERSION of the app's stable worker under a preview alias
+(`wrangler versions upload --preview-alias <tag>-r<n>`, the tag being the last
+part of the Change id, for example `sf21-r3`). A version is not a deployment:
+the Worker's production URL keeps serving what it served before, and each
+preview has its own alias URL
+(`https://<alias>-<worker>.<subdomain>.workers.dev`).
+
+Previews of FAILING revisions are intentional: a viewer can open the app as it
+was when the gate failed and see the failure for themselves. To make that
+possible the run keeps each failing revision's gated commit on the integration
+repo under its candidate ref (`refs/switchyard/gated/<commit>`, never the
+branch); without previews a failing commit is not kept, as before. This is the
+local integrator's: with `--integrator cloud` the Workflow does not keep
+failing commits, so only passing revisions get previews there (each failing
+one is reported skipped).
+
+Previews are ADVISORY and visual only. They never gate, never change a verdict,
+a promotion, or a redeploy, and never block the run loop: the tree of each
+revision is checked out as soon as it is recorded, and uploads run one at a
+time on a queue off the integrator's path. An upload that fails (for example a
+Worker that does not exist yet: deploy the baseline once first with
+`make deploy-app APP=<app>`) is reported (`revision-preview-skipped`) and that
+revision simply has no preview. At the end the run waits for the queue for at
+most 120 s before cleanup; what did not finish is reported and not recorded.
+
+Each finished preview is recorded on the Worker with
+`POST /changes/:id/previews` `{n, commit, url, alias, at, backfilled?}` (the
+same bearer auth as every mutation; `n` a positive integer, `commit` 7 to 64
+hex, `alias` `[a-z0-9-]{1,40}`, `url` https on a `.workers.dev` host) and
+appears on the ChangeState snapshot as `previews`, one per revision (a later
+write for the same `n` replaces), sorted by `n`, at most 200. Re-creating the
+Change id resets them, like the deployment. The run summary lists them
+(`preview r3: <url>`). A preview uploaded after the run from recorded commits
+(see the replay page's backfill) carries `backfilled: true`.
+
+Preview URLs are public `workers.dev` URLs: anyone with the URL can open them.
+They live as long as the Worker: deleting it (`make delete-app APP=<app>`, or
+`wrangler delete`) removes every version and preview alias with it.
 
 ### Cost and time caps (demo safety)
 
