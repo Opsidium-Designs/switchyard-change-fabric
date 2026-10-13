@@ -163,6 +163,7 @@ import {
   type GatedUnitInput,
 } from "./run-live.ts";
 import { withWorkerAuth } from "./worker-auth.ts";
+import { checkoutIntegratedCommit, createRevisionPreviewer, type PreviewUploader, type RevisionPreview, type RevisionPreviewEvent, type RevisionPreviewer } from "./revision-preview.ts";
 
 
 /** An advisory typed decision and its outcome, as recorded on the board. */
@@ -305,6 +306,8 @@ export type BoardRunEvent =
   | { readonly kind: "clashes-predicted"; readonly pairs: number; readonly recorded: number; readonly conflicts: number }
   /** The operator forked a requester's repo for the helper of a help request. */
   | { readonly kind: "help-forked"; readonly request: string; readonly helper: string; readonly forkOf: string; readonly workspace: string }
+  /** An integrated revision's app was uploaded as a Worker version under a preview alias (advisory), or not and why. */
+  | RevisionPreviewEvent
   | FullLiveEvent;
 
 /** The effective budgets of a board run (scaled with the plan unless explicit). */
@@ -633,6 +636,16 @@ export interface RunBoardOptions {
   readonly deployAppName?: string;
   readonly deployApp?: DeployApp;
   readonly appAlreadyDeployed?: (input: { readonly appName: string }) => Promise<string | undefined>;
+  /**
+   * Upload each integrated revision's app (failing ones included) as a Worker
+   * VERSION under a preview alias (never a production deploy), on a serial
+   * queue off the integrator's path. ADVISORY and visual only: it never gates,
+   * never changes a verdict, and a failure is reported, never thrown. Active
+   * only with `deployAppDir` and `deployAppName`.
+   */
+  readonly previewRevision?: PreviewUploader;
+  /** How long the run waits at its end for queued previews, in ms (default 120 s). */
+  readonly previewDrainMs?: number;
   /** Leave the agents' repos in place at the end. */
   readonly skipCleanup?: boolean;
   /** Concurrent schedule: how often the driver checks the board (default 500 ms). */
@@ -753,6 +766,8 @@ export interface RunBoardResult {
   readonly receipt?: PromotionReceiptRecord;
   readonly sourceRepoDir?: string;
   readonly deployment?: { readonly url: string; readonly app: string };
+  /** The revision previews uploaded (advisory; set when previews were on), one per revision, sorted by n. */
+  readonly previews?: readonly RevisionPreview[];
   readonly workRoot: string;
   /** The run's whole scratch directory when it is wider than `workRoot` (the offline run's control repos too). */
   readonly scratchRoot?: string;
@@ -803,6 +818,12 @@ export interface BoardAgentRepo {
 /** Inputs to one integration of the board's announced pushes. */
 export interface IntegrateBoardOptions {
   readonly operator: BoardOperatorClient;
+  /**
+   * Keep a failing revision's gated commit on the integration repo (a
+   * candidate ref, never the branch) so its tree can be previewed (advisory;
+   * set when revision previews are on).
+   */
+  readonly keepFailedCommits?: boolean;
   readonly change: Pick<Change, "id" | "objective">;
   readonly agentRepos: ReadonlyMap<string, BoardAgentRepo>;
   /**
@@ -1495,6 +1516,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
       // only after the board recorded this one (below).
       ...(state.integrated ? { integrationBaseCommit: state.integrated.commit } : {}),
       deferIntegrationPush: true,
+      ...(options.keepFailedCommits ? { keepFailedGatedCommit: true } : {}),
       workRoot: options.worktreeRoot,
       identity: options.identity,
       ...(options.signal ? { signal: options.signal } : {}),
@@ -2648,6 +2670,59 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       },
     });
 
+  // ADVISORY revision previews: each recorded revision's app tree (fail and
+  // pass) is uploaded as a Worker version under a preview alias, one at a time,
+  // off the integrator's path. Never a gate; failures are reported only.
+  const previewer: RevisionPreviewer | undefined =
+    options.previewRevision && options.deployAppDir && options.deployAppName
+      ? createRevisionPreviewer({
+          changeId,
+          appName: options.deployAppName,
+          projectDir: options.projectDir,
+          deployAppDir: options.deployAppDir,
+          workRoot,
+          upload: options.previewRevision,
+          scrub,
+          materialise: async (commit, targetDir) => {
+            // The cloud integration repo is read with a fresh short-lived token (sent as a header, never stored).
+            const token = cloudWorkspace ? await integrationRepoToken({ fetchFn: rawFetch, base, changeId, scope: "read", ttlSeconds: 600 }) : undefined;
+            if (token) {
+              secrets.add(token.token);
+            }
+            try {
+              await checkoutIntegratedCommit({
+                remote: authenticatedRemote(integration.integrationRef.gitUrl, token?.token ?? integration.integrationToken),
+                commit,
+                targetDir,
+              });
+            } finally {
+              await token?.revoke().catch(() => undefined);
+            }
+          },
+          record: async (preview) => {
+            const res = await withWorkerAuth(rawFetch)(`${base}/changes/${encodeURIComponent(changeId)}/previews`, {
+              method: "POST",
+              headers: { "content-type": "application/json" },
+              body: JSON.stringify(preview),
+            });
+            if (res.status >= 400) {
+              throw new Error(`the Worker refused the preview (HTTP ${res.status})`);
+            }
+          },
+          emit,
+        })
+      : undefined;
+  let previews: RevisionPreview[] | undefined;
+  const drainPreviews = async (): Promise<void> => {
+    if (previewer && previews === undefined) {
+      previews = await previewer.drain(options.previewDrainMs ?? 120_000);
+    }
+  };
+  const onRevision = (revision: BoardRevision): void => {
+    emit({ kind: "integrated", revision });
+    previewer?.enqueue(revision.n, revision.commit);
+  };
+
   const integrator: BoardIntegratorLike = cloud
     ? new CloudBoardIntegrator({
         fetchFn: rawFetch,
@@ -2658,7 +2733,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         scrub,
         ...(options.pollMs !== undefined ? { pollMs: Math.max(options.pollMs, 250) } : {}),
         ...(options.cloudSettleTimeoutMs !== undefined ? { settleTimeoutMs: options.cloudSettleTimeoutMs } : {}),
-        onRevision: (revision) => emit({ kind: "integrated", revision }),
+        onRevision,
         onFailure: (reason) => emit({ kind: "integration-not-recorded", reason }),
         ...(jev
           ? {
@@ -2692,11 +2767,13 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     contract: guarded,
     ...(inventory ? { testInventory: inventory } : {}),
     onSettled: revokeReadTokens,
+    // Revision previews read each failing revision's tree back (advisory).
+    ...(previewer ? { keepFailedCommits: true } : {}),
     ...(jev ? { jev } : {}),
     ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
     scrub,
     recordDecision,
-    onRevision: (revision) => emit({ kind: "integrated", revision }),
+    onRevision,
     onFailure: (reason) => emit({ kind: "integration-not-recorded", reason }),
     onClashes: (c) => emit({ kind: "clashes-predicted", pairs: c.pairs, recorded: c.recorded, conflicts: c.conflicts }),
     ...(options.candidateConcurrency !== undefined ? { candidateConcurrency: options.candidateConcurrency } : {}),
@@ -3342,6 +3419,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           fetchFn: rawFetch,
         }).catch(() => false);
       }
+      await drainPreviews();
       await cleanupRepos();
       await toolBench.dispose();
     }
@@ -3623,6 +3701,8 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
       await agent.leave("the run is over").catch(() => undefined);
     }
   } finally {
+    // Queued revision previews finish (bounded) before the repos they read go away.
+    await drainPreviews();
     await cleanupRepos();
     // The bench's private root (tool checkouts, the baseline copy, scratch) is not part of any work root.
     await toolBench.dispose();
@@ -3669,6 +3749,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     ...(receipt ? { receipt } : {}),
     ...(sourceRepoDir ? { sourceRepoDir } : {}),
     ...(deployment ? { deployment } : {}),
+    ...(previews !== undefined ? { previews } : {}),
     workRoot,
     cleanedUp,
     toolGates: [...toolBench.gates],
@@ -4516,6 +4597,17 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
   }
   if (result.deployment) {
     lines.push(`  redeployed: ${result.deployment.url}`);
+  }
+  if (result.previews !== undefined) {
+    // Advisory: a Worker version per revision (failing ones included), never a deploy and never a verdict.
+    const previewed = new Set(result.previews.map((p) => p.n));
+    for (const preview of result.previews) {
+      lines.push(`  preview r${preview.n}: ${preview.url}`);
+    }
+    const missing = result.revisions.filter((r) => !previewed.has(r.n)).map((r) => r.n);
+    if (missing.length > 0) {
+      lines.push(`  no preview for revision(s) ${missing.join(", ")} (advisory; see the run's preview events)`);
+    }
   }
   return lines.join("\n");
 }

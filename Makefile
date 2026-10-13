@@ -26,6 +26,7 @@
 #   make deploy-app APP=service-api  deploy an example web app to a live workers.dev URL
 #   make delete-app APP=service-api  tear that deployed example app down (stop billing)
 #   make export-replay ID=<changeId>  export a recorded board run from a Worker for the replay page (scrubbed)
+#   make preview-replay REPLAY=<file> REPO=<integration git dir> APP=<name> [DRY_RUN=1]  backfill revision previews into a replay (uploads Worker versions unless DRY_RUN)
 #   make replay-build    build the static replay page (recorded runs, no Worker, no credentials)
 #   make replay-preview  serve the replay build locally (REPLAY_PORT, default 4180)
 #   make deploy-replay   deploy the replay page as Workers static assets (a REAL deploy: confirm first)
@@ -40,7 +41,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: export-replay replay-build replay-preview deploy-replay delete-replay jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: export-replay preview-replayreplay-build replay-preview deploy-replay delete-replay jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -453,6 +454,15 @@ export-replay:
 	@test -n "$(ID)" || { echo "usage: make export-replay ID=<changeId> [WORKER=$(WORKER)] [TITLE=...] [APP=...] [DESCRIPTION=...]"; exit 2; }
 	npm -w apps/console run export-replay -- --id "$(ID)" --worker "$(WORKER)" \
 	  $(if $(TITLE),--title "$(TITLE)",) $(if $(filter command line,$(origin APP)),--app "$(APP)",) $(if $(DESCRIPTION),--description "$(DESCRIPTION)",)
+
+# Backfill revision previews into a recorded replay: each integrated revision
+# whose commit is still in the run's integration repo is uploaded as a Worker
+# VERSION of the app's stable worker under a preview alias (never a production
+# deploy; needs the Worker to exist and CLOUDFLARE_* in .env, which the CLI
+# reads into memory). DRY_RUN=1 plans only (no upload, nothing written).
+preview-replay:
+	@test -n "$(REPLAY)" && test -n "$(REPO)" && test -n "$(APP)" || { echo "usage: make preview-replay REPLAY=<replay.json> REPO=<integration git dir> APP=<app name> [DRY_RUN=1]"; exit 2; }
+	npm -w apps/cli run dev -- preview-replay --replay "$(abspath $(REPLAY))" --repo "$(abspath $(REPO))" --app "$(APP)" $(if $(DRY_RUN),--dry-run,)
 
 # Build the static replay page into apps/console/dist-replay: the console's
 # mission control over the recorded runs in apps/console/public/replays, with no

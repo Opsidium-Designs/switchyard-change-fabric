@@ -92,6 +92,40 @@ The scrubber and the refusal are unit-tested offline
 replay folds with every node backed and holds no secret or local path
 (`apps/console/tests/replay-data.test.tsx`).
 
+## Backfill revision previews
+
+A run made with `--preview-revisions` records a preview (the running app at that
+revision, a Worker version under a preview alias, never a production deploy;
+see the board doc) for each integrated revision as it goes. For a run recorded
+without them, the previews can be added afterwards from the run's integration
+repo, if it is still on disk:
+
+```bash
+make preview-replay REPLAY=apps/console/public/replays/<id>.json \
+  REPO=/tmp/scf-board-XXXX/integration-artifacts/<id>--integration.git APP=storefront DRY_RUN=1
+```
+
+It reads each `integrated.rev` (its `n` and `commit`) from the replay, checks
+the commit is in the repo, finds the app in that commit's tree (the directory
+whose `wrangler.jsonc` names the app's stable worker,
+`switchyard-change-fabric-<app>`), and, without `DRY_RUN`, uploads it as a
+version of that worker under the alias `<tag>-r<n>`. Each uploaded preview is
+written into the replay's `snapshot.previews` with `backfilled: true` (the
+snapshot is created if the replay had none; the file keeps the exporter's
+compact JSON). `DRY_RUN=1` prints the plan and writes nothing.
+
+- A revision whose commit is not in the repo is skipped and named. A run made
+  WITHOUT previews kept only its passing revisions' commits, so for such a run
+  only those can be backfilled; a run made with `--preview-revisions` keeps the
+  failing ones too.
+- The Worker must exist: if it does not, wrangler's error is shown, nothing is
+  written for that revision, and the fix is a first deploy of the baseline
+  (`make deploy-app APP=<app>`).
+- Previews are advisory and visual: they change nothing about the recorded run.
+  Their URLs are public `workers.dev` URLs and go away with the Worker
+  (`make delete-app APP=<app>`, or `wrangler delete`).
+- Re-exporting a run writes a fresh snapshot: backfill after the export.
+
 ## Deploy it
 
 `apps/console/wrangler.replay.jsonc` serves `dist-replay/` as Workers static

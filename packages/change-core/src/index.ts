@@ -340,3 +340,5 @@ export { prePassRatchet, ratchetHistory, ratchetLine, ratchetUnits } from "./pro
 export type { AttributableUnit } from "./failure-attribution.ts";
 export { attributeFailure, combineAttribution, failingRepoFiles } from "./failure-attribution.ts";
 export type { ImplicationSource } from "./failure-attribution.ts";
+export type { RevisionPreview } from "./revision-preview.ts";
+export { MAX_RECORDED_PREVIEWS, mergeRevisionPreview, parseRevisionPreview } from "./revision-preview.ts";

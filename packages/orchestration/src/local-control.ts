@@ -18,6 +18,9 @@
 import { createHash, randomBytes } from "node:crypto";
 
 import {
+  mergeRevisionPreview,
+  parseRevisionPreview,
+  type RevisionPreview,
   appendBoardMessage,
   appendDecisionRecorded,
   appendSeamStalled,
@@ -276,6 +279,8 @@ export interface ChangeStateView {
   readonly failed: readonly FailureRecord[];
   /** The live deployment of the fixed app for this run (mirrors the Worker). */
   readonly deployment?: DeploymentRecord;
+  /** Revision previews (Worker versions under preview aliases; advisory), sorted by n (mirrors the Worker). */
+  readonly previews?: readonly RevisionPreview[];
   /** Mechanical verify attempts (mirrors the Worker); back the `verify` nodes. */
   readonly verifyAttempts: readonly VerifyAttempt[];
   /** Model-escalation retries (mirrors the Worker); back `retry` nodes/edges. */
@@ -556,6 +561,8 @@ class ChangeRecord {
   readonly detail = new Map<string, UnitDetail>();
   /** The live deployment of the fixed app recorded for this run (mirrors DO). */
   deployment: DeploymentRecord | null = null;
+  /** Revision previews recorded for this run, sorted by n (mirrors the DO). */
+  previews: RevisionPreview[] = [];
   /** Mechanical verify attempts recorded for this Change (mirrors the DO). */
   readonly verifyAttempts: VerifyAttempt[] = [];
   /** Model-escalation retries recorded for this Change (mirrors the DO). */
@@ -1221,6 +1228,21 @@ export class LocalChangeControl {
   }
 
   /**
+   * Record a revision preview (mirrors the DO): validated, one per revision (a
+   * later write for the same n replaces), sorted by n, capped. Throws on an
+   * invalid body. Advisory: it backs no verdict.
+   */
+  recordPreview(changeId: string, body: unknown): RevisionPreview {
+    const record = this.require(changeId);
+    const parsed = parseRevisionPreview(body, () => new Date().toISOString());
+    if (!parsed.ok) {
+      throw new Error(parsed.error);
+    }
+    record.previews = mergeRevisionPreview(record.previews, parsed.preview);
+    return parsed.preview;
+  }
+
+  /**
    * Record one mechanical CHANGE-LEVEL VERIFY attempt (mirrors the DO). This is
    * the real backing for a `verify` graph node, so a verify node can only exist
    * once this record does. The verifier is mechanical on every round, so this is
@@ -1639,6 +1661,7 @@ export class LocalChangeControl {
         a.unitId < b.unitId ? -1 : a.unitId > b.unitId ? 1 : 0,
       ),
       ...(record.deployment ? { deployment: record.deployment } : {}),
+      ...(record.previews.length > 0 ? { previews: [...record.previews] } : {}),
       verifyAttempts: record.verifyAttempts,
       retryAttempts: record.retryAttempts,
       rePlans: record.retryAttempts.filter((a) => a.refanSource === "re-plan").length,
@@ -1786,6 +1809,24 @@ export class LocalChangeControl {
         app: String(b.app ?? ""),
       });
       return json({ deployment: recorded }, 201);
+    }
+    const previewsRoute = url.pathname.match(/^\/changes\/([^/]+)\/previews$/);
+    if (method === "POST" && previewsRoute) {
+      const changeId = dec(previewsRoute[1]);
+      if (!this.records.has(changeId)) {
+        return json({ error: `no such Change: ${changeId}` }, 404);
+      }
+      let body: unknown;
+      try {
+        body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      } catch {
+        return json({ error: "invalid preview body" }, 400);
+      }
+      try {
+        return json({ preview: this.recordPreview(changeId, body) }, 201);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : String(error) }, 400);
+      }
     }
     const integrationRoute = url.pathname.match(/^\/changes\/([^/]+)\/integration$/);
     if (method === "POST" && integrationRoute) {

@@ -518,6 +518,7 @@ export async function gateCandidateTree(ctx: CandidateContext, index: number, en
       // Every candidate builds on the same RECORDED head; none moves the branch.
       ...(state.integrated ? { integrationBaseCommit: state.integrated.commit } : {}),
       deferIntegrationPush: true,
+      ...(options.keepFailedCommits ? { keepFailedGatedCommit: true } : {}),
       workRoot: options.worktreeRoot,
       identity: options.identity,
       ...(options.signal ? { signal: options.signal } : {}),
