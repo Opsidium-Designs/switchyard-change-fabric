@@ -342,6 +342,9 @@ CH_MAX ?= 30
 CH_INFLIGHT ?= 8
 # A ~36-item plan asks for ~1300 run turns; the default cap is 800.
 CH_TURNS ?= 1400
+# The first live 30-agent run passed at 29 minutes against the 30-minute
+# default agent-phase limit, so cityhall gets 75 minutes.
+CH_TIMEOUT_MS ?= 4500000
 
 demo-board-cityhall:
 	npm -w apps/cli run dev -- run-board --offline --fixture-gate --decide-contracts $(DECIDE_CONTRACTS) --goal-file "$(CITYHALL_GOAL)" --project "$(CITYHALL_PROJECT)" \
@@ -349,7 +352,7 @@ demo-board-cityhall:
 
 run-board-cityhall:
 	npm -w apps/cli run dev -- run-board --goal-file "$(CITYHALL_GOAL)" --project "$(CITYHALL_PROJECT)" --worker "$(WORKER)" \
-	  --min $(CH_MIN) --max $(CH_MAX) --max-inflight $(CH_INFLIGHT) --max-turns $(CH_TURNS) $(if $(INTEGRATOR),--integrator $(INTEGRATOR),) $(if $(DECIDE),--decide-contracts $(DECIDE),)
+	  --min $(CH_MIN) --max $(CH_MAX) --max-inflight $(CH_INFLIGHT) --max-turns $(CH_TURNS) --timeout-ms $(CH_TIMEOUT_MS) $(if $(INFERENCE),--inference $(INFERENCE),) $(if $(INTEGRATOR),--integrator $(INTEGRATOR),) $(if $(DECIDE),--decide-contracts $(DECIDE),)
 
 cityhall-gate:
 	cd examples/apps/cityhall && npm ci --no-audit --no-fund && npm run gate
