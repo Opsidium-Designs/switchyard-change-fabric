@@ -300,6 +300,8 @@ async function contractRun(jev: AskJev | undefined, resolve?: (request: BoardCon
     seed,
     workRoot: join(root, "work"),
     ...(resolve ? { resolveContract: resolve } : {}),
+    // Without a resolver the run waits on the human until its time limit (never quiescent): keep it short.
+    ...(resolve ? {} : { budgets: { timeoutMs: 5000 } }),
     ...(jev ? { jev } : {}),
     onEvent: (e) => events.push(e),
   });

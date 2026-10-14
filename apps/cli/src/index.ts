@@ -1437,6 +1437,13 @@ const commands: Command[] = [
                 console.log(redactSecrets(`    advisory triage: ${event.recommendation}`));
               }
               break;
+            case "waiting-on-human": {
+              const named = [...event.contracts.map((c) => `contract ${c}`), ...event.contests.map((c) => `contest ${c}`)];
+              console.log(
+                `  waiting on you: ${named.length} decision(s) (${named.join(", ")}); the board has been quiet ${Math.round(event.quietMs / 1000)} s, and the run waits for them until --timeout-ms`,
+              );
+              break;
+            }
             case "contract-decision":
               console.log(`  contract ${event.contract}${event.path ? ` on ${event.path}` : ""}: ${event.decision} (human)`);
               break;

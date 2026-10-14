@@ -60,6 +60,7 @@ import {
   narrowToSplitChildren,
   objectiveSubChanges,
   pendingPushItems,
+  pendingHumanDecisions,
   integrablePushItems,
   splitCue,
   planBoardIntegration,
@@ -235,6 +236,7 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
   },
   "integration.started": { from: "engine", payload: { kind: "speculative", pushes: [7, 9], agents: ["a", "b"], items: ["i", "j"], candidates: 2 } },
   "integration.phase": { from: "engine", payload: { started: 10, phase: "candidate", detail: "candidate 2 of 2: base + a, b", elapsedMs: 1200 } },
+  "run.waiting": { from: "engine", payload: { contracts: ["k1"], contests: [], waitedMs: 180000 } },
   "item.discovered": { from: "a", payload: { item: "k", objective: "o", reason: "found a gap", parent: "i" } },
   "help.requested": { from: "a", payload: { request: "r", item: "i", need: "tool" } },
   "help.offered": { from: "b", payload: { request: "r", forkOf: "a", forkCommit: "abc123", fork: "chg--help-r" } },
@@ -309,6 +311,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "candidate.gated": { round: 1, index: 2, of: 2, prefix: [{ agent: "a", items: ["i"], commit: "c1" }], commit: "abc", verdict: "pass", outcome: "passed" },
   "integration.started": { kind: "integrate", pushes: [], agents: ["a"], items: ["i"] },
   "integration.phase": { started: 3, phase: "testing" },
+  "run.waiting": { contracts: [], contests: [] },
   "item.discovered": { item: "k", objective: "o" },
   "help.requested": { request: "r", item: "i" },
   "help.offered": {},
@@ -347,7 +350,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(61);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(62);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -3982,6 +3985,42 @@ describe("integration progress is recorded by the engine and changes nothing els
     expect(next(noisy.board)).toEqual(next(plain.board));
     expect(itemWaitReason(noisy.board.state, "one")).toEqual(itemWaitReason(plain.board.state, "one"));
     expect(reduceBoard(noisy.board.log)).toEqual(noisy.board.state);
+  });
+});
+
+describe("a run waiting on a human is recorded by the engine and changes nothing else", () => {
+  const escalated = (rules: Record<string, number> = { arbitration: 7 }) => {
+    const board = new TestBoard();
+    board.post(msg("human", "goal.posted", { objective: "o", protected: ["gate/gate.test.mjs"], rules }));
+    board.post(msg("a", "agent.joined"));
+    board.post(msg("lead", "agent.joined", { role: "lead" }));
+    board.post(msg("human", "item.proposed", { item: "g", objective: "update the gate test", scopeHint: ["gate/**"] }));
+    board.post(msg("a", "contract.proposed", { contract: "k1", target: "gate/gate.test.mjs", kind: "modify", item: "g" }));
+    return board;
+  };
+
+  it("names only pending human decisions, records nothing in state, and replays", () => {
+    const board = escalated();
+    expect(pendingHumanDecisions(board.state)).toEqual({ contracts: ["k1"], contests: [] });
+    const before = { ...board.state, lastSeq: 0 };
+    const [w] = board.post(msg("engine", "run.waiting", { contracts: ["k1"], contests: [], waitedMs: 120000 }));
+    expect(w).toMatchObject({ from: "engine", type: "run.waiting", payload: { contracts: ["k1"], contests: [], waitedMs: 120000 } });
+    expect(w!.to).toBeUndefined();
+    expect({ ...board.state, lastSeq: 0 }).toEqual(before);
+    expect(reduceBoard(board.log)).toEqual(board.state);
+    board.reject(msg("engine", "run.waiting", { contracts: ["nope"], contests: [] }), /not a protected contract awaiting a human/, "INVALID_STATE");
+    board.reject(msg("engine", "run.waiting", { contracts: [], contests: ["contest-9"] }), /not escalated to a human/, "INVALID_STATE");
+    board.reject(msg("engine", "run.waiting", { contracts: ["k1"], contests: [], who: "x" }), /run.waiting record is/, "BAD_PAYLOAD");
+    expect(() => appendBoardMessage(board.state, { kind: "agent", agent: "a" }, { type: "run.waiting", payload: { contracts: ["k1"], contests: [] } }, AT)).toThrow(/cannot be sent by an agent/);
+    // Decided: nothing is pending, and a wait on it is refused.
+    board.post(msg("human", "contract.accepted", { contract: "k1" }));
+    expect(pendingHumanDecisions(board.state)).toEqual({ contracts: [], contests: [] });
+    board.reject(msg("engine", "run.waiting", { contracts: ["k1"], contests: [] }), /not a protected contract awaiting a human/, "INVALID_STATE");
+  });
+
+  it("is refused under arbitration revision 1", () => {
+    const board = escalated({});
+    board.reject(msg("engine", "run.waiting", { contracts: ["k1"], contests: [] }), /arbitration revision 2/, "NOT_ALLOWED");
   });
 });
 

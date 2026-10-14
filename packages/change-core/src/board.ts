@@ -821,6 +821,16 @@ export interface BoardPayloads {
     readonly detail?: string;
     readonly elapsedMs?: number;
   };
+  /**
+   * Engine (recorded by the operator): the board is quiet but the run waits
+   * for HUMAN decisions (protected contracts escalated to a human:
+   * `contracts`; contests escalated to a human: `contests`), so it is not
+   * ended as quiescent; it waits until they are decided or the agent phase's
+   * time limit. `waitedMs` is how long the board has been quiet. Recorded at a
+   * bounded interval while waiting. PROGRESS ONLY: no board state changes,
+   * nothing is decided, never addressed to an agent.
+   */
+  "run.waiting": { readonly contracts: readonly string[]; readonly contests: readonly string[]; readonly waitedMs?: number };
   /** Engine (derived): an item the lead already re-planned failed again (fix budget spent, or stalled twice): a human decides. */
   "item.escalated": { readonly item: string; readonly reason: "replan-failed"; readonly replanOf: string };
   "item.discovered": {
@@ -1150,6 +1160,7 @@ export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "candidate.gated",
   "integration.started",
   "integration.phase",
+  "run.waiting",
   "push.excluded",
   "push.regressed",
   "item.discovered",
@@ -2388,6 +2399,15 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
       const candidates = raw.candidates === undefined ? undefined : positiveInt(raw, "candidates", L.maxSpeculate);
       return { kind, pushes: seqs, agents, items, ...(candidates !== undefined ? { candidates } : {}) };
     }
+    case "run.waiting": {
+      const contracts = idList(raw, "contracts", { max: L.maxShortList });
+      const contests = idList(raw, "contests", { max: L.maxShortList });
+      if (contracts.length + contests.length === 0) {
+        fail("BAD_PAYLOAD", "a run waits on at least one human decision (contracts or contests)");
+      }
+      const waitedMs = raw.waitedMs === undefined ? undefined : nonNegativeInt(raw, "waitedMs");
+      return { contracts, contests, ...(waitedMs !== undefined ? { waitedMs } : {}) };
+    }
     case "integration.phase": {
       const detail = raw.detail === undefined ? undefined : text(raw, "detail", L.maxIntegrationDetail);
       const elapsedMs = raw.elapsedMs === undefined ? undefined : nonNegativeInt(raw, "elapsedMs");
@@ -2884,6 +2904,7 @@ const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "candidate.gated": ["engine"],
   "integration.started": ["engine"],
   "integration.phase": ["engine"],
+  "run.waiting": ["engine"],
   "item.discovered": ["agent"],
   "help.requested": ["agent"],
   "help.offered": ["agent"],
@@ -4630,6 +4651,23 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       return;
     }
+    case "run.waiting": {
+      if (!arbitrationV2(state)) {
+        fail("NOT_ALLOWED", "a run's wait on a human is recorded only under arbitration revision 2 or later (whose clocks ignore engine records)");
+      }
+      for (const id of draft.payload.contracts) {
+        const c = state.contracts[id];
+        if (c === undefined || !c.guarded || c.status !== "proposed") {
+          fail("INVALID_STATE", `contract ${id} is not a protected contract awaiting a human`);
+        }
+      }
+      for (const id of draft.payload.contests) {
+        if (state.contests[id]?.status !== "escalated") {
+          fail("INVALID_STATE", `contest ${id} is not escalated to a human`);
+        }
+      }
+      return;
+    }
     case "integration.started":
     case "integration.phase": {
       // Progress only, never arbitration state: recorded only where the
@@ -5882,6 +5920,7 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
       break;
     case "integration.started":
     case "integration.phase":
+    case "run.waiting":
       // Progress only: nothing but the seq moves (no arbitration state, no verdict).
       break;
     case "clash.predicted": {
@@ -7054,6 +7093,7 @@ const RECORDED_ENGINE_TYPES: ReadonlySet<BoardMessageType> = new Set([
   "candidate.gated",
   "integration.started",
   "integration.phase",
+  "run.waiting",
   "push.excluded",
   "push.regressed",
   // Only an engine close (closedBy: engine) is recorded; every other completion is derived.
@@ -7356,6 +7396,25 @@ export function promotionRefusal(
   return undefined;
 }
 
+/**
+ * The HUMAN decisions the board waits on: protected contracts escalated to a
+ * human (still proposed) and contests escalated to a human (unresolved),
+ * each sorted by id. A quiet board with any of these is waiting on a person,
+ * not stuck. Pure.
+ */
+export function pendingHumanDecisions(state: BoardState): { readonly contracts: string[]; readonly contests: string[] } {
+  return {
+    contracts: Object.values(state.contracts)
+      .filter((c) => c.guarded === true && c.status === "proposed")
+      .map((c) => c.contract)
+      .sort(),
+    contests: Object.values(state.contests)
+      .filter((c) => c.status === "escalated")
+      .map((c) => c.id)
+      .sort(),
+  };
+}
+
 /** The engine messages the operator records through the engine-record route (`appendEngineRecord`). */
 export const ENGINE_RECORD_TYPES = [
   "claim.lapsed",
@@ -7367,6 +7426,7 @@ export const ENGINE_RECORD_TYPES = [
   "candidate.gated",
   "integration.started",
   "integration.phase",
+  "run.waiting",
   "push.excluded",
   "push.regressed",
   "item.completed",
@@ -7396,6 +7456,8 @@ export type EngineRecordType = (typeof ENGINE_RECORD_TYPES)[number];
  *     integration.phase {started, phase, detail?, elapsedMs?}: integration
  *     progress (a round began, a coarse phase changed). Progress only: no
  *     board state changes and nothing is decided (arbitration revision 2+).
+ *   - run.waiting {contracts, contests, waitedMs?}: the quiet board waits on
+ *     these human decisions (progress only, arbitration revision 2+).
  *   - push.excluded {item, agent, commit, reason}: the integrator left the
  *     holder's pending push out of the integrated tree (it failed
  *     verification); addressed to the holder, it is not re-gated until the
@@ -7469,6 +7531,12 @@ export function appendEngineRecord(state: BoardState, input: unknown, at: string
         fail("BAD_PAYLOAD", "an integration.started record is {kind, pushes, agents, items, candidates?}");
       }
       return appendChecked(state, { from: BOARD_ENGINE, type: "integration.started", payload: parsePayload("integration.started", raw) as BoardPayloads["integration.started"] }, at);
+    }
+    case "run.waiting": {
+      if (Object.keys(raw).some((k) => !["contracts", "contests", "waitedMs"].includes(k))) {
+        fail("BAD_PAYLOAD", "a run.waiting record is {contracts, contests, waitedMs?}");
+      }
+      return appendChecked(state, { from: BOARD_ENGINE, type: "run.waiting", payload: parsePayload("run.waiting", raw) as BoardPayloads["run.waiting"] }, at);
     }
     case "integration.phase": {
       if (Object.keys(raw).some((k) => !["started", "phase", "detail", "elapsedMs"].includes(k))) {

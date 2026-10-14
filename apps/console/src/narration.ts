@@ -238,6 +238,15 @@ export function narrateMessage(message: BoardMessage, log: readonly BoardMessage
       text = `The integrator starts on revision ${n} with ${pushes.length} push${pushes.length === 1 ? "" : "es"} from ${list(p, "agents").length} agent(s)${shape}. Nothing is decided until its gate runs.`;
       break;
     }
+    case "run.waiting": {
+      const contracts = list(p, "contracts");
+      const contests = list(p, "contests");
+      for (const c of contracts) cite(index.latestBefore(message.seq, (m, q) => m.type === "contract.escalated" && str(q, "contract") === c)?.seq);
+      for (const c of contests) cite(index.latestBefore(message.seq, (m, q) => m.type === "claim.escalated" && str(q, "contest") === c)?.seq);
+      const n = contracts.length + contests.length;
+      text = `The board is quiet, but the run is waiting on you: ${n} decision${n === 1 ? "" : "s"} (${[...contracts.map((c) => `contract ${c}`), ...contests.map((c) => `contest ${c}`)].join(", ")}). It waits until its time limit, not stuck.`;
+      break;
+    }
     case "integration.phase": {
       const started = Number(p.started);
       if (Number.isInteger(started)) cite(started);

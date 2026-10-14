@@ -242,6 +242,36 @@ the result stays partial.
   the others, and the owner closes its item` (`run-board-close-out.e2e.test.ts`);
   the `engine close` tests (`packages/change-core/tests/board.test.ts`)
 
+### 15. A run ends "quiescent" while a human decision is pending (prevented)
+
+**Seen:** in a live 30-agent run on 2026-10-13, the agent phase ended
+`quiescent` ("every agent was idle, nothing was integrating or pending, and no
+board message arrived for 120 s") while two protected contract changes
+(`contract.escalated`, pending escalations on the Worker) were still
+unanswered. The run failed only because the human had not clicked yet.
+
+**Now:** a quiet board that waits on a person is not ended quiescent. While a
+protected contract escalated to a human is undecided, or a contest is
+escalated to a human, the run keeps waiting until those decisions are made or
+the agent phase's time limit (`--timeout-ms`). While it waits it records
+`run.waiting {contracts, contests, waitedMs?}` at most every 3 minutes
+(`humanWaitRecordMs`; at most 40 per run), progress only: it changes no board
+state and is never shown to agents. The console narrator reads "Waiting on
+you: N decisions" and the CLI prints a line. Once decided, the normal
+quiescence rules apply again. If nobody decides, the run ends at its time
+limit and the reason names the pending decisions ("the run was waiting on N
+human decision(s) nobody made (contract ...)").
+
+- Code: `pendingHumanDecisions` (`packages/change-core/src/board.ts`); the
+  quiet-board endings in `runBoard` (`packages/orchestration/src/run-board.ts`)
+- Tests: `a human who decides after the old quiet window: the run waits for
+  the decision instead of ending quiescent, then continues and completes`;
+  `without a human resolver the contract waits durably, and the run reports
+  the item as not completed` (`run-board-contracts.e2e.test.ts`); `a run
+  waiting on a human is recorded by the engine and changes nothing else`
+  (`packages/change-core/tests/board.test.ts`); `a run waiting on a person`
+  (`apps/console/tests/integration-marker.test.tsx`)
+
 ## What is still open
 
 - A changed developer test is approved by a human. When the final revision

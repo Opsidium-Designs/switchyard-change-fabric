@@ -52,12 +52,81 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
   it("without a human resolver the contract waits durably, and the run reports the item as not completed", async () => {
     const projectDir = await project();
     const events: BoardRunEvent[] = [];
-    const result = await runBoardOffline({ goal: GOAL, projectDir, seed, onEvent: (e) => events.push(e) });
+    const started = Date.now();
+    // Nobody decides: a quiet board waiting on a human does not end quiescent; it waits to the time limit.
+    const result = await runBoardOffline({ goal: GOAL, projectDir, seed, onEvent: (e) => events.push(e), budgets: { timeoutMs: 6000, humanWaitRecordMs: 2000 } });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(6000);
     expect(events.some((e) => e.kind === "contract-awaiting-human")).toBe(true);
+    expect(result.stopReason).toBe("timeout");
+    expect(result.stopDetail).toMatch(/wall-clock limit \(6 s.*the run was waiting on 1 human decision\(s\) nobody made \(contract [^)]+\): decide them in the console/);
+    // The wait is on the board (bounded: at most one record per interval), never a verdict.
+    const waiting = of(result.log, "run.waiting");
+    expect(waiting.length).toBeGreaterThan(0);
+    expect(waiting.length).toBeLessThanOrEqual(4);
+    expect(waiting[0]!.payload.contracts).toHaveLength(1);
+    expect(waiting.every((m) => m.from === "engine" && m.to === undefined && !("waitedMs" in m.payload))).toBe(true);
+    expect(events.some((e) => e.kind === "waiting-on-human")).toBe(true);
+    expect(reduceBoard(result.log)).toEqual(reduceBoard(result.log));
     expect(result.incompleteItems).toEqual(["tests"]);
     expect(result.verdict).toBe("unverified"); // no gate in this project
     expect(formatBoardRunSummary(result)).toMatch(/unverified \(no gate configured: nothing checked\) \(partial: 1 item\(s\) not completed: tests; the Change is not complete\)/);
     expect(boardRunExitCode(result)).toBe(1);
+  });
+
+  it("a human who decides after the old quiet window: the run waits for the decision instead of ending quiescent, then continues and completes", async () => {
+    const projectDir = await project();
+    let fetchFn: typeof fetch | undefined;
+    let resolvedAt: number | undefined;
+    let waitingAt: number | undefined;
+    const events: BoardRunEvent[] = [];
+    const escalations = new Set<string>();
+    // Above the idle agents' longest poll (4 s), as the default 120 s window is: a decided contract wakes its owner in time.
+    const quietMs = 5000;
+    const result = await runBoardOffline({
+      goal: GOAL,
+      projectDir,
+      seed,
+      schedule: "concurrent",
+      pollMs: 50,
+      budgets: { quiescenceMs: quietMs, timeoutMs: 90_000, humanWaitRecordMs: 1000 },
+      onControl: (f) => {
+        fetchFn = f;
+      },
+      onEvent: (e) => {
+        events.push(e);
+        if (e.kind === "contract-awaiting-human") {
+          escalations.add(e.escalationId);
+        }
+        // The board went quiet for the whole quiet window with the decision pending: the old
+        // code ended the run quiescent right here. The human clicks a whole window later.
+        if (e.kind === "waiting-on-human" && waitingAt === undefined) {
+          waitingAt = Date.now();
+          setTimeout(() => {
+            resolvedAt = Date.now();
+            for (const id of escalations) {
+              void fetchFn!(`http://local-control/changes/change-board-offline/escalations/${encodeURIComponent(id)}/resolve`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ decision: "accept" }),
+              });
+            }
+          }, quietMs);
+        }
+      },
+    });
+    expect(waitingAt).toBeDefined();
+    expect(resolvedAt).toBeDefined();
+    expect(resolvedAt! - waitingAt!).toBeGreaterThanOrEqual(quietMs);
+    expect(result.stopReason).toBe("all-items-done");
+    expect(result.incompleteItems).toEqual([]);
+    expect(of(result.log, "contract.accepted").map((m) => m.from)).toEqual(["human"]);
+    // While it waited, the board said so; after the decision, nothing more is recorded waiting.
+    const waiting = of(result.log, "run.waiting");
+    expect(waiting.length).toBeGreaterThan(0);
+    const accepted = of(result.log, "contract.accepted")[0]!.seq;
+    expect(waiting.every((m) => m.seq < accepted)).toBe(true);
+    expect(events.filter((e) => e.kind === "waiting-on-human").length).toBe(waiting.length);
+    expect(reduceBoard(result.log)).toBeDefined();
   });
 
   it("a worker's late proposal waits for the lead: a duplicate is rejected (not counted), new work is accepted and completed", async () => {

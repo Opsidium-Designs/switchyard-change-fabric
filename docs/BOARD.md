@@ -83,7 +83,7 @@ Who sent a message is established by the route, never by the message body.
 | `POST /changes/:id/board` | agent token | `{type, payload, rationale?, inReplyTo?, to?}` appended as that agent; `201 {appended, escalations}`. |
 | `POST /changes/:id/board/human` | bearer | A human message. |
 | `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected or seam `contract` (kept on the contract as `triage` for whoever decides it). It changes only the decision counts and that advisory line, never arbitration or the verdict. |
-| `POST /changes/:id/board/record` | bearer | `{type, payload}`: an engine fact only the operator side observes, validated against the board before it is appended (`appendEngineRecord`): `claim.lapsed {item}` (a leased claim recorded `stalled` on a quiet board), `clash.predicted`, `trunk.moved`, `token.refreshed`, `revision.promoted`, `run.capped`, `candidate.gated`, `push.excluded {item, agent, commit, reason}` (addressed to the holder), `item.completed {item, n, pushSeq}` (an engine close after the last gated pass, recorded `closedBy: engine` and addressed to the owner), `integration.started` and `integration.phase` (integration progress; see "Integration progress"). See "Stalls, re-plans, clashes, proofs, and caps". |
+| `POST /changes/:id/board/record` | bearer | `{type, payload}`: an engine fact only the operator side observes, validated against the board before it is appended (`appendEngineRecord`): `claim.lapsed {item}` (a leased claim recorded `stalled` on a quiet board), `clash.predicted`, `trunk.moved`, `token.refreshed`, `revision.promoted`, `run.capped`, `candidate.gated`, `push.excluded {item, agent, commit, reason}` (addressed to the holder), `item.completed {item, n, pushSeq}` (an engine close after the last gated pass, recorded `closedBy: engine` and addressed to the owner), `integration.started` and `integration.phase` (integration progress; see "Integration progress"), `run.waiting {contracts, contests, waitedMs?}` (the quiet run waits on human decisions). See "Stalls, re-plans, clashes, proofs, and caps". |
 | `POST /changes/:id/board/agent-token` | bearer | `{agent, ttlSeconds?, help?}` (60 to 3600): a REFRESHED, short-lived WRITE token for a joined agent's own repo (with `help`, the granted helper's fork), for runs longer than one token lifetime. `201 {workspaceName, tokenId, token, tokenExpiresAt}`, returned once; the old token is revoked through the read-token revoke route. Same checks as the read-token route. With `help`, a write token also requires the helper still joined (a read token does not). |
 | `POST /changes/:id/board/seam-stalled` | bearer | `{item}`: the board went quiet while this seam item held dependents; the engine appends `seam.stalled {item, released}` (the hold ends; with no push of its owner's the item is released). Refused unless the item holds a dependent. |
 | `POST /changes/:id/integration/revision` | bearer | An integration result `{commit, gate, merged, failing?}`; appends `integrated.rev` and what it triggers (completions and `rebase.needed` on a pass, `fix.requested` / `fix.exhausted` on a fail). |
@@ -163,7 +163,9 @@ recorded, arbitration revision 5, before the first pass, addressed to the holder
 strictly better without this push; see "The pre-pass progress ratchet"), `integration.started {kind: integrate |
 leave-one-out | speculative, pushes, agents, items, candidates?}` and `integration.phase {started, phase: fetch | merge |
 install | gate | candidate | ended, detail?, elapsedMs?}` (engine, recorded, arbitration revision 2 or later: integration
-PROGRESS only, no board state changes; see "Integration progress"), `decision.recorded {juncture:
+PROGRESS only, no board state changes; see "Integration progress"), `run.waiting {contracts, contests, waitedMs?}`
+(engine, recorded, arbitration revision 2 or later: a quiet board waits on these human decisions; progress only, see
+"Waiting on a person is not quiescence"), `decision.recorded {juncture:
 plan-review | attribution | fix-confidence | contract-triage, question, answer?, confidence?, accepted, error?, rev?,
 parsed?, contract?}` (engine, advisory), `decision.resolved {decisionSeq, rev, passed, answer, outcome:
 in-fixed-set | not-in-fixed-set, fixed, parsed, parseOutcome: in-fixed-set | not-in-fixed-set | none}` (engine, derived, advisory),
@@ -1417,6 +1419,19 @@ is distributed changes: items are proposed and claimed, never assigned.
   the result and the summary). An idle agent that is only polling its digest
   does not count as active: counting it kept a live board where every agent
   waited from ever looking quiet, since some agent was almost always mid-poll.
+- Waiting on a person is not quiescence (both schedules): while a protected
+  contract escalated to a human is undecided, or a contest is escalated to a
+  human (`pendingHumanDecisions`), a quiet board does not end the agent phase.
+  The run waits for the decisions until the agent phase's time limit
+  (`--timeout-ms`), recording `run.waiting {contracts, contests, waitedMs?}`
+  at most every `humanWaitRecordMs` (default 3 minutes; at most 40 per run;
+  arbitration revision 2 or later; progress only, no board state, never shown
+  to agents; `waitedMs` is omitted by the deterministic offline run). The
+  console narrator reads "Waiting on you: N decisions" until they are decided,
+  and the CLI prints a line. Once decided, the normal quiescence rules apply
+  again (in the lockstep schedule an idle round spent waiting is not counted
+  toward the round cap). If nobody decides, the phase ends `timeout` and the
+  reason names the pending decisions. See FAILURE-MODES.md, 15.
 - Tokens: agents push with their own short write tokens, which the driver
   refreshes before they expire (see "Token refresh for runs over one token
   lifetime"), so `--timeout-ms` may exceed `--token-ttl`; `--no-token-refresh`

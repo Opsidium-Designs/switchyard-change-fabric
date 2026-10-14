@@ -30,11 +30,45 @@ export function integrationSummary(message: BoardMessage): string | undefined {
     const p = message.payload;
     return `${p.kind} round on ${p.pushes.length} push(es) of ${p.agents.length} agent(s)${p.candidates !== undefined ? `, up to ${p.candidates} candidate(s)` : ""} (progress only)`;
   }
+  if (message.type === "run.waiting") {
+    const p = message.payload;
+    const named = [...p.contracts.map((c) => `contract ${c}`), ...p.contests.map((c) => `contest ${c}`)];
+    return `waiting on ${named.length} human decision(s): ${named.join(", ")}${p.waitedMs !== undefined ? ` (quiet ${Math.round(p.waitedMs / 1000)} s)` : ""}`;
+  }
   if (message.type === "integration.phase") {
     const p = message.payload;
     return `round seq ${p.started}: ${p.phase === "ended" ? `ended${p.detail !== undefined ? `: ${p.detail}` : ""}` : integrationPhaseLine(p)}${p.elapsedMs !== undefined ? ` (${Math.round(p.elapsedMs / 1000)} s in)` : ""}`;
   }
   return undefined;
+}
+
+/**
+ * The run waiting on a person at K: the latest run.waiting at or before K,
+ * keeping only the decisions it names that are still undecided at K (a
+ * contract.accepted / contract.rejected, or a claim.resolved of the contest,
+ * decides one). Null when none is left. Read from the log only.
+ */
+export function waitingOnHumans(log: readonly BoardMessage[], k: number): { readonly seq: number; readonly count: number; readonly line: string; readonly names: readonly string[] } | null {
+  let latest: Extract<BoardMessage, { type: "run.waiting" }> | undefined;
+  for (const m of log) {
+    if (m.seq > k) break;
+    if (m.type === "run.waiting") latest = m;
+  }
+  if (!latest) return null;
+  const decidedContracts = new Set<string>();
+  const decidedContests = new Set<string>();
+  for (const m of log) {
+    if (m.seq > k) break;
+    if (m.seq <= latest.seq) continue;
+    if (m.type === "contract.accepted" || m.type === "contract.rejected") decidedContracts.add(m.payload.contract);
+    if (m.type === "claim.resolved") decidedContests.add(m.payload.contest);
+  }
+  const names = [
+    ...latest.payload.contracts.filter((c) => !decidedContracts.has(c)).map((c) => `contract ${c}`),
+    ...latest.payload.contests.filter((c) => !decidedContests.has(c)).map((c) => `contest ${c}`),
+  ];
+  if (names.length === 0) return null;
+  return { seq: latest.seq, count: names.length, names, line: `Waiting on you: ${names.length} decision${names.length === 1 ? "" : "s"}` };
 }
 
 /** How far below the anchor the marker sits when a revision is already drawn there. */

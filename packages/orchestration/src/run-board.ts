@@ -47,6 +47,7 @@ import { join } from "node:path";
 import {
   BOARD_LIMITS,
   boardAttributionTally,
+  pendingHumanDecisions,
   pendingPushItems,
   awaitingSubLead,
   promotionRefusal,
@@ -270,6 +271,13 @@ export interface BoardRunBudgets {
    * propose done before the phase ends. Lockstep: one round of their turns.
    */
   readonly closeOutMs?: number;
+  /**
+   * While a quiet board waits on HUMAN decisions (escalated protected
+   * contracts or contests), the run does not end quiescent: it waits until
+   * they are decided or the agent phase's time limit, recording run.waiting at
+   * most this often, in ms (default 3 minutes).
+   */
+  readonly humanWaitRecordMs?: number;
 }
 
 /** A progress event of a board run. */
@@ -280,6 +288,8 @@ export type BoardRunEvent =
   | ({ readonly kind: "budgets" } & BoardRunEffectiveBudgets)
   | { readonly kind: "contract-decision"; readonly contract: string; readonly decision: string; readonly path?: string }
   | { readonly kind: "contract-awaiting-human"; readonly contract: string; readonly escalationId: string; readonly path?: string; readonly recommendation?: string }
+  /** The board is quiet but human decisions are pending: the run waits for them (recorded as run.waiting), not ended quiescent. */
+  | { readonly kind: "waiting-on-human"; readonly contracts: readonly string[]; readonly contests: readonly string[]; readonly quietMs: number }
   /** The advisory triage of a protected contract, recorded before the human is asked. */
   | { readonly kind: "contract-triage"; readonly contract: string; readonly recommendation: string }
   | { readonly kind: "seeded"; readonly source: string; readonly model?: string; readonly items: number }
@@ -523,6 +533,9 @@ export type BoardStopReason =
  * Every other reason (an interrupt, a cap, the turn budget, a rate limit, no
  * agent left) ends the phase at once.
  */
+/** run.waiting records one run may post while it waits on human decisions (bounded; the time limit ends the wait). */
+export const MAX_HUMAN_WAIT_RECORDS = 40;
+
 const CLOSE_OUT_REASONS: ReadonlySet<BoardStopReason> = new Set<BoardStopReason>(["timeout", "quiescent", "max-rounds", "fix-budget"]);
 
 /** An integration recorded as a board revision. */
@@ -2263,6 +2276,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     quiescenceMs: options.budgets?.quiescenceMs ?? 2 * 60 * 1000,
     toolHoldMs: options.budgets?.toolHoldMs ?? 90 * 1000,
     closeOutMs: options.budgets?.closeOutMs ?? 2 * 60 * 1000,
+    humanWaitRecordMs: options.budgets?.humanWaitRecordMs ?? 3 * 60 * 1000,
   };
   const ttl = options.workspaceTtlSeconds ?? 1800;
   const refreshTokens = options.refreshTokens !== false;
@@ -3062,6 +3076,46 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     const lines = undecidedContractLines(state, contractNudges);
     return lines.length > 0 ? `; ${lines.join("; ")}` : "";
   };
+  // A quiet board that waits on a HUMAN (an escalated protected contract or
+  // contest) is not stuck: the run waits for the decision (until the agent
+  // phase's time limit) instead of ending quiescent, and says so on the board
+  // at a bounded interval (run.waiting, progress only).
+  let humanWaitRecordedAt = Number.NEGATIVE_INFINITY;
+  let humanWaitRecords = 0;
+  let humanWaitSince: number | undefined;
+  const waitOnHumans = async (state: BoardState, quietMs: number): Promise<boolean> => {
+    const pending = pendingHumanDecisions(state);
+    if (pending.contracts.length + pending.contests.length === 0) {
+      humanWaitSince = undefined;
+      return false;
+    }
+    humanWaitSince ??= Date.now();
+    if (Date.now() - humanWaitRecordedAt >= budgets.humanWaitRecordMs && humanWaitRecords < MAX_HUMAN_WAIT_RECORDS) {
+      humanWaitRecordedAt = Date.now();
+      humanWaitRecords += 1;
+      if (arbitrationV2(state)) {
+        await operator
+          .recordEngine("run.waiting", {
+            contracts: pending.contracts,
+            contests: pending.contests,
+            // A deterministic offline log carries no wall-clock time.
+            ...(options.progressClock === null ? {} : { waitedMs: Math.max(0, Math.round(quietMs)) }),
+          })
+          .catch(() => undefined);
+      }
+      emit({ kind: "waiting-on-human", contracts: pending.contracts, contests: pending.contests, quietMs: Math.round(quietMs) });
+    }
+    return true;
+  };
+  const pendingHumanDetail = (state: BoardState): string => {
+    const pending = pendingHumanDecisions(state);
+    const n = pending.contracts.length + pending.contests.length;
+    if (n === 0) {
+      return "";
+    }
+    const named = [...pending.contracts.map((c) => `contract ${c}`), ...pending.contests.map((c) => `contest ${c}`)].join(", ");
+    return `; the run was waiting on ${n} human decision(s) nobody made (${named}): decide them in the console or the escalation resolve route`;
+  };
 
   // Held claims judged on a quiet board: what their holder had done when it
   // was last judged (its lease progress and its local turns on the item, such
@@ -3469,7 +3523,14 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
         // A rate-limit streak is not a quiet board: the next round waits it out.
         if (!acted && joined === 0 && !integrated && !decided && !rateLimit.limited && !(await actOnStalls())) {
           const quietState = (await operator.page(0, 1)).state;
-          stopReason = check(quietState) ?? "quiescent";
+          stopReason = check(quietState);
+          if (stopReason === undefined && (await waitOnHumans(quietState, Date.now() - (humanWaitSince ?? Date.now())))) {
+            // Waiting on a person, not stuck: the round is not spent; the time limit still applies.
+            round -= 1;
+            await new Promise((resolve) => setTimeout(resolve, Math.max(50, options.pollMs ?? 500)));
+            continue;
+          }
+          stopReason ??= "quiescent";
           stopDetail = `no agent had anything to do and no integration was pending${awaitingSubLeadDetail(quietState)}${undecidedDetail(quietState)}`;
         }
       }
@@ -3596,6 +3657,10 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           // A quiet board acts on the stated reasons (seam holds end, open
           // items are offered, stalled claims lapse) before quiescence could.
           quietSince = Date.now();
+        } else if (Date.now() - quietSince >= budgets.quiescenceMs && (await waitOnHumans(state, Date.now() - quietSince))) {
+          // Waiting on a person, not stuck: no quiescent ending while a human decision is pending
+          // (the time limit still applies). The run.waiting record itself is not activity.
+          lastSeq = (await operator.page(0, 1)).state.lastSeq;
         } else if (Date.now() - quietSince >= budgets.quiescenceMs) {
           const detail =
             (awaitingSubLead(state).length === 0
@@ -3659,7 +3724,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   }
   if (stopReason === "timeout") {
     const limit = `the agent phase reached its wall-clock limit (${Math.round(budgets.timeoutMs / 1000)} s; --timeout-ms raises it)`;
-    stopDetail = stopDetail !== undefined ? `${limit}; ${stopDetail}` : limit;
+    stopDetail = (stopDetail !== undefined ? `${limit}; ${stopDetail}` : limit) + pendingHumanDetail((await operator.page(0, 1)).state);
   }
   if (stopReason === "rate-limited") {
     stopDetail ??= rateLimit.stopDetail();
@@ -4404,6 +4469,11 @@ function payloadSummary(m: BoardMessage): string {
     case "integration.started": {
       const s = m.payload;
       return `${s.kind} round on ${s.pushes.length} push(es) of ${s.agents.length} agent(s) (${s.items.slice(0, 6).join(", ")}${s.items.length > 6 ? ", ..." : ""})${s.candidates !== undefined ? `, up to ${s.candidates} candidate(s)` : ""} (progress only)`;
+    }
+    case "run.waiting": {
+      const w = m.payload;
+      const named = [...w.contracts.map((c) => `contract ${c}`), ...w.contests.map((c) => `contest ${c}`)];
+      return `the quiet board waits on ${named.length} human decision(s): ${named.join(", ")}${w.waitedMs !== undefined ? ` (quiet ${Math.round(w.waitedMs / 1000)} s)` : ""} (progress only)`;
     }
     case "integration.phase": {
       const s = m.payload;

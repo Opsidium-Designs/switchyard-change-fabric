@@ -14,7 +14,7 @@ import type { BoardMessage } from "@switchyard-change/orchestration/board-graph"
 
 import { FixtureBoard, missionControlLog } from "../../../packages/orchestration/tests/board-graph-fixture.ts";
 import { buildReplayFile } from "../scripts/replay-export.ts";
-import { integratingLine, integrationMarkerLayout, integrationSummary, openIntegrationRound } from "../src/integration-marker.tsx";
+import { integratingLine, integrationMarkerLayout, integrationSummary, openIntegrationRound, waitingOnHumans } from "../src/integration-marker.tsx";
 import { MissionControl } from "../src/mission-control.tsx";
 import { narrateMessage } from "../src/narration.ts";
 
@@ -100,6 +100,31 @@ describe("the integration marker", () => {
       a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
     expect(taken.label === null || !overlap(taken.label, free.label!)).toBe(true);
     expect(integratingLine(free.round)).toBe("Integrating revision 1 (running the gate: npm run gate)");
+  });
+});
+
+describe("a run waiting on a person", () => {
+  it("the narrator says 'Waiting on you: N decision' while the decisions run.waiting names are pending, and stops once they are decided", () => {
+    const b = new FixtureBoard();
+    b.human({ type: "goal.posted", payload: { objective: "o", protected: ["gate/gate.test.mjs"], rules: { arbitration: 7 } } });
+    b.join("lead", "lead");
+    b.join("ag-1", "worker");
+    b.human({ type: "item.proposed", payload: { item: "g", objective: "update the gate test", scopeHint: ["gate/**"] } });
+    b.agent("ag-1", { type: "contract.proposed", payload: { contract: "k1", target: "gate/gate.test.mjs", kind: "modify", item: "g" } });
+    const escalatedSeq = b.lastSeqOf("contract.escalated");
+    const waitSeq = b.record("run.waiting", { contracts: ["k1"], contests: [], waitedMs: 180000 })[0]!.seq;
+    const html = render(b.log, waitSeq);
+    expect(html).toMatch(/class="mc-seq-link mc-narr-waiting"[^>]*>Waiting on you: 1 decision</);
+    expect(waitingOnHumans(b.log, waitSeq)).toMatchObject({ seq: waitSeq, count: 1, names: ["contract k1"] });
+    const said = narrateMessage(b.log.find((m) => m.seq === waitSeq)!, b.log, () => "");
+    expect(said.text).toBe("The board is quiet, but the run is waiting on you: 1 decision (contract k1). It waits until its time limit, not stuck.");
+    expect(said.causes).toEqual([escalatedSeq]);
+    // Decided: the line is gone at once (the next record is not needed).
+    const decided = b.human({ type: "contract.accepted", payload: { contract: "k1" } })[0]!.seq;
+    expect(render(b.log, decided)).not.toContain("mc-narr-waiting");
+    expect(waitingOnHumans(b.log, decided)).toBeNull();
+    // Before the record, nothing is claimed.
+    expect(waitingOnHumans(b.log, waitSeq - 1)).toBeNull();
   });
 });
 

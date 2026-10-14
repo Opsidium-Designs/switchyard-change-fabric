@@ -1510,6 +1510,7 @@ body {
 .mc-integrating-label text { fill: var(--text); font-size: calc(12px * var(--mc-t, 1)); }
 .mc-integrating-label .mc-integrating-phase { fill: var(--muted); }
 .mc-narr-integrating { color: var(--muted); font-style: italic; }
+.mc-narr-waiting { color: var(--await-2); font-weight: 600; }
 .mc-chapter-integrating { display: block; color: var(--muted); font-size: 11px; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
 @keyframes mc-integrating-flow {

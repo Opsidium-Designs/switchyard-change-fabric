@@ -239,6 +239,7 @@ const CONTEXT_ONLY_TYPES: ReadonlySet<string> = new Set([
   // Integration progress (the engine's own records): never a reason to take a turn.
   "integration.started",
   "integration.phase",
+  "run.waiting",
 ]);
 
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "out", "coverage", ".wrangler"]);

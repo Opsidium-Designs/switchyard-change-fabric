@@ -187,6 +187,7 @@ export {
   appendEngineRecord,
   promotionRefusal,
   ENGINE_RECORD_TYPES,
+  pendingHumanDecisions,
   applyBoardEscalations,
   applyBoardMessage,
   arbitrate,

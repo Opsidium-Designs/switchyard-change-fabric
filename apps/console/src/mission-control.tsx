@@ -82,7 +82,7 @@ import {
 } from "./board-scale";
 import { chapters as runChapters, formatDuration, narrateAt, narrateMessage, type Chapter, type Narration } from "./narration";
 import { GRADE_INFO, gradeOf, type EvidenceGrade } from "./evidence";
-import { IntegrationMarker, integratingLine, integrationMarkerLayout, integrationSummary, openIntegrationRound } from "./integration-marker";
+import { IntegrationMarker, integratingLine, integrationMarkerLayout, integrationSummary, openIntegrationRound, waitingOnHumans } from "./integration-marker";
 import { keyMoments, MOMENT_GROUPS, type MomentKind } from "./replay-data";
 
 /**
@@ -366,6 +366,7 @@ export function payloadSummary(message: BoardMessage): string {
       return `${message.payload.review}: ${message.payload.findings.length} finding(s)`;
     case "integration.started":
     case "integration.phase":
+    case "run.waiting":
       return integrationSummary(message) ?? "";
     default:
       return clip(JSON.stringify((message as BoardMessage).payload), 110);
@@ -587,11 +588,14 @@ export function Narrator({
   onSelectSeq,
   preview,
   integrating,
+  waiting,
 }: {
   narration: Narration | null;
   onSelectSeq: (seq: number) => void;
   /** The open integration round (its line and its seq), so a long gate is never silence. */
   integrating?: { readonly line: string; readonly seq: number } | undefined;
+  /** The human decisions the quiet run waits on ("Waiting on you: 2 decisions", backed by run.waiting). */
+  waiting?: { readonly line: string; readonly seq: number; readonly names: readonly string[] } | undefined;
   /** The backed preview of the revision this message integrated, if any. */
   preview?: { readonly preview: RevisionPreview; readonly gate: string } | undefined;
 }) {
@@ -624,6 +628,16 @@ export function Narrator({
       {integrating ? (
         <button type="button" className="mc-seq-link mc-narr-integrating" onClick={() => onSelectSeq(integrating.seq)} title="the open integration round (progress only; the gate decides)">
           {integrating.line}
+        </button>
+      ) : null}
+      {waiting ? (
+        <button
+          type="button"
+          className="mc-seq-link mc-narr-waiting"
+          onClick={() => onSelectSeq(waiting.seq)}
+          title={`The board is quiet and the run waits for: ${waiting.names.join(", ")}. Decide them in the escalations panel; the run waits until its time limit (seq ${waiting.seq}, run.waiting)`}
+        >
+          {waiting.line}
         </button>
       ) : null}
       <button type="button" className="mc-seq-link mc-narr-self" onClick={() => onSelectSeq(narration.seq)} title="open this message in the thread">
@@ -3571,6 +3585,7 @@ export function MissionControl({
   const narration = narrateAt(log, k, payloadSummary);
   const openRound = openIntegrationRound(log, k);
   const integrating = openRound ? { line: integratingLine(openRound), seq: openRound.seq } : undefined;
+  const waiting = waitingOnHumans(log, k) ?? undefined;
   const narratedRev = narration?.type === "integrated.rev" ? log.find((m) => m.seq === narration.seq) : undefined;
   const narratedPreview = narratedRev?.type === "integrated.rev" ? backed.get(narratedRev.payload.n) : undefined;
   const narratedMarker = narratedPreview ? markers.find((m) => m.n === narratedPreview.n) : undefined;
@@ -3588,6 +3603,7 @@ export function MissionControl({
             onSelectSeq={selectSeqInThread}
             preview={narratedPreview && narratedMarker ? { preview: narratedPreview, gate: GATE_WORD[narratedMarker.verdict] } : undefined}
             integrating={integrating}
+            waiting={waiting}
           />
           <Ticker ticker={model.ticker} live={live} k={k} lastSeq={lastSeq} recorded={recorded} teams={subLeadTeams(model)} />
         </div>

@@ -199,6 +199,11 @@ export interface RunBoardOfflineOptions {
   readonly deployAppName?: string;
   /** Revision previews with an injected uploader (see RunBoardOptions.previewRevision; offline runs pass a fake). */
   readonly previewRevision?: RunBoardOptions["previewRevision"];
+  /**
+   * Told the offline Worker's fetch before the run starts, so a test can act
+   * as the human (resolve an escalation through its route) while it runs.
+   */
+  readonly onControl?: (fetchFn: typeof fetch) => void;
   /** Which revisions are previewed (see RunBoardOptions.previewMode). */
   readonly previewMode?: RunBoardOptions["previewMode"];
 }
@@ -218,6 +223,7 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
   const control = new LocalChangeControl(new LocalFilesystemWorkspaceProvider({ rootDir: join(workRoot, "repos") }), {
     now: () => new Date(epoch + 1000 * tick++),
   });
+  options.onControl?.(control.fetch as unknown as typeof fetch);
   const pinDates = options.fixedGitDates ?? true;
   const saved = { author: process.env.GIT_AUTHOR_DATE, committer: process.env.GIT_COMMITTER_DATE };
   if (pinDates) {
