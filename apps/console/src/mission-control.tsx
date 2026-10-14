@@ -1377,6 +1377,61 @@ export function hullHeader(input: { readonly title: string; readonly status: str
   };
 }
 
+/**
+ * What a hull draws besides its title bar, so every hull says the same things whatever its width:
+ * - `badge`: the status pill, under the title bar when it does not fit beside the title (never dropped);
+ * - `held`: a hollow marker naming the owner when the owner's dot is drawn in another hull (an agent
+ *   holding two items is drawn once), so a claimed hull never looks empty.
+ * Both are backed by the item's recorded status and owner.
+ */
+export function hullAside(input: {
+  readonly rect: { readonly x: number; readonly y: number; readonly w: number; readonly h: number };
+  readonly status: string;
+  readonly besideTitle: boolean;
+  readonly owner?: string;
+  readonly ownerHull?: string;
+  readonly ownerHullLabel?: string;
+  readonly item: string;
+  readonly agentsHere: number;
+  readonly compact: boolean;
+  readonly boost?: number;
+}): {
+  readonly badge?: { readonly x: number; readonly y: number; readonly w: number; readonly h: number; readonly text: string };
+  readonly held?: { readonly cx: number; readonly cy: number; readonly nameY: number; readonly subY: number; readonly label: string; readonly sub: string; readonly title: string; readonly box: { readonly x: number; readonly y: number; readonly w: number; readonly h: number } };
+} {
+  const boost = input.boost ?? 1;
+  const { rect } = input;
+  const out: { badge?: { x: number; y: number; w: number; h: number; text: string }; held?: { cx: number; cy: number; nameY: number; subY: number; label: string; sub: string; title: string; box: { x: number; y: number; w: number; h: number } } } = {};
+  if (!input.besideTitle && input.status.length > 0 && !input.compact) {
+    const w = Math.ceil(input.status.length * HULL_STATUS_FONT * boost * CHAR_EM + 14);
+    const h = 18 * boost;
+    out.badge = { x: rect.x + rect.w - 10 - w, y: rect.y + HULL_TITLE_H + 4, w, h, text: input.status };
+  }
+  if (!input.compact && input.owner !== undefined && input.agentsHere === 0 && input.ownerHull !== undefined && input.ownerHull !== input.item) {
+    // Centred on the hull's agent row (the hull has no dot of its own), with two short lines under it.
+    const cx = rect.x + rect.w / 2;
+    const cy = rect.y + 90;
+    const where = input.ownerHullLabel ?? input.ownerHull;
+    const label = input.owner;
+    const sub = `also on ${where}`;
+    const lw = Math.max(label.length * 13, sub.length * 11) * boost * CHAR_EM;
+    // Spaced like an agent's own label (radius plus 15 text units), scaled with the text.
+    const nameY = cy + 9 + 15 * boost;
+    const subY = nameY + 14 * boost;
+    out.held = {
+      cx,
+      cy,
+      nameY,
+      subY,
+      label,
+      sub,
+      title: `${input.owner} holds this item too; its dot is drawn in ${where}, where it is working now.`,
+      box: { x: cx - lw / 2, y: cy - 10, w: lw, h: subY + 4 * boost - (cy - 10) },
+    };
+  }
+  return out;
+}
+
 /** The smallest a hull title is set (a fraction of its size) before it is ellipsized instead. */
 export const HULL_TITLE_MIN_SCALE = 0.72;
 
@@ -1669,8 +1724,39 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
       return [{ node, p, inHull: inHull !== undefined, compactLabel, compactX }];
     });
 
+  // Each hull's status pill and held-elsewhere marker (computed once: drawn below and kept clear of labels).
+  const agentHull = new Map<string, string>();
+  for (const n of model.nodes) if (n.detail.kind === "agent" && n.detail.hull !== undefined) agentHull.set(n.detail.agent, n.detail.hull);
+  const hullExtras = new Map<string, { header: ReturnType<typeof hullHeader>; statusText: string; aside: ReturnType<typeof hullAside> }>();
+  for (const node of model.nodes) {
+    if (node.detail.kind !== "item") continue;
+    const d = node.detail;
+    const rect = layout.items.get(d.item);
+    if (!rect) continue;
+    const statusText = `${node.status}${fixAsks.get(d.item)?.state === "open" ? ` / fix ${d.fixAttempts}` : ""}`;
+    const title = itemLabels.get(d.item) ?? d.item;
+    const header = hullHeader({ title: compact ? compactHullTitle(d.item, title, rect.parent ?? laneOfItem.get(d.item)) : title, status: statusText, width: rect.w, boost });
+    const ownerHull = d.owner !== undefined ? agentHull.get(d.owner) : undefined;
+    const aside = hullAside({
+      rect,
+      status: statusText,
+      besideTitle: header.badge.w > 0,
+      ...(d.owner !== undefined ? { owner: d.owner } : {}),
+      ...(ownerHull !== undefined ? { ownerHull, ownerHullLabel: itemLabels.get(ownerHull) ?? ownerHull } : {}),
+      item: d.item,
+      agentsHere: d.agents.length,
+      compact,
+      boost,
+    });
+    hullExtras.set(d.item, { header, statusText, aside });
+  }
+
   // Everything a talk label must not cover: node shapes and labels, hull and lane titles, hull text, edge tags, captions, the bench chip.
   const occupied: Box[] = drawnNodes.flatMap((d) => nodeBoxes(d, boost));
+  for (const { aside } of hullExtras.values()) {
+    if (aside.badge) occupied.push({ x: aside.badge.x, y: aside.badge.y, w: aside.badge.w, h: aside.badge.h });
+    if (aside.held) occupied.push(aside.held.box);
+  }
   for (const node of model.nodes) {
     if (node.detail.kind !== "item") continue;
     const rect = layout.items.get(node.detail.item);
@@ -1849,9 +1935,9 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
                   const rect = layout.items.get(d.item);
                   if (!rect) return null;
                   const isSel = selected === node.id;
-                  const statusText = `${node.status}${fixAsks.get(d.item)?.state === "open" ? ` / fix ${d.fixAttempts}` : ""}`;
-                  const title = itemLabels.get(d.item) ?? d.item;
-                  const header = hullHeader({ title: compact ? compactHullTitle(d.item, title, rect.parent ?? laneOfItem.get(d.item)) : title, status: statusText, width: rect.w, boost });
+                  const extras = hullExtras.get(d.item);
+                  if (!extras) return null;
+                  const { header, aside } = extras;
                   // The done check and the struggling mark sit at the bottom of the hull; a compact hull keeps them in its own band (above any nested child).
                   const markBottom = compact ? rect.y + (rect.parent !== undefined ? COMPACT_NESTED_H : COMPACT_HULL_H) : rect.y + rect.h;
                   const inFocus = focusNode?.detail.kind === "rev" ? revLinks.some((e) => e.from === node.id || e.to === node.id) : false;
@@ -1881,6 +1967,26 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
                             {header.status}
                           </text>
                         </>
+                      ) : null}
+                      {aside.badge ? (
+                        <>
+                          <rect className="mc-hull-badge" x={aside.badge.x} y={aside.badge.y} width={aside.badge.w} height={aside.badge.h} rx={aside.badge.h / 2} />
+                          <text className="mc-hull-status" x={aside.badge.x + aside.badge.w / 2} y={aside.badge.y + aside.badge.h * 0.72} textAnchor="middle">
+                            {aside.badge.text}
+                          </text>
+                        </>
+                      ) : null}
+                      {aside.held ? (
+                        <g className="mc-held-elsewhere">
+                          <circle cx={aside.held.cx} cy={aside.held.cy} r={9} />
+                          <text className="mc-held-name" x={aside.held.cx} y={aside.held.nameY} textAnchor="middle">
+                            {aside.held.label}
+                          </text>
+                          <text className="mc-held-sub" x={aside.held.cx} y={aside.held.subY} textAnchor="middle">
+                            {aside.held.sub}
+                          </text>
+                          <title>{aside.held.title}</title>
+                        </g>
                       ) : null}
                       {d.completed !== undefined ? (
                         <circle className="mc-check is-filled" cx={rect.x + rect.w - 22} cy={markBottom - 22} r={11} />

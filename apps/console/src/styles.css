@@ -1467,6 +1467,9 @@ body {
 .mc-hull-title { fill: var(--text); font-size: calc(15px * var(--mc-t, 1)); font-weight: 600; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .mc-hull-status { fill: var(--muted); font-size: calc(12px * var(--mc-t, 1)); pointer-events: none; }
 .mc-hull rect.mc-hull-badge { fill: rgba(139, 148, 158, 0.16); stroke: none; pointer-events: none; }
+.mc-held-elsewhere circle { fill: none; stroke: var(--node-agent); stroke-width: 2; stroke-dasharray: 3 2; }
+.mc-held-elsewhere .mc-held-name { fill: var(--muted); font-size: calc(13px * var(--mc-t, 1)); }
+.mc-held-elsewhere .mc-held-sub { fill: var(--muted); font-size: calc(11px * var(--mc-t, 1)); font-style: italic; }
 .mc-hull.status-proposed rect { stroke-dasharray: 6 4; }
 .mc-hull.status-rejected rect { stroke-dasharray: 2 4; opacity: 0.55; }
 .mc-hull-count { fill: var(--muted); font-size: calc(15px * var(--mc-t, 1)); }
