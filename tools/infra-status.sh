@@ -70,7 +70,7 @@ fi
 # example-app deploy, so a leak is never hidden by only checking the one name.
 APP_WORKERS=$(curl -s -H "${AUTH}" "${ACCT}/workers/scripts" \
   | jq -r --arg w "${WORKER_NAME}" \
-    '(.result // [])[] | .id | select(startswith($w + "-"))' | sort -u)
+    '(.result // [])[] | .id | select(startswith($w + "-") and . != ($w + "-replay"))' | sort -u)
 if [ -n "${APP_WORKERS}" ]; then
   echo "app workers: PRESENT (torn down by 'make infra-down'):"
   echo "${APP_WORKERS}" | sed 's/^/  - /'

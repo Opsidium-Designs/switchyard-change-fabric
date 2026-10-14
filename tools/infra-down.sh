@@ -126,8 +126,10 @@ if ! echo "${SCRIPTS}" | jq -e '.success == true' >/dev/null 2>&1; then
 else
   # The control-plane worker first (force=true also detaches the queue consumer
   # binding so Step 2b can delete the queue), then any '${WORKER_NAME}-*' apps.
+  # The public replay page ('${WORKER_NAME}-replay') is static and not live-run
+  # infrastructure: it stays up (remove it with make delete-replay or make public-down).
   WORKER_NAMES=$(echo "${SCRIPTS}" | jq -r --arg w "${WORKER_NAME}" \
-    '(.result // [])[] | .id | select(. == $w or startswith($w + "-"))' \
+    '(.result // [])[] | .id | select((. == $w or startswith($w + "-")) and . != ($w + "-replay"))' \
     | sort -u)
 fi
 if [ -z "${WORKER_NAMES}" ]; then
