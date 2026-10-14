@@ -1499,6 +1499,28 @@ body {
 .mc-tool-uses { fill: var(--orange); font-weight: 600; }
 .mc-edge-label { fill: var(--orange); font-size: calc(12px * var(--mc-t, 1)); }
 
+/* The open integration round (progress only): a pulsing neutral marker at the revision anchor, its phase, and dashed lines from the items it gates. */
+.mc-integrating { cursor: pointer; }
+.mc-integrating-line path,
+.mc-integrating-line line { fill: none; stroke: var(--edge); stroke-width: 1.6; stroke-dasharray: 3 5; }
+.mc-integrating .mc-integrating-line path { animation: mc-integrating-flow 1.2s linear infinite; }
+.mc-integrating-ring { fill: var(--node-idle); stroke: var(--muted); stroke-width: 2; stroke-dasharray: 5 4; animation: mc-pulse 1.6s ease-in-out infinite; }
+.mc-integrating-mark .mc-node-label { fill: var(--text); }
+.mc-integrating-label rect { fill: var(--panel); stroke: var(--border); }
+.mc-integrating-label text { fill: var(--text); font-size: calc(12px * var(--mc-t, 1)); }
+.mc-integrating-label .mc-integrating-phase { fill: var(--muted); }
+.mc-narr-integrating { color: var(--muted); font-style: italic; }
+.mc-chapter-integrating { display: block; color: var(--muted); font-size: 11px; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+@keyframes mc-integrating-flow {
+  to { stroke-dashoffset: -16; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mc-integrating-ring,
+  .mc-integrating .mc-integrating-line path { animation: none; }
+}
+
 @keyframes mc-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }

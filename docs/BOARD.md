@@ -83,7 +83,7 @@ Who sent a message is established by the route, never by the message body.
 | `POST /changes/:id/board` | agent token | `{type, payload, rationale?, inReplyTo?, to?}` appended as that agent; `201 {appended, escalations}`. |
 | `POST /changes/:id/board/human` | bearer | A human message. |
 | `POST /changes/:id/board/decision` | bearer | `{juncture, question, answer?, confidence?, accepted, error?, rev?, parsed?, contract?}`: the engine appends an ADVISORY `decision.recorded` (a typed decision and its outcome, or a failed call's reason). An attribution names the failing revision `rev` (it must be the latest, failing) and the items the string-parse attributed; a `contract-triage` names its protected or seam `contract` (kept on the contract as `triage` for whoever decides it). It changes only the decision counts and that advisory line, never arbitration or the verdict. |
-| `POST /changes/:id/board/record` | bearer | `{type, payload}`: an engine fact only the operator side observes, validated against the board before it is appended (`appendEngineRecord`): `claim.lapsed {item}` (a leased claim recorded `stalled` on a quiet board), `clash.predicted`, `trunk.moved`, `token.refreshed`, `revision.promoted`, `run.capped`, `candidate.gated`, `push.excluded {item, agent, commit, reason}` (addressed to the holder), `item.completed {item, n, pushSeq}` (an engine close after the last gated pass, recorded `closedBy: engine` and addressed to the owner). See "Stalls, re-plans, clashes, proofs, and caps". |
+| `POST /changes/:id/board/record` | bearer | `{type, payload}`: an engine fact only the operator side observes, validated against the board before it is appended (`appendEngineRecord`): `claim.lapsed {item}` (a leased claim recorded `stalled` on a quiet board), `clash.predicted`, `trunk.moved`, `token.refreshed`, `revision.promoted`, `run.capped`, `candidate.gated`, `push.excluded {item, agent, commit, reason}` (addressed to the holder), `item.completed {item, n, pushSeq}` (an engine close after the last gated pass, recorded `closedBy: engine` and addressed to the owner), `integration.started` and `integration.phase` (integration progress; see "Integration progress"). See "Stalls, re-plans, clashes, proofs, and caps". |
 | `POST /changes/:id/board/agent-token` | bearer | `{agent, ttlSeconds?, help?}` (60 to 3600): a REFRESHED, short-lived WRITE token for a joined agent's own repo (with `help`, the granted helper's fork), for runs longer than one token lifetime. `201 {workspaceName, tokenId, token, tokenExpiresAt}`, returned once; the old token is revoked through the read-token revoke route. Same checks as the read-token route. With `help`, a write token also requires the helper still joined (a read token does not). |
 | `POST /changes/:id/board/seam-stalled` | bearer | `{item}`: the board went quiet while this seam item held dependents; the engine appends `seam.stalled {item, released}` (the hold ends; with no push of its owner's the item is released). Refused unless the item holds a dependent. |
 | `POST /changes/:id/integration/revision` | bearer | An integration result `{commit, gate, merged, failing?}`; appends `integrated.rev` and what it triggers (completions and `rebase.needed` on a pass, `fix.requested` / `fix.exhausted` on a fail). |
@@ -160,7 +160,10 @@ speculative candidate; see "Speculative batch gating"), `push.excluded {item, ag
 recorded, addressed to the holder: the integrator left its pending push out because it failed verification; see
 "Excluded pushes"), `push.regressed {item, agent, commit, rev, ratchet, from, to, candidate, evidence, seams?}` (engine,
 recorded, arbitration revision 5, before the first pass, addressed to the holder: the stack of every latest push scored
-strictly better without this push; see "The pre-pass progress ratchet"), `decision.recorded {juncture:
+strictly better without this push; see "The pre-pass progress ratchet"), `integration.started {kind: integrate |
+leave-one-out | speculative, pushes, agents, items, candidates?}` and `integration.phase {started, phase: fetch | merge |
+install | gate | candidate | ended, detail?, elapsedMs?}` (engine, recorded, arbitration revision 2 or later: integration
+PROGRESS only, no board state changes; see "Integration progress"), `decision.recorded {juncture:
 plan-review | attribution | fix-confidence | contract-triage, question, answer?, confidence?, accepted, error?, rev?,
 parsed?, contract?}` (engine, advisory), `decision.resolved {decisionSeq, rev, passed, answer, outcome:
 in-fixed-set | not-in-fixed-set, fixed, parsed, parseOutcome: in-fixed-set | not-in-fixed-set | none}` (engine, derived, advisory),
@@ -1535,6 +1538,54 @@ flag with no value are refused with a clear error. The dial is integers
 `--min`); `--max-inflight` is an integer from 1 to 64; `--token-ttl` is an integer from 60 to 3600 seconds; every numeric
 flag must be a plain decimal number (never coerced: `NaN`, `Infinity`, `1e3`,
 and `0x10` are refused).
+
+### Integration progress (`integration.started`, `integration.phase`)
+
+Between a push and the revision that gates it, the integrator can spend
+minutes reading the agents' repos, merging, installing, and running the gate
+(and, before the first pass, leave-one-out candidates; after it, speculative
+candidates). The local integrator records that work as engine facts so the
+board is not silent meanwhile:
+
+- `integration.started {kind, pushes, agents, items, candidates?}` once a round
+  has read the pushes it will gate: `pushes` are their push.announced seqs,
+  `kind` is `integrate` (every pending push as one revision), `leave-one-out`
+  (the pre-pass ratchet), or `speculative` (up to `candidates` prefix
+  candidates). The ratchet's second gate (the stack without the regressors) is
+  a new round.
+- `integration.phase {started, phase, detail?, elapsedMs?}` at coarse phase
+  changes only: `fetch` (reading and verifying the pushes), `merge`, `install`
+  (the gate's dependency install, reported apart from the gate; the same
+  once-per-tree install), `gate`, and `candidate` (`detail` names the
+  candidate, for example "leave-one-out candidate 2 of 4: the stack without
+  agent-7's push", or one record for candidates gated at once). At most 12
+  phase records per round; a repeat is dropped. `detail` is at most 160
+  characters, never gate output. `elapsedMs` is the time since the round
+  started (omitted by the deterministic offline run). No percentages: nothing
+  is recorded that the integrator did not do.
+- The round ends with what it records: `integrated.rev`, `candidate.gated`, or
+  `push.regressed`. A round that records no revision (the integrator refused,
+  every push was excluded, the pushes moved while the gate ran) ends with one
+  `integration.phase {phase: ended, detail}` saying why.
+
+They are progress only. They change no board state (only the seq), so replay
+(`reduceBoard`, `foldBoard`) folds them as no-ops and arbitration is the same
+with or without them; they are refused on a board under arbitration revision 1,
+whose clocks count engine records (a refused record is ignored and the round
+proceeds). They are never a verdict and never addressed to an agent: agents do
+not see them in their digest and are never woken by them. Nothing is recorded
+once an interrupted run abandons its attempt. Older logs without them replay
+unchanged. The cloud integrator (`--integrator cloud`) does not record them
+yet.
+
+The console reads the open round from the log (`openIntegrationRound`): while
+an `integration.started` is not closed, the graph draws a pulsing neutral
+"integrating revision N" marker at the revision anchor (below a revision drawn
+there) with the current phase, and dashed lines from the items whose pushes
+the round gates (legend: "pushes being integrated"); the narrator line and the
+STORY strip's current chapter read "Integrating revision N (phase)"; and the
+wait reason of a push the round gates reads "waiting for revision N's gate".
+Every drawn element is backed by the round's `integration.started`.
 
 ### Wide pools: agents, model calls, and replacements
 

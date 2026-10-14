@@ -82,6 +82,7 @@ import {
 } from "./board-scale";
 import { chapters as runChapters, formatDuration, narrateAt, narrateMessage, type Chapter, type Narration } from "./narration";
 import { GRADE_INFO, gradeOf, type EvidenceGrade } from "./evidence";
+import { IntegrationMarker, integratingLine, integrationMarkerLayout, integrationSummary, openIntegrationRound } from "./integration-marker";
 import { keyMoments, MOMENT_GROUPS, type MomentKind } from "./replay-data";
 
 /**
@@ -363,6 +364,9 @@ export function payloadSummary(message: BoardMessage): string {
       return `${message.payload.review} on ${message.payload.item}`;
     case "review.result":
       return `${message.payload.review}: ${message.payload.findings.length} finding(s)`;
+    case "integration.started":
+    case "integration.phase":
+      return integrationSummary(message) ?? "";
     default:
       return clip(JSON.stringify((message as BoardMessage).payload), 110);
   }
@@ -513,9 +517,12 @@ export function ChapterStrip({
   onSelect,
   onSeek,
   previews,
+  integrating,
 }: {
   chapters: readonly Chapter[];
   k: number;
+  /** The open integration round's line ("Integrating revision N (phase)"), shown on the current chapter. */
+  integrating?: string | undefined;
   markers: readonly GateMarker[];
   focus: number | null;
   onHover: (n: number | null) => void;
@@ -549,6 +556,7 @@ export function ChapterStrip({
                 <span className="mc-chapter-meta">
                   {span} msg{c.durationMs !== undefined ? ` · ${formatDuration(c.durationMs)}` : ""}
                 </span>
+                {state === "is-current" && integrating ? <span className="mc-chapter-integrating">{integrating}</span> : null}
                 <span className="mc-chapter-fill" style={{ width: `${Math.round(fill * 100)}%` }} aria-hidden="true" />
               </button>
               {marker ? (
@@ -578,9 +586,12 @@ export function Narrator({
   narration,
   onSelectSeq,
   preview,
+  integrating,
 }: {
   narration: Narration | null;
   onSelectSeq: (seq: number) => void;
+  /** The open integration round (its line and its seq), so a long gate is never silence. */
+  integrating?: { readonly line: string; readonly seq: number } | undefined;
   /** The backed preview of the revision this message integrated, if any. */
   preview?: { readonly preview: RevisionPreview; readonly gate: string } | undefined;
 }) {
@@ -610,6 +621,11 @@ export function Narrator({
         <span className="mc-narr-why muted">no recorded cause</span>
       ) : null}
       {preview ? <PreviewLink preview={preview.preview} gate={preview.gate} /> : null}
+      {integrating ? (
+        <button type="button" className="mc-seq-link mc-narr-integrating" onClick={() => onSelectSeq(integrating.seq)} title="the open integration round (progress only; the gate decides)">
+          {integrating.line}
+        </button>
+      ) : null}
       <button type="button" className="mc-seq-link mc-narr-self" onClick={() => onSelectSeq(narration.seq)} title="open this message in the thread">
         {narration.type}
       </button>
@@ -1806,6 +1822,18 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
       occupied.push(textBox(revAnchor.x + 18 - w / 2, revAnchor.y - 26, w, 13 * boost));
     }
   }
+  // The open integration round (progress only), at the anchor or just below a drawn revision.
+  const integration = integrationMarkerLayout({
+    log,
+    k: model.k,
+    anchor: revAnchor,
+    anchorTaken: shownRev !== undefined,
+    items: layout.items,
+    occupied,
+    bounds: { x: -FIT_PAD, y: -FIT_PAD, w: vbW, h: vbH },
+    boost,
+  });
+  if (integration) occupied.push(...integration.boxes);
   if (layout.benchChip && bench.idle.length + bench.left.length > 0) {
     occupied.push({ x: layout.benchChip.x, y: layout.benchChip.y, w: benchW, h: BENCH_CHIP_H });
   }
@@ -1839,6 +1867,7 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
       ...messages.filter((e) => points.has(e.from) && points.has(e.to)),
     ],
     talkDrawn.map((t) => t.arrow),
+    { integrating: integration?.lines.length ?? 0 },
   );
 
   return (
@@ -2093,6 +2122,9 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
                 </g>
               </g>
             ) : null}
+
+            {/* The open integration round: a pulsing marker, its phase, and lines from the items it gates (backed by integration.started). */}
+            {integration ? <IntegrationMarker layout={integration} onSelectSeq={(seq) => choose({ kind: "seq", seq })} /> : null}
 
             {/* Message edges: transient (a dot travels and fades), all (aggregated), or off. */}
             <g className="mc-messages">
@@ -3496,6 +3528,8 @@ export function MissionControl({
   const landed = selectedNode?.detail.kind === "rev" ? speculativeLanded(log, k, selectedNode.detail.n) : undefined;
 
   const narration = narrateAt(log, k, payloadSummary);
+  const openRound = openIntegrationRound(log, k);
+  const integrating = openRound ? { line: integratingLine(openRound), seq: openRound.seq } : undefined;
   const narratedRev = narration?.type === "integrated.rev" ? log.find((m) => m.seq === narration.seq) : undefined;
   const narratedPreview = narratedRev?.type === "integrated.rev" ? backed.get(narratedRev.payload.n) : undefined;
   const narratedMarker = narratedPreview ? markers.find((m) => m.n === narratedPreview.n) : undefined;
@@ -3512,6 +3546,7 @@ export function MissionControl({
             narration={narration}
             onSelectSeq={selectSeqInThread}
             preview={narratedPreview && narratedMarker ? { preview: narratedPreview, gate: GATE_WORD[narratedMarker.verdict] } : undefined}
+            integrating={integrating}
           />
           <Ticker ticker={model.ticker} live={live} k={k} lastSeq={lastSeq} recorded={recorded} teams={subLeadTeams(model)} />
         </div>
@@ -3528,6 +3563,7 @@ export function MissionControl({
             }}
             onSeek={seek}
             previews={backed}
+            integrating={integrating?.line}
           />
         </div>
         {replayBar}
@@ -3672,6 +3708,7 @@ const EDGE_SWATCH_CLASS: Readonly<Record<EdgeVariant, string>> = {
   contest: "mc-edge kind-contest contest-open",
   "contest-escalated": "mc-edge kind-contest contest-escalated",
   message: "mc-edge kind-message",
+  integrating: "mc-edge mc-integrating-line",
 };
 
 /** A legend swatch: a short line (or talk curve) drawn with the real graph classes. */

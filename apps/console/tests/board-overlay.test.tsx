@@ -335,7 +335,7 @@ describe("the on-screen legend", () => {
       [{ kind: "help-ask" }, { kind: "help-offer" }, { kind: "help-offer" }, { kind: "conflict" }],
     );
     expect(present.map((e) => `${e.key} ${e.count}`)).toEqual(["dependency 2", "fork 1", "contest-escalated 1", "talk-help-ask 1", "talk-help-offer 2", "talk-conflict 1"]);
-    expect(absent.map((e) => e.key)).toEqual(["merged", "trigger", "consumed-tool", "contest", "message", "talk-proposal", "talk-contract", "talk-handoff"]);
+    expect(absent.map((e) => e.key)).toEqual(["merged", "trigger", "consumed-tool", "contest", "message", "integrating", "talk-proposal", "talk-contract", "talk-handoff"]);
     expect(absent.find((e) => e.key === "contest")!.hint).toBe("contest: two agents claim the same file");
     expect(absent.find((e) => e.key === "fork")).toBeUndefined();
     expect(edgeVariant(edge("dependency", { label: "merged" }))).toBe("merged");

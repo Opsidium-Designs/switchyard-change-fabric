@@ -224,6 +224,40 @@ export function narrateMessage(message: BoardMessage, log: readonly BoardMessage
     case "push.regressed":
       text = `${item}'s push made revision ${str(p, "rev")} worse, so it is held back until ${str(p, "agent")} pushes again.`;
       break;
+    case "integration.started": {
+      const pushes = Array.isArray(p.pushes) ? p.pushes.filter((s): s is number => typeof s === "number") : [];
+      for (const seq of pushes) cite(seq);
+      const n = index.all(message.seq, (m) => m.type === "integrated.rev").length + 1;
+      const kind = str(p, "kind");
+      const shape =
+        kind === "speculative"
+          ? `, building up to ${str(p, "candidates") || "several"} candidate trees on the passing head`
+          : kind === "leave-one-out"
+            ? ": the whole stack, then (if it scores worse than the best so far) the stack without each new push"
+            : "";
+      text = `The integrator starts on revision ${n} with ${pushes.length} push${pushes.length === 1 ? "" : "es"} from ${list(p, "agents").length} agent(s)${shape}. Nothing is decided until its gate runs.`;
+      break;
+    }
+    case "integration.phase": {
+      const started = Number(p.started);
+      if (Number.isInteger(started)) cite(started);
+      const detail = str(p, "detail");
+      const secs = typeof p.elapsedMs === "number" ? ` (${formatDuration(p.elapsedMs)} in)` : "";
+      const PHASE: Record<string, string> = {
+        fetch: "reads and checks each agent's push",
+        merge: "merges the pushes onto the current head",
+        install: "installs dependencies for the gate",
+        gate: "runs the gate on the integrated tree",
+      };
+      const phase = str(p, "phase");
+      text =
+        phase === "ended"
+          ? `The integration round ends without a revision${detail ? `: ${clip(detail, 140)}` : ""}.`
+          : phase === "candidate"
+            ? `The integrator gates ${detail ? clip(detail, 140) : "a candidate tree"}${secs}.`
+            : `The integrator ${PHASE[phase] ?? phase}${detail ? ` (${clip(detail, 100)})` : ""}${secs}.`;
+      break;
+    }
     case "decision.recorded":
       text = `Advisory model (Jev) on ${str(p, "juncture")}: ${p.error !== undefined ? "the call failed" : str(p, "answer") || "no answer"}. Advice only; it cannot change a verdict.`;
       break;

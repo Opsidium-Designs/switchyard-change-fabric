@@ -503,8 +503,8 @@ export function fixAskState(model: BoardGraphModel, log: readonly BoardMessage[]
 // ---------------------------------------------------------------------------
 
 /** How a drawn line looks: a graph edge kind, split by its style (fork, merged, escalated contest). */
-export type EdgeVariant = "dependency" | "fork" | "merged" | "trigger" | "consumed-tool" | "contest" | "contest-escalated" | "message";
-export const EDGE_VARIANTS: readonly EdgeVariant[] = ["dependency", "fork", "merged", "trigger", "consumed-tool", "contest", "contest-escalated", "message"];
+export type EdgeVariant = "dependency" | "fork" | "merged" | "trigger" | "consumed-tool" | "contest" | "contest-escalated" | "message" | "integrating";
+export const EDGE_VARIANTS: readonly EdgeVariant[] = ["dependency", "fork", "merged", "trigger", "consumed-tool", "contest", "contest-escalated", "message", "integrating"];
 
 /** The style variant a graph edge is drawn in (null for `spawn`, which the board graph never emits). */
 export function edgeVariant(edge: BoardGraphEdge): EdgeVariant | null {
@@ -554,6 +554,11 @@ const LEGEND_TEXT: Readonly<Record<LegendKey, { readonly label: string; readonly
   contest: { label: "contest: two agents claim the same file (until resolved)", name: "contest", hint: "contest: two agents claim the same file" },
   "contest-escalated": { label: "escalated contest: waiting on a human (pulsing)", name: "escalated contest", hint: "escalated contest: a contest handed to a human" },
   message: { label: "message: an addressed message (messages toggle: as they land, or all)", name: "message", hint: "message: turn messages on (as they land, or all)" },
+  integrating: {
+    label: "pushes being integrated: item -> the pulsing revision marker while its integration round runs (progress only; the gate decides)",
+    name: "pushes being integrated",
+    hint: "pushes being integrated: while an integration round (integration.started) is open, from the items whose pushes it gates",
+  },
   "talk-proposal": { label: "proposal", name: "talk: proposal", hint: "talk: an item or tool proposed, accepted, rejected, or re-planned (talk on)" },
   "talk-contract": { label: "contract", name: "talk: contract", hint: "talk: a contract proposed, decided, or escalated (talk on)" },
   "talk-help-ask": { label: "help asked", name: "talk: help asked", hint: "talk: help asked or granted, or a volunteer declined by the owner (talk on)" },
@@ -570,8 +575,11 @@ const LEGEND_TEXT: Readonly<Record<LegendKey, { readonly label: string; readonly
 export function drawnLegend(
   edges: readonly BoardGraphEdge[],
   arrows: readonly Pick<CommArrow, "kind">[],
+  /** Lines drawn that are not graph edges: the open integration round's (see integration-marker.tsx). */
+  overlays: { readonly integrating?: number } = {},
 ): { readonly present: readonly LegendEntry[]; readonly absent: readonly LegendEntry[] } {
   const counts = new Map<LegendKey, number>();
+  if (overlays.integrating) counts.set("integrating", overlays.integrating);
   for (const e of edges) {
     const v = edgeVariant(e);
     if (v !== null) counts.set(v, (counts.get(v) ?? 0) + 1);
