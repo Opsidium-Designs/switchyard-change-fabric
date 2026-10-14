@@ -199,6 +199,8 @@ export interface RunBoardOfflineOptions {
   readonly deployAppName?: string;
   /** Revision previews with an injected uploader (see RunBoardOptions.previewRevision; offline runs pass a fake). */
   readonly previewRevision?: RunBoardOptions["previewRevision"];
+  /** Which revisions are previewed (see RunBoardOptions.previewMode). */
+  readonly previewMode?: RunBoardOptions["previewMode"];
 }
 
 /** An offline run's result, with the Change snapshot the offline control served at the end. */
@@ -287,6 +289,7 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       ...(options.deployAppDir ? { deployAppDir: options.deployAppDir } : {}),
       ...(options.deployAppName ? { deployAppName: options.deployAppName } : {}),
       ...(options.previewRevision ? { previewRevision: options.previewRevision } : {}),
+      ...(options.previewMode ? { previewMode: options.previewMode } : {}),
     });
     // The Change's state projection (what the Worker serves as GET /changes/:id):
     // what a replay export keeps a slim slice of. A run that never created its

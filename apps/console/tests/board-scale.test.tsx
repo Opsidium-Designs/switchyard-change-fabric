@@ -17,6 +17,7 @@ import {
   boardLayout,
   boardNodePoint,
   buildBoardGraph,
+  HULL_TITLE_H,
   type BoardMessage,
 } from "@switchyard-change/orchestration/board-graph";
 
@@ -27,6 +28,13 @@ import {
   boardLanes,
   compactHullTitle,
   COMPACT_MAX_AGENTS,
+  compactDot,
+  COMPACT_DOT_R,
+  COMPACT_DOT_R_MAX,
+  COMPACT_DOT_Y,
+  COMPACT_HULL_W,
+  COMPACT_NESTED_DOT_Y,
+  COMPACT_NESTED_H,
   domainPrefix,
   isLargeBoard,
   laneCaption,
@@ -238,6 +246,40 @@ describe("the scaled layout", () => {
       const hull = layout.items.get(node.detail.hull)!;
       if (node.detail.subLeadOf?.includes(node.detail.hull)) expect(p.x).toBe(hull.x);
       else expect(p.x > hull.x && p.x < hull.x + hull.w && p.y > hull.y && p.y < hull.y + hull.h).toBe(true);
+    }
+  });
+
+  it("grows a compact hull's dots with the text boost (one factor), within the hull's row and clear of its title bar", () => {
+    // Unboosted: the base dot.
+    expect(compactDot(COMPACT_HULL_W, 4, 1)).toEqual({ r: COMPACT_DOT_R, step: 24 });
+    // Boosted like the text (1.8): the dot grows to the cap, and four still fit left of the hull's marks.
+    const big = compactDot(COMPACT_HULL_W, 4, 1.8);
+    expect(big.r).toBe(COMPACT_DOT_R_MAX);
+    expect(big.r).toBeGreaterThan(COMPACT_DOT_R * 1.5);
+    expect(18 + 3 * big.step + big.r).toBeLessThanOrEqual(COMPACT_HULL_W - 40);
+    expect(COMPACT_DOT_Y - big.r).toBeGreaterThan(HULL_TITLE_H);
+    expect(COMPACT_NESTED_DOT_Y - big.r).toBeGreaterThan(HULL_TITLE_H);
+    expect(COMPACT_NESTED_DOT_Y + big.r).toBeLessThanOrEqual(COMPACT_NESTED_H);
+    // A narrow hull keeps the base dot rather than overflow.
+    expect(compactDot(90, 3, 1.8).r).toBe(COMPACT_DOT_R);
+    // Every boosted dot of the 30-agent board stays in its hull, and no two dots of a hull overlap.
+    const layout = scaledBoardLayout(log30);
+    const model = buildBoardGraph(log30, Math.round(last(log30) * 0.5));
+    const byHull = new Map<string, { x: number; y: number }[]>();
+    for (const node of model.nodes) {
+      if (node.detail.kind !== "agent" || node.kind === "lead" || node.detail.hull === undefined || node.detail.subLeadOf?.includes(node.detail.hull)) continue;
+      const hull = layout.items.get(node.detail.hull)!;
+      const p = scaledNodePoint(layout, node, model, 1.8)!;
+      const agents = (model.nodes.find((n) => n.id === `item:${node.detail.kind === "agent" ? node.detail.hull : ""}`)?.detail as { agents: string[] }).agents;
+      if (agents.length > COMPACT_MAX_AGENTS) continue;
+      const { r } = compactDot(hull.w, agents.length, 1.8);
+      expect(p.x - r).toBeGreaterThanOrEqual(hull.x);
+      expect(p.x + r).toBeLessThanOrEqual(hull.x + hull.w - 40);
+      byHull.set(node.detail.hull, [...(byHull.get(node.detail.hull) ?? []), p]);
+    }
+    for (const points of byHull.values()) {
+      const xs = points.map((q) => q.x).sort((a, b) => a - b);
+      for (let i = 1; i < xs.length; i += 1) expect(xs[i]! - xs[i - 1]!).toBeGreaterThan(0);
     }
   });
 });

@@ -91,6 +91,12 @@ export interface Template {
    * `--timeout-ms`). Absent means the CLI's defaults.
    */
   readonly boardOptions?: BoardRunOptions;
+  /**
+   * The text of the template's goal file, filled in by the launcher's GET
+   * /api/templates (never bundled). The console matches a CLI run's objective
+   * against it to find that run's app (?watch=).
+   */
+  readonly goalText?: string;
 }
 
 /**

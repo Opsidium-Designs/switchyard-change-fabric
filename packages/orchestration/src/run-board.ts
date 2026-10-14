@@ -172,7 +172,7 @@ import {
   type GatedUnitInput,
 } from "./run-live.ts";
 import { withWorkerAuth } from "./worker-auth.ts";
-import { checkoutIntegratedCommit, createRevisionPreviewer, type PreviewUploader, type RevisionPreview, type RevisionPreviewEvent, type RevisionPreviewer } from "./revision-preview.ts";
+import { checkoutIntegratedCommit, createRevisionPreviewer, fixedAlias, type PreviewUploader, type RevisionPreview, type RevisionPreviewEvent, type RevisionPreviewer } from "./revision-preview.ts";
 
 
 /** An advisory typed decision and its outcome, as recorded on the board. */
@@ -694,6 +694,13 @@ export interface RunBoardOptions {
    * only with `deployAppDir` and `deployAppName`.
    */
   readonly previewRevision?: PreviewUploader;
+  /**
+   * Which revisions `previewRevision` uploads: "every" (the default, one alias
+   * per revision, failing ones included) or "passing" (only revisions whose
+   * gate ran and passed, all under ONE alias, `fixed-<change tag>`, so the
+   * alias serves the latest passing revision as soon as its gate passes).
+   */
+  readonly previewMode?: "every" | "passing";
   /** How long the run waits at its end for queued previews, in ms (default 120 s). */
   readonly previewDrainMs?: number;
   /** Leave the agents' repos in place at the end. */
@@ -826,6 +833,8 @@ export interface RunBoardResult {
   readonly deployment?: { readonly url: string; readonly app: string };
   /** The revision previews uploaded (advisory; set when previews were on), one per revision, sorted by n. */
   readonly previews?: readonly RevisionPreview[];
+  /** Which revisions were previewed (set with previews): "every", or "passing" only (one alias). */
+  readonly previewMode?: "every" | "passing";
   readonly workRoot: string;
   /** The run's whole scratch directory when it is wider than `workRoot` (the offline run's control repos too). */
   readonly scratchRoot?: string;
@@ -2774,7 +2783,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
 
   // ADVISORY revision previews: each recorded revision's app tree (fail and
   // pass) is uploaded as a Worker version under a preview alias, one at a time,
-  // off the integrator's path. Never a gate; failures are reported only.
+  // off the integrator's path. Never a gate; failures are reported only. In
+  // "passing" mode only gated passing revisions go up, under one alias.
+  const previewPassing = options.previewMode === "passing";
   const previewer: RevisionPreviewer | undefined =
     options.previewRevision && options.deployAppDir && options.deployAppName
       ? createRevisionPreviewer({
@@ -2784,6 +2795,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
           deployAppDir: options.deployAppDir,
           workRoot,
           upload: options.previewRevision,
+          ...(previewPassing ? { aliasFor: () => fixedAlias(changeId, options.deployAppName!) } : {}),
           scrub,
           materialise: async (commit, targetDir) => {
             // The cloud integration repo is read with a fresh short-lived token (sent as a header, never stored).
@@ -2822,7 +2834,9 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
   };
   const onRevision = (revision: BoardRevision): void => {
     emit({ kind: "integrated", revision });
-    previewer?.enqueue(revision.n, revision.commit);
+    if (!previewPassing || (revision.gate === "pass" && revision.gated)) {
+      previewer?.enqueue(revision.n, revision.commit);
+    }
   };
 
   const integrator: BoardIntegratorLike = cloud
@@ -2871,7 +2885,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     ...(inventory ? { testInventory: inventory } : {}),
     onSettled: revokeReadTokens,
     // Revision previews read each failing revision's tree back (advisory).
-    ...(previewer ? { keepFailedCommits: true } : {}),
+    ...(previewer && !previewPassing ? { keepFailedCommits: true } : {}),
     ...(jev ? { jev } : {}),
     ...(options.jevThreshold !== undefined ? { jevThreshold: options.jevThreshold } : {}),
     scrub,
@@ -3988,7 +4002,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     ...(receipt ? { receipt } : {}),
     ...(sourceRepoDir ? { sourceRepoDir } : {}),
     ...(deployment ? { deployment } : {}),
-    ...(previews !== undefined ? { previews } : {}),
+    ...(previews !== undefined ? { previews, previewMode: previewPassing ? ("passing" as const) : ("every" as const) } : {}),
     workRoot,
     cleanedUp,
     toolGates: [...toolBench.gates],
@@ -4931,11 +4945,17 @@ export function formatBoardRunSummary(result: RunBoardResult): string {
   }
   if (result.previews !== undefined) {
     // Advisory: a Worker version per revision (failing ones included), never a deploy and never a verdict.
+    // In "passing" mode only gated passing revisions are uploaded (one alias,
+    // the latest one wins), so only those can be missing.
+    const passingOnly = result.previewMode === "passing";
     const previewed = new Set(result.previews.map((p) => p.n));
     for (const preview of result.previews) {
-      lines.push(`  preview r${preview.n}: ${preview.url}`);
+      lines.push(`  ${passingOnly ? "fixed preview" : "preview"} r${preview.n}: ${preview.url}`);
     }
-    const missing = result.revisions.filter((r) => !previewed.has(r.n)).map((r) => r.n);
+    const missing = result.revisions
+      .filter((r) => !passingOnly || (r.gate === "pass" && r.gated))
+      .filter((r) => !previewed.has(r.n))
+      .map((r) => r.n);
     if (missing.length > 0) {
       lines.push(`  no preview for revision(s) ${missing.join(", ")} (advisory; see the run's preview events)`);
     }

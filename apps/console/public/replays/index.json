@@ -2,6 +2,14 @@
   "format": "switchyard-replay/v1",
   "runs": [
     {
+      "id": "board-live-ch1",
+      "title": "City hall: 30 agents fix 8 departments (passed)",
+      "app": "cityhall",
+      "outcome": "verified",
+      "description": "Thirty worker agents and a lead on a local Claude CLI fix 32 modules across 8 city departments. Two stale developer tests change under human-accepted contracts; acceptance climbs 106, 109, 208, 234, then 237 of 237 at revision 8, which is gated and promoted. All 34 items completed.",
+      "messages": 433
+    },
+    {
       "id": "board-live-sf21",
       "title": "Storefront: correct and safe (passed)",
       "app": "storefront",

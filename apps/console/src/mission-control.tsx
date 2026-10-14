@@ -62,7 +62,7 @@ import {
   BENCH_CHIP_H,
   benchCounts,
   benchLine,
-  COMPACT_DOT_R,
+  compactDot,
   COMPACT_DOT_Y,
   COMPACT_NESTED_DOT_Y,
   COMPACT_HULL_H,
@@ -633,8 +633,10 @@ export function Narrator({
   );
 }
 
-const CHART_W = 260;
-const CHART_H = 96;
+const CHART_W = 310;
+const CHART_H = 130;
+/** About how wide a count label (`181/237`) is in chart units: points closer than this are not all labelled. */
+const CHART_LABEL_W = 46;
 
 /** What each suite is, in plain words (the Board pane's chart headings). */
 export const SUITE_INFO: Readonly<Record<SuiteSeries["suite"], { readonly name: string; readonly explain: string }>> = {
@@ -699,7 +701,8 @@ export function SuiteChart({ series, landed, focus = null }: { series: SuiteSeri
   const story = seriesStory(series);
   const info = SUITE_INFO[series.suite];
   const headline = suiteHeadline(series);
-  const labelled = labelledPoints(series, focus);
+  // Label every point only when the labels have room side by side; otherwise the first, best, last, and focused.
+  const labelled = labelledPoints(series, focus, Math.max(2, Math.floor((CHART_W - 48) / CHART_LABEL_W) + 1));
   const xLabelEvery = Math.max(1, Math.ceil(n / 10));
   return (
     <figure className={`mc-chart suite-${series.suite}`} aria-label={`${series.suite} over revisions`}>
@@ -1560,6 +1563,21 @@ const FIX_ASKED_LABEL = "FAIL: fix asked";
 /** The line over a newly passing latest revision (shown a few seqs, fading). */
 const PASSED_LABEL = "PASS";
 
+/** The largest text in a compact hull's title bar, in drawing units: three quarters of the bar's height. */
+export const COMPACT_BAR_TEXT_MAX = 0.75 * HULL_TITLE_H;
+
+/**
+ * The boost of the text in a hull's title bar. On a full-size board it is the
+ * drawing's text boost; on a large board's compact hulls it is held so the
+ * title is at most COMPACT_BAR_TEXT_MAX: the title follows the hull (its bar)
+ * rather than the boost alone, so it never dwarfs the hull's dots. It never
+ * goes below 1 (the CSS size).
+ */
+export function hullBarBoost(boost: number, compact: boolean): number {
+  if (!compact) return boost;
+  return Math.max(1, Math.min(boost, COMPACT_BAR_TEXT_MAX / HULL_TITLE_FONT));
+}
+
 /** The text boost that keeps labels at their minimum on-screen size at a given drawing scale. */
 export function textBoost(drawingScale: number): number {
   if (!Number.isFinite(drawingScale) || drawingScale <= 0) return 1;
@@ -1667,7 +1685,7 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
       continue;
     }
     if (node.kind === "jev") continue;
-    const p = compact ? scaledNodePoint(layout, node, model) : boardNodePoint(layout, node);
+    const p = compact ? scaledNodePoint(layout, node, model, boost) : boardNodePoint(layout, node);
     if (!p) continue;
     if (node.detail.kind === "agent" && node.detail.hull !== undefined && collapsed.has(node.detail.hull)) {
       // A collapsed hull bundles its agents' edges at the hull center.
@@ -1728,22 +1746,28 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
       const inHull = compact && node.detail.kind === "agent" && node.kind !== "lead" && node.detail.hull !== undefined ? layout.items.get(node.detail.hull) : undefined;
       // In a compact hull only the first dot (or the sub-lead) is labelled, to its right, cut to the hull.
       const hullAgents = inHull && node.detail.kind === "agent" ? itemAgents.get(node.detail.hull!) ?? [] : [];
+      // The hull's dot grows with the text boost (one factor for both), as far as the hull's row allows.
+      const dot = compactDot(inHull?.w ?? 0, hullAgents.length, boost);
+      const compactX = dot.r + 4 + (node.detail.kind === "agent" && !node.detail.subLeadOf?.includes(node.detail.hull!) ? (hullAgents.length - 1) * dot.step : 0);
       const compactLabel =
         inHull && node.detail.kind === "agent" && (hullAgents[0] === node.detail.agent || node.detail.subLeadOf?.includes(node.detail.hull!))
           ? ellipsizeToWidth(
               `${agentShortLabel(node.label)}${node.detail.subLeadOf?.includes(node.detail.hull!) ? " (sub-lead)" : hullAgents.length > 1 ? ` +${hullAgents.length - 1}` : ""}`,
-              inHull.x + inHull.w - p.x - 14 - 60 - (hullAgents.length - 1) * 24,
+              inHull.x + inHull.w - p.x - compactX - 61,
               11 * boost,
             )
           : null;
-      const compactX = COMPACT_DOT_R + 4 + (node.detail.kind === "agent" && !node.detail.subLeadOf?.includes(node.detail.hull!) ? (hullAgents.length - 1) * 24 : 0);
-      return [{ node, p, inHull: inHull !== undefined, compactLabel, compactX }];
+      return [{ node, p, inHull: inHull !== undefined, compactLabel, compactX, dotR: dot.r }];
     });
 
   // Each hull's status pill and held-elsewhere marker (computed once: drawn below and kept clear of labels).
   const agentHull = new Map<string, string>();
   for (const n of model.nodes) if (n.detail.kind === "agent" && n.detail.hull !== undefined) agentHull.set(n.detail.agent, n.detail.hull);
   const hullExtras = new Map<string, { header: ReturnType<typeof hullHeader>; statusText: string; aside: ReturnType<typeof hullAside> }>();
+  // The text in a hull's title bar (its title and status pill): boosted like
+  // all text, but on a large board's compact hulls held to the bar it sits in
+  // (hullBarBoost), so a title follows its hull's size instead of the boost alone.
+  const barBoost = hullBarBoost(boost, compact);
   for (const node of model.nodes) {
     if (node.detail.kind !== "item") continue;
     const d = node.detail;
@@ -1751,7 +1775,7 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
     if (!rect) continue;
     const statusText = `${node.status}${fixAsks.get(d.item)?.state === "open" ? ` / fix ${d.fixAttempts}` : ""}`;
     const title = itemLabels.get(d.item) ?? d.item;
-    const header = hullHeader({ title: compact ? compactHullTitle(d.item, title, rect.parent ?? laneOfItem.get(d.item)) : title, status: statusText, width: rect.w, boost });
+    const header = hullHeader({ title: compact ? compactHullTitle(d.item, title, rect.parent ?? laneOfItem.get(d.item)) : title, status: statusText, width: rect.w, boost: barBoost });
     const ownerHull = d.owner !== undefined ? agentHull.get(d.owner) : undefined;
     const aside = hullAside({
       rect,
@@ -1985,14 +2009,22 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
                         className="mc-hull-title"
                         x={rect.x + 14}
                         y={rect.y + 22}
-                        {...(header.scale !== undefined ? { style: { fontSize: `calc(15px * var(--mc-t, 1) * ${header.scale})` } } : {})}
+                        {...(barBoost !== boost || header.scale !== undefined
+                          ? { style: { fontSize: `${(HULL_TITLE_FONT * barBoost * (header.scale ?? 1)).toFixed(2)}px` } }
+                          : {})}
                       >
                         {header.title}
                       </text>
                       {header.badge.w > 0 ? (
                         <>
                           <rect className="mc-hull-badge" x={rect.x + header.badge.x} y={rect.y + 7} width={header.badge.w} height={HULL_TITLE_H - 14} rx={9} />
-                          <text className="mc-hull-status" x={rect.x + header.badge.x + header.badge.w / 2} y={rect.y + 21} textAnchor="middle">
+                          <text
+                            className="mc-hull-status"
+                            x={rect.x + header.badge.x + header.badge.w / 2}
+                            y={rect.y + 21}
+                            textAnchor="middle"
+                            {...(barBoost !== boost ? { style: { fontSize: `${(HULL_STATUS_FONT * barBoost).toFixed(2)}px` } } : {})}
+                          >
                             {header.status}
                           </text>
                         </>
@@ -2156,7 +2188,7 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
 
             {/* Nodes (agents tween between hulls via a CSS transform transition). Revisions and decisions live outside the drawing. */}
             <g className="mc-nodes">
-              {drawnNodes.map(({ node, p, inHull, compactLabel, compactX }) => {
+              {drawnNodes.map(({ node, p, inHull, compactLabel, compactX, dotR }) => {
                   const isSel = selected === node.id;
                   return (
                     <g
@@ -2172,7 +2204,7 @@ export function BoardGraphView({ model, layout: given, selection, log, messageMo
                     >
                       {inHull ? (
                         <>
-                          <circle className="shape" r={COMPACT_DOT_R} />
+                          <circle className="shape" r={dotR} />
                           {compactLabel ? (
                             <text className="mc-node-label is-compact" textAnchor="start" x={compactX} y={4}>
                               {compactLabel}
@@ -2280,6 +2312,8 @@ interface DrawnNode {
   readonly inHull: boolean;
   readonly compactLabel: string | null;
   readonly compactX: number;
+  /** The radius of a compact hull's dot (compactDot: it grows with the text boost). */
+  readonly dotR: number;
 }
 
 /** One talk arrow (or mark) as drawn: its curve (null for a mark) and its placed label (null when no spot was free). */
@@ -2317,7 +2351,7 @@ function shapeRadius(node: BoardGraphNode): number {
 function nodeBoxes(d: DrawnNode, boost: number): Box[] {
   const { node, p } = d;
   if (d.inHull) {
-    const boxes: Box[] = [{ x: p.x - COMPACT_DOT_R, y: p.y - COMPACT_DOT_R, w: 2 * COMPACT_DOT_R, h: 2 * COMPACT_DOT_R }];
+    const boxes: Box[] = [{ x: p.x - d.dotR, y: p.y - d.dotR, w: 2 * d.dotR, h: 2 * d.dotR }];
     if (d.compactLabel) {
       const w = d.compactLabel.length * 11 * boost * CHAR_EM;
       boxes.push(textBox(p.x + d.compactX + w / 2, p.y + 4, w, 11 * boost));
@@ -3314,6 +3348,8 @@ export function ReplayBar({
 /** How long a landed message's edge stays visible (live mode) and its caption floats. */
 const MESSAGE_FADE_MS = 4000;
 const CAPTION_MS = 3000;
+/** Following a live run, talk arrows are hidden once no message has landed for this long. */
+export const TALK_QUIET_MS = 15000;
 /** A big jump (a first load, a replay seek) animates only its latest messages. */
 const MAX_ANIMATED = 12;
 
@@ -3391,6 +3427,9 @@ export function MissionControl({
   // transient message edges and the captions.
   const arrivals = useRef(new Map<number, number>());
   const previousK = useRef<number | null>(null);
+  // When the cursor last moved forward: following a live run, talk arrows fade once the board has been quiet a while
+  // (a long integration posts nothing), instead of the last few arrows staying up as if stuck.
+  const lastAdvance = useRef(Date.now());
   const [now, setNow] = useState(0);
   useEffect(() => {
     const prev = previousK.current;
@@ -3399,6 +3438,7 @@ export function MissionControl({
       return;
     }
     const t = Date.now();
+    lastAdvance.current = t;
     for (let s = Math.max(prev + 1, k - MAX_ANIMATED + 1); s <= k; s += 1) {
       arrivals.current.set(s, t);
     }
@@ -3455,7 +3495,8 @@ export function MissionControl({
   }, []);
 
   // The overlays at K: the talk arrows, the gate timeline, the progress chart, the advisory decisions.
-  const arrows = useMemo(() => (talk ? (attempt(() => communicationArrows(log, k)).value ?? []) : []), [log, k, talk]);
+  const quietLive = live && now > 0 && now - lastAdvance.current > TALK_QUIET_MS;
+  const arrows = useMemo(() => (talk && !quietLive ? (attempt(() => communicationArrows(log, k)).value ?? []) : []), [log, k, talk, quietLive]);
   const chart = useMemo(() => attempt(() => progressChart(log, k)).value ?? { series: [] }, [log, k]);
 
   const story = useMemo(() => runChapters(log), [log]);

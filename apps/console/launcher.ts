@@ -15,7 +15,15 @@
  *   POST /api/deploy-app {templateId|app}  MANUALLY deploy that app in its
  *                                  CURRENT (broken) state to its STABLE live URL,
  *                                  BEFORE any fix, and return the workers.dev URL
- *   GET  /api/runs/:id            the launcher-side status of a launched run
+ *                                  (409 while another launched run is still
+ *                                  running: one live run at a time)
+ *   GET  /api/runs                every run this launcher launched (newest
+ *                                  first) and the active one, if any
+ *   GET  /api/runs/:id            the launcher-side status of a launched run,
+ *                                  with its promoted repo/commit once printed
+ *   POST /api/publish-fixed {changeId}  upload that launched run's promoted
+ *                                  commit as the fixed preview of its app
+ *                                  (`publish-fixed` CLI; refused unless verified)
  *   GET  /api/deployments         the app URLs already deployed (read from the
  *                                  gitignored .deployments/<app>.json markers),
  *                                  so a console reload remembers a prior Deploy
@@ -79,20 +87,118 @@ const REPO_ROOT = resolve(CONSOLE_DIR, "..", "..");
 /** The Worker base URL the launched run drives (same default as the console). */
 const WORKER_URL = process.env.VITE_WORKER_URL ?? "http://127.0.0.1:8787";
 
+/** A launched run's promotion, as the run's own output printed it. */
+export interface PromotedOutput {
+  readonly branch: string;
+  /** The commit as printed (abbreviated; publish-fixed resolves it in the repo). */
+  readonly commit: string;
+}
+
+/** The fixed version published for a run (publish-fixed's output). */
+export interface FixedVersion {
+  readonly url: string;
+  readonly commit: string;
+}
+
 /** A launched run the launcher is tracking. */
-interface LaunchedRun {
+export interface LaunchedRun {
   readonly changeId: string;
   readonly templateId: string;
-  readonly child: ChildProcess;
+  readonly child?: ChildProcess;
   status: "running" | "exited";
   exitCode: number | null;
   /** run-live, or agents on the board (run-board). */
   readonly mode: LaunchMode;
+  /** ISO time of the launch. */
+  readonly startedAt: string;
   /** The last lines of CLI output, kept small for an honest status read. */
   readonly log: string[];
+  /** The promoted repo the run printed (`repo: <dir>`, or run-live's `... in <dir>`). */
+  repoDir?: string;
+  /** The promotion the run printed (`promoted: ...`); only a verified promotion is kept. */
+  promoted?: PromotedOutput;
+  /** The fixed version published from the promoted commit (POST /api/publish-fixed). */
+  fixed?: FixedVersion;
+  /** A publish-fixed in flight, or its last error. */
+  publish?: { readonly kind: "publishing" } | { readonly kind: "failed"; readonly error: string; readonly output: readonly string[] };
+  /** An output line cut across two chunks, joined with the next one. */
+  partial?: string;
 }
 
 const runs = new Map<string, LaunchedRun>();
+
+/** True while a launch is between its 409 check and the run being tracked (a pre-deploy can take a while). */
+let launching = false;
+
+/**
+ * What one line of a launched run's output says about its promotion, if
+ * anything. The CLI prints (after leading spaces):
+ *   run-board: `promoted: branch <b> commit <c>` then `repo: <dir>`
+ *   run-live:  `promoted: <b> (<c>) in <dir>`
+ * An unverified promotion (`promoted unverified (no gate): ...`) and a refused
+ * one are ignored: there is no fixed version to publish from them. Exported for tests.
+ */
+export function parseRunOutputLine(line: string): { readonly repoDir?: string; readonly promoted?: PromotedOutput } | undefined {
+  const text = line.trim();
+  const board = text.match(/^promoted: branch (\S+) commit ([0-9a-f]{7,64})$/);
+  if (board) {
+    return { promoted: { branch: board[1]!, commit: board[2]! } };
+  }
+  const live = text.match(/^promoted: (\S+) \(([0-9a-f]{7,64})\) in (\/.+)$/);
+  if (live) {
+    return { promoted: { branch: live[1]!, commit: live[2]! }, repoDir: live[3]! };
+  }
+  const repo = text.match(/^repo: (\/.+)$/);
+  if (repo) {
+    return { repoDir: repo[1]! };
+  }
+  return undefined;
+}
+
+/** The public view of a tracked run (GET /api/runs and /api/runs/:id). */
+export function runView(run: LaunchedRun, withLog = false): Record<string, unknown> {
+  return {
+    changeId: run.changeId,
+    templateId: run.templateId,
+    status: run.status,
+    exitCode: run.exitCode,
+    mode: run.mode,
+    startedAt: run.startedAt,
+    ...(run.repoDir !== undefined ? { repoDir: run.repoDir } : {}),
+    ...(run.promoted !== undefined ? { promoted: run.promoted } : {}),
+    ...(run.fixed !== undefined ? { fixed: run.fixed } : {}),
+    ...(run.publish !== undefined ? { publish: run.publish } : {}),
+    ...(withLog ? { log: run.log } : {}),
+  };
+}
+
+/** The launched run still running, if any: only one live run at a time. */
+export function activeRun(tracked: Iterable<LaunchedRun> = runs.values()): LaunchedRun | undefined {
+  for (const run of tracked) {
+    if (run.status === "running") {
+      return run;
+    }
+  }
+  return undefined;
+}
+
+/** The 409 a launch gets while another launched run is still running (or one is being launched). */
+export function launchConflict(tracked: Iterable<LaunchedRun> = runs.values(), launchInFlight = false): EndpointResult | undefined {
+  const active = activeRun(tracked);
+  if (active) {
+    return {
+      status: 409,
+      body: {
+        error: `a run is in progress: ${active.changeId} (${active.templateId}). One live run at a time: wait for it to finish.`,
+        activeRun: { changeId: active.changeId, templateId: active.templateId, mode: active.mode, startedAt: active.startedAt },
+      },
+    };
+  }
+  if (launchInFlight) {
+    return { status: 409, body: { error: "another launch is starting. One live run at a time." } };
+  }
+  return undefined;
+}
 
 /**
  * Mask URL userinfo and bare Artifact tokens (a failed `git clone` echoes its
@@ -105,11 +211,26 @@ export function redactSecrets(text: string): string {
     .replace(/\bart_v\d+_[A-Za-z0-9_%.=-]+/g, "art_***");
 }
 
-/** Append a line to a run's small rolling log. */
-function pushLog(run: LaunchedRun, chunk: string): void {
-  for (const line of chunk.split(/\r?\n/)) {
+/**
+ * Append a chunk of a run's output to its small rolling log, and keep what it
+ * says about the promotion (the log scrolls; the promotion must not). Lines
+ * are split on newlines; a line cut across two chunks is joined first.
+ * Exported for tests.
+ */
+export function pushLog(run: LaunchedRun, chunk: string): void {
+  const text = (run.partial ?? "") + chunk;
+  const parts = text.split(/\r?\n/);
+  run.partial = parts.pop() ?? "";
+  for (const line of parts) {
     if (line.trim() === "") {
       continue;
+    }
+    const said = parseRunOutputLine(line);
+    if (said?.promoted) {
+      run.promoted = said.promoted;
+    }
+    if (said?.repoDir) {
+      run.repoDir = said.repoDir;
     }
     run.log.push(redactSecrets(line));
     if (run.log.length > 50) {
@@ -244,11 +365,13 @@ export function launchRequestFromBody(
  * app, and gate as its run-live launch, the template's own board agent counts,
  * plus the template's own board
  * budget flags (`--max-inflight`, `--max-turns`, `--timeout-ms`) when it
- * declares them. When the template's app is currently deployed (a manual
- * Deploy left its Worker live), `--preview-revisions` uploads each integrated
- * revision as a Worker VERSION under a preview alias (never a production
- * deploy), so every revision gets a link and the passing one is the fixed app;
- * a preview needs that Worker to exist, so it is not passed otherwise.
+ * declares them. When the template's app is deployed (its Worker serves the
+ * original at the production URL), `--preview-passing` uploads each revision
+ * whose gate passes as a Worker VERSION under ONE alias, `fixed-<change tag>`
+ * (never a production deploy; failing revisions are not uploaded), so the run
+ * has a before and an after side by side as soon as a revision passes, and the
+ * production URL keeps the original. A version needs that Worker to exist, so
+ * it is not passed otherwise (the launcher deploys the original first).
  * `--decide-contracts` is passed ONLY for an automatic policy (and stays last);
  * otherwise each contract decision waits for the human's answer in the console.
  */
@@ -281,7 +404,7 @@ export function runBoardArgs(
     args.push("--deploy-app", resolve(REPO_ROOT, "examples/apps", template.app));
     args.push("--deploy-app-name", `switchyard-change-fabric-${template.app}`);
     if (appDeployed) {
-      args.push("--preview-revisions");
+      args.push("--preview-passing");
     }
   }
   // A board run is always held to the project's declared gate: both board
@@ -297,7 +420,7 @@ export function runBoardArgs(
 
 /**
  * The CLI args for a launch, by mode. `appDeployed` (the template's app has a
- * live deployment marker) turns on revision previews for a board run; run-live
+ * live deployment marker) turns on the fixed preview for a board run; run-live
  * has no preview route and keeps its redeploy-in-place behavior. Exported for tests.
  */
 export function launchArgs(
@@ -586,34 +709,202 @@ export async function teardownAppRequest(body: Record<string, unknown>, spawnFn:
   return { status: 502, body: { app, ok: false, error: `could not remove ${app}`, output: result.output } };
 }
 
-/** Spawn a launch child for a template (with its own agent counts) and track it. */
-async function launch(template: Template, options: LaunchOptions): Promise<LaunchedRun> {
-  const changeId = freshChangeId(template);
-  // A deployed app (a live marker) gets revision previews on a board run.
-  const appDeployed = template.app
-    ? (await readDeployedUrls(REPO_ROOT, [template.app]))[template.app] !== undefined
-    : false;
-  const args = launchArgs(template, changeId, options, appDeployed);
-  // The spawned CLI reads .env into memory itself: no credential is forwarded
-  // through its environment (code it runs could read a parent's environ).
-  const child = spawn("npm", args, cliSpawnOptions());
-  const run: LaunchedRun = {
+/** What a launch needs; injectable so tests run with a fake spawn and their own run table. */
+export interface LaunchDeps {
+  readonly spawnFn: SpawnFn;
+  readonly tracked: Map<string, LaunchedRun>;
+  /** Whether the app is deployed now (its .deployments marker). */
+  readonly appDeployed: (app: string) => Promise<boolean>;
+  /** The one-launch-at-a-time latch across the pre-deploy. */
+  readonly state: { launching: boolean };
+}
+
+const defaultLaunchDeps: LaunchDeps = {
+  spawnFn: spawn,
+  tracked: runs,
+  appDeployed: async (app) => (await readDeployedUrls(REPO_ROOT, [app]))[app] !== undefined,
+  state: {
+    get launching() {
+      return launching;
+    },
+    set launching(value: boolean) {
+      launching = value;
+    },
+  },
+};
+
+/**
+ * POST /api/launch: start a run of a template with a fresh unique id and track
+ * it. Refused with 409 while a launched run is still running (one live run at
+ * a time; the body names it). A BOARD run of an app template gets the fixed
+ * preview (`--preview-passing`), which needs the app's Worker: when the app is
+ * not deployed, the launcher deploys the ORIGINAL first (the same deploy-app
+ * command as the Deploy button), so the before is live from the start; if that
+ * deploy fails the run still launches, without the fixed preview, and the
+ * response says why. Exported for tests.
+ */
+export async function launchRequest(body: Record<string, unknown>, deps: LaunchDeps = defaultLaunchDeps): Promise<EndpointResult> {
+  const resolved = launchRequestFromBody(body);
+  if (!resolved.ok) {
+    return { status: 400, body: { error: resolved.error } };
+  }
+  const conflict = launchConflict(deps.tracked.values(), deps.state.launching);
+  if (conflict) {
+    return conflict;
+  }
+  const { template, options } = resolved;
+  deps.state.launching = true;
+  try {
+    const changeId = freshChangeId(template);
+    let appDeployed = template.app ? await deps.appDeployed(template.app) : false;
+    let deployedOriginal: string | undefined;
+    let previewSkipped: string | undefined;
+    if (template.app && options.mode === "board" && !appDeployed) {
+      const deployed = await deployAppRequest({ templateId: template.id }, deps.spawnFn);
+      if (deployed.status === 201 && typeof deployed.body.url === "string") {
+        appDeployed = true;
+        deployedOriginal = deployed.body.url;
+      } else {
+        previewSkipped = `the original ${template.app} could not be deployed first, so this run has no fixed preview: ${String(deployed.body.error ?? "deploy failed")}`;
+      }
+    }
+    const args = launchArgs(template, changeId, options, appDeployed);
+    // The spawned CLI reads .env into memory itself: no credential is forwarded
+    // through its environment (code it runs could read a parent's environ).
+    const child = deps.spawnFn("npm", args, cliSpawnOptions());
+    const run: LaunchedRun = {
+      changeId,
+      templateId: template.id,
+      child,
+      status: "running",
+      exitCode: null,
+      mode: options.mode,
+      startedAt: new Date().toISOString(),
+      log: [],
+    };
+    child.stdout?.on("data", (data: Buffer) => pushLog(run, data.toString("utf8")));
+    child.stderr?.on("data", (data: Buffer) => pushLog(run, data.toString("utf8")));
+    child.on("error", (error: Error) => {
+      pushLog(run, `\n${error.message}\n`);
+      run.status = "exited";
+    });
+    child.on("exit", (code) => {
+      pushLog(run, "\n");
+      run.status = "exited";
+      run.exitCode = code;
+    });
+    deps.tracked.set(changeId, run);
+    return {
+      status: 201,
+      body: {
+        changeId,
+        templateId: template.id,
+        escalates: template.escalates,
+        mode: options.mode,
+        ...(deployedOriginal !== undefined ? { deployedOriginal } : {}),
+        ...(previewSkipped !== undefined ? { previewSkipped } : {}),
+      },
+    };
+  } finally {
+    deps.state.launching = false;
+  }
+}
+
+/** The `publish-fixed` CLI args: upload the run's promoted commit as the fixed preview of its app. */
+export function publishFixedArgs(changeId: string, app: string, repoDir: string, promoted: PromotedOutput): string[] {
+  return [
+    "-w",
+    "apps/cli",
+    "run",
+    "dev",
+    "--",
+    "publish-fixed",
+    "--change-id",
     changeId,
-    templateId: template.id,
-    child,
-    status: "running",
-    exitCode: null,
-    mode: options.mode,
-    log: [],
-  };
-  child.stdout?.on("data", (data: Buffer) => pushLog(run, data.toString("utf8")));
-  child.stderr?.on("data", (data: Buffer) => pushLog(run, data.toString("utf8")));
-  child.on("exit", (code) => {
-    run.status = "exited";
-    run.exitCode = code;
-  });
-  runs.set(changeId, run);
-  return run;
+    "--app",
+    app,
+    "--repo",
+    repoDir,
+    "--commit",
+    promoted.commit,
+    "--branch",
+    promoted.branch,
+    "--worker",
+    WORKER_URL,
+  ];
+}
+
+/**
+ * POST /api/publish-fixed {changeId}: publish the fixed version of a run THIS
+ * launcher launched, from the promoted repo and commit its own output printed.
+ * The browser names only the run; the repo, commit, branch, and app come from
+ * the launcher's own tracking and the template. The CLI refuses unless the
+ * Worker records the run as verified by a gate that ran (see publish-fixed.ts).
+ * Exported for tests.
+ */
+export async function publishFixedRequest(
+  body: Record<string, unknown>,
+  deps: { readonly spawnFn: SpawnFn; readonly tracked: Map<string, LaunchedRun> } = defaultLaunchDeps,
+): Promise<EndpointResult> {
+  const changeId = typeof body.changeId === "string" ? body.changeId : "";
+  const run = changeId === "" ? undefined : deps.tracked.get(changeId);
+  if (!run) {
+    return { status: 404, body: { error: `no launched run ${changeId || "(none)"}: only a run launched from this console can be published here` } };
+  }
+  const app = templateById(run.templateId)?.app;
+  if (!app) {
+    return { status: 400, body: { error: `${run.templateId} has no app to publish` } };
+  }
+  if (run.fixed) {
+    return { status: 200, body: { changeId, app, fixed: run.fixed } };
+  }
+  if (run.status === "running") {
+    return { status: 409, body: { error: "the run is still running: publish its fixed version after it has promoted and exited" } };
+  }
+  if (!run.promoted || !run.repoDir) {
+    return { status: 409, body: { error: "the run printed no verified promotion (no promoted commit and repo), so there is no fixed version to publish" } };
+  }
+  if (run.publish?.kind === "publishing") {
+    return { status: 409, body: { error: "the fixed version is already being published" } };
+  }
+  run.publish = { kind: "publishing" };
+  const result = await runCli(deps.spawnFn, publishFixedArgs(changeId, app, run.repoDir, run.promoted));
+  const url = result.output.map((line) => line.trim().match(/^fixed version: (https:\/\/\S+\.workers\.dev\S*)$/)?.[1]).find((u) => u !== undefined);
+  const commit = result.output.map((line) => line.trim().match(/^fixed: ([0-9a-f]{7,64}) /)?.[1]).find((c) => c !== undefined);
+  if (result.code === 0 && url) {
+    run.fixed = { url, commit: commit ?? run.promoted.commit };
+    run.publish = undefined;
+    return { status: 201, body: { changeId, app, fixed: run.fixed } };
+  }
+  const error = "publishing the fixed version did not complete";
+  run.publish = { kind: "failed", error, output: result.output };
+  return { status: 502, body: { changeId, app, error, output: result.output } };
+}
+
+/**
+ * GET /api/templates: the gallery descriptors, each with its goal file's text
+ * (`goalText`, read from the fixed repo-relative goal file), so the console
+ * can find the app of a run started from the CLI by its objective. A goal file
+ * that cannot be read is simply left out.
+ */
+export async function templatesWithGoalText(repoRoot: string = REPO_ROOT, templates: readonly Template[] = TEMPLATES): Promise<Template[]> {
+  return Promise.all(
+    templates.map(async (template) => {
+      const goalFile = boardGoalFileOf(template);
+      if (goalFile === undefined) return template;
+      try {
+        return { ...template, goalText: (await readFile(resolve(repoRoot, goalFile), "utf8")).trim() };
+      } catch {
+        return template;
+      }
+    }),
+  );
+}
+
+/** GET /api/runs: every run this launcher launched (newest first) and the one still running, if any. */
+export function listRuns(tracked: Map<string, LaunchedRun> = runs): Record<string, unknown> {
+  const list = [...tracked.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt)).map((run) => runView(run));
+  return { runs: list, active: activeRun(tracked.values())?.changeId ?? null };
 }
 
 /**
@@ -631,7 +922,7 @@ export function launcherPlugin(): Plugin {
           next();
           return;
         }
-        sendJson(res, 200, { templates: TEMPLATES });
+        void templatesWithGoalText().then((templates) => sendJson(res, 200, { templates }));
       });
 
       server.middlewares.use("/api/deployments", (req, res, next) => {
@@ -649,26 +940,33 @@ export function launcherPlugin(): Plugin {
           next();
           return;
         }
-        void readJson(req).then((body) => {
-          const resolved = launchRequestFromBody(body);
-          if (!resolved.ok) {
-            sendJson(res, 400, { error: resolved.error });
-            return;
-          }
-          const { template, options } = resolved;
-          return launch(template, options).then((run) =>
-            sendJson(res, 201, {
-              changeId: run.changeId,
-              templateId: run.templateId,
-              escalates: template.escalates,
-              mode: run.mode,
-            }),
-          );
-        }).catch(() => {
-          if (!res.headersSent) {
-            sendJson(res, 500, { error: "launch failed" });
-          }
-        });
+        void readJson(req)
+          .then((body) => launchRequest(body))
+          .then((result) => sendJson(res, result.status, result.body))
+          .catch(() => {
+            if (!res.headersSent) {
+              sendJson(res, 500, { error: "launch failed" });
+            }
+          });
+      });
+
+      server.middlewares.use("/api/publish-fixed", (req, res, next) => {
+        if (req.method !== "POST") {
+          next();
+          return;
+        }
+        // Publish a launched run's fixed version: its promoted commit, as a
+        // preview version of the app's Worker beside the original. The body
+        // names only the run; everything else comes from the launcher's own
+        // tracking of that run's output.
+        void readJson(req)
+          .then((body) => publishFixedRequest(body))
+          .then((result) => sendJson(res, result.status, result.body))
+          .catch(() => {
+            if (!res.headersSent) {
+              sendJson(res, 500, { error: "publish failed" });
+            }
+          });
       });
 
       server.middlewares.use("/api/deploy-app", (req, res, next) => {
@@ -717,20 +1015,24 @@ export function launcherPlugin(): Plugin {
           next();
           return;
         }
-        const id = decodeURIComponent((req.url ?? "").replace(/^\/+/, "").split("?")[0] ?? "");
-        const run = id === "" ? undefined : runs.get(id);
+        let id: string;
+        try {
+          id = decodeURIComponent((req.url ?? "").replace(/^\/+/, "").split("?")[0] ?? "");
+        } catch {
+          sendJson(res, 400, { error: "malformed run id" });
+          return;
+        }
+        if (id === "") {
+          // The listing: every run this launcher launched, and the active one.
+          sendJson(res, 200, listRuns());
+          return;
+        }
+        const run = runs.get(id);
         if (!run) {
           sendJson(res, 404, { error: `no launched run ${id}` });
           return;
         }
-        sendJson(res, 200, {
-          changeId: run.changeId,
-          templateId: run.templateId,
-          status: run.status,
-          exitCode: run.exitCode,
-          mode: run.mode,
-          log: run.log,
-        });
+        sendJson(res, 200, runView(run, true));
       });
 
       // The console's MUTATION proxy. Connect strips the mount prefix, so

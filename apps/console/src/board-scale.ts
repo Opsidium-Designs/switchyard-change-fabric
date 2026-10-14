@@ -417,10 +417,40 @@ export function scaledBoardLayout(log: readonly BoardMessage[]): ScaledBoardLayo
 }
 
 /** Where an agent's dot sits inside a compact hull: a row below the title, by its index in the hull's agents at K. */
-export function compactAgentPoint(hull: BoardHullRect, index: number): BoardPoint {
+export function compactAgentPoint(hull: BoardHullRect, index: number, dot: CompactDot = { r: COMPACT_DOT_R, step: COMPACT_DOT_STEP }): BoardPoint {
   const nested = (hull.depth ?? 0) > 0;
-  const perRow = Math.max(1, Math.min(COMPACT_MAX_AGENTS, Math.floor((hull.w - 24) / COMPACT_DOT_STEP)));
-  return { x: hull.x + 18 + (index % perRow) * COMPACT_DOT_STEP, y: hull.y + (nested ? COMPACT_NESTED_DOT_Y : COMPACT_DOT_Y) };
+  const perRow = Math.max(1, Math.min(COMPACT_MAX_AGENTS, Math.floor((hull.w - 24) / dot.step)));
+  return { x: hull.x + 18 + (index % perRow) * dot.step, y: hull.y + (nested ? COMPACT_NESTED_DOT_Y : COMPACT_DOT_Y) };
+}
+
+/** The largest compact dot radius: the dot row keeps clear of the title bar and the hull's done and struggling marks. */
+export const COMPACT_DOT_R_MAX = 14;
+
+/** A compact hull's dot: its radius and the step between dots. */
+export interface CompactDot {
+  readonly r: number;
+  readonly step: number;
+}
+
+/**
+ * The dot an agent is drawn with in a compact hull at a drawing boost. The
+ * text of a fitted drawing is boosted (textBoost) so it keeps a minimum
+ * on-screen size; the dots grow by the SAME factor, so a large board's dots
+ * keep their size next to its titles instead of shrinking under them. The
+ * growth is capped so the hull's dots (up to COMPACT_MAX_AGENTS) still fit
+ * one row left of the hull's marks: radius COMPACT_DOT_R (the unboosted size)
+ * to COMPACT_DOT_R_MAX, step 2r + 4. A hull too narrow for bigger dots keeps
+ * the unboosted dot.
+ */
+export function compactDot(hullWidth: number, agents: number, boost = 1): CompactDot {
+  const n = Math.max(1, Math.min(COMPACT_MAX_AGENTS, agents));
+  const wanted = Math.min(COMPACT_DOT_R_MAX, Math.max(COMPACT_DOT_R, COMPACT_DOT_R * (Number.isFinite(boost) ? boost : 1)));
+  // The row runs from x = 18 and ends 40 short of the hull's right edge (the done check and struggling mark).
+  const room = hullWidth - 40 - 18;
+  // 18 + (n - 1) * (2r + 4) + r <= hullWidth - 40
+  const fits = Math.floor((room - (n - 1) * 4) / (2 * (n - 1) + 1));
+  const r = Math.max(COMPACT_DOT_R, Math.min(wanted, fits));
+  return { r, step: Math.max(COMPACT_DOT_STEP, Math.ceil(2 * r + 4)) };
 }
 
 /**
@@ -428,7 +458,7 @@ export function compactAgentPoint(hull: BoardHullRect, index: number): BoardPoin
  * small board; on a large board an agent in a hull sits in the hull's dot row
  * (a sub-lead on its split hull's left border, level with that row).
  */
-export function scaledNodePoint(layout: ScaledBoardLayout, node: BoardGraphNode, model: BoardGraphModel | null = null): BoardPoint | undefined {
+export function scaledNodePoint(layout: ScaledBoardLayout, node: BoardGraphNode, model: BoardGraphModel | null = null, boost = 1): BoardPoint | undefined {
   if (!layout.compact || node.detail.kind !== "agent" || node.kind === "lead" || node.detail.hull === undefined) {
     return boardNodePoint(layout, node);
   }
@@ -439,7 +469,7 @@ export function scaledNodePoint(layout: ScaledBoardLayout, node: BoardGraphNode,
   const itemNode = model?.nodes.find((n) => n.id === `item:${d.hull}`);
   const agents = itemNode?.detail.kind === "item" ? itemNode.detail.agents : [];
   const index = Math.max(0, agents.indexOf(d.agent));
-  return compactAgentPoint(hull, index);
+  return compactAgentPoint(hull, index, compactDot(hull.w, agents.length, boost));
 }
 
 /** The bench at K: free agents still on the board (idle) and those who left, for the bench chip. */
