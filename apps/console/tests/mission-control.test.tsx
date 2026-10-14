@@ -34,6 +34,8 @@ import {
   HULL_TITLE_FONT,
   placeCaptions,
   textBoost,
+  hullBarBoost,
+  COMPACT_BAR_TEXT_MAX,
   BoardNodeDetail,
   BoardPane,
   ProofPanel,
@@ -606,6 +608,14 @@ describe("captions", () => {
     expect(textBoost(0.8)).toBeCloseTo(1.25);
     expect(textBoost(0.2)).toBe(1.8);
     expect(textBoost(Number.NaN)).toBe(1);
+  });
+
+  it("holds a compact hull's title bar text to the bar, so it follows the hull, not the boost alone", () => {
+    expect(hullBarBoost(1.8, false)).toBe(1.8);
+    expect(hullBarBoost(1.8, true) * HULL_TITLE_FONT).toBeCloseTo(COMPACT_BAR_TEXT_MAX);
+    expect(COMPACT_BAR_TEXT_MAX).toBeLessThan(HULL_TITLE_H);
+    expect(hullBarBoost(1.2, true)).toBe(1.2);
+    expect(hullBarBoost(0.5, true)).toBe(1);
   });
 });
 
