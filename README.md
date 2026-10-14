@@ -119,9 +119,13 @@ planner-driven mode (see below).
    `ChangeState` Durable Object) before planning starts, and the goal records
    the protected set (the gate's own files and the existing developer tests)
    and the baseline test inventory from a gate run on the original code.
-2. **Plan.** The lead's LLM planner proposes items against frozen shared
-   contracts. Jev records an advisory plan review; a doubtful plan is
-   re-planned once with that doubt as feedback.
+2. **Plan.** The lead's LLM planner gives each module to one item, and
+   leaves the shared seams (files many modules import, like the money and
+   http contracts) unowned at first, so agents code against the same
+   interface instead of all editing it. Changing a seam later goes through a
+   seam item the lead creates, or a contract the lead or a human decides.
+   Jev records an advisory plan review; a doubtful plan is re-planned once
+   with that doubt as feedback.
 3. **Recruit.** Workers join, each with its own Artifact repo and a
    short-lived scoped write token.
 4. **Claim and contest.** Agents claim items with a declared read/write
