@@ -1,7 +1,7 @@
 # Failure modes we hit, and what stops them now
 
-Twenty-one live storefront runs, and the service-api runs before them, failed
-in ways a design review would not have predicted. This page lists each failure
+The live storefront runs, and the service-api runs before them, failed in ways
+a design review would not have predicted. This page lists each failure
 we actually saw, what the engine does about it now, where that lives in the
 code, and the offline test that shows it working. Every test named here runs
 in `make check`.

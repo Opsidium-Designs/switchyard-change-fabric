@@ -66,8 +66,8 @@ make replay-preview   # build, then serve on http://127.0.0.1:4180 (REPLAY_PORT=
   never styled like a verdict.
 - A seam item reads `seam: <file>` (its contract's recorded target) and a tool
   item `tool: <capability>`; the full id stays in the tooltip and the detail.
-- A large board (more than 24 items or 16 workers; the board admits up to 100
-  agents) is drawn at scale (`apps/console/src/board-scale.ts`): items are
+- A large board (more than 24 items or 16 workers; a board admits up to 256
+  agents over its life) is drawn at scale (`apps/console/src/board-scale.ts`): items are
   grouped into lanes (a sub-lead's split item with its children nested inside,
   else the items sharing a domain prefix such as `parking-`, else a scope
   directory), each lane captioned with its done count at the current seq;
@@ -90,7 +90,7 @@ make replay-preview   # build, then serve on http://127.0.0.1:4180 (REPLAY_PORT=
   (`reduceBoard`): a file it refuses is not shown, with the reason. If the
   graph cannot be drawn at some seq, the view says so and keeps the replay
   controls, so the viewer can scrub away.
-- Live-only controls are gone: no launcher, templates, deploy, or dial, and a
+- Live-only controls are gone: no launcher, templates, or deploy, and a
   pending escalation is shown read-only ("recorded run: decided during the live
   run, not here").
 
@@ -234,15 +234,18 @@ make delete-replay    # remove it again
 
 | id | outcome | what happened |
 | --- | --- | --- |
+| `board-live-sf21` | verified, promoted | storefront on a local Claude CLI, a lead and 6 workers: a human accepted the change to the developer test that pinned the old tax rounding; acceptance 79/129, 103, 126, 128, then 129/129 on revision 6, which was gated and promoted |
+| `board-live-l3` | verified, promoted | service-api, a lead and 3 workers under a one-item claim cap: acceptance 10/20, 14/20, 18/20, then 20/20 on revision 4; a speculative round landed one more push as revision 5, which was gated and promoted |
 | `board-live-reg3` | verified | service-api: 6 resource items, a codemod built and published, acceptance 10/20, 16/20, then 20/20 on revision 3 |
 | `board-live-sf7` | failed | storefront: contracts, help, handoffs, a scanner and a codemod; a shared Invoice change broke typecheck for revisions 2 to 9; best acceptance 40/129 |
 | `board-live-sf8` | failed | storefront: 7 contract proposals, 4 escalated to a human; acceptance peaked at 35/129; two seam items stalled |
 | `board-sim-100` | verified (SIMULATED) | NOT a live run: 100 scripted agents and a lead on a generated 100-module project; a seeded scanner and codemod, a scanner-found item split three ways under a sub-lead, the fixture gate failing revision 1 and passing revision 2, the gated tree promoted; 853 messages |
 
-Runs recorded before promotions were written to the board (the three above)
-carry no `revision.promoted`, so the page reports the recorded verdict, never
-promotion, and their PROOF tab says not proven (no promotion recorded). A run
-recorded since shows "VERIFIED AND PROMOTED" only from its recorded
+Runs recorded before promotions were written to the board (`board-live-reg3`,
+`board-live-sf7`, and `board-live-sf8`) carry no `revision.promoted`, so the
+page reports the recorded verdict, never promotion, and their PROOF tab says
+not proven (no promotion recorded). A run recorded since (`board-live-sf21`,
+`board-live-l3`, and the simulated run) shows "VERIFIED AND PROMOTED" only from its recorded
 `revision.promoted`.
 
 ## The simulated run at scale
