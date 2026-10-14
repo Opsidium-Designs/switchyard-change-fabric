@@ -6,10 +6,12 @@ command, then tear it down so it stops billing. The reference example is
 [`examples/apps/service-api`](../examples/apps/service-api/README.md), a
 multi-resource JSON API whose every resource carries a deliberate, observable gap
 (it skips input validation and the shared auth check) so a before/after is obvious
-on the live service. The second example,
-[`examples/apps/storefront`](../examples/apps/storefront/README.md), is a
-TypeScript Worker (wrangler bundles it as is) and deploys the same way with
-`APP=storefront`.
+on the live service. The other two examples,
+[`examples/apps/storefront`](../examples/apps/storefront/README.md) and
+[`examples/apps/cityhall`](../examples/apps/cityhall/README.md), are
+TypeScript Workers (wrangler bundles them as is) and deploy the same way with
+`APP=storefront` or `APP=cityhall`. Each app's home page (`GET /`) is a
+self-test that runs representative checks against the Worker serving it.
 
 ## What path this uses and why
 
@@ -69,9 +71,12 @@ curl -sS -o /dev/null -w "%{http_code}\n" -X POST "$URL/users" \
   -H "content-type: application/json" -d '{"email":"a@example.com"}'
 ```
 
-Open the same URL in a browser: `GET /` renders a styled page listing the
-resources. With the fix, an unauthenticated or invalid request to any resource is
-rejected (401 or 400); with the planted gap it wrongly succeeds.
+Open the same URL in a browser: `GET /` is an interactive tester that runs the
+gate's 18 checks against this Worker (6 of 18 on the original code, 18 of 18
+after a correct fix). With the fix, an unauthenticated or invalid request to any
+resource is rejected (401 or 400); with the planted gap it wrongly succeeds.
+storefront's home page is a demo store with a "Health checks" drawer (about 1
+of 16, then 16 of 16) and cityhall's a self-test (about 1 of 46, then 46 of 46).
 
 ## Tear it down (stop billing)
 
@@ -94,12 +99,16 @@ cd examples/apps/service-api && npx wrangler delete --dry-run
 
 ## Deploy a different example app
 
-Both targets take `APP=<dir>` pointing at a subdirectory of `examples/apps/`:
+Both targets take `APP=<dir>` pointing at a subdirectory of `examples/apps/`
+(`service-api`, the default, `storefront`, or `cityhall`):
 
 ```bash
-make deploy-app APP=<your-app>
-make delete-app APP=<your-app>
+make deploy-app APP=cityhall
+make delete-app APP=cityhall
 ```
+
+In the console, every app card (service-api, storefront, cityhall) has the same
+Deploy app and Remove app controls (next section).
 
 Each app is standalone (its own `package.json` and `wrangler.jsonc`), so
 deploying it does not touch the offline demo or the root `make check`.

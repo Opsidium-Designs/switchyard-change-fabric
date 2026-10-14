@@ -1,9 +1,10 @@
 # storefront
 
 A small multi-domain store served by one Cloudflare Worker, written in
-TypeScript with a plain `fetch` handler (no framework). It is the larger of the
-two example apps: three domains, each a folder of modules that own their
-routes, over three shared contracts every domain imports.
+TypeScript with a plain `fetch` handler (no framework). It is the middle one of
+the three example apps (larger than service-api, smaller than cityhall): three
+domains, each a folder of modules that own their routes, over three shared
+contracts every domain imports.
 
 | Domain | Module | Routes |
 |--------|--------|--------|

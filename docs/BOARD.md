@@ -549,12 +549,15 @@ need no acceptance from the lead.
 
 ## Limits
 
-Per board: 20000 messages, 1000 items, 100 agents, 200 published tool
-versions (64 findings per use, 16 checks per tool gate), 512 protected paths (more existing tests than that are collapsed into
-their dedicated test directories). Per message: 32 children per split (and 32 merges per sub-lead push), 64 entries
-per intent (each at most 512 characters), 256 paths per push, 8192 characters
-of failing output per failing revision, bounded objective, acceptance, and
-rationale text, and a 64 KB request body. The state keeps counts and latest
+Per board: 20000 messages (512 of them kept in reserve for engine batches),
+1000 items, 256 agents over the board's life (the lead, the workers, and every
+replacement), 200 published tool versions (64 findings per use, 16 checks per
+tool gate), 512 protected paths (more existing tests than that are collapsed
+into their dedicated test directories). Per message: 32 children per split
+(and 32 merges per sub-lead push), 64 entries per intent (each at most 512
+characters), 256 paths per push, 256 pushes merged by one integrated revision,
+8192 characters of failing output per failing revision, bounded objective,
+acceptance, and rationale text, and a 64 KB request body. The state keeps counts and latest
 values (push count, the latest push per item, uses per tool version); per-event
 detail stays in the log.
 
@@ -1506,12 +1509,25 @@ Usage:
 make demo-board                     # offline: local control, generic policy, noop executor, fixture gate
 switchyard-change run-board --offline [--fixture-gate] [--decide-contracts accept|reject] --goal-file <goal.txt> --project <dir> [--min N] [--max N] [--keep-work-root] \
   [--concurrent] [--spread-claims] [--board-out <file>]   # the simulated run at scale: see docs/REPLAY.md
-switchyard-change run-board "<goal>" --project <dir> --worker <url> [--min N] [--max N] [--max-inflight N] \
-  [--id <changeId>] [--item-turns N] [--max-turns N] [--fix-attempts N] [--timeout-ms N] \
-  [--quiet-ms N] [--token-ttl S] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] \
-  [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] \
+switchyard-change run-board "<goal>"|--goal-file <goal.txt> --project <dir> --worker <url> \
+  [--inference gateway|claude-cli|codex-cli] [--min N] [--max N] [--max-inflight N] [--id <changeId>] \
+  [--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] \
+  [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] \
+  [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] \
+  [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] \
+  [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--proof-out <file>] \
+  [--deploy-app <app dir> [--deploy-app-name <worker>] [--preview-revisions]] \
   [--rate-limit-window-ms N] [--require-model-plan] [--allow-heuristic-planner]
 ```
+
+`switchyard-change run-board --help` prints the same list. The caps
+(`--max-calls`, `--max-spend-usd`, `--max-wall-ms`, `--max-item-calls`,
+`--price`) are in "Cost and time caps", the leases (`--lease-messages`,
+`--deadline-messages`) in "Claim leases", `--proof-out` in "Proof bundle per
+verified revision", and `--deploy-app` / `--preview-revisions` in "Revision
+previews" (all under "Stalls, re-plans, clashes, proofs, and caps" below);
+`--claim-cap` and the other plan-scaled budgets are described above.
+`--inference` picks the model path for every role (see docs/LOCAL-CLI.md).
 
 Flags are `--flag value` (two arguments): an inline `--flag=value` and a known
 flag with no value are refused with a clear error. The dial is integers
@@ -1574,9 +1590,11 @@ the per-app gate is on.
 with the gate in a Cloudflare Container (next section). `make run-board
 INTEGRATOR=cloud` passes it through.
 
-A live board run needs `EXECUTOR=ai-gateway` with the gateway URL and token
-(the turn model is `AI_GATEWAY_AGENT_MODEL`, else `AI_GATEWAY_MODEL`); without a
-live turn model it refuses rather than substituting the offline policy.
+A live board run needs a live turn model: `EXECUTOR=ai-gateway` with the
+gateway URL and token (the turn model is `AI_GATEWAY_AGENT_MODEL`, else
+`AI_GATEWAY_MODEL`), or `SWITCHYARD_INFERENCE=claude-cli` (`CLI_AGENT_MODEL`;
+see docs/LOCAL-CLI.md); without one it refuses rather than substituting the
+offline policy.
 
 ### Speculative batch gating (`speculate`, `candidate.gated`)
 
