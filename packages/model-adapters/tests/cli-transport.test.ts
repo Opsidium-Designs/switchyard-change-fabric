@@ -26,6 +26,8 @@ import {
   cliStdinPrompt,
   createAgentTurnInvoke,
   createClaudeCliDriver,
+  createCodexCliDriver,
+  CODEX_SCHEMA_FILE,
   createCliInvoke,
   createCliJsonSchemaCaller,
   createPlannerInvoke,
@@ -259,9 +261,69 @@ describe("selection helpers", () => {
     expect(() => parseInferenceMode("claude")).toThrow(/must be one of gateway, claude-cli, codex-cli/);
   });
 
-  it("refuses codex-cli clearly as not supported yet", () => {
-    expect(() => cliDriverFor("codex-cli")).toThrow(/codex-cli is not supported yet/);
+  it("selects the claude and codex drivers, each with an overridable binary", () => {
     expect(cliDriverFor("claude-cli", { claudeBin: "/x/claude" }).bin).toBe("/x/claude");
+    expect(cliDriverFor("codex-cli").name).toBe("codex");
+    expect(cliDriverFor("codex-cli", { codexBin: "/x/codex" }).bin).toBe("/x/codex");
+  });
+});
+
+describe("the codex CLI driver", () => {
+  const codex = createCodexCliDriver({ now: () => 0 });
+  const messages = [
+    { role: "system" as const, content: "You are an agent." },
+    { role: "user" as const, content: "Do the thing." },
+  ];
+  const events = (...lines: unknown[]) => lines.map((l) => JSON.stringify(l)).join("\n");
+
+  it("runs read-only with approvals never, no inherited env, no user config or rules, no session, no web search", () => {
+    const args = codex.buildArgs({ model: "gpt-5.5", messages });
+    expect(args.slice(0, 2)).toEqual(["exec", "--json"]);
+    for (const flag of ["--skip-git-repo-check", "--ephemeral", "--ignore-user-config", "--ignore-rules"]) expect(args).toContain(flag);
+    expect(args.join(" ")).toContain("--sandbox read-only");
+    expect(args).toContain('approval_policy="never"');
+    expect(args).toContain('shell_environment_policy.inherit="none"');
+    expect(args).toContain('web_search="disabled"');
+    expect(args).not.toContain("--dangerously-bypass-approvals-and-sandbox");
+    expect(args.join(" ")).toContain("--model gpt-5.5");
+    expect(args.at(-1)).toBe("-");
+    expect(codex.buildArgs({ model: "default", messages })).not.toContain("--model");
+    expect(CLI_ENV_ALLOWLIST).toContain("CODEX_HOME");
+  });
+
+  it("puts the system prompt ahead of the conversation on stdin, and a schema in a file", () => {
+    expect(codex.buildStdin({ model: "gpt-5.5", messages })).toBe("=== SYSTEM ===\nYou are an agent.\n\nDo the thing.");
+    const schema = { type: "object" };
+    expect(codex.buildArgs({ model: "gpt-5.5", messages, schema }).join(" ")).toContain(`--output-schema ${CODEX_SCHEMA_FILE}`);
+    expect(codex.buildFiles!({ model: "gpt-5.5", messages, schema })).toEqual({ [CODEX_SCHEMA_FILE]: JSON.stringify(schema) });
+    expect(codex.buildFiles!({ model: "gpt-5.5", messages })).toEqual({});
+  });
+
+  it("reads the last agent message, the structured reply, and usage (reasoning counted as output)", () => {
+    const out = events(
+      { type: "thread.started" },
+      { type: "item.completed", item: { type: "reasoning", text: "thinking" } },
+      { type: "item.completed", item: { type: "agent_message", text: '{"answer":"ok"}' } },
+      { type: "turn.completed", usage: { input_tokens: 100, output_tokens: 5, reasoning_output_tokens: 7 } },
+    );
+    const result = codex.parse(out, "", 0, { model: "gpt-5.5", messages, schema: {} });
+    expect(result.text).toBe('{"answer":"ok"}');
+    expect(result.structured).toEqual({ answer: "ok" });
+    expect(result.usage).toEqual({ inputTokens: 100, outputTokens: 12 });
+  });
+
+  it("classifies a usage limit, a login failure, a provider error, and an empty reply", () => {
+    const request = { model: "gpt-5.5", messages };
+    expect(() => codex.parse(events({ type: "turn.failed", error: { message: "You've hit your usage limit. Try again in 20 minutes." } }), "", 1, request)).toThrow(RateLimitError);
+    expect(() => codex.parse(events({ type: "error", message: JSON.stringify({ status: 401, error: { message: "Unauthorized" } }) }), "", 1, request)).toThrow(CliAuthError);
+    expect(() => codex.parse(events({ type: "error", message: JSON.stringify({ status: 400, error: { message: "model not supported" } }) }), "", 1, request)).toThrow(/model not supported \(HTTP 400\)/);
+    expect(() => codex.parse(events({ type: "turn.completed", usage: {} }), "", 0, request)).toThrow(UnusableModelOutputError);
+  });
+
+  it("reads its login state without an account or key", () => {
+    expect(codex.parseAuthStatus!("Logged in using ChatGPT\n")).toEqual({ loggedIn: true, method: "ChatGPT" });
+    expect(codex.parseAuthStatus!("Not logged in\n")).toEqual({ loggedIn: false });
+    expect(codex.parseAuthStatus!("something else")).toBeUndefined();
   });
 });
 

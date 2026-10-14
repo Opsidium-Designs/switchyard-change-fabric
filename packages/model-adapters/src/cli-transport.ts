@@ -31,7 +31,7 @@
  */
 
 import { spawn as nodeSpawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -76,6 +76,7 @@ export const CLI_ENV_ALLOWLIST: readonly string[] = [
   "XDG_DATA_HOME",
   "XDG_CACHE_HOME",
   "CLAUDE_CONFIG_DIR",
+  "CODEX_HOME",
 ];
 
 /** One CLI model call. */
@@ -109,6 +110,12 @@ export interface CliDriver {
   buildArgs(request: CliRequest): string[];
   /** The text written to the CLI's stdin for one call. */
   buildStdin(request: CliRequest): string;
+  /**
+   * Files written into the call's empty temp directory before it starts
+   * (name -> content; plain file names only), for a CLI that reads an input
+   * such as a JSON schema from a file. Never a credential.
+   */
+  buildFiles?(request: CliRequest): Readonly<Record<string, string>>;
   /**
    * Read the CLI's output: the parsed result on success; throws a classified
    * error (RateLimitError, CliAuthError, UnusableModelOutputError, or a plain
@@ -413,10 +420,8 @@ export function createClaudeCliDriver(options: ClaudeCliDriverOptions = {}): Cli
   };
 }
 
-function notLoggedIn(label: string): CliAuthError {
-  return new CliAuthError(
-    `the local ${label} is not logged in (or its login expired): run \`claude\` in a terminal and log in, then rerun`,
-  );
+function notLoggedIn(label: string, loginHint = "run `claude` in a terminal and log in"): CliAuthError {
+  return new CliAuthError(`the local ${label} is not logged in (or its login expired): ${loginHint}, then rerun`);
 }
 
 function rateLimited(label: string, model: string, text: string, now: number): RateLimitError {
@@ -425,6 +430,186 @@ function rateLimited(label: string, model: string, text: string, now: number): R
     `the ${label} hit a usage or rate limit for ${model}` + (retryAfterMs !== undefined ? ` (resets in about ${Math.ceil(retryAfterMs / 1000)} s)` : ""),
     { status: 429, model, ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) },
   );
+}
+
+
+// ---------------------------------------------------------------------------
+// The OpenAI Codex CLI driver
+// ---------------------------------------------------------------------------
+
+/** Options for the Codex driver. */
+export interface CodexCliDriverOptions {
+  /** The binary (default `codex` on PATH). */
+  readonly bin?: string;
+  /** The clock for reset-time parsing (tests). */
+  readonly now?: () => number;
+}
+
+/** The file the schema is written to in the call's temp directory. */
+export const CODEX_SCHEMA_FILE = "schema.json";
+
+/** A model value that means "the CLI's own default" (no -m flag). */
+const CODEX_DEFAULT_MODEL = "default";
+
+/** One JSONL event `codex exec --json` prints. */
+interface CodexEvent {
+  readonly type?: unknown;
+  readonly message?: unknown;
+  readonly item?: { readonly type?: unknown; readonly text?: unknown };
+  readonly error?: { readonly message?: unknown };
+  readonly usage?: {
+    readonly input_tokens?: unknown;
+    readonly output_tokens?: unknown;
+    readonly reasoning_output_tokens?: unknown;
+  };
+}
+
+/** The events in Codex's stdout, in order (lines that do not parse are skipped). */
+function codexEvents(stdout: string): CodexEvent[] {
+  const out: CodexEvent[] = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) out.push(parsed as CodexEvent);
+    } catch {
+      // not an event line
+    }
+  }
+  return out;
+}
+
+/** Codex nests the provider's error as a JSON string inside `message`; read its inner message when it is one. */
+function codexErrorText(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  try {
+    const inner = JSON.parse(raw) as { error?: { message?: unknown }; message?: unknown; status?: unknown };
+    const message = typeof inner.error?.message === "string" ? inner.error.message : typeof inner.message === "string" ? inner.message : raw;
+    return typeof inner.status === "number" ? `${message} (HTTP ${inner.status})` : message;
+  } catch {
+    return raw;
+  }
+}
+
+/**
+ * The OpenAI Codex CLI driver: `codex exec --json` in the call's empty temp
+ * directory with a read-only sandbox, approvals never granted, no inherited
+ * shell environment, web search off, no user config or rules, and no session
+ * persistence. Codex has no tool-off switch, so the hardening is the sandbox
+ * plus the empty directory and the allowlisted environment: a model-run
+ * command can read nothing of the repo and change nothing. Codex has no
+ * system-prompt flag either, so the system prompt leads the stdin prompt. A
+ * schema is written to schema.json in the temp directory and passed as
+ * --output-schema. The model `default` omits -m (the CLI's own default).
+ */
+export function createCodexCliDriver(options: CodexCliDriverOptions = {}): CliDriver {
+  const bin = (options.bin ?? "").trim() || "codex";
+  const now = options.now ?? Date.now;
+  const label = "codex CLI";
+  const loginHint = "run `codex login` in a terminal";
+  return {
+    name: "codex",
+    bin,
+    label,
+    versionArgs: ["--version"],
+    authStatusArgs: ["login", "status"],
+    buildArgs(request) {
+      return [
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--sandbox",
+        "read-only",
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'shell_environment_policy.inherit="none"',
+        "-c",
+        'web_search="disabled"',
+        "--color",
+        "never",
+        ...(request.model.trim() !== "" && request.model !== CODEX_DEFAULT_MODEL ? ["--model", request.model] : []),
+        ...(request.schema !== undefined ? ["--output-schema", CODEX_SCHEMA_FILE] : []),
+        "-",
+      ];
+    },
+    buildStdin(request) {
+      const system = cliSystemPrompt(request.messages);
+      const prompt = cliStdinPrompt(request.messages);
+      return system.trim() === "" ? prompt : `=== SYSTEM ===\n${system}\n\n${prompt}`;
+    },
+    buildFiles(request): Record<string, string> {
+      const files: Record<string, string> = {};
+      if (request.schema !== undefined) files[CODEX_SCHEMA_FILE] = JSON.stringify(request.schema);
+      return files;
+    },
+    parse(stdout, stderr, exitCode, request) {
+      const events = codexEvents(stdout);
+      const failure = events.find((e) => e.type === "turn.failed" || e.type === "error");
+      if (failure !== undefined) {
+        const text = codexErrorText(failure.type === "turn.failed" ? failure.error?.message : failure.message);
+        const what = `${text}\n${stderr}`;
+        if (RATE_LIMIT_TEXT.test(what)) {
+          throw rateLimited(label, request.model, what, now());
+        }
+        if (AUTH_TEXT.test(what)) {
+          throw notLoggedIn(label, loginHint);
+        }
+        throw new Error(`the ${label} call failed for ${request.model}` + (text.trim() !== "" ? `: ${excerpt(text)}` : ""));
+      }
+      const messages = events.filter((e) => e.type === "item.completed" && e.item?.type === "agent_message" && typeof e.item.text === "string");
+      const text = messages.length > 0 ? String(messages[messages.length - 1]!.item!.text) : "";
+      if (text === "") {
+        const what = `${stderr}\n${stdout}`;
+        if (AUTH_TEXT.test(what)) {
+          throw notLoggedIn(label, loginHint);
+        }
+        if (RATE_LIMIT_TEXT.test(what)) {
+          throw rateLimited(label, request.model, what, now());
+        }
+        if (exitCode !== 0) {
+          throw new Error(
+            `the ${label} call for ${request.model} exited with code ${exitCode ?? "unknown"} and no reply` + (stderr.trim() !== "" ? `: ${excerpt(stderr)}` : ""),
+          );
+        }
+        throw new UnusableModelOutputError(`the ${label} returned an empty response for ${request.model}`);
+      }
+      let structured: unknown;
+      if (request.schema !== undefined) {
+        try {
+          structured = JSON.parse(text);
+        } catch {
+          structured = undefined;
+        }
+      }
+      const done = [...events].reverse().find((e) => e.type === "turn.completed");
+      const inputTokens = finiteNumber(done?.usage?.input_tokens);
+      const output = finiteNumber(done?.usage?.output_tokens);
+      const reasoning = finiteNumber(done?.usage?.reasoning_output_tokens);
+      const outputTokens = output === undefined && reasoning === undefined ? undefined : (output ?? 0) + (reasoning ?? 0);
+      return {
+        text,
+        ...(structured !== undefined && structured !== null ? { structured } : {}),
+        finishReason: "stop",
+        ...(inputTokens !== undefined || outputTokens !== undefined
+          ? { usage: { ...(inputTokens !== undefined ? { inputTokens } : {}), ...(outputTokens !== undefined ? { outputTokens } : {}) } }
+          : {}),
+      };
+    },
+    parseAuthStatus(stdout) {
+      const line = stdout.trim().split(/\r?\n/)[0] ?? "";
+      if (/^not logged in/i.test(line)) return { loggedIn: false };
+      const match = /^logged in(?: using (.+))?$/i.exec(line);
+      if (!match) return undefined;
+      const method = match[1]?.trim();
+      // Only the login state and its method are read: never an account or key.
+      return { loggedIn: true, ...(method !== undefined && /^[A-Za-z0-9 ._-]{1,40}$/.test(method) ? { method } : {}) };
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -451,18 +636,17 @@ export function parseInferenceMode(raw: string | undefined, source = "SWITCHYARD
 }
 
 /**
- * The CLI driver for a local-CLI inference mode. Only Claude Code is
- * supported today; `codex-cli` is refused with a clear message (the driver
- * interface is ready for it, but it is not implemented or tested yet).
+ * The CLI driver for a local-CLI inference mode: Claude Code for
+ * `claude-cli`, the OpenAI Codex CLI for `codex-cli`.
  */
-export function cliDriverFor(mode: Exclude<InferenceMode, "gateway">, options: { readonly claudeBin?: string } = {}): CliDriver {
-  if (mode === "claude-cli") {
-    return createClaudeCliDriver(options.claudeBin !== undefined ? { bin: options.claudeBin } : {});
+export function cliDriverFor(
+  mode: Exclude<InferenceMode, "gateway">,
+  options: { readonly claudeBin?: string; readonly codexBin?: string } = {},
+): CliDriver {
+  if (mode === "codex-cli") {
+    return createCodexCliDriver(options.codexBin !== undefined ? { bin: options.codexBin } : {});
   }
-  throw new Error(
-    "SWITCHYARD_INFERENCE=codex-cli is not supported yet: only the local Claude Code CLI (claude-cli) is implemented. " +
-      "Use claude-cli, or gateway (the default AI Gateway path).",
-  );
+  return createClaudeCliDriver(options.claudeBin !== undefined ? { bin: options.claudeBin } : {});
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +718,7 @@ async function spawnBounded(
   stdin: string,
   what: string,
   options: RunCliOptions,
+  files: Readonly<Record<string, string>> = {},
 ): Promise<SpawnOutcome> {
   const spawn = options.spawn ?? (nodeSpawn as unknown as CliSpawn);
   const timeoutMs = options.timeoutMs ?? DEFAULT_CLI_TIMEOUT_MS;
@@ -544,6 +729,12 @@ async function spawnBounded(
   }
   const cwd = await mkdtemp(join(options.tmpRoot ?? tmpdir(), "scf-cli-"));
   try {
+    for (const [name, content] of Object.entries(files)) {
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name)) {
+        throw new Error(`the ${driver.label} call asked to write an unsafe file name ${JSON.stringify(name)}`);
+      }
+      await writeFile(join(cwd, name), content, { mode: 0o600 });
+    }
     return await new Promise<SpawnOutcome>((resolve, reject) => {
       let child: ChildProcess;
       try {
@@ -639,7 +830,7 @@ function abortError(label: string, what: string): Error {
 export async function runCli(driver: CliDriver, request: CliRequest, options: RunCliOptions = {}): Promise<CliResult> {
   const args = driver.buildArgs(request);
   const stdin = driver.buildStdin(request);
-  const outcome = await spawnBounded(driver, args, stdin, `call for ${request.model}`, options);
+  const outcome = await spawnBounded(driver, args, stdin, `call for ${request.model}`, options, driver.buildFiles?.(request) ?? {});
   return driver.parse(outcome.stdout, outcome.stderr, outcome.exitCode, request);
 }
 
@@ -676,7 +867,8 @@ export async function probeCli(driver: CliDriver, options: RunCliOptions = {}): 
   }
   try {
     const out = await spawnBounded(driver, driver.authStatusArgs, "", "login probe", short);
-    const status = driver.parseAuthStatus(out.stdout);
+    // Some CLIs (codex) print their login state on stderr.
+    const status = driver.parseAuthStatus(out.stdout) ?? (out.stderr.trim() !== "" ? driver.parseAuthStatus(out.stderr) : undefined);
     if (status === undefined) {
       return { ok: true, version, reason: "login state unknown (the CLI did not report it)" };
     }

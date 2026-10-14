@@ -339,7 +339,7 @@ a live command (the flag wins).
 | --- | --- | --- | --- |
 | `gateway` (default) | Cloudflare AI Gateway, BYOK: the provider key lives in the Cloudflare account. `EXECUTOR=ai-gateway` plus the gateway URL and token. | planner, agent turns, executor and its escalation ladder, tool authoring | on, with the gateway and account credentials |
 | `claude-cli` | The operator's own logged-in Claude Code CLI on this machine, tools disabled, in an empty temp directory, with an allowlisted environment | every model role | off unless `CLI_JEV=gateway` |
-| `codex-cli` | Accepted as a name only: not implemented. Every command that would use it stops with "not supported yet" (a live run before it creates anything). | none | none |
+| `codex-cli` | The operator's own logged-in OpenAI Codex CLI (`codex exec`) on this machine: read-only sandbox, approvals never granted, no inherited shell environment, web search off, no user config, in an empty temp directory with an allowlisted environment | every model role | off unless `CLI_JEV=gateway` |
 
 `EXECUTOR=workers-ai` gives a Workers AI executor only: no live planner, agent
 turns, or Jev. `EXECUTOR` unset (or `noop`) is the offline path. Models and

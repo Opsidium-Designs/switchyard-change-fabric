@@ -310,7 +310,7 @@ async function inferenceChecks(
         name,
         status: "missing",
         required: false,
-        detail: `selected (SWITCHYARD_INFERENCE=${cli.mode}) but ${JSON.stringify(cli.driver.bin)} did not run: install it (or set CLAUDE_CLI_BIN); no AI Gateway URL or token is needed in this mode`,
+        detail: `selected (SWITCHYARD_INFERENCE=${cli.mode}) but ${JSON.stringify(cli.driver.bin)} did not run: install it (or set ${cli.driver.name === "codex" ? "CODEX_CLI_BIN" : "CLAUDE_CLI_BIN"}); no AI Gateway URL or token is needed in this mode`,
       },
     ];
   }

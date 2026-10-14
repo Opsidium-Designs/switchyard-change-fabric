@@ -213,6 +213,7 @@ export type {
   CliResult,
   CliSpawn,
   ClaudeCliDriverOptions,
+  CodexCliDriverOptions,
   InferenceMode,
   RunCliOptions,
 } from "./cli-transport.ts";
@@ -226,6 +227,8 @@ export {
   cliStdinPrompt,
   cliSystemPrompt,
   createClaudeCliDriver,
+  createCodexCliDriver,
+  CODEX_SCHEMA_FILE,
   createCliInvoke,
   createCliJsonSchemaCaller,
   DEFAULT_CLI_TIMEOUT_MS,

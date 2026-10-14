@@ -27,10 +27,11 @@
  * authoring): `gateway` (the default) keeps the `EXECUTOR` selection above;
  * `claude-cli` runs every role through the operator's own locally installed,
  * logged-in Claude Code CLI (see model-adapters cli-transport.ts), ignoring
- * `EXECUTOR` and needing no gateway credential; `codex-cli` is refused as not
- * supported yet. In CLI mode the models come from CLI_MODEL,
- * CLI_ESCALATION_MODELS, CLI_PLANNER_MODEL, CLI_AGENT_MODEL, and
- * CLI_TOOL_MODELS, the binary from CLAUDE_CLI_BIN, the per-call timeout from
+ * `EXECUTOR` and needing no gateway credential; `codex-cli` does the same
+ * through the operator's own logged-in OpenAI Codex CLI. In CLI mode the models
+ * come from CLI_MODEL, CLI_ESCALATION_MODELS, CLI_PLANNER_MODEL, CLI_AGENT_MODEL,
+ * and CLI_TOOL_MODELS (each mode has its own defaults), the binary from
+ * CLAUDE_CLI_BIN or CODEX_CLI_BIN, the per-call timeout from
  * CLI_TIMEOUT_MS, and the advisory Jev layer is off unless CLI_JEV=gateway.
  */
 
@@ -118,6 +119,8 @@ export interface ExecutorEnv {
   readonly CLI_TOOL_MODELS?: string;
   /** CLI mode: the Claude Code binary (default `claude` on PATH). */
   readonly CLAUDE_CLI_BIN?: string;
+  /** The codex binary for codex-cli (default `codex` on PATH). */
+  readonly CODEX_CLI_BIN?: string;
   /** CLI mode: the per-call timeout in ms (a positive integer; default 300000). */
   readonly CLI_TIMEOUT_MS?: string;
   /** CLI mode: `gateway` keeps the advisory Jev layer on the AI Gateway (needs its credentials); default off. */
@@ -130,6 +133,16 @@ export const DEFAULT_CLI_ESCALATION_MODELS: readonly string[] = ["opus"];
 export const DEFAULT_CLI_PLANNER_MODEL = "sonnet";
 export const DEFAULT_CLI_AGENT_MODEL = "sonnet";
 export const DEFAULT_CLI_TOOL_MODELS: readonly string[] = ["opus", "sonnet"];
+
+/**
+ * The codex-cli defaults: the same base and stronger split as Claude's sonnet
+ * and opus, with model ids a ChatGPT-login Codex accepts (verified 2026-10-14).
+ */
+export const DEFAULT_CODEX_MODEL = "gpt-5.5";
+export const DEFAULT_CODEX_ESCALATION_MODELS: readonly string[] = ["gpt-6.1-sol"];
+export const DEFAULT_CODEX_PLANNER_MODEL = "gpt-5.5";
+export const DEFAULT_CODEX_AGENT_MODEL = "gpt-5.5";
+export const DEFAULT_CODEX_TOOL_MODELS: readonly string[] = ["gpt-6.1-sol", "gpt-5.5"];
 
 /** The resolved local-CLI inference configuration (no secrets: the CLI holds its own login). */
 export interface CliInference {
@@ -162,16 +175,18 @@ function parseModelList(raw: string | undefined, fallback: readonly string[]): r
 
 /**
  * The local-CLI inference configuration, or undefined in gateway mode. Throws
- * a clear error for an unknown mode, for codex-cli (not supported yet), and
- * for a CLI_TIMEOUT_MS that is not a positive integer.
+ * a clear error for an unknown mode and for a CLI_TIMEOUT_MS that is not a
+ * positive integer.
  */
 export function selectCliInference(env: ExecutorEnv = runtimeEnv()): CliInference | undefined {
   const mode = selectInferenceMode(env);
   if (mode === "gateway") {
     return undefined;
   }
-  const bin = (env.CLAUDE_CLI_BIN ?? "").trim();
-  const driver = cliDriverFor(mode, bin !== "" ? { claudeBin: bin } : {});
+  const claudeBin = (env.CLAUDE_CLI_BIN ?? "").trim();
+  const codexBin = (env.CODEX_CLI_BIN ?? "").trim();
+  const driver = cliDriverFor(mode, { ...(claudeBin !== "" ? { claudeBin } : {}), ...(codexBin !== "" ? { codexBin } : {}) });
+  const codex = mode === "codex-cli";
   const timeoutRaw = (env.CLI_TIMEOUT_MS ?? "").trim();
   const timeoutMs = timeoutRaw === "" ? DEFAULT_CLI_TIMEOUT_MS : /^[0-9]+$/.test(timeoutRaw) ? Number(timeoutRaw) : Number.NaN;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
@@ -185,11 +200,11 @@ export function selectCliInference(env: ExecutorEnv = runtimeEnv()): CliInferenc
     mode,
     driver,
     timeoutMs,
-    executorModel: (env.CLI_MODEL ?? "").trim() || DEFAULT_CLI_MODEL,
-    escalationModels: parseModelList(env.CLI_ESCALATION_MODELS, DEFAULT_CLI_ESCALATION_MODELS),
-    plannerModel: (env.CLI_PLANNER_MODEL ?? "").trim() || DEFAULT_CLI_PLANNER_MODEL,
-    agentModel: (env.CLI_AGENT_MODEL ?? "").trim() || DEFAULT_CLI_AGENT_MODEL,
-    toolModels: parseModelList(env.CLI_TOOL_MODELS, DEFAULT_CLI_TOOL_MODELS),
+    executorModel: (env.CLI_MODEL ?? "").trim() || (codex ? DEFAULT_CODEX_MODEL : DEFAULT_CLI_MODEL),
+    escalationModels: parseModelList(env.CLI_ESCALATION_MODELS, codex ? DEFAULT_CODEX_ESCALATION_MODELS : DEFAULT_CLI_ESCALATION_MODELS),
+    plannerModel: (env.CLI_PLANNER_MODEL ?? "").trim() || (codex ? DEFAULT_CODEX_PLANNER_MODEL : DEFAULT_CLI_PLANNER_MODEL),
+    agentModel: (env.CLI_AGENT_MODEL ?? "").trim() || (codex ? DEFAULT_CODEX_AGENT_MODEL : DEFAULT_CLI_AGENT_MODEL),
+    toolModels: parseModelList(env.CLI_TOOL_MODELS, codex ? DEFAULT_CODEX_TOOL_MODELS : DEFAULT_CLI_TOOL_MODELS),
     jev: jevRaw === "gateway" ? "gateway" : "off",
   };
 }

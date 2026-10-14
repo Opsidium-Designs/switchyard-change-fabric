@@ -3,7 +3,7 @@
  * validated strictly and overrides SWITCHYARD_INFERENCE; env-check
  * in CLI mode does not ask for the AI Gateway URL or token; a live run-board in
  * CLI mode refuses to start (before anything is created) when the CLI is
- * missing or not logged in, and codex-cli is refused as not supported yet. A
+ * missing or not logged in, and codex-cli does the same for the codex binary. A
  * fake CLI script stands in for `claude`; the Worker is an unreachable
  * loopback port, so nothing touches the network.
  */
@@ -125,9 +125,12 @@ describe("--inference and SWITCHYARD_INFERENCE at the CLI", () => {
     expect(stdout).not.toContain("Board run for");
   });
 
-  it("codex-cli is refused clearly as not supported yet", async () => {
-    const { code, stderr } = await runCli(["run-board", "add validation", "--project", PROJECT, "--worker", DEAD_WORKER, "--inference", "codex-cli"]);
+  it("a live run-board with codex-cli refuses to start when the codex binary is missing", async () => {
+    const file = await envFile("missing-codex.env", [`CODEX_CLI_BIN=${join(dir, "no-such-codex")}`]);
+    const { code, stderr, stdout } = await runCli(["run-board", "add validation", "--project", PROJECT, "--worker", DEAD_WORKER, "--inference", "codex-cli"], file);
     expect(code).toBe(1);
-    expect(stderr).toContain("codex-cli is not supported yet");
+    expect(stderr).toContain("the local codex CLI is not ready");
+    expect(stderr).toContain("was not found");
+    expect(stdout).not.toContain("Board run for");
   });
 });

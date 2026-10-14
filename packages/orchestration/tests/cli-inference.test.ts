@@ -95,9 +95,21 @@ describe("selection from SWITCHYARD_INFERENCE", () => {
     expect(selectToolFiller(env).models).toEqual(["opus"]);
   });
 
-  it("refuses an unknown mode, codex-cli (not supported yet), and a bad timeout clearly", () => {
+  it("codex-cli selects the codex driver with its own model defaults, overridable like claude-cli", () => {
+    const cli = selectCliInference({ SWITCHYARD_INFERENCE: "codex-cli" })!;
+    expect(cli.driver.name).toBe("codex");
+    expect(cli.driver.bin).toBe("codex");
+    expect(cli.executorModel).toBe("gpt-5.5");
+    expect(cli.escalationModels).toEqual(["gpt-6.1-sol"]);
+    expect(cli.toolModels).toEqual(["gpt-6.1-sol", "gpt-5.5"]);
+    const custom = selectCliInference({ SWITCHYARD_INFERENCE: "codex-cli", CODEX_CLI_BIN: "/opt/codex", CLI_MODEL: "gpt-5.6-sol" })!;
+    expect(custom.driver.bin).toBe("/opt/codex");
+    expect(custom.executorModel).toBe("gpt-5.6-sol");
+    expect(selectCliInference({ SWITCHYARD_INFERENCE: "claude-cli" })!.executorModel).toBe("sonnet");
+  });
+
+  it("refuses an unknown mode and a bad timeout clearly", () => {
     expect(() => selectExecutor({ SWITCHYARD_INFERENCE: "claude" })).toThrow(/SWITCHYARD_INFERENCE must be one of gateway, claude-cli, codex-cli/);
-    expect(() => selectExecutor({ SWITCHYARD_INFERENCE: "codex-cli" })).toThrow(/codex-cli is not supported yet/);
     expect(() => selectExecutor({ SWITCHYARD_INFERENCE: "claude-cli", CLI_TIMEOUT_MS: "soon" })).toThrow(/CLI_TIMEOUT_MS must be a positive integer/);
     expect(() => selectExecutor({ SWITCHYARD_INFERENCE: "claude-cli", CLI_JEV: "maybe" })).toThrow(/CLI_JEV must be off or gateway/);
   });
