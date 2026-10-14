@@ -186,6 +186,8 @@ make showcase APP=storefront FIXED=$HOME/path/to/storefront--board-live-sf21.bun
 make showcase APP=storefront BEFORE_ONLY=1 RUN="board-live-sf7 board-live-sf8" DRY_RUN=1
 # remove an app's showcase Worker (both versions and its production URL)
 make showcase-down APP=storefront
+# remove the whole public demo: every showcase Worker and the hosted replay page
+make public-down
 ```
 
 - **Honesty.** The fixed link is the exact code the gate passed. The command

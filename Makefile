@@ -46,6 +46,7 @@
 #   make showcase APP=<app> FIXED=<git dir or bundle>[@ref] RUN=<replay id> [DRY_RUN=1]  publish the original and run-fixed app for the replay page's "Try the app" (a REAL deploy unless DRY_RUN)
 #   make showcase APP=<app> BEFORE_ONLY=1 [RUN='<id> ...'] [DRY_RUN=1]  publish only the original (a run with no fixed code)
 #   make showcase-down APP=<app>  delete that showcase Worker (switchyard-showcase-<app>; infra-down leaves it)
+#   make public-down     delete every showcase Worker and the replay page in one go
 #   make publish-fixed CHANGE=<id> APP=<app> REPO=<dir> COMMIT=<c> BRANCH=<b> [DRY_RUN=1]  upload a verified live run's promoted commit as the fixed preview (alias fixed-<tag>) beside the original (a REAL upload unless DRY_RUN)
 #   make infra-up      spin the hosted Cloudflare infra up (deploy + queue + subscription), idempotent
 #   make infra-status  read-only: what is live right now (am I paying for anything?)
@@ -57,7 +58,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: export-replay preview-replay replay-build replay-preview deploy-replay delete-replay showcase showcase-down publish-fixed jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-board-cityhall run-board-cityhall cityhall-gate cityhall-reference-check demo-board-scale demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: export-replay preview-replay replay-build replay-preview deploy-replay delete-replay showcase showcase-down public-down publish-fixed jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-board-cityhall run-board-cityhall cityhall-gate cityhall-reference-check demo-board-scale demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -646,6 +647,17 @@ showcase-down:
 	  grep -qE '"success"[[:space:]]*:[[:space:]]*true|does not exist' \
 	  && echo "Teardown complete: $$name is not deployed." \
 	  || { echo "Teardown may have failed; check the account."; exit 1; }
+
+# Take everything public down in one go: every showcase Worker
+# (switchyard-showcase-<app>) and the deployed replay page. Idempotent: an app
+# or page that is already gone counts as done. The live-run infrastructure is
+# separate (make infra-down).
+SHOWCASE_APPS ?= cityhall storefront service-api
+public-down:
+	@fail=0; \
+	for app in $(SHOWCASE_APPS); do $(MAKE) --no-print-directory showcase-down APP=$$app || fail=1; done; \
+	$(MAKE) --no-print-directory delete-replay || fail=1; \
+	if [ $$fail -eq 0 ]; then echo "Public demo removed: showcase Workers ($(SHOWCASE_APPS)) and the replay page."; else echo "Some deletions may have failed; check the account."; exit 1; fi
 
 # Opt-in LIVE check of the decision model (never part of make check): one call
 # per question type (noul, choice, score) plus the contract-triage question a

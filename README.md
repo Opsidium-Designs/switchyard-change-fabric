@@ -14,10 +14,14 @@ interfaces will change.
 
 ## What to look at first
 
-- **The replay page.** Real recorded board runs, played back in the browser
-  with the same mission control a live run uses, failures included. No
-  account, no credentials, no model calls: `make replay-preview`, then open
-  `http://127.0.0.1:4180`. See [docs/REPLAY.md](./docs/REPLAY.md).
+- **The replay page, hosted:**
+  **<https://switchyard-change-fabric-replay.ckinney.workers.dev>**. Real
+  recorded board runs, played back in the browser with the same mission
+  control a live run uses, failures included, and each passing run's app
+  live twice: the original code and the code the run's gate passed. No
+  account, no credentials, no model calls. To serve it yourself:
+  `make replay-preview`, then open `http://127.0.0.1:4180`. See
+  [docs/REPLAY.md](./docs/REPLAY.md).
 - **The honesty invariants.** What the engine refuses to pretend; see
   [Honesty invariants](#honesty-invariants) below.
 - **Verified-only promotion.** Nothing reaches Git unless the gate passed on
@@ -322,7 +326,9 @@ anything?"). `make infra-down` removes it all, including leftover repos. See
 [docs/EVENT-SUBSCRIPTION.md](docs/EVENT-SUBSCRIPTION.md) and
 [docs/LIVE-DEPLOY.md](docs/LIVE-DEPLOY.md). The replay page's showcase Workers
 (`switchyard-showcase-<app>`, from `make showcase`) are deliberately outside
-that teardown; remove one with `make showcase-down APP=<app>`.
+that teardown; remove one with `make showcase-down APP=<app>`, or take the
+whole public demo down (every showcase Worker and the hosted replay page) with
+`make public-down`.
 
 ## Inference options
 
