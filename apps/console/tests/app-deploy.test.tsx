@@ -2,7 +2,7 @@
  * Deploying and removing the example apps from the console, offline (no
  * browser, no network, no wrangler: every spawned CLI is a fake child):
  *   - the cityhall template and the run-board args it launches with (the
- *     Makefile's CH_* agent counts and budget flags, previews only when deployed);
+ *     Makefile's CH_* agent counts and budget flags, the fixed preview only when deployed);
  *   - the launcher's deploy-app / teardown-app endpoints: only template apps,
  *     the exact CLI commands, no credential in the spawned environment, and
  *     the CLI's own error on a failure;
@@ -95,7 +95,7 @@ describe("the cityhall template", () => {
     expect(flag("--deploy-app")).toMatch(/examples\/apps\/cityhall$/);
     expect(flag("--deploy-app-name")).toBe("switchyard-change-fabric-cityhall");
     expect(args).toContain("--gate");
-    expect(args).not.toContain("--preview-revisions");
+    expect(args).not.toContain("--preview-passing");
   });
 
   it("passes no budget flags for a template without board options", () => {
@@ -107,22 +107,22 @@ describe("the cityhall template", () => {
 });
 
 describe("revision previews on a launch", () => {
-  it("adds --preview-revisions to a board run only when the app is deployed, keeping --decide-contracts last", () => {
+  it("adds --preview-passing to a board run only when the app is deployed, keeping --decide-contracts last", () => {
     for (const t of TEMPLATES.filter((x) => x.app)) {
       const deployed = launchArgs(t, "x", { mode: "board", contractPolicy: "accept" }, true);
-      expect(deployed, t.id).toContain("--preview-revisions");
-      expect(deployed.indexOf("--preview-revisions")).toBeGreaterThan(deployed.indexOf("--deploy-app-name"));
+      expect(deployed, t.id).toContain("--preview-passing");
+      expect(deployed.indexOf("--preview-passing")).toBeGreaterThan(deployed.indexOf("--deploy-app-name"));
       expect(deployed.slice(-2)).toEqual(["--decide-contracts", "accept"]);
-      expect(launchArgs(t, "x", { mode: "board", contractPolicy: "console" }, false)).not.toContain("--preview-revisions");
+      expect(launchArgs(t, "x", { mode: "board", contractPolicy: "console" }, false)).not.toContain("--preview-passing");
     }
   });
 
   it("never adds previews to a non-app template or to run-live (which keeps its redeploy in place)", () => {
     const audit = templateById("audit-logging")!;
-    expect(launchArgs(audit, "x", { mode: "board", contractPolicy: "console" }, true)).not.toContain("--preview-revisions");
+    expect(launchArgs(audit, "x", { mode: "board", contractPolicy: "console" }, true)).not.toContain("--preview-passing");
     const live = launchArgs(templateById("service-api")!, "x", { mode: "live", contractPolicy: "console" }, true);
     expect(live[5]).toBe("run-live");
-    expect(live).not.toContain("--preview-revisions");
+    expect(live).not.toContain("--preview-passing");
     expect(live[live.indexOf("--deploy-app-name") + 1]).toBe("switchyard-change-fabric-service-api");
   });
 });

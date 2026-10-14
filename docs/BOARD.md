@@ -1516,7 +1516,7 @@ switchyard-change run-board "<goal>"|--goal-file <goal.txt> --project <dir> --wo
   [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] \
   [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] \
   [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--proof-out <file>] \
-  [--deploy-app <app dir> [--deploy-app-name <worker>] [--preview-revisions]] \
+  [--deploy-app <app dir> [--deploy-app-name <worker>] [--preview-revisions|--preview-passing]] \
   [--rate-limit-window-ms N] [--require-model-plan] [--allow-heuristic-planner]
 ```
 
@@ -2566,7 +2566,7 @@ summary and writes the JSON to `--proof-out`, or `proof-bundle.json` in a kept
 work root (a live run's, or `--keep-work-root`); the console's PROOF tab
 renders it from the log alone, so a recorded run shows it too.
 
-### Revision previews (`--preview-revisions`)
+### Revision previews (`--preview-revisions`, `--preview-passing`)
 
 A revision preview is the running app at exactly one integrated revision. With
 `--preview-revisions` (live `run-board` only, off by default, and only together
@@ -2605,6 +2605,18 @@ write for the same `n` replaces), sorted by `n`, at most 200. Re-creating the
 Change id resets them, like the deployment. The run summary lists them
 (`preview r3: <url>`). A preview uploaded after the run from recorded commits
 (see the replay page's backfill) carries `backfilled: true`.
+
+`--preview-passing` (instead of `--preview-revisions`; the console uses it for
+a board run of an app template) uploads ONLY the revisions whose gate ran and
+passed, all under ONE alias, `fixed-<tag>`: as soon as a revision passes, the
+alias serves it, and a later passing revision re-uploads to the same alias.
+Failing revisions are not uploaded (and their commits are not kept for it).
+Each upload is still recorded per revision (`n`, `commit`, `alias`); a reader
+treats only the latest record of an alias as backed, since the alias no longer
+serves the earlier trees. With `--preview-passing` the run does not redeploy
+the app in place at the end: the production URL keeps the original, so the
+before (production) and the after (`fixed-<tag>`) are both live. The summary
+lists it as `fixed preview r<n>: <url>`.
 
 Preview URLs are public `workers.dev` URLs: anyone with the URL can open them.
 They live as long as the Worker: deleting it (`make delete-app APP=<app>`, or

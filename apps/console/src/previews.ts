@@ -54,12 +54,21 @@ export function readPreviews(snapshot: unknown): RevisionPreview[] {
   return out;
 }
 
-/** The backed previews by revision number: only those whose commit matches the log's `integrated.rev`. */
+/**
+ * The backed previews by revision number: only those whose commit matches the
+ * log's `integrated.rev`. When several previews share one alias (a run with
+ * `--preview-passing` re-uploads every passing revision under `fixed-<tag>`),
+ * the alias URL now serves only the LATEST of them, so only that one is
+ * backed: an earlier record would link to a tree it no longer serves.
+ */
 export function backedPreviews(log: readonly BoardMessage[], previews: readonly RevisionPreview[]): Map<number, RevisionPreview> {
   const commits = new Map<number, string>();
   for (const m of log) if (m.type === "integrated.rev") commits.set(m.payload.n, m.payload.commit);
+  const latestByAlias = new Map<string, number>();
+  for (const p of previews) latestByAlias.set(p.alias, Math.max(latestByAlias.get(p.alias) ?? 0, p.n));
   const out = new Map<number, RevisionPreview>();
   for (const p of previews) {
+    if (latestByAlias.get(p.alias) !== p.n) continue;
     const commit = commits.get(p.n);
     if (commit !== undefined && commit.toLowerCase() === p.commit.toLowerCase()) out.set(p.n, p);
   }

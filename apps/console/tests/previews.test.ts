@@ -66,6 +66,12 @@ describe("revision previews", () => {
     expect([...backed.keys()].sort()).toEqual([1, 3, 4, 5, 6]);
   });
 
+  it("backs only the latest of previews sharing one alias (--preview-passing re-uploads under fixed-<tag>)", () => {
+    const shared = good.slice(0, 3).map((p) => ({ ...p, alias: "fixed-sf21", url: "https://fixed-sf21-switchyard-change-fabric-storefront.example.workers.dev" }));
+    const backed = backedPreviews(log, shared);
+    expect([...backed.keys()]).toEqual([shared[2]!.n]);
+  });
+
   it("links the narrator, the STORY strip, and the revision detail to the running app, once the cursor reaches it", () => {
     const r2 = revs[1]!;
     const at = render(r2.seq, good);

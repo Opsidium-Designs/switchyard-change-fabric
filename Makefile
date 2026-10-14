@@ -46,6 +46,7 @@
 #   make showcase APP=<app> FIXED=<git dir or bundle>[@ref] RUN=<replay id> [DRY_RUN=1]  publish the original and run-fixed app for the replay page's "Try the app" (a REAL deploy unless DRY_RUN)
 #   make showcase APP=<app> BEFORE_ONLY=1 [RUN='<id> ...'] [DRY_RUN=1]  publish only the original (a run with no fixed code)
 #   make showcase-down APP=<app>  delete that showcase Worker (switchyard-showcase-<app>; infra-down leaves it)
+#   make publish-fixed CHANGE=<id> APP=<app> REPO=<dir> COMMIT=<c> BRANCH=<b> [DRY_RUN=1]  upload a verified live run's promoted commit as the fixed preview (alias fixed-<tag>) beside the original (a REAL upload unless DRY_RUN)
 #   make infra-up      spin the hosted Cloudflare infra up (deploy + queue + subscription), idempotent
 #   make infra-status  read-only: what is live right now (am I paying for anything?)
 #   make infra-down    spin the hosted Cloudflare infra down (delete worker + queue + subscription + repos), idempotent
@@ -56,7 +57,7 @@
 #   make example   lint + build + test the example demo-project only
 #   make clean      remove build output
 
-.PHONY: export-replay preview-replay replay-build replay-preview deploy-replay delete-replay showcase showcase-down jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-board-cityhall run-board-cityhall cityhall-gate cityhall-reference-check demo-board-scale demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
+.PHONY: export-replay preview-replay replay-build replay-preview deploy-replay delete-replay showcase showcase-down publish-fixed jev-smoke tool-smoke install dev dev-containers console dev-all dev-all-lan cli doctor demo demo-board run-board decompose decompose-audit run-goal recruit recruit-live run-live run-live-watch run-live-service demo-board-storefront run-board-storefront storefront-gate demo-board-cityhall run-board-cityhall cityhall-gate cityhall-reference-check demo-board-scale demo-live clean-live seed-change deploy deploy-app delete-app artifacts-subscribe infra-up infra-down infra-status build typecheck test check example example-install example-lint example-build example-test clean
 
 install:
 	npm install
@@ -616,6 +617,19 @@ RUN ?=
 showcase:
 	@test "$(origin APP)" != "file" && test -n "$(RUN)$(BEFORE_ONLY)" && { test -n "$(FIXED)" || test -n "$(BEFORE_ONLY)"; } || { echo "usage: make showcase APP=<app> FIXED=<git dir or bundle>[@ref] RUN=<replay id> [DRY_RUN=1]  |  make showcase APP=<app> BEFORE_ONLY=1 [RUN='<id> ...'] [DRY_RUN=1]"; exit 2; }
 	npm -w apps/cli run dev -- showcase-app --app "$(APP)" $(if $(FIXED),--fixed "$(abspath $(FIXED))",) $(foreach r,$(RUN),--run "$(r)") $(if $(BEFORE_ONLY),--before-only,) $(if $(DRY_RUN),--dry-run,)
+
+# Publish the fixed version of a LIVE run (the console's "Publish the fixed
+# version"): upload the promoted commit of a VERIFIED run as a preview version
+# of the app's stable Worker (switchyard-change-fabric-<APP>) under the alias
+# fixed-<change tag>, beside the original production deploy. CHANGE is the
+# run's change id; REPO, COMMIT, and BRANCH come from the run's own output
+# (`promoted: ...` and `repo: ...`). Refused unless the Worker records the run
+# as verified by a gate that ran and the commit is the promoted branch's tip
+# (for a board run, also its recorded promotion and gated tree). The app must
+# be deployed first (make deploy-app APP=<app>). A REAL upload unless DRY_RUN.
+publish-fixed:
+	@test -n "$(CHANGE)" && test "$(origin APP)" != "file" && test -n "$(REPO)" && test -n "$(COMMIT)" && test -n "$(BRANCH)" || { echo "usage: make publish-fixed CHANGE=<change id> APP=<app> REPO=<promoted repo dir> COMMIT=<promoted commit> BRANCH=<promoted branch> [DRY_RUN=1]"; exit 2; }
+	npm -w apps/cli run dev -- publish-fixed --change-id "$(CHANGE)" --app "$(APP)" --repo "$(abspath $(REPO))" --commit "$(COMMIT)" --branch "$(BRANCH)" --worker "$(WORKER)" $(if $(DRY_RUN),--dry-run,)
 
 # Delete an app's showcase Worker (both versions and its production URL) over
 # the Cloudflare REST API, like delete-app. Idempotent: already gone is success.

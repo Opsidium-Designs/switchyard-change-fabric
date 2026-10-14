@@ -269,16 +269,35 @@ one is refused (`assertBoardBacked`).
    The console has no concurrency dial: each template runs with its own agent
    counts, shown on its card.
 
-   Every app card has **Deploy app (see it broken)**, which deploys the
-   ORIGINAL code to the app's stable `workers.dev` URL, and, once deployed,
-   **Remove app** (asks first), which deletes that Worker without touching any
-   run's repos. While the app is deployed, a board run uploads every integrated
-   revision as a preview (`--preview-revisions`) and the run panel links the
-   latest passing one as **Open the fixed app**; a verified run also redeploys
-   the app in place at the same URL. Each launch gets a fresh Change id.
-   **Tear down (repos)** asks first, is disabled while the run is still
-   running, and deletes that run's Artifact repos. A run started from the CLI
-   can be followed read-only with `?watch=<change id>` (no Tear down there).
+   The console has two views. **Home** (`/`) holds the templates and a
+   **Runs** table: the runs this console launched and the last run followed
+   with `?watch=`, each opening its run page, and the recorded replays, each
+   with **Open replay** when `VITE_REPLAY_URL` points at the replay page (it
+   is a separate build: `npm -w apps/console run dev:replay` in dev). One live
+   run at a time: while one is in progress the launcher refuses a second
+   launch (HTTP 409) and every Launch button is disabled. Every app card has
+   **Deploy app (see it broken)**, which deploys the ORIGINAL code to the
+   app's stable `workers.dev` URL, and, once deployed, **Remove app** (asks
+   first), which deletes that Worker without touching any run's repos.
+
+   Launching opens the **run page** (`?run=<change id>`, with a **<- Home**
+   link): only that run, its status, its app panel, its human decisions, and
+   its graph or board. The app panel shows the app in two versions side by
+   side: **Original** (the production deploy; "Deploy the original app" works
+   at any time, also during the run) and **Fixed by this run**. A board run of
+   an app template uploads each revision whose gate passes as a preview
+   version of the same Worker under one alias, `fixed-<change tag>`
+   (`--preview-passing`; failing revisions are not uploaded), so the fixed
+   version appears as soon as a revision passes, and the production URL keeps
+   the original; if the app is not deployed at launch, the launcher deploys
+   the original first. For any other verified run, **Publish the fixed
+   version** uploads the promoted commit under the same alias
+   (`make publish-fixed`; refused unless the run is verified by a gate that
+   ran). Each launch gets a fresh Change id. **Tear down (repos)** asks first,
+   is disabled while the run is still running, and deletes that run's Artifact
+   repos. A run started from the CLI is followed read-only with
+   `?watch=<change id>` (no Tear down; its Publish button shows the exact
+   `make publish-fixed ...` command instead).
 
 CLI equivalents (each needs `make dev` or `make dev-all` running):
 
@@ -292,7 +311,7 @@ make run-live-watch                              # the audit-logging run, repos 
 
 The full `run-board` flag list (`--inference`, `--max-inflight`,
 `--claim-cap`, `--max-calls`, `--max-spend-usd`, `--price`, `--deploy-app`,
-`--preview-revisions`, `--proof-out`, and the rest) is in "Agents on the
+`--preview-revisions`, `--preview-passing`, `--proof-out`, and the rest) is in "Agents on the
 board" in [docs/BOARD.md](./docs/BOARD.md), or run
 `make cli ARGS="run-board --help"`.
 
