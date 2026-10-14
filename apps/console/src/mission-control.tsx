@@ -617,8 +617,10 @@ export function Narrator({
   );
 }
 
-const CHART_W = 260;
-const CHART_H = 96;
+const CHART_W = 310;
+const CHART_H = 130;
+/** About how wide a count label (`181/237`) is in chart units: points closer than this are not all labelled. */
+const CHART_LABEL_W = 46;
 
 /** What each suite is, in plain words (the Board pane's chart headings). */
 export const SUITE_INFO: Readonly<Record<SuiteSeries["suite"], { readonly name: string; readonly explain: string }>> = {
@@ -683,7 +685,8 @@ export function SuiteChart({ series, landed, focus = null }: { series: SuiteSeri
   const story = seriesStory(series);
   const info = SUITE_INFO[series.suite];
   const headline = suiteHeadline(series);
-  const labelled = labelledPoints(series, focus);
+  // Label every point only when the labels have room side by side; otherwise the first, best, last, and focused.
+  const labelled = labelledPoints(series, focus, Math.max(2, Math.floor((CHART_W - 48) / CHART_LABEL_W) + 1));
   const xLabelEvery = Math.max(1, Math.ceil(n / 10));
   return (
     <figure className={`mc-chart suite-${series.suite}`} aria-label={`${series.suite} over revisions`}>
@@ -3282,6 +3285,8 @@ export function ReplayBar({
 /** How long a landed message's edge stays visible (live mode) and its caption floats. */
 const MESSAGE_FADE_MS = 4000;
 const CAPTION_MS = 3000;
+/** Following a live run, talk arrows are hidden once no message has landed for this long. */
+export const TALK_QUIET_MS = 15000;
 /** A big jump (a first load, a replay seek) animates only its latest messages. */
 const MAX_ANIMATED = 12;
 
@@ -3359,6 +3364,9 @@ export function MissionControl({
   // transient message edges and the captions.
   const arrivals = useRef(new Map<number, number>());
   const previousK = useRef<number | null>(null);
+  // When the cursor last moved forward: following a live run, talk arrows fade once the board has been quiet a while
+  // (a long integration posts nothing), instead of the last few arrows staying up as if stuck.
+  const lastAdvance = useRef(Date.now());
   const [now, setNow] = useState(0);
   useEffect(() => {
     const prev = previousK.current;
@@ -3367,6 +3375,7 @@ export function MissionControl({
       return;
     }
     const t = Date.now();
+    lastAdvance.current = t;
     for (let s = Math.max(prev + 1, k - MAX_ANIMATED + 1); s <= k; s += 1) {
       arrivals.current.set(s, t);
     }
@@ -3423,7 +3432,8 @@ export function MissionControl({
   }, []);
 
   // The overlays at K: the talk arrows, the gate timeline, the progress chart, the advisory decisions.
-  const arrows = useMemo(() => (talk ? (attempt(() => communicationArrows(log, k)).value ?? []) : []), [log, k, talk]);
+  const quietLive = live && now > 0 && now - lastAdvance.current > TALK_QUIET_MS;
+  const arrows = useMemo(() => (talk && !quietLive ? (attempt(() => communicationArrows(log, k)).value ?? []) : []), [log, k, talk, quietLive]);
   const chart = useMemo(() => attempt(() => progressChart(log, k)).value ?? { series: [] }, [log, k]);
 
   const story = useMemo(() => runChapters(log), [log]);

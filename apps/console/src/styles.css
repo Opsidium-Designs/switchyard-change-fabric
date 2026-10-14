@@ -1134,7 +1134,7 @@ body {
 .mc {
   margin-top: 0.75rem;
   display: grid;
-  grid-template-columns: 290px minmax(0, 1fr) 360px;
+  grid-template-columns: 340px minmax(0, 1fr) 360px;
   grid-template-rows: auto minmax(560px, calc(100vh - 230px)) auto;
   grid-template-areas:
     "ticker ticker ticker"
@@ -1794,7 +1794,7 @@ body {
 
 /* A recorded run: the replay controls sit right under the ticker, in view. */
 .mc.is-recorded {
-  grid-template-columns: 270px minmax(0, 1fr) 340px;
+  grid-template-columns: 330px minmax(0, 1fr) 340px;
   grid-template-rows: auto auto minmax(520px, calc(100vh - 150px));
   grid-template-areas:
     "ticker ticker ticker"
@@ -2181,15 +2181,15 @@ body {
 .mc-gate > figure:first-of-type { margin-left: auto; }
 
 .mc-chart { margin: 0; display: flex; flex-direction: column; gap: 0.05rem; }
-.mc-chart figcaption { font-size: 0.72rem; white-space: nowrap; }
+.mc-chart figcaption { font-size: 0.74rem; }
 .mc-chart-name { font-weight: 800; color: var(--text); font-size: 0.78rem; }
 .mc-chart-story { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 .mc-chart-note { color: var(--advisory); font-style: italic; font-size: 0.66rem; }
-.mc-chart-svg { display: block; width: 260px; height: 96px; overflow: visible; }
+.mc-chart-svg { display: block; width: 100%; max-width: 310px; height: auto; overflow: visible; }
 .mc-chart-explain { color: var(--muted); font-size: 0.68rem; }
-.mc-chart-headline { display: block; font-weight: 700; font-size: 0.8rem; color: var(--text); }
-.mc-chart-axis { fill: var(--muted); font-size: 8.5px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.mc-chart-count { fill: var(--text); font-size: 8.5px; font-weight: 700; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mc-chart-headline { display: block; font-weight: 500; font-size: 0.82rem; line-height: 1.3; color: var(--text); margin-top: 0.15rem; }
+.mc-chart-axis { fill: var(--muted); font-size: 10px; }
+.mc-chart-count { fill: var(--text); font-size: 10.5px; font-weight: 600; }
 .mc-charts-note { margin: 0; font-size: 0.72rem; color: var(--muted); }
 .mc-chart-total { stroke: var(--muted); stroke-dasharray: 3 3; stroke-width: 1; }
 .mc-chart-base { stroke: var(--border); stroke-width: 1; }
