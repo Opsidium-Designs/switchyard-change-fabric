@@ -159,6 +159,7 @@ export type {
   CompletedWorkUnit,
   VerifyAndIntegrateOptions,
 } from "./change-verification.ts";
+export type { IntegrationPhase } from "./types.ts";
 export type { UnitPart } from "./integrator.ts";
 export { ChangeVerification } from "./change-verification.ts";
 

@@ -20,6 +20,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LocalFilesystemWorkspaceProvider } from "@switchyard-change/artifact-workspace/local";
 import type { WorkspaceRef } from "@switchyard-change/artifact-workspace";
 
+import { InstallingCommandRunner } from "../src/dependency-install.ts";
 import { advanceIntegrationBranch, Integrator, recordBaselineInventory, type VerifiedWorkspace } from "../src/integrator.ts";
 import { readDependencySnapshotFromDir, runnerResolutionContract } from "../src/runner-resolution.ts";
 import { FakeCommandRunner, installRecordingGit } from "./helpers.ts";
@@ -136,6 +137,44 @@ describe("Integrator", () => {
     await trackedAt(ref.gitUrl, check);
     const { stdout } = await run("git", ["-C", check, "rev-parse", "HEAD"]);
     expect(stdout.trim()).toBe(baseline);
+  });
+
+  it("reports merge, install, and gate as each starts (progress only: the same install and verdict)", async () => {
+    const unitDir = join(root, "unit");
+    const baseline = await unitThatDeletes(unitDir);
+    const provider = new LocalFilesystemWorkspaceProvider({ rootDir: join(root, "artifacts") });
+    const { ref, token } = await seededIntegration(provider, unitDir, baseline);
+    const events: string[] = [];
+    const installs: string[] = [];
+    const gate = new FakeCommandRunner([{ match: "gate", outcome: { code: 0, stdout: "ok", stderr: "" } }]);
+    const runner = new InstallingCommandRunner(
+      { run: (argv, cwd) => (events.push("command"), gate.run(argv, cwd)) },
+      {
+        async install(dir: string) {
+          installs.push(dir);
+          events.push("installed");
+          return { status: "skipped" as const, tool: "none", detail: "no manifest", durationMs: 0 };
+        },
+      },
+    );
+    const result = await new Integrator(provider, { commandRunner: runner }).integrate({
+      integrationRef: ref,
+      integrationToken: token,
+      verified: [{ unitId: "u", gitUrl: pathToFileURL(unitDir).href, baselineRef: baseline }],
+      excludedUnits: [],
+      integrationGateCommand: ["npm", "run", "gate"],
+      requiresIntegrationGate: true,
+      workRoot: root,
+      onPhase: (phase) => {
+        events.push(phase);
+        if (phase === "install") throw new Error("a failing listener changes nothing");
+      },
+    });
+    expect(result.verdict).toBe("verified");
+    expect(events).toEqual(["merge", "install", "installed", "gate", "command"]);
+    // The install the gate command waits for is the one already done (once per tree).
+    expect(installs).toHaveLength(1);
+    expect(runner.takeLastInstall()).toMatchObject({ status: "skipped" });
   });
 
   it("applies exactly the pinned commit, not a later branch head", async () => {

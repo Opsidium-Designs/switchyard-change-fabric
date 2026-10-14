@@ -233,6 +233,8 @@ const VALID: Record<BoardMessageType, { from: string; payload: Record<string, un
     from: "engine",
     payload: { a: { agent: "a", item: "i", sha: "c1" }, b: { agent: "b", item: "j", sha: "c2" }, status: "conflict", paths: ["src/a.ts"], scope: "local" },
   },
+  "integration.started": { from: "engine", payload: { kind: "speculative", pushes: [7, 9], agents: ["a", "b"], items: ["i", "j"], candidates: 2 } },
+  "integration.phase": { from: "engine", payload: { started: 10, phase: "candidate", detail: "candidate 2 of 2: base + a, b", elapsedMs: 1200 } },
   "item.discovered": { from: "a", payload: { item: "k", objective: "o", reason: "found a gap", parent: "i" } },
   "help.requested": { from: "a", payload: { request: "r", item: "i", need: "tool" } },
   "help.offered": { from: "b", payload: { request: "r", forkOf: "a", forkCommit: "abc123", fork: "chg--help-r" } },
@@ -305,6 +307,8 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
   "revision.promoted": { rev: 3, gatedCommit: "abc", commit: "def", branch: "../etc" },
   "run.capped": { kind: "item-calls", limit: 5, used: 6 },
   "candidate.gated": { round: 1, index: 2, of: 2, prefix: [{ agent: "a", items: ["i"], commit: "c1" }], commit: "abc", verdict: "pass", outcome: "passed" },
+  "integration.started": { kind: "integrate", pushes: [], agents: ["a"], items: ["i"] },
+  "integration.phase": { started: 3, phase: "testing" },
   "item.discovered": { item: "k", objective: "o" },
   "help.requested": { request: "r", item: "i" },
   "help.offered": {},
@@ -343,7 +347,7 @@ const INVALID: Record<BoardMessageType, Record<string, unknown>> = {
 describe("board vocabulary: per-type payload validation", () => {
   it("covers every message type", () => {
     expect(Object.keys(VALID).sort()).toEqual([...BOARD_MESSAGE_TYPES].sort());
-    expect(BOARD_MESSAGE_TYPES).toHaveLength(59);
+    expect(BOARD_MESSAGE_TYPES).toHaveLength(61);
   });
 
   it.each(BOARD_MESSAGE_TYPES)("accepts a well-formed %s", (type) => {
@@ -3904,6 +3908,80 @@ describe("speculative batch gating on the board", () => {
     expect(decideSpeculativeLanding(v("pass", undefined, "pass"))).toEqual({ landed: 1, passed: [], retest: [2, 3] });
     expect(decideSpeculativeLanding(v(undefined, "fail"))).toEqual({ passed: [], retest: [1, 2] });
     expect(decideSpeculativeLanding(v("pass"))).toEqual({ landed: 1, passed: [], retest: [] });
+  });
+});
+
+describe("integration progress is recorded by the engine and changes nothing else", () => {
+  const started = (pushes: number[], extra: Record<string, unknown> = {}) =>
+    msg("engine", "integration.started", { kind: "integrate", pushes, agents: ["a", "b"], items: ["one", "two"], ...extra });
+  const pushedBoard = (rules: Record<string, number> = { arbitration: 7 }) => {
+    const board = seeded(rules);
+    board.post(claim("a", "one", ["src/one/**"]));
+    board.post(claim("b", "two", ["src/two/**"]));
+    const p1 = board.post(push("a", "one", "c1", ["src/one/x.ts"]))[0]!.seq;
+    const p2 = board.post(push("b", "two", "c2", ["src/two/y.ts"]))[0]!.seq;
+    return { board, p1, p2 };
+  };
+
+  it("records a round and its phases as engine facts that change no board state but the seq", () => {
+    const { board, p1, p2 } = pushedBoard();
+    const before = { ...board.state, lastSeq: 0 };
+    const [s] = board.post(started([p1, p2]));
+    expect(s).toMatchObject({ from: "engine", type: "integration.started", payload: { kind: "integrate", pushes: [p1, p2], agents: ["a", "b"], items: ["one", "two"] } });
+    expect(s!.to).toBeUndefined();
+    board.post(msg("engine", "integration.phase", { started: s!.seq, phase: "fetch", elapsedMs: 0 }));
+    board.post(msg("engine", "integration.phase", { started: s!.seq, phase: "gate", detail: "npm run gate", elapsedMs: 41000 }));
+    expect({ ...board.state, lastSeq: 0 }).toEqual(before);
+    // The round ends with what it records, as before.
+    board.post(rev("fail", ["c1", "c2"]));
+    expect(reduceBoard(board.log)).toEqual(board.state);
+    expect(foldBoard(board.log)).toEqual(board.state);
+  });
+
+  it("is engine-only, through the engine-record route", () => {
+    const { board, p1 } = pushedBoard();
+    expect(ENGINE_RECORD_TYPES).toContain("integration.started");
+    expect(ENGINE_RECORD_TYPES).toContain("integration.phase");
+    expect(() =>
+      appendBoardMessage(board.state, { kind: "agent", agent: "a" }, { type: "integration.started", payload: { kind: "integrate", pushes: [p1], agents: ["a"], items: ["one"] } }, AT),
+    ).toThrow(/cannot be sent by an agent/);
+    expect(() => appendBoardMessage(board.state, { kind: "human" }, { type: "integration.phase", payload: { started: 1, phase: "gate" } }, AT)).toThrow(BoardError);
+    expect(() => appendEngineRecord(board.state, { type: "integration.phase", payload: { started: 1, phase: "gate", output: "x" } }, AT)).toThrow(
+      /is \{started, phase, detail\?, elapsedMs\?\}/,
+    );
+  });
+
+  it("validates against the board and stays within its limits", () => {
+    const { board, p1, p2 } = pushedBoard();
+    const last = board.state.lastSeq;
+    board.reject(started([p1, last + 5]), /names no recorded message/, "UNKNOWN_REF");
+    board.reject(msg("engine", "integration.started", { kind: "integrate", pushes: [p1], agents: ["a"], items: ["nope"] }), /nope/);
+    board.reject(msg("engine", "integration.started", { kind: "integrate", pushes: [p1], agents: ["zed"], items: ["one"] }), /never joined/, "UNKNOWN_AGENT");
+    board.reject(msg("engine", "integration.phase", { started: last + 3, phase: "gate" }), /names no recorded message/, "UNKNOWN_REF");
+    board.reject(msg("engine", "integration.phase", { started: p2, phase: "gate", detail: "x".repeat(BOARD_LIMITS.maxIntegrationDetail + 1) }), /at most 160/, "BAD_PAYLOAD");
+    board.reject(msg("engine", "integration.phase", { started: p2, phase: "gate", elapsedMs: -1 }), /non-negative/, "BAD_PAYLOAD");
+    board.reject(started([p1], { candidates: BOARD_LIMITS.maxSpeculate + 1 }), /candidates/, "BAD_PAYLOAD");
+    board.reject(started(Array.from({ length: BOARD_LIMITS.maxRevisionPushes + 1 }, (_, i) => i + 1)), /pushes/, "BAD_PAYLOAD");
+  });
+
+  it("is refused on a board whose clocks count engine records (arbitration revision 1)", () => {
+    const { board, p1 } = pushedBoard({});
+    board.reject(started([p1]), /arbitration revision 2/, "NOT_ALLOWED");
+  });
+
+  it("never moves a lease, a lapse, or a wait: a log with progress records arbitrates exactly as one without", () => {
+    const rules = { arbitration: 7, claimLeaseMessages: 3 };
+    const plain = pushedBoard(rules);
+    const noisy = pushedBoard(rules);
+    const s = noisy.board.post(started([noisy.p1, noisy.p2]))[0]!.seq;
+    for (let i = 0; i < 10; i += 1) noisy.board.post(msg("engine", "integration.phase", { started: s, phase: "gate", elapsedMs: i }));
+    const strip = (state: BoardState) => ({ ...state, lastSeq: 0 });
+    expect(strip(noisy.board.state)).toEqual(strip(plain.board.state));
+    // The next participant message derives the same engine messages on both.
+    const next = (b: TestBoard) => b.types(msg("c", "item.claimed", { item: "three", intent: { read: [], write: ["src/three/**"] } }));
+    expect(next(noisy.board)).toEqual(next(plain.board));
+    expect(itemWaitReason(noisy.board.state, "one")).toEqual(itemWaitReason(plain.board.state, "one"));
+    expect(reduceBoard(noisy.board.log)).toEqual(noisy.board.state);
   });
 });
 

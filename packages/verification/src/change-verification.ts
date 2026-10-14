@@ -33,6 +33,7 @@ import { join } from "node:path";
 import type {
   CoordinationSummary,
   EvidenceSummary,
+  IntegrationPhase,
   IntegrationResult,
   VerificationContract,
   WorkUnitVerification,
@@ -156,6 +157,11 @@ export interface VerifyAndIntegrateOptions {
    * (never evidence) once its temp dirs are removed.
    */
   readonly signal?: AbortSignal;
+  /**
+   * Told as each coarse phase starts (progress only: it never changes what is
+   * verified, integrated, or gated). See IntegrateOptions.onPhase.
+   */
+  readonly onPhase?: (phase: IntegrationPhase) => void;
 }
 
 export class ChangeVerification {
@@ -245,6 +251,9 @@ export class ChangeVerification {
 
     // Verify in the Change's declared WorkUnit order for deterministic evidence.
     const completedById = new Map(completed.map((c) => [c.unitId, c]));
+    if (completed.length > 0) {
+      options.onPhase?.("fetch");
+    }
     for (const unit of change.work) {
       const done = completedById.get(unit.id);
       if (!done) {
@@ -311,6 +320,7 @@ export class ChangeVerification {
       workRoot,
       identity: options.identity,
       ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.onPhase ? { onPhase: options.onPhase } : {}),
     });
 
     return { changeId: change.id, units, integration, coordination };

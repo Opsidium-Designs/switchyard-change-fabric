@@ -84,6 +84,7 @@ import {
 } from "@switchyard-change/change-core";
 import { gateFailureLine, inventoryAfterContracts, matchesGlob, type EvidenceSummary } from "@switchyard-change/verification";
 
+import { agentList } from "./integration-progress.ts";
 import { redactSecrets } from "./redact.ts";
 import {
   ABANDONED_REASON,
@@ -466,8 +467,9 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
   });
   const ratchetInfo = { n: ratchet.n, score: ratchet.score };
 
-  // 1. The whole stack, as every pre-pass revision is built.
-  const whole = await gateCandidateTree(ctx, 1, stack);
+  // 1. The whole stack, as every pre-pass revision is built (its coarse phases recorded as progress).
+  await options.progress?.start({ kind: "leave-one-out", units: stack.map((e) => e.unit) });
+  const whole = await gateCandidateTree(options.progress ? { ...ctx, onPhase: (phase) => options.progress?.phase(phase) } : ctx, 1, stack);
   const verificationExcluded = stack
     .filter((e) => whole.excludedAgents.some((x) => x.agent === e.unit.agent))
     .map((e) => ({ agent: e.unit.agent, items: [...e.unit.items], reason: whole.excludedAgents.find((x) => x.agent === e.unit.agent)!.reason }));
@@ -600,8 +602,21 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
   });
   const limit = Math.max(1, Math.floor(options.isolate));
   const chosen = planned.slice(0, limit);
-  const gated = await inPool(chosen.length, Math.max(1, options.candidateConcurrency ?? limit), async (index): Promise<{ isolation: RatchetIsolation; built?: BuiltCandidate }> => {
+  const concurrency = Math.max(1, options.candidateConcurrency ?? limit);
+  const without = (c: LeaveOneOutCandidate): string => `without ${c.kind === "group" ? `${c.agent}'s seam push and its consumers (${agentList(c.agents)})` : `${c.agent}'s push`}`;
+  if (chosen.length > 0 && concurrency >= chosen.length) {
+    options.progress?.phase(
+      "candidate",
+      chosen.length === 1
+        ? `leave-one-out candidate 1 of 1: the stack ${without(chosen[0]!)}`
+        : `${chosen.length} leave-one-out candidates at once: the stack without each of ${agentList(chosen.map((c) => c.agent))}`,
+    );
+  }
+  const gated = await inPool(chosen.length, concurrency, async (index): Promise<{ isolation: RatchetIsolation; built?: BuiltCandidate }> => {
     const c = chosen[index - 1]!;
+    if (concurrency < chosen.length) {
+      options.progress?.phase("candidate", `leave-one-out candidate ${index} of ${chosen.length}: the stack ${without(c)}`);
+    }
     const capped = options.stopCandidates?.();
     if (capped !== undefined) {
       return { isolation: { ...describe(c), outcome: "skipped", skipped: `not built: ${capped}` } };
@@ -794,6 +809,9 @@ export async function integrateRatchetRound(options: RatchetRoundOptions): Promi
     if (restEntries.length === 0) {
       return done();
     }
+    // A new round: the stack without the regressors, gated as the next revision.
+    await options.progress?.start({ kind: "leave-one-out", units: restEntries.map((e) => e.unit) });
+    options.progress?.phase("candidate", `the stack without the regressing push${blamedAgents.length === 1 ? "" : "es"} of ${agentList(blamedAgents)}`);
     t = await gateCandidateTree({ ...ctx, state: after.state }, chosen.length + 2, restEntries);
     if (t.commit === undefined || t.gate === undefined) {
       return done({ failure: t.skipped ?? "the stack without the regressors could not be gated" });

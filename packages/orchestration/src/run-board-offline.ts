@@ -242,6 +242,8 @@ export async function runBoardOffline(options: RunBoardOfflineOptions): Promise<
       ...(options.speculate !== undefined ? { speculate: options.speculate } : {}),
       // Candidates in order, one at a time: a deterministic log.
       candidateConcurrency: 1,
+      // Integration progress records carry no wall-clock time: a deterministic log.
+      progressClock: null,
       ...(options.budgets ? { budgets: options.budgets } : {}),
       ...(options.rules ? { rules: options.rules } : {}),
       ...(options.caps ? { caps: options.caps } : {}),

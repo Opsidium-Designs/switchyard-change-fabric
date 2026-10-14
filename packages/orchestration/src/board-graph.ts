@@ -438,6 +438,8 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     case "trunk.moved":
     case "revision.promoted":
     case "candidate.gated":
+    case "integration.started":
+    case "integration.phase":
     case "push.excluded":
     case "push.regressed":
     case "fix.requested":
@@ -460,6 +462,100 @@ export function boardMessageFamily(type: BoardMessageType): BoardMessageFamily {
     default:
       return "agent";
   }
+}
+
+/**
+ * The integration round open at K: the latest integration.started at or
+ * before K that nothing has closed yet (its revision, a speculative
+ * candidate, a recorded regression, its own `ended` phase, or a newer round),
+ * with its latest phase. Read from the log only; null when none is open (and
+ * always on a log that records no integration progress). Pure.
+ */
+export interface OpenIntegrationRound {
+  /** The integration.started seq (what backs every drawn element of the round). */
+  readonly seq: number;
+  /** The revision number the round integrates (the next one at its start). */
+  readonly n: number;
+  readonly kind: BoardPayloads["integration.started"]["kind"];
+  readonly pushes: readonly number[];
+  readonly agents: readonly string[];
+  readonly items: readonly string[];
+  readonly candidates?: number;
+  /** The round's latest phase record, if any. */
+  readonly phase?: { readonly seq: number } & BoardPayloads["integration.phase"];
+  /** The phase in words ("running the gate", "leave-one-out candidate 2 of 4: ..."). */
+  readonly line: string;
+}
+
+/** Message types that close an open integration round. */
+const ROUND_CLOSERS: ReadonlySet<BoardMessageType> = new Set(["integrated.rev", "candidate.gated", "push.regressed"]);
+
+/** A phase in words, with its detail. */
+export function integrationPhaseLine(phase: Pick<BoardPayloads["integration.phase"], "phase" | "detail"> | undefined): string {
+  if (phase === undefined) {
+    return "starting";
+  }
+  const words: Record<BoardPayloads["integration.phase"]["phase"], string> = {
+    fetch: "reading the pushes",
+    merge: "merging the pushes onto the head",
+    install: "installing dependencies",
+    gate: "running the gate",
+    candidate: "gating candidates",
+    ended: "ended",
+  };
+  if (phase.phase === "candidate" && phase.detail !== undefined) {
+    return phase.detail;
+  }
+  return `${words[phase.phase]}${phase.detail !== undefined ? `: ${phase.detail}` : ""}`;
+}
+
+export function openIntegrationRound(log: readonly BoardMessage[], k: number = Number.POSITIVE_INFINITY): OpenIntegrationRound | null {
+  const messages = boardPrefix(log, k);
+  let start = -1;
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]!.type === "integration.started") {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) {
+    return null;
+  }
+  const started = messages[start]!;
+  if (!isType(started, "integration.started")) {
+    return null;
+  }
+  let phase: OpenIntegrationRound["phase"];
+  for (let i = start + 1; i < messages.length; i += 1) {
+    const m = messages[i]!;
+    if (ROUND_CLOSERS.has(m.type)) {
+      return null;
+    }
+    if (isType(m, "integration.phase") && m.payload.started === started.seq) {
+      if (m.payload.phase === "ended") {
+        return null;
+      }
+      phase = { seq: m.seq, ...m.payload };
+    }
+  }
+  let revs = 0;
+  for (let i = 0; i < start; i += 1) {
+    if (messages[i]!.type === "integrated.rev") {
+      revs += 1;
+    }
+  }
+  const p = started.payload;
+  return {
+    seq: started.seq,
+    n: revs + 1,
+    kind: p.kind,
+    pushes: p.pushes,
+    agents: p.agents,
+    items: p.items,
+    ...(p.candidates !== undefined ? { candidates: p.candidates } : {}),
+    ...(phase !== undefined ? { phase } : {}),
+    line: integrationPhaseLine(phase),
+  };
 }
 
 /** "(seq N, type)": the backing suffix every tooltip ends with. */
@@ -540,6 +636,10 @@ export function messageItems(message: BoardMessage, state?: BoardState): string[
   if (isType(message, "integrated.rev") && message.payload.failing) {
     out.push(...message.payload.failing.items);
   }
+  // An integration round names the items whose pushes it gates.
+  if (isType(message, "integration.started")) {
+    out.push(...message.payload.items);
+  }
   if (isType(message, "push.announced") && message.payload.merges) {
     out.push(...message.payload.merges.map((m) => m.item));
   }
@@ -577,6 +677,8 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
   const kk = Math.max(0, Math.min(k, lastSeq));
   const messages = boardPrefix(log, kk);
   const state = foldBoard(messages);
+  // The integration round open at K (progress only), for the wait lines of the pushes it gates.
+  const integrating = openIntegrationRound(messages);
   const bySeq = new Map<number, BoardMessage>();
   for (const m of messages) {
     bySeq.set(m.seq, m);
@@ -728,6 +830,13 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
     if (item.triage) seqs.add(item.triage.seq);
     const status = contestedItems.has(item.id) && item.status !== "done" ? "contested" : item.status;
     const waitReason = itemWaitReason(state, item.id);
+    // A push waiting for the gate while a round that gates it is open names that round.
+    const waitLine =
+      waitReason === undefined
+        ? undefined
+        : waitReason.kind === "waiting-for-gate" && integrating !== null && integrating.items.includes(item.id)
+          ? `waiting for revision ${integrating.n}'s gate (${integrating.line})`
+          : describeWaitReason(waitReason);
     const ownerText = item.owner !== undefined ? `, owner ${item.owner}` : "";
     const doneText =
       item.status === "done"
@@ -749,7 +858,7 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
       label: item.id,
       status,
       seqs: [...seqs].sort((a, b) => a - b),
-      tooltip: `item ${item.id}: ${item.objective} [${status}${ownerText}${doneText}]${waitReason ? ` (${describeWaitReason(waitReason)})` : ""} ${backingSuffix(origin)}`,
+      tooltip: `item ${item.id}: ${item.objective} [${status}${ownerText}${doneText}]${waitLine !== undefined ? ` (${waitLine})` : ""} ${backingSuffix(origin)}`,
       detail: {
         kind: "item",
         item: item.id,
@@ -787,7 +896,7 @@ export function buildBoardGraph(log: readonly BoardMessage[], k: number = Number
               },
             }
           : {}),
-        ...(waitReason ? { wait: { kind: waitReason.kind, line: describeWaitReason(waitReason) } } : {}),
+        ...(waitReason ? { wait: { kind: waitReason.kind, line: waitLine! } } : {}),
         ...((): { clashes?: { with: string; status: string; scope?: "shared" | "local"; seq: number }[] } => {
           const live = liveClashes(state, item.id);
           return live.length > 0
@@ -1838,7 +1947,15 @@ export function boardThread(log: readonly BoardMessage[], k: number, selection: 
     case "seq": {
       const target = messages.find((m) => m.seq === selection.seq);
       if (!target) return [];
-      return messages.filter((m) => m.seq === target.seq || m.seq === target.inReplyTo || m.inReplyTo === target.seq);
+      // An integration round and its phases are one thread (a phase names its round's seq).
+      const round = isType(target, "integration.phase") ? target.payload.started : isType(target, "integration.started") ? target.seq : undefined;
+      return messages.filter(
+        (m) =>
+          m.seq === target.seq ||
+          m.seq === target.inReplyTo ||
+          m.inReplyTo === target.seq ||
+          (round !== undefined && (m.seq === round || (isType(m, "integration.phase") && m.payload.started === round))),
+      );
     }
     case "node": {
       const id = selection.id;

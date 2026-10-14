@@ -46,7 +46,7 @@ import {
   runnerResolutionViolations,
 } from "./runner-resolution.ts";
 import { inventoryShortfall, readStreamInventory, readTestProgress, type TestInventory } from "./test-inventory.ts";
-import type { AppliedUnit, CheckResult, IntegrationResult, OutputRef, PromotionPush, Verdict } from "./types.ts";
+import type { AppliedUnit, CheckResult, IntegrationPhase, IntegrationResult, OutputRef, PromotionPush, Verdict } from "./types.ts";
 
 /** One verified WorkUnit's workspace to feed into integration. */
 export interface VerifiedWorkspace {
@@ -199,6 +199,14 @@ export interface IntegrateOptions {
    * rejects with IntegrationAbortedError (never a verdict).
    */
   readonly signal?: AbortSignal;
+  /**
+   * Told as each coarse phase starts: `merge` (cloning the base and applying
+   * the units), `install` (the gate's dependency install, when the command
+   * runner installs), and `gate`. Progress only: what is applied, installed,
+   * and gated, and the verdict, are exactly as without it. A throwing
+   * callback is ignored.
+   */
+  readonly onPhase?: (phase: IntegrationPhase) => void;
 }
 
 /**
@@ -260,6 +268,14 @@ export class Integrator {
     } = options;
 
     throwIfAborted(signal);
+    const phase = (p: IntegrationPhase): void => {
+      try {
+        options.onPhase?.(p);
+      } catch {
+        // Progress only: a failing listener never changes the integration.
+      }
+    };
+    phase("merge");
     const workRoot = options.workRoot ?? tmpdir();
     const integrationDir = await mkdtemp(join(workRoot, "scf-integration-"));
     // A trusted bare repo OUTSIDE the checkout the gate runs in, under its own
@@ -404,6 +420,18 @@ export class Integrator {
       }
 
       throwIfAborted(signal);
+      if (options.onPhase) {
+        // Report the install apart from the gate: the installing runner
+        // installs once per tree and manifest, so installing first here is
+        // the same install the gate command would have waited for.
+        const installer = this.commandRunner as Partial<{ installFor(dir: string, options?: { signal?: AbortSignal }): Promise<unknown> }>;
+        if (integrationGateCommand && integrationGateCommand.length > 0 && typeof installer.installFor === "function") {
+          phase("install");
+          await installer.installFor(integrationDir, signal ? { signal } : {}).catch(() => undefined);
+          throwIfAborted(signal);
+        }
+        phase("gate");
+      }
       const ranGate = await this.runIntegrationGate(
         integrationGateCommand,
         requiresIntegrationGate ?? false,

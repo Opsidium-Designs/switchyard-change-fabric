@@ -19,6 +19,14 @@ import type { TestProgress } from "./test-inventory.ts";
 /** The kind of check a verification run performs. */
 export type CheckKind = "clean-state" | "path-scope" | "test" | "lint" | "app-gate";
 
+/**
+ * A coarse integration phase, reported as it starts (progress only, never a
+ * verdict): reading and verifying the units' pushes (`fetch`), composing them
+ * onto the base (`merge`), the gate's dependency install (`install`), and the
+ * authoritative gate itself (`gate`).
+ */
+export type IntegrationPhase = "fetch" | "merge" | "install" | "gate";
+
 /** Overall verdict for a WorkUnit or for the integration. */
 export type Verdict = "verified" | "failed";
 

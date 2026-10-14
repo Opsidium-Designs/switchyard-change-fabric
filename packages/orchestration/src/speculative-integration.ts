@@ -77,9 +77,11 @@ import {
   type CompletedWorkUnit,
   type DependencyInstallOutcome,
   type EvidenceSummary,
+  type IntegrationPhase,
   type TestInventory,
 } from "@switchyard-change/verification";
 
+import { agentList } from "./integration-progress.ts";
 import { redactSecrets } from "./redact.ts";
 import {
   ABANDONED_REASON,
@@ -260,6 +262,19 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
   const ctx: CandidateContext = { options, state, scrub, requiresIntegrationGate, ...(inventoryNow ? { inventory: inventoryNow } : {}) };
   const gateCandidate = (index: number, entries: readonly StackEntry[]): Promise<BuiltCandidate> => gateCandidateTree(ctx, index, entries);
 
+  // Progress only: the round, then which candidates are being built (all at
+  // once as one record, else each as it starts).
+  const concurrency = Math.max(1, options.candidateConcurrency ?? speculate);
+  await options.progress?.start({ kind: "speculative", units: stack.map((e) => e.unit), candidates: stack.length });
+  if (concurrency >= stack.length) {
+    options.progress?.phase(
+      "candidate",
+      stack.length === 1
+        ? `candidate 1 of 1: the head plus ${stack[0]!.unit.agent}'s push`
+        : `${stack.length} prefix candidates at once on the passing head (the head plus the first 1 to ${stack.length} pushes: ${agentList(stack.map((e) => e.unit.agent))})`,
+    );
+  }
+
   // Build and gate the candidates: C1 always; a later one only while no cap
   // is reached and no shorter prefix is already known to have failed.
   const known = new Map<number, BuiltCandidate>();
@@ -274,6 +289,9 @@ export async function integrateSpeculativeRound(options: SpeculativeRoundOptions
       if (failedBefore !== undefined) {
         return { index, entries, mergedAgents: [], excludedAgents: [], skipped: `not built: candidate ${failedBefore.index} did not pass` } satisfies BuiltCandidate;
       }
+    }
+    if (concurrency < stack.length) {
+      options.progress?.phase("candidate", `candidate ${index} of ${stack.length}: the head plus ${agentList(entries.map((e) => e.unit.agent))}`);
     }
     const candidate = await gateCandidate(index, entries);
     known.set(index, candidate);
@@ -468,6 +486,8 @@ export interface CandidateContext {
   readonly requiresIntegrationGate: boolean;
   /** The baseline test inventory adjusted for accepted contracts. */
   readonly inventory?: TestInventory;
+  /** Told as the candidate's coarse phases start (progress only; see IntegrateOptions.onPhase). */
+  readonly onPhase?: (phase: IntegrationPhase) => void;
 }
 
 /**
@@ -522,6 +542,7 @@ export async function gateCandidateTree(ctx: CandidateContext, index: number, en
       workRoot: options.worktreeRoot,
       identity: options.identity,
       ...(options.signal ? { signal: options.signal } : {}),
+      ...(ctx.onPhase ? { onPhase: ctx.onPhase } : {}),
     });
   } catch (error) {
     // An aborted candidate (the run stopped waiting) records nothing (see ABANDONED_REASON).
@@ -598,6 +619,7 @@ export async function recordBuiltCandidate(
     decisions.length = 0;
     return { failure: ABANDONED_REASON };
   }
+  await options.progress?.flush();
   const recorded = await options.operator.recordRevision({
     commit: c.commit!,
     gate: c.gate!,
@@ -616,6 +638,7 @@ export async function recordBuiltCandidate(
       ? { stale: true, supersededAgents: await supersededAgentsNow(options.operator, items), failure: scrub(`the board refused the revision: ${recorded.error}`) }
       : { failure: scrub(`the board refused the revision (${recorded.code}): ${recorded.error}`) };
   }
+  options.progress?.closed();
   const rev = recorded.appended.find((m) => m.type === "integrated.rev");
   const n = rev && rev.type === "integrated.rev" ? rev.payload.n : input.nFallback;
   const revExcluded = [...input.revExcluded];

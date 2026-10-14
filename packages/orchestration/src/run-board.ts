@@ -74,6 +74,7 @@ import {
   releasedTargets,
   type ImplicationSource,
   arbitrationV3,
+  arbitrationV2,
   arbitrationV5,
   ratchetHistory,
   ratchetLine,
@@ -128,12 +129,14 @@ import {
   readTestProgress,
   type CommandRunner as VerificationCommandRunner,
   type CompletedWorkUnit,
+  type IntegrationPhase,
   type EvidenceSummary,
 } from "@switchyard-change/verification";
 
 import { recordPendingClashes, type PendingClashResult } from "./board-clash.ts";
 import { DEFAULT_SPECULATE, formatCandidates, integrateSpeculativeRound, MAX_SPECULATE, type CandidateOutcome, type SpeculativeRoundResult } from "./speculative-integration.ts";
 import { integrateRatchetRound, type RatchetIsolation, type RatchetRoundResult } from "./ratchet-integration.ts";
+import { createIntegrationProgress, type IntegrationProgress } from "./integration-progress.ts";
 import { TokenRefresher } from "./token-refresh.ts";
 import { buildProofBundle, type ProofBundle } from "./proof-bundle.ts";
 import { buildPromotionReceipt } from "./promotion-receipt.ts";
@@ -629,6 +632,11 @@ export interface RunBoardOptions {
   readonly caps?: RunCaps;
   /** The caps' clock (default Date.now): injected in tests. */
   readonly capsClock?: () => number;
+  /**
+   * The clock of the integration progress records' `elapsedMs` (default
+   * Date.now); null records no elapsed time (a deterministic offline log).
+   */
+  readonly progressClock?: (() => number) | null;
   /** The lifetime of the read tokens the integrator asks for per revision (default 600 s). */
   readonly readTokenTtlSeconds?: number;
   readonly rules?: Partial<BoardRules>;
@@ -931,6 +939,11 @@ export interface IntegrateBoardOptions {
   readonly recordDecision?: RecordBoardDecision;
   /** The branch advance after a recorded pass (default: advanceIntegrationBranch; injectable for tests). */
   readonly advanceBranch?: typeof advanceIntegrationBranch;
+  /**
+   * The attempt's progress on the board (integration.started and its coarse
+   * phases; see integration-progress.ts). Progress only: never a verdict.
+   */
+  readonly progress?: IntegrationProgress;
 }
 
 /** The result of one integration attempt. */
@@ -1531,6 +1544,8 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
   }
 
   const change: Change = { id: options.change.id, objective: options.change.objective, baseline: "HEAD", budgetUsd: 0, assurance: "standard", work: units };
+  // Progress only: the round and the pushes it read, then its coarse phases.
+  await options.progress?.start({ kind: "integrate", units: plan.units.filter((u) => completed.some((c) => c.unitId === u.agent)) });
   // The baseline test inventory, adjusted for contract changes a human accepted
   // (a changed or removed test may rename or drop tests), read from board state.
   const acceptedTargets = [...new Set(Object.values(state.contracts).filter((c) => c.status === "accepted" && c.guarded).map((c) => c.target))].sort();
@@ -1572,6 +1587,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
       workRoot: options.worktreeRoot,
       identity: options.identity,
       ...(options.signal ? { signal: options.signal } : {}),
+      ...(options.progress ? { onPhase: (phase: IntegrationPhase) => options.progress?.phase(phase) } : {}),
     });
   } catch (error) {
     if (isIntegrationAborted(error) || options.abandoned?.()) {
@@ -1680,6 +1696,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     attributionDecisions.length = 0;
     return { requiresIntegrationGate, key, evidence, failure: ABANDONED_REASON };
   }
+  await options.progress?.flush();
   const recorded = await options.operator.recordRevision({
     commit,
     gate,
@@ -1708,6 +1725,7 @@ export async function integrateBoardRevision(options: IntegrateBoardOptions): Pr
     }
     return { requiresIntegrationGate, key, ...unreadKeyOf(key), evidence, failure: scrub(`the board refused the revision (${recorded.code}): ${recorded.error}`) };
   }
+  options.progress?.closed();
   const rev = recorded.appended.find((m) => m.type === "integrated.rev");
   const n = rev && rev.type === "integrated.rev" ? rev.payload.n : state.lastRevN + 1;
   let trunkMoved: BoardRevision["trunkMoved"];
@@ -1838,6 +1856,8 @@ export class ContinuousBoardIntegrator {
       readonly stopCandidates?: () => string | undefined;
       /** Called with each speculative round's candidates. */
       readonly onCandidates?: (candidates: readonly CandidateOutcome[]) => void;
+      /** The progress records' elapsed-time clock (default Date.now; null: no elapsed time). */
+      readonly progressClock?: (() => number) | null;
     },
   ) {
     // A caller's own signal aborts the attempt too.
@@ -1973,6 +1993,7 @@ export class ContinuousBoardIntegrator {
       return;
     }
     let result: SpeculativeRoundResult & RatchetRoundResult;
+    let progress: IntegrationProgress | undefined;
     try {
       if (this.options.predictClashes !== false) {
         // Clash alerts from real code (advisory): never blocks the revision below.
@@ -1989,11 +2010,19 @@ export class ContinuousBoardIntegrator {
           this.options.onClashes?.(clashes);
         }
       }
+      const abandoned = (): boolean => this.abandoned || this.options.abandoned?.() === true;
+      // Progress on the board (never a verdict): only where engine records move no clock.
+      progress = createIntegrationProgress(this.options.operator, {
+        enabled: arbitrationV2(state),
+        abandoned,
+        ...(this.options.progressClock !== undefined ? { now: this.options.progressClock } : {}),
+      });
       const attempt = {
         ...this.options,
         decided: this.attempted,
-        abandoned: () => this.abandoned || this.options.abandoned?.() === true,
+        abandoned,
         signal: this.abort.signal,
+        progress,
         ...(this.holdBack.size > 0 ? { holdBack: [...this.holdBack] } : {}),
       };
       result = this.speculatesOn(state)
@@ -2022,6 +2051,8 @@ export class ContinuousBoardIntegrator {
     } finally {
       await this.options.onSettled?.().catch(() => undefined);
     }
+    // A round still open recorded nothing: say so (and why), so it is not shown in progress.
+    await progress?.end(result.failure ?? "the round recorded no revision").catch(() => undefined);
     // Mark the set the attempt actually read (it may have moved since `key`).
     const tried = result.key ?? key;
     // What to mark attempted: with pushes left unread (an unreadable repo, or
@@ -2827,6 +2858,7 @@ export async function runBoard(options: RunBoardOptions): Promise<RunBoardResult
     : new ContinuousBoardIntegrator({
     operator,
     change: { id: changeId, objective },
+    ...(options.progressClock !== undefined ? { progressClock: options.progressClock } : {}),
     agentRepos,
     readRemote,
     integration: integration as Awaited<ReturnType<typeof createIntegrationWorkspace>>,
@@ -4354,6 +4386,14 @@ function payloadSummary(m: BoardMessage): string {
         (c.rev !== undefined ? ` (rev ${c.rev})` : "") +
         (c.blamed !== undefined ? `; blamed ${c.blamed.join(", ")}` : "")
       );
+    }
+    case "integration.started": {
+      const s = m.payload;
+      return `${s.kind} round on ${s.pushes.length} push(es) of ${s.agents.length} agent(s) (${s.items.slice(0, 6).join(", ")}${s.items.length > 6 ? ", ..." : ""})${s.candidates !== undefined ? `, up to ${s.candidates} candidate(s)` : ""} (progress only)`;
+    }
+    case "integration.phase": {
+      const s = m.payload;
+      return `round ${s.started}: ${s.phase}${s.detail !== undefined ? `: ${s.detail}` : ""}${s.elapsedMs !== undefined ? ` (${Math.round(s.elapsedMs / 1000)} s in)` : ""} (progress only)`;
     }
     case "push.excluded":
       return `${String(p.agent)}'s push ${String(p.commit).slice(0, 10)} for ${String(p.item)} was left out of integration: ${String(p.reason).slice(0, 160)} (not re-gated until it pushes again)`;

@@ -256,6 +256,8 @@ export const BOARD_LIMITS = {
   maxRegressionEvidenceLine: 300,
   /** Prefix candidates one speculative integration round may gate (the speculate rule's bound). */
   maxSpeculate: 8,
+  /** Characters of an integration.phase detail (a short, bounded line: never gate output). */
+  maxIntegrationDetail: 160,
   /**
    * Stall releases (lapsed claims, released seam stalls) after which an item
    * is not released again by a quiet board: it is the lead's to re-plan.
@@ -783,6 +785,42 @@ export interface BoardPayloads {
     readonly blamed?: readonly string[];
     readonly progress?: BoardRevProgress;
   };
+  /**
+   * Engine (recorded by the operator): the integrator began an integration
+   * ROUND on the pending pushes `pushes` (the push.announced seqs, each an
+   * item's latest push it read) of `agents`, carrying `items`. `kind` is the
+   * round's shape: `integrate` (every pending push as one revision),
+   * `leave-one-out` (the pre-pass ratchet: the whole stack, then, when it
+   * scores worse, the stack without each new push), or `speculative` (up to
+   * `candidates` prefix candidates on the passing head). PROGRESS ONLY: it
+   * changes no board state, decides nothing, and is never a verdict; the
+   * round ends with what it records (integrated.rev, candidate.gated,
+   * push.regressed) or, when it records nothing, an integration.phase `ended`.
+   */
+  "integration.started": {
+    readonly kind: "integrate" | "leave-one-out" | "speculative";
+    readonly pushes: readonly number[];
+    readonly agents: readonly string[];
+    readonly items: readonly string[];
+    readonly candidates?: number;
+  };
+  /**
+   * Engine (recorded by the operator): the integration round started at seq
+   * `started` reached a coarse phase: `fetch` (reading and verifying the
+   * agents' pushes), `merge` (composing them onto the head), `install` (the
+   * gate's dependency install), `gate` (the gate runs), `candidate` (one
+   * candidate tree of the round is built and gated; `detail` says which), or
+   * `ended` (the round ended without recording a revision; `detail` says
+   * why). `detail` is a short bounded line (never gate output) and
+   * `elapsedMs` the time since the round began. PROGRESS ONLY, like
+   * integration.started; the operator records a bounded number per round.
+   */
+  "integration.phase": {
+    readonly started: number;
+    readonly phase: "fetch" | "merge" | "install" | "gate" | "candidate" | "ended";
+    readonly detail?: string;
+    readonly elapsedMs?: number;
+  };
   /** Engine (derived): an item the lead already re-planned failed again (fix budget spent, or stalled twice): a human decides. */
   "item.escalated": { readonly item: string; readonly reason: "replan-failed"; readonly replanOf: string };
   "item.discovered": {
@@ -1110,6 +1148,8 @@ export const BOARD_MESSAGE_TYPES: readonly BoardMessageType[] = [
   "revision.promoted",
   "run.capped",
   "candidate.gated",
+  "integration.started",
+  "integration.phase",
   "push.excluded",
   "push.regressed",
   "item.discovered",
@@ -2327,6 +2367,37 @@ function parsePayload(type: BoardMessageType, raw: Raw): BoardPayloads[BoardMess
         ...(raw.progress !== undefined ? { progress: revProgress(raw.progress) } : {}),
       };
     }
+    case "integration.started": {
+      const pushes = raw.pushes;
+      if (!Array.isArray(pushes) || pushes.length === 0 || pushes.length > L.maxRevisionPushes) {
+        fail("BAD_PAYLOAD", `pushes must be an array of 1 to ${L.maxRevisionPushes} push seqs`);
+      }
+      const seqs: number[] = [];
+      pushes.forEach((value, index) => {
+        const seq = positiveInt({ [`pushes[${index}]`]: value }, `pushes[${index}]`);
+        if (!seqs.includes(seq)) {
+          seqs.push(seq);
+        }
+      });
+      const agents = idList(raw, "agents", { max: L.maxRevisionPushes });
+      const items = idList(raw, "items", { max: L.maxRevisionPushes });
+      if (agents.length === 0 || items.length === 0) {
+        fail("BAD_PAYLOAD", "an integration round names at least one agent and one item");
+      }
+      const kind = oneOf(raw, "kind", ["integrate", "leave-one-out", "speculative"] as const);
+      const candidates = raw.candidates === undefined ? undefined : positiveInt(raw, "candidates", L.maxSpeculate);
+      return { kind, pushes: seqs, agents, items, ...(candidates !== undefined ? { candidates } : {}) };
+    }
+    case "integration.phase": {
+      const detail = raw.detail === undefined ? undefined : text(raw, "detail", L.maxIntegrationDetail);
+      const elapsedMs = raw.elapsedMs === undefined ? undefined : nonNegativeInt(raw, "elapsedMs");
+      return {
+        started: positiveInt(raw, "started"),
+        phase: oneOf(raw, "phase", ["fetch", "merge", "install", "gate", "candidate", "ended"] as const),
+        ...(detail !== undefined ? { detail } : {}),
+        ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+      };
+    }
     case "push.excluded":
       return { item: id(raw, "item"), agent: id(raw, "agent"), commit: id(raw, "commit"), reason: text(raw, "reason", L.maxRationale) };
     case "push.regressed": {
@@ -2811,6 +2882,8 @@ const ALLOWED_SENDERS: Record<BoardMessageType, readonly Senders[]> = {
   "revision.promoted": ["engine"],
   "run.capped": ["engine"],
   "candidate.gated": ["engine"],
+  "integration.started": ["engine"],
+  "integration.phase": ["engine"],
   "item.discovered": ["agent"],
   "help.requested": ["agent"],
   "help.offered": ["agent"],
@@ -4557,6 +4630,36 @@ export function checkBoardTransition(state: BoardState, draft: BoardDraft, mode:
       }
       return;
     }
+    case "integration.started":
+    case "integration.phase": {
+      // Progress only, never arbitration state: recorded only where the
+      // board's clocks count participant messages (revision 2), so an
+      // engine record never moves a lease, a deadline, or a wait.
+      if (!arbitrationV2(state)) {
+        fail("NOT_ALLOWED", "integration progress is recorded only under arbitration revision 2 or later (whose clocks ignore engine records)");
+      }
+      if (draft.type === "integration.phase") {
+        if (draft.payload.started > state.lastSeq) {
+          fail("UNKNOWN_REF", `integration round ${draft.payload.started} names no recorded message`);
+        }
+        return;
+      }
+      const p = draft.payload;
+      for (const seq of p.pushes) {
+        if (seq > state.lastSeq) {
+          fail("UNKNOWN_REF", `push seq ${seq} names no recorded message`);
+        }
+      }
+      for (const item of p.items) {
+        requireItem(state, item);
+      }
+      for (const agent of p.agents) {
+        if (state.agents[agent] === undefined) {
+          fail("UNKNOWN_AGENT", `${agent} never joined this board`);
+        }
+      }
+      return;
+    }
     case "run.capped": {
       const p = draft.payload;
       if (p.item !== undefined) {
@@ -5777,6 +5880,10 @@ function applyInPlace(state: BoardState, message: BoardMessage): void {
     case "candidate.gated":
       state.lastCandidate = { round: message.payload.round, index: message.payload.index, seq: message.seq };
       break;
+    case "integration.started":
+    case "integration.phase":
+      // Progress only: nothing but the seq moves (no arbitration state, no verdict).
+      break;
     case "clash.predicted": {
       const p = message.payload;
       (state.clashes ??= []).push({
@@ -6945,6 +7052,8 @@ const RECORDED_ENGINE_TYPES: ReadonlySet<BoardMessageType> = new Set([
   "revision.promoted",
   "run.capped",
   "candidate.gated",
+  "integration.started",
+  "integration.phase",
   "push.excluded",
   "push.regressed",
   // Only an engine close (closedBy: engine) is recorded; every other completion is derived.
@@ -7256,6 +7365,8 @@ export const ENGINE_RECORD_TYPES = [
   "revision.promoted",
   "run.capped",
   "candidate.gated",
+  "integration.started",
+  "integration.phase",
   "push.excluded",
   "push.regressed",
   "item.completed",
@@ -7281,6 +7392,10 @@ export type EngineRecordType = (typeof ENGINE_RECORD_TYPES)[number];
  *   - candidate.gated {round, index, of, prefix, commit, base?, verdict,
  *     outcome, rev?, blamed?, progress?}: one candidate of a speculative
  *     integration round; a landed one must be the latest passing revision.
+ *   - integration.started {kind, pushes, agents, items, candidates?} and
+ *     integration.phase {started, phase, detail?, elapsedMs?}: integration
+ *     progress (a round began, a coarse phase changed). Progress only: no
+ *     board state changes and nothing is decided (arbitration revision 2+).
  *   - push.excluded {item, agent, commit, reason}: the integrator left the
  *     holder's pending push out of the integrated tree (it failed
  *     verification); addressed to the holder, it is not re-gated until the
@@ -7348,6 +7463,18 @@ export function appendEngineRecord(state: BoardState, input: unknown, at: string
         fail("BAD_PAYLOAD", "a candidate.gated record is {round, index, of, prefix, commit, base?, verdict, outcome, rev?, blamed?, progress?}");
       }
       return appendChecked(state, { from: BOARD_ENGINE, type: "candidate.gated", payload: parsePayload("candidate.gated", raw) as BoardPayloads["candidate.gated"] }, at);
+    }
+    case "integration.started": {
+      if (Object.keys(raw).some((k) => !["kind", "pushes", "agents", "items", "candidates"].includes(k))) {
+        fail("BAD_PAYLOAD", "an integration.started record is {kind, pushes, agents, items, candidates?}");
+      }
+      return appendChecked(state, { from: BOARD_ENGINE, type: "integration.started", payload: parsePayload("integration.started", raw) as BoardPayloads["integration.started"] }, at);
+    }
+    case "integration.phase": {
+      if (Object.keys(raw).some((k) => !["started", "phase", "detail", "elapsedMs"].includes(k))) {
+        fail("BAD_PAYLOAD", "an integration.phase record is {started, phase, detail?, elapsedMs?}");
+      }
+      return appendChecked(state, { from: BOARD_ENGINE, type: "integration.phase", payload: parsePayload("integration.phase", raw) as BoardPayloads["integration.phase"] }, at);
     }
     case "run.capped": {
       if (Object.keys(raw).some((k) => !["kind", "limit", "used", "item"].includes(k))) {
