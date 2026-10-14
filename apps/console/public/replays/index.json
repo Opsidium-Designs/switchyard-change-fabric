@@ -7,7 +7,19 @@
       "app": "cityhall",
       "outcome": "verified",
       "description": "Thirty worker agents and a lead on a local Claude CLI fix 32 modules across 8 city departments. Two stale developer tests change under human-accepted contracts; acceptance climbs 106, 109, 208, 234, then 237 of 237 at revision 8, which is gated and promoted. All 34 items completed.",
-      "messages": 433
+      "messages": 433,
+      "apps": {
+        "before": {
+          "url": "https://before-switchyard-showcase-cityhall.ckinney.workers.dev",
+          "commit": "d0a598d6f65421bf23d2eab1b0b2c76c8030c0f3"
+        },
+        "after": {
+          "url": "https://after-ch1-r8-switchyard-showcase-cityhall.ckinney.workers.dev",
+          "commit": "858d707d0180dfe440ce5fd157ffae0650a95bc9",
+          "run": "board-live-ch1",
+          "rev": 8
+        }
+      }
     },
     {
       "id": "board-live-sf21",
@@ -15,7 +27,19 @@
       "app": "storefront",
       "outcome": "verified",
       "description": "Six agents on a local Claude CLI make the storefront correct and safe: a stale developer test is changed under a human-accepted contract, acceptance climbs 79, 103, 126, 128, then 129 of 129 at revision 6, which is gated and promoted.",
-      "messages": 137
+      "messages": 137,
+      "apps": {
+        "before": {
+          "url": "https://before-switchyard-showcase-storefront.ckinney.workers.dev",
+          "commit": "d0a598d6f65421bf23d2eab1b0b2c76c8030c0f3"
+        },
+        "after": {
+          "url": "https://after-sf21-r6-switchyard-showcase-storefront.ckinney.workers.dev",
+          "commit": "15d7d40565c8df381bfacecbf8a8333da0ab3dbb",
+          "run": "board-live-sf21",
+          "rev": 6
+        }
+      }
     },
     {
       "id": "board-live-l3",
@@ -23,7 +47,19 @@
       "app": "service-api",
       "outcome": "verified",
       "description": "A lead and 3 workers fix a multi-resource API (input validation and auth on every resource) under a one-item claim cap. Failing revisions blame only items whose own tests fail; agents whose work waits on others take the next item. Acceptance climbs 10/20 -> 14/20 -> 18/20 -> 20/20 on revision 4, a speculative round lands one more push on revision 5, and the gated commit is promoted. Recorded verdict: verified.",
-      "messages": 74
+      "messages": 74,
+      "apps": {
+        "before": {
+          "url": "https://before-switchyard-showcase-service-api.ckinney.workers.dev",
+          "commit": "d0a598d6f65421bf23d2eab1b0b2c76c8030c0f3"
+        },
+        "after": {
+          "url": "https://after-l3-r5-switchyard-showcase-service-api.ckinney.workers.dev",
+          "commit": "1298cc3fe8e4c8886323d70b6ef67d744acd4750",
+          "run": "board-live-l3",
+          "rev": 5
+        }
+      }
     },
     {
       "id": "board-live-reg3",
@@ -31,7 +67,13 @@
       "app": "service-api",
       "outcome": "verified",
       "description": "A lead and 3 workers fix a multi-resource API (input validation and auth on every resource). They claim 6 resource items, a codemod tool is built, gated, and published, and the integrated tree goes from acceptance 10/20 (revision 1) to 16/20 (revision 2) to 20/20: revision 3 passes the app's own gate. Recorded verdict: verified.",
-      "messages": 89
+      "messages": 89,
+      "apps": {
+        "before": {
+          "url": "https://before-switchyard-showcase-service-api.ckinney.workers.dev",
+          "commit": "d0a598d6f65421bf23d2eab1b0b2c76c8030c0f3"
+        }
+      }
     },
     {
       "id": "board-live-sf7",
@@ -39,7 +81,13 @@
       "app": "storefront",
       "outcome": "failed",
       "description": "A lead and 6 workers on a multi-domain storefront (exact money, payment limits, auth, input validation). They publish a scanner and a codemod, negotiate 3 contract changes (one decided by a human), ask for help, and hand items off, but a shared Invoice contract change breaks typecheck for revisions 2 to 9; revision 10 reaches acceptance 40/129. No revision passed the gate, so nothing was promoted. Recorded verdict: failed.",
-      "messages": 152
+      "messages": 152,
+      "apps": {
+        "before": {
+          "url": "https://before-switchyard-showcase-storefront.ckinney.workers.dev",
+          "commit": "d0a598d6f65421bf23d2eab1b0b2c76c8030c0f3"
+        }
+      }
     },
     {
       "id": "board-live-sf8",
@@ -47,7 +95,13 @@
       "app": "storefront",
       "outcome": "failed",
       "description": "The same storefront goal with a lead and 6 workers: 7 contract proposals (6 accepted, 1 rejected by the lead, 4 escalated to a human), help requests, a volunteer, and handoffs. Acceptance peaks at 35/129 on revisions 6 and 7, later revisions fail typecheck, and two seam items stall. No revision passed the gate, so nothing was promoted. Recorded verdict: failed.",
-      "messages": 178
+      "messages": 178,
+      "apps": {
+        "before": {
+          "url": "https://before-switchyard-showcase-storefront.ckinney.workers.dev",
+          "commit": "d0a598d6f65421bf23d2eab1b0b2c76c8030c0f3"
+        }
+      }
     },
     {
       "id": "board-sim-100",
