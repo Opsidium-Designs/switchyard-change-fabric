@@ -4,16 +4,39 @@
  *
  * The CLI is the thin front end to the fabric. It reuses the orchestration
  * package to drive a Change end to end (orchestration, runners, verification,
- * integration, conflict coordination, local Git promotion, and cleanup) with
- * the deterministic noop executor and the honest local fallback, so every
- * command runs offline with no Cloudflare account.
+ * integration, conflict coordination, local Git promotion, and cleanup). The
+ * offline commands use the deterministic noop executor and the honest local
+ * fallback, with no Cloudflare account and no network. The live commands read
+ * the repo's `.env` into memory (never into this process's environment) and
+ * talk to a running Worker, Cloudflare, or a model.
  *
- * Commands:
- *   doctor                 check local prerequisites and print a readiness report
+ * Offline (no credentials):
  *   init  <project>        describe how a project maps to Change coordination
  *   run   <change.yaml>    run a Change end to end and print a readable summary
  *   status <change.yaml>   print the declared WorkGraph and schedule for a Change
  *   promote <change.yaml>  run a Change and promote the result into local Git
+ *   decompose              decompose a goal against a project into a WorkGraph
+ *   run-goal               decompose a goal and run the resulting Change
+ *   recruit                recruit agents under a min/max dial, driven by push events
+ *   run-board --offline    agents on the board with the offline policy and fixture gate
+ *
+ * Checks (read .env; they run without credentials and report what is missing):
+ *   env-check              confirm no credential is in this process's environment
+ *   doctor                 check local prerequisites and print a readiness report
+ *
+ * Live (credentials in .env; see .env.example):
+ *   jev-smoke              live check of the decision model (AI Gateway)
+ *   tool-smoke             live check of agent-built tool authoring (a model)
+ *   recruit-live           recruit agents into real Artifact repos (a running Worker)
+ *   run-live               the planner-driven live run (a running Worker and a model)
+ *   run-board              agents on the board, live (a running Worker and a model)
+ *   cleanup-live           delete the Artifact repos a watch-mode run left (a running Worker)
+ *   deploy-app             deploy an example app to its stable workers.dev URL (Cloudflare)
+ *   teardown-app           delete that deployed example app (Cloudflare)
+ *   preview-replay         backfill revision previews into a replay (Cloudflare; --dry-run plans only)
+ *   showcase-app           publish an app's original and run-fixed code (Cloudflare; --dry-run plans only)
+ *
+ * `switchyard-change --help` lists every command; `<command> --help` prints its usage.
  */
 
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -956,7 +979,7 @@ const commands: Command[] = [
     summary:
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
-      `${CLI_NAME} run-board "<goal>" --project <dir> [--offline [--fixture-gate] [--spread-claims] [--concurrent] [--board-out <file>]] [--worker <url>] [--min N] [--max N] [--max-inflight N] [--id <changeId>] ` +
+      `${CLI_NAME} run-board "<goal>"|--goal-file <file> --project <dir> [--offline [--fixture-gate] [--spread-claims] [--concurrent] [--board-out <file>]] [--worker <url>] [--min N] [--max N] [--max-inflight N] [--id <changeId>] ` +
       `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--deploy-app <app dir> [--deploy-app-name <worker>] [--preview-revisions]] [--rate-limit-window-ms N] [--inference gateway|claude-cli|codex-cli] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);

@@ -6,21 +6,27 @@
 #   make dev       run the Worker locally (wrangler dev; the gate container off)
 #   make dev-containers  run the Worker locally WITH the integration gate container (needs Docker)
 #   make console   run the local console (Vite)
-#   make dev-all   run the Worker and the console together
-#   make cli ARGS="doctor"   run the switchyard-change CLI
+#   make dev-all   run the Worker and the console together (console on http://127.0.0.1:5173)
+#   make dev-all-lan  the same, reachable from other machines on a trusted LAN (set SWITCHYARD_API_TOKEN first)
+#   make cli ARGS="doctor"   run the switchyard-change CLI (ARGS="--help" lists every command)
 #   make doctor    run the readiness check (switchyard-change doctor)
 #   make jev-smoke live check of the decision model's question types and contract triage (needs .env; not in check)
 #   make tool-smoke live check: the region filler builds the service-api codemod and its own gate runs (needs .env; not in check)
 #   make demo      run the example audit-logging Change end to end (offline)
+#   make decompose / decompose-audit  print a goal's WorkGraph and schedule (offline; GOAL=, PROJECT=)
+#   make run-goal  decompose a goal and run it to a promoted local commit (offline)
+#   make recruit   recruit agents under the MIN/MAX dial, driven by push events (offline)
+#   make recruit-live  recruit agents into real Artifact repos through a running Worker
 #   make demo-board  agents form around a goal on the Change board and build tools for each other (offline, deterministic)
-#   make run-board   live board run against a running Worker (needs the AI Gateway in .env)
+#   make run-board   live board run against a running Worker (needs live inference: the AI Gateway or SWITCHYARD_INFERENCE=claude-cli in .env)
+#   make run-live    the planner-driven live run against a running Worker (GOAL=, PROJECT=, MIN=, MAX=, OWNER=)
 #   make run-live-watch  watchable live run: stable id, escalation fires, repos left up
 #   make run-live-service  live run of the MODULAR service-api app (carries the blueprint)
 #   make demo-board-storefront  the board on the multi-domain storefront app (offline, deterministic)
-#   make run-board-storefront   live board run on the storefront app (needs a running Worker and the AI Gateway)
+#   make run-board-storefront   live board run on the storefront app (needs a running Worker and live inference)
 #   make storefront-gate  install the storefront app's pinned deps and run its gate (fails on the planted gaps)
 #   make demo-board-cityhall  the board on the 32-module cityhall app (offline, deterministic)
-#   make run-board-cityhall   live board run on the cityhall app at ~30 agents (needs a running Worker and inference)
+#   make run-board-cityhall   live board run on the cityhall app, a lead and up to 30 agents (needs a running Worker and live inference; INFERENCE=claude-cli)
 #   make cityhall-gate  install the cityhall app's pinned deps and run its gate (fails on the planted gaps)
 #   make cityhall-reference-check  prove cityhall is solvable: baseline gate fails, reference solution passes (offline)
 #   make demo-board-scale  a SIMULATED ~100-agent board run (real engine, scripted agents) published to the replay page
@@ -28,7 +34,8 @@
 #   make clean-live  tear down the real repos a watch run left up
 #   make seed-change seed the demo Change into a running Worker (for the console)
 #   make deploy    deploy the Worker to Cloudflare (wrangler deploy)
-#   make deploy-app APP=service-api  deploy an example web app to a live workers.dev URL
+#   make artifacts-subscribe  provision the Artifacts repo.pushed subscription to the Worker's Queue (infra-up does this too)
+#   make deploy-app APP=service-api  deploy an example web app (service-api, storefront, cityhall) to a live workers.dev URL
 #   make delete-app APP=service-api  tear that deployed example app down (stop billing)
 #   make export-replay ID=<changeId>  export a recorded board run from a Worker for the replay page (scrubbed)
 #   make preview-replay REPLAY=<file> REPO=<integration git dir> APP=<name> [DRY_RUN=1]  backfill revision previews into a replay (uploads Worker versions unless DRY_RUN)
@@ -260,8 +267,9 @@ run-live:
 
 # A LIVE board run against a running Worker (start it with `make dev`): the
 # planner, every agent turn, and the executor run through the AI Gateway
-# (EXECUTOR=ai-gateway plus the gateway URL/token in .env); without a live turn
-# model the command refuses. Each worker joins with its own Artifact repo and a
+# (EXECUTOR=ai-gateway plus the gateway URL/token in .env) or the local Claude
+# CLI (SWITCHYARD_INFERENCE=claude-cli in .env); without a live turn model the
+# command refuses. Each worker joins with its own Artifact repo and a
 # short-lived write token. Override GOAL / PROJECT / MIN / MAX as needed.
 run-board:
 	npm -w apps/cli run dev -- run-board "$(GOAL)" --project "$(PROJECT)" --worker "$(WORKER)" \
@@ -499,8 +507,8 @@ infra-down:
 # hop: a tiny real Worker goes from source to a clickable page in one command.
 # Authenticate first with a scoped CLOUDFLARE_API_TOKEN in a gitignored .env
 # (sourced below) or `wrangler login`. Tear it down with `make delete-app`.
-# See docs/LIVE-DEPLOY.md. The example apps are: service-api, storefront.
-# Defaults to service-api.
+# See docs/LIVE-DEPLOY.md. The example apps are: service-api, storefront,
+# cityhall. Defaults to service-api.
 APP ?= service-api
 
 deploy-app:
