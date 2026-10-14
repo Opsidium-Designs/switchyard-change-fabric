@@ -24,6 +24,7 @@ import type { CommandOutcome, CommandRunner } from "@switchyard-change/verificat
 
 import { BoardAgentClient, BoardOperatorClient } from "../src/board-client.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
+import { openIntegrationRound } from "../src/board-graph.ts";
 import {
   blamedItems,
   leaveOneOutPlan,
@@ -300,6 +301,28 @@ describe("the pre-pass progress ratchet (arbitration revision 5)", () => {
     expect(reduceBoard(log)).toEqual(state);
   }, 120_000);
 
+  it("records the round as progress: the whole stack's phases, then the leave-one-out candidates, all before the revision that closes it", async () => {
+    const env = await setup();
+    await env.firstRatchet();
+    await env.threePushes();
+    const before = (await env.log()).length;
+    await env.run();
+    const fresh = (await env.log()).slice(before);
+    const started = fresh.filter((m) => m.type === "integration.started");
+    expect(started[0]).toMatchObject({ from: "engine", payload: { kind: "leave-one-out", agents: ["a1", "a2", "a3"], items: ["x", "y", "z"] } });
+    const phases = fresh.filter((m) => m.type === "integration.phase" && m.payload.started === started[0]!.seq);
+    const words = phases.map((m) => (m.type === "integration.phase" ? m.payload.phase : ""));
+    // The whole stack is read, merged, and gated; then the leave-one-out candidates.
+    expect(words.slice(0, 3)).toEqual(["fetch", "merge", "gate"]);
+    expect(words.slice(3).every((w) => w === "candidate")).toBe(true);
+    expect(phases.slice(3).map((m) => (m.type === "integration.phase" ? m.payload.detail : ""))[0]).toMatch(/leave-one-out candidate/);
+    expect(phases.length).toBeLessThanOrEqual(12);
+    const firstRev = fresh.find((m) => m.type === "integrated.rev")!;
+    expect([...started.slice(0, 1), ...phases].every((m) => m.seq < firstRev.seq)).toBe(true);
+    // The rounds all closed (a revision, a regression, or an ended phase).
+    expect(openIntegrationRound(await env.log())).toBeNull();
+  }, 120_000);
+
   it("abandoned (the interrupt grace ended) after the round's first revision: nothing further is recorded (no push.regressed, no second revision, no decision)", async () => {
     const env = await setup();
     await env.firstRatchet();
@@ -320,7 +343,13 @@ describe("the pre-pass progress ratchet (arbitration revision 5)", () => {
     expect(of(after, "push.regressed")).toEqual([]);
     expect(of(after, "push.excluded")).toEqual([]);
     expect(of(after, "candidate.gated")).toEqual([]);
-    expect(after.filter((m) => m.from !== "engine" || !["integrated.rev", "fix.requested", "decision.resolved"].includes(m.type))).toEqual([]);
+    // Integration progress is recorded only BEFORE the abandon point (the revision); nothing after it.
+    const revSeq = of(after, "integrated.rev")[0]!.seq;
+    const progress = after.filter((m) => m.type === "integration.started" || m.type === "integration.phase");
+    expect(progress.length).toBeGreaterThan(0);
+    expect(progress.every((m) => m.seq < revSeq)).toBe(true);
+    const progressSeqs = new Set(progress.map((m) => m.seq));
+    expect(after.filter((m) => !progressSeqs.has(m.seq) && (m.from !== "engine" || !["integrated.rev", "fix.requested", "decision.resolved"].includes(m.type)))).toEqual([]);
     expect(decisions).toEqual([]);
     expect(await env.branchHead()).toBe(env.remote);
     expect(integrator.revisions.map((r) => r.n)).toEqual([2]);

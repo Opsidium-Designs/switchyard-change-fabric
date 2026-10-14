@@ -172,6 +172,54 @@
   },
   {
     "from": "engine",
+    "type": "integration.started",
+    "payload": {
+      "kind": "integrate",
+      "pushes": [
+        13
+      ],
+      "agents": [
+        "a0"
+      ],
+      "items": [
+        "w"
+      ]
+    },
+    "seq": 15,
+    "at": "2026-01-01T00:00:13.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.phase",
+    "payload": {
+      "started": 15,
+      "phase": "fetch"
+    },
+    "seq": 16,
+    "at": "2026-01-01T00:00:14.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.phase",
+    "payload": {
+      "started": 15,
+      "phase": "merge"
+    },
+    "seq": 17,
+    "at": "2026-01-01T00:00:15.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.phase",
+    "payload": {
+      "started": 15,
+      "phase": "gate"
+    },
+    "seq": 18,
+    "at": "2026-01-01T00:00:16.000Z"
+  },
+  {
+    "from": "engine",
     "type": "integrated.rev",
     "payload": {
       "n": 1,
@@ -201,8 +249,8 @@
         }
       ]
     },
-    "seq": 15,
-    "at": "2026-01-01T00:00:13.000Z"
+    "seq": 19,
+    "at": "2026-01-01T00:00:17.000Z"
   },
   {
     "from": "engine",
@@ -212,9 +260,9 @@
       "n": 1,
       "via": "integrated"
     },
-    "inReplyTo": 15,
-    "seq": 16,
-    "at": "2026-01-01T00:00:13.000Z"
+    "inReplyTo": 19,
+    "seq": 20,
+    "at": "2026-01-01T00:00:17.000Z"
   },
   {
     "from": "a1",
@@ -229,8 +277,8 @@
         ]
       }
     },
-    "seq": 17,
-    "at": "2026-01-01T00:00:14.000Z"
+    "seq": 21,
+    "at": "2026-01-01T00:00:18.000Z"
   },
   {
     "from": "engine",
@@ -246,9 +294,9 @@
         ]
       }
     },
-    "inReplyTo": 17,
-    "seq": 18,
-    "at": "2026-01-01T00:00:14.000Z"
+    "inReplyTo": 21,
+    "seq": 22,
+    "at": "2026-01-01T00:00:18.000Z"
   },
   {
     "from": "a2",
@@ -262,8 +310,8 @@
         ]
       }
     },
-    "seq": 19,
-    "at": "2026-01-01T00:00:15.000Z"
+    "seq": 23,
+    "at": "2026-01-01T00:00:19.000Z"
   },
   {
     "from": "engine",
@@ -278,9 +326,9 @@
         ]
       }
     },
-    "inReplyTo": 19,
-    "seq": 20,
-    "at": "2026-01-01T00:00:15.000Z"
+    "inReplyTo": 23,
+    "seq": 24,
+    "at": "2026-01-01T00:00:19.000Z"
   },
   {
     "from": "a3",
@@ -294,8 +342,8 @@
         ]
       }
     },
-    "seq": 21,
-    "at": "2026-01-01T00:00:16.000Z"
+    "seq": 25,
+    "at": "2026-01-01T00:00:20.000Z"
   },
   {
     "from": "engine",
@@ -310,9 +358,9 @@
         ]
       }
     },
-    "inReplyTo": 21,
-    "seq": 22,
-    "at": "2026-01-01T00:00:16.000Z"
+    "inReplyTo": 25,
+    "seq": 26,
+    "at": "2026-01-01T00:00:20.000Z"
   },
   {
     "from": "a1",
@@ -325,8 +373,8 @@
         "src/common.ts"
       ]
     },
-    "seq": 23,
-    "at": "2026-01-01T00:00:17.000Z"
+    "seq": 27,
+    "at": "2026-01-01T00:00:21.000Z"
   },
   {
     "from": "a2",
@@ -338,8 +386,8 @@
         "src/y/b.ts"
       ]
     },
-    "seq": 24,
-    "at": "2026-01-01T00:00:18.000Z"
+    "seq": 28,
+    "at": "2026-01-01T00:00:22.000Z"
   },
   {
     "from": "a3",
@@ -351,8 +399,8 @@
         "src/z/c.ts"
       ]
     },
-    "seq": 25,
-    "at": "2026-01-01T00:00:19.000Z"
+    "seq": 29,
+    "at": "2026-01-01T00:00:23.000Z"
   },
   {
     "from": "a1",
@@ -360,8 +408,8 @@
     "payload": {
       "item": "x"
     },
-    "seq": 26,
-    "at": "2026-01-01T00:00:20.000Z"
+    "seq": 30,
+    "at": "2026-01-01T00:00:24.000Z"
   },
   {
     "from": "engine",
@@ -387,8 +435,66 @@
       "a1",
       "a2"
     ],
-    "seq": 27,
-    "at": "2026-01-01T00:00:21.000Z"
+    "seq": 31,
+    "at": "2026-01-01T00:00:25.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.started",
+    "payload": {
+      "kind": "speculative",
+      "pushes": [
+        27,
+        28,
+        29
+      ],
+      "agents": [
+        "a1",
+        "a2",
+        "a3"
+      ],
+      "items": [
+        "x",
+        "y",
+        "z"
+      ],
+      "candidates": 3
+    },
+    "seq": 32,
+    "at": "2026-01-01T00:00:26.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.phase",
+    "payload": {
+      "started": 32,
+      "phase": "candidate",
+      "detail": "candidate 1 of 3: the head plus a1"
+    },
+    "seq": 33,
+    "at": "2026-01-01T00:00:27.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.phase",
+    "payload": {
+      "started": 32,
+      "phase": "candidate",
+      "detail": "candidate 2 of 3: the head plus a1, a2"
+    },
+    "seq": 34,
+    "at": "2026-01-01T00:00:28.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.phase",
+    "payload": {
+      "started": 32,
+      "phase": "candidate",
+      "detail": "candidate 3 of 3: the head plus a1, a2, a3"
+    },
+    "seq": 35,
+    "at": "2026-01-01T00:00:29.000Z"
   },
   {
     "from": "engine",
@@ -402,8 +508,8 @@
     "to": [
       "a2"
     ],
-    "seq": 28,
-    "at": "2026-01-01T00:00:22.000Z"
+    "seq": 36,
+    "at": "2026-01-01T00:00:30.000Z"
   },
   {
     "from": "engine",
@@ -453,8 +559,8 @@
         }
       ]
     },
-    "seq": 29,
-    "at": "2026-01-01T00:00:23.000Z"
+    "seq": 37,
+    "at": "2026-01-01T00:00:31.000Z"
   },
   {
     "from": "engine",
@@ -467,9 +573,9 @@
     "to": [
       "a3"
     ],
-    "inReplyTo": 29,
-    "seq": 30,
-    "at": "2026-01-01T00:00:23.000Z"
+    "inReplyTo": 37,
+    "seq": 38,
+    "at": "2026-01-01T00:00:31.000Z"
   },
   {
     "from": "engine",
@@ -504,8 +610,8 @@
         }
       ]
     },
-    "seq": 31,
-    "at": "2026-01-01T00:00:24.000Z"
+    "seq": 39,
+    "at": "2026-01-01T00:00:32.000Z"
   },
   {
     "from": "engine",
@@ -515,9 +621,9 @@
       "n": 3,
       "via": "integrated"
     },
-    "inReplyTo": 31,
-    "seq": 32,
-    "at": "2026-01-01T00:00:24.000Z"
+    "inReplyTo": 39,
+    "seq": 40,
+    "at": "2026-01-01T00:00:32.000Z"
   },
   {
     "from": "engine",
@@ -545,8 +651,8 @@
         "total": 1
       }
     },
-    "seq": 33,
-    "at": "2026-01-01T00:00:25.000Z"
+    "seq": 41,
+    "at": "2026-01-01T00:00:33.000Z"
   },
   {
     "from": "engine",
@@ -582,8 +688,8 @@
         "total": 1
       }
     },
-    "seq": 34,
-    "at": "2026-01-01T00:00:26.000Z"
+    "seq": 42,
+    "at": "2026-01-01T00:00:34.000Z"
   },
   {
     "from": "engine",
@@ -629,8 +735,8 @@
         "total": 1
       }
     },
-    "seq": 35,
-    "at": "2026-01-01T00:00:27.000Z"
+    "seq": 43,
+    "at": "2026-01-01T00:00:35.000Z"
   },
   {
     "from": "a3",
@@ -642,8 +748,38 @@
         "src/z/c.ts"
       ]
     },
-    "seq": 36,
-    "at": "2026-01-01T00:00:28.000Z"
+    "seq": 44,
+    "at": "2026-01-01T00:00:36.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.started",
+    "payload": {
+      "kind": "speculative",
+      "pushes": [
+        44
+      ],
+      "agents": [
+        "a3"
+      ],
+      "items": [
+        "z"
+      ],
+      "candidates": 1
+    },
+    "seq": 45,
+    "at": "2026-01-01T00:00:37.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.phase",
+    "payload": {
+      "started": 45,
+      "phase": "candidate",
+      "detail": "candidate 1 of 1: the head plus a3's push"
+    },
+    "seq": 46,
+    "at": "2026-01-01T00:00:38.000Z"
   },
   {
     "from": "engine",
@@ -682,8 +818,8 @@
         }
       ]
     },
-    "seq": 37,
-    "at": "2026-01-01T00:00:29.000Z"
+    "seq": 47,
+    "at": "2026-01-01T00:00:39.000Z"
   },
   {
     "from": "engine",
@@ -693,9 +829,9 @@
       "n": 4,
       "attempts": 1
     },
-    "inReplyTo": 37,
-    "seq": 38,
-    "at": "2026-01-01T00:00:29.000Z"
+    "inReplyTo": 47,
+    "seq": 48,
+    "at": "2026-01-01T00:00:39.000Z"
   },
   {
     "from": "engine",
@@ -706,9 +842,9 @@
       "n": 4,
       "commit": "b9d3a6a3aa41e66b28754ed2570e4fcda078f44b"
     },
-    "inReplyTo": 37,
-    "seq": 39,
-    "at": "2026-01-01T00:00:29.000Z"
+    "inReplyTo": 47,
+    "seq": 49,
+    "at": "2026-01-01T00:00:39.000Z"
   },
   {
     "from": "engine",
@@ -740,8 +876,8 @@
         "total": 1
       }
     },
-    "seq": 40,
-    "at": "2026-01-01T00:00:30.000Z"
+    "seq": 50,
+    "at": "2026-01-01T00:00:40.000Z"
   },
   {
     "from": "lead",
@@ -761,8 +897,8 @@
         }
       ]
     },
-    "seq": 41,
-    "at": "2026-01-01T00:00:31.000Z"
+    "seq": 51,
+    "at": "2026-01-01T00:00:41.000Z"
   },
   {
     "from": "a0",
@@ -776,8 +912,8 @@
         ]
       }
     },
-    "seq": 42,
-    "at": "2026-01-01T00:00:32.000Z"
+    "seq": 52,
+    "at": "2026-01-01T00:00:42.000Z"
   },
   {
     "from": "engine",
@@ -792,9 +928,9 @@
         ]
       }
     },
-    "inReplyTo": 42,
-    "seq": 43,
-    "at": "2026-01-01T00:00:32.000Z"
+    "inReplyTo": 52,
+    "seq": 53,
+    "at": "2026-01-01T00:00:42.000Z"
   },
   {
     "from": "a0",
@@ -806,8 +942,8 @@
         "src/z/c.ts"
       ]
     },
-    "seq": 44,
-    "at": "2026-01-01T00:00:33.000Z"
+    "seq": 54,
+    "at": "2026-01-01T00:00:43.000Z"
   },
   {
     "from": "a0",
@@ -815,8 +951,38 @@
     "payload": {
       "item": "z.r1"
     },
-    "seq": 45,
-    "at": "2026-01-01T00:00:34.000Z"
+    "seq": 55,
+    "at": "2026-01-01T00:00:44.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.started",
+    "payload": {
+      "kind": "speculative",
+      "pushes": [
+        54
+      ],
+      "agents": [
+        "a0"
+      ],
+      "items": [
+        "z.r1"
+      ],
+      "candidates": 1
+    },
+    "seq": 56,
+    "at": "2026-01-01T00:00:45.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.phase",
+    "payload": {
+      "started": 56,
+      "phase": "candidate",
+      "detail": "candidate 1 of 1: the head plus a0's push"
+    },
+    "seq": 57,
+    "at": "2026-01-01T00:00:46.000Z"
   },
   {
     "from": "engine",
@@ -849,8 +1015,8 @@
         }
       ]
     },
-    "seq": 46,
-    "at": "2026-01-01T00:00:35.000Z"
+    "seq": 58,
+    "at": "2026-01-01T00:00:47.000Z"
   },
   {
     "from": "engine",
@@ -860,9 +1026,9 @@
       "n": 5,
       "via": "integrated"
     },
-    "inReplyTo": 46,
-    "seq": 47,
-    "at": "2026-01-01T00:00:35.000Z"
+    "inReplyTo": 58,
+    "seq": 59,
+    "at": "2026-01-01T00:00:47.000Z"
   },
   {
     "from": "engine",
@@ -872,9 +1038,9 @@
       "n": 5,
       "via": "children"
     },
-    "inReplyTo": 46,
-    "seq": 48,
-    "at": "2026-01-01T00:00:35.000Z"
+    "inReplyTo": 58,
+    "seq": 60,
+    "at": "2026-01-01T00:00:47.000Z"
   },
   {
     "from": "engine",
@@ -903,8 +1069,8 @@
         "total": 1
       }
     },
-    "seq": 49,
-    "at": "2026-01-01T00:00:36.000Z"
+    "seq": 61,
+    "at": "2026-01-01T00:00:48.000Z"
   },
   {
     "from": "lead",
@@ -913,8 +1079,8 @@
       "item": "y",
       "reason": "its holder was told why its push was left out"
     },
-    "seq": 50,
-    "at": "2026-01-01T00:00:37.000Z"
+    "seq": 62,
+    "at": "2026-01-01T00:00:49.000Z"
   },
   {
     "from": "lead",
@@ -927,8 +1093,8 @@
         "docs/note-0.md"
       ]
     },
-    "seq": 51,
-    "at": "2026-01-01T00:00:38.000Z"
+    "seq": 63,
+    "at": "2026-01-01T00:00:50.000Z"
   },
   {
     "from": "lead",
@@ -941,8 +1107,8 @@
         "docs/note-1.md"
       ]
     },
-    "seq": 52,
-    "at": "2026-01-01T00:00:39.000Z"
+    "seq": 64,
+    "at": "2026-01-01T00:00:51.000Z"
   },
   {
     "from": "lead",
@@ -955,8 +1121,8 @@
         "docs/note-2.md"
       ]
     },
-    "seq": 53,
-    "at": "2026-01-01T00:00:40.000Z"
+    "seq": 65,
+    "at": "2026-01-01T00:00:52.000Z"
   },
   {
     "from": "lead",
@@ -969,8 +1135,8 @@
         "docs/note-3.md"
       ]
     },
-    "seq": 54,
-    "at": "2026-01-01T00:00:41.000Z"
+    "seq": 66,
+    "at": "2026-01-01T00:00:53.000Z"
   },
   {
     "from": "lead",
@@ -983,8 +1149,8 @@
         "docs/note-4.md"
       ]
     },
-    "seq": 55,
-    "at": "2026-01-01T00:00:42.000Z"
+    "seq": 67,
+    "at": "2026-01-01T00:00:54.000Z"
   },
   {
     "from": "lead",
@@ -997,8 +1163,8 @@
         "docs/note-5.md"
       ]
     },
-    "seq": 56,
-    "at": "2026-01-01T00:00:43.000Z"
+    "seq": 68,
+    "at": "2026-01-01T00:00:55.000Z"
   },
   {
     "from": "engine",
@@ -1007,15 +1173,15 @@
       "item": "y",
       "agent": "a2",
       "reason": "no-progress",
-      "lastProgressSeq": 28,
+      "lastProgressSeq": 36,
       "commit": "130d518717f6d86fc8611e66087e074b58ae027e"
     },
     "to": [
       "a2"
     ],
-    "inReplyTo": 56,
-    "seq": 57,
-    "at": "2026-01-01T00:00:43.000Z"
+    "inReplyTo": 68,
+    "seq": 69,
+    "at": "2026-01-01T00:00:55.000Z"
   },
   {
     "from": "lead",
@@ -1028,8 +1194,8 @@
         "docs/note-6.md"
       ]
     },
-    "seq": 58,
-    "at": "2026-01-01T00:00:44.000Z"
+    "seq": 70,
+    "at": "2026-01-01T00:00:56.000Z"
   },
   {
     "from": "lead",
@@ -1042,8 +1208,8 @@
         "docs/note-7.md"
       ]
     },
-    "seq": 59,
-    "at": "2026-01-01T00:00:45.000Z"
+    "seq": 71,
+    "at": "2026-01-01T00:00:57.000Z"
   },
   {
     "from": "lead",
@@ -1056,8 +1222,8 @@
         "docs/note-8.md"
       ]
     },
-    "seq": 60,
-    "at": "2026-01-01T00:00:46.000Z"
+    "seq": 72,
+    "at": "2026-01-01T00:00:58.000Z"
   },
   {
     "from": "lead",
@@ -1070,8 +1236,8 @@
         "docs/note-9.md"
       ]
     },
-    "seq": 61,
-    "at": "2026-01-01T00:00:47.000Z"
+    "seq": 73,
+    "at": "2026-01-01T00:00:59.000Z"
   },
   {
     "from": "lead",
@@ -1084,8 +1250,8 @@
         "docs/note-10.md"
       ]
     },
-    "seq": 62,
-    "at": "2026-01-01T00:00:48.000Z"
+    "seq": 74,
+    "at": "2026-01-01T00:01:00.000Z"
   },
   {
     "from": "lead",
@@ -1098,8 +1264,8 @@
         "docs/note-11.md"
       ]
     },
-    "seq": 63,
-    "at": "2026-01-01T00:00:49.000Z"
+    "seq": 75,
+    "at": "2026-01-01T00:01:01.000Z"
   },
   {
     "from": "a1",
@@ -1113,8 +1279,8 @@
         ]
       }
     },
-    "seq": 64,
-    "at": "2026-01-01T00:00:50.000Z"
+    "seq": 76,
+    "at": "2026-01-01T00:01:02.000Z"
   },
   {
     "from": "engine",
@@ -1129,9 +1295,9 @@
         ]
       }
     },
-    "inReplyTo": 64,
-    "seq": 65,
-    "at": "2026-01-01T00:00:50.000Z"
+    "inReplyTo": 76,
+    "seq": 77,
+    "at": "2026-01-01T00:01:02.000Z"
   },
   {
     "from": "a1",
@@ -1143,8 +1309,8 @@
         "src/y/b.ts"
       ]
     },
-    "seq": 66,
-    "at": "2026-01-01T00:00:51.000Z"
+    "seq": 78,
+    "at": "2026-01-01T00:01:03.000Z"
   },
   {
     "from": "a1",
@@ -1152,8 +1318,38 @@
     "payload": {
       "item": "y"
     },
-    "seq": 67,
-    "at": "2026-01-01T00:00:52.000Z"
+    "seq": 79,
+    "at": "2026-01-01T00:01:04.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.started",
+    "payload": {
+      "kind": "speculative",
+      "pushes": [
+        78
+      ],
+      "agents": [
+        "a1"
+      ],
+      "items": [
+        "y"
+      ],
+      "candidates": 1
+    },
+    "seq": 80,
+    "at": "2026-01-01T00:01:05.000Z"
+  },
+  {
+    "from": "engine",
+    "type": "integration.phase",
+    "payload": {
+      "started": 80,
+      "phase": "candidate",
+      "detail": "candidate 1 of 1: the head plus a1's push"
+    },
+    "seq": 81,
+    "at": "2026-01-01T00:01:06.000Z"
   },
   {
     "from": "engine",
@@ -1186,8 +1382,8 @@
         }
       ]
     },
-    "seq": 68,
-    "at": "2026-01-01T00:00:53.000Z"
+    "seq": 82,
+    "at": "2026-01-01T00:01:07.000Z"
   },
   {
     "from": "engine",
@@ -1197,9 +1393,9 @@
       "n": 6,
       "via": "integrated"
     },
-    "inReplyTo": 68,
-    "seq": 69,
-    "at": "2026-01-01T00:00:53.000Z"
+    "inReplyTo": 82,
+    "seq": 83,
+    "at": "2026-01-01T00:01:07.000Z"
   },
   {
     "from": "engine",
@@ -1228,8 +1424,8 @@
         "total": 1
       }
     },
-    "seq": 70,
-    "at": "2026-01-01T00:00:54.000Z"
+    "seq": 84,
+    "at": "2026-01-01T00:01:08.000Z"
   },
   {
     "from": "engine",
@@ -1240,7 +1436,7 @@
       "commit": "efb7567f26e231a4d1ef612e88f378e5f79779e7",
       "branch": "switchyard/change-coverage"
     },
-    "seq": 71,
-    "at": "2026-01-01T00:00:55.000Z"
+    "seq": 85,
+    "at": "2026-01-01T00:01:09.000Z"
   }
 ]

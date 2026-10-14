@@ -155,6 +155,8 @@ async function scenario(): Promise<readonly BoardMessage[]> {
   const integrator = new ContinuousBoardIntegrator({
     operator,
     change: { id: ID, objective: "o" },
+    // Progress records carry no wall-clock time: a deterministic fixture.
+    progressClock: null,
     agentRepos: new Map([...agents.entries()].map(([id, a]) => [id, { gitUrl: a.gitUrl, defaultBranch: a.branch }])),
     readRemote: async (id) => agent(id).gitUrl,
     integration,

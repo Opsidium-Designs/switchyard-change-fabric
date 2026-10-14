@@ -17,6 +17,7 @@ import { describe, expect, it } from "vitest";
 import { reduceBoard, type BoardDigest, type BoardMessage } from "@switchyard-change/change-core";
 import type { AgentTurnTransport, ExecutorProvider } from "@switchyard-change/model-adapters";
 
+import { openIntegrationRound } from "../src/board-graph.ts";
 import { createGenericBoardPolicy } from "../src/board-policy.ts";
 import { boardRunExitCode, formatBoardRunSummary, formatBoardTranscript, runBoard, type BoardRunEvent, type BoardSeed } from "../src/run-board.ts";
 import { GOAL, ModelStampingExecutor, direct, git, of, offline, project, seed } from "./run-board-fixtures.ts";
@@ -29,6 +30,20 @@ describe("runBoard (offline, lockstep, continuous integration)", () => {
     expect(second.log).toEqual(first.log);
     expect(second.turns).toEqual(first.turns);
     expect(formatBoardTranscript(second.log)).toBe(formatBoardTranscript(first.log));
+    // Every revision is preceded by the round that gated it (progress only, no wall-clock time),
+    // each round bounded, and no round is left open at the end.
+    const log = first.log;
+    for (const rev of log.filter((m) => m.type === "integrated.rev")) {
+      const round = openIntegrationRound(log, rev.seq - 1);
+      expect(round, `rev at seq ${rev.seq}`).not.toBeNull();
+    }
+    for (const s of log.filter((m) => m.type === "integration.started")) {
+      const phases = log.filter((m) => m.type === "integration.phase" && m.payload.started === s.seq);
+      expect(phases.length).toBeLessThanOrEqual(12);
+      expect(phases.every((m) => !("elapsedMs" in m.payload))).toBe(true);
+    }
+    expect(openIntegrationRound(log)).toBeNull();
+    expect(reduceBoard(log).lastSeq).toBe(log.at(-1)!.seq);
   });
 
   it("re-cues an owner that ignores the done cue (bounded), so the item does not stall", async () => {

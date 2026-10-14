@@ -24,7 +24,7 @@ import { readDependencySnapshotFromDir, runnerResolutionContract, type CommandOu
 
 import { BoardAgentClient, BoardOperatorClient } from "../src/board-client.ts";
 import { LocalChangeControl } from "../src/local-control.ts";
-import { assertBoardBacked, boardRevNodeId, buildBoardGraph } from "../src/board-graph.ts";
+import { assertBoardBacked, boardRevNodeId, buildBoardGraph, openIntegrationRound } from "../src/board-graph.ts";
 import { ContinuousBoardIntegrator, promotionBlocked, runBoard, type BoardAgentRepo } from "../src/run-board.ts";
 import { createIntegrationWorkspace } from "../src/run-live.ts";
 
@@ -36,6 +36,8 @@ const IDENTITY = { name: "Test Integrator", email: "integrator@test.local" };
 /** Optional fixture extras: more project files, and extra write scope per item. */
 interface SetupOptions {
   readonly files?: Readonly<Record<string, string>>;
+  /** Extra goal rules (for example an arbitration revision). */
+  readonly rules?: Readonly<Record<string, number>>;
   readonly extraWrite?: Readonly<Record<string, readonly string[]>>;
 }
 
@@ -60,7 +62,7 @@ async function setup(setupOptions: SetupOptions = {}) {
   const integration = await createIntegrationWorkspace(join(root, "work"), projectDir, ID, IDENTITY);
   const remote = (await git("git", ["ls-remote", integration.integrationRef.gitUrl, `refs/heads/${integration.integrationRef.defaultBranch}`])).stdout.split(/\s+/)[0]!;
   const human = async (draft: unknown) => expect((await operator.postAsHuman(draft)).ok).toBe(true);
-  await human({ type: "goal.posted", payload: { objective: "o", protected: ["package.json"], baseline: remote, rules: { speculate: 3 } } });
+  await human({ type: "goal.posted", payload: { objective: "o", protected: ["package.json"], baseline: remote, rules: { speculate: 3, ...setupOptions.rules } } });
   for (const item of ["w", "x", "y", "z"]) {
     await human({ type: "item.proposed", payload: { item, objective: `do ${item}`, scopeHint: [`src/${item}/**`, ...(setupOptions.extraWrite?.[item] ?? [])] } });
   }
@@ -560,5 +562,71 @@ describe("speculative batch gating", () => {
     expect(await env.branchHead()).toBe(landed);
     expect(await env.fileAt(landed, "package-lock.json")).toBe(lock(packages));
     expect(integrator.revisions[0]!.failure).toMatch(/protected path\(s\).*node_modules\/vitest\/node_modules\/vite/);
+  });
+});
+
+describe("speculative rounds record their progress on the board (integration.started, integration.phase)", () => {
+  const roundsOf = (log: readonly BoardMessage[]) =>
+    log.flatMap((m) => (m.type === "integration.started" ? [{ start: m, phases: log.filter((p) => p.type === "integration.phase" && p.payload.started === m.seq) }] : []));
+
+  it("one candidate at a time: the round names its pushes, then each candidate as it starts, then closes with its revisions", async () => {
+    const env = await setup({ rules: { arbitration: 7 } });
+    await env.warm();
+    await env.push("a1", "x", "src/x/a.ts", "export const a = 1;\n");
+    await env.push("a2", "y", "src/y/b.ts", "export const b = 'BAD';\n");
+    await env.push("a3", "z", "src/z/c.ts", "export const c = 1;\n");
+    const before = (await env.log()).length;
+    const integrator = env.integrator({ verifyCommandRunner: new MarkerGate(), candidateConcurrency: 1 });
+    integrator.kick();
+    await integrator.idle();
+    const log = await env.log();
+    const fresh = log.slice(before);
+    const rounds = roundsOf(fresh);
+    expect(rounds.length).toBeGreaterThan(0);
+    const [first] = rounds;
+    expect(first!.start).toMatchObject({ from: "engine", type: "integration.started", payload: { kind: "speculative", agents: ["a1", "a2", "a3"], items: ["x", "y", "z"], candidates: 3 } });
+    expect(first!.start.to).toBeUndefined();
+    const pushSeqs = fresh.length > 0 ? log.filter((m) => m.type === "push.announced").slice(-3).map((m) => m.seq) : [];
+    expect(first!.start.type === "integration.started" && first!.start.payload.pushes).toEqual(pushSeqs);
+    // C2 failed after C1 passed, so C3 is never built: two candidate phases, in order, then the revisions.
+    const details = first!.phases.map((p) => (p.type === "integration.phase" ? [p.payload.phase, p.payload.detail] : []));
+    expect(details).toEqual([
+      ["candidate", "candidate 1 of 3: the head plus a1"],
+      ["candidate", "candidate 2 of 3: the head plus a1, a2"],
+    ]);
+    const firstRev = fresh.find((m) => m.type === "integrated.rev")!;
+    expect(first!.phases.every((p) => p.seq < firstRev.seq)).toBe(true);
+    for (const r of rounds) expect(r.phases.length).toBeLessThanOrEqual(12);
+    // Every round closed: nothing is shown in progress once the integrator is idle.
+    expect(openIntegrationRound(log)).toBeNull();
+    // While the first round was open, the console's round was it, at its latest phase.
+    const open = openIntegrationRound(log, firstRev.seq - 1);
+    expect(open).toMatchObject({ seq: first!.start.seq, kind: "speculative", items: ["x", "y", "z"], line: "candidate 2 of 3: the head plus a1, a2" });
+    for (let k = before; k <= log.length; k += 1) assertBoardBacked(buildBoardGraph(log, k), log);
+  });
+
+  it("all candidates at once: one candidate phase names them together", async () => {
+    const env = await setup({ rules: { arbitration: 7 } });
+    await env.warm();
+    await env.push("a1", "x", "src/x/a.ts", "export const a = 1;\n");
+    await env.push("a2", "y", "src/y/b.ts", "export const b = 1;\n");
+    const before = (await env.log()).length;
+    const integrator = env.integrator({ verifyCommandRunner: new MarkerGate(), candidateConcurrency: 3 });
+    integrator.kick();
+    await integrator.idle();
+    const [round] = roundsOf((await env.log()).slice(before));
+    expect(round!.phases.map((p) => (p.type === "integration.phase" ? p.payload.detail : ""))).toEqual([
+      "2 prefix candidates at once on the passing head (the head plus the first 1 to 2 pushes: a1, a2)",
+    ]);
+  });
+
+  it("a board under arbitration revision 1 records no progress (its clocks count engine records)", async () => {
+    const env = await setup();
+    await env.warm();
+    await env.push("a1", "x", "src/x/a.ts", "export const a = 1;\n");
+    const integrator = env.integrator({ verifyCommandRunner: new MarkerGate(), candidateConcurrency: 1 });
+    integrator.kick();
+    await integrator.idle();
+    expect((await env.log()).filter((m) => m.type === "integration.started" || m.type === "integration.phase")).toEqual([]);
   });
 });
