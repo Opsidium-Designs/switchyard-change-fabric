@@ -2615,3 +2615,46 @@ body {
 .replay-card-try { margin: 0; font-size: 0.8rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: baseline; }
 .replay-card-try a { color: var(--accent); text-decoration: none; }
 .replay-card-try a:hover, .replay-card-try a:focus-visible { text-decoration: underline; }
+
+/* --- The live console's home and run pages --- */
+
+.active-run {
+  margin-top: 1.25rem;
+  padding: 0.6rem 0.85rem;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  background: var(--panel);
+}
+.active-run a { color: var(--accent); }
+.run-nav { display: flex; align-items: baseline; gap: 1rem; margin-top: 1.25rem; }
+.home-link { color: var(--accent); font-weight: 600; text-decoration: none; }
+.home-link:hover, .home-link:focus-visible { text-decoration: underline; }
+.runs-panel h3 { margin: 1.25rem 0 0.5rem; font-size: 0.95rem; }
+.runs-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+.runs-table th, .runs-table td { padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
+.runs-table th { color: var(--muted); font-weight: 600; }
+.runs-table a { color: var(--accent); white-space: nowrap; }
+.runs-table .is-verified { color: var(--ok); }
+.runs-table .is-failed { color: var(--bad-text); }
+.runs-note { margin-top: 0.5rem; }
+.app-versions { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 1rem; }
+.app-version { padding: 0.85rem 1rem; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); }
+.app-version.is-original { border-top: 3px solid var(--bad); }
+.app-version.is-fixed { border-top: 3px solid var(--ok); }
+.app-version p { margin: 0.4rem 0 0.75rem; font-size: 0.9rem; }
+.app-version a { color: var(--accent); font-weight: 600; word-break: break-all; }
+.app-version button {
+  padding: 0.45rem 0.9rem;
+  background: var(--accent);
+  color: var(--ink-on);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.app-version button.secondary { background: transparent; color: var(--accent); }
+.app-version button:disabled { opacity: 0.5; cursor: default; }
+.runs-table .run-outcome { text-transform: uppercase; font-size: 0.78rem; letter-spacing: 0.04em; font-weight: 600; }
+.publish-reason { margin: 0.5rem 0 0; }
+.publish-command { margin-top: 0.5rem; white-space: pre-wrap; word-break: break-all; }

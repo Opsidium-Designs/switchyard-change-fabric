@@ -64,7 +64,7 @@ function fakeUploader(failFor?: number): { upload: PreviewUploader; uploads: { a
   return { upload, uploads };
 }
 
-async function run(options: { previewRevision?: PreviewUploader; gate: FirstAttemptFailingGate; events: BoardRunEvent[] }): Promise<RunBoardResult> {
+async function run(options: { previewRevision?: PreviewUploader; previewMode?: "every" | "passing"; gate: FirstAttemptFailingGate; events: BoardRunEvent[] }): Promise<RunBoardResult> {
   const projectDir = await project();
   return runBoardOffline({
     goal: GOAL,
@@ -78,6 +78,7 @@ async function run(options: { previewRevision?: PreviewUploader; gate: FirstAtte
     deployAppDir: projectDir,
     deployAppName: WORKER,
     ...(options.previewRevision ? { previewRevision: options.previewRevision } : {}),
+    ...(options.previewMode ? { previewMode: options.previewMode } : {}),
     onEvent: (e) => options.events.push(e),
   });
 }
@@ -141,6 +142,29 @@ describe("revision previews on a board run (advisory)", () => {
     expect(result.previews!.map((p) => p.n)).toEqual(result.revisions.filter((r) => r.n !== 1).map((r) => r.n));
     expect(events).toContainEqual({ kind: "revision-preview-skipped", n: 1, reason: "wrangler: the Worker does not exist yet" });
     expect(formatBoardRunSummary(result)).toContain("  no preview for revision(s) 1 (advisory; see the run's preview events)");
+  });
+
+  it("passing mode uploads only gated passing revisions, all under one fixed alias, from the passing tree", async () => {
+    const events: BoardRunEvent[] = [];
+    const { upload, uploads } = fakeUploader();
+    const gate = new FirstAttemptFailingGate();
+    const result = await run({ previewRevision: upload, previewMode: "passing", gate, events });
+    expect(result.verdict).toBe("verified");
+    const passing = result.revisions.filter((r) => r.gate === "pass" && r.gated);
+    expect(passing.length).toBeGreaterThanOrEqual(1);
+    expect(result.revisions.some((r) => r.gate === "fail")).toBe(true);
+    // Failing revisions are never uploaded; every upload uses the one alias.
+    expect(uploads.map((u) => u.alias)).toEqual(passing.map(() => "fixed-pv7"));
+    expect(result.previewMode).toBe("passing");
+    expect(result.previews!.map((p) => [p.n, p.commit, p.alias])).toEqual(passing.map((r) => [r.n, r.commit, "fixed-pv7"]));
+    // The uploaded tree is the passing revision's own tree.
+    const last = passing.at(-1)!;
+    for (const [rel, content] of Object.entries(uploads.at(-1)!.files)) {
+      expect(content, rel).toBe(await atCommit(result, last.commit, rel));
+    }
+    const summary = formatBoardRunSummary(result);
+    expect(summary).toContain(`  fixed preview r${last.n}: https://fixed-pv7-${WORKER}.example.workers.dev`);
+    expect(summary).not.toContain("no preview for revision");
   });
 
   it("uploads nothing without the option", async () => {

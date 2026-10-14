@@ -7,7 +7,10 @@
  * a version is never deployed to the Worker's production URL, so the live app
  * is untouched; the alias URL serves exactly that revision. Previews of
  * failing revisions are intentional: a viewer can open the app as it was when
- * the gate failed.
+ * the gate failed. In "passing" mode (`--preview-passing`) only revisions
+ * whose gate ran and passed are uploaded, all under ONE alias
+ * (`fixed-<change tag>`), so the run has exactly a before (the production
+ * deploy of the original) and an after (the latest passing revision).
  *
  * ADVISORY and visual only: a preview never gates, never changes a verdict,
  * and never blocks the run loop. Uploads run one at a time on a serial queue
@@ -64,6 +67,21 @@ export function previewAlias(changeId: string, n: number, workerName: string): s
   if (!Number.isInteger(n) || n < 1) {
     throw new Error(`a preview alias needs a positive integer revision number (got ${n})`);
   }
+  return aliasWithTag(changeId, "", `-r${n}`, workerName, `revision ${n}`);
+}
+
+/**
+ * The ONE preview alias a run's passing revisions share (`--preview-passing`):
+ * `fixed-${tag}`, the tag as in previewAlias. Each later passing revision is
+ * uploaded again under it, so the alias always serves the latest revision
+ * whose gate passed; failing revisions are never uploaded under it.
+ */
+export function fixedAlias(changeId: string, workerName: string): string {
+  return aliasWithTag(changeId, "fixed-", "", workerName, "the fixed version");
+}
+
+/** `${prefix}${tag}${suffix}`, the tag truncated so the alias fits the bounds above. */
+function aliasWithTag(changeId: string, prefix: string, suffix: string, workerName: string, what: string): string {
   const parts = changeId
     .toLowerCase()
     .split("-")
@@ -75,12 +93,11 @@ export function previewAlias(changeId: string, n: number, workerName: string): s
   } else if (!/^[a-z]/.test(tag)) {
     tag = `c${tag}`;
   }
-  const suffix = `-r${n}`;
-  const room = Math.min(MAX_PREVIEW_ALIAS, MAX_HOST_LABEL - 1 - workerName.length) - suffix.length;
+  const room = Math.min(MAX_PREVIEW_ALIAS, MAX_HOST_LABEL - 1 - workerName.length) - suffix.length - prefix.length;
   if (room < 1) {
-    throw new Error(`the worker name ${JSON.stringify(workerName)} is too long for a preview alias of revision ${n}`);
+    throw new Error(`the worker name ${JSON.stringify(workerName)} is too long for a preview alias of ${what}`);
   }
-  return `${tag.slice(0, room)}${suffix}`;
+  return `${prefix}${tag.slice(0, room)}${suffix}`;
 }
 
 /** Whether a URL is an https workers.dev URL (what a preview alias URL must be). */
@@ -189,6 +206,11 @@ export interface RevisionPreviewerOptions {
   /** Record the preview (the Worker's previews route); a failure is reported, never thrown. */
   readonly record: (preview: RevisionPreview) => Promise<void>;
   readonly emit: (event: RevisionPreviewEvent) => void;
+  /**
+   * The alias revision `n` is uploaded under (default: previewAlias, one per
+   * revision). `--preview-passing` gives every passing revision one alias.
+   */
+  readonly aliasFor?: (n: number) => string;
   readonly now?: () => Date;
   /** Scrubs failure text before it is reported (credentials, local paths). */
   readonly scrub?: (text: string) => string;
@@ -253,7 +275,7 @@ export function createRevisionPreviewer(options: RevisionPreviewerOptions): Revi
         throw prepared.error ?? new Error("the revision's tree was not materialised");
       }
       const appRel = appPathInProject(options.projectDir, options.deployAppDir);
-      const alias = previewAlias(options.changeId, job.n, options.appName);
+      const alias = options.aliasFor ? options.aliasFor(job.n) : previewAlias(options.changeId, job.n, options.appName);
       const tree = prepared.tree;
       const appDir = appRel === "" ? tree : join(tree, appRel);
       const { url } = await options.upload({ appDir, appName: options.appName, alias });

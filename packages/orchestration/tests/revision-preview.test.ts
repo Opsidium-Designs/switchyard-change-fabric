@@ -18,12 +18,24 @@ import {
   createRevisionPreviewer,
   isWorkersDevUrl,
   parsePreviewAliasUrl,
+  fixedAlias,
   previewAlias,
   type RevisionPreview,
   type RevisionPreviewEvent,
 } from "../src/revision-preview.ts";
 
 const WORKER = "switchyard-change-fabric-storefront";
+
+describe("fixedAlias", () => {
+  it("is fixed-<change tag>, one alias for the whole run, within one hostname label", () => {
+    expect(fixedAlias("board-live-sf21", WORKER)).toBe("fixed-sf21");
+    expect(fixedAlias("console-storefront-mg3x1abcde", "switchyard-change-fabric-storefront")).toBe("fixed-mg3x1abcde");
+    expect(fixedAlias("run-42", WORKER)).toBe("fixed-c42");
+    const long = fixedAlias(`change-${"a".repeat(60)}`, "switchyard-change-fabric-cityhall");
+    expect(`${long}-switchyard-change-fabric-cityhall`.length).toBeLessThanOrEqual(63);
+    expect(long.startsWith("fixed-a")).toBe(true);
+  });
+});
 
 describe("previewAlias", () => {
   it("uses the last meaningful part of the Change id", () => {

@@ -132,11 +132,24 @@ deploy hop above:
    directory), so the SAME URL now serves the fixed app. A failed or cannot-pass
    verdict is neither promoted nor redeployed. If no Deploy happened first, the
    run deploys nothing: a verified fix is still promoted to Git, and the console
-   simply shows no live URL. A board run launched while the app is deployed also
-   gets `--preview-revisions`: every integrated revision is uploaded as a Worker
-   VERSION under a preview alias (never a production deploy), and the run panel
-   links the latest revision whose gate passed as "Open the fixed app" (only a
-   preview whose commit matches the board log's revision is ever linked).
+   simply shows no live URL. A BOARD run of an app template works differently,
+   so the original and the fix are both live, side by side: the launcher passes
+   `--preview-passing`, and each revision whose gate passes is uploaded as a
+   Worker VERSION under one preview alias, `fixed-<change tag>` (never a
+   production deploy; failing revisions are not uploaded; a later passing
+   revision replaces it), and there is no redeploy in place: the production URL
+   keeps the original. A version needs its Worker, so when the app is not
+   deployed at launch the launcher deploys the original first (the same
+   `deploy-app` command; if that fails the run still launches, without the fixed
+   preview, and says why). The run page's app panel shows "Original" and "Fixed
+   by this run (revision N)" (only a preview whose commit matches the board
+   log's revision is shown). For a run with no such preview (run-live, or a
+   board run without previews), "Publish the fixed version" uploads the run's
+   PROMOTED commit under the same alias once the run has exited, refused unless
+   the Worker records the run as verified by a gate that ran and the commit is
+   the promoted branch's tip (for a board run, also its recorded promotion and
+   gated tree). It needs the original deployed, and on run-live the production
+   URL must serve the original again (deploy it again first) so both are live.
 3. **Tear down (repos).** Once the run has exited, the "Tear down (repos)"
    control (it asks first) deletes the run's real Artifact repos. It is disabled
    while the run is still running and hidden for a run followed read-only with
@@ -157,6 +170,18 @@ credential in their environment; the CLI reads `.env` itself):
 | Deploy app | `npm -w apps/cli run dev -- deploy-app --app <app> --worker <worker url>` |
 | Remove app | `npm -w apps/cli run dev -- teardown-app --app <app>` |
 | Tear down (repos) | `npm -w apps/cli run dev -- cleanup-live --change-id <id> --worker <worker url>` |
+| Publish the fixed version | `npm -w apps/cli run dev -- publish-fixed --change-id <id> --app <app> --repo <promoted repo> --commit <promoted commit> --branch <promoted branch> --worker <worker url>` |
+
+The console's layout: HOME (`/`) has the template gallery and the runs table
+(runs launched by this console, the last `?watch=` run, and the recorded
+replays); a RUN page (`?run=<id>`, or `?watch=<id>` for a CLI run, read-only)
+has only that run, with a "<- Home" link. Launching is refused (HTTP 409 from
+`POST /api/launch`, Launch disabled on home) while a launched run is still
+running. The launcher reads the promoted repo, commit, and branch for "Publish
+the fixed version" from the run's own output (`promoted: ...` and `repo: ...`);
+the browser names only the run. For a CLI run the button is disabled and shows
+the equivalent `make publish-fixed CHANGE=<id> APP=<app> REPO=<dir> COMMIT=<c>
+BRANCH=<b>` command.
 
 `teardown-app` runs `wrangler delete` in `examples/apps/<app>` and fails (keeping
 the marker) on any error other than the Worker already being gone; if a scoped

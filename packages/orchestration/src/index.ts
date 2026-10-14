@@ -386,6 +386,7 @@ export {
   appPathInProject,
   checkoutIntegratedCommit,
   createRevisionPreviewer,
+  fixedAlias,
   isWorkersDevUrl,
   MAX_PREVIEW_ALIAS,
   parsePreviewAliasUrl,
@@ -431,3 +432,5 @@ export {
   showcaseWranglerConfig,
   withShowcaseApps,
 } from "./showcase.ts";
+export type { PublishFixedOptions, PublishFixedResult, PublishFixedRunFacts } from "./publish-fixed.ts";
+export { checkPublishFixed, publishFixedRunFacts, runPublishFixed } from "./publish-fixed.ts";

@@ -35,6 +35,7 @@
  *   teardown-app           delete that deployed example app (Cloudflare)
  *   preview-replay         backfill revision previews into a replay (Cloudflare; --dry-run plans only)
  *   showcase-app           publish an app's original and run-fixed code (Cloudflare; --dry-run plans only)
+ *   publish-fixed          upload a verified run's promoted commit as the fixed preview of its app (Cloudflare; --dry-run plans only)
  *
  * `switchyard-change --help` lists every command; `<command> --help` prints its usage.
  */
@@ -118,6 +119,7 @@ import {
   type RePlanTransport,
   type TeardownApp,
   redactSecrets,
+  runPublishFixed,
   ChildProcessCommandRunner,
   createPrePushTypecheck,
   runJevSmoke,
@@ -980,7 +982,7 @@ const commands: Command[] = [
       "Board run: agents form around a goal (the lead proposes items, workers claim, contest, push) -> integrate -> verify -> promote.",
     usage:
       `${CLI_NAME} run-board "<goal>"|--goal-file <file> --project <dir> [--offline [--fixture-gate] [--spread-claims] [--concurrent] [--board-out <file>]] [--worker <url>] [--min N] [--max N] [--max-inflight N] [--id <changeId>] ` +
-      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--deploy-app <app dir> [--deploy-app-name <worker>] [--preview-revisions]] [--rate-limit-window-ms N] [--inference gateway|claude-cli|codex-cli] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
+      `[--item-turns N] [--max-turns N] [--claim-cap N] [--lease-messages N] [--deadline-messages N] [--fix-attempts N] [--timeout-ms N] [--quiet-ms N] [--token-ttl S] [--no-token-refresh] [--proof-out <file>] [--max-calls N] [--max-spend-usd X] [--max-wall-ms N] [--max-item-calls N] [--price <model>=<in>/<out>] [--decide-contracts accept|reject] [--gate-timeout-ms N] [--integrator local|cloud] [--speculate K] [--lockstep] [--gate|--no-gate] [--no-pre-push-typecheck] [--watch] [--keep-work-root] [--deploy-app <app dir> [--deploy-app-name <worker>] [--preview-revisions|--preview-passing]] [--rate-limit-window-ms N] [--inference gateway|claude-cli|codex-cli] [${REQUIRE_MODEL_PLAN_FLAG}] [${ALLOW_HEURISTIC_PLANNER_FLAG}]`,
     async run(args) {
       const projectDir = requireProjectDir(args);
       const goal = await resolveGoal(args);
@@ -1056,13 +1058,22 @@ const commands: Command[] = [
       // Revision previews (opt-in, advisory): each integrated revision's app is
       // uploaded as a Worker VERSION under a preview alias (never a production
       // deploy). They need the app being deployed (--deploy-app) and a live run.
-      const previewRevisions = hasFlag(args, "--preview-revisions");
+      // --preview-passing uploads only the revisions whose gate ran and passed,
+      // all under ONE alias (fixed-<change tag>): the fixed app, beside the
+      // original at the Worker's production URL, as soon as a revision passes.
+      const previewPassing = hasFlag(args, "--preview-passing");
+      if (previewPassing && hasFlag(args, "--preview-revisions")) {
+        console.error("Error: pass --preview-revisions (every revision) or --preview-passing (passing revisions under one alias), not both");
+        return 1;
+      }
+      const previewRevisions = hasFlag(args, "--preview-revisions") || previewPassing;
+      const previewFlag = previewPassing ? "--preview-passing" : "--preview-revisions";
       if (previewRevisions && hasFlag(args, "--offline")) {
-        console.error("Error: --preview-revisions uploads Worker versions to Cloudflare; the offline board run never does");
+        console.error(`Error: ${previewFlag} uploads Worker versions to Cloudflare; the offline board run never does`);
         return 1;
       }
       if (previewRevisions && optionValue(args, "--deploy-app") === undefined) {
-        console.error("Error: --preview-revisions needs --deploy-app <app dir> (the app whose Worker the previews are versions of)");
+        console.error(`Error: ${previewFlag} needs --deploy-app <app dir> (the app whose Worker the previews are versions of)`);
         return 1;
       }
       if (integratorFlag === "cloud" && hasFlag(args, "--offline")) {
@@ -1325,7 +1336,11 @@ const commands: Command[] = [
               (speculate ?? DEFAULT_SPECULATE) > 1 ? `up to ${speculate ?? DEFAULT_SPECULATE} prefix candidates per round` : "off"
             })`,
       );
-      if (previewRevisions) {
+      if (previewPassing) {
+        console.log(
+          `  fixed preview: ON (each revision whose gate passes is uploaded as a version of ${deployAppName} under one preview alias, the latest passing one wins; failing revisions are not uploaded; never a production deploy; advisory). The production URL keeps the original: no in-place redeploy at the end`,
+        );
+      } else if (previewRevisions) {
         console.log(
           `  revision previews: ON (each integrated revision, failing ones included, is uploaded as a version of ${deployAppName} under a preview alias; never a production deploy; advisory)`,
         );
@@ -1384,13 +1399,17 @@ const commands: Command[] = [
         ...(hasFlag(args, "--watch") ? { skipCleanup: true } : {}),
         ...(deployAppDir ? { deployAppDir: resolve(deployAppDir) } : {}),
         ...(deployAppName ? { deployAppName } : {}),
-        ...(deployAppDir ? { deployApp: (async ({ appDir }) => ({ url: await wranglerDeploy(appDir) })) as DeployApp } : {}),
-        ...(deployAppBase
+        // With --preview-passing the fix lives at the fixed preview alias and
+        // the production URL keeps serving the original: no in-place redeploy,
+        // so the before and the after are both live, side by side.
+        ...(deployAppDir && !previewPassing ? { deployApp: (async ({ appDir }) => ({ url: await wranglerDeploy(appDir) })) as DeployApp } : {}),
+        ...(deployAppBase && !previewPassing
           ? { appAlreadyDeployed: async () => (await readAppDeployment(repoRoot(), deployAppBase))?.url }
           : {}),
         ...(previewRevisions && deployAppDir
           ? { previewRevision: async ({ appDir, alias }: { readonly appDir: string; readonly alias: string }) => ({ url: await wranglerVersionsUpload(appDir, alias) }) }
           : {}),
+        ...(previewPassing ? { previewMode: "passing" as const } : {}),
         onEvent: (event) => {
           switch (event.kind) {
             case "change-created":
@@ -1729,6 +1748,50 @@ const commands: Command[] = [
           `(${result.promotion.commit.slice(0, 10)}) in ${result.sourceRepoDir}`,
       );
       return 0;
+    },
+  },
+  {
+    name: "publish-fixed",
+    summary: "Upload a verified run's promoted commit as a preview version of its app's Worker (alias fixed-<change tag>), beside the original.",
+    usage: `${CLI_NAME} publish-fixed --change-id <id> --app <app name under examples/apps> --repo <promoted repo dir> --commit <promoted commit> --branch <promoted branch> [--worker <url>] [--dry-run]`,
+    async run(args) {
+      // The console's "Publish the fixed version": the promoted commit of a
+      // VERIFIED run (checked against the Worker's recorded verdict and, for a
+      // board run, its recorded promotion and gated tree) is uploaded as a
+      // Worker VERSION under one preview alias, never a production deploy.
+      const changeId = optionValue(args, "--change-id");
+      const app = optionValue(args, "--app");
+      const repo = optionValue(args, "--repo");
+      const commit = optionValue(args, "--commit");
+      const branch = optionValue(args, "--branch");
+      if (!changeId || !app || !repo || !commit || !branch) {
+        console.error(`Usage: ${CLI_NAME} publish-fixed --change-id <id> --app <app> --repo <promoted repo dir> --commit <promoted commit> --branch <promoted branch> [--worker <url>] [--dry-run]`);
+        return 1;
+      }
+      const workerUrl = optionValue(args, "--worker") ?? "http://127.0.0.1:8787";
+      const dryRun = hasFlag(args, "--dry-run");
+      try {
+        await runPublishFixed({
+          repoRoot: repoRoot(),
+          workerUrl,
+          changeId,
+          app,
+          repoDir: repo,
+          commit,
+          branch,
+          dryRun,
+          fetchFn: fetch,
+          upload: async ({ appDir, alias }) => ({ url: await wranglerVersionsUpload(appDir, alias) }),
+          log: (line) => console.log(redactSecrets(line)),
+        });
+        if (dryRun) {
+          console.log("Dry run: nothing was uploaded.");
+        }
+        return 0;
+      } catch (error) {
+        console.error(`Error: ${redactSecrets(error instanceof Error ? error.message : String(error))}`);
+        return 1;
+      }
     },
   },
   // The replay page's "Try the app" links (see showcase-app.ts).
@@ -2280,7 +2343,7 @@ async function preflightInference(): Promise<boolean> {
 }
 
 /** The commands that read `.env`: they talk to the live Worker, Cloudflare, or the AI Gateway. */
-const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "tool-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "teardown-app", "cleanup-live", "preview-replay", "showcase-app"]);
+const LIVE_COMMANDS: ReadonlySet<string> = new Set(["env-check", "doctor", "jev-smoke", "tool-smoke", "recruit-live", "run-live", "run-board", "deploy-app", "teardown-app", "cleanup-live", "preview-replay", "showcase-app", "publish-fixed"]);
 
 /**
  * Load the repo's `.env` (or SCF_ENV_FILE) into memory, never into this
